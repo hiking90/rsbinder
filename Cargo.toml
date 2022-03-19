@@ -1,0 +1,15 @@
+[package]
+name = "rsbinder"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+nix = "0"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0"
+tokio = { version = "1", features = ["full"] }
