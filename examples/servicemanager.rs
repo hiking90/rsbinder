@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
 
@@ -12,6 +13,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut process_state = ProcessState::as_self().write().unwrap();
 
         process_state.init(DEFAULT_BINDER_PATH, 0);
+
         process_state.become_context_manager();
     }
 

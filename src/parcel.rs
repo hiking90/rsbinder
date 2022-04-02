@@ -1,5 +1,10 @@
 use std::vec::Vec;
+use std::mem;
+use std::ptr;
 use crate::error::Result;
+use crate::sys::binder::{binder_size_t, flat_binder_object, BINDER_TYPE_FD};
+use crate::thread_state;
+use crate::binder;
 
 macro_rules! read_primitive {
     ( $name:ident, $ty:ty ) => (
@@ -20,41 +25,118 @@ macro_rules! write_primitive {
     )
 }
 
+const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
-pub struct Parcel {
-    data: Vec<u8>,
-    pos: usize,
+
+pub trait Parcel {
+    fn as_mut_ptr(&mut self) -> *mut u8;
+    fn is_empty(&self) -> bool;
+    fn capacity(&self) -> usize;
+    fn len(&self) -> usize;
+    fn set_len(&mut self, new_len: usize);
 }
 
-impl Parcel {
-    pub fn new(capacity: usize) -> Self {
-        Parcel {
-            data: Vec::with_capacity(capacity),
-            pos: 0,
-        }
+pub struct Reader {
+    data: Vec<u8>,
+    pos: usize,
+    objects: *mut binder_size_t,
+    object_count: usize,
+}
+
+impl Parcel for Reader {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
     }
 
-    pub fn as_mut_data(&mut self) -> &mut Vec<u8> {
-        &mut self.data
+    fn capacity(&self) -> usize {
+        self.data.capacity()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.pos >= self.data.len()
-    }
-
-    pub fn set_data_position(&mut self, pos: usize) {
-        self.pos = pos;
-    }
-
-    pub fn data_avail(&self) -> usize {
+    fn len(&self) -> usize {
         let result = self.data.len() - self.pos;
         assert!(result < i32::MAX as _, "data too big: {}", result);
 
         result
     }
 
+    fn is_empty(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    fn set_len(&mut self, new_len: usize) {
+        unsafe { self.data.set_len(new_len); }
+    }
+}
+
+impl Reader {
+    pub fn new(capacity: usize) -> Self {
+        Reader {
+            data: Vec::with_capacity(capacity),
+            pos: 0,
+            objects: ptr::null_mut(),
+            object_count: 0,
+        }
+    }
+
+    pub fn from_ipc_data(data: *mut u8, length: usize,
+            objects: *mut binder_size_t, object_count: usize) -> mem::ManuallyDrop<Self> {
+        mem::ManuallyDrop::new(
+            Reader {
+                data: unsafe { Vec::from_raw_parts(data, length, length) },
+                pos: 0,
+                objects: objects,
+                object_count: object_count,
+            }
+        )
+    }
+
+    pub fn from_slice(data: &[u8]) -> Self {
+        Reader {
+            data: data.to_vec(),
+            pos: 0,
+            objects: ptr::null_mut(),
+            object_count: 0,
+        }
+    }
+
+    pub fn from_vec_u8(data: Vec<u8>) -> Self {
+        Reader {
+            data: data,
+            pos: 0,
+            objects: ptr::null_mut(),
+            object_count: 0,
+        }
+    }
+
+    pub fn into_writer(self) -> Result<Writer> {
+        Ok(Writer {
+            data: self.data
+        })
+    }
+
+    pub fn set_data_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    pub fn close_file_descriptors(&self) {
+        for i in 0..self.object_count {
+            unsafe {
+                let offset = self.objects.add(i);
+                let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
+
+                if (*flat).hdr.type_ == BINDER_TYPE_FD {
+                    libc::close((*flat).__bindgen_anon_1.handle as _);
+                }
+            }
+        }
+    }
+
     pub fn dump(&self) {
         println!("Parcel: pos {}, len {}, {:?}", self.pos, self.data.len(), self.data);
+    }
+
+    pub fn check_interface(&self, binder: &dyn binder::IBinder) {
+
     }
 
     read_primitive!(read_f32, f32);
@@ -79,6 +161,71 @@ impl Parcel {
         Ok(res != 0)
     }
 
+    pub fn read<T: Copy>(&mut self, size: usize) -> Result<T> {
+        let res: T = unsafe {
+            let ptr: *const T = std::mem::transmute(self.data[self.pos..(self.pos + size)].as_ptr());
+            *ptr
+        };
+        self.pos += size;
+
+        Ok(res)
+    }
+}
+
+pub struct Writer {
+    data: Vec<u8>,
+}
+
+impl Parcel for Writer {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn set_len(&mut self, new_len: usize) {
+        unsafe { self.data.set_len(new_len); }
+    }
+}
+
+impl Writer {
+    pub fn new(capacity: usize) -> Self {
+        Writer {
+            data: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn into_reader(self) -> Reader {
+        Reader::from_vec_u8(self.data)
+    }
+
+    pub fn dump(&self) {
+        println!("Parcel: len {}, {:?}", self.data.len(), self.data);
+    }
+
+    pub fn extend_from_slice(&mut self, other: &[u8]) {
+        self.data.extend_from_slice(other)
+    }
+
+    // fn update_work_source_request_header_pos(&mut self) {
+    //     if self.request_header_present == false {
+    //         self.work_source_request_header_pos = self.data.len();
+    //         self.request_header_present = true;
+    //     }
+    // }
+
+    write_primitive!(write_i16, i16);
+    write_primitive!(write_u16, u16);
     write_primitive!(write_i32, i32);
     write_primitive!(write_u32, u32);
     write_primitive!(write_i64, i64);
@@ -101,6 +248,29 @@ impl Parcel {
         self.data.extend_from_slice(&val.to_ne_bytes())
     }
 
+    pub fn write_string16(&mut self, val: &str) {
+        self.write_i32(val.len() as _);
+        for ch16 in val.encode_utf16() {
+            self.write_u16(ch16);
+        }
+    }
+
+    pub fn write_interface_token(&mut self, val: &str) {
+        thread_state::THREAD_STATE.with(|thread_state| {
+            self.write_i32(thread_state.borrow().strict_mode_policy() | STRICT_MODE_PENALTY_GATHER);
+    //     updateWorkSourceRequestHeaderPosition();
+    //     writeInt32(threadState->shouldPropagateWorkSource() ? threadState->getCallingWorkSourceUid()
+    //                                                         : IPCThreadState::kUnsetWorkSource);
+            self.write_i32(-1);
+            self.write_i32(binder::INTERFACE_HEADER as _);
+        });
+
+        self.write_string16(val);
+    }
+
+    pub fn write(&mut self, data: &[u8]) {
+        self.data.extend_from_slice(data);
+    }
 }
 
 #[cfg(test)]
@@ -109,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_primitives() -> Result<()> {
-        let mut parcel = Parcel::new(10);
+        let mut writer = parcel::Writer::new(10);
 
         let v_i32:i32 = 1234;
         let v_f32:f32 = 1234.0;
@@ -118,28 +288,29 @@ mod tests {
         let v_u64:u64 = 1234;
         let v_f64:f64 = 1234.0;
 
-        parcel.write_i32(v_i32);
-        parcel.write_f32(v_f32);
-        parcel.write_u32(v_u32);
-        parcel.write_i64(v_i64);
-        parcel.write_u64(v_u64);
-        parcel.write_f64(v_f64);
+        writer.write_i32(v_i32);
+        writer.write_f32(v_f32);
+        writer.write_u32(v_u32);
+        writer.write_i64(v_i64);
+        writer.write_u64(v_u64);
+        writer.write_f64(v_f64);
 
-        assert_eq!(parcel.read_i32()?, v_i32);
-        assert_eq!(parcel.read_f32()?, v_f32);
-        assert_eq!(parcel.read_u32()?, v_u32);
-        assert_eq!(parcel.read_i64()?, v_i64);
-        assert_eq!(parcel.read_u64()?, v_u64);
-        assert_eq!(parcel.read_f64()?, v_f64);
+        let mut reader = writer.into_reader();
+
+        assert_eq!(reader.read_i32()?, v_i32);
+        assert_eq!(reader.read_f32()?, v_f32);
+        assert_eq!(reader.read_u32()?, v_u32);
+        assert_eq!(reader.read_i64()?, v_i64);
+        assert_eq!(reader.read_u64()?, v_u64);
+        assert_eq!(reader.read_f64()?, v_f64);
 
         Ok(())
     }
 
     #[test]
     fn test_with_slice() -> Result<()> {
-        let mut parcel = Parcel::new(256);
-        parcel.as_mut_data().extend_from_slice(&[12, 114, 0, 0, 2, 114, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71, 78, 80, 95, 16, 0, 0, 0, 242, 13, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 209, 234, 37, 127, 0, 0, 0, 96, 209, 234, 37, 127, 0, 0]);
-        assert_eq!(parcel.read_i32()?, 29196);
+        let mut reader = parcel::Reader::from_slice(&[12, 114, 0, 0, 2, 114, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71, 78, 80, 95, 16, 0, 0, 0, 242, 13, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 209, 234, 37, 127, 0, 0, 0, 96, 209, 234, 37, 127, 0, 0]);
+        assert_eq!(reader.read_i32()?, 29196);
 
         Ok(())
     }

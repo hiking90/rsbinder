@@ -6,6 +6,8 @@ use std::sync::{RwLock, Once};
 use log;
 
 use crate::sys::binder;
+use crate::binder::*;
+use crate::{native, service_manager::BnServiceManager};
 
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
@@ -17,6 +19,7 @@ pub struct ProcessState {
     driver: RawFd,
     vm_start: *mut libc::c_void,
     vm_size: usize,
+    context_manager: Option<native::Binder<BnServiceManager>>,
 }
 
 impl ProcessState {
@@ -25,6 +28,7 @@ impl ProcessState {
             driver: -1,
             vm_start: std::ptr::null_mut(),
             vm_size: 0,
+            context_manager: None,
         }
     }
 
@@ -36,7 +40,6 @@ impl ProcessState {
             });
             PROCESS_STATE.assume_init_ref()
         }
-
     }
 
     pub fn init(&mut self, driver: &str, max_threads: u32) -> bool {
@@ -74,7 +77,7 @@ impl ProcessState {
         true
     }
 
-    pub fn become_context_manager(&self) -> bool {
+    pub fn become_context_manager(&mut self) -> bool {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
@@ -90,7 +93,13 @@ impl ProcessState {
             }
         }
 
+        self.context_manager = Some(native::Binder::new(BnServiceManager::new()));
+
         true
+    }
+
+    pub fn context_manager(&self) -> Option<&native::Binder<BnServiceManager>> {
+        self.context_manager.as_ref()
     }
 }
 

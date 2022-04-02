@@ -1,0 +1,166 @@
+use std::sync::Arc;
+use crate::binder::*;
+use crate::parcel;
+use crate::error::*;
+
+
+pub struct Binder<T: Remotable + ?Sized> {
+    remotable: T,
+}
+
+
+/// # Safety
+///
+/// A `Binder<T>` is a pair of unique owning pointers to two values:
+///   * a C++ ABBinder which the C++ API guarantees can be passed between threads
+///   * a Rust object which implements `Remotable`; this trait requires `Send + Sync`
+///
+/// Both pointers are unique (never escape the `Binder<T>` object and are not copied)
+/// so we can essentially treat `Binder<T>` as a box-like containing the two objects;
+/// the box-like object inherits `Send` from the two inner values, similarly
+/// to how `Box<T>` is `Send` if `T` is `Send`.
+unsafe impl<T: Remotable> Send for Binder<T> {}
+
+/// # Safety
+///
+/// A `Binder<T>` is a pair of unique owning pointers to two values:
+///   * a C++ ABBinder which is thread-safe, i.e. `Send + Sync`
+///   * a Rust object which implements `Remotable`; this trait requires `Send + Sync`
+///
+/// `ABBinder` contains an immutable `mUserData` pointer, which is actually a
+/// pointer to a boxed `T: Remotable`, which is `Sync`. `ABBinder` also contains
+/// a mutable pointer to its class, but mutation of this field is controlled by
+/// a mutex and it is only allowed to be set once, therefore we can concurrently
+/// access this field safely. `ABBinder` inherits from `BBinder`, which is also
+/// thread-safe. Thus `ABBinder` is thread-safe.
+///
+/// Both pointers are unique (never escape the `Binder<T>` object and are not copied)
+/// so we can essentially treat `Binder<T>` as a box-like containing the two objects;
+/// the box-like object inherits `Sync` from the two inner values, similarly
+/// to how `Box<T>` is `Sync` if `T` is `Sync`.
+unsafe impl<T: Remotable> Sync for Binder<T> {}
+
+impl<T: Remotable> Binder<T> {
+    pub fn new(remotable: T) -> Self {
+        Binder {
+            remotable: remotable,
+        }
+    }
+
+    /// Retrieve the interface descriptor string for this object's Binder
+    /// interface.
+    pub fn get_descriptor() -> &'static str {
+        T::get_descriptor()
+    }
+
+    pub fn transact(&self, code: TransactionCode, data: &mut parcel::Reader, reply: &mut parcel::Writer) -> Result<()> {
+        data.set_data_position(0);
+        match code {
+            PING_TRANSACTION => (),
+            EXTENSION_TRANSACTION => {
+                todo!("EXTENSION_TRANSACTION");
+                // CHECK(reply != nullptr);
+                // err = reply->writeStrongBinder(getExtension());
+            }
+            DEBUG_PID_TRANSACTION => {
+                todo!("DEBUG_PID_TRANSACTION");
+                // CHECK(reply != nullptr);
+                // err = reply->writeInt32(getDebugPid());
+            }
+
+            _ => {
+                self.remotable.on_transact(code, data, reply)?;
+            }
+        };
+
+        Ok(())
+    }
+}
+
+impl<T: Remotable> Interface for Binder<T> {
+    /// Converts the local remotable object into a generic `SpIBinder`
+    /// reference.
+    ///
+    /// The resulting `SpIBinder` will hold its own strong reference to this
+    /// remotable object, which will prevent the object from being dropped while
+    /// the `SpIBinder` is alive.
+    fn as_binder(&self) -> &dyn IBinder {
+        self
+    }
+}
+
+impl<T: Remotable> IBinder for Binder<T> {
+    fn link_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()> {
+        todo!("link_to_death")
+    }
+
+    /// Remove a previously registered death notification.
+    /// The recipient will no longer be called if this object
+    /// dies.
+    fn unlink_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()> {
+        todo!("unlink_to_death")
+    }
+
+    /// Send a ping transaction to this object
+    fn ping_binder(&mut self) -> Result<()> {
+        todo!("ping_binder");
+    }
+}
+
+impl<T: Remotable> InterfaceClassMethods for Binder<T> {
+    fn get_descriptor() -> &'static str {
+        <T as Remotable>::get_descriptor()
+    }
+
+    fn on_create() {
+
+    }
+
+    // fn on_transact(
+    //     binder: &mut Binder<T>,
+    //     code: u32,
+    //     data: &parcel::Reader,
+    //     reply: &parcel::Writer,
+    // ) -> Result<()> {
+    //     Ok(())
+    // }
+
+    fn on_destroy() {
+    }
+
+    fn on_dump<R: Remotable>(binder: &mut Binder<R>, fd: i32, args: &str, num_args: u32) -> Result<()> {
+        Ok(())
+    }
+}
+
+
+// // This implementation is an idiomatic implementation of the C++
+// // `IBinder::localBinder` interface if the binder object is a Rust binder
+// // service.
+// impl<B: Remotable> TryFrom<SpIBinder> for Binder<B> {
+//     type Error = StatusCode;
+
+//     fn try_from(mut ibinder: SpIBinder) -> Result<Self> {
+//         let class = B::get_class();
+//         if Some(class) != ibinder.get_class() {
+//             return Err(StatusCode::BAD_TYPE);
+//         }
+//         let userdata = unsafe {
+//             // Safety: `SpIBinder` always holds a valid pointer pointer to an
+//             // `AIBinder`, which we can safely pass to
+//             // `AIBinder_getUserData`. `ibinder` retains ownership of the
+//             // returned pointer.
+//             sys::AIBinder_getUserData(ibinder.as_native_mut())
+//         };
+//         if userdata.is_null() {
+//             return Err(StatusCode::UNEXPECTED_NULL);
+//         }
+//         // We are transferring the ownership of the AIBinder into the new Binder
+//         // object.
+//         let mut ibinder = ManuallyDrop::new(ibinder);
+//         Ok(Binder {
+//             ibinder: ibinder.as_native_mut(),
+//             rust_object: userdata as *mut B,
+//         })
+//     }
+// }

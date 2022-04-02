@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use std::io;
@@ -74,18 +75,59 @@ fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
+const WORK_SOURCE_PROPAGATED_BIT_INDEX: i64 = 32;
+const UNSET_WORK_SOURCE: i32 = -1;
+
+#[derive(Debug, Clone, Copy)]
+struct TransactionState {
+    calling_pid: binder::pid_t,
+    calling_sid: *const u8,
+    calling_uid: binder::uid_t,
+    strict_mode_policy: i32,
+    last_transaction_binder_flags: u32,
+    work_source: binder::uid_t,
+    propagate_work_source: bool,
+}
+
+impl TransactionState {
+    fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
+        TransactionState {
+            calling_pid: data.transaction_data.sender_pid,
+            calling_sid: data.secctx as _,
+            calling_uid: data.transaction_data.sender_euid,
+            strict_mode_policy: 0,
+            last_transaction_binder_flags: data.transaction_data.flags,
+            work_source: 0,
+            propagate_work_source: false,
+        }
+    }
+}
+
+
 pub struct ThreadState {
-    in_parcel: Parcel,
-    out_parcel: Parcel,
+    in_parcel: parcel::Reader,
+    out_parcel: parcel::Writer,
+    transaction: Option<TransactionState>,
+    strict_mode_policy: i32,
 }
 
 
 impl ThreadState {
     fn new() -> Self {
         ThreadState {
-            in_parcel: Parcel::new(256),
-            out_parcel: Parcel::new(256),
+            in_parcel: parcel::Reader::new(256),
+            out_parcel: parcel::Writer::new(256),
+            transaction: None,
+            strict_mode_policy: 0,
         }
+    }
+
+    pub fn set_strict_mode_policy(&mut self, policy: i32) {
+        self.strict_mode_policy = policy;
+    }
+
+    pub fn strict_mode_policy(&self) -> i32 {
+        self.strict_mode_policy
     }
 
     pub fn setup_polling(&mut self) -> Result<std::os::unix::io::RawFd> {
@@ -96,22 +138,21 @@ impl ThreadState {
 
     fn flash_commands(&mut self) -> Result<()> {
         self.talk_with_driver(false)?;
-        if self.out_parcel.data_avail() > 0 {
+        if self.out_parcel.len() > 0 {
             self.talk_with_driver(false)?;
         }
 
-        if self.out_parcel.data_avail() > 0 {
-            log::warn!("self.out_parcel.data_avail() > 0 after flash_commands()");
+        if self.out_parcel.len() > 0 {
+            log::warn!("self.out_parcel.len() > 0 after flash_commands()");
         }
 
         Ok(())
     }
 
     pub fn handle_commands(&mut self) -> Result<()>{
-        println!("handle_commands");
         while {
             self.get_and_execute_command()?;
-            self.in_parcel.data_avail() != 0
+            self.in_parcel.len() != 0
         } {
             self.flash_commands()?;
         }
@@ -121,10 +162,11 @@ impl ThreadState {
     fn get_and_execute_command(&mut self) -> Result<()> {
         self.talk_with_driver(true)?;
 
-        if self.in_parcel.data_avail() < std::mem::size_of::<i32>() {
+        if self.in_parcel.len() < std::mem::size_of::<i32>() {
             return Ok(())
         }
 
+        self.in_parcel.dump();
         let cmd = self.in_parcel.read_i32().unwrap_or(0);
         self.execute_command(cmd)?;
 
@@ -142,13 +184,90 @@ impl ThreadState {
                 return Err(Error::from(error::ErrorKind::Other(other)));
             }
             binder::BR_OK => {}
-            binder::BR_TRANSACTION_SEC_CTX => {}
-            binder::BR_TRANSACTION => {}
-            binder::BR_REPLY => {}
-            binder::BR_ACQUIRE_RESULT => {}
-            binder::BR_DEAD_REPLY => {}
-            binder::BR_TRANSACTION_COMPLETE => {}
+
+            binder::BR_TRANSACTION_SEC_CTX |
+            binder::BR_TRANSACTION => {
+                let tr_secctx = if cmd == binder::BR_TRANSACTION_SEC_CTX {
+                    let size = std::mem::size_of::<binder::binder_transaction_data_secctx>();
+                    self.in_parcel.read::<binder::binder_transaction_data_secctx>(size)?
+                } else {
+                    let size = std::mem::size_of::<binder::binder_transaction_data>();
+                    binder::binder_transaction_data_secctx {
+                        transaction_data: self.in_parcel.read::<binder::binder_transaction_data>(size)?,
+                        secctx: 0,
+                    }
+                };
+
+                let mut reader = unsafe {
+                    let tr = &tr_secctx.transaction_data;
+
+                    parcel::Reader::from_ipc_data(tr.data.ptr.buffer as _, tr.data_size as _,
+                        tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
+                };
+
+                // TODO: Skip now, because if below implmentation is mandatory.
+                // const void* origServingStackPointer = mServingStackPointer;
+                // mServingStackPointer = &origServingStackPointer; // anything on the stack
+
+                let transaction_old = self.transaction;
+
+                self.clear_calling_work_source();
+                self.clear_propagate_work_source();
+
+                self.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
+
+                let mut reply = parcel::Writer::new(256);
+
+                unsafe {
+                    let target_ptr = tr_secctx.transaction_data.target.ptr;
+                    if target_ptr != 0 {
+                        todo!("need to call BBinder->transact()")
+                        // let weak_ref: *mut ref_base::WeakRef = target_ptr as _;
+                        // let mut ref_base = ref_base::RefBase::<ref_base::RemoteRef>::from_raw(target_ptr as _);
+                        // if ref_base.attempt_inc_strong() {
+                        //     todo!("need to call BBinder->transact()")
+                        // }
+                //     if (reinterpret_cast<RefBase::weakref_type*>(
+                //             tr.target.ptr)->attemptIncStrong(this)) {
+                //         error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
+                //                 &reply, tr.flags);
+                //         reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
+                //     } else {
+                //         error = UNKNOWN_TRANSACTION;
+                //     }
+
+                    } else {
+                        if let Some(context) = ProcessState::as_self().read().unwrap().context_manager() {
+                            context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)?;
+                        }
+                    }
+                }
+
+                let flags = tr_secctx.transaction_data.flags;
+                if (flags & sys::transaction_flags_TF_ONE_WAY) == 0 {
+                    let flags = flags & sys::transaction_flags_TF_CLEAR_BUF;
+                    self.write_transaction_data(binder::BC_REPLY as _, flags, u32::MAX, 0, &mut reply)?;
+                    reply.set_len(0);
+                    self.wait_for_response(&mut reply)?;
+                }
+
+                self.transaction = transaction_old;
+            }
+
+            binder::BR_REPLY => {
+                todo!("execute_command - BR_REPLY");
+            }
+            binder::BR_ACQUIRE_RESULT => {
+                todo!("execute_command - BR_ACQUIRE_RESULT");
+            }
+            binder::BR_DEAD_REPLY => {
+                todo!("execute_command - BR_DEAD_REPLY");
+            }
+            binder::BR_TRANSACTION_COMPLETE => {
+                todo!("execute_command - BR_TRANSACTION_COMPLETE");
+            }
             binder::BR_INCREFS => {
+                todo!("execute_command - BR_INCREFS");
         // refs = (RefBase::weakref_type*)mIn.readPointer();
         // obj = (BBinder*)mIn.readPointer();
         // refs->incWeak(mProcess.get());
@@ -158,6 +277,7 @@ impl ThreadState {
 
             }
             binder::BR_ACQUIRE => {
+                todo!("execute_command - BR_ACQUIRE");
         // refs = (RefBase::weakref_type*)mIn.readPointer();
         // obj = (BBinder*)mIn.readPointer();
         // ALOG_ASSERT(refs->refBase() == obj,
@@ -174,6 +294,7 @@ impl ThreadState {
 
             }
             binder::BR_RELEASE => {
+                todo!("execute_command - BR_RELEASE");
         // refs = (RefBase::weakref_type*)mIn.readPointer();
         // obj = (BBinder*)mIn.readPointer();
         // ALOG_ASSERT(refs->refBase() == obj,
@@ -187,6 +308,7 @@ impl ThreadState {
 
             }
             binder::BR_DECREFS => {
+                todo!("execute_command - BR_DECREFS");
         // refs = (RefBase::weakref_type*)mIn.readPointer();
         // obj = (BBinder*)mIn.readPointer();
         // // NOTE: This assertion is not valid, because the object may no
@@ -198,6 +320,7 @@ impl ThreadState {
         // mPendingWeakDerefs.push(refs);
             }
             binder::BR_ATTEMPT_ACQUIRE => {
+                todo!("execute_command - BR_ATTEMPT_ACQUIRE");
         // refs = (RefBase::weakref_type*)mIn.readPointer();
         // obj = (BBinder*)mIn.readPointer();
 
@@ -212,16 +335,28 @@ impl ThreadState {
         // }
             }
             binder::BR_NOOP => {}
-            binder::BR_SPAWN_LOOPER => {}
-            binder::BR_FINISHED => {}
-            binder::BR_DEAD_BINDER => {}
-            binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {}
-            binder::BR_FAILED_REPLY => {}
-            binder::BR_FROZEN_REPLY => {}
-            binder::BR_ONEWAY_SPAM_SUSPECT => {}
-            _ => {
-                panic!("Unknow binder command: {}", cmd);
+            binder::BR_SPAWN_LOOPER => {
+                todo!("execute_command - BR_SPAWN_LOOPER");
             }
+            binder::BR_FINISHED => {
+                todo!("execute_command - BR_FINISHED");
+            }
+            binder::BR_DEAD_BINDER => {
+                todo!("Bexecute_command - R_DEAD_BINDER");
+            }
+            binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
+                todo!("execute_command - BR_CLEAR_DEATH_NOTIFICATION_DONE");
+            }
+            binder::BR_FAILED_REPLY => {
+                todo!("execute_command - BR_FAILED_REPLY");
+            }
+            binder::BR_FROZEN_REPLY => {
+                todo!("execute_command - BR_FROZEN_REPLY");
+            }
+            binder::BR_ONEWAY_SPAM_SUSPECT => {
+                todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
+            }
+            _ => {}
         }
 
         Ok(())
@@ -234,13 +369,13 @@ impl ThreadState {
 
         let need_read = self.in_parcel.is_empty();
         let out_avail = if !do_receive || need_read {
-            self.out_parcel.data_avail()
+            self.out_parcel.len()
         } else {
             0
         };
 
         let read_size = if do_receive && need_read {
-            self.in_parcel.as_mut_data().capacity()
+            self.in_parcel.capacity()
         } else {
             0
         };
@@ -248,10 +383,10 @@ impl ThreadState {
         let mut bwr = binder::binder_write_read {
             write_size: out_avail as _,
             write_consumed: 0,
-            write_buffer: self.out_parcel.as_mut_data().as_mut_ptr() as _,
+            write_buffer: self.out_parcel.as_mut_ptr() as _,
             read_size: read_size as _,
             read_consumed: 0,
-            read_buffer: self.in_parcel.as_mut_data().as_mut_ptr() as _,
+            read_buffer: self.in_parcel.as_mut_ptr() as _,
         };
 
         if bwr.write_size == 0 && bwr.read_size == 0 {
@@ -270,21 +405,21 @@ impl ThreadState {
                 }
 
             }
+        }
 
-            if bwr.write_consumed > 0 {
-                if bwr.write_consumed < self.out_parcel.data_avail() as _ {
-                    panic!("Driver did not consume write buffer. consumed: {} of {}",
-                        bwr.write_consumed, self.out_parcel.data_avail());
-                } else {
-                    self.out_parcel.as_mut_data().set_len(0);
-                    self.process_post_write_derefs();
-                }
+        if bwr.write_consumed > 0 {
+            if bwr.write_consumed < self.out_parcel.len() as _ {
+                panic!("Driver did not consume write buffer. consumed: {} of {}",
+                    bwr.write_consumed, self.out_parcel.len());
+            } else {
+                self.out_parcel.set_len(0);
+                self.process_post_write_derefs();
             }
+        }
 
-            if bwr.read_consumed > 0 {
-                self.in_parcel.as_mut_data().set_len(bwr.read_consumed as _);
-                self.in_parcel.set_data_position(0);
-            }
+        if bwr.read_consumed > 0 {
+            self.in_parcel.set_len(bwr.read_consumed as _);
+            self.in_parcel.set_data_position(0);
         }
 
         Ok(())
@@ -293,6 +428,144 @@ impl ThreadState {
     fn process_post_write_derefs(&mut self) {
 
     }
+
+    fn clear_propagate_work_source(&mut self) {
+        if let Some(mut state) = self.transaction {
+            state.propagate_work_source = false;
+        }
+    }
+
+    fn clear_calling_work_source(&mut self) {
+        self.set_calling_work_source_uid(UNSET_WORK_SOURCE as _);
+    }
+
+    fn set_calling_work_source_uid(&mut self, uid: binder::uid_t) -> i64 {
+        let token = self.set_calling_work_source_uid_without_propagation(uid);
+        if let Some(mut state) = self.transaction {
+            state.propagate_work_source = true;
+        }
+        token
+    }
+
+    fn set_calling_work_source_uid_without_propagation(&mut self, uid: binder::uid_t) -> i64 {
+        match self.transaction {
+            Some(mut state) => {
+                let propagated_bit = (state.propagate_work_source as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX;
+                let token = propagated_bit | (state.work_source as i64);
+                state.work_source = uid;
+
+                token
+            }
+            None => {
+                0
+            }
+        }
+    }
+
+    fn write_transaction_data(&mut self, cmd: i32, flags: u32, handle: u32, code: u32, data: &mut parcel::Writer) -> Result<()> {
+        let tr = sys::binder_transaction_data {
+            target: sys::binder_transaction_data__bindgen_ty_1 {
+                handle: handle,
+                // ptr: 0,
+            },
+            code: code,
+            flags: flags,
+            cookie: 0,
+            sender_pid: 0,
+            sender_euid: 0,
+            data_size: data.len() as _,
+            offsets_size: 0,
+            data: sys::binder_transaction_data__bindgen_ty_2 {
+                ptr: sys::binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
+                    buffer: data.as_mut_ptr() as _,
+                    offsets: 0,
+                },
+                // buf: ,  // [__u8; 8usize],
+            }
+        };
+
+        self.out_parcel.write_i32(cmd);
+        unsafe {
+            let ptr = &tr as *const sys::binder_transaction_data;
+            self.out_parcel.write(
+                std::slice::from_raw_parts(ptr as _, std::mem::size_of::<sys::binder_transaction_data>())
+            );
+        }
+
+        Ok(())
+    }
+
+    fn wait_for_response(&mut self, reply: &mut parcel::Writer) -> Result<()> {
+        loop {
+            self.talk_with_driver(true)?;
+            if self.in_parcel.is_empty() {
+                continue;
+            }
+
+            let cmd: u32 = self.in_parcel.read_i32()? as _;
+            match cmd {
+                binder::BR_ONEWAY_SPAM_SUSPECT => {
+                    todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
+                },
+                binder::BR_TRANSACTION_COMPLETE => (),
+                binder::BR_DEAD_REPLY => {
+                    todo!("wait_for_response - BR_DEAD_REPLY");
+                },
+                binder::BR_FAILED_REPLY => {
+                    todo!("wait_for_response - BR_FAILED_REPLY");
+                },
+                binder::BR_FROZEN_REPLY => {
+                    todo!("wait_for_response - BR_FROZEN_REPLY");
+                },
+                binder::BR_ACQUIRE_RESULT => {
+                    todo!("wait_for_response - BR_ACQUIRE_RESULT");
+                },
+                binder::BR_REPLY => {
+                    todo!("wait_for_response - BR_REPLY");
+                },
+                _ => self.execute_command(cmd as _)?,
+            };
+        }
+
+        Ok(())
+    }
+
+// status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
+//     int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
+// {
+//     binder_transaction_data tr;
+
+//     tr.target.ptr = 0; /* Don't pass uninitialized stack data to a remote process */
+//     tr.target.handle = handle;
+//     tr.code = code;
+//     tr.flags = binderFlags;
+//     tr.cookie = 0;
+//     tr.sender_pid = 0;
+//     tr.sender_euid = 0;
+
+//     const status_t err = data.errorCheck();
+//     if (err == NO_ERROR) {
+//         tr.data_size = data.ipcDataSize();
+//         tr.data.ptr.buffer = data.ipcData();
+//         tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
+//         tr.data.ptr.offsets = data.ipcObjects();
+//     } else if (statusBuffer) {
+//         tr.flags |= TF_STATUS_CODE;
+//         *statusBuffer = err;
+//         tr.data_size = sizeof(status_t);
+//         tr.data.ptr.buffer = reinterpret_cast<uintptr_t>(statusBuffer);
+//         tr.offsets_size = 0;
+//         tr.data.ptr.offsets = 0;
+//     } else {
+//         return (mLastError = err);
+//     }
+
+//     mOut.writeInt32(cmd);
+//     mOut.write(&tr, sizeof(tr));
+
+//     return NO_ERROR;
+// }
+
 }
 
 // status_t IPCThreadState::setupPolling(int* fd)
@@ -568,3 +841,105 @@ impl ThreadState {
 
 //     return result;
 // }
+
+
+// status_t IPCThreadState::waitForResponse(Parcel *reply, status_t *acquireResult)
+// {
+//     uint32_t cmd;
+//     int32_t err;
+
+//     while (1) {
+//         if ((err=talkWithDriver()) < NO_ERROR) break;
+//         err = mIn.errorCheck();
+//         if (err < NO_ERROR) break;
+//         if (mIn.dataAvail() == 0) continue;
+
+//         cmd = (uint32_t)mIn.readInt32();
+
+//         IF_LOG_COMMANDS() {
+//             alog << "Processing waitForResponse Command: "
+//                 << getReturnString(cmd) << endl;
+//         }
+
+//         switch (cmd) {
+//         case BR_ONEWAY_SPAM_SUSPECT:
+//             ALOGE("Process seems to be sending too many oneway calls.");
+//             CallStack::logStack("oneway spamming", CallStack::getCurrent().get(),
+//                     ANDROID_LOG_ERROR);
+//             [[fallthrough]];
+//         case BR_TRANSACTION_COMPLETE:
+//             if (!reply && !acquireResult) goto finish;
+//             break;
+
+//         case BR_DEAD_REPLY:
+//             err = DEAD_OBJECT;
+//             goto finish;
+
+//         case BR_FAILED_REPLY:
+//             err = FAILED_TRANSACTION;
+//             goto finish;
+
+//         case BR_FROZEN_REPLY:
+//             err = FAILED_TRANSACTION;
+//             goto finish;
+
+//         case BR_ACQUIRE_RESULT:
+//             {
+//                 ALOG_ASSERT(acquireResult != NULL, "Unexpected brACQUIRE_RESULT");
+//                 const int32_t result = mIn.readInt32();
+//                 if (!acquireResult) continue;
+//                 *acquireResult = result ? NO_ERROR : INVALID_OPERATION;
+//             }
+//             goto finish;
+
+//         case BR_REPLY:
+//             {
+//                 binder_transaction_data tr;
+//                 err = mIn.read(&tr, sizeof(tr));
+//                 ALOG_ASSERT(err == NO_ERROR, "Not enough command data for brREPLY");
+//                 if (err != NO_ERROR) goto finish;
+
+//                 if (reply) {
+//                     if ((tr.flags & TF_STATUS_CODE) == 0) {
+//                         reply->ipcSetDataReference(
+//                             reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+//                             tr.data_size,
+//                             reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+//                             tr.offsets_size/sizeof(binder_size_t),
+//                             freeBuffer);
+//                     } else {
+//                         err = *reinterpret_cast<const status_t*>(tr.data.ptr.buffer);
+//                         freeBuffer(nullptr,
+//                             reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+//                             tr.data_size,
+//                             reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+//                             tr.offsets_size/sizeof(binder_size_t));
+//                     }
+//                 } else {
+//                     freeBuffer(nullptr,
+//                         reinterpret_cast<const uint8_t*>(tr.data.ptr.buffer),
+//                         tr.data_size,
+//                         reinterpret_cast<const binder_size_t*>(tr.data.ptr.offsets),
+//                         tr.offsets_size/sizeof(binder_size_t));
+//                     continue;
+//                 }
+//             }
+//             goto finish;
+
+//         default:
+//             err = executeCommand(cmd);
+//             if (err != NO_ERROR) goto finish;
+//             break;
+//         }
+//     }
+
+// finish:
+//     if (err != NO_ERROR) {
+//         if (acquireResult) *acquireResult = err;
+//         if (reply) reply->setError(err);
+//         mLastError = err;
+//     }
+
+//     return err;
+// }
+
