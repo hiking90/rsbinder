@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use crate::binder::*;
-use crate::parcel;
+use crate::parcel::*;
 use crate::error::*;
 
 
@@ -53,7 +53,7 @@ impl<T: Remotable> Binder<T> {
         T::get_descriptor()
     }
 
-    pub fn transact(&self, code: TransactionCode, data: &mut parcel::Reader, reply: &mut parcel::Writer) -> Result<()> {
+    pub fn transact(&self, code: TransactionCode, data: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         data.set_data_position(0);
         match code {
             PING_TRANSACTION => (),

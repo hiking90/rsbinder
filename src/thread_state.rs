@@ -105,8 +105,8 @@ impl TransactionState {
 
 
 pub struct ThreadState {
-    in_parcel: parcel::Reader,
-    out_parcel: parcel::Writer,
+    in_parcel: Parcel,
+    out_parcel: Parcel,
     transaction: Option<TransactionState>,
     strict_mode_policy: i32,
 }
@@ -115,8 +115,8 @@ pub struct ThreadState {
 impl ThreadState {
     fn new() -> Self {
         ThreadState {
-            in_parcel: parcel::Reader::new(256),
-            out_parcel: parcel::Writer::new(256),
+            in_parcel: Parcel::new(),
+            out_parcel: Parcel::new(),
             transaction: None,
             strict_mode_policy: 0,
         }
@@ -131,7 +131,7 @@ impl ThreadState {
     }
 
     pub fn setup_polling(&mut self) -> Result<std::os::unix::io::RawFd> {
-        self.out_parcel.write_i32(binder::BC_ENTER_LOOPER as _);
+        self.out_parcel.as_writable().write::<u32>(&binder::BC_ENTER_LOOPER);
         self.flash_commands()?;
         Ok(ProcessState::as_self().read().unwrap().as_raw_fd())
     }
@@ -167,7 +167,7 @@ impl ThreadState {
         }
 
         self.in_parcel.dump();
-        let cmd = self.in_parcel.read_i32().unwrap_or(0);
+        let cmd = self.in_parcel.as_readable().read::<i32>().unwrap_or(0);
         self.execute_command(cmd)?;
 
         Ok(())
@@ -180,7 +180,7 @@ impl ThreadState {
 
         match cmd {
             binder::BR_ERROR => {
-                let other = self.in_parcel.read_i32()?;
+                let other = self.in_parcel.as_readable().read::<i32>()?;
                 return Err(Error::from(error::ErrorKind::Other(other)));
             }
             binder::BR_OK => {}
@@ -188,12 +188,10 @@ impl ThreadState {
             binder::BR_TRANSACTION_SEC_CTX |
             binder::BR_TRANSACTION => {
                 let tr_secctx = if cmd == binder::BR_TRANSACTION_SEC_CTX {
-                    let size = std::mem::size_of::<binder::binder_transaction_data_secctx>();
-                    self.in_parcel.read::<binder::binder_transaction_data_secctx>(size)?
+                    self.in_parcel.as_readable().read::<binder::binder_transaction_data_secctx>()?
                 } else {
-                    let size = std::mem::size_of::<binder::binder_transaction_data>();
                     binder::binder_transaction_data_secctx {
-                        transaction_data: self.in_parcel.read::<binder::binder_transaction_data>(size)?,
+                        transaction_data: self.in_parcel.as_readable().read::<binder::binder_transaction_data>()?,
                         secctx: 0,
                     }
                 };
@@ -201,7 +199,7 @@ impl ThreadState {
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
-                    parcel::Reader::from_ipc_data(tr.data.ptr.buffer as _, tr.data_size as _,
+                    Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
                         tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
                 };
 
@@ -216,7 +214,7 @@ impl ThreadState {
 
                 self.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
 
-                let mut reply = parcel::Writer::new(256);
+                let mut reply = Parcel::new();
 
                 unsafe {
                     let target_ptr = tr_secctx.transaction_data.target.ptr;
@@ -462,7 +460,7 @@ impl ThreadState {
         }
     }
 
-    fn write_transaction_data(&mut self, cmd: i32, flags: u32, handle: u32, code: u32, data: &mut parcel::Writer) -> Result<()> {
+    fn write_transaction_data(&mut self, cmd: i32, flags: u32, handle: u32, code: u32, data: &mut Parcel) -> Result<()> {
         let tr = sys::binder_transaction_data {
             target: sys::binder_transaction_data__bindgen_ty_1 {
                 handle: handle,
@@ -484,10 +482,11 @@ impl ThreadState {
             }
         };
 
-        self.out_parcel.write_i32(cmd);
+        let mut writer = self.out_parcel.as_writable();
+        writer.write::<i32>(&cmd);
         unsafe {
             let ptr = &tr as *const sys::binder_transaction_data;
-            self.out_parcel.write(
+            writer.write_byte_array(
                 std::slice::from_raw_parts(ptr as _, std::mem::size_of::<sys::binder_transaction_data>())
             );
         }
@@ -495,14 +494,14 @@ impl ThreadState {
         Ok(())
     }
 
-    fn wait_for_response(&mut self, reply: &mut parcel::Writer) -> Result<()> {
+    fn wait_for_response(&mut self, reply: &mut Parcel) -> Result<()> {
         loop {
             self.talk_with_driver(true)?;
             if self.in_parcel.is_empty() {
                 continue;
             }
 
-            let cmd: u32 = self.in_parcel.read_i32()? as _;
+            let cmd: u32 = self.in_parcel.as_readable().read::<i32>()? as _;
             match cmd {
                 binder::BR_ONEWAY_SPAM_SUSPECT => {
                     todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");

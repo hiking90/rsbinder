@@ -3,7 +3,7 @@ use std::fs::File;
 
 use crate::binder::*;
 use crate::error::*;
-use crate::parcel;
+use crate::parcel::*;
 
 pub trait ServiceManager {
     const TRANSACTION_getService: u32 = FIRST_CALL_TRANSACTION + 0;
@@ -33,8 +33,8 @@ impl BnServiceManager {
 }
 
 impl ServiceManager for BnServiceManager {
-    fn add_service(&self, name: &str, binder: Arc<Box<dyn IBinder>>) -> Result<()> {
-        Ok(())
+    fn get_service(&self, name: &str) -> Result<Arc<Box<dyn IBinder>>> {
+        todo!("ServiceManager::get_service()")
     }
 }
 
@@ -44,7 +44,7 @@ impl Remotable for BnServiceManager {
         "android.os.IServiceManager"
     }
 
-    fn on_transact(&self, code: TransactionCode, data: &mut parcel::Reader, reply: &mut parcel::Writer) -> Result<()> {
+    fn on_transact(&self, code: TransactionCode, data: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         match code {
             TRANSACTION_getService => {
                 todo!("TRANSACTION_getService");
@@ -85,7 +85,7 @@ impl Remotable for BnServiceManager {
             _ => {
                 return Err(Error::from(ErrorKind::Unknown));
             }
-        }
+        };
         Ok(())
     }
 

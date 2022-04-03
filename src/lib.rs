@@ -8,6 +8,7 @@ mod binder;
 pub mod parcel;
 mod binderfs;
 mod service_manager;
+mod parcelable;
 
 pub use process_state::ProcessState;
 pub use thread_state::{ThreadState, THREAD_STATE};
