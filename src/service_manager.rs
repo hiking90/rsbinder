@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::fs::File;
 
@@ -7,7 +8,7 @@ use crate::parcel::*;
 
 pub trait ServiceManager {
     const TRANSACTION_getService: u32 = FIRST_CALL_TRANSACTION + 0;
-    fn get_service(&self, name: &str) -> Result<Arc<Box<dyn IBinder>>>;
+    fn get_service(&self, name: &str) -> Option<Arc<Box<dyn IBinder + Send + Sync>>>;
 
     const TRANSACTION_checkService: u32 = FIRST_CALL_TRANSACTION + 1;
     const TRANSACTION_addService: u32 = FIRST_CALL_TRANSACTION + 2;
@@ -22,19 +23,32 @@ pub trait ServiceManager {
     const TRANSACTION_getServiceDebugInfo: u32 = FIRST_CALL_TRANSACTION + 11;
 }
 
+struct Service {
+    binder: Arc<Box<dyn IBinder + Sync + Send>>,
+    has_clients: bool,
+    guarantee_client: bool,
+}
+
 pub struct BnServiceManager {
+    name_to_service: HashMap<String, Service>,
 }
 
 impl BnServiceManager {
     pub fn new() -> Self {
         Self {
+            name_to_service: HashMap::new(),
         }
     }
 }
 
 impl ServiceManager for BnServiceManager {
-    fn get_service(&self, name: &str) -> Result<Arc<Box<dyn IBinder>>> {
-        todo!("ServiceManager::get_service()")
+    fn get_service(&self, name: &str) -> Option<Arc<Box<dyn IBinder + Send + Sync>>> {
+        match self.name_to_service.get(name) {
+            Some(service) => {
+                Some(service.binder.clone())
+            }
+            None => None,
+        }
     }
 }
 
@@ -47,6 +61,7 @@ impl Remotable for BnServiceManager {
     fn on_transact(&self, code: TransactionCode, data: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         match code {
             TRANSACTION_getService => {
+                // self.get_service();
                 todo!("TRANSACTION_getService");
             }
             TRANSACTION_checkService => {

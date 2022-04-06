@@ -2,7 +2,7 @@ use std::array::TryFromSliceError;
 use std::vec::Vec;
 use std::{mem, ptr};
 use std::default::Default;
-use crate::error::{Result, Error};
+use crate::error::{Result, Error, ErrorKind};
 use crate::sys::binder::{binder_size_t, flat_binder_object, BINDER_TYPE_FD};
 use crate::thread_state;
 use crate::binder;
@@ -123,27 +123,25 @@ impl Parcel {
 
     pub fn as_readable(&mut self) -> ReadableParcel<'_> {
         ReadableParcel {
-            parcel: self,
+            inner: self,
         }
     }
 
     pub fn as_writable(&mut self) -> WritableParcel<'_> {
         WritableParcel {
-            parcel: self,
+            inner: self,
         }
     }
 }
 
 pub struct ReadableParcel<'a> {
-    parcel: &'a mut Parcel,
+    inner: &'a mut Parcel,
 }
 
 impl<'a> ReadableParcel<'a> {
     /// Read a type that implements [`Deserialize`] from the sub-parcel.
     pub fn read<D: Deserialize>(&mut self) -> Result<D> {
-        let size = std::mem::size_of::<D>();
         let result = D::deserialize(self);
-        self.parcel.pos += size;
         result
     }
 
@@ -153,16 +151,24 @@ impl<'a> ReadableParcel<'a> {
     // }
 }
 
-impl<'a, const N: usize> TryFrom<&ReadableParcel<'a>> for [u8; N] {
-    type Error = TryFromSliceError;
+impl<'a, const N: usize> TryFrom<&mut ReadableParcel<'a>> for [u8; N] {
+    type Error = Error;
 
-    fn try_from(parcel: &ReadableParcel<'a>) -> std::result::Result<Self, Self::Error> {
-        <[u8; N] as TryFrom<&[u8]>>::try_from(&parcel.parcel.data[parcel.parcel.pos .. (parcel.parcel.pos + N)])
+    fn try_from(parcel: &mut ReadableParcel<'a>) -> std::result::Result<Self, Self::Error> {
+        let pos = parcel.inner.pos;
+        if let Some(data) = parcel.inner.data.get(pos .. (pos + N)) {
+            parcel.inner.pos += N;
+            <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
+                Error::from(e)
+            })
+        } else {
+            Err(Error::from(ErrorKind::BadIndex))
+        }
     }
 }
 
 pub struct WritableParcel<'a> {
-    parcel: &'a mut Parcel,
+    inner: &'a mut Parcel,
 }
 
 impl<'a> WritableParcel<'a> {
@@ -170,36 +176,43 @@ impl<'a> WritableParcel<'a> {
         parcelable.serialize(self)
     }
 
-    pub fn write_byte_array(&mut self, other: &[u8]) {
-        self.parcel.data.extend_from_slice(other)
+    pub fn write_data(&mut self, data: &[u8]) {
+        self.inner.data.extend_from_slice(data)
     }
 }
 
 
 #[cfg(test)]
 mod tests {
+    use crate::parcelable::String16;
     use crate::*;
 
     #[test]
     fn test_primitives() -> Result<()> {
         let v_i32:i32 = 1234;
-        let v_f32:f32 = 1234.0;
-        let v_u32:u32 = 1234;
-        let v_i64:i64 = 1234;
-        let v_u64:u64 = 1234;
-        let v_f64:f64 = 1234.0;
+        let v_f32:f32 = 5678.0;
+        let v_u32:u32 = 9012;
+        let v_i64:i64 = 3456;
+        let v_u64:u64 = 7890;
+        let v_f64:f64 = 9876.0;
+
+        let v_str: String16 = String16("Hello World".to_string());
 
         let mut parcel = Parcel::new();
 
         {
             let mut writer = parcel.as_writable();
-            writer.write::<i32>(&v_i32);
-            writer.write::<u32>(&v_u32);
-            writer.write::<f32>(&v_f32);
-            writer.write::<i64>(&v_i64);
-            writer.write::<u64>(&v_u64);
-            writer.write::<f64>(&v_f64);
+            writer.write::<i32>(&v_i32)?;
+            writer.write::<u32>(&v_u32)?;
+            writer.write::<f32>(&v_f32)?;
+            writer.write::<i64>(&v_i64)?;
+            writer.write::<u64>(&v_u64)?;
+            writer.write::<f64>(&v_f64)?;
+
+            writer.write(&v_str)?;
         }
+
+        parcel.set_data_position(0);
 
         {
             let mut reader = parcel.as_readable();
@@ -209,8 +222,14 @@ mod tests {
             assert_eq!(reader.read::<i64>()?, v_i64);
             assert_eq!(reader.read::<u64>()?, v_u64);
             assert_eq!(reader.read::<f64>()?, v_f64);
+            assert_eq!(reader.read::<String16>()?, v_str);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_errors() -> Result<()> {
         Ok(())
     }
 }

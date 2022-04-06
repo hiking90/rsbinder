@@ -181,7 +181,7 @@ impl ThreadState {
         match cmd {
             binder::BR_ERROR => {
                 let other = self.in_parcel.as_readable().read::<i32>()?;
-                return Err(Error::from(error::ErrorKind::Other(other)));
+                return Err(Error::from(other));
             }
             binder::BR_OK => {}
 
@@ -486,7 +486,7 @@ impl ThreadState {
         writer.write::<i32>(&cmd);
         unsafe {
             let ptr = &tr as *const sys::binder_transaction_data;
-            writer.write_byte_array(
+            writer.write_data(
                 std::slice::from_raw_parts(ptr as _, std::mem::size_of::<sys::binder_transaction_data>())
             );
         }

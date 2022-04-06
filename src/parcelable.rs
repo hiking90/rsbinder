@@ -14,12 +14,12 @@ pub trait Serialize {
 // Might be able to hook this up as a serde backend in the future?
 pub trait Deserialize: Sized {
     /// Deserialize an instance from the given [`Parcel`].
-    fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self>;
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self>;
 
     /// Deserialize an instance from the given [`Parcel`] onto the
     /// current object. This operation will overwrite the old value
     /// partially or completely, depending on how much data is available.
-    fn deserialize_from(&mut self, parcel: &ReadableParcel<'_>) -> Result<()> {
+    fn deserialize_from(&mut self, parcel: &mut ReadableParcel<'_>) -> Result<()> {
         *self = Self::deserialize(parcel)?;
         Ok(())
     }
@@ -135,7 +135,7 @@ macro_rules! impl_parcelable {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
-                parcel.write_byte_array(&self.to_ne_bytes());
+                parcel.write_data(&self.to_ne_bytes());
                 Ok(())
             }
         }
@@ -143,7 +143,7 @@ macro_rules! impl_parcelable {
 
     {Deserialize, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
                 Ok(<$ty>::from_ne_bytes(parcel.try_into()?))
             }
         }
@@ -165,7 +165,7 @@ macro_rules! impl_parcelable_ex {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
                 let val: $to_ty = *self as _;
-                parcel.write_byte_array(&val.to_ne_bytes());
+                parcel.write_data(&val.to_ne_bytes());
                 Ok(())
             }
         }
@@ -173,7 +173,7 @@ macro_rules! impl_parcelable_ex {
 
     {Deserialize, $to_ty:ty, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
                 Ok(<$to_ty>::from_ne_bytes(parcel.try_into()?) as _)
             }
         }
@@ -213,7 +213,7 @@ parcelable_primitives_ex! {
 }
 
 impl Deserialize for bool {
-    fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
         Ok(<i32>::from_ne_bytes(parcel.try_into()?) != 0)
     }
 }
@@ -221,7 +221,7 @@ impl Deserialize for bool {
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
         let val: i32 = *self as _;
-        parcel.write_byte_array(&val.to_ne_bytes());
+        parcel.write_data(&val.to_ne_bytes());
         Ok(())
     }
 }
@@ -242,7 +242,7 @@ macro_rules! impl_parcelable_struct {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
-                parcel.write_byte_array(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
+                parcel.write_data(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
                 Ok(())
             }
         }
@@ -250,7 +250,7 @@ macro_rules! impl_parcelable_struct {
 
     {Deserialize, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
                 Ok(unsafe { std::mem::transmute::<[u8; SIZE], $ty>(parcel.try_into()?) })
             }
@@ -264,6 +264,34 @@ parcelable_struct! {
 
     impl Serialize for binder_transaction_data;
     impl Deserialize for binder_transaction_data;
+}
+
+#[derive(PartialEq, Debug)]
+pub struct String16(pub String);
+
+impl Serialize for String16 {
+    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+        parcel.write::<i32>(&(self.0.len() as i32))?;
+
+        for ch16 in self.0.encode_utf16() {
+            parcel.write_data(&ch16.to_ne_bytes());
+        }
+        Ok(())
+    }
+}
+
+impl Deserialize for String16 {
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+        let len = parcel.read::<i32>()?;
+
+        let mut str16 = Vec::with_capacity(len as _);
+
+        for _ in 0..len {
+            str16.push(<u16>::from_ne_bytes(parcel.try_into()?));
+        }
+
+        Ok(String16(String::from_utf16(&str16)?))
+    }
 }
 
 // impl Deserialize for binder_transaction_data_secctx {
