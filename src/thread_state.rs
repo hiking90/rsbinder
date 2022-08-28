@@ -604,165 +604,160 @@ enum UntilResponse<'a> {
 }
 
 fn wait_for_response(until: &mut UntilResponse) -> Status<()> {
-    THREAD_STATE.with(|thread_state| thread_state.borrow().out_parcel.dump());
+    THREAD_STATE.with(|thread_state| -> Status<()> {
+        thread_state.borrow().out_parcel.dump();
 
-    loop {
-        talk_with_driver(true)?;
+        loop {
+            talk_with_driver(true)?;
 
-        if THREAD_STATE.with(|thread_state| thread_state.borrow().in_parcel.is_empty())  {
-            continue;
-        }
-
-        let cmd: u32 = THREAD_STATE.with(|thread_state| -> Result<i32>
-            { thread_state.borrow_mut().in_parcel.as_readable().read::<i32>() })? as _;
-        match cmd {
-            binder::BR_ONEWAY_SPAM_SUSPECT => {
-                todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
-            },
-            binder::BR_TRANSACTION_COMPLETE => {
-                if let UntilResponse::TransactionComplete = until {
-                    break
-                }
+            if thread_state.borrow().in_parcel.is_empty()  {
+                continue;
             }
-            binder::BR_DEAD_REPLY => {
-                todo!("wait_for_response - BR_DEAD_REPLY");
-            },
-            binder::BR_FAILED_REPLY => {
-                todo!("wait_for_response - BR_FAILED_REPLY");
-            },
-            binder::BR_FROZEN_REPLY => {
-                todo!("wait_for_response - BR_FROZEN_REPLY");
-            },
-            binder::BR_ACQUIRE_RESULT => {
-                todo!("wait_for_response - BR_ACQUIRE_RESULT");
-            },
-            binder::BR_REPLY => {
-                todo!("wait_for_response - BR_REPLY");
-            },
-            _ => execute_command(cmd as _)?,
-        };
-    }
-    Ok(())
-}
 
+            let cmd: u32 = thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()? as _;
+            match cmd {
+                binder::BR_ONEWAY_SPAM_SUSPECT => {
+                    todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
+                },
+                binder::BR_TRANSACTION_COMPLETE => {
+                    if let UntilResponse::TransactionComplete = until {
+                        break
+                    }
+                }
+                binder::BR_DEAD_REPLY => {
+                    todo!("wait_for_response - BR_DEAD_REPLY");
+                },
+                binder::BR_FAILED_REPLY => {
+                    todo!("wait_for_response - BR_FAILED_REPLY");
+                },
+                binder::BR_FROZEN_REPLY => {
+                    todo!("wait_for_response - BR_FROZEN_REPLY");
+                },
+                binder::BR_ACQUIRE_RESULT => {
+                    todo!("wait_for_response - BR_ACQUIRE_RESULT");
+                },
+                binder::BR_REPLY => {
+                    todo!("wait_for_response - BR_REPLY");
+                },
+                _ => execute_command(cmd as _)?,
+            };
+        };
+        Ok(())
+    })
+}
 
 fn execute_command(cmd: i32) -> Status<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
 
     println!("execute_command: {} {:?}", cmd, return_to_str(cmd));
 
-    match cmd {
-        binder::BR_ERROR => {
-            let other = THREAD_STATE.with(|thread_state| -> Result<i32> {
-                thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()
-            })?;
-            return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".into()));
-        }
-        binder::BR_OK => {}
+    THREAD_STATE.with(|thread_state| -> Status<()> {
+        match cmd {
+            binder::BR_ERROR => {
+                let other = thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()?;
+                return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".into()));
+            }
+            binder::BR_OK => {}
 
-        binder::BR_TRANSACTION_SEC_CTX |
-        binder::BR_TRANSACTION => {
-            let tr_secctx = THREAD_STATE.with(|thread_state| -> Result<binder::binder_transaction_data_secctx> {
-                let mut thread_state = thread_state.borrow_mut();
-                if cmd == binder::BR_TRANSACTION_SEC_CTX {
-                    thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data_secctx>()
-                } else {
-                    Ok(binder::binder_transaction_data_secctx {
-                        transaction_data: thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data>()?,
-                        secctx: 0,
-                    })
-                }
-            })?;
+            binder::BR_TRANSACTION_SEC_CTX |
+            binder::BR_TRANSACTION => {
+                let tr_secctx = {
+                    let mut thread_state = thread_state.borrow_mut();
+                    if cmd == binder::BR_TRANSACTION_SEC_CTX {
+                        thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data_secctx>()?
+                    } else {
+                        binder::binder_transaction_data_secctx {
+                            transaction_data: thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data>()?,
+                            secctx: 0,
+                        }
+                    }
+                };
 
+                let mut reader = unsafe {
+                    let tr = &tr_secctx.transaction_data;
 
-            let mut reader = unsafe {
-                let tr = &tr_secctx.transaction_data;
+                    ImmutableParcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
+                        tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
+                };
 
-                ImmutableParcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
-                    tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
-            };
+                // TODO: Skip now, because if below implmentation is mandatory.
+                // const void* origServingStackPointer = mServingStackPointer;
+                // mServingStackPointer = &origServingStackPointer; // anything on the stack
 
-            // TODO: Skip now, because if below implmentation is mandatory.
-            // const void* origServingStackPointer = mServingStackPointer;
-            // mServingStackPointer = &origServingStackPointer; // anything on the stack
+                let transaction_old = {
+                    let mut thread_state = thread_state.borrow_mut();
+                    let transaction_old = thread_state.transaction;
 
-            let transaction_old = THREAD_STATE.with(|thread_state| -> Option<TransactionState> {
-                let mut thread_state = thread_state.borrow_mut();
-                let transaction_old = thread_state.transaction;
+                    thread_state.clear_calling_work_source();
+                    thread_state.clear_propagate_work_source();
 
-                thread_state.clear_calling_work_source();
-                thread_state.clear_propagate_work_source();
+                    thread_state.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
 
-                thread_state.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
+                    transaction_old
+                };
 
-                transaction_old
-            });
+                let mut reply = Parcel::new();
 
-            let mut reply = Parcel::new();
+                unsafe {
+                    let target_ptr = tr_secctx.transaction_data.target.ptr;
+                    if target_ptr != 0 {
+                        todo!("need to call BBinder->transact()")
+                        // let weak_ref: *mut ref_base::WeakRef = target_ptr as _;
+                        // let mut ref_base = ref_base::RefBase::<ref_base::RemoteRef>::from_raw(target_ptr as _);
+                        // if ref_base.attempt_inc_strong() {
+                        //     todo!("need to call BBinder->transact()")
+                        // }
+                //     if (reinterpret_cast<RefBase::weakref_type*>(
+                //             tr.target.ptr)->attemptIncStrong(this)) {
+                //         error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
+                //                 &reply, tr.flags);
+                //         reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
+                //     } else {
+                //         error = UNKNOWN_TRANSACTION;
+                //     }
 
-            unsafe {
-                let target_ptr = tr_secctx.transaction_data.target.ptr;
-                if target_ptr != 0 {
-                    todo!("need to call BBinder->transact()")
-                    // let weak_ref: *mut ref_base::WeakRef = target_ptr as _;
-                    // let mut ref_base = ref_base::RefBase::<ref_base::RemoteRef>::from_raw(target_ptr as _);
-                    // if ref_base.attempt_inc_strong() {
-                    //     todo!("need to call BBinder->transact()")
-                    // }
-            //     if (reinterpret_cast<RefBase::weakref_type*>(
-            //             tr.target.ptr)->attemptIncStrong(this)) {
-            //         error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
-            //                 &reply, tr.flags);
-            //         reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
-            //     } else {
-            //         error = UNKNOWN_TRANSACTION;
-            //     }
-
-                } else {
-                    let context = ProcessState::as_self().read().unwrap().context_manager();
-                    if let Some(context) = context {
-                        reader.set_data_position(0);
-                        context.transact(tr_secctx.transaction_data.code, reader.as_readable(), &mut reply)?;
+                    } else {
+                        let context = ProcessState::as_self().read().unwrap().context_manager();
+                        if let Some(context) = context {
+                            reader.set_data_position(0);
+                            context.transact(tr_secctx.transaction_data.code, reader.as_readable(), &mut reply)?;
+                        }
                     }
                 }
+                let flags = tr_secctx.transaction_data.flags;
+                if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+                    let flags = flags & transaction_flags_TF_CLEAR_BUF;
+                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY as _, flags, u32::MAX, 0, &reply)?;
+                    reply.set_len(0);
+                    wait_for_response(&mut UntilResponse::TransactionComplete)?;
+                }
+
+                thread_state.borrow_mut().transaction = transaction_old;
             }
-            let flags = tr_secctx.transaction_data.flags;
-            if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-                let flags = flags & transaction_flags_TF_CLEAR_BUF;
-                THREAD_STATE.with(|thread_state| -> Result<()> {
-                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY as _, flags, u32::MAX, 0, &reply)
-                })?;
-                reply.set_len(0);
-                wait_for_response(&mut UntilResponse::TransactionComplete)?;
+
+            binder::BR_REPLY => {
+                todo!("execute_command - BR_REPLY");
             }
+            binder::BR_ACQUIRE_RESULT => {
+                todo!("execute_command - BR_ACQUIRE_RESULT");
+            }
+            binder::BR_DEAD_REPLY => {
+                todo!("execute_command - BR_DEAD_REPLY");
+            }
+            binder::BR_TRANSACTION_COMPLETE => {
+                todo!("execute_command - BR_TRANSACTION_COMPLETE");
+            }
+            binder::BR_INCREFS => {
+                todo!("execute_command - BR_INCREFS");
+        // refs = (RefBase::weakref_type*)mIn.readPointer();
+        // obj = (BBinder*)mIn.readPointer();
+        // refs->incWeak(mProcess.get());
+        // mOut.writeInt32(BC_INCREFS_DONE);
+        // mOut.writePointer((uintptr_t)refs);
+        // mOut.writePointer((uintptr_t)obj);
 
-            THREAD_STATE.with(|thread_state| thread_state.borrow_mut().transaction = transaction_old);
-        }
-
-        binder::BR_REPLY => {
-            todo!("execute_command - BR_REPLY");
-        }
-        binder::BR_ACQUIRE_RESULT => {
-            todo!("execute_command - BR_ACQUIRE_RESULT");
-        }
-        binder::BR_DEAD_REPLY => {
-            todo!("execute_command - BR_DEAD_REPLY");
-        }
-        binder::BR_TRANSACTION_COMPLETE => {
-            todo!("execute_command - BR_TRANSACTION_COMPLETE");
-        }
-        binder::BR_INCREFS => {
-            todo!("execute_command - BR_INCREFS");
-    // refs = (RefBase::weakref_type*)mIn.readPointer();
-    // obj = (BBinder*)mIn.readPointer();
-    // refs->incWeak(mProcess.get());
-    // mOut.writeInt32(BC_INCREFS_DONE);
-    // mOut.writePointer((uintptr_t)refs);
-    // mOut.writePointer((uintptr_t)obj);
-
-        }
-        binder::BR_ACQUIRE => {
-            THREAD_STATE.with(|thread_state| -> Result<()> {
+            }
+            binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
                 let raw_pointer = {
                     let mut readable = state.in_parcel.as_readable();
@@ -778,77 +773,75 @@ fn execute_command(cmd: i32) -> Status<()> {
                     writable.write::<i32>(&(binder::BC_ACQUIRE_DONE as i32))?;
                     writable.write::<*const dyn IBinder>(&Arc::into_raw(strong))?;
                 }
+            }
+            binder::BR_RELEASE => {
+                todo!("execute_command - BR_RELEASE");
+        // refs = (RefBase::weakref_type*)mIn.readPointer();
+        // obj = (BBinder*)mIn.readPointer();
+        // ALOG_ASSERT(refs->refBase() == obj,
+        //            "BR_RELEASE: object %p does not match cookie %p (expected %p)",
+        //            refs, obj, refs->refBase());
+        // IF_LOG_REMOTEREFS() {
+        //     LOG_REMOTEREFS("BR_RELEASE from driver on %p", obj);
+        //     obj->printRefs();
+        // }
+        // mPendingStrongDerefs.push(obj);
 
-                Ok(())
-            })?;
-        }
-        binder::BR_RELEASE => {
-            todo!("execute_command - BR_RELEASE");
-    // refs = (RefBase::weakref_type*)mIn.readPointer();
-    // obj = (BBinder*)mIn.readPointer();
-    // ALOG_ASSERT(refs->refBase() == obj,
-    //            "BR_RELEASE: object %p does not match cookie %p (expected %p)",
-    //            refs, obj, refs->refBase());
-    // IF_LOG_REMOTEREFS() {
-    //     LOG_REMOTEREFS("BR_RELEASE from driver on %p", obj);
-    //     obj->printRefs();
-    // }
-    // mPendingStrongDerefs.push(obj);
+            }
+            binder::BR_DECREFS => {
+                todo!("execute_command - BR_DECREFS");
+        // refs = (RefBase::weakref_type*)mIn.readPointer();
+        // obj = (BBinder*)mIn.readPointer();
+        // // NOTE: This assertion is not valid, because the object may no
+        // // longer exist (thus the (BBinder*)cast above resulting in a different
+        // // memory address).
+        // //ALOG_ASSERT(refs->refBase() == obj,
+        // //           "BR_DECREFS: object %p does not match cookie %p (expected %p)",
+        // //           refs, obj, refs->refBase());
+        // mPendingWeakDerefs.push(refs);
+            }
+            binder::BR_ATTEMPT_ACQUIRE => {
+                todo!("execute_command - BR_ATTEMPT_ACQUIRE");
+        // refs = (RefBase::weakref_type*)mIn.readPointer();
+        // obj = (BBinder*)mIn.readPointer();
 
-        }
-        binder::BR_DECREFS => {
-            todo!("execute_command - BR_DECREFS");
-    // refs = (RefBase::weakref_type*)mIn.readPointer();
-    // obj = (BBinder*)mIn.readPointer();
-    // // NOTE: This assertion is not valid, because the object may no
-    // // longer exist (thus the (BBinder*)cast above resulting in a different
-    // // memory address).
-    // //ALOG_ASSERT(refs->refBase() == obj,
-    // //           "BR_DECREFS: object %p does not match cookie %p (expected %p)",
-    // //           refs, obj, refs->refBase());
-    // mPendingWeakDerefs.push(refs);
-        }
-        binder::BR_ATTEMPT_ACQUIRE => {
-            todo!("execute_command - BR_ATTEMPT_ACQUIRE");
-    // refs = (RefBase::weakref_type*)mIn.readPointer();
-    // obj = (BBinder*)mIn.readPointer();
+        // {
+        //     const bool success = refs->attemptIncStrong(mProcess.get());
+        //     ALOG_ASSERT(success && refs->refBase() == obj,
+        //                "BR_ATTEMPT_ACQUIRE: object %p does not match cookie %p (expected %p)",
+        //                refs, obj, refs->refBase());
 
-    // {
-    //     const bool success = refs->attemptIncStrong(mProcess.get());
-    //     ALOG_ASSERT(success && refs->refBase() == obj,
-    //                "BR_ATTEMPT_ACQUIRE: object %p does not match cookie %p (expected %p)",
-    //                refs, obj, refs->refBase());
+        //     mOut.writeInt32(BC_ACQUIRE_RESULT);
+        //     mOut.writeInt32((int32_t)success);
+        // }
+            }
+            binder::BR_NOOP => {}
+            binder::BR_SPAWN_LOOPER => {
+                todo!("execute_command - BR_SPAWN_LOOPER");
+            }
+            binder::BR_FINISHED => {
+                todo!("execute_command - BR_FINISHED");
+            }
+            binder::BR_DEAD_BINDER => {
+                todo!("Bexecute_command - R_DEAD_BINDER");
+            }
+            binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
+                todo!("execute_command - BR_CLEAR_DEATH_NOTIFICATION_DONE");
+            }
+            binder::BR_FAILED_REPLY => {
+                todo!("execute_command - BR_FAILED_REPLY");
+            }
+            binder::BR_FROZEN_REPLY => {
+                todo!("execute_command - BR_FROZEN_REPLY");
+            }
+            binder::BR_ONEWAY_SPAM_SUSPECT => {
+                todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
+            }
+            _ => {}
+        };
 
-    //     mOut.writeInt32(BC_ACQUIRE_RESULT);
-    //     mOut.writeInt32((int32_t)success);
-    // }
-        }
-        binder::BR_NOOP => {}
-        binder::BR_SPAWN_LOOPER => {
-            todo!("execute_command - BR_SPAWN_LOOPER");
-        }
-        binder::BR_FINISHED => {
-            todo!("execute_command - BR_FINISHED");
-        }
-        binder::BR_DEAD_BINDER => {
-            todo!("Bexecute_command - R_DEAD_BINDER");
-        }
-        binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
-            todo!("execute_command - BR_CLEAR_DEATH_NOTIFICATION_DONE");
-        }
-        binder::BR_FAILED_REPLY => {
-            todo!("execute_command - BR_FAILED_REPLY");
-        }
-        binder::BR_FROZEN_REPLY => {
-            todo!("execute_command - BR_FROZEN_REPLY");
-        }
-        binder::BR_ONEWAY_SPAM_SUSPECT => {
-            todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
-        }
-        _ => {}
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 
@@ -857,69 +850,71 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
         return Err(Error::from(ErrorKind::BadFd));
     }
 
-    let mut bwr = THREAD_STATE.with(|thread_state| -> binder::binder_write_read {
-        let mut thread_state = thread_state.borrow_mut();
-        let need_read = thread_state.in_parcel.is_empty();
-        let out_avail = if !do_receive || need_read {
-            thread_state.out_parcel.len()
-        } else {
-            0
-        };
-
-        let read_size = if do_receive && need_read {
-            thread_state.in_parcel.capacity()
-        } else {
-            0
-        };
-
-        binder::binder_write_read {
-            write_size: out_avail as _,
-            write_consumed: 0,
-            write_buffer: thread_state.out_parcel.as_mut_ptr() as _,
-            read_size: read_size as _,
-            read_consumed: 0,
-            read_buffer: thread_state.in_parcel.as_mut_ptr() as _,
-        }
-    });
-
-    if bwr.write_size == 0 && bwr.read_size == 0 {
-        return Ok(())
-    }
-
-    unsafe {
-        loop {
-            let res = binder::write_read(ProcessState::as_self().read().unwrap().as_raw_fd(), &mut bwr);
-            match res {
-                Ok(_) => break,
-                Err(errno) if errno != nix::errno::Errno::EINTR => {
-                    return Err(Error::from(errno));
-                },
-                _ => {}
-            }
-
-        }
-    }
-
-    THREAD_STATE.with(|thread_state| {
-        let mut thread_state = thread_state.borrow_mut();
-
-        if bwr.write_consumed > 0 {
-            if bwr.write_consumed < thread_state.out_parcel.len() as _ {
-                panic!("Driver did not consume write buffer. consumed: {} of {}",
-                    bwr.write_consumed, thread_state.out_parcel.len());
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let mut bwr = {
+            let mut thread_state = thread_state.borrow_mut();
+            let need_read = thread_state.in_parcel.is_empty();
+            let out_avail = if !do_receive || need_read {
+                thread_state.out_parcel.len()
             } else {
-                thread_state.out_parcel.set_len(0);
-                thread_state.process_post_write_derefs();
+                0
+            };
+
+            let read_size = if do_receive && need_read {
+                thread_state.in_parcel.capacity()
+            } else {
+                0
+            };
+
+            binder::binder_write_read {
+                write_size: out_avail as _,
+                write_consumed: 0,
+                write_buffer: thread_state.out_parcel.as_mut_ptr() as _,
+                read_size: read_size as _,
+                read_consumed: 0,
+                read_buffer: thread_state.in_parcel.as_mut_ptr() as _,
+            }
+        };
+
+        if bwr.write_size == 0 && bwr.read_size == 0 {
+            return Ok(())
+        }
+
+        unsafe {
+            loop {
+                let res = binder::write_read(ProcessState::as_self().read().unwrap().as_raw_fd(), &mut bwr);
+                match res {
+                    Ok(_) => break,
+                    Err(errno) if errno != nix::errno::Errno::EINTR => {
+                        return Err(Error::from(errno));
+                    },
+                    _ => {}
+                }
+
             }
         }
 
-        if bwr.read_consumed > 0 {
-            thread_state.in_parcel.set_len(bwr.read_consumed as _);
-            thread_state.in_parcel.set_data_position(0);
-        }
-    });
+        {
+            let mut thread_state = thread_state.borrow_mut();
 
-    Ok(())
+            if bwr.write_consumed > 0 {
+                if bwr.write_consumed < thread_state.out_parcel.len() as _ {
+                    panic!("Driver did not consume write buffer. consumed: {} of {}",
+                        bwr.write_consumed, thread_state.out_parcel.len());
+                } else {
+                    thread_state.out_parcel.set_len(0);
+                    thread_state.process_post_write_derefs();
+                }
+            }
+
+            if bwr.read_consumed > 0 {
+                thread_state.in_parcel.set_len(bwr.read_consumed as _);
+                thread_state.in_parcel.set_data_position(0);
+            }
+        };
+
+        Ok(())
+    })
 }
 
 fn get_and_execute_command() -> Status<()> {
@@ -936,53 +931,54 @@ fn get_and_execute_command() -> Status<()> {
 fn flash_commands() -> Result<()> {
     talk_with_driver(false)?;
 
-    let out_len = THREAD_STATE.with(|thread_state| -> usize { thread_state.borrow().out_parcel.len() });
-    if out_len > 0 {
-        talk_with_driver(false)?;
-    }
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let out_len = thread_state.borrow().out_parcel.len();
+        if out_len > 0 {
+            talk_with_driver(false)?;
+        }
 
-    let out_len = THREAD_STATE.with(|thread_state| -> usize { thread_state.borrow().out_parcel.len() });
-    if out_len > 0 {
-        log::warn!("self.out_parcel.len() > 0 after flash_commands()");
-    }
+        let out_len = thread_state.borrow().out_parcel.len();
+        if out_len > 0 {
+            log::warn!("self.out_parcel.len() > 0 after flash_commands()");
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 
 pub fn inc_strong_handle(handle: u32, proxy: Arc<dyn IBinder>) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        let mut state = thread_state.borrow_mut();
-        let mut writable = state.out_parcel.as_writable();
+        {
+            let mut state = thread_state.borrow_mut();
+            let mut writable = state.out_parcel.as_writable();
 
-        writable.write::<i32>(&(binder::BC_ACQUIRE as i32))?;
-        writable.write::<i32>(&(handle as i32))?;
+            writable.write::<i32>(&(binder::BC_ACQUIRE as i32))?;
+            writable.write::<i32>(&(handle as i32))?;
+        }
+
+        if flash_if_needed()? == false {
+            thread_state.borrow_mut().post_strong_derefs.push(proxy.clone());
+        }
+
         Ok(())
-    })?;
-
-    if flash_if_needed()? == false {
-        THREAD_STATE.with(|thread_state| {
-            thread_state.borrow_mut().post_strong_derefs.push(proxy.clone())
-        });
-    }
-
-    Ok(())
+    })
 }
 
 pub fn dec_strong_handle(handle: u32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        let mut state = thread_state.borrow_mut();
-        let mut writable = state.out_parcel.as_writable();
+        {
+            let mut state = thread_state.borrow_mut();
+            let mut writable = state.out_parcel.as_writable();
 
-        writable.write::<i32>(&(binder::BC_RELEASE as i32))?;
-        writable.write::<i32>(&(handle as i32))?;
+            writable.write::<i32>(&(binder::BC_RELEASE as i32))?;
+            writable.write::<i32>(&(handle as i32))?;
+        }
+
+        flash_if_needed()?;
 
         Ok(())
-    })?;
-
-    flash_if_needed()?;
-
-    Ok(())
+    })
 }
 
 
@@ -1008,16 +1004,21 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
 
 
 pub fn flash_if_needed() -> Result<bool> {
-    if THREAD_STATE.with(|thread_state| -> bool {
-        thread_state.borrow().is_looper || thread_state.borrow().is_flushing }) == true {
-        return Ok(false);
-    }
+    THREAD_STATE.with(|thread_state| -> Result<bool> {
+        {
+            let thread_state = thread_state.borrow();
+            if thread_state.is_looper || thread_state.is_flushing {
+                return Ok(false);
+            }
+        }
 
-    THREAD_STATE.with(|thread_state| thread_state.borrow_mut().is_flushing = true);
-    flash_commands()?;
-    THREAD_STATE.with(|thread_state| thread_state.borrow_mut().is_flushing = false);
+        thread_state.borrow_mut().is_flushing = true;
+        flash_commands()?;
+        thread_state.borrow_mut().is_flushing = false;
 
-    Ok(true)
+        Ok(true)
+
+    })
 }
 
 pub fn handle_commands() -> Status<()> {
