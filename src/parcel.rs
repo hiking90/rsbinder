@@ -2,6 +2,10 @@ use std::array::TryFromSliceError;
 use std::vec::Vec;
 use std::{mem, ptr};
 use std::default::Default;
+use std::ops::Range;
+
+use pretty_hex::*;
+
 use crate::error::{Result, Error, ErrorKind};
 use crate::sys::binder::{binder_size_t, flat_binder_object, BINDER_TYPE_FD};
 use crate::thread_state;
@@ -10,12 +14,102 @@ use crate::parcelable::*;
 
 const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
+// enum ParcelData {
+//     Slice {
+//         data: &'static [u8],
+//         objects: &'static [binder_size_t],
+//     },
+
+//     Vec {
+//         data: Vec<u8>,
+//         objects: Vec<binder_size_t>,
+//     }
+// }
+
+pub struct ImmutableParcel {
+    data: &'static [u8],
+    objects: &'static [binder_size_t],
+    pos: usize,
+    next_object_hint: usize,
+    request_header_present: bool,
+    work_source_request_header_pos: usize,
+}
+
+impl ImmutableParcel {
+    pub fn from_ipc_parts(data: *mut u8, length: usize,
+            objects: *mut binder_size_t, object_count: usize) -> mem::ManuallyDrop<Self> {
+        mem::ManuallyDrop::new(
+            ImmutableParcel {
+                data: unsafe { std::slice::from_raw_parts(data, length) },
+                objects: unsafe { std::slice::from_raw_parts(objects, object_count) },
+                pos: 0,
+                next_object_hint: 0,
+                request_header_present: false,
+                work_source_request_header_pos: 0,
+            }
+        )
+    }
+
+    pub fn as_readable(&mut self) -> ReadableParcel<'_> {
+        ReadableParcel {
+            data: self.data,
+            objects: self.objects,
+            pos: &mut self.pos,
+            next_object_hint: &mut self.next_object_hint,
+            request_header_present: &mut self.request_header_present,
+            work_source_request_header_pos: &mut self.work_source_request_header_pos,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        let result = self.data.len() - self.pos;
+        assert!(result < i32::MAX as _, "data too big: {}", result);
+
+        result
+    }
+
+    pub fn set_data_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+}
+
+impl Readable for ImmutableParcel {
+    fn data_position(&self) -> usize {
+        self.pos
+    }
+
+    fn read(&mut self, len: usize) -> Result<&[u8]> {
+        let pos = self.data_position();
+
+        if len <= self.len() {
+            self.set_data_position(pos + len);
+            Ok(&self.data[pos .. pos + len])
+        } else {
+            Err(Error::from(ErrorKind::NotEnoughData))
+        }
+    }
+
+    fn objects(&self) -> &[binder_size_t] {
+        &self.objects
+    }
+
+    fn next_object_hint(&mut self) -> &mut usize {
+        &mut self.next_object_hint
+    }
+
+    fn update_work_source_request_header_pos(&mut self) {
+        if self.request_header_present == false {
+            self.work_source_request_header_pos = self.data.len();
+            self.request_header_present = true;
+        }
+    }
+}
 
 pub struct Parcel {
     data: Vec<u8>,
+    objects: Vec<binder_size_t>,
     pos: usize,
-    objects: *mut binder_size_t,
-    object_count: usize,
+    next_object_hint: usize,
     request_header_present: bool,
     work_source_request_header_pos: usize,
 }
@@ -28,35 +122,38 @@ impl Parcel {
     pub fn with_capacity(capacity: usize) -> Self {
         Parcel {
             data: Vec::with_capacity(capacity),
+            objects: Vec::new(),
             pos: 0,
-            objects: ptr::null_mut(),
-            object_count: 0,
+            next_object_hint: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
         }
     }
 
-
-    pub fn from_ipc_parts(data: *mut u8, length: usize,
-            objects: *mut binder_size_t, object_count: usize) -> mem::ManuallyDrop<Self> {
-        mem::ManuallyDrop::new(
-            Parcel {
-                data: unsafe { Vec::from_raw_parts(data, length, length) },
-                pos: 0,
-                objects: objects,
-                object_count: object_count,
-                request_header_present: false,
-                work_source_request_header_pos: 0,
-            }
-        )
-    }
+    // pub fn from_ipc_parts(data: *mut u8, length: usize,
+    //         objects: *mut binder_size_t, object_count: usize) -> mem::ManuallyDrop<Self> {
+    //     mem::ManuallyDrop::new(
+    //         Parcel {
+    //             data: ParcelData::Slice {
+    //                 data: unsafe { std::slice::from_raw_parts(data, length) },
+    //                 objects: unsafe { std::slice::from_raw_parts(objects, object_count) },
+    //             },
+    //             pos: 0,
+    //             next_object_hint: 0,
+    //             request_header_present: false,
+    //             work_source_request_header_pos: 0,
+    //         }
+    //     )
+    // }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
         Parcel {
             data: data,
+            objects: Vec::new(),
             pos: 0,
-            objects: ptr::null_mut(),
-            object_count: 0,
+            next_object_hint: 0,
+            // objects: ptr::null_mut(),
+            // object_count: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
         }
@@ -78,13 +175,6 @@ impl Parcel {
         self.data.capacity()
     }
 
-    pub fn len(&self) -> usize {
-        let result = self.data.len() - self.pos;
-        assert!(result < i32::MAX as _, "data too big: {}", result);
-
-        result
-    }
-
     pub fn is_empty(&self) -> bool {
         self.pos >= self.data.len()
     }
@@ -93,23 +183,10 @@ impl Parcel {
         unsafe { self.data.set_len(new_len); }
     }
 
-    fn update_work_source_request_header_pos(&mut self) {
-        if self.request_header_present == false {
-            self.work_source_request_header_pos = self.data.len();
-            self.request_header_present = true;
-        }
-    }
-
-    pub fn set_data_position(&mut self, pos: usize) {
-        self.pos = pos;
-    }
-
     pub fn close_file_descriptors(&self) {
-        for i in 0..self.object_count {
+        for offset in &self.objects {
             unsafe {
-                let offset = self.objects.add(i);
                 let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
-
                 if (*flat).hdr.type_ == BINDER_TYPE_FD {
                     libc::close((*flat).__bindgen_anon_1.handle as _);
                 }
@@ -118,12 +195,18 @@ impl Parcel {
     }
 
     pub fn dump(&self) {
-        println!("Parcel: pos {}, len {}, {:?}", self.pos, self.data.len(), self.data);
+        println!("Parcel: pos {}, len {}", self.pos, self.data.len());
+        println!("{}", pretty_hex(&self.data));
     }
 
     pub fn as_readable(&mut self) -> ReadableParcel<'_> {
         ReadableParcel {
-            inner: self,
+            data: & self.data,
+            objects: &self.objects,
+            pos: &mut self.pos,
+            next_object_hint: &mut self.next_object_hint,
+            request_header_present: &mut self.request_header_present,
+            work_source_request_header_pos: &mut self.work_source_request_header_pos,
         }
     }
 
@@ -132,10 +215,43 @@ impl Parcel {
             inner: self,
         }
     }
+
+    pub fn set_data_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    pub fn len(&self) -> usize {
+        let result = self.data.len() - self.pos;
+        assert!(result < i32::MAX as _, "data too big: {}", result);
+
+        result
+    }
+}
+
+
+#[inline]
+fn pad_size(len: usize) -> usize {
+    (len+3) & (!3)
+}
+
+pub trait Readable {
+    fn data_position(&self) -> usize;
+
+    fn read(&mut self, len: usize) -> Result<&[u8]>;
+
+    fn objects(&self) -> &[binder_size_t];
+    fn next_object_hint(&mut self) -> &mut usize;
+
+    fn update_work_source_request_header_pos(&mut self);
 }
 
 pub struct ReadableParcel<'a> {
-    inner: &'a mut Parcel,
+    data: &'a [u8],
+    objects: &'a [binder_size_t],
+    pos: &'a mut usize,
+    next_object_hint: &'a mut usize,
+    request_header_present: &'a mut bool,
+    work_source_request_header_pos: &'a mut usize,
 }
 
 impl<'a> ReadableParcel<'a> {
@@ -145,27 +261,97 @@ impl<'a> ReadableParcel<'a> {
         result
     }
 
-    // /// Check if the sub-parcel has more data to read
-    // pub fn has_more_data(&self) -> bool {
-    //     self.parcel.get_data_position() < self.end_position
-    // }
+    fn len(&self) -> usize {
+        let result = self.data.len() - *self.pos;
+        assert!(result < i32::MAX as _, "data too big: {}", result);
+
+        result
+    }
+
+    pub(crate) fn read_data(&mut self, len: usize) -> Result<&[u8]> {
+        let len = pad_size(len);
+        let pos = *self.pos;
+
+        if len <= self.len() {
+            *self.pos = pos + len;
+            Ok(&self.data[pos .. pos + len])
+        } else {
+            Err(Error::from(ErrorKind::NotEnoughData))
+        }
+    }
+
+    pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
+        let data_pos = *self.pos as u64;
+        let size = std::mem::size_of::<flat_binder_object>();
+        let obj = unsafe { *(self.read_data(size)?.as_ptr() as *const flat_binder_object) };
+
+        unsafe {
+            if null_meta == false && obj.cookie == 0 && obj.__bindgen_anon_1.binder == 0 {
+                return Ok(obj);
+            }
+        }
+
+        let objects = self.objects;
+        let count = objects.len();
+        let mut opos = *self.next_object_hint;
+
+        if count > 0 {
+            if opos < count {
+                while opos < (count - 1) && objects[opos] < data_pos {
+                    opos += 1;
+                }
+            } else {
+                opos = count - 1;
+            }
+
+            if objects[opos] == data_pos {
+                *self.next_object_hint = opos + 1;
+                return Ok(obj);
+            }
+
+            while opos > 0 && objects[opos] > data_pos {
+                opos -= 1;
+            }
+
+            if objects[opos] == data_pos {
+                *self.next_object_hint = opos + 1;
+                return Ok(obj);
+            }
+        }
+
+        Err(Error::from(ErrorKind::BadType))
+    }
+
+    pub(crate) fn update_work_source_request_header_pos(&mut self) {
+        if *self.request_header_present == false {
+            *self.work_source_request_header_pos = self.data.len();
+            *self.request_header_present = true;
+        }
+    }
 }
 
 impl<'a, const N: usize> TryFrom<&mut ReadableParcel<'a>> for [u8; N] {
     type Error = Error;
 
     fn try_from(parcel: &mut ReadableParcel<'a>) -> std::result::Result<Self, Self::Error> {
-        let pos = parcel.inner.pos;
-        if let Some(data) = parcel.inner.data.get(pos .. (pos + N)) {
-            parcel.inner.pos += N;
-            <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
-                Error::from(e)
-            })
-        } else {
-            Err(Error::from(ErrorKind::BadIndex))
-        }
+        let data = parcel.read_data(N)?;
+        <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
+            Error::from(e)
+        })
+        // let pos = parcel.inner.pos;
+        // if let Some(data) = parcel.inner.data.get(pos .. (pos + N)) {
+        //     parcel.inner.pos += N;
+        //     <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
+        //         Error::from(e)
+        //     })
+        // } else {
+        //     Err(Error::from(ErrorKind::BadIndex))
+        // }
     }
 }
+
+// fn acquire_object(obj: &flat_binder_object, )
+
 
 pub struct WritableParcel<'a> {
     inner: &'a mut Parcel,
@@ -179,11 +365,72 @@ impl<'a> WritableParcel<'a> {
     pub fn write_data(&mut self, data: &[u8]) {
         self.inner.data.extend_from_slice(data)
     }
+
+    pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
+        const SIZE: usize = std::mem::size_of::<flat_binder_object>();
+        let data = unsafe {std::mem::transmute::<&flat_binder_object, &[u8; SIZE]>(obj)};
+        let data_pos = self.inner.pos;
+        self.write_data(data);
+
+        if null_meta == true || unsafe { obj.__bindgen_anon_1.binder } != 0 {
+            self.inner.objects.push(data_pos as _);
+        }
+
+        Ok(())
+    }
 }
+
+
+// status_t Parcel::writeObject(const flat_binder_object& val, bool nullMetaData)
+// {
+//     const bool enoughData = (mDataPos+sizeof(val)) <= mDataCapacity;
+//     const bool enoughObjects = mObjectsSize < mObjectsCapacity;
+//     if (enoughData && enoughObjects) {
+// restart_write:
+//         *reinterpret_cast<flat_binder_object*>(mData+mDataPos) = val;
+
+//         // remember if it's a file descriptor
+//         if (val.hdr.type == BINDER_TYPE_FD) {
+//             if (!mAllowFds) {
+//                 // fail before modifying our object index
+//                 return FDS_NOT_ALLOWED;
+//             }
+//             mHasFds = mFdsKnown = true;
+//         }
+
+//         // Need to write meta-data?
+//         if (nullMetaData || val.binder != 0) {
+//             mObjects[mObjectsSize] = mDataPos;
+//             acquire_object(ProcessState::self(), val, this, &mOpenAshmemSize);
+//             mObjectsSize++;
+//         }
+
+//         return finishWrite(sizeof(flat_binder_object));
+//     }
+
+//     if (!enoughData) {
+//         const status_t err = growData(sizeof(val));
+//         if (err != NO_ERROR) return err;
+//     }
+//     if (!enoughObjects) {
+//         if (mObjectsSize > SIZE_MAX - 2) return NO_MEMORY; // overflow
+//         if ((mObjectsSize + 2) > SIZE_MAX / 3) return NO_MEMORY; // overflow
+//         size_t newSize = ((mObjectsSize+2)*3)/2;
+//         if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
+//         binder_size_t* objects = (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
+//         if (objects == nullptr) return NO_MEMORY;
+//         mObjects = objects;
+//         mObjectsCapacity = newSize;
+//     }
+
+//     goto restart_write;
+// }
 
 
 #[cfg(test)]
 mod tests {
+    use crate::parcel::Readable;
+    use std::sync::Arc;
     use crate::parcelable::String16;
     use crate::*;
 
@@ -223,6 +470,32 @@ mod tests {
             assert_eq!(reader.read::<u64>()?, v_u64);
             assert_eq!(reader.read::<f64>()?, v_f64);
             assert_eq!(reader.read::<String16>()?, v_str);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dyn_ibinder() -> Result<()> {
+        let proxy: Arc<dyn IBinder> = Arc::new(proxy::Proxy::new(0, Unknown {}));
+        let raw = Arc::into_raw(proxy.clone());
+
+        let mut parcel = Parcel::new();
+
+        {
+            let mut writer = parcel.as_writable();
+            writer.write(&raw)?;
+        }
+        parcel.set_data_position(0);
+
+        let cloned = proxy.clone();
+        {
+            let mut reader = parcel.as_readable();
+
+            let restored = reader.read::<*const dyn IBinder>()?;
+
+            assert_eq!(raw, restored);
+            assert_eq!(Arc::strong_count(&cloned), Arc::strong_count(&unsafe {Arc::from_raw(restored)}));
         }
 
         Ok(())

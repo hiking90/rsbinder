@@ -1,8 +1,8 @@
+use std::any::Any;
 use std::sync::Arc;
 use crate::binder::*;
 use crate::parcel::*;
 use crate::error::*;
-
 
 pub struct Binder<T: Remotable + ?Sized> {
     remotable: T,
@@ -49,12 +49,12 @@ impl<T: Remotable> Binder<T> {
 
     /// Retrieve the interface descriptor string for this object's Binder
     /// interface.
-    pub fn get_descriptor() -> &'static str {
+    pub fn get_descriptor(&self) -> &'static str {
         T::get_descriptor()
     }
 
-    pub fn transact(&self, code: TransactionCode, data: &mut Parcel, reply: &mut Parcel) -> Result<()> {
-        data.set_data_position(0);
+    pub fn transact(&self, code: TransactionCode, reader: ReadableParcel<'_>, reply: &mut Parcel) -> Status<()> {
+        // data.set_data_position(0);
         match code {
             PING_TRANSACTION => (),
             EXTENSION_TRANSACTION => {
@@ -69,7 +69,7 @@ impl<T: Remotable> Binder<T> {
             }
 
             _ => {
-                self.remotable.on_transact(code, data, reply)?;
+                self.remotable.on_transact(code, reader, reply)?;
             }
         };
 
@@ -77,33 +77,41 @@ impl<T: Remotable> Binder<T> {
     }
 }
 
-impl<T: Remotable> Interface for Binder<T> {
-    /// Converts the local remotable object into a generic `SpIBinder`
-    /// reference.
-    ///
-    /// The resulting `SpIBinder` will hold its own strong reference to this
-    /// remotable object, which will prevent the object from being dropped while
-    /// the `SpIBinder` is alive.
-    fn as_binder(&self) -> &dyn IBinder {
-        self
-    }
+impl<T: 'static + Remotable> Interface for Binder<T> {
+    // /// Converts the local remotable object into a generic `SpIBinder`
+    // /// reference.
+    // ///
+    // /// The resulting `SpIBinder` will hold its own strong reference to this
+    // /// remotable object, which will prevent the object from being dropped while
+    // /// the `SpIBinder` is alive.
+    // fn as_any(&self) -> &dyn Any {
+    //     self
+    // }
 }
 
-impl<T: Remotable> IBinder for Binder<T> {
-    fn link_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()> {
+impl<T: 'static +  Remotable> IBinder for Binder<T> {
+    fn link_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("link_to_death")
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()> {
+    fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("unlink_to_death")
     }
 
     /// Send a ping transaction to this object
     fn ping_binder(&mut self) -> Result<()> {
         todo!("ping_binder");
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_remote(&self) -> bool {
+        false
     }
 }
 
@@ -132,6 +140,24 @@ impl<T: Remotable> InterfaceClassMethods for Binder<T> {
         Ok(())
     }
 }
+
+// impl<B: Remotable> TryFrom<Object> for Arc<Box<Binder<B>>> {
+//     type Error = Error;
+
+//     fn try_from(mut object: Object) -> Result<Self> {
+//         match object {
+//             Object::Binder { binder, stability } => {
+//                 let binder: Self = unsafe { Arc::from_raw(binder as *const Box<Binder<B>>) };
+//                 if binder.get_descriptor() == B::get_descriptor() {
+
+//                 }
+//             },
+//             Object::Handle { .. } => {
+//                 Err(Error::from(ErrorKind::BadType))
+//             }
+//         }
+//     }
+// }
 
 
 // // This implementation is an idiomatic implementation of the C++

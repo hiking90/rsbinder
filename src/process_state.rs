@@ -1,13 +1,20 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use std::path::Path;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
 use std::sync::{RwLock, Once};
 use log;
 
-use crate::sys::binder;
-use crate::binder::*;
-use crate::{native, service_manager::BnServiceManager};
+use crate::{
+    error::*,
+    binder::*,
+    sys::binder,
+    proxy::*,
+    thread_state,
+    native,
+    service_manager::BnServiceManager
+};
 
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
@@ -19,7 +26,9 @@ pub struct ProcessState {
     driver: RawFd,
     vm_start: *mut libc::c_void,
     vm_size: usize,
-    context_manager: Option<native::Binder<BnServiceManager>>,
+    context_manager: Option<Arc<native::Binder<BnServiceManager>>>,
+    handle_to_object: HashMap<u32, Weak<dyn IBinder>>,
+    disable_background_scheduling: bool,
 }
 
 impl ProcessState {
@@ -29,6 +38,8 @@ impl ProcessState {
             vm_start: std::ptr::null_mut(),
             vm_size: 0,
             context_manager: None,
+            handle_to_object: HashMap::new(),
+            disable_background_scheduling: false,
         }
     }
 
@@ -93,13 +104,37 @@ impl ProcessState {
             }
         }
 
-        self.context_manager = Some(native::Binder::new(BnServiceManager::new()));
+        self.context_manager = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
 
         true
     }
 
-    pub fn context_manager(&self) -> Option<&native::Binder<BnServiceManager>> {
-        self.context_manager.as_ref()
+    pub fn context_manager(&self) -> Option<Arc<native::Binder<BnServiceManager>>> {
+        self.context_manager.clone()
+    }
+
+    pub fn strong_proxy_for_handle(&mut self, handle: u32) -> Result<Arc<dyn IBinder>> {
+        if let Some(binder) = self.handle_to_object.get(&handle) {
+            if let Some(strong) = binder.upgrade() {
+                return Ok(strong);
+            }
+        }
+
+        let proxy: Arc<dyn IBinder> = Arc::new(Proxy::new(handle, Unknown {}));
+        // if handle != 0 {
+        //     thread_state::inc_strong_handle(handle, proxy.clone())?;
+        // }
+        self.handle_to_object.insert(handle, Arc::downgrade(&proxy));
+
+        Ok(proxy)
+    }
+
+    pub fn disable_background_scheduling(&mut self, disable: bool) {
+        self.disable_background_scheduling = disable;
+    }
+
+    pub fn background_scheduling_disabled(&self) -> bool {
+        self.disable_background_scheduling
     }
 }
 

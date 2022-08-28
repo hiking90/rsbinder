@@ -18,11 +18,13 @@
  *
  */
 
-#ifndef _UAPI_LINUX_BINDER_H
-#define _UAPI_LINUX_BINDER_H
+#ifndef _LINUX_BINDER_H
+#define _LINUX_BINDER_H
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
+
+#include "binderfs.h"
 
 #define B_PACK_CHARS(c1, c2, c3, c4) \
 	((((c1)<<24)) | (((c2)<<16)) | (((c3)<<8)) | (c4))
@@ -326,7 +328,7 @@ struct binder_ptr_cookie {
 struct binder_handle_cookie {
 	__u32 handle;
 	binder_uintptr_t cookie;
-} __packed;
+} __attribute__((packed));
 
 struct binder_pri_desc {
 	__s32 priority;
@@ -528,5 +530,5 @@ enum binder_driver_command_protocol {
 	 */
 };
 
-#endif /* _UAPI_LINUX_BINDER_H */
+#endif /* _LINUX_BINDER_H */
 

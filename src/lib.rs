@@ -1,19 +1,20 @@
 mod sys;
 mod process_state;
-mod thread_state;
+pub mod thread_state;
 mod error;
 // mod ref_base;
 pub mod native;
 mod binder;
 pub mod parcel;
-mod binderfs;
+pub mod binderfs;
 mod service_manager;
 mod parcelable;
+pub mod proxy;
 
 pub use process_state::ProcessState;
-pub use thread_state::{ThreadState, THREAD_STATE};
+// pub use thread_state::Se;
 pub use parcel::Parcel;
-pub use error::{ErrorKind, Error, Result};
+pub use error::{ErrorKind, Error, Result, Exception};
 pub use binder::*;
 pub use service_manager::*;
 
@@ -33,8 +34,5 @@ mod tests {
     #[test]
     fn thread_state() {
         process_state();
-        THREAD_STATE.with(|_state| {
-
-        });
     }
 }

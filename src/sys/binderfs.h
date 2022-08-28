@@ -4,11 +4,11 @@
  *
  */
 
-#ifndef _UAPI_LINUX_BINDERFS_H
-#define _UAPI_LINUX_BINDERFS_H
+#ifndef _LINUX_BINDERFS_H
+#define _LINUX_BINDERFS_H
 
+// #include <linux/android/binder.h>
 #include <sys/types.h>
-#include <linux/android/binder.h>
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
@@ -32,5 +32,5 @@ struct binderfs_device {
  */
 #define BINDER_CTL_ADD _IOWR('b', 1, struct binderfs_device)
 
-#endif /* _UAPI_LINUX_BINDERFS_H */
+#endif /* _LINUX_BINDERFS_H */
 

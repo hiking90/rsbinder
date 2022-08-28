@@ -1,7 +1,16 @@
-use crate::sys::{binder_transaction_data_secctx, binder_transaction_data};
-use crate::binder;
-use crate::error::*;
-use crate::parcel::{ReadableParcel, WritableParcel};
+use std::sync::{Arc, Weak};
+use libc;
+
+use crate::{
+    IBinder,
+    sys::*,
+    error::*,
+    process_state::*,
+    proxy::*,
+    binder::*,
+    native::*,
+    parcel::{ReadableParcel, WritableParcel},
+};
 
 /// A struct whose instances can be written to a [`Parcel`].
 // Might be able to hook this up as a serde backend in the future?
@@ -199,6 +208,9 @@ parcelable_primitives! {
 
     impl Serialize for f64;
     impl Deserialize for f64;
+
+    impl Serialize for u128;
+    impl Deserialize for u128;
 }
 
 parcelable_primitives_ex! {
@@ -271,11 +283,21 @@ pub struct String16(pub String);
 
 impl Serialize for String16 {
     fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
-        parcel.write::<i32>(&(self.0.len() as i32))?;
+        let mut utf16 = Vec::with_capacity(self.0.len());
 
         for ch16 in self.0.encode_utf16() {
-            parcel.write_data(&ch16.to_ne_bytes());
+            utf16.push(ch16);
         }
+
+        parcel.write::<i32>(&(utf16.len() as i32))?;
+        parcel.write_data(
+            unsafe {
+                std::slice::from_raw_parts(utf16.as_ptr() as *const u8,
+                    utf16.len() * std::mem::size_of::<u16>())
+            }
+        );
+        parcel.write_data(&vec![0, 0]);
+
         Ok(())
     }
 }
@@ -284,15 +306,132 @@ impl Deserialize for String16 {
     fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
         let len = parcel.read::<i32>()?;
 
-        let mut str16 = Vec::with_capacity(len as _);
+        let data = parcel.read_data((len as usize + 1) * std::mem::size_of::<u16>())?;
+        let res = String::from_utf16(
+            unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
+            }
+        )?;
 
-        for _ in 0..len {
-            str16.push(<u16>::from_ne_bytes(parcel.try_into()?));
-        }
-
-        Ok(String16(String::from_utf16(&str16)?))
+        Ok(String16(res))
     }
 }
+
+impl Deserialize for flat_binder_object {
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+        parcel.read_object(false)
+    }
+}
+
+impl Serialize for flat_binder_object {
+    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+        parcel.write_object(self, false)?;
+        Ok(())
+    }
+}
+
+impl Deserialize for *const dyn IBinder {
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+        let data = parcel.read::<u128>()?;
+        let ptr = unsafe {std::mem::transmute::<u128, *const dyn IBinder>(data)};
+        Ok(ptr)
+    }
+}
+
+impl Serialize for *const dyn IBinder {
+    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+        let data = unsafe {std::mem::transmute::<&*const dyn IBinder, &u128>(self)};
+        parcel.write::<u128>(data)?;
+        Ok(())
+    }
+}
+
+
+const SCHED_NORMAL:u32 = 0;
+const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT:u32 = 9;
+
+fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
+    (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
+}
+
+impl Serialize for Arc<dyn IBinder> {
+    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+
+        let sched_bits = if ProcessState::as_self().read().unwrap().background_scheduling_disabled() == false {
+            sched_policy_mask(SCHED_NORMAL, 19)
+        } else {
+            0
+        };
+
+        let obj = if self.is_remote() {
+            let proxy = self.as_any().downcast_ref::<Proxy<Unknown>>().expect("Downcast to Proxy<Unknown>");
+
+            flat_binder_object {
+                hdr: binder_object_header {
+                    type_: BINDER_TYPE_HANDLE
+                },
+                flags: sched_bits,
+                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                    handle: proxy.handle(),
+                },
+                cookie: 0,
+            }
+        } else {
+            let weak = Box::new(Arc::downgrade(self));
+
+            flat_binder_object {
+                hdr: binder_object_header {
+                    type_: BINDER_TYPE_BINDER
+                },
+                flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
+                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                    binder: Box::into_raw(weak) as u64,
+                },
+                cookie: 0,
+            }
+        };
+
+        parcel.write(&obj)?;
+
+        // finishFlattenBinder
+        let stability: i32 = 0;
+        parcel.write(&stability)?;
+
+        Ok(())
+    }
+}
+
+
+impl Deserialize for Arc<dyn IBinder> {
+    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+        let flat: flat_binder_object = parcel.read()?;
+        let _stability: i32 = parcel.read()?;
+
+        unsafe {
+            match flat.hdr.type_ {
+                BINDER_TYPE_BINDER => {
+                    let weak = Box::from_raw(flat.__bindgen_anon_1.binder as *mut Box<Weak<dyn IBinder>>);
+                    Weak::upgrade(&weak)
+                        .ok_or_else(|| Error::from(ErrorKind::DeadObject))
+                }
+
+                BINDER_TYPE_HANDLE => {
+                    println!("BINDER_TYPE_HANDLE start");
+                    let res = ProcessState::as_self().write().unwrap()
+                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
+                    println!("BINDER_TYPE_HANDLE end");
+                    res
+                }
+
+                _ => {
+                    log::warn!("Unknown Binder Type ({}) was delivered.", flat.hdr.type_);
+                    Err(Error::from(ErrorKind::BadType))
+                }
+            }
+        }
+    }
+}
+
 
 // impl Deserialize for binder_transaction_data_secctx {
 //     fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {

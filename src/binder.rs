@@ -1,10 +1,14 @@
-use std::sync::Weak;
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::any::Any;
+use std::sync::{Weak, Arc};
 use std::fs::File;
 use crate::error::*;
 use crate::parcel::*;
+use crate::parcelable::*;
 use crate::native;
-// use crate::ref_base::*;
+use crate::proxy;
+// use crate::thread_state::*;
 
 /// Binder action to perform.
 ///
@@ -63,10 +67,12 @@ pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 ///
 /// This is equivalent `IInterface` in C++.
 pub trait Interface: Send + Sync {
-    /// Convert this binder object into a generic [`SpIBinder`] reference.
-    fn as_binder(&self) -> &dyn IBinder {
-        panic!("This object was not a Binder object and cannot be converted into an SpIBinder.")
-    }
+    // fn as_any(&self) -> &dyn Any;
+
+    // /// Convert this binder object into a generic [`SpIBinder`] reference.
+    // fn as_binder(&self) -> &dyn IBinder {
+    //     panic!("This object was not a Binder object and cannot be converted into an SpIBinder.")
+    // }
 
     /// Dump transaction handler for this Binder object.
     ///
@@ -77,28 +83,32 @@ pub trait Interface: Send + Sync {
     }
 }
 
+pub struct Unknown {}
 
-///
-/// # Example
-///
-/// For Binder interface `IFoo`, the following implementation should be made:
-/// ```no_run
-/// # use binder::{FromIBinder, SpIBinder, Result};
-/// # trait IFoo {}
-/// impl FromIBinder for dyn IFoo {
-///     fn try_from(ibinder: SpIBinder) -> Result<Box<Self>> {
-///         // ...
-///         # Err(binder::StatusCode::OK)
-///     }
-/// }
-/// ```
-pub trait FromIBinder: Interface {
-    /// Try to interpret a generic Binder object as this interface.
-    ///
-    /// Returns a trait object for the `Self` interface if this object
-    /// implements that interface.
-    fn try_from(ibinder: Arc<Box<dyn IBinder>>) -> Result<Arc<Self>>;
+impl Interface for Unknown {
 }
+
+// ///
+// /// # Example
+// ///
+// /// For Binder interface `IFoo`, the following implementation should be made:
+// /// ```no_run
+// /// # use binder::{FromIBinder, SpIBinder, Result};
+// /// # trait IFoo {}
+// /// impl FromIBinder for dyn IFoo {
+// ///     fn try_from(ibinder: SpIBinder) -> Result<Box<Self>> {
+// ///         // ...
+// ///         # Err(binder::StatusCode::OK)
+// ///     }
+// /// }
+// /// ```
+// pub trait FromIBinder: Interface {
+//     /// Try to interpret a generic Binder object as this interface.
+//     ///
+//     /// Returns a trait object for the `Self` interface if this object
+//     /// implements that interface.
+//     fn try_from(ibinder: Arc<Box<dyn IBinder>>) -> Result<Arc<Self>>;
+// }
 
 
 pub trait DeathRecipient {
@@ -109,7 +119,7 @@ pub trait DeathRecipient {
 ///
 /// This trait corresponds to the parts of the interface of the C++ `IBinder`
 /// class which are public.
-pub trait IBinder {
+pub trait IBinder: Send + Sync {
     /// Register the recipient for a notification if this binder
     /// goes away. If this binder object unexpectedly goes away
     /// (typically because its hosting process has been killed),
@@ -121,15 +131,24 @@ pub trait IBinder {
     /// INVALID_OPERATION code being returned and nothing happening.
     ///
     /// This link always holds a weak reference to its recipient.
-    fn link_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()>;
+    fn link_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()>;
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, recipient: Arc<Box<dyn DeathRecipient>>) -> Result<()>;
+    fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()>;
 
     /// Send a ping transaction to this object
     fn ping_binder(&mut self) -> Result<()>;
+
+    fn as_any(&self) -> &dyn Any;
+    fn is_remote(&self) -> bool;
+}
+
+pub fn cookie_for_binder(binder: Arc<dyn IBinder>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    Arc::as_ptr(&binder).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A local service that can be remotable via Binder.
@@ -152,7 +171,7 @@ pub trait Remotable: Send + Sync {
     /// Handle and reply to a request to invoke a transaction on this object.
     ///
     /// `reply` may be [`None`] if the sender does not expect a reply.
-    fn on_transact(&self, code: TransactionCode, data: &mut Parcel, reply: &mut Parcel) -> Result<()>;
+    fn on_transact(&self, code: TransactionCode, reader: ReadableParcel<'_>, reply: &mut Parcel) -> Status<()>;
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
@@ -273,5 +292,27 @@ impl<I: InterfaceClassMethods> InterfaceClass<I> {
 // impl From<InterfaceClass> for *const sys::AIBinder_Class {
 //     fn from(class: InterfaceClass) -> *const sys::AIBinder_Class {
 //         class.0
+//     }
+// }
+
+// #[derive(Debug)]
+// pub enum Object {
+//     Binder {
+//         binder: u64,
+//         stability: i32,
+//     },
+//     Handle {
+//         handle: u32,
+//         stability: i32,
+//     }
+// }
+
+// impl Object {
+//     pub fn local<I: Interface + Remotable>(&self) -> Arc<Box<native::Binder<I>>> {
+//         todo!("")
+//     }
+
+//     pub fn remote<I: Interface>(&self) -> Arc<Box<proxy::Proxy<Unknown>>> {
+//         todo!("")
 //     }
 // }
