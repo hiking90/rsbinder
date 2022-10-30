@@ -21,7 +21,7 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
     };
 
     for (a, c) in device.name.iter_mut().zip(CString::new(name)?.as_bytes_with_nul()) {
-        *a = *c as i8;
+        *a = *c as std::os::raw::c_char;
     }
 
     unsafe {
