@@ -1,4 +1,4 @@
-use std::sync::{atomic, Arc};
+
 use std::any::Any;
 
 use crate::{
@@ -26,14 +26,14 @@ impl<I: Interface> Proxy<I> {
 }
 
 impl<I: 'static +  Interface> IBinder for Proxy<I> {
-    fn link_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("IBinder for Proxy<I> - link_to_death")
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn unlink_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("IBinder for Proxy<I> - unlink_to_death")
     }
 

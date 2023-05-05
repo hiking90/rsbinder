@@ -504,11 +504,10 @@ impl ThreadState {
             }
         };
 
-        let mut writer = self.out_parcel.as_writable();
-        writer.write::<i32>(&cmd);
+        self.out_parcel.write::<i32>(&cmd);
         unsafe {
             let ptr = &tr as *const binder_transaction_data;
-            writer.write_data(
+            self.out_parcel.write_data(
                 std::slice::from_raw_parts(ptr as _, std::mem::size_of::<binder_transaction_data>())
             );
         }
@@ -591,14 +590,14 @@ impl ThreadState {
 
 pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        thread_state.borrow_mut().out_parcel.as_writable().write::<u32>(&binder::BC_ENTER_LOOPER)
+        thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
     flash_commands()?;
-    Ok(ProcessState::as_self().read().unwrap().as_raw_fd())
+    Ok(ProcessState::as_self().as_raw_fd())
 }
 
 enum UntilResponse<'a> {
-    Reply(&'a  mut Parcel),
+    Reply(&'a mut Parcel),
     TransactionComplete,
     AcquireResult(ExceptionKind),
 }
@@ -614,7 +613,7 @@ fn wait_for_response(until: &mut UntilResponse) -> Status<()> {
                 continue;
             }
 
-            let cmd: u32 = thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()? as _;
+            let cmd: u32 = thread_state.borrow_mut().in_parcel.read::<i32>()? as _;
             match cmd {
                 binder::BR_ONEWAY_SPAM_SUSPECT => {
                     todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
@@ -654,7 +653,7 @@ fn execute_command(cmd: i32) -> Status<()> {
     THREAD_STATE.with(|thread_state| -> Status<()> {
         match cmd {
             binder::BR_ERROR => {
-                let other = thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()?;
+                let other = thread_state.borrow_mut().in_parcel.read::<i32>()?;
                 return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".into()));
             }
             binder::BR_OK => {}
@@ -664,10 +663,10 @@ fn execute_command(cmd: i32) -> Status<()> {
                 let tr_secctx = {
                     let mut thread_state = thread_state.borrow_mut();
                     if cmd == binder::BR_TRANSACTION_SEC_CTX {
-                        thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data_secctx>()?
+                        thread_state.in_parcel.read::<binder::binder_transaction_data_secctx>()?
                     } else {
                         binder::binder_transaction_data_secctx {
-                            transaction_data: thread_state.in_parcel.as_readable().read::<binder::binder_transaction_data>()?,
+                            transaction_data: thread_state.in_parcel.read::<binder::binder_transaction_data>()?,
                             secctx: 0,
                         }
                     }
@@ -676,7 +675,7 @@ fn execute_command(cmd: i32) -> Status<()> {
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
-                    ImmutableParcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
+                    Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
                         tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
                 };
 
@@ -717,10 +716,10 @@ fn execute_command(cmd: i32) -> Status<()> {
                 //     }
 
                     } else {
-                        let context = ProcessState::as_self().read().unwrap().context_manager();
+                        let context = ProcessState::as_self().context_manager();
                         if let Some(context) = context {
                             reader.set_data_position(0);
-                            context.transact(tr_secctx.transaction_data.code, reader.as_readable(), &mut reply)?;
+                            context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)?;
                         }
                     }
                 }
@@ -760,18 +759,14 @@ fn execute_command(cmd: i32) -> Status<()> {
             binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
                 let raw_pointer = {
-                    let mut readable = state.in_parcel.as_readable();
-
-                    readable.read::<*const dyn IBinder>()?
+                    state.in_parcel.read::<*const dyn IBinder>()?
                 };
 
                 let strong: Arc<dyn IBinder> = unsafe { Arc::from_raw(raw_pointer) };
 
                 {
-                    let mut writable = state.out_parcel.as_writable();
-
-                    writable.write::<i32>(&(binder::BC_ACQUIRE_DONE as i32))?;
-                    writable.write::<*const dyn IBinder>(&Arc::into_raw(strong))?;
+                    state.out_parcel.write::<i32>(&(binder::BC_ACQUIRE_DONE as i32))?;
+                    state.out_parcel.write::<*const dyn IBinder>(&Arc::into_raw(strong))?;
                 }
             }
             binder::BR_RELEASE => {
@@ -846,7 +841,8 @@ fn execute_command(cmd: i32) -> Status<()> {
 
 
 fn talk_with_driver(do_receive: bool) -> Result<()> {
-    if ProcessState::as_self().read().unwrap().as_raw_fd() < 0 {
+    let driver_fd = ProcessState::as_self().as_raw_fd();
+    if driver_fd < 0 {
         return Err(Error::from(ErrorKind::BadFd));
     }
 
@@ -882,7 +878,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
         unsafe {
             loop {
-                let res = binder::write_read(ProcessState::as_self().read().unwrap().as_raw_fd(), &mut bwr);
+                let res = binder::write_read(driver_fd, &mut bwr);
                 match res {
                     Ok(_) => break,
                     Err(errno) if errno != nix::errno::Errno::EINTR => {
@@ -921,7 +917,7 @@ fn get_and_execute_command() -> Status<()> {
     talk_with_driver(true)?;
 
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
-        thread_state.borrow_mut().in_parcel.as_readable().read::<i32>()
+        thread_state.borrow_mut().in_parcel.read::<i32>()
     })?;
     execute_command(cmd)?;
 
@@ -951,10 +947,9 @@ pub fn inc_strong_handle(handle: u32, proxy: Arc<dyn IBinder>) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
-            let mut writable = state.out_parcel.as_writable();
 
-            writable.write::<i32>(&(binder::BC_ACQUIRE as i32))?;
-            writable.write::<i32>(&(handle as i32))?;
+            state.out_parcel.write::<i32>(&(binder::BC_ACQUIRE as i32))?;
+            state.out_parcel.write::<i32>(&(handle as i32))?;
         }
 
         if flash_if_needed()? == false {
@@ -969,10 +964,9 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
-            let mut writable = state.out_parcel.as_writable();
 
-            writable.write::<i32>(&(binder::BC_RELEASE as i32))?;
-            writable.write::<i32>(&(handle as i32))?;
+            state.out_parcel.write::<i32>(&(binder::BC_RELEASE as i32))?;
+            state.out_parcel.write::<i32>(&(handle as i32))?;
         }
 
         flash_if_needed()?;
@@ -1017,7 +1011,6 @@ pub fn flash_if_needed() -> Result<bool> {
         thread_state.borrow_mut().is_flushing = false;
 
         Ok(true)
-
     })
 }
 
@@ -1034,7 +1027,7 @@ pub fn handle_commands() -> Status<()> {
     Ok(())
 }
 
-pub fn check_interface<T: Remotable>(reader: &mut ReadableParcel<'_>) -> Status<()> {
+pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Status<()> {
     let mut strict_policy: i32 = reader.read()?;
 
     THREAD_STATE.with(|thread_state| -> Status<()> {

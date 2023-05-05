@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use std::path::Path;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
-use std::sync::{RwLock, Once};
+use std::sync::{RwLock};
 use log;
 
 use crate::{
@@ -11,7 +11,6 @@ use crate::{
     binder::*,
     sys::binder,
     proxy::*,
-    thread_state,
     native,
     service_manager::BnServiceManager
 };
@@ -19,42 +18,47 @@ use crate::{
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
-static mut PROCESS_STATE: std::mem::MaybeUninit<Arc<RwLock<ProcessState>>> = std::mem::MaybeUninit::uninit();
-static ONCE: Once = Once::new();
+lazy_static! {
+    static ref PROCESS_STATE: Arc<ProcessState> = Arc::new(ProcessState::new());
+}
 
-pub struct ProcessState {
-    driver: RawFd,
-    vm_start: *mut libc::c_void,
+struct Inner {
+    driver_fd: RawFd,
+    vm_start: *mut std::ffi::c_void,
     vm_size: usize,
     context_manager: Option<Arc<native::Binder<BnServiceManager>>>,
     handle_to_object: HashMap<u32, Weak<dyn IBinder>>,
     disable_background_scheduling: bool,
 }
 
+pub struct ProcessState {
+    inner: RwLock<Inner>,
+}
+
+unsafe impl Sync for ProcessState {}
+unsafe impl Send for ProcessState {}
+
 impl ProcessState {
     fn new() -> Self {
         ProcessState {
-            driver: -1,
-            vm_start: std::ptr::null_mut(),
-            vm_size: 0,
-            context_manager: None,
-            handle_to_object: HashMap::new(),
-            disable_background_scheduling: false,
+            inner: RwLock::new(Inner {
+                driver_fd: -1,
+                vm_start: std::ptr::null_mut(),
+                vm_size: 0,
+                context_manager: None,
+                handle_to_object: HashMap::new(),
+                disable_background_scheduling: false,
+            }),
         }
     }
 
-    pub fn as_self() -> &'static Arc<RwLock<ProcessState>> {
-        unsafe {
-            ONCE.call_once(|| {
-                let process = Arc::new(RwLock::new(ProcessState::new()));
-                PROCESS_STATE.write(process);
-            });
-            PROCESS_STATE.assume_init_ref()
-        }
+    pub fn as_self() -> Arc<ProcessState> {
+        PROCESS_STATE.clone()
     }
 
-    pub fn init(&mut self, driver: &str, max_threads: u32) -> bool {
-        if self.driver != -1 {
+    pub fn init(& self, driver: &str, max_threads: u32) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        if inner.driver_fd != -1 {
             log::warn!("ProcessState has been initialized.");
             return false;
         }
@@ -65,56 +69,63 @@ impl ProcessState {
             DEFAULT_MAX_BINDER_THREADS
         };
 
-        self.driver = match open_driver(Path::new(driver), max_threads) {
+        inner.driver_fd = match open_driver(Path::new(driver), max_threads) {
             Some(fd) => fd,
             None => return false
         };
 
-        self.vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
+        inner.vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
         unsafe {
-            self.vm_start = libc::mmap(std::ptr::null_mut(),
-                self.vm_size,
+            let mut vm_start: *mut libc::c_void = std::ptr::null_mut();
+            vm_start = libc::mmap(std::ptr::null_mut(),
+                inner.vm_size,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_NORESERVE, self.driver, 0);
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE, inner.driver_fd, 0);
 
-            if self.vm_start == libc::MAP_FAILED {
-                libc::close(self.driver);
-                self.driver = -1;
+            if vm_start == libc::MAP_FAILED {
+                libc::close(inner.driver_fd);
+                inner.driver_fd = -1;
                 return false;
             }
+
+            inner.vm_start = vm_start;
         }
 
         true
     }
 
-    pub fn become_context_manager(&mut self) -> bool {
+    pub fn become_context_manager(& self) -> bool {
+        let mut inner = self.inner.write().unwrap();
+
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
         unsafe {
-            if let Err(_) = binder::set_context_mgr_ext(self.driver, &obj) {
+            if let Err(_) = binder::set_context_mgr_ext(inner.driver_fd, &obj) {
                 //     android_errorWriteLog(0x534e4554, "121035042");
                 let unused: i32 = 0;
-                if let Err(e) = binder::set_context_mgr(self.driver, &unused) {
+                if let Err(e) = binder::set_context_mgr(inner.driver_fd, &unused) {
                     log::error!("Binder ioctl to become context manager failed: {}", e.to_string());
                     return false;
                 }
             }
         }
 
-        self.context_manager = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
+        inner.context_manager = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
 
         true
     }
 
     pub fn context_manager(&self) -> Option<Arc<native::Binder<BnServiceManager>>> {
-        self.context_manager.clone()
+        let inner = self.inner.read().unwrap();
+        inner.context_manager.clone()
     }
 
-    pub fn strong_proxy_for_handle(&mut self, handle: u32) -> Result<Arc<dyn IBinder>> {
-        if let Some(binder) = self.handle_to_object.get(&handle) {
+    pub fn strong_proxy_for_handle(& self, handle: u32) -> Result<Arc<dyn IBinder>> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(binder) = inner.handle_to_object.get(&handle) {
             if let Some(strong) = binder.upgrade() {
                 return Ok(strong);
             }
@@ -124,17 +135,19 @@ impl ProcessState {
         // if handle != 0 {
         //     thread_state::inc_strong_handle(handle, proxy.clone())?;
         // }
-        self.handle_to_object.insert(handle, Arc::downgrade(&proxy));
+        inner.handle_to_object.insert(handle, Arc::downgrade(&proxy));
 
         Ok(proxy)
     }
 
-    pub fn disable_background_scheduling(&mut self, disable: bool) {
-        self.disable_background_scheduling = disable;
+    pub fn disable_background_scheduling(& self, disable: bool) {
+        let mut inner = self.inner.write().unwrap();
+        inner.disable_background_scheduling = disable;
     }
 
     pub fn background_scheduling_disabled(&self) -> bool {
-        self.disable_background_scheduling
+        let inner = self.inner.read().unwrap();
+        inner.disable_background_scheduling
     }
 }
 
@@ -176,18 +189,21 @@ fn open_driver(driver: &Path, max_threads: u32) -> Option<RawFd> {
 
 impl AsRawFd for ProcessState {
     fn as_raw_fd(&self) -> RawFd {
-        self.driver
+        let inner = self.inner.read().unwrap();
+        inner.driver_fd
     }
 }
 
 impl Drop for ProcessState {
-    fn drop(&mut self) {
-        if self.driver != -1 {
+    fn drop(self: &mut ProcessState) {
+        let mut inner = self.inner.write().unwrap();
+        if inner.driver_fd != -1 {
             unsafe {
-                libc::munmap(self.vm_start, self.vm_size);
-                libc::close(self.driver);
+                libc::munmap(inner.vm_start, inner.vm_size);
+                libc::close(inner.driver_fd);
+                inner.vm_start = std::ptr::null_mut();
             }
-            self.driver = -1;
+            inner.driver_fd = -1;
         }
     }
 }

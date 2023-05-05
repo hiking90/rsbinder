@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate lazy_static;
+
 mod sys;
 mod process_state;
 pub mod thread_state;
@@ -27,7 +30,7 @@ mod tests {
 
     #[test]
     fn process_state() {
-        let mut process = ProcessState::as_self().write().unwrap();
+        let process = ProcessState::as_self();
         process.init("/dev/binderfs/binder", 0);
     }
 

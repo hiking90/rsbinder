@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::sync::Arc;
+
 use crate::binder::*;
 use crate::parcel::*;
 use crate::error::*;
@@ -53,7 +53,7 @@ impl<T: Remotable> Binder<T> {
         T::get_descriptor()
     }
 
-    pub fn transact(&self, code: TransactionCode, reader: ReadableParcel<'_>, reply: &mut Parcel) -> Status<()> {
+    pub fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Status<()> {
         // data.set_data_position(0);
         match code {
             PING_TRANSACTION => (),
@@ -90,14 +90,14 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
 }
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
-    fn link_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("link_to_death")
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn unlink_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("unlink_to_death")
     }
 
@@ -136,7 +136,7 @@ impl<T: Remotable> InterfaceClassMethods for Binder<T> {
     fn on_destroy() {
     }
 
-    fn on_dump<R: Remotable>(binder: &mut Binder<R>, fd: i32, args: &str, num_args: u32) -> Result<()> {
+    fn on_dump<R: Remotable>(_binder: &mut Binder<R>, _fd: i32, _args: &str, _num_args: u32) -> Result<()> {
         Ok(())
     }
 }

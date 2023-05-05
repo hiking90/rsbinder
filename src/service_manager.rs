@@ -10,7 +10,6 @@ use crate::{
     parcel::*,
     parcelable::*,
     thread_state,
-    sys::{flat_binder_object},
 };
 
 
@@ -78,7 +77,7 @@ impl IServiceManager for BnServiceManager {
         Ok(self.try_get_service(name, false))
     }
 
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Status<()> {
+    fn add_service(&self, name: String, service: Arc<dyn IBinder>, _allow_isolated: bool, _dump_priority: i32) -> Status<()> {
         self.name_to_service.lock().unwrap().insert(name, Service {
             binder: service,
             has_clients: false,
@@ -96,9 +95,9 @@ impl Remotable for BnServiceManager {
         "android.os.IServiceManager"
     }
 
-    fn on_transact(&self, code: TransactionCode, mut reader: ReadableParcel<'_>, reply: &mut Parcel) -> Status<()> {
+    fn on_transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Status<()> {
         // let mut reader = data.as_readable();
-        thread_state::check_interface::<BnServiceManager>(&mut reader)?;
+        thread_state::check_interface::<BnServiceManager>(reader)?;
 
         match code {
             transactions::getService => {
@@ -110,8 +109,7 @@ impl Remotable for BnServiceManager {
             transactions::checkService => {
                 let name: String16 = reader.read()?;
                 let status = self.check_service(&name.0);
-                let mut writer = reply.as_writable();
-                writer.write(&status)?;
+                reply.write(&status)?;
                 // if let Ok(binder) = status {
                 //     writer.write()
                 // };
@@ -125,8 +123,7 @@ impl Remotable for BnServiceManager {
 
                 let status = self.add_service(name.0, binder, allow_isolated, dump_priority);
 
-                let mut writer = reply.as_writable();
-                writer.write(&status)?;
+                reply.write(&status)?;
             }
             transactions::listServices => {
                 todo!("transactions::listServices");
@@ -163,7 +160,7 @@ impl Remotable for BnServiceManager {
         Ok(())
     }
 
-    fn on_dump(&self, file: &File, args: &[&str]) -> Result<()> {
+    fn on_dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
         todo!("on_dump()")
 
     }

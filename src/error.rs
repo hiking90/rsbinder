@@ -185,7 +185,7 @@ impl From<Error> for Exception {
 
 
 impl<T> Serialize for Status<T> {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         match self {
             Ok(_) => {
                 parcel.write::<i32>(&0)?;
@@ -218,7 +218,7 @@ impl<T> Serialize for Status<T> {
 }
 
 impl Deserialize for Status<()> {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let exception = parcel.read::<i32>()?;
 
         let status = if exception == ExceptionKind::None as i32 {
@@ -257,19 +257,17 @@ mod tests {
         let mut parcel = Parcel::new();
 
         {
-            let mut writer = parcel.as_writable();
-            writer.write(&ok)?;
-            writer.write(&illegal_status)?;
-            writer.write(&service_specific_status)?;
-            assert_eq!(writer.write(&failed_status).is_err(), true);
+            parcel.write(&ok)?;
+            parcel.write(&illegal_status)?;
+            parcel.write(&service_specific_status)?;
+            assert_eq!(parcel.write(&failed_status).is_err(), true);
         }
 
         {
-            let mut reader = parcel.as_readable();
-            assert_eq!(reader.read::<Status<()>>()?, ok);
-            assert_eq!(reader.read::<Status<()>>()?, illegal_status);
-            assert_eq!(reader.read::<Status<()>>()?, service_specific_status);
-            assert_eq!(reader.read::<Status<()>>().is_err(), true);
+            assert_eq!(parcel.read::<Status<()>>()?, ok);
+            assert_eq!(parcel.read::<Status<()>>()?, illegal_status);
+            assert_eq!(parcel.read::<Status<()>>()?, service_specific_status);
+            assert_eq!(parcel.read::<Status<()>>().is_err(), true);
         }
 
         Ok(())

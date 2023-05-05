@@ -1,5 +1,5 @@
 use std::sync::{Arc, Weak};
-use libc;
+
 
 use crate::{
     IBinder,
@@ -8,27 +8,26 @@ use crate::{
     process_state::*,
     proxy::*,
     binder::*,
-    native::*,
-    parcel::{ReadableParcel, WritableParcel},
+    parcel::Parcel,
 };
 
 /// A struct whose instances can be written to a [`Parcel`].
 // Might be able to hook this up as a serde backend in the future?
 pub trait Serialize {
     /// Serialize this instance into the given [`Parcel`].
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()>;
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()>;
 }
 
 /// A struct whose instances can be restored from a [`Parcel`].
 // Might be able to hook this up as a serde backend in the future?
 pub trait Deserialize: Sized {
     /// Deserialize an instance from the given [`Parcel`].
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self>;
+    fn deserialize(parcel: &mut Parcel) -> Result<Self>;
 
     /// Deserialize an instance from the given [`Parcel`] onto the
     /// current object. This operation will overwrite the old value
     /// partially or completely, depending on how much data is available.
-    fn deserialize_from(&mut self, parcel: &mut ReadableParcel<'_>) -> Result<()> {
+    fn deserialize_from(&mut self, parcel: &mut Parcel) -> Result<()> {
         *self = Self::deserialize(parcel)?;
         Ok(())
     }
@@ -143,7 +142,7 @@ macro_rules! parcelable_primitives {
 macro_rules! impl_parcelable {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
-            fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+            fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 parcel.write_data(&self.to_ne_bytes());
                 Ok(())
             }
@@ -152,7 +151,7 @@ macro_rules! impl_parcelable {
 
     {Deserialize, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut Parcel) -> Result<Self> {
                 Ok(<$ty>::from_ne_bytes(parcel.try_into()?))
             }
         }
@@ -172,7 +171,7 @@ macro_rules! parcelable_primitives_ex {
 macro_rules! impl_parcelable_ex {
     {Serialize, $to_ty:ty, $ty:ty} => {
         impl Serialize for $ty {
-            fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+            fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 let val: $to_ty = *self as _;
                 parcel.write_data(&val.to_ne_bytes());
                 Ok(())
@@ -182,7 +181,7 @@ macro_rules! impl_parcelable_ex {
 
     {Deserialize, $to_ty:ty, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut Parcel) -> Result<Self> {
                 Ok(<$to_ty>::from_ne_bytes(parcel.try_into()?) as _)
             }
         }
@@ -225,13 +224,13 @@ parcelable_primitives_ex! {
 }
 
 impl Deserialize for bool {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         Ok(<i32>::from_ne_bytes(parcel.try_into()?) != 0)
     }
 }
 
 impl Serialize for bool {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = *self as _;
         parcel.write_data(&val.to_ne_bytes());
         Ok(())
@@ -252,7 +251,7 @@ macro_rules! parcelable_struct {
 macro_rules! impl_parcelable_struct {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
-            fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+            fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
                 parcel.write_data(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
                 Ok(())
@@ -262,7 +261,7 @@ macro_rules! impl_parcelable_struct {
 
     {Deserialize, $ty:ty} => {
         impl Deserialize for $ty {
-            fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+            fn deserialize(parcel: &mut Parcel) -> Result<Self> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
                 Ok(unsafe { std::mem::transmute::<[u8; SIZE], $ty>(parcel.try_into()?) })
             }
@@ -282,7 +281,7 @@ parcelable_struct! {
 pub struct String16(pub String);
 
 impl Serialize for String16 {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let mut utf16 = Vec::with_capacity(self.0.len());
 
         for ch16 in self.0.encode_utf16() {
@@ -303,7 +302,7 @@ impl Serialize for String16 {
 }
 
 impl Deserialize for String16 {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let len = parcel.read::<i32>()?;
 
         let data = parcel.read_data((len as usize + 1) * std::mem::size_of::<u16>())?;
@@ -318,20 +317,20 @@ impl Deserialize for String16 {
 }
 
 impl Deserialize for flat_binder_object {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         parcel.read_object(false)
     }
 }
 
 impl Serialize for flat_binder_object {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         parcel.write_object(self, false)?;
         Ok(())
     }
 }
 
 impl Deserialize for *const dyn IBinder {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let data = parcel.read::<u128>()?;
         let ptr = unsafe {std::mem::transmute::<u128, *const dyn IBinder>(data)};
         Ok(ptr)
@@ -339,7 +338,7 @@ impl Deserialize for *const dyn IBinder {
 }
 
 impl Serialize for *const dyn IBinder {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let data = unsafe {std::mem::transmute::<&*const dyn IBinder, &u128>(self)};
         parcel.write::<u128>(data)?;
         Ok(())
@@ -355,9 +354,9 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
 }
 
 impl Serialize for Arc<dyn IBinder> {
-    fn serialize(&self, parcel: &mut WritableParcel<'_>) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
 
-        let sched_bits = if ProcessState::as_self().read().unwrap().background_scheduling_disabled() == false {
+        let sched_bits = if ProcessState::as_self().background_scheduling_disabled() == false {
             sched_policy_mask(SCHED_NORMAL, 19)
         } else {
             0
@@ -403,7 +402,7 @@ impl Serialize for Arc<dyn IBinder> {
 
 
 impl Deserialize for Arc<dyn IBinder> {
-    fn deserialize(parcel: &mut ReadableParcel<'_>) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let flat: flat_binder_object = parcel.read()?;
         let _stability: i32 = parcel.read()?;
 
@@ -417,7 +416,7 @@ impl Deserialize for Arc<dyn IBinder> {
 
                 BINDER_TYPE_HANDLE => {
                     println!("BINDER_TYPE_HANDLE start");
-                    let res = ProcessState::as_self().write().unwrap()
+                    let res = ProcessState::as_self()
                         .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
                     println!("BINDER_TYPE_HANDLE end");
                     res

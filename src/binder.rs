@@ -1,13 +1,13 @@
 use std::hash::{Hash, Hasher};
-use std::collections::HashMap;
+
 use std::any::Any;
 use std::sync::{Weak, Arc};
 use std::fs::File;
 use crate::error::*;
 use crate::parcel::*;
-use crate::parcelable::*;
+
 use crate::native;
-use crate::proxy;
+
 // use crate::thread_state::*;
 
 /// Binder action to perform.
@@ -171,7 +171,7 @@ pub trait Remotable: Send + Sync {
     /// Handle and reply to a request to invoke a transaction on this object.
     ///
     /// `reply` may be [`None`] if the sender does not expect a reply.
-    fn on_transact(&self, code: TransactionCode, reader: ReadableParcel<'_>, reply: &mut Parcel) -> Status<()>;
+    fn on_transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Status<()>;
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
