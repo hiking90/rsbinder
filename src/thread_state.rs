@@ -1,6 +1,7 @@
 use std::sync::{Arc, Weak};
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
+use log::error;
 
 use crate::{
     parcel::*,
@@ -9,6 +10,8 @@ use crate::{
     process_state::*,
     parcelable::*,
     sys::*,
+    native,
+    service_manager,
 };
 
 thread_local! {
@@ -119,8 +122,8 @@ pub struct ThreadState {
     is_flushing: bool,
     post_strong_derefs: Vec<Arc<dyn IBinder>>,
     post_weak_derefs: Vec<Weak<dyn IBinder>>,
+    call_restriction: CallRestriction,
 }
-
 
 impl ThreadState {
     fn new() -> Self {
@@ -133,6 +136,7 @@ impl ThreadState {
             is_flushing: false,
             post_strong_derefs: Vec::new(),
             post_weak_derefs: Vec::new(),
+            call_restriction: ProcessState::as_self().call_restriction(),
         }
     }
 
@@ -150,299 +154,6 @@ impl ThreadState {
             None => 0,
         }
     }
-
-    // pub fn setup_polling(&mut self) -> Result<std::os::unix::io::RawFd> {
-    //     self.out_parcel.as_writable().write::<u32>(&binder::BC_ENTER_LOOPER)?;
-    //     self.flash_commands()?;
-    //     Ok(ProcessState::as_self().read().unwrap().as_raw_fd())
-    // }
-
-    // fn flash_commands(&mut self) -> Result<()> {
-    //     self.talk_with_driver(false)?;
-    //     if self.out_parcel.len() > 0 {
-    //         self.talk_with_driver(false)?;
-    //     }
-
-    //     if self.out_parcel.len() > 0 {
-    //         log::warn!("self.out_parcel.len() > 0 after flash_commands()");
-    //     }
-
-    //     Ok(())
-    // }
-
-    // pub fn handle_commands(&mut self) -> Result<()>{
-    //     while {
-    //         self.get_and_execute_command()?;
-    //         self.in_parcel.len() != 0
-    //     } {
-    //         self.flash_commands()?;
-    //     }
-    //     Ok(())
-    // }
-
-    // fn get_and_execute_command(&mut self) -> Result<()> {
-    //     self.talk_with_driver(true)?;
-
-    //     if self.in_parcel.len() < std::mem::size_of::<i32>() {
-    //         return Ok(())
-    //     }
-
-    //     self.in_parcel.dump();
-    //     let cmd = self.in_parcel.as_readable().read::<i32>().unwrap_or(0);
-    //     self.execute_command(cmd)?;
-
-    //     Ok(())
-    // }
-
-    // fn execute_command(&mut self, cmd: i32) -> Result<()> {
-    //     let cmd: std::os::raw::c_uint = cmd as _;
-
-    //     println!("execute_command: {} {:?}", cmd, return_to_str(cmd));
-
-    //     match cmd {
-    //         binder::BR_ERROR => {
-    //             let other = self.in_parcel.as_readable().read::<i32>()?;
-    //             return Err(Error::from(other));
-    //         }
-    //         binder::BR_OK => {}
-
-    //         binder::BR_TRANSACTION_SEC_CTX |
-    //         binder::BR_TRANSACTION => {
-    //             let tr_secctx = if cmd == binder::BR_TRANSACTION_SEC_CTX {
-    //                 self.in_parcel.as_readable().read::<binder::binder_transaction_data_secctx>()?
-    //             } else {
-    //                 binder::binder_transaction_data_secctx {
-    //                     transaction_data: self.in_parcel.as_readable().read::<binder::binder_transaction_data>()?,
-    //                     secctx: 0,
-    //                 }
-    //             };
-
-    //             let mut reader = unsafe {
-    //                 let tr = &tr_secctx.transaction_data;
-
-    //                 Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
-    //                     tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
-    //             };
-
-    //             // TODO: Skip now, because if below implmentation is mandatory.
-    //             // const void* origServingStackPointer = mServingStackPointer;
-    //             // mServingStackPointer = &origServingStackPointer; // anything on the stack
-
-    //             let transaction_old = self.transaction;
-
-    //             self.clear_calling_work_source();
-    //             self.clear_propagate_work_source();
-
-    //             self.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
-
-    //             let mut reply = Parcel::new();
-
-    //             unsafe {
-    //                 let target_ptr = tr_secctx.transaction_data.target.ptr;
-    //                 if target_ptr != 0 {
-    //                     todo!("need to call BBinder->transact()")
-    //                     // let weak_ref: *mut ref_base::WeakRef = target_ptr as _;
-    //                     // let mut ref_base = ref_base::RefBase::<ref_base::RemoteRef>::from_raw(target_ptr as _);
-    //                     // if ref_base.attempt_inc_strong() {
-    //                     //     todo!("need to call BBinder->transact()")
-    //                     // }
-    //             //     if (reinterpret_cast<RefBase::weakref_type*>(
-    //             //             tr.target.ptr)->attemptIncStrong(this)) {
-    //             //         error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
-    //             //                 &reply, tr.flags);
-    //             //         reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
-    //             //     } else {
-    //             //         error = UNKNOWN_TRANSACTION;
-    //             //     }
-
-    //                 } else {
-    //                     if let Some(context) = ProcessState::as_self().read().unwrap().context_manager() {
-    //                         context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)?;
-    //                     }
-    //                 }
-    //             }
-
-    //             let flags = tr_secctx.transaction_data.flags;
-    //             if (flags & sys::transaction_flags_TF_ONE_WAY) == 0 {
-    //                 let flags = flags & sys::transaction_flags_TF_CLEAR_BUF;
-    //                 self.write_transaction_data(binder::BC_REPLY as _, flags, u32::MAX, 0, &mut reply)?;
-    //                 reply.set_len(0);
-    //                 self.wait_for_response(&mut reply)?;
-    //             }
-
-    //             self.transaction = transaction_old;
-    //         }
-
-    //         binder::BR_REPLY => {
-    //             todo!("execute_command - BR_REPLY");
-    //         }
-    //         binder::BR_ACQUIRE_RESULT => {
-    //             todo!("execute_command - BR_ACQUIRE_RESULT");
-    //         }
-    //         binder::BR_DEAD_REPLY => {
-    //             todo!("execute_command - BR_DEAD_REPLY");
-    //         }
-    //         binder::BR_TRANSACTION_COMPLETE => {
-    //             todo!("execute_command - BR_TRANSACTION_COMPLETE");
-    //         }
-    //         binder::BR_INCREFS => {
-    //             todo!("execute_command - BR_INCREFS");
-    //     // refs = (RefBase::weakref_type*)mIn.readPointer();
-    //     // obj = (BBinder*)mIn.readPointer();
-    //     // refs->incWeak(mProcess.get());
-    //     // mOut.writeInt32(BC_INCREFS_DONE);
-    //     // mOut.writePointer((uintptr_t)refs);
-    //     // mOut.writePointer((uintptr_t)obj);
-
-    //         }
-    //         binder::BR_ACQUIRE => {
-    //             todo!("execute_command - BR_ACQUIRE");
-    //     // refs = (RefBase::weakref_type*)mIn.readPointer();
-    //     // obj = (BBinder*)mIn.readPointer();
-    //     // ALOG_ASSERT(refs->refBase() == obj,
-    //     //            "BR_ACQUIRE: object %p does not match cookie %p (expected %p)",
-    //     //            refs, obj, refs->refBase());
-    //     // obj->incStrong(mProcess.get());
-    //     // IF_LOG_REMOTEREFS() {
-    //     //     LOG_REMOTEREFS("BR_ACQUIRE from driver on %p", obj);
-    //     //     obj->printRefs();
-    //     // }
-    //     // mOut.writeInt32(BC_ACQUIRE_DONE);
-    //     // mOut.writePointer((uintptr_t)refs);
-    //     // mOut.writePointer((uintptr_t)obj);
-
-    //         }
-    //         binder::BR_RELEASE => {
-    //             todo!("execute_command - BR_RELEASE");
-    //     // refs = (RefBase::weakref_type*)mIn.readPointer();
-    //     // obj = (BBinder*)mIn.readPointer();
-    //     // ALOG_ASSERT(refs->refBase() == obj,
-    //     //            "BR_RELEASE: object %p does not match cookie %p (expected %p)",
-    //     //            refs, obj, refs->refBase());
-    //     // IF_LOG_REMOTEREFS() {
-    //     //     LOG_REMOTEREFS("BR_RELEASE from driver on %p", obj);
-    //     //     obj->printRefs();
-    //     // }
-    //     // mPendingStrongDerefs.push(obj);
-
-    //         }
-    //         binder::BR_DECREFS => {
-    //             todo!("execute_command - BR_DECREFS");
-    //     // refs = (RefBase::weakref_type*)mIn.readPointer();
-    //     // obj = (BBinder*)mIn.readPointer();
-    //     // // NOTE: This assertion is not valid, because the object may no
-    //     // // longer exist (thus the (BBinder*)cast above resulting in a different
-    //     // // memory address).
-    //     // //ALOG_ASSERT(refs->refBase() == obj,
-    //     // //           "BR_DECREFS: object %p does not match cookie %p (expected %p)",
-    //     // //           refs, obj, refs->refBase());
-    //     // mPendingWeakDerefs.push(refs);
-    //         }
-    //         binder::BR_ATTEMPT_ACQUIRE => {
-    //             todo!("execute_command - BR_ATTEMPT_ACQUIRE");
-    //     // refs = (RefBase::weakref_type*)mIn.readPointer();
-    //     // obj = (BBinder*)mIn.readPointer();
-
-    //     // {
-    //     //     const bool success = refs->attemptIncStrong(mProcess.get());
-    //     //     ALOG_ASSERT(success && refs->refBase() == obj,
-    //     //                "BR_ATTEMPT_ACQUIRE: object %p does not match cookie %p (expected %p)",
-    //     //                refs, obj, refs->refBase());
-
-    //     //     mOut.writeInt32(BC_ACQUIRE_RESULT);
-    //     //     mOut.writeInt32((int32_t)success);
-    //     // }
-    //         }
-    //         binder::BR_NOOP => {}
-    //         binder::BR_SPAWN_LOOPER => {
-    //             todo!("execute_command - BR_SPAWN_LOOPER");
-    //         }
-    //         binder::BR_FINISHED => {
-    //             todo!("execute_command - BR_FINISHED");
-    //         }
-    //         binder::BR_DEAD_BINDER => {
-    //             todo!("Bexecute_command - R_DEAD_BINDER");
-    //         }
-    //         binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
-    //             todo!("execute_command - BR_CLEAR_DEATH_NOTIFICATION_DONE");
-    //         }
-    //         binder::BR_FAILED_REPLY => {
-    //             todo!("execute_command - BR_FAILED_REPLY");
-    //         }
-    //         binder::BR_FROZEN_REPLY => {
-    //             todo!("execute_command - BR_FROZEN_REPLY");
-    //         }
-    //         binder::BR_ONEWAY_SPAM_SUSPECT => {
-    //             todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
-    //         }
-    //         _ => {}
-    //     }
-
-    //     Ok(())
-    // }
-
-    // fn talk_with_driver(&mut self, do_receive: bool) -> Result<()> {
-    //     if ProcessState::as_self().read().unwrap().as_raw_fd() < 0 {
-    //         return Err(error::Error::from(error::ErrorKind::BadFd));
-    //     }
-
-    //     let need_read = self.in_parcel.is_empty();
-    //     let out_avail = if !do_receive || need_read {
-    //         self.out_parcel.len()
-    //     } else {
-    //         0
-    //     };
-
-    //     let read_size = if do_receive && need_read {
-    //         self.in_parcel.capacity()
-    //     } else {
-    //         0
-    //     };
-
-    //     let mut bwr = binder::binder_write_read {
-    //         write_size: out_avail as _,
-    //         write_consumed: 0,
-    //         write_buffer: self.out_parcel.as_mut_ptr() as _,
-    //         read_size: read_size as _,
-    //         read_consumed: 0,
-    //         read_buffer: self.in_parcel.as_mut_ptr() as _,
-    //     };
-
-    //     if bwr.write_size == 0 && bwr.read_size == 0 {
-    //         return Ok(())
-    //     }
-
-    //     unsafe {
-    //         loop {
-    //             let res = binder::write_read(ProcessState::as_self().read().unwrap().as_raw_fd(), &mut bwr);
-    //             match res {
-    //                 Ok(_) => break,
-    //                 Err(errno) if errno != nix::errno::Errno::EINTR => {
-    //                     return Err(Error::from(errno));
-    //                 },
-    //                 _ => {}
-    //             }
-
-    //         }
-    //     }
-
-    //     if bwr.write_consumed > 0 {
-    //         if bwr.write_consumed < self.out_parcel.len() as _ {
-    //             panic!("Driver did not consume write buffer. consumed: {} of {}",
-    //                 bwr.write_consumed, self.out_parcel.len());
-    //         } else {
-    //             self.out_parcel.set_len(0);
-    //             self.process_post_write_derefs();
-    //         }
-    //     }
-
-    //     if bwr.read_consumed > 0 {
-    //         self.in_parcel.set_len(bwr.read_consumed as _);
-    //         self.in_parcel.set_data_position(0);
-    //     }
-
-    //     Ok(())
-    // }
 
     fn process_post_write_derefs(&mut self) {
         self.post_weak_derefs.clear();
@@ -482,7 +193,43 @@ impl ThreadState {
         }
     }
 
-    fn write_transaction_data(&mut self, cmd: i32, flags: u32, handle: u32, code: u32, data: &Parcel) -> Result<()> {
+// status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
+//     int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
+// {
+//     binder_transaction_data tr;
+
+//     tr.target.ptr = 0; /* Don't pass uninitialized stack data to a remote process */
+//     tr.target.handle = handle;
+//     tr.code = code;
+//     tr.flags = binderFlags;
+//     tr.cookie = 0;
+//     tr.sender_pid = 0;
+//     tr.sender_euid = 0;
+
+//     const status_t err = data.errorCheck();
+//     if (err == NO_ERROR) {
+//         tr.data_size = data.ipcDataSize();
+//         tr.data.ptr.buffer = data.ipcData();
+//         tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
+//         tr.data.ptr.offsets = data.ipcObjects();
+//     } else if (statusBuffer) {
+//         tr.flags |= TF_STATUS_CODE;
+//         *statusBuffer = err;
+//         tr.data_size = sizeof(status_t);
+//         tr.data.ptr.buffer = reinterpret_cast<uintptr_t>(statusBuffer);
+//         tr.offsets_size = 0;
+//         tr.data.ptr.offsets = 0;
+//     } else {
+//         return (mLastError = err);
+//     }
+
+//     mOut.writeInt32(cmd);
+//     mOut.write(&tr, sizeof(tr));
+
+//     return NO_ERROR;
+// }
+
+    fn write_transaction_data(&mut self, cmd: u32, flags: u32, handle: u32, code: u32, data: &Parcel) -> Result<()> {
         let tr = binder_transaction_data {
             target: binder_transaction_data__bindgen_ty_1 {
                 handle: handle,
@@ -504,7 +251,7 @@ impl ThreadState {
             }
         };
 
-        self.out_parcel.write::<i32>(&cmd);
+        self.out_parcel.write::<u32>(&cmd)?;
         unsafe {
             let ptr = &tr as *const binder_transaction_data;
             self.out_parcel.write_data(
@@ -588,6 +335,19 @@ impl ThreadState {
 
 }
 
+pub(crate) fn set_call_restriction(call_restriction: CallRestriction) {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow_mut().call_restriction = call_restriction;
+    })
+}
+
+pub(crate) fn call_restriction() -> CallRestriction {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow().call_restriction
+    })
+}
+
+
 pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
@@ -602,8 +362,8 @@ enum UntilResponse<'a> {
     AcquireResult(ExceptionKind),
 }
 
-fn wait_for_response(until: &mut UntilResponse) -> Status<()> {
-    THREAD_STATE.with(|thread_state| -> Status<()> {
+fn wait_for_response(until: &mut UntilResponse) -> Result<()> {
+    THREAD_STATE.with(|thread_state| -> Result<()> {
         thread_state.borrow().out_parcel.dump();
 
         loop {
@@ -645,16 +405,16 @@ fn wait_for_response(until: &mut UntilResponse) -> Status<()> {
     })
 }
 
-fn execute_command(cmd: i32) -> Status<()> {
+fn execute_command(cmd: i32) -> Result<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
 
     println!("execute_command: {} {:?}", cmd, return_to_str(cmd));
 
-    THREAD_STATE.with(|thread_state| -> Status<()> {
+    THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
                 let other = thread_state.borrow_mut().in_parcel.read::<i32>()?;
-                return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".into()));
+                return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".to_owned()).into());
             }
             binder::BR_OK => {}
 
@@ -726,7 +486,7 @@ fn execute_command(cmd: i32) -> Status<()> {
                 let flags = tr_secctx.transaction_data.flags;
                 if (flags & transaction_flags_TF_ONE_WAY) == 0 {
                     let flags = flags & transaction_flags_TF_CLEAR_BUF;
-                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY as _, flags, u32::MAX, 0, &reply)?;
+                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply)?;
                     reply.set_len(0);
                     wait_for_response(&mut UntilResponse::TransactionComplete)?;
                 }
@@ -913,7 +673,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
     })
 }
 
-fn get_and_execute_command() -> Status<()> {
+fn get_and_execute_command() -> Result<()> {
     talk_with_driver(true)?;
 
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
@@ -1014,7 +774,7 @@ pub fn flash_if_needed() -> Result<bool> {
     })
 }
 
-pub fn handle_commands() -> Status<()> {
+pub fn handle_commands() -> Result<()> {
     while {
         get_and_execute_command()?;
 
@@ -1027,10 +787,10 @@ pub fn handle_commands() -> Status<()> {
     Ok(())
 }
 
-pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Status<()> {
+pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
     let mut strict_policy: i32 = reader.read()?;
 
-    THREAD_STATE.with(|thread_state| -> Status<()> {
+    THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut thread_state = thread_state.borrow_mut();
 
         if (thread_state.last_transaction_binder_flags() & FLAG_ONEWAY) != 0 {
@@ -1045,7 +805,7 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Status<()> {
         let header: u32 = reader.read()?;
         if header != INTERFACE_HEADER {
             return Err(Exception::new(0, ExceptionKind::BadParcelable,
-                format!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header)));
+                format!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header)).into());
         }
 
         Ok(())
@@ -1057,8 +817,43 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Status<()> {
     } else {
         Err(Exception::new(0, ExceptionKind::BadParcelable,
             format!("check_interface() expected '{}' but read '{}'",
-                T::get_descriptor(), parcel_interface.0)))
+                T::get_descriptor(), parcel_interface.0)).into())
     }
+}
+
+pub fn transact(handle: u32, code: u32, data: &Parcel, mut reply: Option<&mut Parcel>, mut flags: u32) -> Result<()> {
+    flags |= transaction_flags_TF_ACCEPT_FDS;
+
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let mut thread_state = thread_state.borrow_mut();
+        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data)?;
+
+        if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+            match thread_state.call_restriction {
+                CallRestriction::ErrorIfNotOneway => {
+                    error!("Process making non-oneway call (code: {}) but is restricted.", code)
+                },
+                CallRestriction::FatalIfNotOneway => {
+                    panic!("Process may not make non-oneway calls (code: {}).", code);
+                },
+                _ => (),
+            }
+
+            match reply {
+                Some(ref mut r) => wait_for_response(&mut UntilResponse::Reply(r))?,
+                None => {
+                    let mut fake_reply = Parcel::new();
+                    wait_for_response(&mut UntilResponse::Reply(&mut fake_reply))?
+                }
+            };
+        } else {
+            wait_for_response(&mut UntilResponse::TransactionComplete)?;
+        }
+
+        Ok(())
+    })?;
+
+    Ok(())
 }
 
 // status_t IPCThreadState::setupPolling(int* fd)

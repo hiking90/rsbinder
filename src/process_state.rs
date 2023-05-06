@@ -11,9 +11,21 @@ use crate::{
     binder::*,
     sys::binder,
     proxy::*,
+    parcel::*,
     native,
-    service_manager::BnServiceManager
+    thread_state,
+    service_manager::{BnServiceManager, BpServiceManager},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub enum CallRestriction {
+    // all calls okay
+    None,
+    // log when calls are blocking
+    ErrorIfNotOneway,
+    // abort process on blocking calls
+    FatalIfNotOneway,
+}
 
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
@@ -29,6 +41,7 @@ struct Inner {
     context_manager: Option<Arc<native::Binder<BnServiceManager>>>,
     handle_to_object: HashMap<u32, Weak<dyn IBinder>>,
     disable_background_scheduling: bool,
+    call_restriction: CallRestriction,
 }
 
 pub struct ProcessState {
@@ -48,12 +61,23 @@ impl ProcessState {
                 context_manager: None,
                 handle_to_object: HashMap::new(),
                 disable_background_scheduling: false,
+                call_restriction: CallRestriction::None,
             }),
         }
     }
 
     pub fn as_self() -> Arc<ProcessState> {
         PROCESS_STATE.clone()
+    }
+
+    pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
+        let mut inner = self.inner.write().unwrap();
+        inner.call_restriction = call_restriction;
+    }
+
+    pub(crate) fn call_restriction(&self) -> CallRestriction {
+        let inner = self.inner.read().unwrap();
+        inner.call_restriction
     }
 
     pub fn init(& self, driver: &str, max_threads: u32) -> bool {
@@ -77,8 +101,7 @@ impl ProcessState {
         inner.vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
         unsafe {
-            let mut vm_start: *mut libc::c_void = std::ptr::null_mut();
-            vm_start = libc::mmap(std::ptr::null_mut(),
+            let vm_start = libc::mmap(std::ptr::null_mut(),
                 inner.vm_size,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE | libc::MAP_NORESERVE, inner.driver_fd, 0);
@@ -123,11 +146,66 @@ impl ProcessState {
         inner.context_manager.clone()
     }
 
-    pub fn strong_proxy_for_handle(& self, handle: u32) -> Result<Arc<dyn IBinder>> {
+    pub fn context_object(&self) -> Option<Arc<Proxy<BpServiceManager>>>{
+        todo!()
+        // sp<IBinder> context = getStrongProxyForHandle(0);
+
+        // if (context) {
+        //     // The root object is special since we get it directly from the driver, it is never
+        //     // written by Parcell::writeStrongBinder.
+        //     internal::Stability::markCompilationUnit(context.get());
+        // } else {
+        //     ALOGW("Not able to get context object on %s.", mDriverName.c_str());
+        // }
+
+        // return context;
+    }
+
+    pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<Arc<dyn IBinder>> {
         let mut inner = self.inner.write().unwrap();
-        if let Some(binder) = inner.handle_to_object.get(&handle) {
-            if let Some(strong) = binder.upgrade() {
-                return Ok(strong);
+
+        match inner.handle_to_object.get(&handle) {
+            Some(binder) => {
+                return binder.upgrade().ok_or(ErrorKind::DeadObject.into());
+            },
+            None => {
+                if handle == 0 {
+                    let original_call_restriction = thread_state::call_restriction();
+                    thread_state::set_call_restriction(CallRestriction::None);
+
+                    let data = Parcel::new();
+                    thread_state::transact(0, PING_TRANSACTION, &data, None, 0)?;
+
+                    thread_state::set_call_restriction(original_call_restriction);
+
+        //             // Special case for context manager...
+        //             // The context manager is the only object for which we create
+        //             // a BpBinder proxy without already holding a reference.
+        //             // Perform a dummy transaction to ensure the context manager
+        //             // is registered before we create the first local reference
+        //             // to it (which will occur when creating the BpBinder).
+        //             // If a local reference is created for the BpBinder when the
+        //             // context manager is not present, the driver will fail to
+        //             // provide a reference to the context manager, but the
+        //             // driver API does not return status.
+        //             //
+        //             // Note that this is not race-free if the context manager
+        //             // dies while this code runs.
+
+        //             IPCThreadState* ipc = IPCThreadState::self();
+
+        //             CallRestriction originalCallRestriction = ipc->getCallRestriction();
+        //             ipc->setCallRestriction(CallRestriction::NONE);
+
+        //             Parcel data;
+        //             status_t status = ipc->transact(
+        //                     0, IBinder::PING_TRANSACTION, data, nullptr, 0);
+
+        //             ipc->setCallRestriction(originalCallRestriction);
+
+        //             if (status == DEAD_OBJECT)
+        //                return nullptr;
+                }
             }
         }
 
@@ -138,6 +216,68 @@ impl ProcessState {
         inner.handle_to_object.insert(handle, Arc::downgrade(&proxy));
 
         Ok(proxy)
+
+
+        // sp<IBinder> result;
+
+        // AutoMutex _l(mLock);
+
+        // handle_entry* e = lookupHandleLocked(handle);
+
+        // if (e != nullptr) {
+        //     // We need to create a new BpBinder if there isn't currently one, OR we
+        //     // are unable to acquire a weak reference on this current one.  The
+        //     // attemptIncWeak() is safe because we know the BpBinder destructor will always
+        //     // call expungeHandle(), which acquires the same lock we are holding now.
+        //     // We need to do this because there is a race condition between someone
+        //     // releasing a reference on this BpBinder, and a new reference on its handle
+        //     // arriving from the driver.
+        //     IBinder* b = e->binder;
+        //     if (b == nullptr || !e->refs->attemptIncWeak(this)) {
+        //         if (handle == 0) {
+        //             // Special case for context manager...
+        //             // The context manager is the only object for which we create
+        //             // a BpBinder proxy without already holding a reference.
+        //             // Perform a dummy transaction to ensure the context manager
+        //             // is registered before we create the first local reference
+        //             // to it (which will occur when creating the BpBinder).
+        //             // If a local reference is created for the BpBinder when the
+        //             // context manager is not present, the driver will fail to
+        //             // provide a reference to the context manager, but the
+        //             // driver API does not return status.
+        //             //
+        //             // Note that this is not race-free if the context manager
+        //             // dies while this code runs.
+
+        //             IPCThreadState* ipc = IPCThreadState::self();
+
+        //             CallRestriction originalCallRestriction = ipc->getCallRestriction();
+        //             ipc->setCallRestriction(CallRestriction::NONE);
+
+        //             Parcel data;
+        //             status_t status = ipc->transact(
+        //                     0, IBinder::PING_TRANSACTION, data, nullptr, 0);
+
+        //             ipc->setCallRestriction(originalCallRestriction);
+
+        //             if (status == DEAD_OBJECT)
+        //                return nullptr;
+        //         }
+
+        //         sp<BpBinder> b = BpBinder::PrivateAccessor::create(handle);
+        //         e->binder = b.get();
+        //         if (b) e->refs = b->getWeakRefs();
+        //         result = b;
+        //     } else {
+        //         // This little bit of nastyness is to allow us to add a primary
+        //         // reference to the remote proxy when this team doesn't have one
+        //         // but another team is sending the handle to us.
+        //         result.force_set(b);
+        //         e->refs->decWeak(this);
+        //     }
+        // }
+
+        // return result;
     }
 
     pub fn disable_background_scheduling(& self, disable: bool) {

@@ -11,6 +11,7 @@ libc = { version = "0.2", default-features = false }
 nix = "0"
 log = "0.4"
 pretty_hex = { version = "0", package = "pretty-hex" }
+thiserror = "1"
 
 [dev-dependencies]
 env_logger = "0"

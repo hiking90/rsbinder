@@ -53,7 +53,7 @@ impl<T: Remotable> Binder<T> {
         T::get_descriptor()
     }
 
-    pub fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Status<()> {
+    pub fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         // data.set_data_position(0);
         match code {
             PING_TRANSACTION => (),

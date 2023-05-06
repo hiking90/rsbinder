@@ -30,11 +30,16 @@ pub mod transactions {
     pub const getServiceDebugInfo: TransactionCode = FIRST_CALL_TRANSACTION + 11;
 }
 
-pub trait IServiceManager: Send {
-    fn get_service(&self, name: &str) -> Status<Option<Arc<dyn IBinder>>>;
-    fn check_service(&self, name: &str) -> Status<Option<Arc<dyn IBinder>>>;
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Status<()>;
+pub trait IServiceManager: Interface {
+    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
+    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
+    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Result<()>;
 }
+
+// lazy_static! {
+//     static ref DEFAULT_SERVICE_MANAGER: Arc<dyn IServiceManager> = Arc::new(ProcessState::new());
+// }
+
 
 struct Service {
     binder: Arc<dyn IBinder>,
@@ -68,16 +73,18 @@ impl BnServiceManager {
     }
 }
 
+impl Interface for BnServiceManager {}
+
 impl IServiceManager for BnServiceManager {
-    fn get_service(&self, name: &str) -> Status<Option<Arc<dyn IBinder>>> {
+    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
         Ok(self.try_get_service(name, true))
     }
 
-    fn check_service(&self, name: &str) -> Status<Option<Arc<dyn IBinder>>> {
+    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
         Ok(self.try_get_service(name, false))
     }
 
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, _allow_isolated: bool, _dump_priority: i32) -> Status<()> {
+    fn add_service(&self, name: String, service: Arc<dyn IBinder>, _allow_isolated: bool, _dump_priority: i32) -> Result<()> {
         self.name_to_service.lock().unwrap().insert(name, Service {
             binder: service,
             has_clients: false,
@@ -86,7 +93,6 @@ impl IServiceManager for BnServiceManager {
 
         Ok(())
     }
-
 }
 
 impl Remotable for BnServiceManager {
@@ -95,7 +101,7 @@ impl Remotable for BnServiceManager {
         "android.os.IServiceManager"
     }
 
-    fn on_transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Status<()> {
+    fn on_transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         // let mut reader = data.as_readable();
         thread_state::check_interface::<BnServiceManager>(reader)?;
 
@@ -154,7 +160,7 @@ impl Remotable for BnServiceManager {
             }
             _ => {
                 println!("Undefined transaction code {:?}", code);
-                return Err(Exception::from(ExceptionKind::UnsupportedOperation));
+                return Err(ExceptionKind::UnsupportedOperation.into());
             }
         };
         Ok(())
@@ -168,5 +174,47 @@ impl Remotable for BnServiceManager {
     fn get_class<T: InterfaceClassMethods>() -> InterfaceClass<T> {
         todo!("get_class()")
 
+    }
+}
+
+
+pub struct BpServiceManager {
+}
+
+impl BpServiceManager {
+    pub fn new() -> Self {
+        Self {
+            // name_to_service: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // fn try_get_service(&self, name: &str, start_if_not_found: bool) -> Option<Arc<dyn IBinder>> {
+    //     match self.name_to_service.lock().unwrap().get(name) {
+    //         Some(service) => {
+    //             Some(service.binder.clone())
+    //         }
+    //         None => {
+    //             if start_if_not_found == true {
+    //                 log::warn!("{} service could not be found. But, starting the service is not implemented yet.", name);
+    //             }
+    //             None
+    //         },
+    //     }
+    // }
+}
+
+impl Interface for BpServiceManager {}
+
+impl IServiceManager for BpServiceManager {
+    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+        todo!()
+    }
+
+    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+        todo!()
+    }
+
+    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Result<()> {
+        todo!()
     }
 }

@@ -1,15 +1,46 @@
+use std::error;
 use std::string::FromUtf16Error;
 use std::array::TryFromSliceError;
-use std::fmt;
-use std::io;
+
 use libc;
+use thiserror;
 
 use crate::parcelable::*;
 use crate::parcel::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
-pub type Status<T> = std::result::Result<T, Exception>;
+// pub type Status<T> = std::result::Result<T, Exception>;
 
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("IO error: {0:?}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Exception error: {0:?}")]
+    Exception(#[from] Exception),
+
+    #[error("Errno: {0:?}")]
+    Errno(#[from] nix::errno::Errno),
+
+    #[error("String error: {0:?}")]
+    Encoding(#[from] FromUtf16Error),
+
+    #[error("Array error: {0:?}")]
+    Slice(#[from] TryFromSliceError),
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Error::Io(err1), Error::Io(err2)) => err1.kind() == err2.kind(),
+            (Error::Exception(err1), Error::Exception(err2)) => err1 == err2,
+            (Error::Errno(err1), Error::Errno(err2)) => err1 == err2,
+            (Error::Encoding(_), Error::Encoding(_)) => true,
+            (Error::Slice(_), Error::Slice(_)) => true,
+            _ => false
+        }
+    }
+}
 
 const UNKNOWN_ERROR: isize = -2147483647-1;
 
@@ -38,80 +69,15 @@ pub enum ErrorKind {
     ServiceSpecific = -8,
 }
 
-
-
-#[derive(Debug)]
-pub enum Error {
-    ErrorKind(i32),
-    Any(Box<dyn std::error::Error>),
-}
-
 impl From<ErrorKind> for Error {
-    fn from(kind: ErrorKind) -> Error {
-        Error::ErrorKind(kind as _)
+    fn from(kind: ErrorKind) -> Self {
+        Exception {
+            code: kind as _,
+            exception: ErrorKind::ServiceSpecific as _,
+            message: format!("ErrorKind: {:?}", kind),
+        }.into()
     }
 }
-
-impl From<i32> for Error {
-    fn from(code: i32) -> Error {
-        Error::ErrorKind(code as _)
-    }
-}
-
-// impl From<(i32, Option<String>)> for Error {
-//     fn from(exception: (i32, Option<String>)) -> Error {
-//         Error {
-//             inner: Inner::Exception(exception.0, ExceptionKind::ServiceSpecific, exception.1)
-//         }
-//     }
-// }
-
-// impl From<(Exception, Option<String>)> for Error {
-//     fn from(exception: (Exception, Option<String>)) -> Error {
-//         Error {
-//             inner: Inner::Exception(0, exception.0, exception.1)
-//         }
-//     }
-// }
-
-impl From<nix::errno::Errno> for Error {
-    fn from(err: nix::errno::Errno) -> Error {
-        Error::ErrorKind(err as _)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Error {
-        Error::Any(Box::new(err))
-    }
-}
-
-impl From<TryFromSliceError> for Error {
-    fn from(err: TryFromSliceError) -> Error {
-        Error::Any(Box::new(err))
-    }
-}
-
-impl From<FromUtf16Error> for Error {
-    fn from(err: FromUtf16Error) -> Error {
-        Error::Any(Box::new(err))
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::ErrorKind(error) => {
-                write!(fmt, "rsbinder::ErrorKind {}", error)
-            }
-            // Inner::Exception(code, exception, message) => {
-            //     write!(fmt, "rsbinder::Error Exception {:?}, Code: {}, Message: {:?}", exception, code, message)
-            // }
-            Error::Any(ref e) => e.fmt(fmt),
-        }
-    }
-}
-
 
 #[derive(Clone, Copy, Debug)]
 pub enum ExceptionKind {
@@ -151,65 +117,61 @@ impl Exception {
     }
 }
 
-impl From<ExceptionKind> for Exception {
-    fn from(exception: ExceptionKind) -> Self {
+impl From<ExceptionKind> for Error {
+    fn from(kind: ExceptionKind) -> Self {
         Exception {
             code: 0,
-            exception: exception as _,
-            message: format!("ExceptionKind: {:?}", exception),
-        }
+            exception: kind as _,
+            message: format!("ExceptionKind: {:?}", kind),
+        }.into()
     }
 }
 
-impl From<Error> for Exception {
-    fn from(error: Error) -> Exception {
-        match error {
-            Error::ErrorKind(code) => {
-                Exception {
-                    code: code,
-                    exception: ErrorKind::ServiceSpecific as _,
-                    message: format!("ErrorKind {}", code),
-                }
-
-            }
-            Error::Any(ref e) => {
-                Exception {
-                    code: ErrorKind::Unknown as _,
-                    exception: ExceptionKind::IllegalState as _,
-                    message: format!("{:?}", e),
-                }
-            }
-        }
+impl std::fmt::Display for Exception {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Exception (code: {}, exception: {}): {}", self.code, self.exception, self.message)
     }
 }
 
+impl error::Error for Exception {}
 
-impl<T> Serialize for Status<T> {
+impl<T> Serialize for Result<T> {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         match self {
             Ok(_) => {
                 parcel.write::<i32>(&0)?;
             }
             Err(err) => {
-                let exception = err.exception;
-                if exception == ExceptionKind::TransactionFailed as i32 {
-                    return Err(Error::from(ErrorKind::FailedTransaction))
-                }
+                let code = match err {
+                    Error::Exception(exception) => {
+                        if exception.exception == ExceptionKind::TransactionFailed as i32 {
+                            return Err(Error::Exception(exception.clone()))
+                        }
 
-                parcel.write::<i32>(&exception)?;
-                if exception == ExceptionKind::None as i32 {
-                    return Ok(())
-                }
+                        parcel.write::<i32>(&exception.exception)?;
+                        if exception.exception == ExceptionKind::None as i32 {
+                            return Ok(())
+                        }
 
-                parcel.write(&String16(err.message.clone()))?;
+                        parcel.write(&String16(exception.message.clone()))?;
+
+                        if exception.exception == ExceptionKind::ServiceSpecific as i32 {
+                            exception.code
+                        } else {
+                            0
+                        }
+                    },
+                    _ => {
+                        parcel.write::<i32>(&(ExceptionKind::JustError as i32))?;
+                        let message = format!("{:?}", err);
+                        parcel.write(&String16(message))?;
+
+                        0
+                    },
+                };
+
                 parcel.write::<i32>(&0)?;
-                if exception == ExceptionKind::ServiceSpecific as i32 {
-                    // There are no usecases in Android. So, it just set 0.
-                    parcel.write::<i32>(&err.code)?;
-                } else {
-                    parcel.write::<i32>(&0)?;
-                }
-
+                parcel.write::<i32>(&code)?;
             }
         }
 
@@ -217,7 +179,7 @@ impl<T> Serialize for Status<T> {
     }
 }
 
-impl Deserialize for Status<()> {
+impl Deserialize for Result<()> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let exception = parcel.read::<i32>()?;
 
@@ -232,7 +194,7 @@ impl Deserialize for Status<()> {
                 code: code,
                 exception: exception,
                 message: message.0,
-            })
+            }.into())
         };
 
         Ok(status)
@@ -246,13 +208,13 @@ mod tests {
     #[test]
     fn test_status_parcelable() -> Result<()> {
         let ok = Ok(());
-        let illegal_status = Status::<()>::Err(
-            Exception::new(0, ExceptionKind::IllegalArgument as _, "IllegalArgument".to_string()));
-        let failed_status = Status::<()>::Err(
-            Exception::new(0, ExceptionKind::TransactionFailed as _, "TransactionFailed".to_string()));
-        let service_specific_status = Status::<()>::Err(
+        let illegal_status = Result::<()>::Err(
+            Exception::new(0, ExceptionKind::IllegalArgument as _, "IllegalArgument".to_owned()).into());
+        let failed_status = Result::<()>::Err(
+            Exception::new(0, ExceptionKind::TransactionFailed as _, "TransactionFailed".to_owned()).into());
+        let service_specific_status = Result::<()>::Err(
             Exception::new(ErrorKind::NameNotFound as _,
-                ExceptionKind::ServiceSpecific as _, "IllegalArgument".to_string()));
+                ExceptionKind::ServiceSpecific as _, "IllegalArgument".to_owned()).into());
 
         let mut parcel = Parcel::new();
 
@@ -264,10 +226,10 @@ mod tests {
         }
 
         {
-            assert_eq!(parcel.read::<Status<()>>()?, ok);
-            assert_eq!(parcel.read::<Status<()>>()?, illegal_status);
-            assert_eq!(parcel.read::<Status<()>>()?, service_specific_status);
-            assert_eq!(parcel.read::<Status<()>>().is_err(), true);
+            assert_eq!(parcel.read::<Result<()>>()?, ok);
+            assert_eq!(parcel.read::<Result<()>>()?, illegal_status);
+            assert_eq!(parcel.read::<Result<()>>()?, service_specific_status);
+            assert_eq!(parcel.read::<Result<()>>().is_err(), true);
         }
 
         Ok(())

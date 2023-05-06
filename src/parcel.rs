@@ -214,7 +214,7 @@ impl Parcel {
             self.pos = pos + len;
             Ok(&self.data.as_slice()[pos .. pos + len])
         } else {
-            Err(Error::from(ErrorKind::NotEnoughData))
+            Err(ErrorKind::NotEnoughData.into())
         }
     }
 

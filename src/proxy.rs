@@ -2,8 +2,10 @@
 use std::any::Any;
 
 use crate::{
+    parcel::*,
     binder::*,
     error::*,
+    thread_state,
 };
 
 
@@ -39,7 +41,17 @@ impl<I: 'static +  Interface> IBinder for Proxy<I> {
 
     /// Send a ping transaction to this object
     fn ping_binder(&mut self) -> Result<()> {
-        todo!("IBinder for Proxy<I> - ping_binder")
+        let data = Parcel::new();
+        let mut reply = Parcel::new();
+        thread_state::transact(self.handle, PING_TRANSACTION, &data, Some(&mut reply), 0)?;
+
+        Ok(())
+
+    // Parcel data;
+    // data.markForBinder(sp<BpBinder>::fromExisting(this));
+    // Parcel reply;
+    // return transact(PING_TRANSACTION, data, &reply);
+
     }
 
     fn as_any(&self) -> &dyn Any {
