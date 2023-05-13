@@ -735,6 +735,28 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
+// pub fn inc_weak_handle()
+
+// void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
+// {
+//     LOG_REMOTEREFS("IPCThreadState::incWeakHandle(%d)\n", handle);
+//     mOut.writeInt32(BC_INCREFS);
+//     mOut.writeInt32(handle);
+//     if (!flushIfNeeded()) {
+//         // Create a temp reference until the driver has handled this command.
+//         proxy->getWeakRefs()->incWeak(mProcess.get());
+//         mPostWriteWeakDerefs.push(proxy->getWeakRefs());
+//     }
+// }
+
+// void IPCThreadState::decWeakHandle(int32_t handle)
+// {
+//     LOG_REMOTEREFS("IPCThreadState::decWeakHandle(%d)\n", handle);
+//     mOut.writeInt32(BC_DECREFS);
+//     mOut.writeInt32(handle);
+//     flushIfNeeded();
+// }
+
 
 // void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
 // {
@@ -824,34 +846,34 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
 pub fn transact(handle: u32, code: u32, data: &Parcel, mut reply: Option<&mut Parcel>, mut flags: u32) -> Result<()> {
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    let call_restriction = THREAD_STATE.with(|thread_state| -> Result<CallRestriction> {
         let mut thread_state = thread_state.borrow_mut();
         thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data)?;
 
-        if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-            match thread_state.call_restriction {
-                CallRestriction::ErrorIfNotOneway => {
-                    error!("Process making non-oneway call (code: {}) but is restricted.", code)
-                },
-                CallRestriction::FatalIfNotOneway => {
-                    panic!("Process may not make non-oneway calls (code: {}).", code);
-                },
-                _ => (),
-            }
+        Ok(thread_state.call_restriction)
+    })?;
 
-            match reply {
-                Some(ref mut r) => wait_for_response(&mut UntilResponse::Reply(r))?,
-                None => {
-                    let mut fake_reply = Parcel::new();
-                    wait_for_response(&mut UntilResponse::Reply(&mut fake_reply))?
-                }
-            };
-        } else {
-            wait_for_response(&mut UntilResponse::TransactionComplete)?;
+    if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+        match call_restriction {
+            CallRestriction::ErrorIfNotOneway => {
+                error!("Process making non-oneway call (code: {}) but is restricted.", code)
+            },
+            CallRestriction::FatalIfNotOneway => {
+                panic!("Process may not make non-oneway calls (code: {}).", code);
+            },
+            _ => (),
         }
 
-        Ok(())
-    })?;
+        match reply {
+            Some(ref mut r) => wait_for_response(&mut UntilResponse::Reply(r))?,
+            None => {
+                let mut fake_reply = Parcel::new();
+                wait_for_response(&mut UntilResponse::Reply(&mut fake_reply))?
+            }
+        };
+    } else {
+        wait_for_response(&mut UntilResponse::TransactionComplete)?;
+    }
 
     Ok(())
 }

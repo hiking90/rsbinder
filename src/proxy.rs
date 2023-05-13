@@ -8,26 +8,49 @@ use crate::{
     thread_state,
 };
 
+pub struct Unknown {}
 
-pub struct Proxy<I: Interface> {
-    handle: u32,
-    interface: I,
+impl Interface for Unknown {
 }
 
-impl<I: Interface> Proxy<I> {
-    pub fn new(handle: u32, interface: I) -> Self {
+
+pub struct Proxy {
+    handle: u32,
+    interface: Option<Box<dyn Interface>>,
+}
+
+impl Proxy {
+    pub fn new(handle: u32) -> Self {
         Self {
             handle: handle,
-            interface: interface,
+            interface: None,
+        }
+    }
+
+    pub fn new_with(handle: u32, interface: Box<dyn Interface>) -> Self {
+        Self {
+            handle: handle,
+            interface: Some(interface),
         }
     }
 
     pub fn handle(&self) -> u32 {
         self.handle
     }
+
+    pub fn interface(&self) -> Option<&Box<dyn Interface>> {
+        self.interface.as_ref()
+    }
+
+    pub fn set_interface(&mut self, interface: Box<dyn Interface>) {
+        self.interface = match self.interface {
+            Some(_) => panic!("interface can't be set twice!!!"),
+            None => Some(interface),
+        };
+    }
 }
 
-impl<I: 'static +  Interface> IBinder for Proxy<I> {
+impl IBinder for Proxy {
     fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("IBinder for Proxy<I> - link_to_death")
     }

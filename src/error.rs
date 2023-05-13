@@ -102,9 +102,9 @@ pub enum ExceptionKind {
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct Exception {
-    code: i32,
-    exception: i32,
-    message: String,
+    pub code: i32,
+    pub exception: i32,
+    pub message: String,
 }
 
 impl Exception {

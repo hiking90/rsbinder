@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::path::Path;
@@ -14,7 +15,7 @@ use crate::{
     parcel::*,
     native,
     thread_state,
-    service_manager::{BnServiceManager, BpServiceManager},
+    service_manager::{BnServiceManager},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -34,18 +35,13 @@ lazy_static! {
     static ref PROCESS_STATE: Arc<ProcessState> = Arc::new(ProcessState::new());
 }
 
-struct Inner {
-    driver_fd: RawFd,
-    vm_start: *mut std::ffi::c_void,
-    vm_size: usize,
-    context_manager: Option<Arc<native::Binder<BnServiceManager>>>,
-    handle_to_object: HashMap<u32, Weak<dyn IBinder>>,
-    disable_background_scheduling: bool,
-    call_restriction: CallRestriction,
-}
-
 pub struct ProcessState {
-    inner: RwLock<Inner>,
+    driver_fd: RwLock<RawFd>,
+    mmap: RwLock<(*mut std::ffi::c_void, usize)>,
+    context_manager: RwLock<Option<Arc<native::Binder<BnServiceManager>>>>,
+    handle_to_object: RwLock<HashMap<u32, Weak<dyn IBinder>>>,
+    disable_background_scheduling: AtomicBool,
+    call_restriction: RwLock<CallRestriction>,
 }
 
 unsafe impl Sync for ProcessState {}
@@ -54,15 +50,12 @@ unsafe impl Send for ProcessState {}
 impl ProcessState {
     fn new() -> Self {
         ProcessState {
-            inner: RwLock::new(Inner {
-                driver_fd: -1,
-                vm_start: std::ptr::null_mut(),
-                vm_size: 0,
-                context_manager: None,
-                handle_to_object: HashMap::new(),
-                disable_background_scheduling: false,
-                call_restriction: CallRestriction::None,
-            }),
+            driver_fd: RwLock::new(-1),
+            mmap: RwLock::new((std::ptr::null_mut(), 0)),
+            context_manager: RwLock::new(None),
+            handle_to_object: RwLock::new(HashMap::new()),
+            disable_background_scheduling: AtomicBool::new(false),
+            call_restriction: RwLock::new(CallRestriction::None),
         }
     }
 
@@ -71,18 +64,16 @@ impl ProcessState {
     }
 
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
-        let mut inner = self.inner.write().unwrap();
-        inner.call_restriction = call_restriction;
+        let mut self_call_restriction = self.call_restriction.write().unwrap();
+        *self_call_restriction = call_restriction;
     }
 
     pub(crate) fn call_restriction(&self) -> CallRestriction {
-        let inner = self.inner.read().unwrap();
-        inner.call_restriction
+        *self.call_restriction.read().unwrap()
     }
 
     pub fn init(& self, driver: &str, max_threads: u32) -> bool {
-        let mut inner = self.inner.write().unwrap();
-        if inner.driver_fd != -1 {
+        if *self.driver_fd.read().unwrap() != -1 {
             log::warn!("ProcessState has been initialized.");
             return false;
         }
@@ -93,127 +84,85 @@ impl ProcessState {
             DEFAULT_MAX_BINDER_THREADS
         };
 
-        inner.driver_fd = match open_driver(Path::new(driver), max_threads) {
+        *self.driver_fd.write().unwrap() = match open_driver(Path::new(driver), max_threads) {
             Some(fd) => fd,
             None => return false
         };
 
-        inner.vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
+        let vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
         unsafe {
+            let mut driver_fd = self.driver_fd.write().unwrap();
             let vm_start = libc::mmap(std::ptr::null_mut(),
-                inner.vm_size,
+                vm_size,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_NORESERVE, inner.driver_fd, 0);
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE, *driver_fd, 0);
 
             if vm_start == libc::MAP_FAILED {
-                libc::close(inner.driver_fd);
-                inner.driver_fd = -1;
+                libc::close(*driver_fd);
+                *driver_fd = -1;
                 return false;
             }
 
-            inner.vm_start = vm_start;
+            *self.mmap.write().unwrap() = (vm_start, vm_size);
         }
 
         true
     }
 
     pub fn become_context_manager(& self) -> bool {
-        let mut inner = self.inner.write().unwrap();
-
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
         unsafe {
-            if let Err(_) = binder::set_context_mgr_ext(inner.driver_fd, &obj) {
+            let driver_fd = self.driver_fd.read().unwrap();
+            if let Err(_) = binder::set_context_mgr_ext(*driver_fd, &obj) {
                 //     android_errorWriteLog(0x534e4554, "121035042");
                 let unused: i32 = 0;
-                if let Err(e) = binder::set_context_mgr(inner.driver_fd, &unused) {
+                if let Err(e) = binder::set_context_mgr(*driver_fd, &unused) {
                     log::error!("Binder ioctl to become context manager failed: {}", e.to_string());
                     return false;
                 }
             }
         }
 
-        inner.context_manager = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
+        *self.context_manager.write().unwrap() = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
 
         true
     }
 
     pub fn context_manager(&self) -> Option<Arc<native::Binder<BnServiceManager>>> {
-        let inner = self.inner.read().unwrap();
-        inner.context_manager.clone()
+        self.context_manager.read().unwrap().clone()
     }
 
-    pub fn context_object(&self) -> Option<Arc<Proxy<BpServiceManager>>>{
-        todo!()
-        // sp<IBinder> context = getStrongProxyForHandle(0);
-
-        // if (context) {
-        //     // The root object is special since we get it directly from the driver, it is never
-        //     // written by Parcell::writeStrongBinder.
-        //     internal::Stability::markCompilationUnit(context.get());
-        // } else {
-        //     ALOGW("Not able to get context object on %s.", mDriverName.c_str());
-        // }
-
-        // return context;
+    pub fn context_object(&self) -> Result<Arc<dyn IBinder>> {
+        self.strong_proxy_for_handle(0)
     }
 
     pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<Arc<dyn IBinder>> {
-        let mut inner = self.inner.write().unwrap();
+        if let Some(binder) = self.handle_to_object.read().unwrap().get(&handle) {
+            return binder.upgrade().ok_or(ErrorKind::DeadObject.into());
+        }
 
-        match inner.handle_to_object.get(&handle) {
-            Some(binder) => {
-                return binder.upgrade().ok_or(ErrorKind::DeadObject.into());
-            },
-            None => {
-                if handle == 0 {
-                    let original_call_restriction = thread_state::call_restriction();
-                    thread_state::set_call_restriction(CallRestriction::None);
+        if handle == 0 {
+            let original_call_restriction = thread_state::call_restriction();
+            thread_state::set_call_restriction(CallRestriction::None);
 
-                    let data = Parcel::new();
-                    thread_state::transact(0, PING_TRANSACTION, &data, None, 0)?;
+            let data = Parcel::new();
+            let result = thread_state::transact(0, PING_TRANSACTION, &data, None, 0);
 
-                    thread_state::set_call_restriction(original_call_restriction);
+            thread_state::set_call_restriction(original_call_restriction);
 
-        //             // Special case for context manager...
-        //             // The context manager is the only object for which we create
-        //             // a BpBinder proxy without already holding a reference.
-        //             // Perform a dummy transaction to ensure the context manager
-        //             // is registered before we create the first local reference
-        //             // to it (which will occur when creating the BpBinder).
-        //             // If a local reference is created for the BpBinder when the
-        //             // context manager is not present, the driver will fail to
-        //             // provide a reference to the context manager, but the
-        //             // driver API does not return status.
-        //             //
-        //             // Note that this is not race-free if the context manager
-        //             // dies while this code runs.
-
-        //             IPCThreadState* ipc = IPCThreadState::self();
-
-        //             CallRestriction originalCallRestriction = ipc->getCallRestriction();
-        //             ipc->setCallRestriction(CallRestriction::NONE);
-
-        //             Parcel data;
-        //             status_t status = ipc->transact(
-        //                     0, IBinder::PING_TRANSACTION, data, nullptr, 0);
-
-        //             ipc->setCallRestriction(originalCallRestriction);
-
-        //             if (status == DEAD_OBJECT)
-        //                return nullptr;
+            if let Err(Error::Exception(exception)) = result {
+                if exception.code == ErrorKind::DeadObject as _ {
+                    return Err(exception.into())
                 }
             }
         }
 
-        let proxy: Arc<dyn IBinder> = Arc::new(Proxy::new(handle, Unknown {}));
-        // if handle != 0 {
-        //     thread_state::inc_strong_handle(handle, proxy.clone())?;
-        // }
-        inner.handle_to_object.insert(handle, Arc::downgrade(&proxy));
+        let proxy: Arc<dyn IBinder> = Arc::new(Proxy::new(handle));
+        self.handle_to_object.write().unwrap().insert(handle, Arc::downgrade(&proxy));
 
         Ok(proxy)
 
@@ -281,13 +230,11 @@ impl ProcessState {
     }
 
     pub fn disable_background_scheduling(& self, disable: bool) {
-        let mut inner = self.inner.write().unwrap();
-        inner.disable_background_scheduling = disable;
+        self.disable_background_scheduling.store(disable, Ordering::Relaxed);
     }
 
     pub fn background_scheduling_disabled(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        inner.disable_background_scheduling
+        self.disable_background_scheduling.load(Ordering::Relaxed)
     }
 }
 
@@ -329,21 +276,21 @@ fn open_driver(driver: &Path, max_threads: u32) -> Option<RawFd> {
 
 impl AsRawFd for ProcessState {
     fn as_raw_fd(&self) -> RawFd {
-        let inner = self.inner.read().unwrap();
-        inner.driver_fd
+        *self.driver_fd.read().unwrap()
     }
 }
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mut inner = self.inner.write().unwrap();
-        if inner.driver_fd != -1 {
+        let mut driver_fd = self.driver_fd.write().unwrap();
+        if *driver_fd != -1 {
             unsafe {
-                libc::munmap(inner.vm_start, inner.vm_size);
-                libc::close(inner.driver_fd);
-                inner.vm_start = std::ptr::null_mut();
+                let mut mmap = self.mmap.write().unwrap();
+                libc::munmap(mmap.0, mmap.1);
+                libc::close(*driver_fd);
+                mmap.0 = std::ptr::null_mut();
             }
-            inner.driver_fd = -1;
+            *driver_fd = -1;
         }
     }
 }

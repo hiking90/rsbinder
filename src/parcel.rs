@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_dyn_ibinder() -> Result<()> {
-        let proxy: Arc<dyn IBinder> = Arc::new(proxy::Proxy::new(0, Unknown {}));
+        let proxy: Arc<dyn IBinder> = Arc::new(proxy::Proxy::new(0));
         let raw = Arc::into_raw(proxy.clone());
 
         let mut parcel = Parcel::new();

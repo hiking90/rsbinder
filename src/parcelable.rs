@@ -363,7 +363,7 @@ impl Serialize for Arc<dyn IBinder> {
         };
 
         let obj = if self.is_remote() {
-            let proxy = self.as_any().downcast_ref::<Proxy<Unknown>>().expect("Downcast to Proxy<Unknown>");
+            let proxy = self.as_any().downcast_ref::<Proxy>().expect("Downcast to Proxy<Unknown>");
 
             flat_binder_object {
                 hdr: binder_object_header {
@@ -415,10 +415,10 @@ impl Deserialize for Arc<dyn IBinder> {
                 }
 
                 BINDER_TYPE_HANDLE => {
-                    println!("BINDER_TYPE_HANDLE start");
+                    // println!("BINDER_TYPE_HANDLE start");
                     let res = ProcessState::as_self()
                         .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
-                    println!("BINDER_TYPE_HANDLE end");
+                    // println!("BINDER_TYPE_HANDLE end");
                     res
                 }
 

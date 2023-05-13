@@ -85,11 +85,6 @@ pub trait Interface: Send + Sync {
     }
 }
 
-pub struct Unknown {}
-
-impl Interface for Unknown {
-}
-
 // ///
 // /// # Example
 // ///
@@ -152,9 +147,9 @@ impl dyn IBinder {
         self.as_any().downcast_ref::<&native::Binder<T>>().unwrap()
     }
 
-    pub fn as_proxy<T: 'static + Interface>(&self) -> &proxy::Proxy<T> {
-        self.as_any().downcast_ref::<&proxy::Proxy<T>>().unwrap()
-    }
+    // pub fn as_proxy<T: 'static + Interface>(&self) -> &proxy::Proxy {
+    //     self.as_any().downcast_ref::<&proxy::Proxy<T>>().unwrap()
+    // }
 }
 
 pub fn cookie_for_binder(binder: Arc<dyn IBinder>) -> u64 {
