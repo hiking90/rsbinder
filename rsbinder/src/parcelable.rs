@@ -415,11 +415,9 @@ impl Deserialize for Arc<dyn IBinder> {
                 }
 
                 BINDER_TYPE_HANDLE => {
-                    // println!("BINDER_TYPE_HANDLE start");
                     let res = ProcessState::as_self()
-                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
-                    // println!("BINDER_TYPE_HANDLE end");
-                    res
+                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle, Box::new(Unknown {}));
+                    Ok(res?)
                 }
 
                 _ => {

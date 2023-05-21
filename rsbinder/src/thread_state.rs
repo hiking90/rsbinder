@@ -1,4 +1,4 @@
-use std::sync::{Arc, Weak};
+use std::sync::{Arc};
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use log::error;
@@ -10,8 +10,7 @@ use crate::{
     process_state::*,
     parcelable::*,
     sys::*,
-    native,
-    service_manager,
+    proxy::*,
 };
 
 thread_local! {
@@ -121,7 +120,7 @@ pub struct ThreadState {
     is_looper: bool,
     is_flushing: bool,
     post_strong_derefs: Vec<Arc<dyn IBinder>>,
-    post_weak_derefs: Vec<Weak<dyn IBinder>>,
+    post_weak_derefs: Vec<Arc<dyn IBinder>>,
     call_restriction: CallRestriction,
 }
 
@@ -235,9 +234,9 @@ impl ThreadState {
                 handle: handle,
                 // ptr: 0,
             },
+            cookie: 0,
             code: code,
             flags: flags,
-            cookie: 0,
             sender_pid: 0,
             sender_euid: 0,
             data_size: data.len() as _,
@@ -250,6 +249,11 @@ impl ThreadState {
                 // buf: ,  // [__u8; 8usize],
             }
         };
+        // TODO:
+        // tr.data_size = data.ipcDataSize();
+        // tr.data.ptr.buffer = data.ipcData();
+        // tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
+        // tr.data.ptr.offsets = data.ipcObjects();
 
         self.out_parcel.write::<u32>(&cmd)?;
         unsafe {
@@ -261,78 +265,6 @@ impl ThreadState {
 
         Ok(())
     }
-
-    // fn wait_for_response(&mut self, reply: &mut Parcel) -> Result<()> {
-    //     loop {
-    //         self.talk_with_driver(true)?;
-    //         if self.in_parcel.is_empty() {
-    //             continue;
-    //         }
-
-    //         let cmd: u32 = self.in_parcel.as_readable().read::<i32>()? as _;
-    //         match cmd {
-    //             binder::BR_ONEWAY_SPAM_SUSPECT => {
-    //                 todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
-    //             },
-    //             binder::BR_TRANSACTION_COMPLETE => (),
-    //             binder::BR_DEAD_REPLY => {
-    //                 todo!("wait_for_response - BR_DEAD_REPLY");
-    //             },
-    //             binder::BR_FAILED_REPLY => {
-    //                 todo!("wait_for_response - BR_FAILED_REPLY");
-    //             },
-    //             binder::BR_FROZEN_REPLY => {
-    //                 todo!("wait_for_response - BR_FROZEN_REPLY");
-    //             },
-    //             binder::BR_ACQUIRE_RESULT => {
-    //                 todo!("wait_for_response - BR_ACQUIRE_RESULT");
-    //             },
-    //             binder::BR_REPLY => {
-    //                 todo!("wait_for_response - BR_REPLY");
-    //             },
-    //             _ => self.execute_command(cmd as _)?,
-    //         };
-    //     }
-
-    //     Ok(())
-    // }
-
-// status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
-//     int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
-// {
-//     binder_transaction_data tr;
-
-//     tr.target.ptr = 0; /* Don't pass uninitialized stack data to a remote process */
-//     tr.target.handle = handle;
-//     tr.code = code;
-//     tr.flags = binderFlags;
-//     tr.cookie = 0;
-//     tr.sender_pid = 0;
-//     tr.sender_euid = 0;
-
-//     const status_t err = data.errorCheck();
-//     if (err == NO_ERROR) {
-//         tr.data_size = data.ipcDataSize();
-//         tr.data.ptr.buffer = data.ipcData();
-//         tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
-//         tr.data.ptr.offsets = data.ipcObjects();
-//     } else if (statusBuffer) {
-//         tr.flags |= TF_STATUS_CODE;
-//         *statusBuffer = err;
-//         tr.data_size = sizeof(status_t);
-//         tr.data.ptr.buffer = reinterpret_cast<uintptr_t>(statusBuffer);
-//         tr.offsets_size = 0;
-//         tr.data.ptr.offsets = 0;
-//     } else {
-//         return (mLastError = err);
-//     }
-
-//     mOut.writeInt32(cmd);
-//     mOut.write(&tr, sizeof(tr));
-
-//     return NO_ERROR;
-// }
-
 }
 
 pub(crate) fn set_call_restriction(call_restriction: CallRestriction) {
@@ -356,24 +288,24 @@ pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
     Ok(ProcessState::as_self().as_raw_fd())
 }
 
-enum UntilResponse<'a> {
-    Reply(&'a mut Parcel),
+enum UntilResponse {
+    Reply,
     TransactionComplete,
-    AcquireResult(ExceptionKind),
+    AcquireResult(ErrorKind),
 }
 
-fn wait_for_response(until: &mut UntilResponse) -> Result<()> {
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        thread_state.borrow().out_parcel.dump();
-
+fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
+    THREAD_STATE.with(|thread_state| -> Result<Option<Parcel>> {
         loop {
             talk_with_driver(true)?;
 
             if thread_state.borrow().in_parcel.is_empty()  {
                 continue;
             }
-
             let cmd: u32 = thread_state.borrow_mut().in_parcel.read::<i32>()? as _;
+
+            log::trace!("{:?}", return_to_str(cmd));
+
             match cmd {
                 binder::BR_ONEWAY_SPAM_SUSPECT => {
                     todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
@@ -393,22 +325,66 @@ fn wait_for_response(until: &mut UntilResponse) -> Result<()> {
                     todo!("wait_for_response - BR_FROZEN_REPLY");
                 },
                 binder::BR_ACQUIRE_RESULT => {
-                    todo!("wait_for_response - BR_ACQUIRE_RESULT");
+                    let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
+                    if let UntilResponse::AcquireResult(exception) = until {
+                        *exception = if result != 0 {
+                            ErrorKind::NoError
+                        } else {
+                            ErrorKind::InvalidOperation
+                        };
+                        break
+                    }
                 },
                 binder::BR_REPLY => {
-                    todo!("wait_for_response - BR_REPLY");
+                    let tr = thread_state.borrow_mut().in_parcel.read::<binder::binder_transaction_data>()?;
+
+                    if let UntilResponse::Reply = until {
+                        if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
+                            let reply = unsafe {
+                                Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
+                                    tr.data.ptr.offsets as _,
+                                    (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
+                                    free_buffer)
+                            };
+
+                            return Ok(Some(reply));
+                        } else {
+                            unsafe {
+                                let status = *(tr.data.ptr.buffer as *const i32);
+                                free_buffer(None,
+                                    tr.data.ptr.buffer,
+                                    tr.data_size as _,
+                                    tr.data.ptr.offsets,
+                                    (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
+
+                                if status != ErrorKind::NoError as _ {
+                                    return Err(Exception {
+                                        code: status,
+                                        exception: 0,
+                                        message: "binder::BR_REPLY".to_owned()
+                                    }.into());
+                                }
+                            };
+                        }
+                    } else {
+                        unsafe {
+                            free_buffer(None,
+                                tr.data.ptr.buffer,
+                                tr.data_size as _,
+                                tr.data.ptr.offsets,
+                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
+                        }
+                    }
                 },
                 _ => execute_command(cmd as _)?,
             };
         };
-        Ok(())
+        Ok(None)
     })
 }
 
 fn execute_command(cmd: i32) -> Result<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
-
-    println!("execute_command: {} {:?}", cmd, return_to_str(cmd));
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
@@ -436,7 +412,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                     let tr = &tr_secctx.transaction_data;
 
                     Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
-                        tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>())
+                        tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
+                        free_buffer)
                 };
 
                 // TODO: Skip now, because if below implmentation is mandatory.
@@ -621,7 +598,6 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             } else {
                 0
             };
-
             binder::binder_write_read {
                 write_size: out_avail as _,
                 write_consumed: 0,
@@ -634,6 +610,12 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
         if bwr.write_size == 0 && bwr.read_size == 0 {
             return Ok(())
+        }
+
+        if bwr.write_size != 0 {
+            log::trace!("Sending command to driver:\n{:?}", thread_state.borrow().out_parcel);
+            log::trace!("Size of receive buffer: {}, need_read: {}, do_receive: {}",
+                bwr.read_size, thread_state.borrow().in_parcel.is_empty(), do_receive);
         }
 
         unsafe {
@@ -666,6 +648,8 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             if bwr.read_consumed > 0 {
                 thread_state.in_parcel.set_len(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
+
+                log::trace!("Received commands to driver:\n{:?}", thread_state.in_parcel);
             }
         };
 
@@ -703,17 +687,17 @@ fn flash_commands() -> Result<()> {
 }
 
 
-pub fn inc_strong_handle(handle: u32, proxy: Arc<dyn IBinder>) -> Result<()> {
+pub fn inc_strong_handle(proxy: Arc<Proxy>) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<i32>(&(binder::BC_ACQUIRE as i32))?;
-            state.out_parcel.write::<i32>(&(handle as i32))?;
+            state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE))?;
+            state.out_parcel.write::<u32>(&(proxy.handle()))?;
         }
 
         if flash_if_needed()? == false {
-            thread_state.borrow_mut().post_strong_derefs.push(proxy.clone());
+            thread_state.borrow_mut().post_strong_derefs.push(proxy);
         }
 
         Ok(())
@@ -725,8 +709,8 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<i32>(&(binder::BC_RELEASE as i32))?;
-            state.out_parcel.write::<i32>(&(handle as i32))?;
+            state.out_parcel.write::<u32>(&(binder::BC_RELEASE))?;
+            state.out_parcel.write::<u32>(&(handle))?;
         }
 
         flash_if_needed()?;
@@ -735,48 +719,38 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-// pub fn inc_weak_handle()
+pub fn inc_weak_handle(proxy: Arc<Proxy>) -> Result<()>{
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        {
+            let mut state = thread_state.borrow_mut();
 
-// void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
-// {
-//     LOG_REMOTEREFS("IPCThreadState::incWeakHandle(%d)\n", handle);
-//     mOut.writeInt32(BC_INCREFS);
-//     mOut.writeInt32(handle);
-//     if (!flushIfNeeded()) {
-//         // Create a temp reference until the driver has handled this command.
-//         proxy->getWeakRefs()->incWeak(mProcess.get());
-//         mPostWriteWeakDerefs.push(proxy->getWeakRefs());
-//     }
-// }
+            state.out_parcel.write::<u32>(&(binder::BC_INCREFS))?;
+            state.out_parcel.write::<u32>(&(proxy.handle()))?;
+        }
 
-// void IPCThreadState::decWeakHandle(int32_t handle)
-// {
-//     LOG_REMOTEREFS("IPCThreadState::decWeakHandle(%d)\n", handle);
-//     mOut.writeInt32(BC_DECREFS);
-//     mOut.writeInt32(handle);
-//     flushIfNeeded();
-// }
+        if flash_if_needed()? == false {
+            // This code is come from IPCThreadState.cpp. Is it necessaryq?
+            thread_state.borrow_mut().post_weak_derefs.push(proxy);
+        }
 
+        Ok(())
+    })
+}
 
-// void IPCThreadState::incWeakHandle(int32_t handle, BpBinder *proxy)
-// {
-//     LOG_REMOTEREFS("IPCThreadState::incWeakHandle(%d)\n", handle);
-//     mOut.writeInt32(BC_INCREFS);
-//     mOut.writeInt32(handle);
-//     if (!flushIfNeeded()) {
-//         // Create a temp reference until the driver has handled this command.
-//         proxy->getWeakRefs()->incWeak(mProcess.get());
-//         mPostWriteWeakDerefs.push(proxy->getWeakRefs());
-//     }
-// }
+pub fn dec_weak_handle(handle: u32) -> Result<()> {
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        {
+            let mut state = thread_state.borrow_mut();
 
-// void IPCThreadState::decWeakHandle(int32_t handle)
-// {
-//     LOG_REMOTEREFS("IPCThreadState::decWeakHandle(%d)\n", handle);
-//     mOut.writeInt32(BC_DECREFS);
-//     mOut.writeInt32(handle);
-//     flushIfNeeded();
-// }
+            state.out_parcel.write::<u32>(&(binder::BC_DECREFS))?;
+            state.out_parcel.write::<u32>(&(handle))?;
+        }
+
+        flash_if_needed()?;
+
+        Ok(())
+    })
+}
 
 
 pub fn flash_if_needed() -> Result<bool> {
@@ -843,13 +817,14 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
     }
 }
 
-pub fn transact(handle: u32, code: u32, data: &Parcel, mut reply: Option<&mut Parcel>, mut flags: u32) -> Result<()> {
+pub fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result<Option<Parcel>> {
+    let mut reply: Option<Parcel> = None;
+
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
     let call_restriction = THREAD_STATE.with(|thread_state| -> Result<CallRestriction> {
         let mut thread_state = thread_state.borrow_mut();
         thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data)?;
-
         Ok(thread_state.call_restriction)
     })?;
 
@@ -864,19 +839,48 @@ pub fn transact(handle: u32, code: u32, data: &Parcel, mut reply: Option<&mut Pa
             _ => (),
         }
 
-        match reply {
-            Some(ref mut r) => wait_for_response(&mut UntilResponse::Reply(r))?,
-            None => {
-                let mut fake_reply = Parcel::new();
-                wait_for_response(&mut UntilResponse::Reply(&mut fake_reply))?
-            }
-        };
+        reply = wait_for_response(&mut UntilResponse::Reply)?
     } else {
         wait_for_response(&mut UntilResponse::TransactionComplete)?;
     }
 
+    Ok(reply)
+}
+
+
+fn free_buffer(parcel: Option<&Parcel>, data: binder_uintptr_t, _: usize, _ : binder_uintptr_t, _: usize) -> Result<()> {
+    if let Some(parcel) = parcel {
+        parcel.close_file_descriptors()
+    }
+
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let mut thread_state = thread_state.borrow_mut();
+        thread_state.out_parcel.write::<u32>(&binder::BC_FREE_BUFFER)?;
+        thread_state.out_parcel.write::<binder_uintptr_t>(&data)?;
+        Ok(())
+    })?;
+
+    flash_if_needed()?;
+
     Ok(())
 }
+
+// void freeBuffer(Parcel* parcel, const uint8_t* data,
+//                                 size_t /*dataSize*/,
+//                                 const binder_size_t* /*objects*/,
+//                                 size_t /*objectsSize*/)
+// {
+//     //ALOGI("Freeing parcel %p", &parcel);
+//     IF_LOG_COMMANDS() {
+//         alog << "Writing BC_FREE_BUFFER for " << data << endl;
+//     }
+//     ALOG_ASSERT(data != NULL, "Called with NULL data");
+//     if (parcel != nullptr) parcel->closeFileDescriptors();
+//     IPCThreadState* state = self();
+//     state->mOut.writeInt32(BC_FREE_BUFFER);
+//     state->mOut.writePointer((uintptr_t)data);
+    // state->flushIfNeeded();
+// }
 
 // status_t IPCThreadState::setupPolling(int* fd)
 // {

@@ -1,3 +1,4 @@
+
 use std::hash::{Hash, Hasher};
 
 use std::any::Any;
@@ -7,7 +8,6 @@ use crate::{
     error::*,
     parcel::*,
     native,
-    proxy,
 };
 
 // use crate::thread_state::*;
@@ -80,10 +80,27 @@ pub trait Interface: Send + Sync {
     ///
     /// This handler is a no-op by default and should be implemented for each
     /// Binder service struct that wishes to respond to dump transactions.
-    fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
-        Ok(())
+    // fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
+    //     Ok(())
+    // }
+
+    fn clone_box(&self) -> Box<dyn Interface>;
+}
+
+impl Clone for Box<dyn Interface> {
+    fn clone(&self) -> Box<dyn Interface> {
+        self.clone_box()
     }
 }
+
+pub(crate) struct Unknown {}
+
+impl Interface for Unknown {
+    fn clone_box(&self) -> Box<dyn Interface> {
+        Box::new(Self {})
+    }
+}
+
 
 // ///
 // /// # Example
@@ -136,7 +153,7 @@ pub trait IBinder: Send + Sync {
     fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()>;
 
     /// Send a ping transaction to this object
-    fn ping_binder(&mut self) -> Result<()>;
+    fn ping_binder(&self) -> Result<()>;
 
     fn as_any(&self) -> &dyn Any;
     fn is_remote(&self) -> bool;

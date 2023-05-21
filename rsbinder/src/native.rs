@@ -87,6 +87,9 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
     // fn as_any(&self) -> &dyn Any {
     //     self
     // }
+    fn clone_box(&self) -> Box<(dyn Interface + 'static)> {
+        todo!()
+    }
 }
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
@@ -102,7 +105,7 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     }
 
     /// Send a ping transaction to this object
-    fn ping_binder(&mut self) -> Result<()> {
+    fn ping_binder(&self) -> Result<()> {
         todo!("ping_binder");
     }
 

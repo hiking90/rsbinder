@@ -1,4 +1,5 @@
 
+use crate::sys::binder_uintptr_t;
 use std::vec::Vec;
 
 use std::default::Default;
@@ -12,7 +13,7 @@ use crate::sys::binder::{binder_size_t, flat_binder_object};
 
 use crate::parcelable::*;
 
-const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
+// const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
 #[inline]
 fn pad_size(len: usize) -> usize {
@@ -73,10 +74,10 @@ impl<T: Clone + Default> ParcelData<T> {
         self.as_slice().len()
     }
 
-    fn resize(&mut self, len: usize) {
+    fn set_len(&mut self, len: usize) {
         match self {
-            ParcelData::Vec(v) => v.resize(len, T::default()),
-            _ => panic!("&[u8] can't be resized."),
+            ParcelData::Vec(v) => unsafe { v.set_len(len) },
+            _ => panic!("&[u8] can't be set_len()."),
         }
     }
 
@@ -109,6 +110,7 @@ pub struct Parcel {
     next_object_hint: usize,
     request_header_present: bool,
     work_source_request_header_pos: usize,
+    free_buffer: Option<fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>>,
 }
 
 impl Parcel {
@@ -124,11 +126,13 @@ impl Parcel {
             next_object_hint: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
+            free_buffer: None,
         }
     }
 
     pub fn from_ipc_parts(data: *mut u8, length: usize,
-            objects: *mut binder_size_t, object_count: usize) -> Self {
+            objects: *mut binder_size_t, object_count: usize,
+            free_buffer: fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>) -> Self {
         Parcel {
             data: ParcelData::from_raw_parts_mut(data, length),
             objects: ParcelData::from_raw_parts_mut(objects, object_count),
@@ -136,6 +140,7 @@ impl Parcel {
             next_object_hint: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
+            free_buffer: Some(free_buffer),
         }
     }
 
@@ -149,6 +154,7 @@ impl Parcel {
             // object_count: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
+            free_buffer: None,
         }
     }
 
@@ -170,10 +176,10 @@ impl Parcel {
     }
 
     pub fn set_len(&mut self, new_len: usize) {
-        self.data.resize(new_len)
+        self.data.set_len(new_len)
     }
 
-    // pub fn close_file_descriptors(&self) {
+    pub fn close_file_descriptors(&self) {
     //     for offset in &self.objects {
     //         unsafe {
     //             let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
@@ -182,11 +188,6 @@ impl Parcel {
     //             }
     //         }
     //     }
-    // }
-
-    pub fn dump(&self) {
-        println!("Parcel: pos {}, len {}", self.pos, self.data.len());
-        println!("{}", pretty_hex(&self.data.as_slice()));
     }
 
     pub fn set_data_position(&mut self, pos: usize) {
@@ -287,8 +288,97 @@ impl Parcel {
 
         Ok(())
     }
+
+    fn release_objects(&mut self) {
+        if self.objects.len() == 0 {
+            return
+        }
+
+        todo!();
+
+        // uint8_t* const data = mData;
+        // binder_size_t* const objects = mObjects;
+        // while (i > 0) {
+        //     i--;
+        //     const flat_binder_object* flat
+        //         = reinterpret_cast<flat_binder_object*>(data+objects[i]);
+        //     release_object(proc, *flat, this);
+        // }
+
+    }
+
+
+    // void Parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
+    //     const binder_size_t* objects, size_t objectsCount, release_func relFunc)
+    // {
+    //     // this code uses 'mOwner == nullptr' to understand whether it owns memory
+    //     LOG_ALWAYS_FATAL_IF(relFunc == nullptr, "must provide cleanup function");
+
+    //     freeData();
+
+    //     mData = const_cast<uint8_t*>(data);
+    //     mDataSize = mDataCapacity = dataSize;
+    //     mObjects = const_cast<binder_size_t*>(objects);
+    //     mObjectsSize = mObjectsCapacity = objectsCount;
+    //     mOwner = relFunc;
+
+    //     binder_size_t minOffset = 0;
+    //     for (size_t i = 0; i < mObjectsSize; i++) {
+    //         binder_size_t offset = mObjects[i];
+    //         if (offset < minOffset) {
+    //             ALOGE("%s: bad object offset %" PRIu64 " < %" PRIu64 "\n",
+    //                   __func__, (uint64_t)offset, (uint64_t)minOffset);
+    //             mObjectsSize = 0;
+    //             break;
+    //         }
+    //         const flat_binder_object* flat
+    //             = reinterpret_cast<const flat_binder_object*>(mData + offset);
+    //         uint32_t type = flat->hdr.type;
+    //         if (!(type == BINDER_TYPE_BINDER || type == BINDER_TYPE_HANDLE ||
+    //               type == BINDER_TYPE_FD)) {
+    //             // We should never receive other types (eg BINDER_TYPE_FDA) as long as we don't support
+    //             // them in libbinder. If we do receive them, it probably means a kernel bug; try to
+    //             // recover gracefully by clearing out the objects.
+    //             android_errorWriteLog(0x534e4554, "135930648");
+    //             android_errorWriteLog(0x534e4554, "203847542");
+    //             ALOGE("%s: unsupported type object (%" PRIu32 ") at offset %" PRIu64 "\n",
+    //                   __func__, type, (uint64_t)offset);
+
+    //             // WARNING: callers of ipcSetDataReference need to make sure they
+    //             // don't rely on mObjectsSize in their release_func.
+    //             mObjectsSize = 0;
+    //             break;
+    //         }
+    //         minOffset = offset + sizeof(flat_binder_object);
+    //     }
+    //     scanForFds();
+    // }
+
 }
 
+impl Drop for Parcel {
+    fn drop(&mut self) {
+        match self.free_buffer {
+            Some(free_buffer) => {
+                free_buffer(Some(self),
+                    self.data.as_ptr() as _,
+                    self.data.len(),
+                    self.objects.as_ptr() as _,
+                    self.objects.len()).unwrap();
+            }
+            None => {
+                self.release_objects();
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Parcel {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Parcel: pos {}, len {}\n", self.pos, self.data.len())?;
+        write!(f, "{}", pretty_hex(&self.data.as_slice()))
+    }
+}
 
 
 impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
@@ -310,6 +400,34 @@ impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
         // }
     }
 }
+
+// static void release_object(const sp<ProcessState>& proc, const flat_binder_object& obj,
+//                            const void* who) {
+//     switch (obj.hdr.type) {
+//         case BINDER_TYPE_BINDER:
+//             if (obj.binder) {
+//                 LOG_REFS("Parcel %p releasing reference on local %llu", who, obj.cookie);
+//                 reinterpret_cast<IBinder*>(obj.cookie)->decStrong(who);
+//             }
+//             return;
+//         case BINDER_TYPE_HANDLE: {
+//             const sp<IBinder> b = proc->getStrongProxyForHandle(obj.handle);
+//             if (b != nullptr) {
+//                 LOG_REFS("Parcel %p releasing reference on remote %p", who, b.get());
+//                 b->decStrong(who);
+//             }
+//             return;
+//         }
+//         case BINDER_TYPE_FD: {
+//             if (obj.cookie != 0) { // owned
+//                 close(obj.handle);
+//             }
+//             return;
+//         }
+//     }
+
+//     ALOGE("Invalid object type 0x%08x", obj.hdr.type);
+// }
 
 
 // status_t Parcel::writeObject(const flat_binder_object& val, bool nullMetaData)
@@ -405,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_dyn_ibinder() -> Result<()> {
-        let proxy: Arc<dyn IBinder> = Arc::new(proxy::Proxy::new(0));
+        let proxy: Arc<dyn IBinder> = proxy::Proxy::new(0, Box::new(Unknown {}))?;
         let raw = Arc::into_raw(proxy.clone());
 
         let mut parcel = Parcel::new();

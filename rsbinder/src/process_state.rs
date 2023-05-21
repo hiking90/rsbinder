@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc};
 use std::path::Path;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
@@ -15,7 +15,7 @@ use crate::{
     parcel::*,
     native,
     thread_state,
-    service_manager::{BnServiceManager},
+    service_manager::{BnServiceManager, BpServiceManager},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,7 +39,7 @@ pub struct ProcessState {
     driver_fd: RwLock<RawFd>,
     mmap: RwLock<(*mut std::ffi::c_void, usize)>,
     context_manager: RwLock<Option<Arc<native::Binder<BnServiceManager>>>>,
-    handle_to_object: RwLock<HashMap<u32, Weak<dyn IBinder>>>,
+    handle_to_object: RwLock<HashMap<u32, Arc<Proxy>>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
 }
@@ -136,13 +136,13 @@ impl ProcessState {
         self.context_manager.read().unwrap().clone()
     }
 
-    pub fn context_object(&self) -> Result<Arc<dyn IBinder>> {
-        self.strong_proxy_for_handle(0)
+    pub fn context_object(&self) -> Result<Arc<Proxy>> {
+        self.strong_proxy_for_handle(0, Box::new(BpServiceManager::new()))
     }
 
-    pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<Arc<dyn IBinder>> {
-        if let Some(binder) = self.handle_to_object.read().unwrap().get(&handle) {
-            return binder.upgrade().ok_or(ErrorKind::DeadObject.into());
+    pub fn strong_proxy_for_handle(&self, handle: u32, interface: Box<dyn Interface>) -> Result<Arc<Proxy>> {
+        if let Some(proxy) = self.handle_to_object.read().unwrap().get(&handle) {
+            return proxy.upgrade()
         }
 
         if handle == 0 {
@@ -150,22 +150,18 @@ impl ProcessState {
             thread_state::set_call_restriction(CallRestriction::None);
 
             let data = Parcel::new();
-            let result = thread_state::transact(0, PING_TRANSACTION, &data, None, 0);
+            let result = thread_state::transact(handle, PING_TRANSACTION, &data, 0);
 
             thread_state::set_call_restriction(original_call_restriction);
 
-            if let Err(Error::Exception(exception)) = result {
-                if exception.code == ErrorKind::DeadObject as _ {
-                    return Err(exception.into())
-                }
-            }
+            result?;
         }
 
-        let proxy: Arc<dyn IBinder> = Arc::new(Proxy::new(handle));
-        self.handle_to_object.write().unwrap().insert(handle, Arc::downgrade(&proxy));
+        let proxy = Proxy::new(handle, interface)?;
 
-        Ok(proxy)
+        self.handle_to_object.write().unwrap().insert(handle, proxy.clone());
 
+        proxy.upgrade()
 
         // sp<IBinder> result;
 

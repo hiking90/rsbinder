@@ -1,4 +1,4 @@
-
+use std::sync::Arc;
 use std::any::Any;
 
 use crate::{
@@ -8,45 +8,61 @@ use crate::{
     thread_state,
 };
 
-pub struct Unknown {}
-
-impl Interface for Unknown {
-}
-
-
 pub struct Proxy {
     handle: u32,
-    interface: Option<Box<dyn Interface>>,
+    interface: Box<dyn Interface>,
+    is_strong: bool,
 }
 
 impl Proxy {
-    pub fn new(handle: u32) -> Self {
-        Self {
+    pub fn new(handle: u32, interface: Box<dyn Interface>) -> Result<Arc<Self>> {
+        let weak = Arc::new(Self {
             handle: handle,
-            interface: None,
-        }
-    }
+            interface: interface,
+            is_strong: false,
+        });
 
-    pub fn new_with(handle: u32, interface: Box<dyn Interface>) -> Self {
-        Self {
-            handle: handle,
-            interface: Some(interface),
-        }
+        thread_state::inc_weak_handle(weak.clone())?;
+
+        Ok(weak)
     }
 
     pub fn handle(&self) -> u32 {
         self.handle
     }
 
-    pub fn interface(&self) -> Option<&Box<dyn Interface>> {
-        self.interface.as_ref()
+    pub fn interface(&self) -> &Box<dyn Interface> {
+        &self.interface
     }
 
-    pub fn set_interface(&mut self, interface: Box<dyn Interface>) {
-        self.interface = match self.interface {
-            Some(_) => panic!("interface can't be set twice!!!"),
-            None => Some(interface),
-        };
+    pub fn is_strong(&self) -> bool {
+        self.is_strong
+    }
+
+    pub fn upgrade(&self) -> Result<Arc<Self>> {
+        let strong = Arc::new(Self {
+            handle: self.handle,
+            interface: self.interface.clone(),
+            is_strong: true,
+        });
+
+        thread_state::inc_strong_handle(strong.clone())?;
+
+        Ok(strong)
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        if self.is_strong {
+            if let Err(err) = thread_state::dec_strong_handle(self.handle) {
+                log::warn!("Proxy dec_strong_handle error: {:?}", err);
+            }
+        } else {
+            if let Err(err) = thread_state::dec_weak_handle(self.handle) {
+                log::warn!("Proxy dec_weak_handle error: {:?}", err);
+            }
+        }
     }
 }
 
@@ -63,18 +79,11 @@ impl IBinder for Proxy {
     }
 
     /// Send a ping transaction to this object
-    fn ping_binder(&mut self) -> Result<()> {
+    fn ping_binder(&self) -> Result<()> {
         let data = Parcel::new();
-        let mut reply = Parcel::new();
-        thread_state::transact(self.handle, PING_TRANSACTION, &data, Some(&mut reply), 0)?;
+        let _reply = thread_state::transact(self.handle, PING_TRANSACTION, &data, 0)?;
 
         Ok(())
-
-    // Parcel data;
-    // data.markForBinder(sp<BpBinder>::fromExisting(this));
-    // Parcel reply;
-    // return transact(PING_TRANSACTION, data, &reply);
-
     }
 
     fn as_any(&self) -> &dyn Any {

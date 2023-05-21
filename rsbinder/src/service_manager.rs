@@ -73,7 +73,11 @@ impl BnServiceManager {
     }
 }
 
-impl Interface for BnServiceManager {}
+impl Interface for BnServiceManager {
+    fn clone_box(&self) -> Box<dyn Interface> {
+        todo!()
+    }
+}
 
 impl IServiceManager for BnServiceManager {
     fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
@@ -203,7 +207,11 @@ impl BpServiceManager {
     // }
 }
 
-impl Interface for BpServiceManager {}
+impl Interface for BpServiceManager {
+    fn clone_box(&self) -> Box<dyn Interface> {
+        Box::new(Self {})
+    }
+}
 
 impl IServiceManager for BpServiceManager {
     fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {

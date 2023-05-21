@@ -47,6 +47,7 @@ const UNKNOWN_ERROR: isize = -2147483647-1;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    NoError = 0,
     Unknown = UNKNOWN_ERROR,
     NoMemory = -libc::ENOMEM as _,
     InvalidOperation = -libc::ENOSYS as _,
