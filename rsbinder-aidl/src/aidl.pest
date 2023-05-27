@@ -1,1 +1,168 @@
-document = {}
+document = { SOI ~ package? ~ imports* ~ decls ~ EOI }
+
+package = { "package" ~ qualified_name ~ ";" }
+
+imports = { import+ }
+
+import = { "import" ~ qualified_name ~ ";" }
+
+decls = { decl+ }
+
+decl = { annotation_list* ~ unannotated_decl }
+
+annotation_list = { annotation+ }
+
+unannotated_decl = { parcelable_decl | interface_decl | enum_decl | union_decl }
+
+parcelable_decl = {
+    PARCELABLE ~ qualified_name ~ optional_type_params ~ "{" ~ parcelable_members* ~ "}" |
+    PARCELABLE ~ qualified_name ~ optional_type_params ~ ";" |
+    PARCELABLE ~ qualified_name ~ CPP_HEADER ~ C_STR ~ ";"
+}
+
+interface_decl = {
+    INTERFACE ~ qualified_name ~ ";" |
+    ONEWAY* ~ INTERFACE ~ qualified_name ~ "{" ~ interface_members? ~ "}"
+}
+
+interface_members = {
+    method_decl ~ interface_members* |
+    constant_decl ~ interface_members* |
+    decl ~ interface_members*
+}
+
+constant_decl = {
+    annotation_list* ~ CONST ~ type ~ identifier ~ "=" ~ const_expr ~ ";"
+}
+
+non_array_type = {
+    annotation_list* ~
+    qualified_name ~
+    (
+        "<" ~ type_args ~ "," ~ non_array_type ~ "<" ~ type_args ~ RSHIFT |
+        "<" ~ non_array_type ~ "<" ~ type_args ~ RSHIFT |
+        "<" ~ type_args ~ ">"
+    )*
+}
+
+type = {
+    non_array_type ~ (annotation_list* ~ "[" ~ const_expr? ~ "]")*
+}
+
+type_args = { type ~ ("," ~ type)* }
+
+method_decl = {
+    type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ ";" |
+    annotation_list* ~ ONEWAY ~ type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ ";" |
+    type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ "=" ~ INTVALUE ~ ";" |
+    annotation_list* ~ ONEWAY ~ type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ "=" ~ INTVALUE ~ ";"
+}
+
+direction = { IN | OUT | INOUT }
+
+arg = {
+    direction* ~ type ~ identifier
+}
+
+arg_list = { arg ~ ("," ~ arg)* }
+
+enumerator = {
+    identifier ~ "=" ~ const_expr |
+    identifier
+}
+
+enumerators = { enumerator ~ ("," ~ enumerator)* }
+
+enum_decl_body = {
+    "{" ~ enumerators ~ "}" |
+    "{" ~ enumerators ~ "," ~ "}"
+}
+
+enum_decl = { ENUM ~ qualified_name ~ enum_decl_body }
+
+union_decl = { UNION ~ qualified_name ~ optional_type_params ~ "{" ~ parcelable_members* ~ "}" }
+
+type_params = { identifier ~ ("," ~ identifier)* }
+
+optional_type_params = { ("<" ~ type_params ~ ">")? }
+
+variable_decl = {
+    type ~ identifier ~ "=" ~ const_expr ~ ";" |
+    type ~ identifier ~ ";"
+}
+
+parcelable_members = { (variable_decl | constant_decl | decl)+ }
+
+keywords = @{
+    (
+        INTERFACE | ONEWAY | CONST | INOUT | IN | OUT | ENUM | UNION | CPP_HEADER | PARCELABLE |
+        TRUE_LITERAL | FALSE_LITERAL
+    ) ~ &WHITESPACE
+}
+
+parameter = { identifier ~ "=" ~ const_expr }
+
+parameter_list = { parameter ~ ("," ~ parameter)* }
+
+annotation = {
+    ANNOTATION ~ "(" ~ const_expr ~ ")" |
+    ANNOTATION ~ "(" ~ parameter_list* ~ ")" |
+    ANNOTATION
+}
+
+qualified_name = @{ identifier ~ ("." ~ identifier)* }
+
+identifier = { !keywords ~ (IDENTIFIER | CPP_HEADER) }
+
+constant_value_list = { const_expr ~ ("," ~ const_expr)* ~ ","? }
+
+const_expr = { atom ~ (binary_operator ~ atom)* }
+atom = { unary_const_expr | value }
+unary_const_expr = { unary_operator ~ const_expr }
+binary_operator = {
+    LOGICAL_OR | LOGICAL_AND | "|" | "^" | "&" | EQUALITY | NEQ |
+    LSHIFT | RSHIFT | LEQ | GEQ | "<" | ">" | "+" | "-" | "*" | "/" | "%"
+}
+unary_operator = { "+" | "-" | "!" | "~" }
+value = {
+    "{" ~ constant_value_list* ~ "}" |
+    "(" ~ const_expr ~ ")" |
+    qualified_name | C_STR | HEXVALUE | FLOATVALUE | INTVALUE |
+    TRUE_LITERAL | FALSE_LITERAL | CHARVALUE
+}
+
+ANNOTATION = @{ "@" ~ identifier }
+
+INTERFACE = { "interface" }
+ONEWAY = { "oneway" }
+CONST = { "const" }
+RSHIFT = { ">>" }
+LSHIFT = { "<<" }
+IN = { "in" }
+OUT = { "out" }
+INOUT = { "inout" }
+ENUM = { "enum" }
+UNION = { "union" }
+CPP_HEADER = { "cpp_header" }
+PARCELABLE = { "parcelable" }
+IDENTIFIER = @{ ("_" | ASCII_ALPHA)+ ~ ("_" | ASCII_ALPHA | ASCII_DIGIT)* }
+TRUE_LITERAL = { "true" }
+FALSE_LITERAL = { "false" }
+// CHARVALUE = @{ !"\n" ~ ANY }
+CHARVALUE = @{ "'" ~ (!("'" | "\n") ~ ANY) ~ "'" }
+INTVALUE = @{ ASCII_DIGIT+ ~ ("l" | "L")? ~ "u8"? }
+FLOATVALUE = @{ ASCII_DIGIT* ~ "."? ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"? }
+HEXVALUE = @{ "0" ~ ("x" | "X") ~ (ASCII_DIGIT | 'a'..'f' | 'A'..'F')+ ~ ("l" | "L")? ~ "u8"? }
+C_STR = @{ "\"" ~ ( !("\"") ~ ANY | "\\" ~ ANY)* ~ "\"" }
+
+LOGICAL_OR = { "||" }
+LOGICAL_AND = { "&&" }
+EQUALITY = { "==" }
+NEQ = { "!=" }
+LEQ = { "<=" }
+GEQ = { ">=" }
+
+LONG_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+LINE_COMMENT = { "//" ~ (!"\n" ~ ANY)* ~ "\n" }
+COMMENT = _{ LONG_COMMENT | LINE_COMMENT }
+WHITESPACE = _{ (" " | "\t" | "\r" | "\n")+ }
