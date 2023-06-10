@@ -1,6 +1,5 @@
 use std::sync::{Arc, Weak};
 
-
 use crate::{
     IBinder,
     sys::*,
@@ -10,6 +9,23 @@ use crate::{
     binder::*,
     parcel::Parcel,
 };
+
+
+/// Metadata that `ParcelableHolder` needs for all parcelables.
+///
+/// The compiler auto-generates implementations of this trait
+/// for AIDL parcelables.
+pub trait ParcelableMetadata {
+    /// The Binder parcelable descriptor string.
+    ///
+    /// This string is a unique identifier for a Binder parcelable.
+    fn get_descriptor() -> &'static str;
+
+    /// The Binder parcelable stability.
+    fn get_stability(&self) -> Stability {
+        Stability::Local
+    }
+}
 
 /// A struct whose instances can be written to a [`Parcel`].
 // Might be able to hook this up as a serde backend in the future?
@@ -411,7 +427,7 @@ impl Deserialize for Arc<dyn IBinder> {
                 BINDER_TYPE_BINDER => {
                     let weak = Box::from_raw(flat.__bindgen_anon_1.binder as *mut Box<Weak<dyn IBinder>>);
                     Weak::upgrade(&weak)
-                        .ok_or_else(|| Error::from(ErrorKind::DeadObject))
+                        .ok_or_else(|| Error::from(StatusCode::DeadObject))
                 }
 
                 BINDER_TYPE_HANDLE => {
@@ -422,7 +438,7 @@ impl Deserialize for Arc<dyn IBinder> {
 
                 _ => {
                     log::warn!("Unknown Binder Type ({}) was delivered.", flat.hdr.type_);
-                    Err(Error::from(ErrorKind::BadType))
+                    Err(Error::from(StatusCode::BadType))
                 }
             }
         }

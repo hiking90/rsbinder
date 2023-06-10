@@ -9,3 +9,5 @@ edition = "2021"
 pest = "2"
 pest_derive = "2"
 clap = { version = "4", features = ["derive"] }
+convert_case = "0"
+lazy_static = "1"

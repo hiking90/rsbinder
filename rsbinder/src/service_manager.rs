@@ -1,3 +1,6 @@
+#![allow(non_upper_case_globals)]
+#![allow(non_snake_case)]
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -31,6 +34,7 @@ pub mod transactions {
 }
 
 pub trait IServiceManager: Interface {
+    fn get_descriptor() -> &'static str where Self: Sized { "android.os.IServiceManager" }
     fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
     fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
     fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Result<()>;
@@ -164,7 +168,7 @@ impl Remotable for BnServiceManager {
             }
             _ => {
                 println!("Undefined transaction code {:?}", code);
-                return Err(ExceptionKind::UnsupportedOperation.into());
+                return Err(ExceptionCode::UnsupportedOperation.into());
             }
         };
         Ok(())

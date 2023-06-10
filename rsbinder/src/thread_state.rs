@@ -291,7 +291,7 @@ pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
 enum UntilResponse {
     Reply,
     TransactionComplete,
-    AcquireResult(ErrorKind),
+    AcquireResult(StatusCode),
 }
 
 fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
@@ -328,9 +328,9 @@ fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
                     let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
                     if let UntilResponse::AcquireResult(exception) = until {
                         *exception = if result != 0 {
-                            ErrorKind::NoError
+                            StatusCode::Ok
                         } else {
-                            ErrorKind::InvalidOperation
+                            StatusCode::InvalidOperation
                         };
                         break
                     }
@@ -357,12 +357,9 @@ fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
                                     tr.data.ptr.offsets,
                                     (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
 
-                                if status != ErrorKind::NoError as _ {
-                                    return Err(Exception {
-                                        code: status,
-                                        exception: 0,
-                                        message: "binder::BR_REPLY".to_owned()
-                                    }.into());
+                                if status != StatusCode::Ok as _ {
+                                    return Err(Status::from_i32_status(status,
+                                        ExceptionCode::None, "binder::BR_REPLY").into())
                                 }
                             };
                         }
@@ -390,7 +387,7 @@ fn execute_command(cmd: i32) -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
                 let other = thread_state.borrow_mut().in_parcel.read::<i32>()?;
-                return Err(Exception::new(other, ExceptionKind::JustError, "binder::BR_ERROR".to_owned()).into());
+                return Err(Status::from_i32_status(other, ExceptionCode::JustError, "binder::BR_ERROR").into());
             }
             binder::BR_OK => {}
 
@@ -580,7 +577,7 @@ fn execute_command(cmd: i32) -> Result<()> {
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     let driver_fd = ProcessState::as_self().as_raw_fd();
     if driver_fd < 0 {
-        return Err(Error::from(ErrorKind::BadFd));
+        return Err(Error::from(StatusCode::BadFd));
     }
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -624,7 +621,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 match res {
                     Ok(_) => break,
                     Err(errno) if errno != nix::errno::Errno::EINTR => {
-                        return Err(Error::from(errno));
+                        return Err(Error::Any(errno.into()));
                     },
                     _ => {}
                 }
@@ -800,8 +797,8 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
 
         let header: u32 = reader.read()?;
         if header != INTERFACE_HEADER {
-            return Err(Exception::new(0, ExceptionKind::BadParcelable,
-                format!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header)).into());
+            return Err(Status::new(StatusCode::Ok, ExceptionCode::BadParcelable,
+                &format!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header)).into());
         }
 
         Ok(())
@@ -811,8 +808,8 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
     if parcel_interface.0.eq(T::get_descriptor()) {
         Ok(())
     } else {
-        Err(Exception::new(0, ExceptionKind::BadParcelable,
-            format!("check_interface() expected '{}' but read '{}'",
+        Err(Status::new(StatusCode::Ok, ExceptionCode::BadParcelable,
+            &format!("check_interface() expected '{}' but read '{}'",
                 T::get_descriptor(), parcel_interface.0)).into())
     }
 }

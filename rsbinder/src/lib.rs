@@ -17,12 +17,13 @@ pub mod proxy;
 pub use process_state::ProcessState;
 // pub use thread_state::Se;
 pub use parcel::Parcel;
-pub use error::{ErrorKind, Error, Result, Exception};
+pub use error::{StatusCode, Error, Result, ExceptionCode};
 pub use binder::*;
 pub use service_manager::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
+
 
 #[cfg(test)]
 mod tests {

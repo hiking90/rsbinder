@@ -7,7 +7,7 @@ use std::default::Default;
 
 use pretty_hex::*;
 
-use crate::error::{Result, Error, ErrorKind};
+use crate::error::{Result, Error, StatusCode};
 use crate::sys::binder::{binder_size_t, flat_binder_object};
 
 
@@ -215,7 +215,7 @@ impl Parcel {
             self.pos = pos + len;
             Ok(&self.data.as_slice()[pos .. pos + len])
         } else {
-            Err(ErrorKind::NotEnoughData.into())
+            Err(StatusCode::NotEnoughData.into())
         }
     }
 
@@ -258,7 +258,7 @@ impl Parcel {
             }
         }
 
-        Err(Error::from(ErrorKind::BadType))
+        Err(Error::from(StatusCode::BadType))
     }
 
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
@@ -387,7 +387,7 @@ impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
     fn try_from(parcel: &mut Parcel) -> std::result::Result<Self, Self::Error> {
         let data = parcel.read_data(N)?;
         <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
-            Error::from(e)
+            Error::Any(e.into())
         })
         // let pos = parcel.inner.pos;
         // if let Some(data) = parcel.inner.data.get(pos .. (pos + N)) {
@@ -396,7 +396,7 @@ impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
         //         Error::from(e)
         //     })
         // } else {
-        //     Err(Error::from(ErrorKind::BadIndex))
+        //     Err(Error::from(StatusCode::BadIndex))
         // }
     }
 }

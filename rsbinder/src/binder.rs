@@ -313,6 +313,51 @@ impl<I: InterfaceClassMethods> InterfaceClass<I> {
     }
 }
 
+
+/// Interface stability promise
+///
+/// An interface can promise to be a stable vendor interface ([`Vintf`]), or
+/// makes no stability guarantees ([`Local`]). [`Local`] is
+/// currently the default stability.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stability {
+    /// Default stability, visible to other modules in the same compilation
+    /// context (e.g. modules on system.img)
+    Local,
+
+    /// A Vendor Interface Object, which promises to be stable
+    Vintf,
+}
+
+impl Default for Stability {
+    fn default() -> Self {
+        Stability::Local
+    }
+}
+
+impl From<Stability> for i32 {
+    fn from(stability: Stability) -> i32 {
+        use Stability::*;
+        match stability {
+            Local => 0,
+            Vintf => 1,
+        }
+    }
+}
+
+impl TryFrom<i32> for Stability {
+    type Error = Error;
+    fn try_from(stability: i32) -> Result<Stability> {
+        use Stability::*;
+        match stability {
+            0 => Ok(Local),
+            1 => Ok(Vintf),
+            _ => Err(StatusCode::BadValue.into())
+        }
+    }
+}
+
+
 // impl From<InterfaceClass> for *const sys::AIBinder_Class {
 //     fn from(class: InterfaceClass) -> *const sys::AIBinder_Class {
 //         class.0

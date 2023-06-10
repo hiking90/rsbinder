@@ -10,6 +10,14 @@ rsbinder = { path = "../rsbinder" }
 env_logger = "0"
 tokio = { version = "1", features = ["full"] }
 
+[build-dependencies]
+# aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }
+rsbinder-aidl = { path = "../rsbinder-aidl" }
+
 [[bin]]
 name = "hello_client"
+path = "src/hello_client.rs"
+
+[[bin]]
+name = "service"
 path = "src/hello_client.rs"

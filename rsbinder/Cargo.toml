@@ -12,3 +12,4 @@ nix = "0"
 log = "0.4"
 pretty_hex = { version = "0", package = "pretty-hex" }
 thiserror = "1"
+rsbinder-aidl = { path = "../rsbinder-aidl" }
