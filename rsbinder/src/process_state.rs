@@ -39,7 +39,7 @@ pub struct ProcessState {
     driver_fd: RwLock<RawFd>,
     mmap: RwLock<(*mut std::ffi::c_void, usize)>,
     context_manager: RwLock<Option<Arc<native::Binder<BnServiceManager>>>>,
-    handle_to_object: RwLock<HashMap<u32, Arc<Proxy>>>,
+    handle_to_object: RwLock<HashMap<u32, WeakIBinder>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
 }
@@ -136,32 +136,32 @@ impl ProcessState {
         self.context_manager.read().unwrap().clone()
     }
 
-    pub fn context_object(&self) -> Result<Arc<Proxy>> {
-        self.strong_proxy_for_handle(0, Box::new(BpServiceManager::new()))
+    pub fn context_object(&self) -> Result<StrongIBinder> {
+        self.strong_proxy_for_handle(0)
+        // , Box::new(BpServiceManager::new())
     }
 
-    pub fn strong_proxy_for_handle(&self, handle: u32, interface: Box<dyn Interface>) -> Result<Arc<Proxy>> {
-        if let Some(proxy) = self.handle_to_object.read().unwrap().get(&handle) {
-            return proxy.upgrade()
+    pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<StrongIBinder> {
+        if let Some(weak) = self.handle_to_object.read().unwrap().get(&handle) {
+            return Ok(weak.upgrade())
         }
 
         if handle == 0 {
             let original_call_restriction = thread_state::call_restriction();
             thread_state::set_call_restriction(CallRestriction::None);
 
-            let data = Parcel::new();
-            let result = thread_state::transact(handle, PING_TRANSACTION, &data, 0);
+            thread_state::ping_binder(handle)?;
 
             thread_state::set_call_restriction(original_call_restriction);
-
-            result?;
         }
 
-        let proxy = Proxy::new(handle, interface)?;
+        let interface = thread_state::query_interface(handle)?;
 
-        self.handle_to_object.write().unwrap().insert(handle, proxy.clone());
+        let weak = WeakIBinder::new(ProxyHandle::new(handle, interface));
 
-        proxy.upgrade()
+        self.handle_to_object.write().unwrap().insert(handle, weak.clone());
+
+        Ok(weak.upgrade())
 
         // sp<IBinder> result;
 

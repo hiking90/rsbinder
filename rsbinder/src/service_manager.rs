@@ -35,9 +35,9 @@ pub mod transactions {
 
 pub trait IServiceManager: Interface {
     fn get_descriptor() -> &'static str where Self: Sized { "android.os.IServiceManager" }
-    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
-    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>>;
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Result<()>;
+    fn get_service(&self, name: &str) -> Result<Option<StrongIBinder>>;
+    fn check_service(&self, name: &str) -> Result<Option<StrongIBinder>>;
+    fn add_service(&self, name: String, service: StrongIBinder, allow_isolated: bool, dump_priority: i32) -> Result<()>;
 }
 
 // lazy_static! {
@@ -46,7 +46,7 @@ pub trait IServiceManager: Interface {
 
 
 struct Service {
-    binder: Arc<dyn IBinder>,
+    binder: StrongIBinder,
     has_clients: bool,
     guarantee_client: bool,
 }
@@ -62,7 +62,7 @@ impl BnServiceManager {
         }
     }
 
-    fn try_get_service(&self, name: &str, start_if_not_found: bool) -> Option<Arc<dyn IBinder>> {
+    fn try_get_service(&self, name: &str, start_if_not_found: bool) -> Option<StrongIBinder> {
         match self.name_to_service.lock().unwrap().get(name) {
             Some(service) => {
                 Some(service.binder.clone())
@@ -78,21 +78,21 @@ impl BnServiceManager {
 }
 
 impl Interface for BnServiceManager {
-    fn clone_box(&self) -> Box<dyn Interface> {
+    fn box_clone(&self) -> Box<dyn Interface> {
         todo!()
     }
 }
 
 impl IServiceManager for BnServiceManager {
-    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+    fn get_service(&self, name: &str) -> Result<Option<StrongIBinder>> {
         Ok(self.try_get_service(name, true))
     }
 
-    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+    fn check_service(&self, name: &str) -> Result<Option<StrongIBinder>> {
         Ok(self.try_get_service(name, false))
     }
 
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, _allow_isolated: bool, _dump_priority: i32) -> Result<()> {
+    fn add_service(&self, name: String, service: StrongIBinder, _allow_isolated: bool, _dump_priority: i32) -> Result<()> {
         self.name_to_service.lock().unwrap().insert(name, Service {
             binder: service,
             has_clients: false,
@@ -131,7 +131,7 @@ impl Remotable for BnServiceManager {
             }
             transactions::addService => {
                 let name: String16 = reader.read()?;
-                let binder: Arc<dyn IBinder> = reader.read()?;
+                let binder: StrongIBinder = reader.read()?;
                 let allow_isolated: bool = reader.read()?;
                 let dump_priority: i32 = reader.read()?;
 
@@ -212,21 +212,21 @@ impl BpServiceManager {
 }
 
 impl Interface for BpServiceManager {
-    fn clone_box(&self) -> Box<dyn Interface> {
+    fn box_clone(&self) -> Box<dyn Interface> {
         Box::new(Self {})
     }
 }
 
 impl IServiceManager for BpServiceManager {
-    fn get_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+    fn get_service(&self, name: &str) -> Result<Option<StrongIBinder>> {
         todo!()
     }
 
-    fn check_service(&self, name: &str) -> Result<Option<Arc<dyn IBinder>>> {
+    fn check_service(&self, name: &str) -> Result<Option<StrongIBinder>> {
         todo!()
     }
 
-    fn add_service(&self, name: String, service: Arc<dyn IBinder>, allow_isolated: bool, dump_priority: i32) -> Result<()> {
+    fn add_service(&self, name: String, service: StrongIBinder, allow_isolated: bool, dump_priority: i32) -> Result<()> {
         todo!()
     }
 }

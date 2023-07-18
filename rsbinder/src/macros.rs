@@ -89,6 +89,7 @@ macro_rules! declare_binder_interface {
         #[doc = $proxy_doc]
         pub struct $proxy {
             binder: $crate::StrongIBinder,
+            handle: $crate::ProxyHandle,
             $($fname: $fty,)*
         }
 
@@ -100,18 +101,23 @@ macro_rules! declare_binder_interface {
             fn box_clone(&self) -> Box<dyn $crate::Interface> { todo!() }
         }
 
-        // impl $crate::binder_impl::Proxy for $proxy
+        impl $crate::Proxy for $proxy
         // where
         //     $proxy: $interface,
-        // {
-        //     fn get_descriptor() -> &'static str {
-        //         $descriptor
-        //     }
+        {
+            fn descriptor() -> &'static str {
+                $descriptor
+            }
 
-        //     fn from_binder(mut binder: $crate::SpIBinder) -> std::result::Result<Self, $crate::StatusCode> {
-        //         Ok(Self { binder, $($fname: $finit),* })
-        //     }
-        // }
+            fn from_binder(binder: $crate::StrongIBinder) -> $crate::Result<Self> {
+                let proxy = binder.as_proxy().ok_or($crate::Error::from($crate::StatusCode::BadValue))?.clone();
+                if proxy.descriptor() != Self::descriptor() {
+                    Err($crate::StatusCode::BadType.into())
+                } else {
+                    Ok(Self { binder, handle: proxy, $($fname: $finit),* })
+                }
+            }
+        }
     }
 }
 

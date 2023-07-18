@@ -5,7 +5,7 @@ mod sys;
 mod process_state;
 pub mod thread_state;
 mod error;
-// mod ref_base;
+mod macros;
 pub mod native;
 mod binder;
 pub mod parcel;
@@ -20,6 +20,8 @@ pub use parcel::Parcel;
 pub use error::{StatusCode, Error, Result, ExceptionCode};
 pub use binder::*;
 pub use service_manager::*;
+pub use proxy::*;
+// pub use ref_base::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";

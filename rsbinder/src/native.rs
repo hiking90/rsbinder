@@ -87,7 +87,7 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
     // fn as_any(&self) -> &dyn Any {
     //     self
     // }
-    fn clone_box(&self) -> Box<(dyn Interface + 'static)> {
+    fn box_clone(&self) -> Box<(dyn Interface + 'static)> {
         todo!()
     }
 }

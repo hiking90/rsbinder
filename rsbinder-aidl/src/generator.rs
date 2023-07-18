@@ -8,16 +8,21 @@ pub fn attribute(indent: usize) -> String {
     let indent = indent_space(indent);
 
     content += &(indent.clone() + "use std::sync::Arc;\n");
-    content += &(indent + "use rsbinder;\n");
+    // content += &(indent + "use rsbinder;\n");
 
     return content;
 }
 
-fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, String, String), Box<dyn Error>> {
+    let mut build_params = String::new();
+    let mut read_params = String::new();
     let mut args = "&self".to_string();
 
     method.arg_list.iter().for_each(|arg| {
-        args += &format!(", {}", arg.to_string());
+        let arg = arg.to_string();
+        args += &format!(", {}", arg.1);
+        build_params += &format!("{}.clone(), ", arg.0);
+        read_params += &format!("{}, ", arg.0);
     });
 
     let return_type = if parser::is_nullable(&method.annotation_list) == true {
@@ -26,11 +31,43 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<String, Box<
         method.r#type.to_string(false)
     };
 
-    let api = format!("{}fn {}({args}) -> rsbinder::Result<{return_type}>;\n",
-        indent_space(indent),
-        method.identifier.to_case(Case::Snake));
+    let method_identifier = method.identifier.to_case(Case::Snake);
+    let indent = indent_space(indent);
 
-    Ok(api)
+    let api = format!("{indent}fn {}({args}) -> rsbinder::Result<{return_type}>;\n",
+        method_identifier);
+
+    let mut proxy_struct_method = format!("{indent}fn build_parcel_{}({args}) -> rsbinder::Result<rsbinder::Parcel> {{\n",
+        method_identifier);
+    proxy_struct_method += &format!("{indent}{}todo!()\n{indent}}}\n", indent_space(1));
+    proxy_struct_method += &format!("{indent}fn read_response_{}({args}, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::Result<{return_type}> {{\n",
+        method_identifier);
+    proxy_struct_method += &format!("{indent}{}todo!()\n", indent_space(1));
+    proxy_struct_method += &format!("{indent}}}\n");
+
+    let mut proxy_interface_method = format!("{indent}fn {}({args}) -> rsbinder::Result<{return_type}> {{\n",
+        method_identifier);
+
+    // let _aidl_data = self.build_parcel_get_service(_arg_name)?;
+    // let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::GET_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+    // self.read_response_get_service(_arg_name, _aidl_reply)
+
+    proxy_interface_method += &format!("{indent}{}let _aidl_data = self.build_parcel_{}({})?;\n",
+        indent_space(1), method_identifier, build_params);
+    proxy_interface_method += &format!("{indent}{}let _aidl_reply = self.handle.submit_transact(transactions::{}, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);\n",
+        indent_space(1), method.identifier.to_case(Case::UpperSnake));
+    if read_params.len() > 0 {
+        proxy_interface_method += &format!("{indent}{}self.read_response_{}({}_aidl_reply)\n",
+            indent_space(1), method_identifier, read_params);
+    } else {
+        proxy_interface_method += &format!("{indent}{}self.read_response_{}(_aidl_reply)\n",
+            indent_space(1), method_identifier);
+    }
+
+    // proxy_interface_method += &format!("{indent}{}todo!()\n", indent_space(1));
+    proxy_interface_method += &format!("{indent}}}\n");
+
+    Ok((api, proxy_struct_method, proxy_interface_method))
 }
 
 fn begin_mod(name: &str, indent: usize) -> String {
@@ -44,10 +81,44 @@ fn end_mod(indent: usize) -> String {
     indent_space(indent) + "}\n"
 }
 
-fn gen_interface(decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+fn gen_declare_binder_interface(decl: &parser::InterfaceDecl, indent: usize) -> (String, String, String) {
+    let indent = indent_space(indent);
+    let mut content = format!("{indent}rsbinder::declare_binder_interface! {{\n");
+
+    let native_name = format!("Bn{}", &decl.name[1..]);
+    let proxy_name = format!("Bp{}", &decl.name[1..]);
+
+    content += &format!("{indent}{}{}[\"{}.{}\"] {{\n", indent_space(1), decl.name, decl.namespace, decl.name);
+    content += &format!("{indent}{}native: {native_name}(on_transact),\n", indent_space(2));
+    content += &format!("{indent}{}proxy: {proxy_name},\n", indent_space(2));
+    content += &format!("{indent}{}}}\n", indent_space(1));
+    content += &format!("{indent}}}\n");
+
+    (content, native_name, proxy_name)
+}
+
+fn gen_native(decl: &parser::InterfaceDecl, indent: usize) -> String {
+    let mut content = format!("{}fn on_transact(\n", indent_space(indent));
+
+    content += &format!("{}service: &dyn {}, code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {{\n",
+        indent_space(indent + 1),
+        decl.name);
+    content += &format!("{}Ok(())\n", indent_space(indent + 1));
+    content += &format!("{}}}\n", indent_space(indent));
+    content
+}
+
+fn gen_proxy(decl: &parser::InterfaceDecl, name: &str, indent: usize) -> (String, String) {
+    let impl_struct = format!("{}impl {} {{\n", indent_space(indent), name);
+    let impl_interface = format!("{}impl {} for {} {{\n", indent_space(indent), decl.name, name);
+
+    (impl_struct, impl_interface)
+}
+
+fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut content = String::new();
 
-    let mut decl = decl.clone();
+    let mut decl = arg_decl.clone();
     decl.post_process()?;
 
     content += &begin_mod(&decl.name, indent);
@@ -65,22 +136,40 @@ fn gen_interface(decl: &parser::InterfaceDecl, indent: usize) -> Result<String, 
         todo!();
     }
 
+    let declare_binder_interface = gen_declare_binder_interface(arg_decl, indent);
+    let generated_native = gen_native(arg_decl, indent);
+    let mut generated_proxy = gen_proxy(arg_decl, &declare_binder_interface.2, indent);
+
     content += &(indent_space(indent) + &format!("pub trait {}: rsbinder::Interface + Send {{\n", decl.name));
     for method in decl.method_list.iter() {
-        content += &gen_method(method, indent + 1)?;
+        let res = gen_method(method, indent + 1)?;
+
+        content += &res.0;
+        generated_proxy.0 += &res.1;
+        generated_proxy.1 += &res.2;
     }
     content += &(indent_space(indent) + "}\n\n");
-    content += &(indent_space(indent) + "mod transactions {\n");
+    content += &(indent_space(indent) + "pub mod transactions {\n");
 
     let mut idx = 0;
     for method in decl.method_list.iter() {
-        content += &format!("{}const {}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {idx};\n",
+        content += &format!("{}pub const {}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {idx};\n",
             indent_space(indent + 1),
             method.identifier.to_case(Case::UpperSnake));
         idx  += 1;
     }
 
     content += &(indent_space(indent) + "}\n");
+
+    content += &declare_binder_interface.0;
+
+    content += &generated_proxy.0;
+    content += &(indent_space(indent) + "}\n\n");
+
+    content += &generated_proxy.1;
+    content += &(indent_space(indent) + "}\n\n");
+
+    content += &generated_native;
 
     content += &end_mod(indent - 1);
 

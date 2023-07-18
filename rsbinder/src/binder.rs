@@ -1,13 +1,18 @@
 
+use std::ops::Deref;
+use std::sync::atomic::*;
 use std::hash::{Hash, Hasher};
 
 use std::any::Any;
-use std::sync::{Weak, Arc};
+use std::sync::{Arc};
 use std::fs::File;
+use std::fmt::Debug;
 use crate::{
     error::*,
     parcel::*,
     native,
+    proxy,
+    thread_state,
 };
 
 // use crate::thread_state::*;
@@ -33,6 +38,7 @@ pub const LAST_CALL_TRANSACTION: u32 = 0x00ffffff;
 pub const PING_TRANSACTION: u32 = b_pack_chars('_', 'P', 'N', 'G');
 pub const DUMP_TRANSACTION: u32 = b_pack_chars('_', 'D', 'M', 'P');
 pub const SHELL_COMMAND_TRANSACTION: u32 = b_pack_chars('_', 'C', 'M', 'D');
+// It must be used to ask binder's interface name.
 pub const INTERFACE_TRANSACTION: u32 = b_pack_chars('_', 'N', 'T', 'F');
 pub const SYSPROPS_TRANSACTION: u32 = b_pack_chars('_', 'S', 'P', 'R');
 pub const EXTENSION_TRANSACTION: u32 = b_pack_chars('_', 'E', 'X', 'T');
@@ -72,9 +78,9 @@ pub trait Interface: Send + Sync {
     // fn as_any(&self) -> &dyn Any;
 
     // /// Convert this binder object into a generic [`SpIBinder`] reference.
-    // fn as_binder(&self) -> &dyn IBinder {
-    //     panic!("This object was not a Binder object and cannot be converted into an SpIBinder.")
-    // }
+    fn as_binder(&self) -> StrongIBinder {
+        panic!("This object was not a Binder object and cannot be converted into an SpIBinder.")
+    }
 
     /// Dump transaction handler for this Binder object.
     ///
@@ -84,19 +90,19 @@ pub trait Interface: Send + Sync {
     //     Ok(())
     // }
 
-    fn clone_box(&self) -> Box<dyn Interface>;
+    fn box_clone(&self) -> Box<dyn Interface>;
 }
 
 impl Clone for Box<dyn Interface> {
     fn clone(&self) -> Box<dyn Interface> {
-        self.clone_box()
+        self.box_clone()
     }
 }
 
 pub(crate) struct Unknown {}
 
 impl Interface for Unknown {
-    fn clone_box(&self) -> Box<dyn Interface> {
+    fn box_clone(&self) -> Box<dyn Interface> {
         Box::new(Self {})
     }
 }
@@ -126,7 +132,7 @@ impl Interface for Unknown {
 
 
 pub trait DeathRecipient {
-    fn binder_died(&mut self, who: Weak<Box<dyn IBinder>>);
+    fn binder_died(&mut self, who: WeakIBinder);
 }
 
 /// Interface of binder local or remote objects.
@@ -160,13 +166,13 @@ pub trait IBinder: Send + Sync {
 }
 
 impl dyn IBinder {
-    pub fn as_native<T: 'static + Remotable>(&self) -> &native::Binder<T> {
-        self.as_any().downcast_ref::<&native::Binder<T>>().unwrap()
+    pub fn as_native<T: 'static + Remotable>(&self) -> Option<&native::Binder<T>> {
+        self.as_any().downcast_ref::<native::Binder<T>>()
     }
 
-    // pub fn as_proxy<T: 'static + Interface>(&self) -> &proxy::Proxy {
-    //     self.as_any().downcast_ref::<&proxy::Proxy<T>>().unwrap()
-    // }
+    pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
+        self.as_any().downcast_ref::<proxy::ProxyHandle>()
+    }
 }
 
 pub fn cookie_for_binder(binder: Arc<dyn IBinder>) -> u64 {
@@ -358,6 +364,32 @@ impl TryFrom<i32> for Stability {
 }
 
 
+/// Interface for transforming a generic SpIBinder into a specific remote
+/// interface trait.
+///
+/// # Example
+///
+/// For Binder interface `IFoo`, the following implementation should be made:
+/// ```no_run
+/// # use binder::{FromIBinder, SpIBinder, Result};
+/// # trait IFoo {}
+/// impl FromIBinder for dyn IFoo {
+///     fn try_from(ibinder: SpIBinder) -> Result<Box<Self>> {
+///         // ...
+///         # Err(binder::StatusCode::OK)
+///     }
+/// }
+/// ```
+// pub trait FromIBinder {
+//     /// Try to interpret a generic Binder object as this interface.
+//     ///
+//     /// Returns a trait object for the `Self` interface if this object
+//     /// implements that interface.
+//     fn try_from(ibinder: StrongIBinder) -> Result<Arc<Self>>;
+// }
+
+
+
 // impl From<InterfaceClass> for *const sys::AIBinder_Class {
 //     fn from(class: InterfaceClass) -> *const sys::AIBinder_Class {
 //         class.0
@@ -385,3 +417,159 @@ impl TryFrom<i32> for Stability {
 //         todo!("")
 //     }
 // }
+
+
+const INITIAL_STRONG_VALUE: usize = i32::MAX as _;
+
+struct Inner {
+    strong: AtomicUsize,
+    data: Box<dyn IBinder>,
+}
+
+impl Inner {
+    fn new(data: Box<dyn IBinder>) -> Arc<Self> {
+        Arc::new(
+            Self {
+                strong: AtomicUsize::new(INITIAL_STRONG_VALUE),
+                data,
+            }
+        )
+    }
+}
+
+impl Drop for Inner {
+    fn drop(self: &mut Inner) {
+        if let Some(proxy) = self.data.as_proxy() {
+            thread_state::dec_weak_handle(proxy.handle())
+                .expect("Failed to decrease the binder weak reference count.")
+        }
+    }
+}
+
+// #[derive(Debug)]
+pub struct StrongIBinder {
+    inner: Arc<Inner>,
+}
+
+impl StrongIBinder {
+    pub fn new(data: Box<dyn IBinder>) -> Self {
+        let this = WeakIBinder::new(data).upgrade();
+        this.inc_strong();
+        this
+    }
+
+    fn new_with_inner(inner: Arc<Inner>) -> Self {
+        let this = Self { inner };
+        this.inc_strong();
+        this
+    }
+
+    pub fn downgrade(this: &Self) -> WeakIBinder {
+        WeakIBinder::new_with_inner(this.inner.clone())
+        // drop will be called.
+    }
+
+    fn inc_strong(&self) {
+        let c = self.inner.strong.fetch_add(1, Ordering::Relaxed);
+        if c == INITIAL_STRONG_VALUE {
+            self.inner.strong.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
+            if let Some(proxy) = self.inner.data.as_proxy() {
+                thread_state::inc_strong_handle(proxy.handle(), self.clone())
+                    .expect("Failed to increase the binder strong reference count.");
+            }
+        }
+    }
+
+    fn dec_strong(&self) {
+        let c = self.inner.strong.fetch_sub(1, Ordering::Relaxed);
+        if c == 1 {
+            if let Some(proxy) = self.inner.data.as_proxy() {
+                thread_state::dec_strong_handle(proxy.handle())
+                    .expect("Failed to decrease the binder strong reference count.");
+            }
+        }
+    }
+}
+
+impl Clone for StrongIBinder {
+    fn clone(&self) -> Self {
+        Self::new_with_inner(self.inner.clone())
+    }
+}
+
+impl Drop for StrongIBinder {
+    fn drop(&mut self) {
+        self.dec_strong();
+    }
+}
+
+impl Deref for StrongIBinder {
+    type Target = Box<dyn IBinder>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner.data
+    }
+}
+
+#[derive(Clone)]
+pub struct WeakIBinder {
+    inner: Arc<Inner>,
+}
+
+impl WeakIBinder {
+    pub(crate) fn new(data: Box<dyn IBinder>) -> Self {
+        let this = Self { inner: Inner::new(data) };
+
+        if let Some(proxy) = this.inner.data.as_proxy() {
+            thread_state::inc_weak_handle(proxy.handle(), this.clone())
+                .expect("Failed to increase the binder weak reference count.")
+        }
+
+        this
+    }
+
+    fn new_with_inner(inner: Arc<Inner>) -> Self {
+        Self { inner: inner }
+    }
+
+    pub fn upgrade(&self) -> StrongIBinder {
+        StrongIBinder::new_with_inner(self.inner.clone())
+    }
+}
+
+impl Deref for WeakIBinder {
+    type Target = Box<dyn IBinder>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner.data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proxy::ProxyHandle;
+    use super::*;
+
+    #[test]
+    fn test_strong() -> Result<()> {
+        let strong = StrongIBinder::new(ProxyHandle::new(0, "interface".to_owned()));
+        assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
+
+        let strong2 = strong.clone();
+        assert_eq!(strong2.inner.strong.load(Ordering::Relaxed), 2);
+
+
+        let weak = StrongIBinder::downgrade(&strong);
+
+        assert_eq!(weak.inner.strong.load(Ordering::Relaxed), 1);
+
+        let strong = weak.upgrade();
+        assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 2);
+        StrongIBinder::downgrade(&strong);
+        // assert_eq!(*strong2.0.lock().unwrap(), 101);
+
+        // let weak = strong2.downgrade();
+
+        // assert_eq!(*weak.0.lock().unwrap(), 1);
+
+        Ok(())
+    }
+}

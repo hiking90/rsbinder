@@ -1,72 +1,43 @@
-use std::sync::Arc;
+
 use std::any::Any;
 
 use crate::{
     parcel::*,
     binder::*,
     error::*,
+    parcelable::*,
     thread_state,
 };
 
-pub struct Proxy {
+
+#[derive(Debug, Clone)]
+pub struct ProxyHandle {
     handle: u32,
-    interface: Box<dyn Interface>,
-    is_strong: bool,
+    descriptor: String,
 }
 
-impl Proxy {
-    pub fn new(handle: u32, interface: Box<dyn Interface>) -> Result<Arc<Self>> {
-        let weak = Arc::new(Self {
-            handle: handle,
-            interface: interface,
-            is_strong: false,
-        });
-
-        thread_state::inc_weak_handle(weak.clone())?;
-
-        Ok(weak)
+impl ProxyHandle {
+    pub fn new(handle: u32, interface: String) -> Box<Self> {
+        Box::new(Self {
+            handle,
+            descriptor: interface,
+        })
     }
 
     pub fn handle(&self) -> u32 {
         self.handle
     }
 
-    pub fn interface(&self) -> &Box<dyn Interface> {
-        &self.interface
+    pub fn descriptor(&self) -> &str {
+        &self.descriptor
     }
 
-    pub fn is_strong(&self) -> bool {
-        self.is_strong
-    }
-
-    pub fn upgrade(&self) -> Result<Arc<Self>> {
-        let strong = Arc::new(Self {
-            handle: self.handle,
-            interface: self.interface.clone(),
-            is_strong: true,
-        });
-
-        thread_state::inc_strong_handle(strong.clone())?;
-
-        Ok(strong)
+    pub fn submit_transact(&self, code: TransactionCode, data: &Parcel, flags: TransactionFlags) -> Result<Option<Parcel>> {
+        thread_state::transact(self.handle, code, data, flags)
     }
 }
 
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        if self.is_strong {
-            if let Err(err) = thread_state::dec_strong_handle(self.handle) {
-                log::warn!("Proxy dec_strong_handle error: {:?}", err);
-            }
-        } else {
-            if let Err(err) = thread_state::dec_weak_handle(self.handle) {
-                log::warn!("Proxy dec_weak_handle error: {:?}", err);
-            }
-        }
-    }
-}
-
-impl IBinder for Proxy {
+impl IBinder for ProxyHandle {
     fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
         todo!("IBinder for Proxy<I> - link_to_death")
     }
@@ -80,10 +51,7 @@ impl IBinder for Proxy {
 
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()> {
-        let data = Parcel::new();
-        let _reply = thread_state::transact(self.handle, PING_TRANSACTION, &data, 0)?;
-
-        Ok(())
+        thread_state::ping_binder(self.handle)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -94,6 +62,19 @@ impl IBinder for Proxy {
         true
     }
 }
+
+pub trait Proxy : Sized + Interface {
+    /// The Binder interface descriptor string.
+    ///
+    /// This string is a unique identifier for a Binder interface, and should be
+    /// the same between all implementations of that interface.
+    fn descriptor() -> &'static str;
+
+    /// Create a new interface from the given proxy, if it matches the expected
+    /// type of this interface.
+    fn from_binder(binder: StrongIBinder) -> Result<Self>;
+}
+
 
 // /// # Safety
 // ///

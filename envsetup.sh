@@ -13,11 +13,11 @@ if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then
 fi
 
 function build() {
-    cargo ndk -t x86_64 build --examples
+    cargo ndk -t x86_64 build
 }
 
 function install() {
-    adb push --sync target/x86_64-linux-android/debug/examples /data/rust/
+    adb push --sync target/x86_64-linux-android/debug/ /data/rsbinder/
 }
 
 function prepare() {

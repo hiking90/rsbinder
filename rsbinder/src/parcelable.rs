@@ -1,5 +1,3 @@
-use std::sync::{Arc, Weak};
-
 use crate::{
     IBinder,
     sys::*,
@@ -369,7 +367,7 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
     (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
-impl Serialize for Arc<dyn IBinder> {
+impl Serialize for StrongIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
 
         let sched_bits = if ProcessState::as_self().background_scheduling_disabled() == false {
@@ -379,7 +377,7 @@ impl Serialize for Arc<dyn IBinder> {
         };
 
         let obj = if self.is_remote() {
-            let proxy = self.as_any().downcast_ref::<Proxy>().expect("Downcast to Proxy<Unknown>");
+            let proxy = self.as_any().downcast_ref::<ProxyHandle>().expect("Downcast to Proxy<Unknown>");
 
             flat_binder_object {
                 hdr: binder_object_header {
@@ -392,7 +390,7 @@ impl Serialize for Arc<dyn IBinder> {
                 cookie: 0,
             }
         } else {
-            let weak = Box::new(Arc::downgrade(self));
+            let weak = Box::new(StrongIBinder::downgrade(self));
 
             flat_binder_object {
                 hdr: binder_object_header {
@@ -417,7 +415,7 @@ impl Serialize for Arc<dyn IBinder> {
 }
 
 
-impl Deserialize for Arc<dyn IBinder> {
+impl Deserialize for StrongIBinder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let flat: flat_binder_object = parcel.read()?;
         let _stability: i32 = parcel.read()?;
@@ -425,14 +423,16 @@ impl Deserialize for Arc<dyn IBinder> {
         unsafe {
             match flat.hdr.type_ {
                 BINDER_TYPE_BINDER => {
-                    let weak = Box::from_raw(flat.__bindgen_anon_1.binder as *mut Box<Weak<dyn IBinder>>);
-                    Weak::upgrade(&weak)
-                        .ok_or_else(|| Error::from(StatusCode::DeadObject))
+                    let weak = Box::from_raw(flat.__bindgen_anon_1.binder as *mut Box<WeakIBinder>);
+                    Ok(weak.upgrade())
+
+                    // Weak::upgrade(&weak)
+                    //     .ok_or_else(|| Error::from(StatusCode::DeadObject))
                 }
 
                 BINDER_TYPE_HANDLE => {
                     let res = ProcessState::as_self()
-                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle, Box::new(Unknown {}));
+                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
                     Ok(res?)
                 }
 

@@ -11,6 +11,7 @@ use pest::Parser;
 pub struct AIDLParser;
 
 use crate::const_expr::{ConstExpr, StringExpr, Expression};
+use crate::DEFAULT_NAMESPACE;
 
 lazy_static! {
     static ref DECLARATION_MAP: Mutex<HashMap<String, Declaration>> = Mutex::new(HashMap::new());
@@ -126,20 +127,22 @@ impl ParcelableDecl {
 
 #[derive(Debug, Default, Clone)]
 pub struct Arg {
-    direction: String,
-    r#type: Type,
-    identifier: String,
+    pub direction: String,
+    pub r#type: Type,
+    pub identifier: String,
 }
 
 impl Arg {
-    pub fn to_string(&self) -> String {
+    pub fn to_string(&self) -> (String, String) {
         let mutable = if self.direction == "out" || self.direction == "inout" {
             "mut"
         } else { "" };
 
         let borrowed = if self.r#type.is_clonable() { "" } else { "&" };
 
-        format!("_arg_{}: {}{}{}", self.identifier.to_case(Case::Snake), borrowed, mutable, self.r#type.to_string(true))
+        let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
+        let arg = format!("{}: {}{}{}", param.clone(), borrowed, mutable, self.r#type.to_string(true));
+        (param, arg)
     }
 }
 
@@ -276,15 +279,15 @@ impl NonArrayType {
             Some(gen) => gen.to_string(is_arg),
             None => "".into(),
         };
-        format!("{}{}", type_to_rust(&self.name, is_arg).0, gen_str)
+        format!("{}{}", type_to_rust(&self.name, is_arg).type_name, gen_str)
     }
 
     fn is_clonable(&self) -> bool {
-        type_to_rust(&self.name, true).2
+        type_to_rust(&self.name, true).is_clonable
     }
 
     fn to_default(&self) -> String {
-        type_to_rust(&self.name, true).1
+        type_to_rust(&self.name, true).default
     }
 }
 
@@ -345,12 +348,18 @@ impl Type {
     }
 }
 
-fn type_to_rust(type_name: &str, is_arg: bool) -> (String, String, bool) {
+pub struct TypeToRust {
+    type_name: String,
+    default: String,
+    is_clonable: bool,
+}
+
+fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
     // Return is (rust type, default, clonable).
     let zero = "0".to_owned();
     let zero_f = "0.0".to_owned();
     let default = "Default::default()".to_owned();
-    match type_name {
+    let res = match type_name {
         "boolean" => ("bool".to_owned(), "false".to_owned(), true),
         "byte" => ("i8".to_owned(), zero, true),
         "char" => ("u16".to_owned(), zero, true),
@@ -366,7 +375,7 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> (String, String, bool) {
                 ("String".to_owned(), default, false)
             }
         }
-        "IBinder" => { ("Arc<dyn rsbinder::IBinder>".to_owned(), default, true) }
+        "IBinder" => { ("rsbinder::StrongIBinder".to_owned(), default, true) }
         _ => {
             if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(type_name) {
                 let type_name = format!("crate::{}::{}", decl.namespace(), type_name);
@@ -381,6 +390,12 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> (String, String, bool) {
                 (type_name.to_owned(), default, false)
             }
         }
+    };
+
+    TypeToRust {
+        type_name: res.0,
+        default: res.1,
+        is_clonable: res.2
     }
 }
 
@@ -883,13 +898,13 @@ pub fn calculate_namespace(decl: &mut Declaration, namespace: Vec<String>) {
         return;
     }
 
-    let mut curr_ns = String::new();
+    let mut curr_ns = DEFAULT_NAMESPACE.to_owned();
 
     for ns in &namespace {
         curr_ns += &("::".to_owned() + &ns);
     }
 
-    *decl.namespace_mut() = curr_ns[2..].to_owned();
+    *decl.namespace_mut() = curr_ns;
 
     DECLARATION_MAP.lock().unwrap().insert(decl.name().to_owned(), decl.clone());
 

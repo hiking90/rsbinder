@@ -31,6 +31,8 @@ mod const_expr;
 //     generator::gen_document(args.outdir, args.filename, &document).unwrap();
 // }
 
+const DEFAULT_NAMESPACE: &str = "aidl";
+
 pub fn indent_space(step: usize) -> String {
     let indent = "    ";
     let mut ret = String::new();
@@ -40,6 +42,30 @@ pub fn indent_space(step: usize) -> String {
     }
 
     ret
+}
+
+fn add_indent(step: usize, source: &str) -> String {
+    let mut content = String::new();
+    for line in source.lines() {
+        if line.len() > 0 {
+            content += &(indent_space(step) + line + "\n");
+        } else {
+            content += "\n";
+        }
+    }
+    content
+}
+
+fn add_namespace(namespace: &str, source: &str) -> String {
+    let mut content = String::new();
+
+    content += &format!("pub mod {} {{\n", namespace);
+
+    content += &add_indent(1, source);
+
+    content += "}\n";
+
+    content
 }
 
 
@@ -140,13 +166,8 @@ impl Builder {
 
             content += "\n";
             content += &(indent_space(mod_count) + &format!("pub use {}::*;\n", package.2.to_case(Case::Snake)));
-            for line in package.1.lines() {
-                if line.len() > 0 {
-                    content += &(indent_space(mod_count) + line + "\n");
-                } else {
-                    content += "\n";
-                }
-            }
+
+            content += &add_indent(mod_count, &package.1);
         }
 
         for i in (0..mod_count).rev() {
@@ -176,8 +197,9 @@ impl Builder {
         }
 
         let content = self.generate_all(package_list)?;
+        let content = add_namespace(DEFAULT_NAMESPACE, &content);
 
-        let output = self.dest_dir.join("rsbinder_generated.rs");
+        let output = self.dest_dir.join("rsbinder_generated_aidl.rs");
         println!("==== {output:?} ====");
         fs::write(output, content)?;
 

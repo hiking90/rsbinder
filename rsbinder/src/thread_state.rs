@@ -10,7 +10,6 @@ use crate::{
     process_state::*,
     parcelable::*,
     sys::*,
-    proxy::*,
 };
 
 thread_local! {
@@ -119,8 +118,8 @@ pub struct ThreadState {
     strict_mode_policy: i32,
     is_looper: bool,
     is_flushing: bool,
-    post_strong_derefs: Vec<Arc<dyn IBinder>>,
-    post_weak_derefs: Vec<Arc<dyn IBinder>>,
+    post_strong_derefs: Vec<StrongIBinder>,
+    post_weak_derefs: Vec<WeakIBinder>,
     call_restriction: CallRestriction,
 }
 
@@ -684,13 +683,13 @@ fn flash_commands() -> Result<()> {
 }
 
 
-pub fn inc_strong_handle(proxy: Arc<Proxy>) -> Result<()> {
+pub fn inc_strong_handle(handle: u32, proxy: StrongIBinder) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
             state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE))?;
-            state.out_parcel.write::<u32>(&(proxy.handle()))?;
+            state.out_parcel.write::<u32>(&(handle))?;
         }
 
         if flash_if_needed()? == false {
@@ -716,18 +715,18 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub fn inc_weak_handle(proxy: Arc<Proxy>) -> Result<()>{
+pub fn inc_weak_handle(handle: u32, weak: WeakIBinder) -> Result<()>{
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
             state.out_parcel.write::<u32>(&(binder::BC_INCREFS))?;
-            state.out_parcel.write::<u32>(&(proxy.handle()))?;
+            state.out_parcel.write::<u32>(&(handle))?;
         }
 
         if flash_if_needed()? == false {
             // This code is come from IPCThreadState.cpp. Is it necessaryq?
-            thread_state.borrow_mut().post_weak_derefs.push(proxy);
+            thread_state.borrow_mut().post_weak_derefs.push(weak);
         }
 
         Ok(())
@@ -861,6 +860,21 @@ fn free_buffer(parcel: Option<&Parcel>, data: binder_uintptr_t, _: usize, _ : bi
 
     Ok(())
 }
+
+pub(crate) fn query_interface(handle: u32) -> Result<String> {
+    let data = Parcel::new();
+    let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
+    let interface: String16 = reply.expect("INTERFACE_TRANSACTION should have reply parcel").read()?;
+
+    Ok(interface.0)
+}
+
+pub(crate) fn ping_binder(handle: u32) -> Result<()> {
+    let data = Parcel::new();
+    let _reply = transact(handle, PING_TRANSACTION, &data, 0)?;
+    Ok(())
+}
+
 
 // void freeBuffer(Parcel* parcel, const uint8_t* data,
 //                                 size_t /*dataSize*/,
