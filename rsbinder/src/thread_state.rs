@@ -83,7 +83,7 @@ fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
 }
 
 const WORK_SOURCE_PROPAGATED_BIT_INDEX: i64 = 32;
-const UNSET_WORK_SOURCE: i32 = -1;
+pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 
 #[derive(Debug, Clone, Copy)]
 struct TransactionState {
@@ -228,31 +228,29 @@ impl ThreadState {
 // }
 
     fn write_transaction_data(&mut self, cmd: u32, flags: u32, handle: u32, code: u32, data: &Parcel) -> Result<()> {
+        // ptr is initialized by zero because ptr(64) and handle(32) size is different.
+        let mut target = binder_transaction_data__bindgen_ty_1 {
+            ptr: 0,
+        };
+        target.handle = handle;
+
         let tr = binder_transaction_data {
-            target: binder_transaction_data__bindgen_ty_1 {
-                handle: handle,
-                // ptr: 0,
-            },
-            cookie: 0,
+            target: target,
+            cookie: 0 ,
             code: code,
             flags: flags,
             sender_pid: 0,
             sender_euid: 0,
             data_size: data.len() as _,
-            offsets_size: 0,
+            offsets_size: (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _,
             data: binder_transaction_data__bindgen_ty_2 {
                 ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
                     buffer: data.as_ptr() as _,
-                    offsets: 0,
+                    offsets: data.objects.as_ptr() as _,
                 },
                 // buf: ,  // [__u8; 8usize],
             }
         };
-        // TODO:
-        // tr.data_size = data.ipcDataSize();
-        // tr.data.ptr.buffer = data.ipcData();
-        // tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
-        // tr.data.ptr.offsets = data.ipcObjects();
 
         self.out_parcel.write::<u32>(&cmd)?;
         unsafe {
@@ -278,6 +276,23 @@ pub(crate) fn call_restriction() -> CallRestriction {
     })
 }
 
+pub(crate) fn strict_mode_policy() -> i32 {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow().strict_mode_policy
+    })
+}
+
+pub(crate) fn should_propagate_work_source() -> bool {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow().transaction.map_or(false, |state| state.propagate_work_source)
+    })
+}
+
+pub(crate) fn calling_work_source_uid() -> binder::uid_t {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow().transaction.map_or(0, |state| state.work_source)
+    })
+}
 
 pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
     THREAD_STATE.with(|thread_state| -> Result<()> {

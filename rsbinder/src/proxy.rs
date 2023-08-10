@@ -35,6 +35,16 @@ impl ProxyHandle {
     pub fn submit_transact(&self, code: TransactionCode, data: &Parcel, flags: TransactionFlags) -> Result<Option<Parcel>> {
         thread_state::transact(self.handle, code, data, flags)
     }
+
+    pub fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
+        let mut data = Parcel::new();
+
+        if write_header == true {
+            data.write_interface_token(String16(self.descriptor.to_owned()))?;
+        }
+
+        Ok(data)
+    }
 }
 
 impl IBinder for ProxyHandle {

@@ -31,7 +31,7 @@ mod const_expr;
 //     generator::gen_document(args.outdir, args.filename, &document).unwrap();
 // }
 
-const DEFAULT_NAMESPACE: &str = "aidl";
+pub const DEFAULT_NAMESPACE: &str = "aidl";
 
 pub fn indent_space(step: usize) -> String {
     let indent = "    ";

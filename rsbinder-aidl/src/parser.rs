@@ -286,6 +286,10 @@ impl NonArrayType {
         type_to_rust(&self.name, true).is_clonable
     }
 
+    fn is_declared(&self) -> bool {
+        type_to_rust(&self.name, true).is_declared
+    }
+
     fn to_default(&self) -> String {
         type_to_rust(&self.name, true).default
     }
@@ -340,7 +344,11 @@ impl Type {
         self.non_array_type.to_default()
     }
 
-    fn is_clonable(&self) -> bool {
+    pub fn is_declared(&self) -> bool {
+        self.non_array_type.is_declared()
+    }
+
+    pub fn is_clonable(&self) -> bool {
         if self.annotation_list.is_empty() && self.array_types.is_empty() {
             return self.non_array_type.is_clonable()
         }
@@ -352,6 +360,7 @@ pub struct TypeToRust {
     type_name: String,
     default: String,
     is_clonable: bool,
+    is_declared: bool,
 }
 
 fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
@@ -359,6 +368,7 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
     let zero = "0".to_owned();
     let zero_f = "0.0".to_owned();
     let default = "Default::default()".to_owned();
+    let mut is_declared = false;
     let res = match type_name {
         "boolean" => ("bool".to_owned(), "false".to_owned(), true),
         "byte" => ("i8".to_owned(), zero, true),
@@ -382,6 +392,7 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
 
                 match decl {
                     Declaration::Interface(_) => {
+                        is_declared = true;
                         (format!("Arc<dyn {}>", type_name), default, true)
                     }
                     _ => { (type_name.to_owned(), default, false) }
@@ -395,7 +406,8 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
     TypeToRust {
         type_name: res.0,
         default: res.1,
-        is_clonable: res.2
+        is_clonable: res.2,
+        is_declared,
     }
 }
 

@@ -7,20 +7,22 @@ use std::default::Default;
 
 use pretty_hex::*;
 
-use crate::error::{Result, Error, StatusCode};
-use crate::sys::binder::{binder_size_t, flat_binder_object};
+use crate::{
+    error::{Result, Error, StatusCode},
+    sys::binder::{binder_size_t, flat_binder_object},
+    parcelable::*,
+    thread_state,
+    binder,
+};
 
-
-use crate::parcelable::*;
-
-// const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
+const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
 #[inline]
-fn pad_size(len: usize) -> usize {
+pub(crate) fn pad_size(len: usize) -> usize {
     (len+3) & (!3)
 }
 
-enum ParcelData<T: Clone + Default + 'static> {
+pub(crate) enum ParcelData<T: Clone + Default + 'static> {
     Vec(Vec<T>),
     Slice(&'static mut [T]),
 }
@@ -56,7 +58,7 @@ impl<T: Clone + Default> ParcelData<T> {
     //     }
     // }
 
-    fn as_ptr(&self) -> *const T {
+    pub(crate) fn as_ptr(&self) -> *const T {
         match self {
             ParcelData::Vec(ref v) => v.as_ptr(),
             ParcelData::Slice(s) => s.as_ptr(),
@@ -70,7 +72,7 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.as_slice().len()
     }
 
@@ -105,7 +107,7 @@ impl<T: Clone + Default> ParcelData<T> {
 
 pub struct Parcel {
     data: ParcelData<u8>,
-    objects: ParcelData<binder_size_t>,
+    pub(crate) objects: ParcelData<binder_size_t>,
     pos: usize,
     next_object_hint: usize,
     request_header_present: bool,
@@ -194,6 +196,10 @@ impl Parcel {
         self.pos = pos;
     }
 
+    pub fn data_position(&self) -> usize {
+        self.pos
+    }
+
     /// Read a type that implements [`Deserialize`] from the sub-parcel.
     pub fn read<D: Deserialize>(&mut self) -> Result<D> {
         let result = D::deserialize(self);
@@ -222,8 +228,18 @@ impl Parcel {
     pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
         let data_pos = self.pos as u64;
         let size = std::mem::size_of::<flat_binder_object>();
-        let obj = unsafe { *(self.read_data(size)?.as_ptr() as *const flat_binder_object) };
 
+        // To avoid the runtime error "misaligned pointer dereference", memory copy is used.
+        let mut obj: flat_binder_object = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.read_data(size)?.as_ptr(),
+                &mut obj as *mut _ as *mut u8,
+                std::mem::size_of::<flat_binder_object>(),
+            );
+        }
+
+        // __bindgen_anon_1 is union type. So, unsafe block is required to read member variable.
         unsafe {
             if null_meta == false && obj.cookie == 0 && obj.__bindgen_anon_1.binder == 0 {
                 return Ok(obj);
@@ -235,6 +251,7 @@ impl Parcel {
         let mut opos = self.next_object_hint;
 
         if count > 0 {
+            log::trace!("Parcel looking for obj at {}, hint={}", data_pos, opos);
             if opos < count {
                 while opos < (count - 1) && (objects[opos] as u64) < data_pos {
                     opos += 1;
@@ -242,7 +259,6 @@ impl Parcel {
             } else {
                 opos = count - 1;
             }
-
             if objects[opos] as u64 == data_pos {
                 self.next_object_hint = opos + 1;
                 return Ok(obj);
@@ -257,7 +273,6 @@ impl Parcel {
                 return Ok(obj);
             }
         }
-
         Err(Error::from(StatusCode::BadType))
     }
 
@@ -285,6 +300,21 @@ impl Parcel {
         if null_meta == true || unsafe { obj.__bindgen_anon_1.binder } != 0 {
             self.objects.push(data_pos as _);
         }
+
+        Ok(())
+    }
+
+    pub(crate) fn write_interface_token(&mut self, interface: String16) -> Result<()> {
+        self.write(&(&thread_state::strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
+        self.update_work_source_request_header_pos();
+        let work_source: i32 = if thread_state::should_propagate_work_source() {
+            thread_state::calling_work_source_uid() as _
+        } else {
+            thread_state::UNSET_WORK_SOURCE
+        };
+        self.write(&work_source)?;
+        self.write(&binder::INTERFACE_HEADER)?;
+        self.write(&interface)?;
 
         Ok(())
     }

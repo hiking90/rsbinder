@@ -11,7 +11,7 @@ mod binder;
 pub mod parcel;
 pub mod binderfs;
 mod service_manager;
-mod parcelable;
+pub mod parcelable;
 pub mod proxy;
 
 pub use process_state::ProcessState;

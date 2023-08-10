@@ -17,13 +17,32 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
     let mut build_params = String::new();
     let mut read_params = String::new();
     let mut args = "&self".to_string();
+    let mut build_parcel = Vec::new();
 
     method.arg_list.iter().for_each(|arg| {
-        let arg = arg.to_string();
-        args += &format!(", {}", arg.1);
-        build_params += &format!("{}.clone(), ", arg.0);
-        read_params += &format!("{}, ", arg.0);
+        let arg_str = arg.to_string();
+        args += &format!(", {}", arg_str.1);
+        build_params += &format!("{}.clone(), ", arg_str.0);
+        read_params += &format!("{}, ", arg_str.0);
+
+        // It generates body of build_parcel_functions.
+        let (ref_str, func_str) = if arg.r#type.is_clonable() == true {
+            if arg.r#type.is_declared() == true {
+                ("", ".as_ref()")
+            } else {
+                ("&", "")
+            }
+        } else {
+            ("", "")
+        };
+        build_parcel.push(format!("data.write({}{}{})?;", ref_str, arg_str.0, func_str));
     });
+
+    if build_parcel.len() > 0 {
+        build_parcel.insert(0, "let mut data = self.handle.prepare_transact(true)?;".to_owned());
+    } else {
+        build_parcel.push("let data = self.handle.prepare_transact(true)?;".to_owned());
+    }
 
     let return_type = if parser::is_nullable(&method.annotation_list) == true {
         format!("Option<{}>", method.r#type.to_string(false))
@@ -39,7 +58,10 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
 
     let mut proxy_struct_method = format!("{indent}fn build_parcel_{}({args}) -> rsbinder::Result<rsbinder::Parcel> {{\n",
         method_identifier);
-    proxy_struct_method += &format!("{indent}{}todo!()\n{indent}}}\n", indent_space(1));
+    build_parcel.iter().for_each(|line| {
+        proxy_struct_method += &format!("{indent}{}{}\n", indent_space(1), line);
+    });
+    proxy_struct_method += &format!("{indent}{}Ok(data)\n{indent}}}\n", indent_space(1));
     proxy_struct_method += &format!("{indent}fn read_response_{}({args}, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::Result<{return_type}> {{\n",
         method_identifier);
     proxy_struct_method += &format!("{indent}{}todo!()\n", indent_space(1));
@@ -88,7 +110,11 @@ fn gen_declare_binder_interface(decl: &parser::InterfaceDecl, indent: usize) -> 
     let native_name = format!("Bn{}", &decl.name[1..]);
     let proxy_name = format!("Bp{}", &decl.name[1..]);
 
-    content += &format!("{indent}{}{}[\"{}.{}\"] {{\n", indent_space(1), decl.name, decl.namespace, decl.name);
+    // decl.namespace has "aidl::android::os" and it must be converted from "aidl::android::os" to "android.os".
+    let namespace = decl.namespace.trim_start_matches(&(crate::DEFAULT_NAMESPACE.to_owned() + "::"));
+    let namespace = namespace.replace("::", ".");
+
+    content += &format!("{indent}{}{}[\"{}.{}\"] {{\n", indent_space(1), decl.name, namespace, decl.name);
     content += &format!("{indent}{}native: {native_name}(on_transact),\n", indent_space(2));
     content += &format!("{indent}{}proxy: {proxy_name},\n", indent_space(2));
     content += &format!("{indent}{}}}\n", indent_space(1));

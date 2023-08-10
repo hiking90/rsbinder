@@ -118,6 +118,17 @@ macro_rules! declare_binder_interface {
                 }
             }
         }
+
+        impl $crate::parcelable::Serialize for dyn $interface
+        where
+            dyn $interface: $crate::Interface
+        {
+            fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                let binder = $crate::Interface::as_binder(self);
+                parcel.write(&binder)?;
+                Ok(())
+            }
+        }
     }
 }
 
