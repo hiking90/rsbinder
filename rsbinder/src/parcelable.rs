@@ -9,6 +9,30 @@ use crate::{
 };
 
 
+/// Super-trait for Binder parcelables.
+///
+/// This trait is equivalent `android::Parcelable` in C++,
+/// and defines a common interface that all parcelables need
+/// to implement.
+pub trait Parcelable {
+    /// Internal serialization function for parcelables.
+    ///
+    /// This method is mainly for internal use.
+    /// `Serialize::serialize` and its variants are generally
+    /// preferred over this function, since the former also
+    /// prepend a header.
+    fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()>;
+
+    /// Internal deserialization function for parcelables.
+    ///
+    /// This method is mainly for internal use.
+    /// `Deserialize::deserialize` and its variants are generally
+    /// preferred over this function, since the former also
+    /// parse the additional header.
+    fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()>;
+}
+
+
 /// Metadata that `ParcelableHolder` needs for all parcelables.
 ///
 /// The compiler auto-generates implementations of this trait

@@ -13,6 +13,14 @@ pub fn attribute(indent: usize) -> String {
     return content;
 }
 
+// decl.namespace has "aidl::android::os" and it must be converted from "aidl::android::os" to "android.os".
+fn to_namespace(namespace: &str, name: &str) -> String {
+    let namespace = namespace.trim_start_matches(&(crate::DEFAULT_NAMESPACE.to_owned() + "::"));
+    let namespace = namespace.replace("::", ".");
+
+    format!("{namespace}.{name}")
+}
+
 fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, String, String), Box<dyn Error>> {
     let mut build_params = String::new();
     let mut read_params = String::new();
@@ -62,7 +70,7 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
         proxy_struct_method += &format!("{indent}{}{}\n", indent_space(1), line);
     });
     proxy_struct_method += &format!("{indent}{}Ok(data)\n{indent}}}\n", indent_space(1));
-    proxy_struct_method += &format!("{indent}fn read_response_{}({args}, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::Result<{return_type}> {{\n",
+    proxy_struct_method += &format!("{indent}fn read_response_{}({args}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{return_type}> {{\n",
         method_identifier);
     proxy_struct_method += &format!("{indent}{}todo!()\n", indent_space(1));
     proxy_struct_method += &format!("{indent}}}\n");
@@ -76,7 +84,7 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
 
     proxy_interface_method += &format!("{indent}{}let _aidl_data = self.build_parcel_{}({})?;\n",
         indent_space(1), method_identifier, build_params);
-    proxy_interface_method += &format!("{indent}{}let _aidl_reply = self.handle.submit_transact(transactions::{}, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);\n",
+    proxy_interface_method += &format!("{indent}{}let _aidl_reply = self.handle.submit_transact(transactions::{}, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;\n",
         indent_space(1), method.identifier.to_case(Case::UpperSnake));
     if read_params.len() > 0 {
         proxy_interface_method += &format!("{indent}{}self.read_response_{}({}_aidl_reply)\n",
@@ -110,11 +118,9 @@ fn gen_declare_binder_interface(decl: &parser::InterfaceDecl, indent: usize) -> 
     let native_name = format!("Bn{}", &decl.name[1..]);
     let proxy_name = format!("Bp{}", &decl.name[1..]);
 
-    // decl.namespace has "aidl::android::os" and it must be converted from "aidl::android::os" to "android.os".
-    let namespace = decl.namespace.trim_start_matches(&(crate::DEFAULT_NAMESPACE.to_owned() + "::"));
-    let namespace = namespace.replace("::", ".");
+    let namespace = to_namespace(&decl.namespace, &decl.name);
 
-    content += &format!("{indent}{}{}[\"{}.{}\"] {{\n", indent_space(1), decl.name, namespace, decl.name);
+    content += &format!("{indent}{}{}[\"{}\"] {{\n", indent_space(1), decl.name, namespace);
     content += &format!("{indent}{}native: {native_name}(on_transact),\n", indent_space(2));
     content += &format!("{indent}{}proxy: {proxy_name},\n", indent_space(2));
     content += &format!("{indent}{}}}\n", indent_space(1));
@@ -237,6 +243,44 @@ fn gen_parcelable(decl: &parser::ParcelableDecl, indent: usize) -> Result<String
     content += &(indent_space(indent + 1) + "}\n");
     content += &(indent_space(indent) + "}\n");
 
+    // Generate Parcelable
+
+    content += &format!("{}impl rsbinder::Parcelable for {} {{\n", indent_space(indent), decl.name);
+
+    content += &(indent_space(indent + 1) + "fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
+    for decl in &decl.members {
+        if let Some(decl) = decl.is_variable() {
+            content += &format!("{}parcel.write(&self.{})?;\n", indent_space(indent+2), decl.identifier());
+        }
+    }
+    content += &(indent_space(indent + 2) + "Ok(())\n");
+    content += &(indent_space(indent + 1) + "}\n");
+
+    content += &(indent_space(indent + 1) + "fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
+    for decl in &decl.members {
+        if let Some(decl) = decl.is_variable() {
+            content += &format!("{}self.{} = parcel.read()?;\n", indent_space(indent+2), decl.identifier());
+        }
+    }
+    content += &(indent_space(indent + 2) + "Ok(())\n");
+    content += &(indent_space(indent + 1) + "}\n");
+
+    content += &(indent_space(indent) + "}\n");
+
+    content += &format!("{}rsbinder::impl_serialize_for_parcelable!({});\n", indent_space(indent), decl.name);
+    content += &format!("{}rsbinder::impl_deserialize_for_parcelable!({});\n", indent_space(indent), decl.name);
+
+    content += &format!("{}impl rsbinder::ParcelableMetadata for {} {{\n", indent_space(indent), decl.name);
+
+    let namespace = to_namespace(&decl.namespace, &decl.name);
+
+    content += &format!("{}fn get_descriptor() -> &'static str {{ \"{}\" }}\n", indent_space(indent+1), namespace);
+    content += &(indent_space(indent) + "}\n");
+
+    // impl rsbinder::ParcelableMetadata for ConnectionInfo {
+    //   fn get_descriptor() -> &'static str { "android.os.ConnectionInfo" }
+    // }
+
     content += &gen_declations(&decl.members, indent+1)?;
 
     content += &end_mod(indent - 1);
@@ -277,6 +321,8 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
 
 pub fn gen_document(document: &parser::Document) -> Result<(String, String), Box<dyn Error>> {
     let mut content = String::new();
+
+    // content += "const SOME_REPLY_EXPECTED: &str = \"reply parcel must be valid.\"\n";
 
     content += &gen_declations(&document.decls, 0)?;
 

@@ -51,14 +51,18 @@ pub struct VariableDecl {
 impl VariableDecl {
     pub fn to_string(&self) -> String {
         if self.constant {
-            format!("pub const {}: {} = {};\n", self.identifier.to_case(Case::UpperSnake), self.r#type.to_string(true), self.const_expr.to_string())
+            format!("pub const {}: {} = {};\n", self.identifier(), self.r#type.to_string(true), self.const_expr.to_string())
         } else {
-            format!("pub {}: {},\n", self.identifier.to_case(Case::Snake), self.r#type.to_string(false))
+            format!("pub {}: {},\n", self.identifier(), self.r#type.to_string(false))
         }
     }
 
     pub fn to_default(&self) -> String {
-        format!("{}: {},\n", self.identifier.to_case(Case::Snake), self.r#type.to_default())
+        format!("{}: {},\n", self.identifier(), self.r#type.to_default())
+    }
+
+    pub fn identifier(&self) -> String {
+        self.identifier.to_case(Case::Snake)
     }
 }
 

@@ -134,6 +134,33 @@ impl std::fmt::Display for Status {
     }
 }
 
+impl Serialize for Status {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        parcel.write::<i32>(&self.exception_code)
+    }
+}
+
+impl Deserialize for Status {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        let exception = parcel.read::<i32>()?;
+
+        if exception == ExceptionCode::None as _ {
+            Ok(Status {
+                status_code: StatusCode::Ok as _,
+                exception_code: exception,
+                message: "Deserialize Status".to_owned(),
+            })
+        } else {
+            Err(Error::Status(Status {
+                status_code: StatusCode::Ok as _,
+                exception_code: exception,
+                message: "Deserialize Status".to_owned(),
+            }))
+        }
+    }
+}
+
+
 impl From<Status> for Error {
     fn from(status: Status) -> Self {
         Error::Status(status)

@@ -17,10 +17,11 @@ pub mod proxy;
 pub use process_state::ProcessState;
 // pub use thread_state::Se;
 pub use parcel::Parcel;
-pub use error::{StatusCode, Error, Result, ExceptionCode};
+pub use error::{StatusCode, Error, Result, ExceptionCode, Status};
 pub use binder::*;
 pub use service_manager::*;
 pub use proxy::*;
+pub use parcelable::*;
 // pub use ref_base::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
