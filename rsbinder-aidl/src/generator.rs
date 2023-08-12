@@ -64,15 +64,28 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
     let api = format!("{indent}fn {}({args}) -> rsbinder::Result<{return_type}>;\n",
         method_identifier);
 
+    // Generate build_parcel_{}
     let mut proxy_struct_method = format!("{indent}fn build_parcel_{}({args}) -> rsbinder::Result<rsbinder::Parcel> {{\n",
         method_identifier);
     build_parcel.iter().for_each(|line| {
         proxy_struct_method += &format!("{indent}{}{}\n", indent_space(1), line);
     });
     proxy_struct_method += &format!("{indent}{}Ok(data)\n{indent}}}\n", indent_space(1));
+
+    // Generate read_response_{}
     proxy_struct_method += &format!("{indent}fn read_response_{}({args}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{return_type}> {{\n",
         method_identifier);
-    proxy_struct_method += &format!("{indent}{}todo!()\n", indent_space(1));
+
+    if method.r#type.to_string(false) == "()" {
+        proxy_struct_method += &format!("{indent}{}Ok(())\n", indent_space(1));
+    } else {
+        proxy_struct_method += &format!("{indent}{}let mut _aidl_reply = _aidl_reply.unwrap();\n", indent_space(1));
+        proxy_struct_method += &format!("{indent}{}let _status = _aidl_reply.read::<rsbinder::Status>()?;\n", indent_space(1));
+        proxy_struct_method += &format!("{indent}{}let _aidl_return: {return_type} = _aidl_reply.read()?;\n", indent_space(1));
+        proxy_struct_method += &format!("{indent}{}Ok(_aidl_return)\n", indent_space(1));
+    }
+
+    // proxy_struct_method += &format!("{indent}{}todo!()\n", indent_space(1));
     proxy_struct_method += &format!("{indent}}}\n");
 
     let mut proxy_interface_method = format!("{indent}fn {}({args}) -> rsbinder::Result<{return_type}> {{\n",
@@ -132,7 +145,7 @@ fn gen_declare_binder_interface(decl: &parser::InterfaceDecl, indent: usize) -> 
 fn gen_native(decl: &parser::InterfaceDecl, indent: usize) -> String {
     let mut content = format!("{}fn on_transact(\n", indent_space(indent));
 
-    content += &format!("{}service: &dyn {}, code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {{\n",
+    content += &format!("{}_service: &dyn {}, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {{\n",
         indent_space(indent + 1),
         decl.name);
     content += &format!("{}Ok(())\n", indent_space(indent + 1));
@@ -181,11 +194,11 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
         generated_proxy.1 += &res.2;
     }
     content += &(indent_space(indent) + "}\n\n");
-    content += &(indent_space(indent) + "pub mod transactions {\n");
+    content += &(indent_space(indent) + "pub(crate) mod transactions {\n");
 
     let mut idx = 0;
     for method in decl.method_list.iter() {
-        content += &format!("{}pub const {}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {idx};\n",
+        content += &format!("{}pub(crate) const {}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {idx};\n",
             indent_space(indent + 1),
             method.identifier.to_case(Case::UpperSnake));
         idx  += 1;
@@ -247,19 +260,19 @@ fn gen_parcelable(decl: &parser::ParcelableDecl, indent: usize) -> Result<String
 
     content += &format!("{}impl rsbinder::Parcelable for {} {{\n", indent_space(indent), decl.name);
 
-    content += &(indent_space(indent + 1) + "fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
+    content += &(indent_space(indent + 1) + "fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
     for decl in &decl.members {
         if let Some(decl) = decl.is_variable() {
-            content += &format!("{}parcel.write(&self.{})?;\n", indent_space(indent+2), decl.identifier());
+            content += &format!("{}_parcel.write(&self.{})?;\n", indent_space(indent+2), decl.identifier());
         }
     }
     content += &(indent_space(indent + 2) + "Ok(())\n");
     content += &(indent_space(indent + 1) + "}\n");
 
-    content += &(indent_space(indent + 1) + "fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
+    content += &(indent_space(indent + 1) + "fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {\n");
     for decl in &decl.members {
         if let Some(decl) = decl.is_variable() {
-            content += &format!("{}self.{} = parcel.read()?;\n", indent_space(indent+2), decl.identifier());
+            content += &format!("{}self.{} = _parcel.read()?;\n", indent_space(indent+2), decl.identifier());
         }
     }
     content += &(indent_space(indent + 2) + "Ok(())\n");

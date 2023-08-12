@@ -331,10 +331,18 @@ impl Serialize for String {
 
 impl SerializeArray for String {}
 
+impl Deserialize for Option<String> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        let res = parcel.read::<Option<String16>>()?.map(|s| s.0);
+        Ok(res)
+    }
+}
+
 impl Deserialize for String {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let res = parcel.read::<String16>()?;
-        Ok(res.0)
+        Deserialize::deserialize(parcel)
+            .transpose()
+            .unwrap_or(Err(StatusCode::UnexpectedNull.into()))
     }
 }
 
@@ -366,18 +374,32 @@ impl Serialize for String16 {
     }
 }
 
-impl Deserialize for String16 {
+impl Deserialize for Option<String16> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let len = parcel.read::<i32>()?;
 
-        let data = parcel.read_data((len as usize + 1) * std::mem::size_of::<u16>())?;
-        let res = String::from_utf16(
-            unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
-            }
-        )?;
+        if len >= 0 && len < i32::MAX {
+            let pad_size = crate::parcel::pad_size((len as usize + 1) * std::mem::size_of::<u16>());
 
-        Ok(String16(res))
+            let data = parcel.read_data(pad_size)?;
+            let res = String::from_utf16(
+                unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
+                }
+            )?;
+
+            Ok(Some(String16(res)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Deserialize for String16 {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        Deserialize::deserialize(parcel)
+            .transpose()
+            .unwrap_or(Err(StatusCode::UnexpectedNull.into()))
     }
 }
 

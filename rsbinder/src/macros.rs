@@ -152,7 +152,7 @@ macro_rules! impl_serialize_for_parcelable {
             }
         }
 
-        // impl $crate::binder_impl::SerializeArray for $parcelable {}
+        impl $crate::SerializeArray for $parcelable {}
 
         impl $crate::SerializeOption for $parcelable {
             fn serialize_option(
@@ -203,7 +203,7 @@ macro_rules! impl_deserialize_for_parcelable {
             }
         }
 
-        // impl $crate::binder_impl::DeserializeArray for $parcelable {}
+        impl $crate::DeserializeArray for $parcelable {}
 
         impl $crate::DeserializeOption for $parcelable {
             fn deserialize_option(
