@@ -99,9 +99,9 @@ enumerator = {
     identifier
 }
 
-enumerators = { enumerator ~ ("," ~ enumerator)* }
+enumerators = _{ enumerator ~ ("," ~ enumerator)* }
 
-enum_decl_body = {
+enum_decl_body = _{
     "{" ~ enumerators ~ "}" |
     "{" ~ enumerators ~ "," ~ "}"
 }
@@ -186,8 +186,8 @@ LSHIFT = { "<<" }
 IN = { "in" }
 OUT = { "out" }
 INOUT = { "inout" }
-ENUM = { "enum" }
-UNION = { "union" }
+ENUM = _{ "enum" }
+UNION = _{ "union" }
 CPP_HEADER = _{ "cpp_header" }
 PARCELABLE = _{ "parcelable" }
 IDENTIFIER = @{ ("_" | ASCII_ALPHA)+ ~ ("_" | ASCII_ALPHA | ASCII_DIGIT)* }

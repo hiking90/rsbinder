@@ -94,7 +94,7 @@ impl Builder {
         self
     }
 
-    fn parse_and_gen(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
+    fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
         let unparsed_file = fs::read_to_string(filename.clone())?;
         let document = parser::parse_document(&unparsed_file)?;
 
@@ -115,7 +115,7 @@ impl Builder {
                 package_list.append(&mut self.traverse_source(&path)?);
             }
             if path.is_file() && path.extension().unwrap_or_default() == "aidl" {
-                let package = Self::parse_and_gen(&path)?;
+                let package = Self::parse_file(&path)?;
                 package_list.push(package);
             }
         }
@@ -183,7 +183,7 @@ impl Builder {
 
         for source in &self.sources {
             if source.is_file() {
-                let package = Self::parse_and_gen(&source)?;
+                let package = Self::parse_file(&source)?;
                 document_list.push(package);
             } else {
                 document_list.append(&mut self.traverse_source(&source)?);
@@ -215,12 +215,11 @@ mod tests {
     #[test]
     fn test_service_manager() -> Result<(), Box<dyn Error>> {
         Builder::new()
-            .source(PathBuf::from("aidl/android/os/IServiceManager.aidl"))
-            .source(PathBuf::from("aidl/android/os/IClientCallback.aidl"))
-            .source(PathBuf::from("aidl/android/os/IServiceCallback.aidl"))
-            .source(PathBuf::from("aidl/android/os/ConnectionInfo.aidl"))
-            .source(PathBuf::from("aidl/android/os/ServiceDebugInfo.aidl"))
-            .source(PathBuf::from("aidl/android/graphics/Bitmap.aidl"))
+            .source(PathBuf::from("../aidl/android/os/IServiceManager.aidl"))
+            .source(PathBuf::from("../aidl/android/os/IClientCallback.aidl"))
+            .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
+            .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
+            .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
             .generate()?;
 
         Ok(())
@@ -231,6 +230,143 @@ mod tests {
         Builder::new()
             .source(PathBuf::from("aidl"))
             .generate()
+    }
+
+    fn enum_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
+        let document = parser::parse_document(input)?;
+        let res = generator::gen_document(&document)?;
+        assert_eq!(res.1.trim(), expect.trim());
+        Ok(())
+    }
+
+    #[test]
+    fn test_enum() -> Result<(), Box<dyn Error>> {
+        enum_generator(r##"
+                @Backing(type="byte")
+                enum ByteEnum {
+                    // Comment about FOO.
+                    FOO = 1,
+                    BAR = 2,
+                    BAZ,
+                }
+            "##,
+            r##"
+declare_binder_enum! {
+    ByteEnum : [i8; 3] {
+        FOO = 1,
+        BAR = 2,
+        BAZ = 3,
+    }
+}
+            "##)?;
+
+        enum_generator(r##"
+                enum BackendType {
+                    CPP,
+                    JAVA,
+                    NDK,
+                    RUST,
+                }
+            "##,
+            r##"
+declare_binder_enum! {
+    BackendType : [i8; 4] {
+        CPP = 0,
+        JAVA = 1,
+        NDK = 2,
+        RUST = 3,
+    }
+}
+            "##)?;
+
+        enum_generator(r##"
+            @Backing(type="int")
+            enum ConstantExpressionEnum {
+                // Should be all true / ones.
+                // dec literals are either int or long
+                decInt32_1 = (~(-1)) == 0,
+                decInt32_2 = ~~(1 << 31) == (1 << 31),
+                decInt64_1 = (~(-1L)) == 0,
+                decInt64_2 = (~4294967295L) != 0,
+                decInt64_3 = (~4294967295) != 0,
+                decInt64_4 = ~~(1L << 63) == (1L << 63),
+
+                // hex literals could be int or long
+                // 0x7fffffff is int, hence can be negated
+                hexInt32_1 = -0x7fffffff < 0,
+
+                // 0x80000000 is int32_t max + 1
+                hexInt32_2 = 0x80000000 < 0,
+
+                // 0xFFFFFFFF is int32_t, not long; if it were long then ~(long)0xFFFFFFFF != 0
+                hexInt32_3 = ~0xFFFFFFFF == 0,
+
+                // 0x7FFFFFFFFFFFFFFF is long, hence can be negated
+                hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
+            }
+            "##,
+
+        // TODO: Android AIDL generates 1, but rsbinder aidl generates 0.
+        // hexInt32_2 = 0,
+        // hexInt32_3 = 0,
+
+            r##"
+declare_binder_enum! {
+    ConstantExpressionEnum : [i32; 10] {
+        decInt32_1 = 1,
+        decInt32_2 = 1,
+        decInt64_1 = 1,
+        decInt64_2 = 1,
+        decInt64_3 = 1,
+        decInt64_4 = 1,
+        hexInt32_1 = 1,
+        hexInt32_2 = 0,
+        hexInt32_3 = 0,
+        hexInt64_1 = 1,
+    }
+}
+            "##)?;
+
+        enum_generator(r##"
+            @Backing(type="int")
+            enum IntEnum {
+                FOO = 1000,
+                BAR = 2000,
+                BAZ,
+                /** @deprecated do not use this */
+                QUX,
+            }
+            "##,
+            r##"
+declare_binder_enum! {
+    IntEnum : [i32; 4] {
+        FOO = 1000,
+        BAR = 2000,
+        BAZ = 2001,
+        QUX = 2002,
+    }
+}
+            "##)?;
+
+        enum_generator(r##"
+            @Backing(type="long")
+            enum LongEnum {
+                FOO = 100000000000,
+                BAR = 200000000000,
+                BAZ,
+            }
+            "##,
+            r##"
+declare_binder_enum! {
+    LongEnum : [i64; 3] {
+        FOO = 100000000000,
+        BAR = 200000000000,
+        BAZ = 200000000001,
+    }
+}
+            "##)?;
+
+        Ok(())
     }
 
 //     #[test]

@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::error::Error;
 
 use convert_case::{Case, Casing};
-use crate::{parser, indent_space};
+use crate::{parser, indent_space, const_expr};
 
 pub fn attribute(indent: usize) -> String {
     let mut content = String::new();
@@ -309,6 +310,42 @@ fn gen_variable(decl: &parser::VariableDecl, indent: usize) -> Result<String, Bo
     Ok(content)
 }
 
+fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let indent = indent_space(indent);
+    let mut content = String::new();
+
+    content += &format!("{indent}declare_binder_enum! {{\n");
+    content += &format!("{indent}{}{} : [{}; {}] {{\n", indent_space(1),
+        decl.name, parser::get_backing_type(&decl.annotation_list), decl.enumerator_list.len());
+
+    let mut enum_val: i64 = 0;
+    for enumerator in &decl.enumerator_list {
+        if let Some(const_expr) = &enumerator.const_expr {
+            if let const_expr::ConstExpr::Expression(expr) = const_expr.calculate(&mut HashMap::new())? {
+                enum_val = expr.to_i64()?;
+            }
+        }
+        content += &format!("{indent}{}{} = {},\n", indent_space(2),
+            enumerator.identifier, enum_val);
+        enum_val += 1;
+    }
+
+    content += &format!("{indent}{}}}\n", indent_space(1));
+    content += &(indent + "}\n");
+
+
+// use binder::declare_binder_enum;
+// declare_binder_enum! {
+//   ByteEnum : [i8; 3] {
+//     FOO = 1,
+//     BAR = 2,
+//     BAZ = 3,
+//   }
+// }
+
+    Ok(content)
+}
+
 pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut content = String::new();
 
@@ -323,6 +360,10 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
             }
 
             parser::Declaration::Variable(_decl) => {
+            }
+
+            parser::Declaration::Enum(decl) => {
+                content += &gen_enum(decl, indent)?;
             }
 
             _ => todo!(),

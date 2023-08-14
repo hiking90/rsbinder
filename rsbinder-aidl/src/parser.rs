@@ -164,7 +164,7 @@ pub struct MethodDecl {
 pub enum Declaration {
     Parcelable(ParcelableDecl),
     Interface(InterfaceDecl),
-    Enum,
+    Enum(EnumDecl),
     Union,
     Variable(VariableDecl),
 }
@@ -190,6 +190,7 @@ impl Declaration {
         match self {
             Declaration::Parcelable(decl) => &mut decl.namespace,
             Declaration::Interface(decl) => &mut decl.namespace,
+            Declaration::Enum(decl) => &mut decl.namespace,
             _ => todo!(),
         }
     }
@@ -198,6 +199,7 @@ impl Declaration {
         match self {
             Declaration::Parcelable(decl) => &decl.name,
             Declaration::Interface(decl) => &decl.name,
+            Declaration::Enum(decl) => &decl.name,
             _ => todo!(),
         }
     }
@@ -206,6 +208,7 @@ impl Declaration {
         match self {
             Declaration::Parcelable(decl) => &mut decl.members,
             Declaration::Interface(decl) => &mut decl.members,
+            Declaration::Enum(decl) => &mut decl.members,
             _ => todo!(),
         }
     }
@@ -425,6 +428,26 @@ pub fn is_nullable(annotation_list: &Vec<Annotation>) -> bool {
     false
 }
 
+pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> String {
+    // parse "@Backing(type="byte")"
+    for annotation in annotation_list {
+        if annotation.annotation == "@Backing" {
+            for param in &annotation.parameter_list {
+                if param.identifier == "type" {
+                    if let ConstExpr::String(expr) = &param.const_expr {
+                        if let StringExpr::CStr(cstr) = expr {
+                            // The cstr is enclosed in quotes.
+                            return type_to_rust(cstr.trim_matches('"'), false).type_name
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    "i8".into()
+}
+
 fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
     let operator = pairs.next().unwrap().as_str().to_owned();
     let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap());
@@ -441,6 +464,8 @@ fn parse_intvalue(value: &str, radix: u32) -> Expression {
     } else if value.ends_with("u8") {
         is_u8 = true;
         &value[..value.len()-2]
+    } else if radix == 16 && (value.starts_with("0x") || value.starts_with("0X")) {
+        &value[2..]
     } else {
         value
     };
@@ -478,7 +503,7 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Expression {
 }
 
 fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Expression {
-    println!("parse_factor {:?}", pair);
+    // println!("parse_factor {:?}", pair);
     match pair.as_rule() {
         Rule::expression => {
             parse_expression(pair.into_inner())
@@ -494,7 +519,7 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Expression {
 }
 
 fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Expression {
-    println!("expression_term {:?}", pair);
+    // println!("expression_term {:?}", pair);
     match pair.as_rule() {
         Rule::equality | Rule::comparison | Rule::bitwise | Rule::shift | Rule::arith |
         Rule::logical => {
@@ -883,6 +908,53 @@ fn parse_parcelable_decl(pairs: pest::iterators::Pairs<Rule>) -> Declaration {
     Declaration::Parcelable(parcelable)
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct Enumerator {
+    pub identifier: String,
+    pub const_expr: Option<ConstExpr>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct EnumDecl {
+    pub namespace: String,
+    pub annotation_list: Vec<Annotation>,
+    pub name: String,
+    pub enumerator_list: Vec<Enumerator>,
+    pub members: Vec<Declaration>,
+}
+
+fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Enumerator {
+    let mut res = Enumerator::default();
+
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::identifier => { res.identifier = pair.as_str().into(); }
+            Rule::const_expr => { res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())); }
+            _ => unreachable!("Unexpected rule in parse_enumerator(): {}", pair),
+        }
+    }
+
+    res
+}
+
+fn parse_enum_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pairs<Rule>) -> Declaration {
+    let mut enum_decl = EnumDecl { annotation_list, .. Default::default() };
+
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::qualified_name => {
+                enum_decl.name = pair.as_str().into();
+            }
+            Rule::enumerator => {
+                enum_decl.enumerator_list.push(parse_enumerator(pair.into_inner()))
+            }
+            _ => unreachable!("Unexpected rule in parse_enum_decl(): {}", pair),
+        }
+    }
+
+    Declaration::Enum(enum_decl)
+}
+
 fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
     let mut annotation_list = Vec::new();
     let mut declarations = Vec::new();
@@ -899,7 +971,9 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
             Rule::parcelable_decl => {
                 declarations.push(parse_parcelable_decl(pair.into_inner()));
             }
-            Rule::enum_decl => todo!(),
+            Rule::enum_decl => {
+                declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner()));
+            }
             Rule::union_decl => todo!(),
 
             _ => unreachable!("Unexpected rule in parse_decl(): {}", pair),
@@ -968,7 +1042,7 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
                 }
             }
 
-            println!("{:?}", document);
+            // println!("{:?}", document);
         },
         Err(err) => {
             panic!("{}", err);
@@ -1025,7 +1099,7 @@ mod tests {
             }
             if path.is_file() && path.extension().unwrap_or_default() == "aidl" {
                 let unparsed_file = fs::read_to_string(path.clone()).expect("cannot read file");
-                println!("File: {}", path.display());
+                // println!("File: {}", path.display());
                 parser(&unparsed_file)?;
             }
         }
@@ -1064,41 +1138,38 @@ mod tests {
 
     #[test]
     fn test_parse_expression() -> Result<(), Box<dyn Error>> {
-        match AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2 | 4"##) {
-            Ok(mut res) => {
-                let expr = parse_expression(res.next().unwrap().into_inner());
-                assert_eq!(
-                    expr.clone(),
-                    Expression::Expr {
-                        lhs: Box::new(Expression::Expr {
-                            lhs: Box::new(Expression::Expr {
-                                lhs: Box::new(Expression::Int(1)),
-                                operator: "+".to_string(),
-                                rhs: Box::new(Expression::Expr {
-                                    lhs: Box::new(Expression::Unary {
-                                        operator: "-".to_string(),
-                                        expr: Box::new(Expression::Int(3))
-                                    }),
-                                    operator: "*".to_string(),
-                                    rhs: Box::new(Expression::Int(2))
-                                })
+        let mut res = AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2 | 4"##).map_err(|err| {
+            println!("{}", err);
+            err
+        })?;
+
+        let expr = parse_expression(res.next().unwrap().into_inner());
+        assert_eq!(
+            expr.clone(),
+            Expression::Expr {
+                lhs: Box::new(Expression::Expr {
+                    lhs: Box::new(Expression::Expr {
+                        lhs: Box::new(Expression::Int(1)),
+                        operator: "+".to_string(),
+                        rhs: Box::new(Expression::Expr {
+                            lhs: Box::new(Expression::Unary {
+                                operator: "-".to_string(),
+                                expr: Box::new(Expression::Int(3))
                             }),
-                            operator: "<<".to_string(),
+                            operator: "*".to_string(),
                             rhs: Box::new(Expression::Int(2))
-                        }),
-                        operator: "|".to_string(),
-                        rhs: Box::new(Expression::Int(4))
-                    },
-                );
-
-                assert_eq!(expr.calculate(&mut HashMap::new())?, Expression::Int(-20));
-
-                Ok(())
+                        })
+                    }),
+                    operator: "<<".to_string(),
+                    rhs: Box::new(Expression::Int(2))
+                }),
+                operator: "|".to_string(),
+                rhs: Box::new(Expression::Int(4))
             },
-            Err(err) => {
-                println!("{}", err);
-                Err(Box::new(err))
-            }
-        }
+        );
+
+        assert_eq!(expr.calculate(&mut HashMap::new())?, Expression::Int(-20));
+
+        Ok(())
     }
 }

@@ -231,6 +231,61 @@ macro_rules! impl_deserialize_for_parcelable {
     };
 }
 
+
+/// Declare an AIDL enumeration.
+///
+/// This is mainly used internally by the AIDL compiler.
+#[macro_export]
+macro_rules! declare_binder_enum {
+    {
+        $( #[$attr:meta] )*
+        $enum:ident : [$backing:ty; $size:expr] {
+            $( $( #[$value_attr:meta] )* $name:ident = $value:expr, )*
+        }
+    } => {
+        $( #[$attr] )*
+        #[derive(Debug, Default, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
+        #[allow(missing_docs)]
+        pub struct $enum(pub $backing);
+        impl $enum {
+            $( $( #[$value_attr] )* #[allow(missing_docs)] pub const $name: Self = Self($value); )*
+
+            #[inline(always)]
+            #[allow(missing_docs)]
+            pub const fn enum_values() -> [Self; $size] {
+                [$(Self::$name),*]
+            }
+        }
+
+        impl $crate::Serialize for $enum {
+            fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                parcel.write(&self.0)
+            }
+        }
+
+        impl $crate::SerializeArray for $enum {
+            fn serialize_array(slice: &[Self], parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                let v: Vec<$backing> = slice.iter().map(|x| x.0).collect();
+                <$backing as $crate::SerializeArray>::serialize_array(&v[..], parcel)
+            }
+        }
+
+        impl $crate::Deserialize for $enum {
+            fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
+                parcel.read().map(Self)
+            }
+        }
+
+        impl $crate::DeserializeArray for $enum {
+            fn deserialize_array(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Vec<Self>>> {
+                let v: Option<Vec<$backing>> =
+                    <$backing as $crate::DeserializeArray>::deserialize_array(parcel)?;
+                Ok(v.map(|v| v.into_iter().map(Self).collect()))
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Interface, TransactionCode, Result};

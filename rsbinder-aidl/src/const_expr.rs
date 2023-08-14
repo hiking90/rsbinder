@@ -118,6 +118,23 @@ impl Expression {
         }
     }
 
+    pub fn to_i64(&self) -> Result<i64, Error> {
+        match self {
+            Expression::Name(v) => Err(Error::WrongFormat(format!("Can't convert Name {} to i64", v))),
+            Expression::Int(v) => Ok(*v),
+            Expression::IntU8(v) => Ok(*v as i64),
+            Expression::Float(v) => Ok(*v as i64),
+            Expression::Bool(v) => if *v == true { Ok(1) } else { Ok(0) },
+            Expression::Unary{ operator, expr } => {
+                let expr = expr.calc_unary(operator, &mut HashMap::new())?;
+                expr.to_i64()
+            }
+            Expression::Expr{ lhs, operator, rhs} => {
+                let expr = lhs.calc_expr(operator, rhs, &mut HashMap::new())?;
+                expr.to_i64()
+            }
+        }
+    }
 
     fn calc_expr(&self, operator: &str, rhs: &Expression, dict: &mut HashMap<String, ConstExpr>) -> Result<Expression, Error> {
         let lhs = self.calculate(dict)?;
@@ -453,7 +470,7 @@ impl ConstExpr {
 
     pub fn calculate(&self, dict: &mut HashMap<String, ConstExpr>) -> Result<ConstExpr, Error> {
         let res = match self {
-            ConstExpr::Char(v) => self.clone(),
+            ConstExpr::Char(_v) => self.clone(),
             ConstExpr::String(v) => {
                 ConstExpr::String(v.calculate(dict)?)
             }
