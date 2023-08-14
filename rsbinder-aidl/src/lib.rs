@@ -10,27 +10,6 @@ mod parser;
 mod generator;
 mod const_expr;
 
-// use clap::Parser as ClapParser;
-
-// #[derive(ClapParser, Debug)]
-// #[command(author, version, about, long_about = None)]
-// struct Args {
-//     #[arg(short, long)]
-//     filename: PathBuf,
-
-//     #[arg(short, long)]
-//     outdir: PathBuf,
-// }
-
-// fn main() {
-//     let args = Args::parse();
-
-//     let unparsed_file = fs::read_to_string(args.filename.clone()).expect("cannot read file");
-//     let document = parser::parse_document(&unparsed_file).unwrap();
-
-//     generator::gen_document(args.outdir, args.filename, &document).unwrap();
-// }
-
 pub const DEFAULT_NAMESPACE: &str = "aidl";
 
 pub fn indent_space(step: usize) -> String {
@@ -67,7 +46,6 @@ fn add_namespace(namespace: &str, source: &str) -> String {
 
     content
 }
-
 
 pub struct Builder {
     sources: Vec<PathBuf>,

@@ -457,20 +457,28 @@ fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
     }
 }
 
-fn parse_intvalue(value: &str, radix: u32) -> Expression {
+fn parse_intvalue(arg_value: &str, radix: u32) -> Expression {
     let mut is_u8 = false;
+
+    let value = if radix == 16 && (arg_value.starts_with("0x") || arg_value.starts_with("0X")) {
+        &arg_value[2..]
+    } else {
+        arg_value
+    };
+
     let value = if value.ends_with("l") || value.ends_with("L") {
         &value[..value.len() -1]
     } else if value.ends_with("u8") {
         is_u8 = true;
         &value[..value.len()-2]
-    } else if radix == 16 && (value.starts_with("0x") || value.starts_with("0X")) {
-        &value[2..]
     } else {
         value
     };
 
-    let value = i64::from_str_radix(&value, radix).unwrap();
+    let value = i64::from_str_radix(&value, radix).map_err(|err| {
+        eprintln!("{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n", err, arg_value, radix);
+        err
+    }).unwrap();
     if is_u8 == true {
         Expression::IntU8(value as u8)
     } else {
@@ -753,7 +761,12 @@ fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> V
             Rule::annotation_list => { decl.annotation_list = parse_annotation_list(pair.into_inner()); }
             Rule::r#type => { decl.r#type = parse_type(pair.into_inner()); }
             Rule::identifier => { decl.identifier = pair.as_str().into(); }
-            Rule::const_expr => { decl.const_expr = parse_const_expr(pair.into_inner().next().unwrap()); }
+            Rule::const_expr => {
+                match pair.into_inner().next() {
+                    Some(pair) => decl.const_expr = parse_const_expr(pair),
+                    None => decl.const_expr = ConstExpr::List(vec![]),
+                }
+            }
             _ => unreachable!("Unexpected rule in parse_variable_decl(): {}\t{}", pair, pair.as_str()),
         }
     }
