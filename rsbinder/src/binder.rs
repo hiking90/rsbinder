@@ -1,3 +1,21 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * Copyright (C) 2020 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 use std::ops::Deref;
 use std::sync::atomic::*;
@@ -174,6 +192,25 @@ impl dyn IBinder {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
     }
 }
+
+impl std::fmt::Debug for dyn IBinder {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_any())
+    }
+}
+
+impl PartialEq for dyn IBinder  {
+    fn eq(&self, other: &Self) -> bool {
+        if self.is_remote() == true && other.is_remote() == true {
+            return self.as_proxy() == other.as_proxy()
+        } else if self.is_remote() == false && other.is_remote() == false {
+            return self.as_any().type_id() == other.as_any().type_id()
+        }
+
+        false
+    }
+}
+
 
 pub fn cookie_for_binder(binder: Arc<dyn IBinder>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -421,6 +458,7 @@ impl TryFrom<i32> for Stability {
 
 const INITIAL_STRONG_VALUE: usize = i32::MAX as _;
 
+#[derive(Debug)]
 struct Inner {
     strong: AtomicUsize,
     data: Box<dyn IBinder>,
@@ -437,6 +475,12 @@ impl Inner {
     }
 }
 
+impl PartialEq for Inner {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.eq(&other.data)
+    }
+}
+
 impl Drop for Inner {
     fn drop(self: &mut Inner) {
         if let Some(proxy) = self.data.as_proxy() {
@@ -446,7 +490,7 @@ impl Drop for Inner {
     }
 }
 
-// #[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct StrongIBinder {
     inner: Arc<Inner>,
 }

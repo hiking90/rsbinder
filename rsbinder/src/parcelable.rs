@@ -1,3 +1,22 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * Copyright (C) 2020 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use crate::{
     IBinder,
     sys::*,
@@ -194,6 +213,58 @@ macro_rules! impl_parcelable {
             }
         }
     };
+
+    {SerializeArray, $ty:ty} => {
+        impl SerializeArray for $ty {
+            // fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
+            //     let status = unsafe {
+            //         // Safety: `Parcel` always contains a valid pointer to an
+            //         // `AParcel`. If the slice is > 0 length, `slice.as_ptr()`
+            //         // will be a valid pointer to an array of elements of type
+            //         // `$ty`. If the slice length is 0, `slice.as_ptr()` may be
+            //         // dangling, but this is safe since the pointer is not
+            //         // dereferenced if the length parameter is 0.
+            //         $write_array_fn(
+            //             parcel.as_native_mut(),
+            //             slice.as_ptr(),
+            //             slice
+            //                 .len()
+            //                 .try_into()
+            //                 .or(Err(StatusCode::BAD_VALUE))?,
+            //         )
+            //     };
+            //     status_result(status)
+            // }
+        }
+    };
+
+    {DeserializeArray, $ty:ty} => {
+        impl DeserializeArray for $ty {
+            // fn deserialize_array(parcel: &mut Parcel) -> Result<Vec<Self>> {
+            //     let mut vec: Option<Vec<MaybeUninit<Self>>> = None;
+            //     let status = unsafe {
+            //         // Safety: `Parcel` always contains a valid pointer to an
+            //         // `AParcel`. `allocate_vec<T>` expects the opaque pointer to
+            //         // be of type `*mut Option<Vec<MaybeUninit<T>>>`, so `&mut vec` is
+            //         // correct for it.
+            //         $read_array_fn(
+            //             parcel.as_native(),
+            //             &mut vec as *mut _ as *mut c_void,
+            //             Some(allocate_vec_with_buffer),
+            //         )
+            //     };
+            //     status_result(status)?;
+            //     let vec: Option<Vec<Self>> = unsafe {
+            //         // Safety: We are assuming that the NDK correctly
+            //         // initialized every element of the vector by now, so we
+            //         // know that all the MaybeUninits are now properly
+            //         // initialized.
+            //         vec.map(|vec| vec_assume_init(vec))
+            //     };
+            //     Ok(vec)
+            // }
+        }
+    };
 }
 
 macro_rules! parcelable_primitives_ex {
@@ -203,6 +274,7 @@ macro_rules! parcelable_primitives_ex {
         )*
     } => {
         $(impl_parcelable_ex!{$trait, $to_ty, $ty})*
+
     };
 }
 
@@ -224,30 +296,67 @@ macro_rules! impl_parcelable_ex {
             }
         }
     };
+
+    {SerializeArray, $to_ty:ty, $ty:ty} => {
+        impl SerializeArray for $ty {
+        }
+    };
+
+    {DeserializeArray, $to_ty:ty, $ty:ty} => {
+        impl DeserializeArray for $ty {
+        }
+    };
 }
 
 
 parcelable_primitives! {
+    impl SerializeArray for i8;
+    impl DeserializeArray for i8;
+
+    impl SerializeArray for u8;
+    impl DeserializeArray for u8;
+
+    impl SerializeArray for i16;
+    impl DeserializeArray for i16;
+
+    impl SerializeArray for u16;
+    impl DeserializeArray for u16;
+
+
     impl Serialize for i32;
     impl Deserialize for i32;
+    impl SerializeArray for i32;
+    impl DeserializeArray for i32;
 
     impl Serialize for u32;
     impl Deserialize for u32;
+    impl SerializeArray for u32;
+    impl DeserializeArray for u32;
 
     impl Serialize for f32;
     impl Deserialize for f32;
+    impl SerializeArray for f32;
+    impl DeserializeArray for f32;
 
     impl Serialize for i64;
     impl Deserialize for i64;
+    impl SerializeArray for i64;
+    impl DeserializeArray for i64;
 
     impl Serialize for u64;
     impl Deserialize for u64;
+    impl SerializeArray for u64;
+    impl DeserializeArray for u64;
 
     impl Serialize for f64;
     impl Deserialize for f64;
+    impl SerializeArray for f64;
+    impl DeserializeArray for f64;
 
     impl Serialize for u128;
     impl Deserialize for u128;
+    impl SerializeArray for u128;
+    impl DeserializeArray for u128;
 }
 
 parcelable_primitives_ex! {
@@ -258,7 +367,10 @@ parcelable_primitives_ex! {
     impl Deserialize for u8 = i32;
 
     impl Serialize for i16 = i32;
-    impl Deserialize for u16 = i32;
+    impl Deserialize for i16 = i32;
+
+    impl Serialize for u16 = u32;
+    impl Deserialize for u16 = u32;
 }
 
 impl Deserialize for bool {
@@ -658,7 +770,10 @@ pub trait DeserializeArray: Deserialize {
     /// Deserialize an array of type from the given parcel.
     fn deserialize_array(parcel: &mut Parcel) -> Result<Vec<Self>> {
         let len: i32 = parcel.read()?;
-        let mut res: Vec<Self> = Vec::new();
+        if len < 0 {
+            return Err(StatusCode::BadValue.into());
+        }
+        let mut res: Vec<Self> = Vec::with_capacity(len as _);
 
         for _ in 0..len {
             res.push(parcel.read()?);

@@ -51,10 +51,19 @@ pub struct VariableDecl {
 impl VariableDecl {
     pub fn to_string(&self) -> String {
         if self.constant {
-            format!("pub const {}: {} = {};\n", self.identifier().to_case(Case::UpperSnake), self.r#type.to_string(true), self.const_expr.to_string())
+            // public constant string type must be "&str".
+            let mut type_string = self.r#type.to_string(true);
+            if type_string == "str" {
+                type_string = "&str".into();
+            }
+            format!("pub const {}: {} = {};\n", self.identifier.to_case(Case::UpperSnake), type_string, self.const_expr.to_string())
         } else {
             format!("pub {}: {},\n", self.identifier(), self.r#type.to_string(false))
         }
+    }
+
+    pub fn to_enum_member(&self) -> String {
+        format!("{}({}),", self.member_identifier(), self.member_type())
     }
 
     pub fn to_default(&self) -> String {
@@ -63,6 +72,14 @@ impl VariableDecl {
 
     pub fn identifier(&self) -> String {
         self.identifier.to_case(Case::Snake)
+    }
+
+    pub fn member_identifier(&self) -> String {
+        self.identifier.to_case(Case::UpperCamel)
+    }
+
+    pub fn member_type(&self) -> String {
+        self.r#type.to_string(false)
     }
 }
 
@@ -165,7 +182,7 @@ pub enum Declaration {
     Parcelable(ParcelableDecl),
     Interface(InterfaceDecl),
     Enum(EnumDecl),
-    Union,
+    Union(UnionDecl),
     Variable(VariableDecl),
 }
 
@@ -182,6 +199,8 @@ impl Declaration {
         match self {
             Declaration::Parcelable(decl) => &decl.namespace,
             Declaration::Interface(decl) => &decl.namespace,
+            Declaration::Enum(decl) => &decl.namespace,
+            Declaration::Union(decl) => &decl.namespace,
             _ => todo!(),
         }
     }
@@ -191,6 +210,7 @@ impl Declaration {
             Declaration::Parcelable(decl) => &mut decl.namespace,
             Declaration::Interface(decl) => &mut decl.namespace,
             Declaration::Enum(decl) => &mut decl.namespace,
+            Declaration::Union(decl) => &mut decl.namespace,
             _ => todo!(),
         }
     }
@@ -200,6 +220,7 @@ impl Declaration {
             Declaration::Parcelable(decl) => &decl.name,
             Declaration::Interface(decl) => &decl.name,
             Declaration::Enum(decl) => &decl.name,
+            Declaration::Union(decl) => &decl.name,
             _ => todo!(),
         }
     }
@@ -209,6 +230,7 @@ impl Declaration {
             Declaration::Parcelable(decl) => &mut decl.members,
             Declaration::Interface(decl) => &mut decl.members,
             Declaration::Enum(decl) => &mut decl.members,
+            Declaration::Union(decl) => &mut decl.members,
             _ => todo!(),
         }
     }
@@ -243,12 +265,12 @@ pub enum Generic {
     }
 }
 
-fn generic_type_args_to_string(args: &Vec<Type>) -> String {
+fn generic_type_args_to_string(args: &Vec<Type>, is_arg: bool) -> String {
     let mut args_str = String::new();
 
     args.iter().for_each(|t| {
         args_str.push_str(", ");
-        args_str.push_str(&t.to_string(true));
+        args_str.push_str(&t.to_string(is_arg));
     });
 
     args_str[2..].into()
@@ -259,16 +281,18 @@ impl Generic {
         match self {
             Generic::Type1 { type_args1, non_array_type, type_args2 } => {
                 format!("{}{}{}",
-                    generic_type_args_to_string(type_args1),
+                    generic_type_args_to_string(type_args1, is_arg),
                     non_array_type.to_string(is_arg),
-                    generic_type_args_to_string(&type_args2))
+                    generic_type_args_to_string(&type_args2, is_arg))
             }
             Generic::Type2 { non_array_type, type_args } => {
                 format!("{}{}",
                     non_array_type.to_string(is_arg),
-                    generic_type_args_to_string(&type_args))
+                    generic_type_args_to_string(&type_args, is_arg))
             }
-            Generic::Type3 { type_args } => { generic_type_args_to_string(&type_args) }
+            Generic::Type3 { type_args } => {
+                generic_type_args_to_string(&type_args, is_arg)
+            }
         }
     }
 }
@@ -286,7 +310,10 @@ impl NonArrayType {
             Some(gen) => gen.to_string(is_arg),
             None => "".into(),
         };
-        format!("{}{}", type_to_rust(&self.name, is_arg).type_name, gen_str)
+        match self.name.as_str() {
+            "List" => format!("Vec<{}>", gen_str),
+            _ => format!("{}{}", type_to_rust(&self.name, is_arg).type_name, gen_str),
+        }
     }
 
     fn is_clonable(&self) -> bool {
@@ -389,7 +416,7 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
             if is_arg == true {
                 ("str".to_owned(), default, false)
             } else {
-                ("String".to_owned(), default, false)
+                ("String".to_owned(), default, true)
             }
         }
         "IBinder" => { ("rsbinder::StrongIBinder".to_owned(), default, true) }
@@ -968,6 +995,36 @@ fn parse_enum_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pai
     Declaration::Enum(enum_decl)
 }
 
+
+#[derive(Debug, Default, Clone)]
+pub struct UnionDecl {
+    pub namespace: String,
+    pub annotation_list: Vec<Annotation>,
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub members: Vec<Declaration>,
+}
+
+fn parse_union_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pairs<Rule>) -> Declaration {
+    let mut union_decl = UnionDecl { annotation_list, .. Default::default() };
+
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::qualified_name => {
+                union_decl.name = pair.as_str().into();
+            }
+            Rule::optional_type_params => {
+                union_decl.type_params = parse_optional_type_params(pair.into_inner());
+            }
+            Rule::parcelable_members => {
+                union_decl.members = parse_parcelable_members(pair.into_inner());
+            }
+            _ => unreachable!("Unexpected rule in parse_union_decl(): {}", pair),
+        }
+    }
+    Declaration::Union(union_decl)
+}
+
 fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
     let mut annotation_list = Vec::new();
     let mut declarations = Vec::new();
@@ -987,7 +1044,9 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
             Rule::enum_decl => {
                 declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner()));
             }
-            Rule::union_decl => todo!(),
+            Rule::union_decl => {
+                declarations.push(parse_union_decl(annotation_list.clone(), pair.into_inner()));
+            }
 
             _ => unreachable!("Unexpected rule in parse_decl(): {}", pair),
         };
@@ -1042,7 +1101,7 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
                     }
 
                     Rule::decl => {
-                        document.decls = parse_decl(pair.into_inner());
+                        document.decls.append(&mut parse_decl(pair.into_inner()));
                     }
 
                     Rule::EOI => {

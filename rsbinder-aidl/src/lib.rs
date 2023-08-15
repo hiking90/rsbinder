@@ -84,7 +84,10 @@ impl Builder {
     }
 
     fn traverse_source(&self, dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
-        let entries = fs::read_dir(dir).unwrap();
+        let entries = fs::read_dir(dir).map_err(|err| {
+            eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
+            err
+        }).unwrap();
         let mut package_list = Vec::new();
 
         for entry in entries {
@@ -210,23 +213,184 @@ mod tests {
             .generate()
     }
 
-    fn enum_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
+    fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
         let document = parser::parse_document(input)?;
         let res = generator::gen_document(&document)?;
+        println!("{}", res.1);
         assert_eq!(res.1.trim(), expect.trim());
         Ok(())
     }
 
     #[test]
-    fn test_enum() -> Result<(), Box<dyn Error>> {
-        enum_generator(r##"
-                @Backing(type="byte")
-                enum ByteEnum {
-                    // Comment about FOO.
-                    FOO = 1,
-                    BAR = 2,
-                    BAZ,
-                }
+    fn test_unions() -> Result<(), Box<dyn Error>> {
+        // r##"
+        //     @JavaDerive(toString=true, equals=true)
+        //     union MyUnion {
+        //         IEmptyInterface iface;
+        //         @nullable IEmptyInterface nullable_iface;
+        //         IEmptyInterface[] iface_array;
+        //         @nullable IEmptyInterface[] nullable_iface_array;
+        //     }
+        // "##;
+
+        aidl_generator(r##"
+            package android.aidl.tests;
+
+            @Backing(type="byte")
+            enum ByteEnum {
+                // Comment about FOO.
+                FOO = 1,
+                BAR = 2,
+                BAZ,
+            }
+
+            @JavaDerive(toString=true, equals=true)
+            @RustDerive(Clone=true, PartialEq=true)
+            union Union {
+                int[] ns = {};
+                int n;
+                int m;
+                @utf8InCpp String s;
+                @nullable IBinder ibinder;
+                @utf8InCpp List<String> ss;
+                ByteEnum be;
+
+                const @utf8InCpp String S1 = "a string constant in union";
+            }
+            "##,
+            r##"
+declare_binder_enum! {
+    ByteEnum : [i8; 3] {
+        FOO = 1,
+        BAR = 2,
+        BAZ = 3,
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum Union {
+    Ns(Vec<i32>),
+    N(i32),
+    M(i32),
+    S(String),
+    Ibinder(Option<rsbinder::StrongIBinder>),
+    Ss(Vec<String>),
+    Be(crate::aidl::android::aidl::tests::ByteEnum),
+}
+pub const S_1: &str = "a string constant in union";
+
+impl Default for Union {
+    fn default() -> Self {
+        Self::Ns(Default::default())
+    }
+}
+impl rsbinder::Parcelable for Union {
+    fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        match self {
+            Self::Ns(v) => {
+                parcel.write(&0i32)?;
+                parcel.write(v)
+            }
+            Self::N(v) => {
+                parcel.write(&1i32)?;
+                parcel.write(v)
+            }
+            Self::M(v) => {
+                parcel.write(&2i32)?;
+                parcel.write(v)
+            }
+            Self::S(v) => {
+                parcel.write(&3i32)?;
+                parcel.write(v)
+            }
+            Self::Ibinder(v) => {
+                parcel.write(&4i32)?;
+                parcel.write(v)
+            }
+            Self::Ss(v) => {
+                parcel.write(&5i32)?;
+                parcel.write(v)
+            }
+            Self::Be(v) => {
+                parcel.write(&6i32)?;
+                parcel.write(v)
+            }
+        }
+    }
+    fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        let tag: i32 = parcel.read()?;
+        match tag {
+            0 => {
+                let value: Vec<i32> = parcel.read()?;
+                *self = Self::Ns(value);
+                Ok(())
+            }
+            1 => {
+                let value: i32 = parcel.read()?;
+                *self = Self::N(value);
+                Ok(())
+            }
+            2 => {
+                let value: i32 = parcel.read()?;
+                *self = Self::M(value);
+                Ok(())
+            }
+            3 => {
+                let value: String = parcel.read()?;
+                *self = Self::S(value);
+                Ok(())
+            }
+            4 => {
+                let value: Option<rsbinder::StrongIBinder> = parcel.read()?;
+                *self = Self::Ibinder(value);
+                Ok(())
+            }
+            5 => {
+                let value: Vec<String> = parcel.read()?;
+                *self = Self::Ss(value);
+                Ok(())
+            }
+            6 => {
+                let value: crate::aidl::android::aidl::tests::ByteEnum = parcel.read()?;
+                *self = Self::Be(value);
+                Ok(())
+            }
+            _ => Err(rsbinder::StatusCode::BadValue.into()),
+        }
+    }
+}
+rsbinder::impl_serialize_for_parcelable!(Union);
+rsbinder::impl_deserialize_for_parcelable!(Union);
+impl rsbinder::ParcelableMetadata for Union {
+    fn get_descriptor() -> &'static str { "android.aidl.tests.Union" }
+}
+pub mod tag {
+    rsbinder::declare_binder_enum! {
+        Tag : [i32; 7] {
+            NS = 0,
+            N = 1,
+            M = 2,
+            S = 3,
+            IBINDER = 4,
+            SS = 5,
+            BE = 6,
+        }
+    }
+}
+            "##)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_enums() -> Result<(), Box<dyn Error>> {
+        aidl_generator(r##"
+            @Backing(type="byte")
+            enum ByteEnum {
+                // Comment about FOO.
+                FOO = 1,
+                BAR = 2,
+                BAZ,
+            }
             "##,
             r##"
 declare_binder_enum! {
@@ -238,13 +402,13 @@ declare_binder_enum! {
 }
             "##)?;
 
-        enum_generator(r##"
-                enum BackendType {
-                    CPP,
-                    JAVA,
-                    NDK,
-                    RUST,
-                }
+        aidl_generator(r##"
+            enum BackendType {
+                CPP,
+                JAVA,
+                NDK,
+                RUST,
+            }
             "##,
             r##"
 declare_binder_enum! {
@@ -257,7 +421,7 @@ declare_binder_enum! {
 }
             "##)?;
 
-        enum_generator(r##"
+        aidl_generator(r##"
             @Backing(type="int")
             enum ConstantExpressionEnum {
                 // Should be all true / ones.
@@ -305,7 +469,7 @@ declare_binder_enum! {
 }
             "##)?;
 
-        enum_generator(r##"
+        aidl_generator(r##"
             @Backing(type="int")
             enum IntEnum {
                 FOO = 1000,
@@ -326,7 +490,7 @@ declare_binder_enum! {
 }
             "##)?;
 
-        enum_generator(r##"
+        aidl_generator(r##"
             @Backing(type="long")
             enum LongEnum {
                 FOO = 100000000000,

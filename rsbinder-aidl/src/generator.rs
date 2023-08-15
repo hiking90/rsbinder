@@ -39,7 +39,7 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
             if arg.r#type.is_declared() == true {
                 ("", ".as_ref()")
             } else {
-                ("&", "")
+                ("", "")
             }
         } else {
             ("", "")
@@ -333,18 +333,128 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
     content += &format!("{indent}{}}}\n", indent_space(1));
     content += &(indent + "}\n");
 
+    Ok(content)
+}
 
-// use binder::declare_binder_enum;
-// declare_binder_enum! {
-//   ByteEnum : [i8; 3] {
-//     FOO = 1,
-//     BAR = 2,
-//     BAZ = 3,
-//   }
-// }
+fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let indent = indent_space(indent);
+    let mut content = String::new();
+    let mut constant_members = Vec::new();
+
+    content += &format!("{indent}#[derive(Debug, Clone, PartialEq)]\n");
+    content += &format!("{indent}pub enum {} {{\n", decl.name);
+
+    let mut first_var: Option<&parser::VariableDecl> = None;
+
+    for member in &decl.members {
+        if let parser::Declaration::Variable(var) = member {
+            if var.constant == true {
+                constant_members.push(var);
+            } else {
+                if let None = first_var {
+                    first_var = Some(var);
+                }
+                content += &format!("{indent}{}{}\n", indent_space(1), var.to_enum_member());
+            }
+        } else {
+            todo!()
+        }
+    }
+
+    content += &format!("{indent}}}\n");
+
+    for var in constant_members {
+        content += &format!("{indent}{}\n", var.to_string());
+    }
+
+    content += &format!("{indent}impl Default for {} {{\n", decl.name);
+    content += &format!("{indent}{}fn default() -> Self {{\n", indent_space(1));
+    content += &match first_var {
+        Some(var) => format!("{indent}{}Self::{}(Default::default())\n", indent_space(2), var.member_identifier()),
+        None => format!("{indent}{}Self {{}}\n", indent_space(2)),
+    };
+    content += &format!("{indent}{}}}\n", indent_space(1));
+    content += &format!("{indent}}}\n");
+
+    content += &format!("{indent}impl rsbinder::Parcelable for {} {{\n", decl.name);
+
+    content += &format!("{indent}{}fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {{\n", indent_space(1));
+    content += &format!("{indent}{}match self {{\n", indent_space(2));
+    let mut tag: i32 = 0;
+    for member in &decl.members {
+        if let parser::Declaration::Variable(var) = member {
+            if var.constant == false {
+                content += &format!("{indent}{}Self::{}(v) => {{\n", indent_space(3), var.member_identifier());
+                content += &format!("{indent}{}parcel.write(&{}i32)?;\n", indent_space(4), tag);
+                content += &format!("{indent}{}parcel.write(v)\n", indent_space(4));
+                content += &format!("{indent}{}}}\n", indent_space(3));
+                tag += 1;
+            }
+        } else {
+            todo!()
+        }
+    }
+
+    content += &format!("{indent}{}}}\n", indent_space(2));
+    content += &format!("{indent}{}}}\n", indent_space(1));
+
+    content += &format!("{indent}{}fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {{\n", indent_space(1));
+    content += &format!("{indent}{}let tag: i32 = parcel.read()?;\n", indent_space(2));
+    content += &format!("{indent}{}match tag {{\n", indent_space(2));
+
+    tag = 0;
+    for member in &decl.members {
+        if let parser::Declaration::Variable(var) = member {
+            if var.constant == false {
+                content += &format!("{indent}{}{} => {{\n", indent_space(3), tag);
+                content += &format!("{indent}{}let value: {} = parcel.read()?;\n", indent_space(4), var.member_type());
+                content += &format!("{indent}{}*self = Self::{}(value);\n", indent_space(4), var.member_identifier());
+                content += &format!("{indent}{}Ok(())\n", indent_space(4));
+                content += &format!("{indent}{}}}\n", indent_space(3));
+                tag += 1;
+            }
+        } else {
+            todo!()
+        }
+    }
+
+    content += &format!("{indent}{}_ => Err(rsbinder::StatusCode::BadValue.into()),\n", indent_space(3));
+
+    content += &format!("{indent}{}}}\n", indent_space(2));
+    content += &format!("{indent}{}}}\n", indent_space(1));
+
+    content += &format!("{indent}}}\n");
+
+    content += &format!("{indent}rsbinder::impl_serialize_for_parcelable!({});\n", decl.name);
+    content += &format!("{indent}rsbinder::impl_deserialize_for_parcelable!({});\n", decl.name);
+
+    content += &format!("{indent}impl rsbinder::ParcelableMetadata for {} {{\n", decl.name);
+    content += &format!("{indent}{}fn get_descriptor() -> &'static str {{ \"{}\" }}\n", indent_space(1), to_namespace(&decl.namespace, &decl.name));
+    content += &format!("{indent}}}\n");
+
+    content += &format!("{indent}pub mod tag {{\n");
+    content += &format!("{indent}{}rsbinder::declare_binder_enum! {{\n", indent_space(1));
+    content += &format!("{indent}{}Tag : [i32; {}] {{\n", indent_space(2), tag);
+
+    tag = 0;
+    for member in &decl.members {
+        if let parser::Declaration::Variable(var) = member {
+            if var.constant == false {
+                content += &format!("{indent}{}{} = {},\n", indent_space(3), var.identifier.to_case(Case::UpperSnake), tag);
+                tag += 1;
+            }
+        } else {
+            todo!()
+        }
+    }
+
+    content += &format!("{indent}{}}}\n", indent_space(2));
+    content += &format!("{indent}{}}}\n", indent_space(1));
+    content += &format!("{indent}}}\n");
 
     Ok(content)
 }
+
 
 pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut content = String::new();
@@ -366,7 +476,9 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
                 content += &gen_enum(decl, indent)?;
             }
 
-            _ => todo!(),
+            parser::Declaration::Union(decl) => {
+                content += &gen_union(decl, indent)?;
+            }
         }
     }
 

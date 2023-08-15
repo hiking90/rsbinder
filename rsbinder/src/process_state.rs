@@ -1,3 +1,6 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc};
@@ -162,67 +165,6 @@ impl ProcessState {
         self.handle_to_object.write().unwrap().insert(handle, weak.clone());
 
         Ok(weak.upgrade())
-
-        // sp<IBinder> result;
-
-        // AutoMutex _l(mLock);
-
-        // handle_entry* e = lookupHandleLocked(handle);
-
-        // if (e != nullptr) {
-        //     // We need to create a new BpBinder if there isn't currently one, OR we
-        //     // are unable to acquire a weak reference on this current one.  The
-        //     // attemptIncWeak() is safe because we know the BpBinder destructor will always
-        //     // call expungeHandle(), which acquires the same lock we are holding now.
-        //     // We need to do this because there is a race condition between someone
-        //     // releasing a reference on this BpBinder, and a new reference on its handle
-        //     // arriving from the driver.
-        //     IBinder* b = e->binder;
-        //     if (b == nullptr || !e->refs->attemptIncWeak(this)) {
-        //         if (handle == 0) {
-        //             // Special case for context manager...
-        //             // The context manager is the only object for which we create
-        //             // a BpBinder proxy without already holding a reference.
-        //             // Perform a dummy transaction to ensure the context manager
-        //             // is registered before we create the first local reference
-        //             // to it (which will occur when creating the BpBinder).
-        //             // If a local reference is created for the BpBinder when the
-        //             // context manager is not present, the driver will fail to
-        //             // provide a reference to the context manager, but the
-        //             // driver API does not return status.
-        //             //
-        //             // Note that this is not race-free if the context manager
-        //             // dies while this code runs.
-
-        //             IPCThreadState* ipc = IPCThreadState::self();
-
-        //             CallRestriction originalCallRestriction = ipc->getCallRestriction();
-        //             ipc->setCallRestriction(CallRestriction::NONE);
-
-        //             Parcel data;
-        //             status_t status = ipc->transact(
-        //                     0, IBinder::PING_TRANSACTION, data, nullptr, 0);
-
-        //             ipc->setCallRestriction(originalCallRestriction);
-
-        //             if (status == DEAD_OBJECT)
-        //                return nullptr;
-        //         }
-
-        //         sp<BpBinder> b = BpBinder::PrivateAccessor::create(handle);
-        //         e->binder = b.get();
-        //         if (b) e->refs = b->getWeakRefs();
-        //         result = b;
-        //     } else {
-        //         // This little bit of nastyness is to allow us to add a primary
-        //         // reference to the remote proxy when this team doesn't have one
-        //         // but another team is sending the handle to us.
-        //         result.force_set(b);
-        //         e->refs->decWeak(this);
-        //     }
-        // }
-
-        // return result;
     }
 
     pub fn disable_background_scheduling(& self, disable: bool) {

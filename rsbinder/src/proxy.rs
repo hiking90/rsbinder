@@ -1,3 +1,5 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
 
 use std::any::Any;
 
@@ -10,7 +12,7 @@ use crate::{
 };
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
