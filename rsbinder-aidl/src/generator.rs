@@ -39,7 +39,7 @@ fn gen_method(method: &parser::MethodDecl, indent: usize) -> Result<(String, Str
             if arg.r#type.is_declared() == true {
                 ("", ".as_ref()")
             } else {
-                ("", "")
+                ("&", "")
             }
         } else {
             ("", "")
