@@ -4,11 +4,12 @@ extern crate lazy_static;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::fs;
-use convert_case::{Case, Casing};
 
 mod parser;
 mod generator;
 mod const_expr;
+pub use parser::parse_document;
+pub use generator::gen_document;
 
 pub const DEFAULT_NAMESPACE: &str = "aidl";
 
@@ -23,7 +24,7 @@ pub fn indent_space(step: usize) -> String {
     ret
 }
 
-fn add_indent(step: usize, source: &str) -> String {
+pub fn add_indent(step: usize, source: &str) -> String {
     let mut content = String::new();
     for line in source.lines() {
         if line.len() > 0 {
@@ -39,9 +40,7 @@ fn add_namespace(namespace: &str, source: &str) -> String {
     let mut content = String::new();
 
     content += &format!("pub mod {} {{\n", namespace);
-
     content += &add_indent(1, source);
-
     content += "}\n";
 
     content
@@ -145,9 +144,6 @@ impl Builder {
 
             }
 
-            content += "\n";
-            content += &(indent_space(mod_count) + &format!("pub use {}::*;\n", package.2.to_case(Case::Snake)));
-
             content += &add_indent(mod_count, &package.1);
         }
 
@@ -181,368 +177,9 @@ impl Builder {
         let content = add_namespace(DEFAULT_NAMESPACE, &content);
 
         let output = self.dest_dir.join("rsbinder_generated_aidl.rs");
-        println!("==== {output:?} ====");
+        // println!("==== {output:?} ====");
         fs::write(output, content)?;
 
         Ok(())
     }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_service_manager() -> Result<(), Box<dyn Error>> {
-        Builder::new()
-            .source(PathBuf::from("../aidl/android/os/IServiceManager.aidl"))
-            .source(PathBuf::from("../aidl/android/os/IClientCallback.aidl"))
-            .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
-            .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
-            .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
-            .generate()?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_builder() -> Result<(), Box<dyn Error>> {
-        Builder::new()
-            .source(PathBuf::from("aidl"))
-            .generate()
-    }
-
-    fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
-        let document = parser::parse_document(input)?;
-        let res = generator::gen_document(&document)?;
-        println!("{}", res.1);
-        assert_eq!(res.1.trim(), expect.trim());
-        Ok(())
-    }
-
-    #[test]
-    fn test_unions() -> Result<(), Box<dyn Error>> {
-        // r##"
-        //     @JavaDerive(toString=true, equals=true)
-        //     union MyUnion {
-        //         IEmptyInterface iface;
-        //         @nullable IEmptyInterface nullable_iface;
-        //         IEmptyInterface[] iface_array;
-        //         @nullable IEmptyInterface[] nullable_iface_array;
-        //     }
-        // "##;
-
-        aidl_generator(r##"
-            package android.aidl.tests;
-
-            @Backing(type="byte")
-            enum ByteEnum {
-                // Comment about FOO.
-                FOO = 1,
-                BAR = 2,
-                BAZ,
-            }
-
-            @JavaDerive(toString=true, equals=true)
-            @RustDerive(Clone=true, PartialEq=true)
-            union Union {
-                int[] ns = {};
-                int n;
-                int m;
-                @utf8InCpp String s;
-                @nullable IBinder ibinder;
-                @utf8InCpp List<String> ss;
-                ByteEnum be;
-
-                const @utf8InCpp String S1 = "a string constant in union";
-            }
-            "##,
-            r##"
-declare_binder_enum! {
-    ByteEnum : [i8; 3] {
-        FOO = 1,
-        BAR = 2,
-        BAZ = 3,
-    }
-}
-#[derive(Debug, Clone, PartialEq)]
-pub enum Union {
-    Ns(Vec<i32>),
-    N(i32),
-    M(i32),
-    S(String),
-    Ibinder(Option<rsbinder::StrongIBinder>),
-    Ss(Vec<String>),
-    Be(crate::aidl::android::aidl::tests::ByteEnum),
-}
-pub const S_1: &str = "a string constant in union";
-
-impl Default for Union {
-    fn default() -> Self {
-        Self::Ns(Default::default())
-    }
-}
-impl rsbinder::Parcelable for Union {
-    fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
-        match self {
-            Self::Ns(v) => {
-                parcel.write(&0i32)?;
-                parcel.write(v)
-            }
-            Self::N(v) => {
-                parcel.write(&1i32)?;
-                parcel.write(v)
-            }
-            Self::M(v) => {
-                parcel.write(&2i32)?;
-                parcel.write(v)
-            }
-            Self::S(v) => {
-                parcel.write(&3i32)?;
-                parcel.write(v)
-            }
-            Self::Ibinder(v) => {
-                parcel.write(&4i32)?;
-                parcel.write(v)
-            }
-            Self::Ss(v) => {
-                parcel.write(&5i32)?;
-                parcel.write(v)
-            }
-            Self::Be(v) => {
-                parcel.write(&6i32)?;
-                parcel.write(v)
-            }
-        }
-    }
-    fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
-        let tag: i32 = parcel.read()?;
-        match tag {
-            0 => {
-                let value: Vec<i32> = parcel.read()?;
-                *self = Self::Ns(value);
-                Ok(())
-            }
-            1 => {
-                let value: i32 = parcel.read()?;
-                *self = Self::N(value);
-                Ok(())
-            }
-            2 => {
-                let value: i32 = parcel.read()?;
-                *self = Self::M(value);
-                Ok(())
-            }
-            3 => {
-                let value: String = parcel.read()?;
-                *self = Self::S(value);
-                Ok(())
-            }
-            4 => {
-                let value: Option<rsbinder::StrongIBinder> = parcel.read()?;
-                *self = Self::Ibinder(value);
-                Ok(())
-            }
-            5 => {
-                let value: Vec<String> = parcel.read()?;
-                *self = Self::Ss(value);
-                Ok(())
-            }
-            6 => {
-                let value: crate::aidl::android::aidl::tests::ByteEnum = parcel.read()?;
-                *self = Self::Be(value);
-                Ok(())
-            }
-            _ => Err(rsbinder::StatusCode::BadValue.into()),
-        }
-    }
-}
-rsbinder::impl_serialize_for_parcelable!(Union);
-rsbinder::impl_deserialize_for_parcelable!(Union);
-impl rsbinder::ParcelableMetadata for Union {
-    fn get_descriptor() -> &'static str { "android.aidl.tests.Union" }
-}
-pub mod tag {
-    rsbinder::declare_binder_enum! {
-        Tag : [i32; 7] {
-            NS = 0,
-            N = 1,
-            M = 2,
-            S = 3,
-            IBINDER = 4,
-            SS = 5,
-            BE = 6,
-        }
-    }
-}
-            "##)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_enums() -> Result<(), Box<dyn Error>> {
-        aidl_generator(r##"
-            @Backing(type="byte")
-            enum ByteEnum {
-                // Comment about FOO.
-                FOO = 1,
-                BAR = 2,
-                BAZ,
-            }
-            "##,
-            r##"
-declare_binder_enum! {
-    ByteEnum : [i8; 3] {
-        FOO = 1,
-        BAR = 2,
-        BAZ = 3,
-    }
-}
-            "##)?;
-
-        aidl_generator(r##"
-            enum BackendType {
-                CPP,
-                JAVA,
-                NDK,
-                RUST,
-            }
-            "##,
-            r##"
-declare_binder_enum! {
-    BackendType : [i8; 4] {
-        CPP = 0,
-        JAVA = 1,
-        NDK = 2,
-        RUST = 3,
-    }
-}
-            "##)?;
-
-        aidl_generator(r##"
-            @Backing(type="int")
-            enum ConstantExpressionEnum {
-                // Should be all true / ones.
-                // dec literals are either int or long
-                decInt32_1 = (~(-1)) == 0,
-                decInt32_2 = ~~(1 << 31) == (1 << 31),
-                decInt64_1 = (~(-1L)) == 0,
-                decInt64_2 = (~4294967295L) != 0,
-                decInt64_3 = (~4294967295) != 0,
-                decInt64_4 = ~~(1L << 63) == (1L << 63),
-
-                // hex literals could be int or long
-                // 0x7fffffff is int, hence can be negated
-                hexInt32_1 = -0x7fffffff < 0,
-
-                // 0x80000000 is int32_t max + 1
-                hexInt32_2 = 0x80000000 < 0,
-
-                // 0xFFFFFFFF is int32_t, not long; if it were long then ~(long)0xFFFFFFFF != 0
-                hexInt32_3 = ~0xFFFFFFFF == 0,
-
-                // 0x7FFFFFFFFFFFFFFF is long, hence can be negated
-                hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
-            }
-            "##,
-
-        // TODO: Android AIDL generates 1, but rsbinder aidl generates 0.
-        // hexInt32_2 = 0,
-        // hexInt32_3 = 0,
-
-            r##"
-declare_binder_enum! {
-    ConstantExpressionEnum : [i32; 10] {
-        decInt32_1 = 1,
-        decInt32_2 = 1,
-        decInt64_1 = 1,
-        decInt64_2 = 1,
-        decInt64_3 = 1,
-        decInt64_4 = 1,
-        hexInt32_1 = 1,
-        hexInt32_2 = 0,
-        hexInt32_3 = 0,
-        hexInt64_1 = 1,
-    }
-}
-            "##)?;
-
-        aidl_generator(r##"
-            @Backing(type="int")
-            enum IntEnum {
-                FOO = 1000,
-                BAR = 2000,
-                BAZ,
-                /** @deprecated do not use this */
-                QUX,
-            }
-            "##,
-            r##"
-declare_binder_enum! {
-    IntEnum : [i32; 4] {
-        FOO = 1000,
-        BAR = 2000,
-        BAZ = 2001,
-        QUX = 2002,
-    }
-}
-            "##)?;
-
-        aidl_generator(r##"
-            @Backing(type="long")
-            enum LongEnum {
-                FOO = 100000000000,
-                BAR = 200000000000,
-                BAZ,
-            }
-            "##,
-            r##"
-declare_binder_enum! {
-    LongEnum : [i64; 3] {
-        FOO = 100000000000,
-        BAR = 200000000000,
-        BAZ = 200000000001,
-    }
-}
-            "##)?;
-
-        Ok(())
-    }
-
-//     #[test]
-//     fn test_gen_include_all() -> Result<(), Box<dyn Error>> {
-//         let builder = Builder::new();
-//         let package_list = vec![
-//             ("android.os".to_owned(), "IServiceManager".to_owned()),
-//             ("android.os.callback".to_owned(), "IClientCallback".to_owned()),
-//             ("android.graphics".to_owned(), "Bitmap".to_owned()),
-//             ("rsbinder.hello".to_owned(), "World".to_owned()),
-//         ];
-
-//         let content = builder.gen_include_all(package_list)?;
-
-//         assert_eq!(content.trim(),
-//             r##"
-// pub mod android {
-//     pub mod graphics {
-//         include!(concat!(std::env!("OUT_DIR"), "/aidl_gen/android/graphics/Bitmap"));
-//     }
-//     pub mod os {
-//         include!(concat!(std::env!("OUT_DIR"), "/aidl_gen/android/os/IServiceManager"));
-//         pub mod callback {
-//             include!(concat!(std::env!("OUT_DIR"), "/aidl_gen/android/os/callback/IClientCallback"));
-//         }
-//     }
-// }
-// pub mod rsbinder {
-//     pub mod hello {
-//         include!(concat!(std::env!("OUT_DIR"), "/aidl_gen/rsbinder/hello/World"));
-//     }
-// }
-//             "##.trim());
-
-//         Ok(())
-//     }
 }

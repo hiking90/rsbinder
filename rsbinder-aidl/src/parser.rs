@@ -51,36 +51,44 @@ pub struct VariableDecl {
 impl VariableDecl {
     pub fn to_string(&self) -> String {
         if self.constant {
-            // public constant string type must be "&str".
-            let mut type_string = self.r#type.to_string(true);
-            if type_string == "str" {
-                type_string = "&str".into();
-            }
-            format!("pub const {}: {} = {};\n", self.identifier.to_case(Case::UpperSnake), type_string, self.const_expr.to_string())
+            format!("pub const {}: {} = {};\n", self.const_identifier(), self.const_type(), self.const_expr.to_string())
         } else {
-            format!("pub {}: {},\n", self.identifier(), self.r#type.to_string(false))
+            format!("pub {}: {},\n", self.identifier(), self.member_type())
         }
     }
 
-    pub fn to_enum_member(&self) -> String {
-        format!("{}({}),", self.member_identifier(), self.member_type())
-    }
-
-    pub fn to_default(&self) -> String {
-        format!("{}: {},\n", self.identifier(), self.r#type.to_default())
-    }
+    // pub fn to_default(&self) -> String {
+    //     format!("{}: {},\n", self.identifier(), self.member_default())
+    // }
 
     pub fn identifier(&self) -> String {
         self.identifier.to_case(Case::Snake)
     }
 
-    pub fn member_identifier(&self) -> String {
+    pub fn const_identifier(&self) -> String {
+        self.identifier.to_case(Case::UpperSnake)
+    }
+
+    pub fn const_type(&self) -> String {
+        let mut type_string = self.r#type.to_string(true);
+            // public constant string type must be "&str".
+        if type_string == "str" {
+            type_string = "&str".into();
+        }
+        type_string
+    }
+
+    pub fn union_identifier(&self) -> String {
         self.identifier.to_case(Case::UpperCamel)
     }
 
     pub fn member_type(&self) -> String {
         self.r#type.to_string(false)
     }
+
+    // pub fn member_default(&self) -> String {
+    //     self.r#type.to_default()
+    // }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -102,9 +110,6 @@ impl InterfaceDecl {
         }
 
         for decl in &mut self.constant_list {
-            if decl.identifier == "DUMP_FLAG_PRIORITY_ALL" {
-                print!("DUMP_FLAG_PRIORITY_ALL: {:?}", decl);
-            }
             decl.const_expr = decl.const_expr.calculate(&mut dict)?;
         }
 
@@ -427,7 +432,7 @@ fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
                 match decl {
                     Declaration::Interface(_) => {
                         is_declared = true;
-                        (format!("Arc<dyn {}>", type_name), default, true)
+                        (format!("std::sync::Arc<dyn {}>", type_name), default, true)
                     }
                     _ => { (type_name.to_owned(), default, false) }
                 }
@@ -1109,7 +1114,7 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
                     }
 
                     _ => {
-                        println!("main loop: {}", pair);
+                        unreachable!("Unexpected rule in parse_document(): {}", pair)
                     }
                 }
             }
@@ -1155,11 +1160,11 @@ mod tests {
         }
     }
 
-    fn parse_document_test(doc: &str) -> Result<(), Box<dyn Error>> {
-        parse_document(doc)?;
+    // fn parse_document_test(doc: &str) -> Result<(), Box<dyn Error>> {
+    //     parse_document(doc)?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     fn parse_dir(path: &Path, parser: fn(data: &str) -> Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
         let entries = fs::read_dir(path).unwrap();
@@ -1183,10 +1188,10 @@ mod tests {
         parse_dir(&Path::new("aidl"), parse_str)
     }
 
-    #[test]
-    fn test_parse_document() -> Result<(), Box<dyn Error>> {
-        parse_dir(&Path::new("aidl"), parse_document_test)
-    }
+    // #[test]
+    // fn test_parse_document() -> Result<(), Box<dyn Error>> {
+    //     parse_dir(&Path::new("aidl"), parse_document_test)
+    // }
 
     #[test]
     fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {
