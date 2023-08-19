@@ -144,7 +144,7 @@ mod i_client_callback {
     impl IClientCallback for BpClientCallback {
         fn on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()> {
             let _aidl_data = self.build_parcel_on_clients(_arg_registered.clone(), _arg_has_clients.clone(), )?;
-            let _aidl_reply = self.handle.submit_transact(transactions::ON_CLIENTS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+            let _aidl_reply = self.handle.submit_transact(transactions::ON_CLIENTS, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_clients(_arg_registered, _arg_has_clients, _aidl_reply)
         }
     }
@@ -181,7 +181,7 @@ mod i_service_callback {
     impl IServiceCallback for BpServiceCallback {
         fn on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder) -> rsbinder::Result<()> {
             let _aidl_data = self.build_parcel_on_registration(_arg_name.clone(), _arg_binder.clone(), )?;
-            let _aidl_reply = self.handle.submit_transact(transactions::ON_REGISTRATION, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+            let _aidl_reply = self.handle.submit_transact(transactions::ON_REGISTRATION, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_registration(_arg_name, _arg_binder, _aidl_reply)
         }
     }
@@ -266,6 +266,8 @@ mod i_service_manager {
             Ok(data)
         }
         fn read_response_add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
         fn build_parcel_list_services(&self, _arg_dump_priority: i32) -> rsbinder::Result<rsbinder::Parcel> {
@@ -286,6 +288,8 @@ mod i_service_manager {
             Ok(data)
         }
         fn read_response_register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
         fn build_parcel_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<rsbinder::Parcel> {
@@ -295,6 +299,8 @@ mod i_service_manager {
             Ok(data)
         }
         fn read_response_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
         fn build_parcel_is_declared(&self, _arg_name: &str) -> rsbinder::Result<rsbinder::Parcel> {
@@ -349,6 +355,8 @@ mod i_service_manager {
             Ok(data)
         }
         fn read_response_register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
         fn build_parcel_try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder) -> rsbinder::Result<rsbinder::Parcel> {
@@ -358,6 +366,8 @@ mod i_service_manager {
             Ok(data)
         }
         fn read_response_try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
         fn build_parcel_get_service_debug_info(&self) -> rsbinder::Result<rsbinder::Parcel> {

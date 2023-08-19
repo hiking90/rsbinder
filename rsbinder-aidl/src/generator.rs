@@ -155,13 +155,19 @@ mod {{mod}} {
             Ok(data)
         }
         fn read_response_{{ member.0 }}({{ member.1 }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{{ member.2 }}> {
-            {%- if member.2 == "()" %}
+            {%- if oneway or member.6 %}
             Ok(())
             {%- else %}
+            {%- if member.2 != "()" %}
             let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             let _aidl_return: {{ member.2 }} = _aidl_reply.read()?;
             Ok(_aidl_return)
+            {%- else %}
+            let _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
+            Ok(())
+            {%- endif %}
             {%- endif %}
         }
         {%- endfor %}
@@ -170,7 +176,7 @@ mod {{mod}} {
         {%- for member in fn_members %}
         fn {{ member.0 }}({{ member.1 }}) -> rsbinder::Result<{{ member.2 }}> {
             let _aidl_data = self.build_parcel_{{ member.0 }}({{ member.4 }})?;
-            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.0|upper }}, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.0|upper }}, &_aidl_data, {% if oneway or member.6 %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_{{ member.0 }}({{ member.5 }}_aidl_reply)
         }
         {%- endfor %}
@@ -201,7 +207,7 @@ fn to_namespace(namespace: &str, name: &str) -> String {
     format!("{namespace}.{name}")
 }
 
-fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String, Vec<String>, String, String), Box<dyn Error>> {
+fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String, Vec<String>, String, String, bool), Box<dyn Error>> {
     let mut build_params = String::new();
     let mut read_params = String::new();
     let mut args = "&self".to_string();
@@ -233,7 +239,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
     };
 
     Ok((method.identifier.to_case(Case::Snake),
-        args, return_type, write_params, build_params, read_params))
+        args, return_type, write_params, build_params, read_params, method.oneway))
 }
 
 
@@ -260,6 +266,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     context.insert("fn_members", &fn_members);
     context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
     context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
+    context.insert("oneway", &decl.oneway);
     // let native_name = format!("Bn{}", &decl.name[1..]);
     // let proxy_name = format!("Bp{}", &decl.name[1..]);
 
