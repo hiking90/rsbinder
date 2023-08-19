@@ -49,6 +49,7 @@ fn add_namespace(namespace: &str, source: &str) -> String {
 pub struct Builder {
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
+    output: String,
 }
 
 impl Builder {
@@ -56,13 +57,7 @@ impl Builder {
         Self {
             sources: Vec::new(),
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
-        }
-    }
-
-    pub fn new_with_destination(dest: PathBuf) -> Self {
-        Self {
-            sources: Vec::new(),
-            dest_dir: dest,
+            output: "rsbinder_generated_aidl.rs".into(),
         }
     }
 
@@ -71,15 +66,16 @@ impl Builder {
         self
     }
 
+    pub fn output(mut self, output: &str) -> Self {
+        self.output = output.into();
+        self
+    }
+
     fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
         let unparsed_file = fs::read_to_string(filename.clone())?;
         let document = parser::parse_document(&unparsed_file)?;
 
         Ok((filename.file_stem().unwrap().to_str().unwrap().to_string(), document))
-
-        // let package = generator::gen_document(&document)?;
-
-        // Ok((package.0, package.1, filename.file_stem().unwrap().to_str().unwrap().to_string()))
     }
 
     fn traverse_source(&self, dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
@@ -176,10 +172,15 @@ impl Builder {
         let content = self.generate_all(package_list)?;
         let content = add_namespace(DEFAULT_NAMESPACE, &content);
 
-        let output = self.dest_dir.join("rsbinder_generated_aidl.rs");
-        // println!("==== {output:?} ====");
-        fs::write(output, content)?;
+        fs::write(self.dest_dir.join(&self.output), content)?;
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // use std::path::Path;
+    // use std::fs;
+    // use super::*;
 }
