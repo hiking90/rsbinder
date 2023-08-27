@@ -668,7 +668,8 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Expression {
 fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Expression {
     // println!("expression_term {:?}", pair);
     match pair.as_rule() {
-        Rule::equality | Rule::comparison | Rule::bitwise | Rule::shift | Rule::arith |
+        Rule::equality | Rule::comparison |
+        Rule::bitwise_or | Rule::bitwise_xor | Rule::bitwise_and | Rule::shift | Rule::arith |
         Rule::logical => {
             parse_expression(pair.clone().into_inner(),pair.as_str().into())
         }

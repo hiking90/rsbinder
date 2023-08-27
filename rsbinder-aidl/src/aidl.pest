@@ -156,12 +156,16 @@ logical = { equality ~ (equality_op ~ equality)* }
 equality_op = { EQUALITY | NEQ }
 equality = { comparison ~ (comparison_op ~ comparison)* }
 comparison_op = { LEQ | GEQ | LT | GT }
-comparison = { bitwise ~ (bitwise_op ~ bitwise)* }
+comparison = { bitwise_or ~ (bitwise_or_op ~ bitwise_or)* }
 // In Android's AIDL parser, bitwise operators have lower precedence than comparison operators.
 // However, in rsbinder, bitwise operators are defined to have higher precedence,
 // consistent with other programming languages.
-bitwise_op = { "|" | "^" | "&" }
-bitwise = { shift ~ (shift_op ~ shift)* }
+bitwise_or_op = { "|" }
+bitwise_or = { bitwise_xor ~ (bitwise_xor_op ~ bitwise_xor)* }
+bitwise_xor_op = { "^" }
+bitwise_xor = { bitwise_and ~ (bitwise_and_op ~ bitwise_and)* }
+bitwise_and_op = { "&" }
+bitwise_and = { shift ~ (shift_op ~ shift)* }
 shift_op = { LSHIFT | RSHIFT }
 shift = { arith ~ (arith_op ~ arith)* }
 arith_op = { "+" | "-" }
