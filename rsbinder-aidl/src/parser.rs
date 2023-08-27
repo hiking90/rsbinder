@@ -45,21 +45,20 @@ pub struct VariableDecl {
     pub annotation_list: Vec<Annotation>,
     pub r#type: Type,
     pub identifier: String,
-    pub const_expr: ConstExpr,
+    pub const_expr: Option<ConstExpr>,
 }
 
 impl VariableDecl {
     pub fn to_string(&self) -> String {
+        let type_cast = self.r#type.type_cast();
         if self.constant {
-            format!("pub const {}: {} = {};\n", self.const_identifier(), self.const_type(), self.const_expr.to_string())
+            format!("pub const {}: {} = {};\n",
+                self.const_identifier(),
+                type_cast.const_type(), type_cast.init_type(self.const_expr.as_ref()))
         } else {
-            format!("pub {}: {},\n", self.identifier(), self.member_type())
+            format!("pub {}: {},\n", self.identifier(), type_cast.member_type())
         }
     }
-
-    // pub fn to_default(&self) -> String {
-    //     format!("{}: {},\n", self.identifier(), self.member_default())
-    // }
 
     pub fn identifier(&self) -> String {
         self.identifier.to_case(Case::Snake)
@@ -69,26 +68,13 @@ impl VariableDecl {
         self.identifier.to_case(Case::UpperSnake)
     }
 
-    pub fn const_type(&self) -> String {
-        let mut type_string = self.r#type.to_string(true);
-            // public constant string type must be "&str".
-        if type_string == "str" {
-            type_string = "&str".into();
-        }
-        type_string
-    }
-
     pub fn union_identifier(&self) -> String {
         self.identifier.to_case(Case::UpperCamel)
     }
 
-    pub fn member_type(&self) -> String {
-        self.r#type.to_string(false)
+    pub fn member_init(&self) -> String {
+        "Default::default()".into()
     }
-
-    // pub fn member_default(&self) -> String {
-    //     self.r#type.to_default()
-    // }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -103,17 +89,17 @@ pub struct InterfaceDecl {
 }
 
 impl InterfaceDecl {
-    pub fn post_process(&mut self) -> Result<(), crate::const_expr::Error>  {
+    pub fn pre_process(&mut self) {
         let mut dict = HashMap::new();
         for decl in &self.constant_list {
-            dict.insert(decl.identifier.clone(), decl.const_expr.clone());
+            if let Some(expr) = &decl.const_expr {
+                dict.insert(decl.identifier.clone(), expr.clone());
+            }
         }
 
         for decl in &mut self.constant_list {
-            decl.const_expr = decl.const_expr.calculate(&mut dict)?;
+            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate(&mut dict));
         }
-
-        Ok(())
     }
 }
 
@@ -127,14 +113,16 @@ pub struct ParcelableDecl {
 }
 
 impl ParcelableDecl {
-    pub fn post_process(&mut self) -> Result<(), crate::const_expr::Error>  {
+    pub fn pre_process(&mut self) {
         let mut dict = HashMap::new();
         for decl in &mut self.members {
             match decl {
-                Declaration::Interface(decl) => { decl.post_process()?; }
-                Declaration::Parcelable(decl) => { decl.post_process()?; }
+                Declaration::Interface(decl) => { decl.pre_process(); }
+                Declaration::Parcelable(decl) => { decl.pre_process(); }
                 Declaration::Variable(decl) => {
-                    dict.insert(decl.identifier.clone(), decl.const_expr.clone());
+                    if let Some(expr) = &decl.const_expr {
+                        dict.insert(decl.identifier.clone(), expr.clone());
+                    }
                 },
                 _ => {}
             }
@@ -142,11 +130,9 @@ impl ParcelableDecl {
 
         for decl in &mut self.members {
             if let Declaration::Variable(decl) = decl {
-                decl.const_expr = decl.const_expr.calculate(&mut dict)?;
+                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate(&mut dict));
             }
         }
-
-        Ok(())
     }
 }
 
@@ -160,14 +146,14 @@ pub struct Arg {
 
 impl Arg {
     pub fn to_string(&self) -> (String, String) {
-        let mutable = if self.direction == "out" || self.direction == "inout" {
-            "mut"
-        } else { "" };
-
-        let borrowed = if self.r#type.is_clonable() { "" } else { "&" };
+        let is_mutable = if self.direction == "out" || self.direction == "inout" {
+            true
+        } else {
+            false
+        };
 
         let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
-        let arg = format!("{}: {}{}{}", param.clone(), borrowed, mutable, self.r#type.to_string(true));
+        let arg = format!("{}: {}", param.clone(), self.r#type.type_cast().fn_def_arg(is_mutable));
         (param, arg)
     }
 }
@@ -270,33 +256,33 @@ pub enum Generic {
     }
 }
 
-fn generic_type_args_to_string(args: &Vec<Type>, is_arg: bool) -> String {
+fn generic_type_args_to_string(args: &Vec<Type>) -> String {
     let mut args_str = String::new();
 
     args.iter().for_each(|t| {
         args_str.push_str(", ");
-        args_str.push_str(&t.to_string(is_arg));
+        args_str.push_str(&t.type_cast().member_type());
     });
 
     args_str[2..].into()
 }
 
 impl Generic {
-    pub fn to_string(&self, is_arg: bool) -> String {
+    pub fn to_string(&self) -> String {
         match self {
             Generic::Type1 { type_args1, non_array_type, type_args2 } => {
                 format!("{}{}{}",
-                    generic_type_args_to_string(type_args1, is_arg),
-                    non_array_type.to_string(is_arg),
-                    generic_type_args_to_string(&type_args2, is_arg))
+                    generic_type_args_to_string(type_args1),
+                    TypeCast::new(&non_array_type).member_type(),
+                    generic_type_args_to_string(&type_args2))
             }
             Generic::Type2 { non_array_type, type_args } => {
                 format!("{}{}",
-                    non_array_type.to_string(is_arg),
-                    generic_type_args_to_string(&type_args, is_arg))
+                    TypeCast::new(&non_array_type).member_type(),
+                    generic_type_args_to_string(&type_args))
             }
             Generic::Type3 { type_args } => {
-                generic_type_args_to_string(&type_args, is_arg)
+                generic_type_args_to_string(&type_args)
             }
         }
     }
@@ -309,31 +295,6 @@ pub struct NonArrayType {
     pub generic: Option<Box<Generic>>,
 }
 
-impl NonArrayType {
-    pub fn to_string(&self, is_arg: bool) -> String {
-        let gen_str = match &self.generic {
-            Some(gen) => gen.to_string(is_arg),
-            None => "".into(),
-        };
-        match self.name.as_str() {
-            "List" => format!("Vec<{}>", gen_str),
-            _ => format!("{}{}", type_to_rust(&self.name, is_arg).type_name, gen_str),
-        }
-    }
-
-    fn is_clonable(&self) -> bool {
-        type_to_rust(&self.name, true).is_clonable
-    }
-
-    fn is_declared(&self) -> bool {
-        type_to_rust(&self.name, true).is_declared
-    }
-
-    fn to_default(&self) -> String {
-        type_to_rust(&self.name, true).default
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ArrayType {
     const_expr: Option<ConstExpr>,
@@ -342,7 +303,10 @@ pub struct ArrayType {
 impl ArrayType {
     pub fn to_string(&self) -> String {
         match &self.const_expr {
-            Some(expr) => format!("[{}]", expr.to_string()),
+            Some(expr) => {
+                let expr = expr.calculate(&mut HashMap::new());
+                format!("[{}]", expr.to_string())
+            }
             None => "".to_string(),
         }
     }
@@ -360,95 +324,235 @@ pub struct Type {
 }
 
 impl Type {
-    pub fn to_string(&self, is_arg: bool) -> String {
-        let mut res = self.non_array_type.to_string(is_arg);
+    pub fn type_cast(&self) -> TypeCast {
+        let mut cast = TypeCast::new(&self.non_array_type);
+
+        cast.set_more(&self.array_types, is_nullable(&self.annotation_list));
+
+        cast
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeCast {
+    pub aidl_type: NonArrayType,
+    pub type_name: String,
+    pub is_declared: bool,
+    pub is_primitive: bool,
+    pub is_string: bool,
+    pub is_vector: bool,
+    pub is_nullable: bool,
+    pub expression: ConstExpr,
+}
+
+impl TypeCast {
+    fn new(aidl_type: &NonArrayType) -> TypeCast {
+        let mut is_declared = false;
+        let mut is_primitive = true;
+        let mut is_string = false;
+        let mut is_vector = false;
+        let type_name = match aidl_type.name.as_str() {
+            "boolean" => ("bool".to_owned(), ConstExpr::Expression(Expression::Bool(Default::default()))),
+            "byte" => ("i8".to_owned(), ConstExpr::Expression(Expression::Int8(Default::default()))),
+            "char" => ("char".to_owned(), ConstExpr::Char(Default::default())),
+            "int" => ("i32".to_owned(), ConstExpr::Expression(Expression::Int(Default::default()))),
+            "long" => ("i64".to_owned(), ConstExpr::Expression(Expression::Long(Default::default()))),
+            "float" => ("f32".to_owned(), ConstExpr::Expression(Expression::Float(Default::default()))),
+            "double" => ("f64".to_owned(), ConstExpr::Expression(Expression::Double(Default::default()))),
+            "void" => ("()".to_owned(), ConstExpr::String(StringExpr::CStr("()".into()))),
+            "String" => {
+                is_primitive = false;
+                is_string = true;
+                ("String".to_owned(), ConstExpr::String(StringExpr::CStr(Default::default())))
+            }
+            "IBinder" => {
+                is_primitive = false;
+                ("rsbinder::StrongIBinder".to_owned(), ConstExpr::String(StringExpr::CStr("rsbinder::StrongIBinder".into())))
+            }
+            "List" => {
+                is_primitive = false;
+                is_vector = true;
+                match &aidl_type.generic {
+                    Some(gen) => (gen.to_string(), ConstExpr::String(StringExpr::CStr(gen.to_string()))),
+                    None => panic!("Type \"List\" of AIDL must have Generic Type!"),
+                }
+            }
+            _ => {
+                is_primitive = false;
+                if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(aidl_type.name.as_str()) {
+                    let type_name = format!("crate::{}::{}", decl.namespace(), aidl_type.name.as_str());
+
+                    match decl {
+                        Declaration::Interface(_) => {
+                            is_declared = true;
+                            let type_name = format!("std::sync::Arc<dyn {}>", type_name);
+                            (type_name.clone(), ConstExpr::String(StringExpr::CStr(type_name)))
+                        }
+                        _ => (type_name.to_owned(), ConstExpr::String(StringExpr::CStr(type_name))),
+                    }
+                } else {
+                    (aidl_type.name.to_owned(), ConstExpr::String(StringExpr::CStr(aidl_type.name.to_owned())))
+                }
+            }
+        };
+
+        Self {
+            aidl_type: aidl_type.clone(),
+            type_name: type_name.0,
+            expression: type_name.1,
+            is_declared,
+            is_primitive,
+            is_string,
+            is_vector,
+            is_nullable: false,
+        }
+    }
+
+    pub fn type_name(&self) -> String {
+        let mut type_name = if self.is_vector {
+            format!("Vec<{}>", self.type_name)
+        } else {
+            self.type_name.clone()
+        };
+
+        if self.is_nullable {
+            type_name = format!("Option<{}>", type_name);
+        }
+
+        type_name
+    }
+
+    pub fn fn_def_arg(&self, is_mutable: bool) -> String {
+        let mutable = if is_mutable == true { "mut " } else { "" };
+
+        if self.is_string {
+            format!("&{}str", mutable)
+        } else {
+            format!("{}{}", mutable, self.type_name())
+        }
+    }
+
+    // Return String for function call.
+    pub fn as_ref(&self, arg_name: &str) -> String {
+        // declared type is wrapped by Arc<T>.
+        if self.is_declared {
+            format!("{}.as_ref()", arg_name)
+        } else if self.is_primitive {
+            format!("&{}", arg_name)
+        } else {
+            // arg is already referenced likes &rsbinder::StrongIBinder.
+            arg_name.into()
+        }
+    }
+
+    fn set_more(&mut self, array_types: &Vec<ArrayType>, is_nullable: bool) {
         // TODO: implement Vector.....
         // &Vec<T>
-        self.array_types.iter().for_each(|t| {
+        array_types.iter().for_each(|t| {
             if t.is_vector() {
-                res = format!("Vec<{res}>");
+                self.is_vector = true;
             } else {
-                res += &t.to_string();
+                self.type_name = format!("{}[{}]", self.type_name, t.to_string());
             }
         });
 
-        if is_nullable(&self.annotation_list) {
-            format!("Option<{res}>")
+        self.is_nullable = is_nullable;
+    }
+
+    pub fn expression(&self) -> ConstExpr {
+        self.expression.clone()
+    }
+
+    pub fn const_type(&self) -> String {
+        let mut type_string = self.type_name();
+            // public constant string type must be "&str".
+        if type_string == "String" {
+            type_string = "&str".into();
+        }
+        type_string
+    }
+
+    pub fn member_type(&self) -> String {
+        self.type_name()
+    }
+
+    pub fn init_type(&self, const_expr: Option<&ConstExpr>) -> String {
+        match const_expr {
+            Some(expr) => {
+                let expr = expr.convert_to(&self.expression());
+                expr.to_string()
+            }
+            None => "Default::default()".into(),
+        }
+    }
+
+    pub fn return_type(&self, is_nullable: bool) -> String {
+        if is_nullable == true && self.is_nullable == false {
+            format!("Option<{}>", self.type_name())
         } else {
-            res
+            self.type_name()
         }
     }
 
-    pub fn to_default(&self) -> String {
-        self.non_array_type.to_default()
-    }
+    // pub fn to_expression(&self) -> Expression {
 
-    pub fn is_declared(&self) -> bool {
-        self.non_array_type.is_declared()
-    }
-
-    pub fn is_clonable(&self) -> bool {
-        if self.annotation_list.is_empty() && self.array_types.is_empty() {
-            return self.non_array_type.is_clonable()
-        }
-        false
-    }
+    // }
 }
 
-pub struct TypeToRust {
-    type_name: String,
-    default: String,
-    is_clonable: bool,
-    is_declared: bool,
-}
+// pub struct TypeToRust {
+//     type_name: String,
+//     default: String,
+//     is_clonable: bool,
+//     is_declared: bool,
+// }
 
-fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
-    // Return is (rust type, default, clonable).
-    let zero = "0".to_owned();
-    let zero_f = "0.0".to_owned();
-    let default = "Default::default()".to_owned();
-    let mut is_declared = false;
-    let res = match type_name {
-        "boolean" => ("bool".to_owned(), "false".to_owned(), true),
-        "byte" => ("i8".to_owned(), zero, true),
-        "char" => ("u16".to_owned(), zero, true),
-        "int" => ("i32".to_owned(), zero, true),
-        "long" => ("i64".to_owned(), zero, true),
-        "float" => ("f32".to_owned(), zero_f, true),
-        "double" => ("f64".to_owned(), zero_f, true),
-        "void" => ("()".to_owned(), default, true),
-        "String" => {
-            if is_arg == true {
-                ("str".to_owned(), default, false)
-            } else {
-                ("String".to_owned(), default, true)
-            }
-        }
-        "IBinder" => { ("rsbinder::StrongIBinder".to_owned(), default, true) }
-        _ => {
-            if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(type_name) {
-                let type_name = format!("crate::{}::{}", decl.namespace(), type_name);
+// fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
+//     // Return is (rust type, default, clonable).
+//     let zero = "0".to_owned();
+//     let zero_f = "0.0".to_owned();
+//     let default = "Default::default()".to_owned();
+//     let mut is_declared = false;
+//     let res = match type_name {
+//         "boolean" => ("bool".to_owned(), "false".to_owned(), true),
+//         "byte" => ("i8".to_owned(), zero, true),
+//         "char" => ("u16".to_owned(), zero, true),
+//         "int" => ("i32".to_owned(), zero, true),
+//         "long" => ("i64".to_owned(), zero, true),
+//         "float" => ("f32".to_owned(), zero_f, true),
+//         "double" => ("f64".to_owned(), zero_f, true),
+//         "void" => ("()".to_owned(), default, true),
+//         "String" => {
+//             if is_arg == true {
+//                 ("str".to_owned(), default, false)
+//             } else {
+//                 ("String".to_owned(), default, true)
+//             }
+//         }
+//         "IBinder" => { ("rsbinder::StrongIBinder".to_owned(), default, true) }
+//         _ => {
+//             if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(type_name) {
+//                 let type_name = format!("crate::{}::{}", decl.namespace(), type_name);
 
-                match decl {
-                    Declaration::Interface(_) => {
-                        is_declared = true;
-                        (format!("std::sync::Arc<dyn {}>", type_name), default, true)
-                    }
-                    _ => { (type_name.to_owned(), default, false) }
-                }
-            } else {
-                (type_name.to_owned(), default, false)
-            }
-        }
-    };
+//                 match decl {
+//                     Declaration::Interface(_) => {
+//                         is_declared = true;
+//                         (format!("std::sync::Arc<dyn {}>", type_name), default, true)
+//                     }
+//                     _ => { (type_name.to_owned(), default, false) }
+//                 }
+//             } else {
+//                 (type_name.to_owned(), default, false)
+//             }
+//         }
+//     };
 
-    TypeToRust {
-        type_name: res.0,
-        default: res.1,
-        is_clonable: res.2,
-        is_declared,
-    }
-}
+//     TypeToRust {
+//         type_name: res.0,
+//         default: res.1,
+//         is_clonable: res.2,
+//         is_declared,
+//     }
+// }
 
 pub fn is_nullable(annotation_list: &Vec<Annotation>) -> bool {
     for annotation in annotation_list {
@@ -468,8 +572,11 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> String {
                 if param.identifier == "type" {
                     if let ConstExpr::String(expr) = &param.const_expr {
                         if let StringExpr::CStr(cstr) = expr {
+                            return TypeCast::new(&NonArrayType {
                             // The cstr is enclosed in quotes.
-                            return type_to_rust(cstr.trim_matches('"'), false).type_name
+                                name: cstr.trim_matches('"').into(),
+                                generic: None,
+                            }).type_name();
                         }
                     }
                 }
@@ -514,7 +621,7 @@ fn parse_intvalue(arg_value: &str, radix: u32) -> Expression {
     if is_u8 == true {
         Expression::IntU8(value as u8)
     } else {
-        Expression::Int(value)
+        Expression::Long(value)
     }
 }
 
@@ -533,7 +640,7 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Expression {
                 value
             };
 
-            Expression::Float(value.parse::<f64>().unwrap())
+            Expression::Double(value.parse::<f64>().unwrap())
         }
         Rule::INTVALUE => { parse_intvalue(pair.as_str(), 10) }
         Rule::TRUE_LITERAL => { Expression::Bool(true) }
@@ -546,7 +653,7 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Expression {
     // println!("parse_factor {:?}", pair);
     match pair.as_rule() {
         Rule::expression => {
-            parse_expression(pair.into_inner())
+            parse_expression(pair.clone().into_inner(), pair.as_str().into())
         }
         Rule::unary => {
             parse_unary(pair.into_inner())
@@ -563,7 +670,7 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Expression {
     match pair.as_rule() {
         Rule::equality | Rule::comparison | Rule::bitwise | Rule::shift | Rule::arith |
         Rule::logical => {
-            parse_expression(pair.into_inner())
+            parse_expression(pair.clone().into_inner(),pair.as_str().into())
         }
         Rule::factor => {
             parse_factor(pair.into_inner().next().unwrap())
@@ -572,14 +679,15 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Expression {
     }
 }
 
-fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
+fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>, as_str: String) -> Expression {
     let mut lhs = parse_expression_term(pairs.next().unwrap());
 
     while let Some(pair) = pairs.next() {
         let op = pair.as_str().to_owned();
         let rhs = parse_expression_term(pairs.next().unwrap());
 
-        lhs = Expression::Expr { lhs: Box::new(lhs), operator: op, rhs: Box::new(rhs) };
+        lhs = Expression::Expr { lhs: Box::new(lhs), operator: op, rhs: Box::new(rhs),
+            as_str: as_str.clone() };
     }
 
     lhs
@@ -632,7 +740,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
         }
 
         Rule::expression => {
-            ConstExpr::Expression(parse_expression(pair.into_inner()))
+            ConstExpr::Expression(parse_expression(pair.clone().into_inner(), pair.as_str().into()))
         }
 
         Rule::string_expr => {
@@ -795,8 +903,8 @@ fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> V
             Rule::identifier => { decl.identifier = pair.as_str().into(); }
             Rule::const_expr => {
                 match pair.into_inner().next() {
-                    Some(pair) => decl.const_expr = parse_const_expr(pair),
-                    None => decl.const_expr = ConstExpr::List(vec![]),
+                    Some(pair) => decl.const_expr = Some(parse_const_expr(pair)),
+                    None => decl.const_expr = None,
                 }
             }
             _ => unreachable!("Unexpected rule in parse_variable_decl(): {}\t{}", pair, pair.as_str()),
@@ -840,8 +948,8 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
             }
             Rule::INTVALUE => {
                 let expr = parse_intvalue(pair.as_str(), 10);
-                decl.intvalue = match expr.calculate(&mut HashMap::new()).unwrap() {
-                    Expression::Int(v) => v,
+                decl.intvalue = match expr.calculate(&mut HashMap::new()) {
+                    Expression::Long(v) => v,
                     Expression::IntU8(v) => v as i64,
                     _ => unreachable!("Unexpected Expression in parse_method_decl(): {}, \"{}\"", pair, pair.as_str()),
                 };
@@ -1220,32 +1328,36 @@ mod tests {
             err
         })?;
 
-        let expr = parse_expression(res.next().unwrap().into_inner());
+        let expr = parse_expression(res.next().unwrap().into_inner(), res.as_str().into());
         assert_eq!(
             expr.clone(),
             Expression::Expr {
+                as_str: "1 + -3 * 2 << 2 | 4".into(),
                 lhs: Box::new(Expression::Expr {
+                    as_str: "1 + -3 * 2 << 2 ".into(),
                     lhs: Box::new(Expression::Expr {
-                        lhs: Box::new(Expression::Int(1)),
+                        as_str: "1 + -3 * 2".into(),
+                        lhs: Box::new(Expression::Long(1)),
                         operator: "+".to_string(),
                         rhs: Box::new(Expression::Expr {
+                            as_str: "-3 * 2".into(),
                             lhs: Box::new(Expression::Unary {
                                 operator: "-".to_string(),
-                                expr: Box::new(Expression::Int(3))
+                                expr: Box::new(Expression::Long(3))
                             }),
                             operator: "*".to_string(),
-                            rhs: Box::new(Expression::Int(2))
+                            rhs: Box::new(Expression::Long(2))
                         })
                     }),
                     operator: "<<".to_string(),
-                    rhs: Box::new(Expression::Int(2))
+                    rhs: Box::new(Expression::Long(2))
                 }),
                 operator: "|".to_string(),
-                rhs: Box::new(Expression::Int(4))
+                rhs: Box::new(Expression::Long(4))
             },
         );
 
-        assert_eq!(expr.calculate(&mut HashMap::new())?, Expression::Int(-20));
+        assert_eq!(expr.calculate(&mut HashMap::new()), Expression::Long(-20));
 
         Ok(())
     }

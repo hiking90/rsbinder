@@ -49,7 +49,7 @@ fn add_namespace(namespace: &str, source: &str) -> String {
 pub struct Builder {
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
-    output: String,
+    output: PathBuf,
 }
 
 impl Builder {
@@ -66,8 +66,13 @@ impl Builder {
         self
     }
 
-    pub fn output(mut self, output: &str) -> Self {
-        self.output = output.into();
+    pub fn output(mut self, mut output: PathBuf) -> Self {
+        if let None = output.extension() {
+            output.set_extension("rs");
+        }
+
+        self.output = output;
+
         self
     }
 

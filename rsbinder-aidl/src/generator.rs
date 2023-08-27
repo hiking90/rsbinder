@@ -89,11 +89,23 @@ mod {{mod}} {
 const PARCELABLE_TEMPLATE: &str = r##"
 pub use {{mod}}::*;
 mod {{mod}} {
+    {%- for member in const_members %}
+    pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
+    {%- endfor %}
     #[derive(Debug, Default)]
     pub struct {{name}} {
     {%- for member in members %}
         pub {{ member.0 }}: {{ member.1 }},
     {%- endfor %}
+    }
+    impl Default for {{ name }} {
+        fn default() -> Self {
+            Self {
+            {%- for member in members %}
+                {{ member.0 }} = {{ member.2 }},
+            {%- endfor %}
+            }
+        }
     }
     impl rsbinder::Parcelable for {{name}} {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
@@ -216,27 +228,32 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
     method.arg_list.iter().for_each(|arg| {
         let arg_str = arg.to_string();
         args += &format!(", {}", arg_str.1);
-        build_params += &format!("{}.clone(), ", arg_str.0);
+
+        let type_cast = arg.r#type.type_cast();
+
+        if type_cast.is_declared {
+            build_params += &format!("{}.clone(), ", arg_str.0);
+            write_params.push(format!("{}.as_ref()", arg_str.0))
+        } else if type_cast.is_primitive {
+            build_params += &format!("{}, ", arg_str.0);
+            write_params.push(format!("&{}", arg_str.0))
+        } else {
+            if type_cast.is_string {
+                build_params += &format!("{}, ", arg_str.0);
+                write_params.push(format!("{}", arg_str.0))
+            } else {
+                build_params += &format!("{}.clone(), ", arg_str.0);
+                write_params.push(format!("&{}", arg_str.0))
+            }
+        }
+
+        // build_params += &format!("{}.clone(), ", arg_str.0);
         read_params += &format!("{}, ", arg_str.0);
 
-        // It generates body of build_parcel_functions.
-        let (ref_str, func_str) = if arg.r#type.is_clonable() == true {
-            if arg.r#type.is_declared() == true {
-                ("", ".as_ref()")
-            } else {
-                ("&", "")
-            }
-        } else {
-            ("", "")
-        };
-        write_params.push(format!("{}{}{}", ref_str, arg_str.0, func_str));
+        // write_params.push(type_cast.as_ref(&arg_str.0));
     });
 
-    let return_type = if parser::is_nullable(&method.annotation_list) == true {
-        format!("Option<{}>", method.r#type.to_string(false))
-    } else {
-        method.r#type.to_string(false)
-    };
+    let return_type = method.r#type.type_cast().return_type(parser::is_nullable(&method.annotation_list));
 
     Ok((method.identifier.to_case(Case::Snake),
         args, return_type, write_params, build_params, read_params, method.oneway))
@@ -245,11 +262,13 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
 
 fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut decl = arg_decl.clone();
-    decl.post_process()?;
+    decl.pre_process();
 
     let mut const_members = Vec::new();
     for constant in decl.constant_list.iter() {
-        const_members.push((constant.const_identifier(), constant.const_type(), constant.const_expr.to_string()));
+        let type_cast = constant.r#type.type_cast();
+        const_members.push((constant.const_identifier(),
+            type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref())));
     }
 
     let mut fn_members = Vec::new();
@@ -275,12 +294,25 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     Ok(add_indent(indent, &rendered.trim()))
 }
 
-fn gen_parcelable(decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let mut decl = arg_decl.clone();
+    decl.pre_process();
+
+    let mut constant_members = Vec::new();
     let mut members = Vec::new();
     // Parse struct variables only.
     for decl in &decl.members {
         if let Some(var) = decl.is_variable() {
-            members.push((var.identifier(), var.member_type()))
+            let type_cast = var.r#type.type_cast();
+
+            if var.constant == true {
+                constant_members.push((var.const_identifier(),
+                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref())));
+            } else {
+                members.push(
+                    (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref()))
+                )
+            }
         }
     }
 
@@ -290,6 +322,7 @@ fn gen_parcelable(decl: &parser::ParcelableDecl, indent: usize) -> Result<String
     context.insert("name", &decl.name);
     context.insert("namespace", &to_namespace(&decl.namespace, &decl.name));
     context.insert("members", &members);
+    context.insert("const_members", &constant_members);
 
     let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
 
@@ -301,8 +334,8 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
     let mut enum_val: i64 = 0;
     for enumerator in &decl.enumerator_list {
         if let Some(const_expr) = &enumerator.const_expr {
-            if let const_expr::ConstExpr::Expression(expr) = const_expr.calculate(&mut HashMap::new())? {
-                enum_val = expr.to_i64()?;
+            if let const_expr::ConstExpr::Expression(expr) = const_expr.calculate(&mut HashMap::new()) {
+                enum_val = expr.to_i64();
             }
         }
         members.push((&enumerator.identifier, enum_val));
@@ -328,10 +361,12 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     for member in &decl.members {
         if let parser::Declaration::Variable(var) = member {
+            let type_cast = var.r#type.type_cast();
             if var.constant == true {
-                constant_members.push((var.const_identifier(), var.const_type(), var.const_expr.to_string()));
+                constant_members.push((var.const_identifier(),
+                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref())));
             } else {
-                members.push((var.union_identifier(), var.member_type()));
+                members.push((var.union_identifier(), type_cast.member_type()));
             }
         } else {
             todo!();

@@ -98,6 +98,14 @@ mod connection_info {
         pub ip_address: String,
         pub port: i32,
     }
+    impl Default for ConnectionInfo {
+        fn default() -> Self {
+            Self {
+                ip_address = Default::default(),
+                port = Default::default(),
+            }
+        }
+    }
     impl rsbinder::Parcelable for ConnectionInfo {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.write(&self.ip_address)?;
@@ -143,7 +151,7 @@ mod i_client_callback {
     }
     impl IClientCallback for BpClientCallback {
         fn on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_on_clients(_arg_registered.clone(), _arg_has_clients.clone(), )?;
+            let _aidl_data = self.build_parcel_on_clients(_arg_registered.clone(), _arg_has_clients, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ON_CLIENTS, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_clients(_arg_registered, _arg_has_clients, _aidl_reply)
         }
@@ -180,7 +188,7 @@ mod i_service_callback {
     }
     impl IServiceCallback for BpServiceCallback {
         fn on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_on_registration(_arg_name.clone(), _arg_binder.clone(), )?;
+            let _aidl_data = self.build_parcel_on_registration(_arg_name, _arg_binder.clone(), )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ON_REGISTRATION, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_registration(_arg_name, _arg_binder, _aidl_reply)
         }
@@ -383,62 +391,62 @@ mod i_service_manager {
     }
     impl IServiceManager for BpServiceManager {
         fn get_service(&self, _arg_name: &str) -> rsbinder::Result<Option<rsbinder::StrongIBinder>> {
-            let _aidl_data = self.build_parcel_get_service(_arg_name.clone(), )?;
+            let _aidl_data = self.build_parcel_get_service(_arg_name, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::GET_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_get_service(_arg_name, _aidl_reply)
         }
         fn check_service(&self, _arg_name: &str) -> rsbinder::Result<Option<rsbinder::StrongIBinder>> {
-            let _aidl_data = self.build_parcel_check_service(_arg_name.clone(), )?;
+            let _aidl_data = self.build_parcel_check_service(_arg_name, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::CHECK_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_check_service(_arg_name, _aidl_reply)
         }
         fn add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_add_service(_arg_name.clone(), _arg_service.clone(), _arg_allow_isolated.clone(), _arg_dump_priority.clone(), )?;
+            let _aidl_data = self.build_parcel_add_service(_arg_name, _arg_service.clone(), _arg_allow_isolated, _arg_dump_priority, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ADD_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_add_service(_arg_name, _arg_service, _arg_allow_isolated, _arg_dump_priority, _aidl_reply)
         }
         fn list_services(&self, _arg_dump_priority: i32) -> rsbinder::Result<Vec<String>> {
-            let _aidl_data = self.build_parcel_list_services(_arg_dump_priority.clone(), )?;
+            let _aidl_data = self.build_parcel_list_services(_arg_dump_priority, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::LIST_SERVICES, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_list_services(_arg_dump_priority, _aidl_reply)
         }
         fn register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_register_for_notifications(_arg_name.clone(), _arg_callback.clone(), )?;
+            let _aidl_data = self.build_parcel_register_for_notifications(_arg_name, _arg_callback.clone(), )?;
             let _aidl_reply = self.handle.submit_transact(transactions::REGISTER_FOR_NOTIFICATIONS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_register_for_notifications(_arg_name, _arg_callback, _aidl_reply)
         }
         fn unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_unregister_for_notifications(_arg_name.clone(), _arg_callback.clone(), )?;
+            let _aidl_data = self.build_parcel_unregister_for_notifications(_arg_name, _arg_callback.clone(), )?;
             let _aidl_reply = self.handle.submit_transact(transactions::UNREGISTER_FOR_NOTIFICATIONS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_unregister_for_notifications(_arg_name, _arg_callback, _aidl_reply)
         }
         fn is_declared(&self, _arg_name: &str) -> rsbinder::Result<bool> {
-            let _aidl_data = self.build_parcel_is_declared(_arg_name.clone(), )?;
+            let _aidl_data = self.build_parcel_is_declared(_arg_name, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::IS_DECLARED, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_is_declared(_arg_name, _aidl_reply)
         }
         fn get_declared_instances(&self, _arg_iface: &str) -> rsbinder::Result<Vec<String>> {
-            let _aidl_data = self.build_parcel_get_declared_instances(_arg_iface.clone(), )?;
+            let _aidl_data = self.build_parcel_get_declared_instances(_arg_iface, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::GET_DECLARED_INSTANCES, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_get_declared_instances(_arg_iface, _aidl_reply)
         }
         fn updatable_via_apex(&self, _arg_name: &str) -> rsbinder::Result<Option<String>> {
-            let _aidl_data = self.build_parcel_updatable_via_apex(_arg_name.clone(), )?;
+            let _aidl_data = self.build_parcel_updatable_via_apex(_arg_name, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::UPDATABLE_VIA_APEX, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_updatable_via_apex(_arg_name, _aidl_reply)
         }
         fn get_connection_info(&self, _arg_name: &str) -> rsbinder::Result<Option<crate::aidl::android::os::ConnectionInfo>> {
-            let _aidl_data = self.build_parcel_get_connection_info(_arg_name.clone(), )?;
+            let _aidl_data = self.build_parcel_get_connection_info(_arg_name, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::GET_CONNECTION_INFO, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_get_connection_info(_arg_name, _aidl_reply)
         }
         fn register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_register_client_callback(_arg_name.clone(), _arg_service.clone(), _arg_callback.clone(), )?;
+            let _aidl_data = self.build_parcel_register_client_callback(_arg_name, _arg_service.clone(), _arg_callback.clone(), )?;
             let _aidl_reply = self.handle.submit_transact(transactions::REGISTER_CLIENT_CALLBACK, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_register_client_callback(_arg_name, _arg_service, _arg_callback, _aidl_reply)
         }
         fn try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_try_unregister_service(_arg_name.clone(), _arg_service.clone(), )?;
+            let _aidl_data = self.build_parcel_try_unregister_service(_arg_name, _arg_service.clone(), )?;
             let _aidl_reply = self.handle.submit_transact(transactions::TRY_UNREGISTER_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_try_unregister_service(_arg_name, _arg_service, _aidl_reply)
         }
@@ -459,6 +467,14 @@ mod service_debug_info {
     pub struct ServiceDebugInfo {
         pub name: String,
         pub debug_pid: i32,
+    }
+    impl Default for ServiceDebugInfo {
+        fn default() -> Self {
+            Self {
+                name = Default::default(),
+                debug_pid = Default::default(),
+            }
+        }
     }
     impl rsbinder::Parcelable for ServiceDebugInfo {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
@@ -506,6 +522,14 @@ mod connection_info {
     pub struct ConnectionInfo {
         pub ip_address: String,
         pub port: i32,
+    }
+    impl Default for ConnectionInfo {
+        fn default() -> Self {
+            Self {
+                ip_address = Default::default(),
+                port = Default::default(),
+            }
+        }
     }
     impl rsbinder::Parcelable for ConnectionInfo {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
@@ -826,5 +850,55 @@ mod long_enum {
 }
         "##)?;
 
+    Ok(())
+}
+
+#[test]
+fn test_byte_parcelable() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+package android.aidl.tests;
+parcelable StructuredParcelable {
+    // Constant expressions that evaluate to 1
+    byte[] int8_1 = {
+            1,
+            0xffu8 + 1 == 0,
+            255u8 + 1 == 0,
+            0x80u8 == -128,
+            // u8 type is reinterpreted as a signed type
+            0x80u8 / 2 == -0x40u8,
+    };
+}
+        "##,
+        r##"
+pub use structured_parcelable::*;
+mod structured_parcelable {
+    #[derive(Debug, Default)]
+    pub struct StructuredParcelable {
+        pub int_8_1: Vec<i8>,
+    }
+    impl Default for StructuredParcelable {
+        fn default() -> Self {
+            Self {
+                int_8_1 = vec![1,1,1,1,1,],
+            }
+        }
+    }
+    impl rsbinder::Parcelable for StructuredParcelable {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.write(&self.int_8_1)?;
+            Ok(())
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            self.int_8_1 = _parcel.read()?;
+            Ok(())
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(StructuredParcelable);
+    rsbinder::impl_deserialize_for_parcelable!(StructuredParcelable);
+    impl rsbinder::ParcelableMetadata for StructuredParcelable {
+        fn get_descriptor() -> &'static str { "android.aidl.tests.StructuredParcelable" }
+    }
+}
+        "##)?;
     Ok(())
 }
