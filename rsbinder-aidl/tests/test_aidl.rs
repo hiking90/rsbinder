@@ -780,11 +780,6 @@ mod backend_type {
             hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
         }
         "##,
-
-    // TODO: Android AIDL generates 1, but rsbinder aidl generates 0.
-    // hexInt32_2 = 0,
-    // hexInt32_3 = 0,
-
         r##"
 pub use constant_expression_enum::*;
 mod constant_expression_enum {
@@ -797,8 +792,8 @@ mod constant_expression_enum {
             decInt64_3 = 1,
             decInt64_4 = 1,
             hexInt32_1 = 1,
-            hexInt32_2 = 0,
-            hexInt32_3 = 0,
+            hexInt32_2 = 1,
+            hexInt32_3 = 1,
             hexInt64_1 = 1,
         }
     }
@@ -867,6 +862,87 @@ parcelable StructuredParcelable {
             // u8 type is reinterpreted as a signed type
             0x80u8 / 2 == -0x40u8,
     };
+    int[] int32_1 = {
+            (~(-1)) == 0,
+            ~~(1 << 31) == (1 << 31),
+            -0x7fffffff < 0,
+            0x80000000 < 0,
+
+            0x7fffffff == 2147483647,
+
+            // Shifting for more than 31 bits are undefined. Not tested.
+            (1 << 31) == 0x80000000,
+
+            // Should be all true / ones.
+            (1 + 2) == 3,
+            (8 - 9) == -1,
+            (9 * 9) == 81,
+            (29 / 3) == 9,
+            (29 % 3) == 2,
+            (0xC0010000 | 0xF00D) == (0xC001F00D),
+            (10 | 6) == 14,
+            (10 & 6) == 2,
+            (10 ^ 6) == 12,
+            6 < 10,
+            (10 < 10) == 0,
+            (6 > 10) == 0,
+            (10 > 10) == 0,
+            19 >= 10,
+            10 >= 10,
+            5 <= 10,
+            (19 <= 10) == 0,
+            19 != 10,
+            (10 != 10) == 0,
+            (22 << 1) == 44,
+            (11 >> 1) == 5,
+            (1 || 0) == 1,
+            (1 || 1) == 1,
+            (0 || 0) == 0,
+            (0 || 1) == 1,
+            (1 && 0) == 0,
+            (1 && 1) == 1,
+            (0 && 0) == 0,
+            (0 && 1) == 0,
+
+            // precedence tests -- all 1s
+            4 == 4,
+            -4 < 0,
+            0xffffffff == -1,
+            4 + 1 == 5,
+            2 + 3 - 4,
+            2 - 3 + 4 == 3,
+            1 == 4 == 0,
+            1 && 1,
+            1 || 1 && 0, // && higher than ||
+            1 < 2,
+            !!((3 != 4 || (2 < 3 <= 3 > 4)) >= 0),
+            !(1 == 7) && ((3 != 4 || (2 < 3 <= 3 > 4)) >= 0),
+            (1 << 2) >= 0,
+            (4 >> 1) == 2,
+            (8 << -1) == 4,
+            (1 << 30 >> 30) == 1,
+            (1 | 16 >> 2) == 5,
+            (0x0f ^ 0x33 & 0x99) == 0x1e, // & higher than ^
+            (~42 & (1 << 3 | 16 >> 2) ^ 7) == 3,
+            (2 + 3 - 4 * -7 / (10 % 3)) - 33 == 0,
+            (2 + (-3 & 4 / 7)) == 2,
+            (((((1 + 0))))),
+    };
+    long[] int64_1 = {
+            (~(-1)) == 0,
+            (~4294967295) != 0,
+            (~4294967295) != 0,
+            ~~(1L << 63) == (1L << 63),
+            -0x7FFFFFFFFFFFFFFF < 0,
+
+            0x7fffffff == 2147483647,
+            0xfffffffff == 68719476735,
+            0xffffffffffffffff == -1,
+            (0xfL << 32L) == 0xf00000000,
+            (0xfL << 32) == 0xf00000000,
+    };
+    int hexInt32_pos_1 = -0xffffffff;
+    int hexInt64_pos_1 = -0xfffffffffff < 0;
 }
         "##,
         r##"

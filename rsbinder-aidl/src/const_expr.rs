@@ -8,53 +8,47 @@ fn bool_to_int(v: bool) -> i32 {
 macro_rules! arithmetic_op {
     ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $as_str:expr) => {
         match $lhs {
-            Expression::Int(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
-                    Expression::Int(lhs $op rhs)
-                } else if let Expression::Long(rhs) = $rhs {
-                    Expression::Int(lhs $op (rhs as i32))
+            Expression::Int32(lhs) => {
+                if let Expression::Int32(rhs) = $rhs {
+                    Expression::Int32(lhs $op rhs)
+                } else if let Expression::Int64(rhs) = $rhs {
+                    Expression::Int32(lhs $op (rhs as i32))
                 } else if let Expression::Int8(rhs) = $rhs {
-                    Expression::Int(lhs $op (rhs as i32))
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::Int(lhs $op (rhs as i32))
+                    Expression::Int32(lhs $op (rhs as i32))
                 } else if let Expression::Float(rhs) = $rhs {
-                    Expression::Int(lhs $op rhs as i32)
+                    Expression::Int32(lhs $op rhs as i32)
                 } else if let Expression::Double(rhs) = $rhs {
-                    Expression::Int(lhs $op rhs as i32)
+                    Expression::Int32(lhs $op rhs as i32)
                 } else if let Expression::Bool(rhs) = $rhs {
-                    Expression::Int(lhs $op bool_to_int(rhs))
+                    Expression::Int32(lhs $op bool_to_int(rhs))
                 } else {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, $as_str);
                 }
             }
-            Expression::Long(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
-                    Expression::Long(lhs $op rhs as i64)
-                } else if let Expression::Long(rhs) = $rhs {
-                    Expression::Long(lhs $op (rhs as i64))
+            Expression::Int64(lhs) => {
+                if let Expression::Int32(rhs) = $rhs {
+                    Expression::Int64(lhs $op rhs as i64)
+                } else if let Expression::Int64(rhs) = $rhs {
+                    Expression::Int64(lhs $op (rhs as i64))
                 } else if let Expression::Int8(rhs) = $rhs {
-                    Expression::Long(lhs $op (rhs as i64))
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::Long(lhs $op (rhs as i64))
+                    Expression::Int64(lhs $op (rhs as i64))
                 } else if let Expression::Float(rhs) = $rhs {
-                    Expression::Long(lhs $op rhs as i64)
+                    Expression::Int64(lhs $op rhs as i64)
                 } else if let Expression::Double(rhs) = $rhs {
-                    Expression::Long(lhs $op rhs as i64)
+                    Expression::Int64(lhs $op rhs as i64)
                 } else if let Expression::Bool(rhs) = $rhs {
-                    Expression::Long(lhs $op bool_to_int(rhs) as i64)
+                    Expression::Int64(lhs $op bool_to_int(rhs) as i64)
                 } else {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, $as_str);
                 }
             }
             Expression::Int8(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
+                if let Expression::Int32(rhs) = $rhs {
                     Expression::Int8(lhs $op rhs as i8)
-                } else if let Expression::Long(rhs) = $rhs {
+                } else if let Expression::Int64(rhs) = $rhs {
                     Expression::Int8(lhs $op (rhs as i8))
                 } else if let Expression::Int8(rhs) = $rhs {
                     Expression::Int8(lhs $op rhs)
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::Int8(lhs $op (rhs as i8))
                 } else if let Expression::Float(rhs) = $rhs {
                     Expression::Int8(lhs $op rhs as i8)
                 } else if let Expression::Double(rhs) = $rhs {
@@ -65,26 +59,13 @@ macro_rules! arithmetic_op {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, $as_str);
                 }
             }
-            Expression::IntU8(lhs) => {
-                let rhs = $rhs.to_i64();
-                match $desc {
-                    "+" => Expression::IntU8(lhs.wrapping_add(rhs as _)),
-                    "-" => Expression::IntU8(lhs.wrapping_sub(rhs as _)),
-                    "*" => Expression::Int8((lhs as i8).wrapping_mul(rhs as i8)),
-                    "/" => Expression::Int8((lhs as i8).wrapping_div(rhs as i8)),
-                    "%" => Expression::IntU8(lhs.wrapping_rem(rhs as _)),
-                    _ => unreachable!(),
-                }
-            }
             Expression::Float(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
+                if let Expression::Int32(rhs) = $rhs {
                     Expression::Float(lhs $op (rhs as f32))
-                } else if let Expression::Long(rhs) = $rhs {
+                } else if let Expression::Int64(rhs) = $rhs {
                     Expression::Float(lhs $op (rhs as f32))
                 } else if let Expression::Int8(rhs) = $rhs {
                     Expression::Float(lhs $op rhs as f32)
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::Float(lhs $op (rhs as f32))
                 } else if let Expression::Float(rhs) = $rhs {
                     Expression::Float(lhs $op rhs)
                 } else if let Expression::Double(rhs) = $rhs {
@@ -96,14 +77,12 @@ macro_rules! arithmetic_op {
                 }
             }
             Expression::Double(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
+                if let Expression::Int32(rhs) = $rhs {
                     Expression::Double(lhs $op (rhs as f64))
-                } else if let Expression::Long(rhs) = $rhs {
+                } else if let Expression::Int64(rhs) = $rhs {
                     Expression::Double(lhs $op (rhs as f64))
                 } else if let Expression::Int8(rhs) = $rhs {
                     Expression::Double(lhs $op rhs as f64)
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::Double(lhs $op (rhs as f64))
                 } else if let Expression::Float(rhs) = $rhs {
                     Expression::Double(lhs $op rhs as f64)
                 } else if let Expression::Double(rhs) = $rhs {
@@ -115,16 +94,18 @@ macro_rules! arithmetic_op {
                 }
             }
             Expression::Bool(lhs) => {
-                if let Expression::Int(rhs) = $rhs {
-                    Expression::Int(bool_to_int(lhs) $op rhs)
-                } else if let Expression::IntU8(rhs) = $rhs {
-                    Expression::IntU8((bool_to_int(lhs) as u8) $op rhs)
+                if let Expression::Int32(rhs) = $rhs {
+                    Expression::Int32(bool_to_int(lhs) $op rhs)
+                } else if let Expression::Int8(rhs) = $rhs {
+                    Expression::Int8((bool_to_int(lhs) as i8) $op rhs)
+                } else if let Expression::Int64(rhs) = $rhs {
+                    Expression::Int64((bool_to_int(lhs) as i64) $op rhs)
                 } else if let Expression::Float(rhs) = $rhs {
                     Expression::Float((bool_to_int(lhs) as f32) $op rhs)
                 } else if let Expression::Double(rhs) = $rhs {
                     Expression::Double((bool_to_int(lhs) as f64) $op rhs)
                 } else if let Expression::Bool(rhs) = $rhs {
-                    Expression::Int(bool_to_int(lhs) $op bool_to_int(rhs))
+                    Expression::Int32(bool_to_int(lhs) $op bool_to_int(rhs))
                 } else {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, $as_str);
                 }
@@ -138,10 +119,9 @@ macro_rules! arithmetic_op {
 macro_rules! int_value_convert {
     ($lhs:expr, $value:expr, $from:tt) => {
         match $lhs {
-            Expression::Int(_) => Expression::Int($value.wrapping_add(0) as i32),
-            Expression::Long(_) => Expression::Long($value.wrapping_add(0) as i64),
+            Expression::Int32(_) => Expression::Int32($value.wrapping_add(0) as i32),
+            Expression::Int64(_) => Expression::Int64($value.wrapping_add(0) as i64),
             Expression::Int8(_) => Expression::Int8($value.wrapping_add(0) as i8),
-            Expression::IntU8(_) => Expression::IntU8($value.wrapping_add(0) as u8),
             Expression::Float(_) => Expression::Float($value.wrapping_add(0) as f32),
             Expression::Double(_) => Expression::Double($value.wrapping_add(0) as f64),
             Expression::Bool(_) => Expression::Bool($value != 0),
@@ -153,10 +133,9 @@ macro_rules! int_value_convert {
 macro_rules! float_value_convert {
     ($lhs:expr, $value:expr, $from:tt) => {
         match $lhs {
-            Expression::Int(_) => Expression::Int($value as i32),
-            Expression::Long(_) => Expression::Long($value as i64),
+            Expression::Int32(_) => Expression::Int32($value as i32),
+            Expression::Int64(_) => Expression::Int64($value as i64),
             Expression::Int8(_) => Expression::Int8($value as i8),
-            Expression::IntU8(_) => Expression::IntU8($value as u8),
             Expression::Float(_) => Expression::Float($value as f32),
             Expression::Double(_) => Expression::Double($value as f64),
             Expression::Bool(_) => Expression::Bool($value != 0.),
@@ -168,10 +147,9 @@ macro_rules! float_value_convert {
 macro_rules! bool_value_convert {
     ($lhs:expr, $value:expr, $from:tt) => {
         match $lhs {
-            Expression::Int(_) => Expression::Int(bool_to_int($value) as i32),
-            Expression::Long(_) => Expression::Long(bool_to_int($value) as i64),
+            Expression::Int32(_) => Expression::Int32(bool_to_int($value) as i32),
+            Expression::Int64(_) => Expression::Int64(bool_to_int($value) as i64),
             Expression::Int8(_) => Expression::Int8(bool_to_int($value) as i8),
-            Expression::IntU8(_) => Expression::IntU8(bool_to_int($value) as u8),
             Expression::Float(_) => Expression::Float(bool_to_int($value) as f32),
             Expression::Double(_) => Expression::Double(bool_to_int($value) as f64),
             Expression::Bool(_) => Expression::Bool($value),
@@ -183,10 +161,9 @@ macro_rules! bool_value_convert {
 #[derive(Debug, Clone)]
 pub enum Expression {
     Name(String),
-    Int(i32),
     Int8(i8),
-    IntU8(u8),
-    Long(i64),
+    Int32(i32),
+    Int64(i64),
     Float(f32),
     Double(f64),
     Bool(bool),
@@ -206,10 +183,9 @@ impl Expression {
     pub fn to_string(&self) -> String {
         match self {
             Expression::Name(v) => v.clone(),
-            Expression::Int(v) => v.to_string(),
-            Expression::Long(v) => v.to_string(),
+            Expression::Int32(v) => v.to_string(),
+            Expression::Int64(v) => v.to_string(),
             Expression::Int8(v) => v.to_string(),
-            Expression::IntU8(v) => v.to_string(),
             Expression::Float(v) => v.to_string(),
             Expression::Double(v) => v.to_string(),
             Expression::Bool(v) => v.to_string(),
@@ -225,10 +201,9 @@ impl Expression {
     pub fn convert_to(&self, ref_type: &Expression) -> Expression {
         match self {
             Expression::Name(v) => Expression::Name(v.clone()),
-            Expression::Int(v) => int_value_convert!(ref_type, *v, self),
-            Expression::Long(v) => int_value_convert!(ref_type, *v, self),
+            Expression::Int32(v) => int_value_convert!(ref_type, *v, self),
+            Expression::Int64(v) => int_value_convert!(ref_type, *v, self),
             Expression::Int8(v) => int_value_convert!(ref_type, *v, self),
-            Expression::IntU8(v) => int_value_convert!(ref_type, *v, self),
             Expression::Float(v) => float_value_convert!(ref_type, *v, self),
             Expression::Double(v) => float_value_convert!(ref_type, *v, self),
             Expression::Bool(v) => bool_value_convert!(ref_type, *v, self),
@@ -262,10 +237,9 @@ impl Expression {
     pub fn to_bool(&self) -> bool {
         match self {
             Expression::Name(v) => v.is_empty() != true,
-            Expression::Int(v) => *v != 0,
-            Expression::Long(v) => *v != 0,
+            Expression::Int32(v) => *v != 0,
+            Expression::Int64(v) => *v != 0,
             Expression::Int8(v) => *v != 0,
-            Expression::IntU8(v) => *v != 0,
             Expression::Float(v) => *v != 0.,
             Expression::Double(v) => *v != 0.,
             Expression::Bool(v) => *v,
@@ -283,10 +257,9 @@ impl Expression {
     pub fn to_i64(&self) -> i64 {
         match self {
             Expression::Name(v) => panic!("Can't convert Name {} to i64", v),
-            Expression::Int(v) => *v as i64,
-            Expression::Long(v) => *v as i64,
+            Expression::Int32(v) => *v as i64,
+            Expression::Int64(v) => *v as i64,
             Expression::Int8(v) => *v as i64,
-            Expression::IntU8(v) => *v as i8 as i64,
             Expression::Float(v) => *v as i64,
             Expression::Double(v) => *v as i64,
             Expression::Bool(v) => bool_to_int(*v) as i64,
@@ -304,10 +277,9 @@ impl Expression {
     pub fn to_f64(&self) -> f64 {
         match self {
             Expression::Name(v) => panic!("Can't convert Name {} to f64", v),
-            Expression::Int(v) => *v as f64,
-            Expression::Long(v) => *v as f64,
+            Expression::Int32(v) => *v as f64,
+            Expression::Int64(v) => *v as f64,
             Expression::Int8(v) => *v as f64,
-            Expression::IntU8(v) => *v as f64,
             Expression::Float(v) => *v as f64,
             Expression::Double(v) => *v as f64,
             Expression::Bool(v) => bool_to_int(*v) as f64,
@@ -325,10 +297,9 @@ impl Expression {
     pub fn as_str(&self) -> String {
         match self {
             Expression::Name(v) => v.clone(),
-            Expression::Int(v) => v.to_string(),
-            Expression::Long(v) => v.to_string(),
+            Expression::Int32(v) => v.to_string(),
+            Expression::Int64(v) => v.to_string(),
             Expression::Int8(v) => v.to_string(),
-            Expression::IntU8(v) => v.to_string(),
             Expression::Float(v) => v.to_string(),
             Expression::Double(v) => v.to_string(),
             Expression::Bool(v) => v.to_string(),
@@ -357,10 +328,9 @@ impl Expression {
                 let rhs = rhs.convert_to(&lhs);
 
                 match lhs {
-                    Expression::Int(_v) => Expression::Int((lhs.to_i64() | rhs.to_i64()) as i32),
-                    Expression::Long(_v) => Expression::Long(lhs.to_i64() | rhs.to_i64()),
+                    Expression::Int32(_v) => Expression::Int32((lhs.to_i64() | rhs.to_i64()) as i32),
+                    Expression::Int64(_v) => Expression::Int64(lhs.to_i64() | rhs.to_i64()),
                     Expression::Int8(_v) => Expression::Int8((lhs.to_i64() | rhs.to_i64()) as i8),
-                    Expression::IntU8(_v) => Expression::IntU8((lhs.to_i64() | rhs.to_i64()) as u8),
                     Expression::Bool(_v) => Expression::Bool((lhs.to_i64() | rhs.to_i64()) != 0),
                     _ => panic!("Can't apply operator '|' for non integer type: {} {}", lhs.as_str(), rhs.as_str()),
                 }
@@ -370,10 +340,9 @@ impl Expression {
                 let rhs = rhs.convert_to(&lhs);
 
                 match lhs {
-                    Expression::Int(_v) => Expression::Int((lhs.to_i64() ^ rhs.to_i64()) as i32),
-                    Expression::Long(_v) => Expression::Long(lhs.to_i64() ^ rhs.to_i64()),
+                    Expression::Int32(_v) => Expression::Int32((lhs.to_i64() ^ rhs.to_i64()) as i32),
+                    Expression::Int64(_v) => Expression::Int64(lhs.to_i64() ^ rhs.to_i64()),
                     Expression::Int8(_v) => Expression::Int8((lhs.to_i64() ^ rhs.to_i64()) as i8),
-                    Expression::IntU8(_v) => Expression::IntU8((lhs.to_i64() ^ rhs.to_i64()) as u8),
                     Expression::Bool(_v) => Expression::Bool((lhs.to_i64() ^ rhs.to_i64()) != 0),
                     _ => panic!("Can't apply operator '^' for non integer type: {} {}", lhs.as_str(), rhs.as_str()),
                 }
@@ -383,43 +352,52 @@ impl Expression {
                 let rhs = rhs.convert_to(&lhs);
 
                 match lhs {
-                    Expression::Int(_v) => Expression::Int((lhs.to_i64() & rhs.to_i64()) as i32),
-                    Expression::Long(_v) => Expression::Long(lhs.to_i64() & rhs.to_i64()),
+                    Expression::Int32(_v) => Expression::Int32((lhs.to_i64() & rhs.to_i64()) as i32),
+                    Expression::Int64(_v) => Expression::Int64(lhs.to_i64() & rhs.to_i64()),
                     Expression::Int8(_v) => Expression::Int8((lhs.to_i64() & rhs.to_i64()) as i8),
-                    Expression::IntU8(_v) => Expression::IntU8((lhs.to_i64() & rhs.to_i64()) as u8),
                     Expression::Bool(_v) => Expression::Bool((lhs.to_i64() & rhs.to_i64()) != 0),
                     _ => panic!("Can't apply operator '&' for non integer type: {} {}", lhs.as_str(), rhs.as_str()),
                 }
             }
             "==" => {
+                let rhs = rhs.convert_to(&lhs);
                 // println!("{:?} == {:?} => {:?}", lhs, rhs, lhs.partial_cmp(&rhs));
                 Expression::Bool(lhs == rhs)
             }
             "!=" => {
                 Expression::Bool(lhs != rhs)
             }
-            "<<" => {
-                let rhs = rhs.to_i64() as u32;
+            "<<" | ">>" => {
+                let mut shl = if operator == "<<" {
+                    true
+                } else {
+                    false
+                };
 
-                match lhs {
-                    Expression::Int(v) => Expression::Int(v.wrapping_shl(rhs)),
-                    Expression::Long(v) => Expression::Long(v.wrapping_shl(rhs)),
-                    Expression::Int8(v) => Expression::Int8(v.wrapping_shl(rhs)),
-                    Expression::IntU8(v) => Expression::IntU8(v.wrapping_shl(rhs)),
-                    Expression::Bool(v) => Expression::Bool(((v as u64).wrapping_shl(rhs)) != 0),
-                    _ => panic!("Can't apply operator '<<' for non integer type: {}", lhs.as_str()),
-                }
-            }
-            ">>" => {
-                let rhs = rhs.to_i64() as u32;
+                let rhs = rhs.to_i64();
+                let rhs: u32 = if rhs < 0 {
+                    shl = !shl;
+                    rhs.wrapping_neg() as u32
+                } else {
+                    rhs as u32
+                };
 
-                match lhs {
-                    Expression::Int(v) => Expression::Int(v.wrapping_shr(rhs)),
-                    Expression::Long(v) => Expression::Long(v.wrapping_shr(rhs)),
-                    Expression::Int8(v) => Expression::Int8(v.wrapping_shr(rhs)),
-                    Expression::IntU8(v) => Expression::IntU8(v.wrapping_shr(rhs)),
-                    Expression::Bool(v) => Expression::Bool((v as u64).wrapping_shr(rhs) != 0),
-                    _ => panic!("Can't apply operator '>>' for non integer type: {}", lhs.as_str()),
+                if shl == true {
+                    match lhs {
+                        Expression::Int32(v) => Expression::Int64((v as i64).wrapping_shl(rhs)),
+                        Expression::Int64(v) => Expression::Int64(v.wrapping_shl(rhs)),
+                        Expression::Int8(v) => Expression::Int64((v as i64).wrapping_shl(rhs)),
+                        Expression::Bool(v) => Expression::Bool(((v as i64).wrapping_shl(rhs)) != 0),
+                        _ => panic!("Can't apply operator '<<' for non integer type: {}", lhs.as_str()),
+                    }
+                } else {
+                    match lhs {
+                        Expression::Int32(v) => Expression::Int32(v.wrapping_shr(rhs)),
+                        Expression::Int64(v) => Expression::Int64(v.wrapping_shr(rhs)),
+                        Expression::Int8(v) => Expression::Int8(v.wrapping_shr(rhs)),
+                        Expression::Bool(v) => Expression::Bool((v as u64).wrapping_shr(rhs) != 0),
+                        _ => panic!("Can't apply operator '>>' for non integer type: {}", lhs.as_str()),
+                    }
                 }
             }
             "<=" => Expression::Bool(lhs <= rhs),
@@ -456,22 +434,20 @@ impl Expression {
             "+" => self.clone(),
             "-" => {
                 match self {
-                    Expression::Int(v) => Self::Int(-v),
-                    Expression::Long(v) => Self::Long(-(*v)),
-                    Expression::Int8(v) => Self::Int8(-v),
-                    Expression::IntU8(v) => Self::Int8(-(*v as i8)),
+                    Expression::Int32(v) => Self::Int32(v.wrapping_neg()),
+                    Expression::Int64(v) => Self::Int64(v.wrapping_neg()),
+                    Expression::Int8(v) => Self::Int8(v.wrapping_neg()),
                     Expression::Float(v) => Self::Float(-v),
                     Expression::Double(v) => Self::Double(-v),
-                    Expression::Bool(v) => Self::Int(-bool_to_int(*v)),
+                    Expression::Bool(v) => Self::Int32(-bool_to_int(*v)),
                     _ => panic!("Can't apply unary operator '-' to {:?}\n{}", self, self.as_str()),
                 }
             }
             "~" | "!" => {
                 match self {
-                    Expression::Int(v) => Self::Int(!v),
-                    Expression::Long(v) => Self::Long(!v),
+                    Expression::Int32(v) => Self::Int32(!v),
+                    Expression::Int64(v) => Self::Int64(!v),
                     Expression::Int8(v) => Self::Int8(!v),
-                    Expression::IntU8(v) => Self::IntU8(!v),
                     Expression::Bool(v) => Self::Bool(!v),
                     _ => panic!("Can't apply unary operator '~' or \"!\" to {:?}\n{}", self, self.as_str()),
                 }
@@ -521,9 +497,9 @@ impl PartialOrd for Expression {
                     None
                 }
             }
-            Expression::Int(_) |
+            Expression::Int32(_) |
             Expression::Int8(_) |
-            Expression::Long(_) |
+            Expression::Int64(_) |
             Expression::Bool(_) => {
                 let lhs = self.to_i64();
                 let rhs = rhs.to_i64();
@@ -536,17 +512,17 @@ impl PartialOrd for Expression {
                     Some(std::cmp::Ordering::Greater)
                 }
             }
-            Expression::IntU8(lhs) => {
-                let rhs = rhs.to_i64() as i8 as u8;
+            // Expression::IntU8(lhs) => {
+            //     let rhs = rhs.to_i64() as i8 as u8;
 
-                if *lhs < rhs {
-                    Some(std::cmp::Ordering::Less)
-                } else if *lhs == rhs {
-                    Some(std::cmp::Ordering::Equal)
-                } else {
-                    Some(std::cmp::Ordering::Greater)
-                }
-            }
+            //     if *lhs < rhs {
+            //         Some(std::cmp::Ordering::Less)
+            //     } else if *lhs == rhs {
+            //         Some(std::cmp::Ordering::Equal)
+            //     } else {
+            //         Some(std::cmp::Ordering::Greater)
+            //     }
+            // }
 
             Expression::Double(_) |
             Expression::Float(_) => {
@@ -647,7 +623,7 @@ pub enum ConstExpr {
 
 impl Default for ConstExpr {
     fn default() -> Self {
-        Self::Expression(Expression::Int(0))
+        Self::Expression(Expression::Int32(0))
     }
 }
 
@@ -763,8 +739,8 @@ impl ConstExpr {
 // impl PartialOrd for ConstExpr {
 //     fn partial_cmp(&self, rhs: &Self) -> Option<std::cmp::Ordering> {
 //         match self {
-//             ConstExpr::Int(lhs) => {
-//                 let rhs = if let ConstExpr::Int(rhs) = rhs {
+//             ConstExpr::Int32(lhs) => {
+//                 let rhs = if let ConstExpr::Int32(rhs) = rhs {
 //                     *rhs
 //                 } else if let ConstExpr::IntU8(rhs) = rhs {
 //                     *rhs as i64
@@ -808,34 +784,27 @@ mod tests {
     fn test_expression_arithmatic() {
         let mut dict = HashMap::new();
         let expr = Expression::Expr {
-            lhs: Box::new(Expression::Int(10)),
+            lhs: Box::new(Expression::Int32(10)),
             operator: "+".to_owned(),
-            rhs: Box::new(Expression::Int(10)),
+            rhs: Box::new(Expression::Int32(10)),
             as_str: "".into(),
         };
 
-        assert_eq!(expr.calculate(&mut dict), Expression::Int(20));
+        assert_eq!(expr.calculate(&mut dict), Expression::Int32(20));
 
         let expr = Expression::Expr {
-            lhs: Box::new(Expression::IntU8(10)),
-            operator: "-".to_owned(),
-            rhs: Box::new(Expression::IntU8(10)),
+            lhs: Box::new(Expression::Int8(1)),
+            operator: "<<".to_owned(),
+            rhs: Box::new(Expression::Int8(31)),
             as_str: "".into(),
         };
 
-        assert_eq!(expr.calculate(&mut dict), Expression::IntU8(0));
+        assert_eq!(expr.calculate(&mut dict), Expression::Int64(0x80000000));
+
+        // assert_eq!(expr.calculate(&mut dict), Expression::Int32(100));
 
         let expr = Expression::Expr {
-            lhs: Box::new(Expression::Int(10)),
-            operator: "*".to_owned(),
-            rhs: Box::new(Expression::IntU8(10)),
-            as_str: "".into(),
-        };
-
-        assert_eq!(expr.calculate(&mut dict), Expression::Int(100));
-
-        let expr = Expression::Expr {
-            lhs: Box::new(Expression::Int(10)),
+            lhs: Box::new(Expression::Int32(10)),
             operator: "/".to_owned(),
             rhs: Box::new(Expression::Float(2.0)),
             as_str: "".into(),
@@ -853,13 +822,13 @@ mod tests {
         assert_eq!(expr.calculate(&mut dict), Expression::Float(10.0 % 2.0));
 
         let expr = Expression::Expr {
-            lhs: Box::new(Expression::Int(10)),
+            lhs: Box::new(Expression::Int32(10)),
             operator: "%".to_owned(),
             rhs: Box::new(Expression::Bool(true)),
             as_str: "".into(),
         };
 
-        assert_eq!(expr.calculate(&mut dict), Expression::Int(10 % 1));
+        assert_eq!(expr.calculate(&mut dict), Expression::Int32(10 % 1));
     }
 
     #[test]
@@ -867,36 +836,36 @@ mod tests {
         let mut dict = HashMap::new();
         dict.insert("DUMP_FLAG_PRIORITY_CRITICAL".to_owned(),
             ConstExpr::Expression(Expression::Expr {
-                lhs: Box::new(Expression::Int(1)),
+                lhs: Box::new(Expression::Int32(1)),
                 operator: "<<".to_owned(),
-                rhs: Box::new(Expression::Int(0)),
+                rhs: Box::new(Expression::Int32(0)),
                 as_str: "".into(),
             })
         );
 
         dict.insert("DUMP_FLAG_PRIORITY_HIGH".to_owned(),
             ConstExpr::Expression(Expression::Expr {
-                lhs: Box::new(Expression::Int(1)),
+                lhs: Box::new(Expression::Int32(1)),
                 operator: "<<".to_owned(),
-                rhs: Box::new(Expression::Int(1)),
+                rhs: Box::new(Expression::Int32(1)),
                 as_str: "".into(),
         })
         );
 
         dict.insert("DUMP_FLAG_PRIORITY_NORMAL".to_owned(),
             ConstExpr::Expression(Expression::Expr {
-                lhs: Box::new(Expression::Int(1)),
+                lhs: Box::new(Expression::Int32(1)),
                 operator: "<<".to_owned(),
-                rhs: Box::new(Expression::Int(2)),
+                rhs: Box::new(Expression::Int32(2)),
                 as_str: "".into(),
             })
         );
 
         dict.insert("DUMP_FLAG_PRIORITY_DEFAULT".to_owned(),
             ConstExpr::Expression(Expression::Expr {
-                lhs: Box::new(Expression::Int(1)),
+                lhs: Box::new(Expression::Int32(1)),
                 operator: "<<".to_owned(),
-                rhs: Box::new(Expression::Int(3)),
+                rhs: Box::new(Expression::Int32(3)),
                 as_str: "".into(),
         })
         );
@@ -919,6 +888,6 @@ mod tests {
             }),
         };
 
-        assert_eq!(expr.calculate(&mut dict), Expression::Int(15));
+        assert_eq!(expr.calculate(&mut dict), Expression::Int32(15));
     }
 }

@@ -354,9 +354,9 @@ impl TypeCast {
         let type_name = match aidl_type.name.as_str() {
             "boolean" => ("bool".to_owned(), ConstExpr::Expression(Expression::Bool(Default::default()))),
             "byte" => ("i8".to_owned(), ConstExpr::Expression(Expression::Int8(Default::default()))),
-            "char" => ("char".to_owned(), ConstExpr::Char(Default::default())),
-            "int" => ("i32".to_owned(), ConstExpr::Expression(Expression::Int(Default::default()))),
-            "long" => ("i64".to_owned(), ConstExpr::Expression(Expression::Long(Default::default()))),
+            "char" => ("u16".to_owned(), ConstExpr::Char(Default::default())),
+            "int" => ("i32".to_owned(), ConstExpr::Expression(Expression::Int32(Default::default()))),
+            "long" => ("i64".to_owned(), ConstExpr::Expression(Expression::Int64(Default::default()))),
             "float" => ("f32".to_owned(), ConstExpr::Expression(Expression::Float(Default::default()))),
             "double" => ("f64".to_owned(), ConstExpr::Expression(Expression::Double(Default::default()))),
             "void" => ("()".to_owned(), ConstExpr::String(StringExpr::CStr("()".into()))),
@@ -376,6 +376,12 @@ impl TypeCast {
                     Some(gen) => (gen.to_string(), ConstExpr::String(StringExpr::CStr(gen.to_string()))),
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
                 }
+            }
+            "ParcelFileDescriptor" => {
+                todo!("ParcelFileDescriptor is not implemented yet.")
+            }
+            "ParcelableHolder" => {
+                todo!("ParcelableHolder is not implemented yet.")
             }
             _ => {
                 is_primitive = false;
@@ -493,66 +499,8 @@ impl TypeCast {
             self.type_name()
         }
     }
-
-    // pub fn to_expression(&self) -> Expression {
-
-    // }
 }
 
-// pub struct TypeToRust {
-//     type_name: String,
-//     default: String,
-//     is_clonable: bool,
-//     is_declared: bool,
-// }
-
-// fn type_to_rust(type_name: &str, is_arg: bool) -> TypeToRust {
-//     // Return is (rust type, default, clonable).
-//     let zero = "0".to_owned();
-//     let zero_f = "0.0".to_owned();
-//     let default = "Default::default()".to_owned();
-//     let mut is_declared = false;
-//     let res = match type_name {
-//         "boolean" => ("bool".to_owned(), "false".to_owned(), true),
-//         "byte" => ("i8".to_owned(), zero, true),
-//         "char" => ("u16".to_owned(), zero, true),
-//         "int" => ("i32".to_owned(), zero, true),
-//         "long" => ("i64".to_owned(), zero, true),
-//         "float" => ("f32".to_owned(), zero_f, true),
-//         "double" => ("f64".to_owned(), zero_f, true),
-//         "void" => ("()".to_owned(), default, true),
-//         "String" => {
-//             if is_arg == true {
-//                 ("str".to_owned(), default, false)
-//             } else {
-//                 ("String".to_owned(), default, true)
-//             }
-//         }
-//         "IBinder" => { ("rsbinder::StrongIBinder".to_owned(), default, true) }
-//         _ => {
-//             if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(type_name) {
-//                 let type_name = format!("crate::{}::{}", decl.namespace(), type_name);
-
-//                 match decl {
-//                     Declaration::Interface(_) => {
-//                         is_declared = true;
-//                         (format!("std::sync::Arc<dyn {}>", type_name), default, true)
-//                     }
-//                     _ => { (type_name.to_owned(), default, false) }
-//                 }
-//             } else {
-//                 (type_name.to_owned(), default, false)
-//             }
-//         }
-//     };
-
-//     TypeToRust {
-//         type_name: res.0,
-//         default: res.1,
-//         is_clonable: res.2,
-//         is_declared,
-//     }
-// }
 
 pub fn is_nullable(annotation_list: &Vec<Annotation>) -> bool {
     for annotation in annotation_list {
@@ -564,7 +512,7 @@ pub fn is_nullable(annotation_list: &Vec<Annotation>) -> bool {
     false
 }
 
-pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> String {
+pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> TypeCast {
     // parse "@Backing(type="byte")"
     for annotation in annotation_list {
         if annotation.annotation == "@Backing" {
@@ -576,7 +524,7 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> String {
                             // The cstr is enclosed in quotes.
                                 name: cstr.trim_matches('"').into(),
                                 generic: None,
-                            }).type_name();
+                            });
                         }
                     }
                 }
@@ -584,115 +532,200 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> String {
         }
     }
 
-    "i8".into()
+    TypeCast::new(&NonArrayType {
+    // The cstr is enclosed in quotes.
+        name: "i8".into(),
+        generic: None,
+    })
 }
 
-fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
-    let operator = pairs.next().unwrap().as_str().to_owned();
-    let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap());
-    Expression::Unary {
-        operator: operator,
-        expr: Box::new(factor),
+#[derive(Debug, Clone)]
+struct ExpressionParser {
+    default_type: Expression,
+    as_str: String,
+}
+
+impl ExpressionParser {
+    fn new(default_type: &Expression, as_str: &str) -> Self {
+        Self {
+            default_type: default_type.clone(),
+            as_str: as_str.into(),
+        }
     }
-}
 
-fn parse_intvalue(arg_value: &str, radix: u32) -> Expression {
-    let mut is_u8 = false;
-
-    let value = if radix == 16 && (arg_value.starts_with("0x") || arg_value.starts_with("0X")) {
-        &arg_value[2..]
-    } else {
-        arg_value
-    };
-
-    let value = if value.ends_with("l") || value.ends_with("L") {
-        &value[..value.len() -1]
-    } else if value.ends_with("u8") {
-        is_u8 = true;
-        &value[..value.len()-2]
-    } else {
-        value
-    };
-
-    let value = i64::from_str_radix(&value, radix).map_err(|err| {
-        eprintln!("{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n", err, arg_value, radix);
-        err
-    }).unwrap();
-    if is_u8 == true {
-        Expression::IntU8(value as u8)
-    } else {
-        Expression::Long(value)
+    fn parse_unary(&self, mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
+        let operator = pairs.next().unwrap().as_str().to_owned();
+        let factor = self.parse_factor(pairs.next().unwrap().into_inner().next().unwrap());
+        Expression::Unary {
+            operator: operator,
+            expr: Box::new(factor),
+        }
     }
-}
 
-fn parse_value(pair: pest::iterators::Pair<Rule>) -> Expression {
-    match pair.as_rule() {
+    fn parse_intvalue(&self, arg_value: &str) -> Expression {
+        let mut is_u8 = false;
+        let mut is_long = false;
 
-        // Rule::const_expr => { parse_const_expr(pair.into_inner()) }
-        Rule::qualified_name => { Expression::Name(pair.as_str().into()) }
-        // Rule::C_STR => { ConstExpr::CStr(pair.as_str().into()) }
-        Rule::HEXVALUE => { parse_intvalue(pair.as_str(), 16) }
-        Rule::FLOATVALUE => {
-            let value = pair.as_str();
-            let value = if value.ends_with("f") {
-                &value[..value.len()-1]
+        let (value, radix) = if arg_value.starts_with("0x") || arg_value.starts_with("0X") {
+            (&arg_value[2..], 16)
+        } else {
+            (arg_value, 10)
+        };
+
+        let value = if value.ends_with("l") || value.ends_with("L") {
+            is_long = true;
+            &value[..value.len() -1]
+        } else if value.ends_with("u8") {
+            is_u8 = true;
+            &value[..value.len()-2]
+        } else {
+            value
+        };
+
+        if radix == 16 {
+            if is_u8 {
+                let parsed_value = u8::from_str_radix(&value, radix).map_err(|err| {
+                        eprintln!("{:?}\nparse_intvalue() - Invalid u8 value: {}, radix: {}\n", err, arg_value, radix);
+                        err
+                    }).unwrap();
+                Expression::Int8(parsed_value as i8)
+            } else if is_long == false {
+                if let Some(parsed_value) = u32::from_str_radix(&value, radix).ok() {
+                    Expression::Int32(parsed_value as i32)
+                } else {
+                    let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
+                            eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
+                            err
+                        }).unwrap();
+                    Expression::Int64(parsed_value as i64)
+
+                }
             } else {
-                value
-            };
+                let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
+                        eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
+                        err
+                    }).unwrap();
+                Expression::Int64(parsed_value as i64)
 
-            Expression::Double(value.parse::<f64>().unwrap())
+            }
+        } else {
+            let parsed_value = i64::from_str_radix(&value, radix).map_err(|err| {
+                    eprintln!("{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n", err, arg_value, radix);
+                    err
+                }).unwrap();
+            if is_u8 {
+                if parsed_value > u8::MAX.into() || parsed_value < 0 {
+                    panic!("u8 is overflowed. {}", parsed_value);
+                }
+                Expression::Int8(parsed_value as i8)
+            } else if is_long == true {
+                Expression::Int64(parsed_value)
+            } else {
+                if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
+                    Expression::Int8(parsed_value as i8)
+                } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
+                    Expression::Int32(parsed_value as i32)
+                } else {
+                    Expression::Int64(parsed_value)
+                }
+            }
         }
-        Rule::INTVALUE => { parse_intvalue(pair.as_str(), 10) }
-        Rule::TRUE_LITERAL => { Expression::Bool(true) }
-        Rule::FALSE_LITERAL => { Expression::Bool(false) }
-        _ => unreachable!("Unexpected rule in parse_value(): {}", pair),
+
+        // let value = i128::from_str_radix(&value, radix).map_err(|err| {
+        //     eprintln!("{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n", err, arg_value, radix);
+        //     err
+        // }).unwrap();
+        // if is_u8 == true {
+        //     Expression::IntU8(value as u8)
+        // } else {
+
+        //     // In AIDL, int can be either i32 or i64. In below expression, hexInt64_pos_1 must be i64 type.
+        //     // int hexInt64_pos_1 = -0xfffffffffff < 0;
+        //     // if let Expression::Int32(_) = self.default_type {
+        //     //     if value > i32::MAX as i128 || value < i32::MIN as i128 {
+        //     //         is_long = true;
+        //     //     }
+        //     // }
+
+        //     let expr = Expression::Int64(value as i64);
+
+        //     if is_long == false {
+        //         expr.convert_to(&self.default_type)
+        //     } else {
+        //         expr
+        //     }
+        // }
+    }
+
+    fn parse_value(&self, pair: pest::iterators::Pair<Rule>) -> Expression {
+        match pair.as_rule() {
+
+            // Rule::const_expr => { parse_const_expr(pair.into_inner()) }
+            Rule::qualified_name => { Expression::Name(pair.as_str().into()) }
+            // Rule::C_STR => { ConstExpr::CStr(pair.as_str().into()) }
+            Rule::HEXVALUE => { self.parse_intvalue(pair.as_str()) }
+            Rule::FLOATVALUE => {
+                let value = pair.as_str();
+                let value = if value.ends_with("f") {
+                    &value[..value.len()-1]
+                } else {
+                    value
+                };
+
+                Expression::Double(value.parse::<f64>().unwrap())
+            }
+            Rule::INTVALUE => { self.parse_intvalue(pair.as_str()) }
+            Rule::TRUE_LITERAL => { Expression::Bool(true) }
+            Rule::FALSE_LITERAL => { Expression::Bool(false) }
+            _ => unreachable!("Unexpected rule in parse_value(): {}", pair),
+        }
+    }
+
+    fn parse_factor(&self, pair: pest::iterators::Pair<Rule>) -> Expression {
+        // println!("parse_factor {:?}", pair);
+        match pair.as_rule() {
+            Rule::expression => {
+                self.parse_expression(pair.clone().into_inner())
+            }
+            Rule::unary => {
+                self.parse_unary(pair.into_inner())
+            }
+            Rule::value => {
+                self.parse_value(pair.into_inner().next().unwrap())
+            }
+            _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
+        }
+    }
+
+    fn parse_expression_term(&self, pair: pest::iterators::Pair<Rule>) -> Expression {
+        match pair.as_rule() {
+            Rule::equality | Rule::comparison |
+            Rule::bitwise_or | Rule::bitwise_xor | Rule::bitwise_and | Rule::shift | Rule::arith |
+            Rule::logical_or | Rule::logical_and => {
+                self.parse_expression(pair.clone().into_inner())
+            }
+            Rule::factor => {
+                self.parse_factor(pair.into_inner().next().unwrap())
+            }
+            _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
+        }
+    }
+
+    fn parse_expression(&self, mut pairs: pest::iterators::Pairs<Rule>) -> Expression {
+        let mut lhs = self.parse_expression_term(pairs.next().unwrap());
+
+        while let Some(pair) = pairs.next() {
+            let op = pair.as_str().to_owned();
+            let rhs = self.parse_expression_term(pairs.next().unwrap());
+
+            lhs = Expression::Expr { lhs: Box::new(lhs), operator: op, rhs: Box::new(rhs),
+                as_str: self.as_str.clone() };
+        }
+
+        lhs
     }
 }
 
-fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Expression {
-    // println!("parse_factor {:?}", pair);
-    match pair.as_rule() {
-        Rule::expression => {
-            parse_expression(pair.clone().into_inner(), pair.as_str().into())
-        }
-        Rule::unary => {
-            parse_unary(pair.into_inner())
-        }
-        Rule::value => {
-            parse_value(pair.into_inner().next().unwrap())
-        }
-        _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
-    }
-}
-
-fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Expression {
-    // println!("expression_term {:?}", pair);
-    match pair.as_rule() {
-        Rule::equality | Rule::comparison |
-        Rule::bitwise_or | Rule::bitwise_xor | Rule::bitwise_and | Rule::shift | Rule::arith |
-        Rule::logical => {
-            parse_expression(pair.clone().into_inner(),pair.as_str().into())
-        }
-        Rule::factor => {
-            parse_factor(pair.into_inner().next().unwrap())
-        }
-        _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
-    }
-}
-
-fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>, as_str: String) -> Expression {
-    let mut lhs = parse_expression_term(pairs.next().unwrap());
-
-    while let Some(pair) = pairs.next() {
-        let op = pair.as_str().to_owned();
-        let rhs = parse_expression_term(pairs.next().unwrap());
-
-        lhs = Expression::Expr { lhs: Box::new(lhs), operator: op, rhs: Box::new(rhs),
-            as_str: as_str.clone() };
-    }
-
-    lhs
-}
 
 fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> StringExpr {
     match pair.as_rule() {
@@ -721,14 +754,14 @@ fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> StringExpr {
     }
 }
 
-fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_const_expr(pair: pest::iterators::Pair<Rule>, default_type: &ConstExpr) -> ConstExpr {
     match pair.as_rule() {
         Rule::constant_value_list => {
             let mut value_list = Vec::new();
             for pair in pair.into_inner() {
                 match pair.as_rule() {
                     Rule::const_expr => {
-                        value_list.push(Box::new(parse_const_expr(pair.into_inner().next().unwrap())));
+                        value_list.push(Box::new(parse_const_expr(pair.into_inner().next().unwrap(), default_type)));
                     }
                     _ => unreachable!("Unexpected rule in Rule::constant_value_list: {}", pair),
                 }
@@ -741,7 +774,12 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
         }
 
         Rule::expression => {
-            ConstExpr::Expression(parse_expression(pair.clone().into_inner(), pair.as_str().into()))
+            let default_type = if let ConstExpr::Expression(expr) = default_type {
+                expr
+            } else {
+                &Expression::Int64(0)
+            };
+            ConstExpr::Expression(ExpressionParser::new(default_type, pair.as_str()).parse_expression(pair.clone().into_inner()))
         }
 
         Rule::string_expr => {
@@ -755,13 +793,16 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
 fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Parameter {
     let mut parameter = Parameter {
         identifier: "".to_string(),
-        const_expr: ConstExpr::Expression(Expression::Int(0)),
+        const_expr: ConstExpr::Expression(Expression::Int32(0)),
     };
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::identifier => { parameter.identifier = pair.as_str().into(); }
-            Rule::const_expr => { parameter.const_expr = parse_const_expr(pair.into_inner().next().unwrap()); }
+            Rule::const_expr => {
+                parameter.const_expr = parse_const_expr(pair.into_inner().next().unwrap(),
+                    &ConstExpr::Expression(Expression::Int64(0)));
+            }
             _ => unreachable!("Unexpected rule in parse_parameter(): {}", pair),
         }
     }
@@ -787,7 +828,8 @@ fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Annotation {
             }
 
             Rule::const_expr => {
-                annotation.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap()));
+                annotation.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap(),
+                    &ConstExpr::Expression(Expression::Int64(0))));
             }
 
             Rule::parameter_list => {
@@ -871,7 +913,10 @@ fn parse_array_type(pairs: pest::iterators::Pairs<Rule>) -> ArrayType {
     for pair in pairs {
         match pair.as_rule() {
             // Rule::annotation_list => { array_type.annotation_list = parse_annotation_list(pair.into_inner()); }
-            Rule::const_expr => { array_type.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())); }
+            Rule::const_expr => {
+                array_type.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap(),
+                    &ConstExpr::Expression(Expression::Int64(0))));
+            }
             _ => unreachable!("Unexpected rule in parse_array_type(): {}", pair),
         }
     }
@@ -904,7 +949,7 @@ fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> V
             Rule::identifier => { decl.identifier = pair.as_str().into(); }
             Rule::const_expr => {
                 match pair.into_inner().next() {
-                    Some(pair) => decl.const_expr = Some(parse_const_expr(pair)),
+                    Some(pair) => decl.const_expr = Some(parse_const_expr(pair, &decl.r#type.type_cast().expression())),
                     None => decl.const_expr = None,
                 }
             }
@@ -948,10 +993,16 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
                 }
             }
             Rule::INTVALUE => {
-                let expr = parse_intvalue(pair.as_str(), 10);
+                let default_type = if let ConstExpr::Expression(expr) = decl.r#type.type_cast().expression() {
+                    expr
+                } else {
+                    Expression::Int64(0)
+                };
+                let expr = ExpressionParser::new(&default_type, pair.as_str()).parse_intvalue(pair.as_str());
                 decl.intvalue = match expr.calculate(&mut HashMap::new()) {
-                    Expression::Long(v) => v,
-                    Expression::IntU8(v) => v as i64,
+                    Expression::Int64(v) => v,
+                    Expression::Int32(v) => v as i64,
+                    Expression::Int8(v) => v as i64,
                     _ => unreachable!("Unexpected Expression in parse_method_decl(): {}, \"{}\"", pair, pair.as_str()),
                 };
             }
@@ -1077,13 +1128,16 @@ pub struct EnumDecl {
     pub members: Vec<Declaration>,
 }
 
-fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Enumerator {
+fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>, default_type: &ConstExpr) -> Enumerator {
     let mut res = Enumerator::default();
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::identifier => { res.identifier = pair.as_str().into(); }
-            Rule::const_expr => { res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())); }
+            Rule::const_expr => {
+                res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap(),
+                    default_type));
+            }
             _ => unreachable!("Unexpected rule in parse_enumerator(): {}", pair),
         }
     }
@@ -1092,7 +1146,9 @@ fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Enumerator {
 }
 
 fn parse_enum_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pairs<Rule>) -> Declaration {
-    let mut enum_decl = EnumDecl { annotation_list, .. Default::default() };
+    let mut enum_decl = EnumDecl { annotation_list: annotation_list.clone(), .. Default::default() };
+
+    let default_type = get_backing_type(&annotation_list).expression();
 
     for pair in pairs {
         match pair.as_rule() {
@@ -1100,7 +1156,7 @@ fn parse_enum_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pai
                 enum_decl.name = pair.as_str().into();
             }
             Rule::enumerator => {
-                enum_decl.enumerator_list.push(parse_enumerator(pair.into_inner()))
+                enum_decl.enumerator_list.push(parse_enumerator(pair.into_inner(), &default_type))
             }
             _ => unreachable!("Unexpected rule in parse_enum_decl(): {}", pair),
         }
@@ -1329,36 +1385,37 @@ mod tests {
             err
         })?;
 
-        let expr = parse_expression(res.next().unwrap().into_inner(), res.as_str().into());
+        let parser = ExpressionParser::new(&Expression::Int64(0), res.as_str());
+        let expr = parser.parse_expression(res.next().unwrap().into_inner());
         assert_eq!(
             expr.clone(),
             Expression::Expr {
                 as_str: "1 + -3 * 2 << 2 | 4".into(),
                 lhs: Box::new(Expression::Expr {
-                    as_str: "1 + -3 * 2 << 2 ".into(),
+                    as_str: "1 + -3 * 2 << 2 | 4".into(),
                     lhs: Box::new(Expression::Expr {
-                        as_str: "1 + -3 * 2".into(),
-                        lhs: Box::new(Expression::Long(1)),
+                        as_str: "1 + -3 * 2 << 2 | 4".into(),
+                        lhs: Box::new(Expression::Int8(1)),
                         operator: "+".to_string(),
                         rhs: Box::new(Expression::Expr {
-                            as_str: "-3 * 2".into(),
+                            as_str: "1 + -3 * 2 << 2 | 4".into(),
                             lhs: Box::new(Expression::Unary {
                                 operator: "-".to_string(),
-                                expr: Box::new(Expression::Long(3))
+                                expr: Box::new(Expression::Int8(3))
                             }),
                             operator: "*".to_string(),
-                            rhs: Box::new(Expression::Long(2))
+                            rhs: Box::new(Expression::Int8(2))
                         })
                     }),
                     operator: "<<".to_string(),
-                    rhs: Box::new(Expression::Long(2))
+                    rhs: Box::new(Expression::Int8(2))
                 }),
                 operator: "|".to_string(),
-                rhs: Box::new(Expression::Long(4))
+                rhs: Box::new(Expression::Int8(4))
             },
         );
 
-        assert_eq!(expr.calculate(&mut HashMap::new()), Expression::Long(-20));
+        assert_eq!(expr.calculate(&mut HashMap::new()), Expression::Int64(-20));
 
         Ok(())
     }

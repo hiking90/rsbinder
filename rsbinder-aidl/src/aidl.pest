@@ -150,9 +150,12 @@ const_expr = {
 string_expr = { string_term ~ ("+" ~ string_term)* }
 string_term = { C_STR | qualified_name }
 
-expression = { logical ~ (logical_op ~ logical)* }
-logical_op = { LOGICAL_OR | LOGICAL_AND }
-logical = { equality ~ (equality_op ~ equality)* }
+expression = { logical_or ~ (logical_or_op ~ logical_or)* }
+logical_or_op = { LOGICAL_OR }
+logical_or = { logical_and ~ (logical_and_op ~ logical_and)* }
+logical_and_op = { LOGICAL_AND }
+logical_and = { equality ~ (equality_op ~ equality)* }
+
 equality_op = { EQUALITY | NEQ }
 equality = { comparison ~ (comparison_op ~ comparison)* }
 comparison_op = { LEQ | GEQ | LT | GT }

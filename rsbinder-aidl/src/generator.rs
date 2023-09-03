@@ -330,6 +330,8 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 }
 
 fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let type_cast = &parser::get_backing_type(&decl.annotation_list);
+
     let mut members = Vec::new();
     let mut enum_val: i64 = 0;
     for enumerator in &decl.enumerator_list {
@@ -346,7 +348,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 
     context.insert("mod", &decl.name.to_case(Case::Snake));
     context.insert("enum_name", &decl.name);
-    context.insert("enum_type", &parser::get_backing_type(&decl.annotation_list));
+    context.insert("enum_type", &type_cast.type_name());
     context.insert("enum_len", &decl.enumerator_list.len());
     context.insert("members", &members);
 
