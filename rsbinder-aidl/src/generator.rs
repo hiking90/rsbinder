@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+
 use std::error::Error;
 
 use tera::Tera;
 use convert_case::{Case, Casing};
 
-use crate::{parser, add_indent, const_expr};
+use crate::{parser, add_indent};
 
 const ENUM_TEMPLATE: &str = r##"
 pub use {{mod}}::*;
@@ -336,9 +336,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
     let mut enum_val: i64 = 0;
     for enumerator in &decl.enumerator_list {
         if let Some(const_expr) = &enumerator.const_expr {
-            if let const_expr::ConstExpr::Expression(expr) = const_expr.calculate(&mut HashMap::new()) {
-                enum_val = expr.to_i64();
-            }
+            enum_val = const_expr.calculate(None).to_i64(None);
         }
         members.push((&enumerator.identifier, enum_val));
         enum_val += 1;
