@@ -708,9 +708,58 @@ mod union {
     Ok(())
 }
 
-#[test]
-fn test_enums() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+#[cfg(test)]
+const CONSTANT_EXPRESSION_ENUM: &str = r##"
+        @Backing(type="int")
+        enum ConstantExpressionEnum {
+            // Should be all true / ones.
+            // dec literals are either int or long
+            decInt32_1 = (~(-1)) == 0,
+            decInt32_2 = ~~(1 << 31) == (1 << 31),
+            decInt64_1 = (~(-1L)) == 0,
+            decInt64_2 = (~4294967295L) != 0,
+            decInt64_3 = (~4294967295) != 0,
+            decInt64_4 = ~~(1L << 63) == (1L << 63),
+
+            // hex literals could be int or long
+            // 0x7fffffff is int, hence can be negated
+            hexInt32_1 = -0x7fffffff < 0,
+
+            // 0x80000000 is int32_t max + 1
+            hexInt32_2 = 0x80000000 < 0,
+
+            // 0xFFFFFFFF is int32_t, not long; if it were long then ~(long)0xFFFFFFFF != 0
+            hexInt32_3 = ~0xFFFFFFFF == 0,
+
+            // 0x7FFFFFFFFFFFFFFF is long, hence can be negated
+            hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
+        }
+"##;
+
+#[cfg(test)]
+const INT_ENUM: &str = r##"
+        @Backing(type="int")
+        enum IntEnum {
+            FOO = 1000,
+            BAR = 2000,
+            BAZ,
+            /** @deprecated do not use this */
+            QUX,
+        }
+"##;
+
+#[cfg(test)]
+const LONG_ENUM: &str =r##"
+        @Backing(type="long")
+        enum LongEnum {
+            FOO = 100000000000,
+            BAR = 200000000000,
+            BAZ,
+        }
+"##;
+
+#[cfg(test)]
+const BYTE_ENUM: &str = r##"
         @Backing(type="byte")
         enum ByteEnum {
             // Comment about FOO.
@@ -718,7 +767,11 @@ fn test_enums() -> Result<(), Box<dyn Error>> {
             BAR = 2,
             BAZ,
         }
-        "##,
+"##;
+
+#[test]
+fn test_enums() -> Result<(), Box<dyn Error>> {
+    aidl_generator(BYTE_ENUM,
         r##"
 pub use byte_enum::*;
 mod byte_enum {
@@ -754,32 +807,7 @@ mod backend_type {
 }
         "##)?;
 
-    aidl_generator(r##"
-        @Backing(type="int")
-        enum ConstantExpressionEnum {
-            // Should be all true / ones.
-            // dec literals are either int or long
-            decInt32_1 = (~(-1)) == 0,
-            decInt32_2 = ~~(1 << 31) == (1 << 31),
-            decInt64_1 = (~(-1L)) == 0,
-            decInt64_2 = (~4294967295L) != 0,
-            decInt64_3 = (~4294967295) != 0,
-            decInt64_4 = ~~(1L << 63) == (1L << 63),
-
-            // hex literals could be int or long
-            // 0x7fffffff is int, hence can be negated
-            hexInt32_1 = -0x7fffffff < 0,
-
-            // 0x80000000 is int32_t max + 1
-            hexInt32_2 = 0x80000000 < 0,
-
-            // 0xFFFFFFFF is int32_t, not long; if it were long then ~(long)0xFFFFFFFF != 0
-            hexInt32_3 = ~0xFFFFFFFF == 0,
-
-            // 0x7FFFFFFFFFFFFFFF is long, hence can be negated
-            hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
-        }
-        "##,
+    aidl_generator(CONSTANT_EXPRESSION_ENUM,
         r##"
 pub use constant_expression_enum::*;
 mod constant_expression_enum {
@@ -800,16 +828,7 @@ mod constant_expression_enum {
 }
         "##)?;
 
-    aidl_generator(r##"
-        @Backing(type="int")
-        enum IntEnum {
-            FOO = 1000,
-            BAR = 2000,
-            BAZ,
-            /** @deprecated do not use this */
-            QUX,
-        }
-        "##,
+    aidl_generator(INT_ENUM,
         r##"
 pub use int_enum::*;
 mod int_enum {
@@ -824,14 +843,7 @@ mod int_enum {
 }
         "##)?;
 
-    aidl_generator(r##"
-        @Backing(type="long")
-        enum LongEnum {
-            FOO = 100000000000,
-            BAR = 200000000000,
-            BAZ,
-        }
-        "##,
+    aidl_generator(LONG_ENUM,
         r##"
 pub use long_enum::*;
 mod long_enum {
@@ -850,9 +862,34 @@ mod long_enum {
 
 #[test]
 fn test_byte_parcelable() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(&(r##"
 package android.aidl.tests;
 parcelable StructuredParcelable {
+    int[] shouldContainThreeFs;
+    int f;
+    @utf8InCpp String shouldBeJerry;
+    ByteEnum shouldBeByteBar;
+    IntEnum shouldBeIntBar;
+    LongEnum shouldBeLongBar;
+    ByteEnum[] shouldContainTwoByteFoos;
+    IntEnum[] shouldContainTwoIntFoos;
+    LongEnum[] shouldContainTwoLongFoos;
+
+    String stringDefaultsToFoo = "foo";
+    byte byteDefaultsToFour = 4;
+    int intDefaultsToFive = 5;
+    long longDefaultsToNegativeSeven = -7;
+    boolean booleanDefaultsToTrue = true;
+    char charDefaultsToC = '\'';
+    float floatDefaultsToPi = 3.14f;
+    double doubleWithDefault = -3.14e17;
+    int[] arrayDefaultsTo123 = {
+            1,
+            2,
+            3,
+    };
+    int[] arrayDefaultsToEmpty = {};
+
     // Constant expressions that evaluate to 1
     byte[] int8_1 = {
             1,
@@ -943,29 +980,72 @@ parcelable StructuredParcelable {
     };
     int hexInt32_pos_1 = -0xffffffff;
     int hexInt64_pos_1 = -0xfffffffffff < 0;
+
+    ConstantExpressionEnum const_exprs_1;
+    ConstantExpressionEnum const_exprs_2;
+    ConstantExpressionEnum const_exprs_3;
+    ConstantExpressionEnum const_exprs_4;
+    ConstantExpressionEnum const_exprs_5;
+    ConstantExpressionEnum const_exprs_6;
+    ConstantExpressionEnum const_exprs_7;
+    ConstantExpressionEnum const_exprs_8;
+    ConstantExpressionEnum const_exprs_9;
+    ConstantExpressionEnum const_exprs_10;
+
+    // String expressions
+    @utf8InCpp String addString1 = "hello"
+            + " world!";
+    @utf8InCpp String addString2 = "The quick brown fox jumps "
+            + "over the lazy dog.";
+
+    const int BIT0 = 0x1;
+    const int BIT1 = 0x1 << 1;
+    const int BIT2 = 0x1 << 2;
+    int shouldSetBit0AndBit2;
+
+    @nullable Union u;
+    @nullable Union shouldBeConstS1;
+
+    // IntEnum defaultWithFoo = IntEnum.FOO;
 }
-        "##,
+        "##.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM),
         r##"
 pub use structured_parcelable::*;
 mod structured_parcelable {
     #[derive(Debug, Default)]
     pub struct StructuredParcelable {
         pub int_8_1: Vec<i8>,
+        pub int_32_1: Vec<i32>,
+        pub int_64_1: Vec<i64>,
+        pub hex_int_32_pos_1: i32,
+        pub hex_int_64_pos_1: i32,
     }
     impl Default for StructuredParcelable {
         fn default() -> Self {
             Self {
                 int_8_1 = vec![1,1,1,1,1,],
+                int_32_1 = vec![1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,],
+                int_64_1 = vec![1,1,1,1,1,1,1,1,1,1,],
+                hex_int_32_pos_1 = 1,
+                hex_int_64_pos_1 = 1,
             }
         }
     }
     impl rsbinder::Parcelable for StructuredParcelable {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.write(&self.int_8_1)?;
+            _parcel.write(&self.int_32_1)?;
+            _parcel.write(&self.int_64_1)?;
+            _parcel.write(&self.hex_int_32_pos_1)?;
+            _parcel.write(&self.hex_int_64_pos_1)?;
             Ok(())
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             self.int_8_1 = _parcel.read()?;
+            self.int_32_1 = _parcel.read()?;
+            self.int_64_1 = _parcel.read()?;
+            self.hex_int_32_pos_1 = _parcel.read()?;
+            self.hex_int_64_pos_1 = _parcel.read()?;
             Ok(())
         }
     }
@@ -973,6 +1053,54 @@ mod structured_parcelable {
     rsbinder::impl_deserialize_for_parcelable!(StructuredParcelable);
     impl rsbinder::ParcelableMetadata for StructuredParcelable {
         fn get_descriptor() -> &'static str { "android.aidl.tests.StructuredParcelable" }
+    }
+}
+pub use constant_expression_enum::*;
+mod constant_expression_enum {
+    declare_binder_enum! {
+        ConstantExpressionEnum : [i32; 10] {
+            decInt32_1 = 1,
+            decInt32_2 = 1,
+            decInt64_1 = 1,
+            decInt64_2 = 1,
+            decInt64_3 = 1,
+            decInt64_4 = 1,
+            hexInt32_1 = 1,
+            hexInt32_2 = 1,
+            hexInt32_3 = 1,
+            hexInt64_1 = 1,
+        }
+    }
+}
+pub use byte_enum::*;
+mod byte_enum {
+    declare_binder_enum! {
+        ByteEnum : [i8; 3] {
+            FOO = 1,
+            BAR = 2,
+            BAZ = 3,
+        }
+    }
+}
+pub use int_enum::*;
+mod int_enum {
+    declare_binder_enum! {
+        IntEnum : [i32; 4] {
+            FOO = 1000,
+            BAR = 2000,
+            BAZ = 2001,
+            QUX = 2002,
+        }
+    }
+}
+pub use long_enum::*;
+mod long_enum {
+    declare_binder_enum! {
+        LongEnum : [i64; 3] {
+            FOO = 100000000000,
+            BAR = 200000000000,
+            BAZ = 200000000001,
+        }
     }
 }
         "##)?;

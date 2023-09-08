@@ -10,7 +10,7 @@ use pest::Parser;
 #[grammar = "aidl.pest"]
 pub struct AIDLParser;
 
-use crate::const_expr::{ConstExpr, Expression, ValueType};
+use crate::const_expr::{ConstExpr, ValueType};
 use crate::DEFAULT_NAMESPACE;
 
 lazy_static! {
@@ -368,18 +368,18 @@ impl TypeCast {
         let mut is_string = false;
         let mut is_vector = false;
         let type_name = match aidl_type.name.as_str() {
-            "boolean" => ("bool".to_owned(), ValueType::Bool),
-            "byte" => ("i8".to_owned(), ValueType::Int8),
-            "char" => ("u16".to_owned(), ValueType::Char),
-            "int" => ("i32".to_owned(), ValueType::Int32),
-            "long" => ("i64".to_owned(), ValueType::Int64),
-            "float" => ("f32".to_owned(), ValueType::Float),
-            "double" => ("f64".to_owned(), ValueType::Double),
+            "boolean" => ("bool".to_owned(), ValueType::Bool(false)),
+            "byte" => ("i8".to_owned(), ValueType::Int8(0)),
+            "char" => ("u16".to_owned(), ValueType::Char(Default::default())),
+            "int" => ("i32".to_owned(), ValueType::Int32(0)),
+            "long" => ("i64".to_owned(), ValueType::Int64(0)),
+            "float" => ("f32".to_owned(), ValueType::Float(0.)),
+            "double" => ("f64".to_owned(), ValueType::Double(0.)),
             "void" => ("()".to_owned(), ValueType::Void),
             "String" => {
                 is_primitive = false;
                 is_string = true;
-                ("String".to_owned(), ValueType::String)
+                ("String".to_owned(), ValueType::String(String::new()))
             }
             "IBinder" => {
                 is_primitive = false;
@@ -389,7 +389,7 @@ impl TypeCast {
                 is_primitive = false;
                 is_vector = true;
                 match &aidl_type.generic {
-                    Some(gen) => (gen.to_string(), ValueType::List),
+                    Some(gen) => (gen.to_string(), ValueType::Array(Vec::new())),
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
                 }
             }
@@ -482,7 +482,7 @@ impl TypeCast {
     }
 
     pub fn value_type(&self) -> ValueType {
-        self.value_type
+        self.value_type.clone()
     }
 
     pub fn const_type(&self) -> String {
@@ -501,10 +501,10 @@ impl TypeCast {
     pub fn init_type(&self, const_expr: Option<&ConstExpr>) -> String {
         match const_expr {
             Some(expr) => {
-                let expr = expr.convert_to(self.value_type());
-                expr.to_string()
+                let expr = expr.calculate(None).convert_to(&self.value_type(), None);
+                expr.value.to_init_string()
             }
-            None => "Default::default()".into(),
+            None => ValueType::Void.to_init_string(),
         }
     }
 
@@ -554,7 +554,7 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> TypeCast {
 fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
     let operator = pairs.next().unwrap().as_str().to_owned();
     let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap());
-    ConstExpr::new_with_expr(Expression::new_with_unary(&operator, factor))
+    ConstExpr::new_unary(&operator, factor)
 }
 
 fn parse_intvalue(arg_value: &str) -> ConstExpr {
@@ -583,23 +583,23 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
                     eprintln!("{:?}\nparse_intvalue() - Invalid u8 value: {}, radix: {}\n", err, arg_value, radix);
                     err
                 }).unwrap();
-            ConstExpr::new_with_int(parsed_value as i8 as i64, ValueType::Int8)
+            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
         } else if is_long == false {
             if let Some(parsed_value) = u32::from_str_radix(&value, radix).ok() {
-                ConstExpr::new_with_int(parsed_value as i32 as i64, ValueType::Int32)
+                ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
             } else {
                 let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
                         eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
                         err
                     }).unwrap();
-                ConstExpr::new_with_int(parsed_value as i64, ValueType::Int64)
+                ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
             }
         } else {
             let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
                     eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
                     err
                 }).unwrap();
-            ConstExpr::new_with_int(parsed_value as i64, ValueType::Int64)
+            ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
         }
     } else {
         let parsed_value = i64::from_str_radix(&value, radix).map_err(|err| {
@@ -610,16 +610,16 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
             if parsed_value > u8::MAX.into() || parsed_value < 0 {
                 panic!("u8 is overflowed. {}", parsed_value);
             }
-            ConstExpr::new_with_int(parsed_value as i8 as i64, ValueType::Int8)
+            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
         } else if is_long == true {
-            ConstExpr::new_with_int(parsed_value, ValueType::Int64)
+            ConstExpr::new(ValueType::Int64(parsed_value as _))
         } else {
             if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
-                ConstExpr::new_with_int(parsed_value as i8 as i64, ValueType::Int8)
+                ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
             } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
-                ConstExpr::new_with_int(parsed_value as i32 as i64, ValueType::Int32)
+                ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
             } else {
-                ConstExpr::new_with_int(parsed_value, ValueType::Int64)
+                ConstExpr::new(ValueType::Int64(parsed_value as _))
             }
         }
     }
@@ -629,7 +629,7 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     match pair.as_rule() {
 
         // Rule::const_expr => { parse_const_expr(pair.into_inner()) }
-        Rule::qualified_name => { ConstExpr::new_with_str(pair.as_str(), ValueType::Name) }
+        Rule::qualified_name => { ConstExpr::new(ValueType::Name(pair.as_str().into())) }
         // Rule::C_STR => { ConstExpr::CStr(pair.as_str().into()) }
         Rule::HEXVALUE => { parse_intvalue(pair.as_str()) }
         Rule::FLOATVALUE => {
@@ -639,12 +639,12 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
             } else {
                 value
             };
-
-            ConstExpr::new_with_float(value.parse::<f64>().unwrap(), ValueType::Double)
+            println!("FLOATVALUE = {}, {}", value, value.parse::<f64>().unwrap());
+            ConstExpr::new(ValueType::Double(value.parse::<f64>().unwrap() as _))
         }
         Rule::INTVALUE => { parse_intvalue(pair.as_str()) }
-        Rule::TRUE_LITERAL => { ConstExpr::new_with_int(1, ValueType::Bool) }
-        Rule::FALSE_LITERAL => { ConstExpr::new_with_int(0, ValueType::Bool) }
+        Rule::TRUE_LITERAL => { ConstExpr::new(ValueType::Bool(true)) }
+        Rule::FALSE_LITERAL => { ConstExpr::new(ValueType::Bool(false)) }
         _ => unreachable!("Unexpected rule in parse_value(): {}", pair),
     }
 }
@@ -686,7 +686,7 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
         let op = pair.as_str().to_owned();
         let rhs = parse_expression_term(pairs.next().unwrap());
 
-        lhs = ConstExpr::new_with_expr(Expression::new(lhs, &op, rhs))
+        lhs = ConstExpr::new_expr(lhs, &op, rhs)
     }
 
     lhs
@@ -695,29 +695,41 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
 
 fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     match pair.as_rule() {
-        Rule::C_STR => { ConstExpr::new_with_str(pair.as_str(), ValueType::String) }
-        Rule::qualified_name => { ConstExpr::new_with_str(pair.as_str(), ValueType::Name) }
+        Rule::C_STR => {
+            let string = pair.as_str();
+            ConstExpr::new(ValueType::String(string[1 .. string.len()-1].into()))
+        }
+        Rule::qualified_name => { ConstExpr::new(ValueType::Name(pair.as_str().into())) }
         _ => unreachable!("Unexpected rule in Rule::parse_string_term: {}", pair),
     }
 }
 
 fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
-    let mut expr_list = Vec::new();
+    let mut expr: Option<ConstExpr> = None;
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::string_term => {
-                expr_list.push(parse_string_term(pair.into_inner().next().unwrap()));
+                let term = parse_string_term(pair.into_inner().next().unwrap());
+                expr = match expr {
+                    Some(expr) => Some(ConstExpr::new_expr(expr, "+", term)),
+                    None => Some(term),
+                }
             }
             _ => unreachable!("Unexpected rule in Rule::parse_string_expr: {}", pair),
         }
     }
 
-    if expr_list.len() > 1 {
-        ConstExpr::new_with_array(expr_list)
-    } else {
-        expr_list.pop().unwrap()
-    }
+    expr.expect("Parsing error in String expression.")
+
+    // if expr_list.len() > 1 {
+    //     // ConstExpr::new(ValueType::Array(expr_list))
+    //     for expr in expr_list {
+
+    //     }
+    // } else {
+    //     expr_list.pop().unwrap()
+    // }
 }
 
 fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
@@ -732,11 +744,24 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
                     _ => unreachable!("Unexpected rule in Rule::constant_value_list: {}", pair),
                 }
             }
-            ConstExpr::new_with_array(value_list)
+            ConstExpr::new(ValueType::Array(value_list))
         }
 
         Rule::CHARVALUE => {
-            ConstExpr::new_with_int(pair.as_str().chars().nth(0).unwrap() as i64, ValueType::Char)
+            let mut found = false;
+            let mut has_backslash = false;
+            for ch in pair.as_str().chars() {
+                if found == false && ch == '\'' {
+                    found = true;
+                } else if found == true {
+                    if has_backslash == false && ch == '\\' {
+                        has_backslash = true;
+                    } else {
+                        return ConstExpr::new(ValueType::Char(ch));
+                    }
+                }
+            }
+            unreachable!()
         }
 
         Rule::expression => {
@@ -952,8 +977,10 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
             }
             Rule::INTVALUE => {
                 let expr = parse_intvalue(pair.as_str()). calculate(None);
-                decl.intvalue = match expr.value_type {
-                    ValueType::Int8 | ValueType::Int32 | ValueType::Int64 => expr.int_value,
+                decl.intvalue = match expr.value {
+                    ValueType::Int8(v) => v as _,
+                    ValueType::Int32(v) => v as _,
+                    ValueType::Int64(v) => v,
                     _ => unreachable!("Unexpected Expression in parse_method_decl(): {}, \"{}\"", pair, pair.as_str()),
                 };
             }
@@ -1308,22 +1335,23 @@ mod tests {
 
     #[test]
     fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {
-        match AIDLParser::parse(Rule::string_expr, r##""Hello" + " World""##) {
-            Ok(mut res) => {
-                assert_eq!(
-                    parse_string_expr(res.next().unwrap().into_inner()),
-                    ConstExpr::new_with_array(vec![
-                        ConstExpr::new_with_str("\"Hello\"", ValueType::String),
-                        ConstExpr::new_with_str("\" World\"", ValueType::String)
-                    ])
-                );
-                Ok(())
-            },
-            Err(err) => {
-                println!("{}", err);
-                Err(Box::new(err))
-            }
-        }
+        let mut res = AIDLParser::parse(Rule::string_expr, r##""Hello" + " World""##).map_err(|err| {
+            println!("{}", err);
+            err
+        })?;
+
+        let expr = parse_string_expr(res.next().unwrap().into_inner());
+        assert_eq!(
+            expr,
+            ConstExpr::new(
+                ValueType::Array(vec![
+                    ConstExpr::new(ValueType::String("\"Hello\"".into())),
+                    ConstExpr::new(ValueType::String("\" World\"".into()))
+                ])
+            )
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -1334,36 +1362,36 @@ mod tests {
         })?;
 
         let expr = parse_expression(res.next().unwrap().into_inner());
-        assert_eq!(
-            expr.clone(),
-            // Expression::Expr {
-            //     as_str: "1 + -3 * 2 << 2 | 4".into(),
-            //     lhs: Box::new(Expression::Expr {
-            //         as_str: "1 + -3 * 2 << 2 | 4".into(),
-            //         lhs: Box::new(Expression::Expr {
-            //             as_str: "1 + -3 * 2 << 2 | 4".into(),
-            //             lhs: Box::new(Expression::Int8(1)),
-            //             operator: "+".to_string(),
-            //             rhs: Box::new(Expression::Expr {
-            //                 as_str: "1 + -3 * 2 << 2 | 4".into(),
-            //                 lhs: Box::new(Expression::Unary {
-            //                     operator: "-".to_string(),
-            //                     expr: Box::new(Expression::Int8(3))
-            //                 }),
-            //                 operator: "*".to_string(),
-            //                 rhs: Box::new(Expression::Int8(2))
-            //             })
-            //         }),
-            //         operator: "<<".to_string(),
-            //         rhs: Box::new(Expression::Int8(2))
-            //     }),
-            //     operator: "|".to_string(),
-            //     rhs: Box::new(Expression::Int8(4))
-            // },
-            ConstExpr::default(),
-        );
+        // assert_eq!(
+        //     expr.clone(),
+        //     // Expression::Expr {
+        //     //     as_str: "1 + -3 * 2 << 2 | 4".into(),
+        //     //     lhs: Box::new(Expression::Expr {
+        //     //         as_str: "1 + -3 * 2 << 2 | 4".into(),
+        //     //         lhs: Box::new(Expression::Expr {
+        //     //             as_str: "1 + -3 * 2 << 2 | 4".into(),
+        //     //             lhs: Box::new(Expression::Int8(1)),
+        //     //             operator: "+".to_string(),
+        //     //             rhs: Box::new(Expression::Expr {
+        //     //                 as_str: "1 + -3 * 2 << 2 | 4".into(),
+        //     //                 lhs: Box::new(Expression::Unary {
+        //     //                     operator: "-".to_string(),
+        //     //                     expr: Box::new(Expression::Int8(3))
+        //     //                 }),
+        //     //                 operator: "*".to_string(),
+        //     //                 rhs: Box::new(Expression::Int8(2))
+        //     //             })
+        //     //         }),
+        //     //         operator: "<<".to_string(),
+        //     //         rhs: Box::new(Expression::Int8(2))
+        //     //     }),
+        //     //     operator: "|".to_string(),
+        //     //     rhs: Box::new(Expression::Int8(4))
+        //     // },
+        //     ConstExpr::default(),
+        // );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new_with_int(-20, ValueType::Int64));
+        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Int64(-20)));
 
         Ok(())
     }

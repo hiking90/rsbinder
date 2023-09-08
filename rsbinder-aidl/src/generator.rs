@@ -102,7 +102,7 @@ mod {{mod}} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
-                {{ member.0 }} = {{ member.2 }},
+                {{ member.0 }}: {{ member.2 }},
             {%- endfor %}
             }
         }
