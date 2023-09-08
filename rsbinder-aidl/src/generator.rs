@@ -268,7 +268,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     for constant in decl.constant_list.iter() {
         let type_cast = constant.r#type.type_cast();
         const_members.push((constant.const_identifier(),
-            type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref())));
+            type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref(), true)));
     }
 
     let mut fn_members = Vec::new();
@@ -307,10 +307,10 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 
             if var.constant == true {
                 constant_members.push((var.const_identifier(),
-                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref())));
+                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
             } else {
                 members.push(
-                    (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref()))
+                    (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref(), false))
                 )
             }
         }
@@ -364,7 +364,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
             let type_cast = var.r#type.type_cast();
             if var.constant == true {
                 constant_members.push((var.const_identifier(),
-                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref())));
+                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
             } else {
                 members.push((var.union_identifier(), type_cast.member_type()));
             }

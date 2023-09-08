@@ -101,8 +101,8 @@ mod connection_info {
     impl Default for ConnectionInfo {
         fn default() -> Self {
             Self {
-                ip_address = Default::default(),
-                port = Default::default(),
+                ip_address: Default::default(),
+                port: Default::default(),
             }
         }
     }
@@ -471,8 +471,8 @@ mod service_debug_info {
     impl Default for ServiceDebugInfo {
         fn default() -> Self {
             Self {
-                name = Default::default(),
-                debug_pid = Default::default(),
+                name: Default::default(),
+                debug_pid: Default::default(),
             }
         }
     }
@@ -526,8 +526,8 @@ mod connection_info {
     impl Default for ConnectionInfo {
         fn default() -> Self {
             Self {
-                ip_address = Default::default(),
-                port = Default::default(),
+                ip_address: Default::default(),
+                port: Default::default(),
             }
         }
     }

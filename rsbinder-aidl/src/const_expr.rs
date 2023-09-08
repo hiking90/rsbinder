@@ -268,9 +268,15 @@ impl ValueType {
         }
     }
 
-    pub fn to_init_string(&self) -> String {
+    pub fn to_init(&self, is_const: bool) -> String {
         match self {
-            ValueType::String(_) => format!("\"{}\".into()", self.to_string()),
+            ValueType::String(_) => {
+                if is_const == true {
+                    format!("\"{}\"", self.to_string())
+                } else {
+                    format!("\"{}\".into()", self.to_string())
+                }
+            }
             ValueType::Float(_) => format!("{}f32", self.to_string()),
             ValueType::Double(_) => format!("{}f64", self.to_string()),
             ValueType::Char(_) => format!("'{}'", self.to_string()),

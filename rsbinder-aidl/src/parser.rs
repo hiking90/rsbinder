@@ -54,7 +54,7 @@ impl VariableDecl {
         if self.constant {
             format!("pub const {}: {} = {};\n",
                 self.const_identifier(),
-                type_cast.const_type(), type_cast.init_type(self.const_expr.as_ref()))
+                type_cast.const_type(), type_cast.init_type(self.const_expr.as_ref(), true))
         } else {
             format!("pub {}: {},\n", self.identifier(), type_cast.member_type())
         }
@@ -498,13 +498,13 @@ impl TypeCast {
         self.type_name()
     }
 
-    pub fn init_type(&self, const_expr: Option<&ConstExpr>) -> String {
+    pub fn init_type(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
         match const_expr {
             Some(expr) => {
                 let expr = expr.calculate(None).convert_to(&self.value_type(), None);
-                expr.value.to_init_string()
+                expr.value.to_init(is_const)
             }
-            None => ValueType::Void.to_init_string(),
+            None => ValueType::Void.to_init(is_const),
         }
     }
 
@@ -1343,11 +1343,10 @@ mod tests {
         let expr = parse_string_expr(res.next().unwrap().into_inner());
         assert_eq!(
             expr,
-            ConstExpr::new(
-                ValueType::Array(vec![
-                    ConstExpr::new(ValueType::String("\"Hello\"".into())),
-                    ConstExpr::new(ValueType::String("\" World\"".into()))
-                ])
+            ConstExpr::new_expr(
+                ConstExpr::new(ValueType::String("Hello".into())),
+                "+",
+                ConstExpr::new(ValueType::String(" World".into()))
             )
         );
 
