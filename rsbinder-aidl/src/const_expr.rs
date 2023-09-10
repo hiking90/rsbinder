@@ -1,27 +1,28 @@
+use crate::parser;
 use std::collections::HashMap;
 
 macro_rules! arithmetic_bit_op {
-    ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr, $dict:expr) => {
+    ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
             match $promoted {
                 ValueType::Bool(_) => {
-                    let value = ($lhs.to_i64($dict) $op $rhs.to_i64($dict)) != 0;
+                    let value = ($lhs.to_i64() $op $rhs.to_i64()) != 0;
                     ConstExpr::new(ValueType::Bool(value))
                 }
                 ValueType::Int8(_) => {
-                    let value = ($lhs.to_i64($dict) $op $rhs.to_i64($dict));
+                    let value = ($lhs.to_i64() $op $rhs.to_i64());
                     ConstExpr::new(ValueType::Int8(value as _))
                 }
                 ValueType::Int32(_) => {
-                    let value = ($lhs.to_i64($dict) $op $rhs.to_i64($dict));
+                    let value = ($lhs.to_i64() $op $rhs.to_i64());
                     ConstExpr::new(ValueType::Int32(value as _))
                 }
                 ValueType::Int64(_) => {
-                    let value = ($lhs.to_i64($dict) $op $rhs.to_i64($dict));
+                    let value = ($lhs.to_i64() $op $rhs.to_i64());
                     ConstExpr::new(ValueType::Int64(value as _))
                 }
                 // ValueType::Float(_) | ValueType::Double => {
-                //     ConstExpr::new_with_int($lhs.to_i64($dict) $op $rhs.to_i64($dict), $promoted)
+                //     ConstExpr::new_with_int($lhs.to_i64() $op $rhs.to_i64(), $promoted)
                 // }
                 _ => panic!("Can't apply operator {:?} - '{}' for non integer type: {} {:?} - {}",
                     $lhs, $lhs.raw_expr(), $desc, $rhs, $rhs.raw_expr()),
@@ -31,10 +32,10 @@ macro_rules! arithmetic_bit_op {
 }
 
 macro_rules! arithmetic_basic_op {
-    ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr, $dict:expr) => {
+    ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
-            let lhs = $lhs.convert_to($promoted, $dict);
-            let rhs = $rhs.convert_to($promoted, $dict);
+            let lhs = $lhs.convert_to($promoted);
+            let rhs = $rhs.convert_to($promoted);
             let as_str = &format!("{} {} {}", lhs.raw_expr(), $desc, rhs.raw_expr());
 
             match $promoted {
@@ -44,22 +45,22 @@ macro_rules! arithmetic_basic_op {
                     ConstExpr::new(ValueType::String(value))
                 }
                 ValueType::Int8(_) => {
-                    ConstExpr::new(ValueType::Int8((lhs.to_i64($dict) $op rhs.to_i64($dict)) as i8 as _))
+                    ConstExpr::new(ValueType::Int8((lhs.to_i64() $op rhs.to_i64()) as i8 as _))
                 }
                 ValueType::Int32(_) => {
-                    ConstExpr::new(ValueType::Int32((lhs.to_i64($dict) $op rhs.to_i64($dict)) as i32 as _))
+                    ConstExpr::new(ValueType::Int32((lhs.to_i64() $op rhs.to_i64()) as i32 as _))
                 }
                 ValueType::Int64(_) => {
-                    ConstExpr::new(ValueType::Int64((lhs.to_i64($dict) $op rhs.to_i64($dict)) as _))
+                    ConstExpr::new(ValueType::Int64((lhs.to_i64() $op rhs.to_i64()) as _))
                 }
                 ValueType::Float(_) => {
-                    ConstExpr::new(ValueType::Float((lhs.to_f64($dict) $op rhs.to_f64($dict)) as f32 as _))
+                    ConstExpr::new(ValueType::Float((lhs.to_f64() $op rhs.to_f64()) as f32 as _))
                 }
                 ValueType::Double(_) => {
-                    ConstExpr::new(ValueType::Double((lhs.to_f64($dict) $op rhs.to_f64($dict)) as _))
+                    ConstExpr::new(ValueType::Double((lhs.to_f64() $op rhs.to_f64()) as _))
                 }
                 ValueType::Bool(_) => {
-                    ConstExpr::new(ValueType::Bool((lhs.to_i64($dict) $op rhs.to_i64($dict)) != 0))
+                    ConstExpr::new(ValueType::Bool((lhs.to_i64() $op rhs.to_i64()) != 0))
                 }
                 _ => {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, as_str);
@@ -106,12 +107,12 @@ impl ValueType {
         }
     }
 
-    fn new_unary(operator: &str, expr: ValueType) -> ValueType {
-        ValueType::Unary{
-            operator: operator.into(),
-            expr: Box::new(ConstExpr::new(expr)),
-        }
-    }
+    // fn new_unary(operator: &str, expr: ValueType) -> ValueType {
+    //     ValueType::Unary{
+    //         operator: operator.into(),
+    //         expr: Box::new(ConstExpr::new(expr)),
+    //     }
+    // }
 
     fn order(&self) -> u32 {
         match self {
@@ -135,7 +136,7 @@ impl ValueType {
         }
     }
 
-    fn unary_not(&self, dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
+    fn unary_not(&self) -> ConstExpr {
         match self {
             ValueType::Void | ValueType::String(_) |
             ValueType::Char(_) => ConstExpr::new(self.clone()),
@@ -144,13 +145,13 @@ impl ValueType {
             ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(!*v)),
             ValueType::Bool(v) => ConstExpr::new(ValueType::Bool(!*v)),
             ValueType::Expr{..} | ValueType::Unary{..} => {
-                let expr = self.calculate(dict);
-                expr.value.unary_not(dict)
+                let expr = self.calculate();
+                expr.value.unary_not()
             }
             ValueType::Array(v) => {
                 let mut list = Vec::new();
                 for expr in v {
-                    list.push(expr.value.unary_not(dict))
+                    list.push(expr.value.unary_not())
                 }
                 ConstExpr::new(ValueType::Array(list))
             }
@@ -158,7 +159,7 @@ impl ValueType {
         }
     }
 
-    fn unary_minus(&self, dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
+    fn unary_minus(&self) -> ConstExpr {
         match self {
             ValueType::Void | ValueType::String(_) | ValueType::Bool(_) |
             ValueType::Char(_) => ConstExpr::new(self.clone()),
@@ -168,14 +169,14 @@ impl ValueType {
             ValueType::Float(v) => ConstExpr::new(ValueType::Float(-(*v as f32) as _)),
             ValueType::Double(v) => ConstExpr::new(ValueType::Double(-*v)),
             ValueType::Expr{..} | ValueType::Unary{..} => {
-                let expr = self.calculate(dict);
-                expr.value.unary_minus(dict)
+                let expr = self.calculate();
+                expr.value.unary_minus()
             }
 
             ValueType::Array(v) => {
                 let mut list = Vec::new();
                 for expr in v {
-                    list.push(expr.value.unary_minus(dict))
+                    list.push(expr.value.unary_minus())
                 }
 
                 ConstExpr::new(ValueType::Array(list))
@@ -184,12 +185,12 @@ impl ValueType {
         }
     }
 
-    pub fn to_bool(&self, dict: Option<&HashMap<String, ConstExpr>>) -> bool {
+    pub fn to_bool(&self) -> bool {
         match self {
             ValueType::Void => false,
             ValueType::String(_) => unimplemented!(),
             ValueType::Bool(v) => *v,
-            ValueType::Char(v) => true,
+            ValueType::Char(_) => true,
             ValueType::Int8(v) => *v != 0,
             ValueType::Int32(v) => *v != 0,
             ValueType::Int64(v) => *v != 0,
@@ -201,14 +202,14 @@ impl ValueType {
                 panic!("to_bool() for Name is not supported.");
             }
             ValueType::Expr{ .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate(dict);
-                expr.to_bool(dict)
+                let expr = self.calculate();
+                expr.to_bool()
             }
             _ => unimplemented!(),
         }
     }
 
-    pub fn to_f64(&self, dict: Option<&HashMap<String, ConstExpr>>) -> f64 {
+    pub fn to_f64(&self) -> f64 {
         match self {
             ValueType::Void => 0.,
             ValueType::String(_) => unimplemented!(),
@@ -225,14 +226,14 @@ impl ValueType {
                 panic!("to_f64() for Name is not supported.");
             }
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => {
-                let expr = self.calculate(dict);
-                expr.to_f64(dict)
+                let expr = self.calculate();
+                expr.to_f64()
             }
             _ => unimplemented!(),
         }
     }
 
-    pub fn to_i64(&self, dict: Option<&HashMap<String, ConstExpr>>) -> i64 {
+    pub fn to_i64(&self) -> i64 {
         match self {
             ValueType::Void => 0,
             ValueType::String(_) => unimplemented!(),
@@ -249,8 +250,8 @@ impl ValueType {
                 panic!("to_i64() for Name is not supported.");
             }
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => {
-                let expr = self.calculate(dict);
-                expr.to_i64(dict)
+                let expr = self.calculate();
+                expr.to_i64()
             }
             _ => unimplemented!(),
         }
@@ -280,10 +281,10 @@ impl ValueType {
             ValueType::Float(_) => format!("{}f32", self.to_string()),
             ValueType::Double(_) => format!("{}f64", self.to_string()),
             ValueType::Char(_) => format!("'{}'", self.to_string()),
+            ValueType::Name(_) => format!("crate::{}", self.to_string()),
             ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
             ValueType::Bool(_) | ValueType::Array(_) |
-            ValueType::Expr{ .. } | ValueType::Unary{ .. } |
-            ValueType::Name(_) => self.to_string(),
+            ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_string(),
             _ => format!("Default::default()"),
         }
     }
@@ -310,7 +311,7 @@ impl ValueType {
                 res
             }
             ValueType::Name(v) => {
-                format!("{{{}}}", v)
+                format!("{}", v)
             }
             ValueType::Expr{ lhs, operator, rhs} => {
                 format!("{} {} {}", lhs.to_string(), operator, rhs.to_string())
@@ -322,32 +323,31 @@ impl ValueType {
         }
     }
 
-    fn calc_expr(lhs: &Box<ConstExpr>, operator: &str, rhs: &Box<ConstExpr>,
-        dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
-        let lhs = lhs.calculate(dict);
-        let rhs = rhs.calculate(dict);
+    fn calc_expr(lhs: &Box<ConstExpr>, operator: &str, rhs: &Box<ConstExpr>) -> ConstExpr {
+        let lhs = lhs.calculate();
+        let rhs = rhs.calculate();
 
         let promoted = type_conversion(integral_promotion(lhs.value.clone()), integral_promotion(rhs.value.clone()));
 
         match operator {
             "||" => {
-                ConstExpr::new(ValueType::Bool(lhs.to_bool(dict) || rhs.to_bool(dict)))
+                ConstExpr::new(ValueType::Bool(lhs.to_bool() || rhs.to_bool()))
             }
             "&&" => {
-                ConstExpr::new(ValueType::Bool(lhs.to_bool(dict) && rhs.to_bool(dict)))
+                ConstExpr::new(ValueType::Bool(lhs.to_bool() && rhs.to_bool()))
             }
             "|" => {
-                arithmetic_bit_op!(lhs, |, rhs, "|", promoted, dict)
+                arithmetic_bit_op!(lhs, |, rhs, "|", promoted)
             }
             "^" => {
-                arithmetic_bit_op!(lhs, ^, rhs, "^", promoted, dict)
+                arithmetic_bit_op!(lhs, ^, rhs, "^", promoted)
             }
             "&" => {
-                arithmetic_bit_op!(lhs, &, rhs, "&", promoted, dict)
+                arithmetic_bit_op!(lhs, &, rhs, "&", promoted)
             }
             "==" | "!=" | "<=" | ">=" | "<" | ">" => {
-                let lhs = lhs.convert_to(&promoted, dict);
-                let rhs = rhs.convert_to(&promoted, dict);
+                let lhs = lhs.convert_to(&promoted);
+                let rhs = rhs.convert_to(&promoted);
 
                 let value = match operator {
                     "==" => lhs == rhs,
@@ -369,8 +369,8 @@ impl ValueType {
                     false
                 };
 
-                let lhs_value = lhs.to_i64(dict);
-                let rhs_value = rhs.to_i64(dict);
+                let lhs_value = lhs.to_i64();
+                let rhs_value = rhs.to_i64();
                 let rhs_value: u32 = if rhs_value < 0 {
                     is_shl = !is_shl;
                     rhs_value.wrapping_neg() as _
@@ -391,48 +391,44 @@ impl ValueType {
                     _ => panic!("Can't apply operator '{}' for non integer type: {}", operator, lhs.raw_expr()),
                 }
             }
-            "+" => arithmetic_basic_op!(lhs, +, rhs, "+", &promoted, dict),
-            "-" => arithmetic_basic_op!(lhs, -, rhs, "-", &promoted, dict),
-            "*" => arithmetic_basic_op!(lhs, *, rhs, "*", &promoted, dict),
-            "/" => arithmetic_basic_op!(lhs, /, rhs, "/", &promoted, dict),
-            "%" => arithmetic_basic_op!(lhs, %, rhs, "%", &promoted, dict),
+            "+" => arithmetic_basic_op!(lhs, +, rhs, "+", &promoted),
+            "-" => arithmetic_basic_op!(lhs, -, rhs, "-", &promoted),
+            "*" => arithmetic_basic_op!(lhs, *, rhs, "*", &promoted),
+            "/" => arithmetic_basic_op!(lhs, /, rhs, "/", &promoted),
+            "%" => arithmetic_basic_op!(lhs, %, rhs, "%", &promoted),
             _ => unreachable!(),
         }
     }
 
-    pub fn calculate(&self, dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
+    pub fn calculate(&self) -> ConstExpr {
         match self {
             ValueType::Unary{ operator, expr } => {
-                let expr = expr.calculate(dict);
+                let expr = expr.calculate();
                 if operator == "-" {
-                    expr.value.unary_minus(dict)
+                    expr.value.unary_minus()
                 } else if operator == "~" || operator == "!" {
-                    expr.value.unary_not(dict)
+                    expr.value.unary_not()
                 } else {
                     expr
                 }
             }
             ValueType::Expr{ lhs, operator, rhs } => {
-                ValueType::calc_expr(lhs, operator, rhs, dict)
+                ValueType::calc_expr(lhs, operator, rhs)
             }
             ValueType::Array(v) => {
                 let mut array = Vec::new();
 
                 for value in v {
-                    array.push(value.calculate(dict));
+                    array.push(value.calculate());
                 }
 
                 ConstExpr::new(ValueType::Array(array))
             }
             ValueType::Name(name) => {
-                if let Some(dict) = dict {
-                    if let Some(expr) = dict.get(name) {
-                        expr.calculate(Some(dict)).clone()
-                    } else {
-                        panic!("Can't find {} from Dictionary.", name);
-                    }
-                } else {
-                    panic!("ValueType is Name. But, there is no dictionary to find the Name.");
+                let expr = parser::name_to_const_expr(name);
+                match expr {
+                    Some(expr) => expr.calculate(),
+                    None => ConstExpr::new(self.clone()),
                 }
             }
             _ => ConstExpr::new(self.clone()),
@@ -455,12 +451,12 @@ impl PartialOrd for ValueType {
                 Some(std::cmp::Ordering::Less)
             },
             ValueType::String(v) | ValueType::Name(v) => v.partial_cmp(&rhs.to_string()),
-            ValueType::Int8(v) => v.partial_cmp(&(rhs.to_i64(None) as _)),
-            ValueType::Int32(v) => v.partial_cmp(&(rhs.to_i64(None) as _)),
-            ValueType::Int64(v) => v.partial_cmp(&(rhs.to_i64(None) as _)),
-            ValueType::Char(v) => (*v as i64).partial_cmp(&rhs.to_i64(None)),
-            ValueType::Bool(v) => v.partial_cmp(&rhs.to_bool(None)),
-            ValueType::Float(v) | ValueType::Double(v) => v.partial_cmp(&rhs.to_f64(None)),
+            ValueType::Int8(v) => v.partial_cmp(&(rhs.to_i64() as _)),
+            ValueType::Int32(v) => v.partial_cmp(&(rhs.to_i64() as _)),
+            ValueType::Int64(v) => v.partial_cmp(&(rhs.to_i64() as _)),
+            ValueType::Char(v) => (*v as i64).partial_cmp(&rhs.to_i64()),
+            ValueType::Bool(v) => v.partial_cmp(&rhs.to_bool()),
+            ValueType::Float(v) | ValueType::Double(v) => v.partial_cmp(&rhs.to_f64()),
             ValueType::Array(lhs_array) => {
                 if let ValueType::Array(rhs_array) = rhs {
                     lhs_array.partial_cmp(rhs_array)
@@ -469,8 +465,8 @@ impl PartialOrd for ValueType {
                 }
             }
             ValueType::Unary { .. } | ValueType::Expr{..} => {
-                let lhs = self.calculate(None);
-                let rhs = rhs.calculate(None);
+                let lhs = self.calculate();
+                let rhs = rhs.calculate();
                 lhs.partial_cmp(&rhs)
             }
             _ => None,
@@ -565,19 +561,19 @@ impl ConstExpr {
         self.value.to_string()
     }
 
-    pub fn to_i64(&self, dict: Option<&HashMap<String, ConstExpr>>) -> i64 {
-        self.value.to_i64(dict)
+    pub fn to_i64(&self) -> i64 {
+        self.value.to_i64()
     }
 
-    pub fn to_f64(&self, dict: Option<&HashMap<String, ConstExpr>>) -> f64 {
-        self.value.to_f64(dict)
+    pub fn to_f64(&self) -> f64 {
+        self.value.to_f64()
     }
 
-    pub fn to_bool(&self, dict: Option<&HashMap<String, ConstExpr>>) -> bool {
-        self.value.to_bool(dict)
+    pub fn to_bool(&self) -> bool {
+        self.value.to_bool()
     }
 
-    pub fn convert_to(&self, value_type: &ValueType, dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
+    pub fn convert_to(&self, value_type: &ValueType) -> ConstExpr {
         if self.value.order() == value_type.order() {
             self.clone()
         } else {
@@ -585,21 +581,21 @@ impl ConstExpr {
                 let mut res = Vec::new();
 
                 for v in list {
-                    res.push(v.convert_to(value_type, dict))
+                    res.push(v.convert_to(value_type))
                 }
                 ConstExpr::new(ValueType::Array(res))
             } else {
                 match value_type {
                     ValueType::Void => Self::default(),
                     ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_string())),
-                    ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64(dict) as i8 as _)),
-                    ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64(dict) as i32 as _)),
-                    ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64(dict))),
-                    ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64(dict) as f32 as _)),
-                    ValueType::Double(_) => ConstExpr::new(ValueType::Float(self.to_f64(dict))),
-                    ValueType::Bool(_) => ConstExpr::new(ValueType::Bool(self.to_bool(dict))),
+                    ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64() as i8 as _)),
+                    ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
+                    ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
+                    ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64() as f32 as _)),
+                    ValueType::Double(_) => ConstExpr::new(ValueType::Float(self.to_f64())),
+                    ValueType::Bool(_) => ConstExpr::new(ValueType::Bool(self.to_bool())),
                     ValueType::Char(_) => {
-                        let ch = self.to_i64(dict) as u32;
+                        let ch = self.to_i64() as u32;
                         if let Some(ch) = char::from_u32(ch) {
                             Self::new(ValueType::Char(ch as _))
                         } else {
@@ -610,7 +606,7 @@ impl ConstExpr {
                         unimplemented!();
                         // let mut res = Vec::new();
                         // for v in &v {
-                        //     res.push(v.convert_to(value_type, dict));
+                        //     res.push(v.convert_to(value_type));
                         // }
 
                         // Self::new_with_array(res)
@@ -621,15 +617,18 @@ impl ConstExpr {
                     ValueType::Expr {..} | ValueType::Unary {..} => {
                         unreachable!();
                     }
-                    _ => unimplemented!(),
+                    ValueType::UserDefined => {
+                        self.clone()
+                    }
+                    _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),
 
                 }
             }
         }
     }
 
-    pub fn calculate(&self, dict: Option<&HashMap<String, ConstExpr>>) -> ConstExpr {
-        self.value.calculate(dict)
+    pub fn calculate(&self) -> ConstExpr {
+        self.value.calculate()
     }
 }
 
@@ -641,7 +640,7 @@ mod tests {
     fn test_expression_arithmatic() {
         let expr = ValueType::new_expr(ValueType::Int32(10), "+", ValueType::Int32(10));
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Int32(20)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(20)));
 
         let expr = ValueType::new_expr(
             ValueType::Int8(1),
@@ -649,7 +648,7 @@ mod tests {
             ValueType::Int8(31),
         );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Int32(0x80000000u32 as _)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(0x80000000u32 as _)));
 
         // assert_eq!(expr.calculate(&mut dict), Expression::Int32(100));
 
@@ -659,7 +658,7 @@ mod tests {
             ValueType::Float(2.0),
         );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Float(5.0)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Float(5.0)));
 
 
         let expr = ValueType::new_expr(
@@ -668,7 +667,7 @@ mod tests {
             ValueType::Float(2.0),
         );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Float(10.0 % 2.0)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Float(10.0 % 2.0)));
 
         let expr = ValueType::new_expr(
             ValueType::Int32(10),
@@ -676,68 +675,68 @@ mod tests {
             ValueType::Bool(true),
         );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Int32(10 % 1)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(10 % 1)));
     }
 
-    #[test]
-    fn test_const_expr_name() {
-        let mut dict = HashMap::new();
-        dict.insert("DUMP_FLAG_PRIORITY_CRITICAL".to_owned(),
-            ConstExpr::new(
-                ValueType::new_expr(
-                    ValueType::Int32(1),
-                    "<<",
-                    ValueType::Int32(0),
-                )
-            )
-        );
+    // #[test]
+    // fn test_const_expr_name() {
+    //     let mut dict = HashMap::new();
+    //     dict.insert("DUMP_FLAG_PRIORITY_CRITICAL".to_owned(),
+    //         ConstExpr::new(
+    //             ValueType::new_expr(
+    //                 ValueType::Int32(1),
+    //                 "<<",
+    //                 ValueType::Int32(0),
+    //             )
+    //         )
+    //     );
 
-        dict.insert("DUMP_FLAG_PRIORITY_HIGH".to_owned(),
-            ConstExpr::new(
-                ValueType::new_expr(
-                    ValueType::Int32(1),
-                    "<<",
-                    ValueType::Int32(1),
-                )
-            )
-        );
+    //     dict.insert("DUMP_FLAG_PRIORITY_HIGH".to_owned(),
+    //         ConstExpr::new(
+    //             ValueType::new_expr(
+    //                 ValueType::Int32(1),
+    //                 "<<",
+    //                 ValueType::Int32(1),
+    //             )
+    //         )
+    //     );
 
-        dict.insert("DUMP_FLAG_PRIORITY_NORMAL".to_owned(),
-            ConstExpr::new(
-                ValueType::new_expr(
-                    ValueType::Int32(1),
-                    "<<",
-                    ValueType::Int32(2),
-                )
-            )
-        );
+    //     dict.insert("DUMP_FLAG_PRIORITY_NORMAL".to_owned(),
+    //         ConstExpr::new(
+    //             ValueType::new_expr(
+    //                 ValueType::Int32(1),
+    //                 "<<",
+    //                 ValueType::Int32(2),
+    //             )
+    //         )
+    //     );
 
-        dict.insert("DUMP_FLAG_PRIORITY_DEFAULT".to_owned(),
-            ConstExpr::new(
-                ValueType::new_expr(
-                    ValueType::Int32(1),
-                    "<<",
-                    ValueType::Int32(3),
-                )
-            )
-        );
+    //     dict.insert("DUMP_FLAG_PRIORITY_DEFAULT".to_owned(),
+    //         ConstExpr::new(
+    //             ValueType::new_expr(
+    //                 ValueType::Int32(1),
+    //                 "<<",
+    //                 ValueType::Int32(3),
+    //             )
+    //         )
+    //     );
 
-        let expr = ConstExpr::new(
-            ValueType::new_expr(
-                ValueType::Name("DUMP_FLAG_PRIORITY_CRITICAL".into()),
-                "|",
-                ValueType::new_expr(
-                    ValueType::Name("DUMP_FLAG_PRIORITY_HIGH".into()),
-                    "|",
-                    ValueType::new_expr(
-                        ValueType::Name("DUMP_FLAG_PRIORITY_NORMAL".into()),
-                        "|",
-                        ValueType::Name("DUMP_FLAG_PRIORITY_DEFAULT".into()),
-                    )
-                ),
-            )
-        );
+    //     let expr = ConstExpr::new(
+    //         ValueType::new_expr(
+    //             ValueType::Name("DUMP_FLAG_PRIORITY_CRITICAL".into()),
+    //             "|",
+    //             ValueType::new_expr(
+    //                 ValueType::Name("DUMP_FLAG_PRIORITY_HIGH".into()),
+    //                 "|",
+    //                 ValueType::new_expr(
+    //                     ValueType::Name("DUMP_FLAG_PRIORITY_NORMAL".into()),
+    //                     "|",
+    //                     ValueType::Name("DUMP_FLAG_PRIORITY_DEFAULT".into()),
+    //                 )
+    //             ),
+    //         )
+    //     );
 
-        assert_eq!(expr.calculate(Some(&dict)), ConstExpr::new(ValueType::Int32(15)));
-    }
+    //     assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(15)));
+    // }
 }

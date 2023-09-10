@@ -1,4 +1,4 @@
-
+use std::cell::RefCell;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::error::Error;
@@ -11,15 +11,125 @@ use pest::Parser;
 pub struct AIDLParser;
 
 use crate::const_expr::{ConstExpr, ValueType};
-use crate::DEFAULT_NAMESPACE;
+use crate::{Namespace};
 
-lazy_static! {
-    static ref DECLARATION_MAP: Mutex<HashMap<String, Declaration>> = Mutex::new(HashMap::new());
+thread_local! {
+    static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
+    static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
+}
+
+pub struct NamespaceGuard();
+
+impl NamespaceGuard {
+    pub fn new(ns: &Namespace) -> Self {
+        NAMESPACE_STACK.with(|vec| {
+            vec.borrow_mut().push(ns.clone());
+        });
+        Self()
+    }
+}
+
+impl Drop for NamespaceGuard {
+    fn drop(&mut self) {
+        NAMESPACE_STACK.with(|vec| {
+            vec.borrow_mut().pop();
+        });
+    }
+}
+
+pub fn current_namespace() -> Namespace {
+    NAMESPACE_STACK.with(|stack| {
+        stack.borrow().last().map_or_else(|| panic!("There is no namespace in stack."),
+            |namespace| namespace.clone())
+    })
+}
+
+pub fn lookup_name_decl(name: &str, style: &str, is_type: bool) -> (Declaration, Namespace, String) {
+    let mut namespace = Namespace::new(name, style);
+
+    let name = if is_type == false {
+        namespace.pop().unwrap()
+    } else {
+        "".into()
+    };
+
+    let mut cur_ns = current_namespace();
+    let new_len = if cur_ns.ns.len() > namespace.ns.len() { cur_ns.ns.len() - namespace.ns.len() } else { 0 };
+    cur_ns.ns.truncate(new_len);
+    cur_ns.ns.append(&mut namespace.ns);
+
+    DECLARATION_MAP.with(|hashmap| {
+        let decl = hashmap.borrow().get(&cur_ns)
+            .expect(&format!("Unknown namespace: {:?} for name: {}", cur_ns, name)).clone();
+
+        (decl, cur_ns, name)
+    })
+}
+
+fn make_const_expr(const_expr: Option<&ConstExpr>, decl_set: &(Declaration, Namespace, String)) -> ConstExpr {
+    if let Some(expr) = const_expr {
+        expr.clone()
+    } else {
+        let name = format!("{}{}{}", decl_set.1.to_string(Namespace::RUST),
+            Namespace::RUST, decl_set.2);
+        ConstExpr::new(ValueType::Name(name))
+    }
+}
+
+fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
+    for decl in members {
+        match decl {
+            Declaration::Variable(decl) => {
+                if decl.identifier == decl_set.2 {
+                    return Some(make_const_expr(decl.const_expr.as_ref(), &decl_set));
+                }
+            },
+            _ => unreachable!(),
+        }
+    }
+    None
+}
+
+// Normally, this function is used to generate Rust source code.
+pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
+    let decl_set = lookup_name_decl(name, Namespace::AIDL, false);
+
+    match decl_set.0 {
+        Declaration::Interface(ref decl) => {
+            for var in &decl.constant_list {
+                if var.identifier == decl_set.2 {
+                    return Some(make_const_expr(var.const_expr.as_ref(), &decl_set));
+                }
+            }
+            lookup_name_members(&decl.members, &decl_set)
+        }
+
+        Declaration::Parcelable(ref decl) => {
+            lookup_name_members(&decl.members, &decl_set)
+        }
+
+        Declaration::Enum(ref decl) => {
+            for enumerator in &decl.enumerator_list {
+                if enumerator.identifier == decl_set.2 {
+                    return Some(make_const_expr(None, &decl_set));
+                    // return make_const_expr(enumerator.const_expr.as_ref(), &decl_set);
+                }
+            }
+            lookup_name_members(&decl.members, &decl_set)
+        }
+
+        Declaration::Union(ref decl) => {
+            lookup_name_members(&decl.members, &decl_set)
+        }
+
+        _ => {
+            unreachable!("Unexpected Declaration::Variable : {:?}", decl_set);
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Interface {
-
 }
 
 #[derive(Debug)]
@@ -79,74 +189,59 @@ impl VariableDecl {
 
 #[derive(Debug, Default, Clone)]
 pub struct InterfaceDecl {
-    pub namespace: String,
+    pub namespace: Namespace,
     pub annotation_list: Vec<Annotation>,
     pub oneway: bool,
     pub name: String,
     pub method_list: Vec<MethodDecl>,
     pub constant_list: Vec<VariableDecl>,
     pub members: Vec<Declaration>,
-    pub name_dict: Option<HashMap<String, ConstExpr>>,
 }
 
 impl InterfaceDecl {
     pub fn pre_process(&mut self) {
-        let mut dict = HashMap::new();
-        for decl in &self.constant_list {
-            if let Some(expr) = &decl.const_expr {
-                dict.insert(decl.identifier.clone(), expr.clone());
-            }
-        }
-
-        let mut calculated = HashMap::new();
-        for (key, expr) in dict.iter() {
-            calculated.insert(key.into(), expr.calculate(Some(&dict)));
-        }
-
-        self.name_dict = Some(calculated);
-
         for decl in &mut self.constant_list {
-            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate(self.name_dict.as_ref()));
+            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate());
         }
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct ParcelableDecl {
-    pub namespace: String,
+    pub namespace: Namespace,
     pub name: String,
     pub type_params: Vec<String>,
     pub cpp_header: String,
     pub members: Vec<Declaration>,
-    pub name_dict: Option<HashMap<String, ConstExpr>>,
+    // pub name_dict: Option<HashMap<String, ConstExpr>>,
 }
 
 impl ParcelableDecl {
     pub fn pre_process(&mut self) {
-        let mut dict = HashMap::new();
-        for decl in &mut self.members {
-            match decl {
-                Declaration::Interface(decl) => { decl.pre_process(); }
-                Declaration::Parcelable(decl) => { decl.pre_process(); }
-                Declaration::Variable(decl) => {
-                    if let Some(expr) = &decl.const_expr {
-                        dict.insert(decl.identifier.clone(), expr.clone());
-                    }
-                },
-                _ => {}
-            }
-        }
+        // let mut dict = HashMap::new();
+        // for decl in &mut self.members {
+        //     match decl {
+        //         Declaration::Interface(decl) => { decl.pre_process(); }
+        //         Declaration::Parcelable(decl) => { decl.pre_process(); }
+        //         Declaration::Variable(decl) => {
+        //             if let Some(expr) = &decl.const_expr {
+        //                 dict.insert(decl.identifier.clone(), expr.clone());
+        //             }
+        //         },
+        //         _ => {}
+        //     }
+        // }
 
-        let mut calculated = HashMap::new();
-        for (key, expr) in dict.iter() {
-            calculated.insert(key.into(), expr.calculate(Some(&dict)));
-        }
+        // let mut calculated = HashMap::new();
+        // for (key, expr) in dict.iter() {
+        //     calculated.insert(key.into(), expr.calculate());
+        // }
 
-        self.name_dict = Some(calculated);
+        // self.name_dict = Some(calculated);
 
         for decl in &mut self.members {
             if let Declaration::Variable(decl) = decl {
-                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate(self.name_dict.as_ref()));
+                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate());
             }
         }
     }
@@ -202,7 +297,7 @@ impl Declaration {
         }
     }
 
-    pub fn namespace(&self) -> &str {
+    pub fn namespace(&self) -> &Namespace {
         match self {
             Declaration::Parcelable(decl) => &decl.namespace,
             Declaration::Interface(decl) => &decl.namespace,
@@ -212,12 +307,12 @@ impl Declaration {
         }
     }
 
-    pub fn namespace_mut(&mut self) -> &mut String {
+    pub fn set_namespace(&mut self, namespace: Namespace) {
         match self {
-            Declaration::Parcelable(decl) => &mut decl.namespace,
-            Declaration::Interface(decl) => &mut decl.namespace,
-            Declaration::Enum(decl) => &mut decl.namespace,
-            Declaration::Union(decl) => &mut decl.namespace,
+            Declaration::Parcelable(decl) => decl.namespace = namespace,
+            Declaration::Interface(decl) => decl.namespace = namespace,
+            Declaration::Enum(decl) => decl.namespace = namespace,
+            Declaration::Union(decl) => decl.namespace = namespace,
             _ => todo!(),
         }
     }
@@ -320,7 +415,7 @@ impl ArrayType {
     pub fn to_string(&self) -> String {
         match &self.const_expr {
             Some(expr) => {
-                let expr = expr.calculate(None);
+                let expr = expr.calculate();
                 format!("[{}]", expr.to_string())
             }
             None => "".to_string(),
@@ -401,20 +496,32 @@ impl TypeCast {
             }
             _ => {
                 is_primitive = false;
-                if let Some(decl) = DECLARATION_MAP.lock().unwrap().get(aidl_type.name.as_str()) {
-                    let type_name = format!("crate::{}::{}", decl.namespace(), aidl_type.name.as_str());
+                let decl_set = lookup_name_decl(aidl_type.name.as_str(), Namespace::RUST, true);
+                let type_name = format!("crate::{}", decl_set.1.to_string(Namespace::RUST));
 
-                    match decl {
-                        Declaration::Interface(_) => {
-                            is_declared = true;
-                            let type_name = format!("std::sync::Arc<dyn {}>", type_name);
-                            (type_name.clone(), ValueType::UserDefined)
-                        }
-                        _ => (type_name.to_owned(), ValueType::UserDefined),
+                match decl_set.0 {
+                    Declaration::Interface(_) => {
+                        is_declared = true;
+                        let type_name = format!("std::sync::Arc<dyn {}>", type_name);
+                        (type_name.clone(), ValueType::UserDefined)
                     }
-                } else {
-                    (aidl_type.name.to_owned(), ValueType::UserDefined)
+                    _ => (type_name.to_owned(), ValueType::UserDefined),
                 }
+
+                // if let Some(decl) = lookup_name(aidl_type.name.as_str()) {
+                //     let type_name = format!("crate::{}::{}", decl.namespace(), aidl_type.name.as_str());
+
+                //     match decl {
+                //         Declaration::Interface(_) => {
+                //             is_declared = true;
+                //             let type_name = format!("std::sync::Arc<dyn {}>", type_name);
+                //             (type_name.clone(), ValueType::UserDefined)
+                //         }
+                //         _ => (type_name.to_owned(), ValueType::UserDefined),
+                //     }
+                // } else {
+                //     (aidl_type.name.to_owned(), ValueType::UserDefined)
+                // }
             }
         };
 
@@ -501,7 +608,7 @@ impl TypeCast {
     pub fn init_type(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
         match const_expr {
             Some(expr) => {
-                let expr = expr.calculate(None).convert_to(&self.value_type(), None);
+                let expr = expr.calculate().convert_to(&self.value_type());
                 expr.value.to_init(is_const)
             }
             None => ValueType::Void.to_init(is_const),
@@ -546,7 +653,7 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> TypeCast {
 
     TypeCast::new(&NonArrayType {
     // The cstr is enclosed in quotes.
-        name: "i8".into(),
+        name: "byte".into(),
         generic: None,
     })
 }
@@ -639,7 +746,6 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
             } else {
                 value
             };
-            println!("FLOATVALUE = {}, {}", value, value.parse::<f64>().unwrap());
             ConstExpr::new(ValueType::Double(value.parse::<f64>().unwrap() as _))
         }
         Rule::INTVALUE => { parse_intvalue(pair.as_str()) }
@@ -976,7 +1082,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
                 }
             }
             Rule::INTVALUE => {
-                let expr = parse_intvalue(pair.as_str()). calculate(None);
+                let expr = parse_intvalue(pair.as_str()). calculate();
                 decl.intvalue = match expr.value {
                     ValueType::Int8(v) => v as _,
                     ValueType::Int32(v) => v as _,
@@ -1099,7 +1205,7 @@ pub struct Enumerator {
 
 #[derive(Debug, Default, Clone)]
 pub struct EnumDecl {
-    pub namespace: String,
+    pub namespace: Namespace,
     pub annotation_list: Vec<Annotation>,
     pub name: String,
     pub enumerator_list: Vec<Enumerator>,
@@ -1143,7 +1249,7 @@ fn parse_enum_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pai
 
 #[derive(Debug, Default, Clone)]
 pub struct UnionDecl {
-    pub namespace: String,
+    pub namespace: Namespace,
     pub annotation_list: Vec<Annotation>,
     pub name: String,
     pub type_params: Vec<String>,
@@ -1200,26 +1306,21 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
     declarations
 }
 
-pub fn calculate_namespace(decl: &mut Declaration, namespace: Vec<String>) {
+pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
     if decl.is_variable().is_some() {
         return;
     }
 
-    let mut curr_ns = DEFAULT_NAMESPACE.to_owned();
+    namespace.push(decl.name());
 
-    for ns in &namespace {
-        curr_ns += &("::".to_owned() + &ns);
-    }
+    decl.set_namespace(namespace.clone());
 
-    *decl.namespace_mut() = curr_ns;
-
-    DECLARATION_MAP.lock().unwrap().insert(decl.name().to_owned(), decl.clone());
-
-    let mut new_ns = namespace.clone();
-    new_ns.push(decl.name().to_owned());
+    DECLARATION_MAP.with(|hashmap| {
+        hashmap.borrow_mut().insert(namespace.clone(), decl.clone());
+    });
 
     for mut decl in decl.members_mut() {
-        calculate_namespace(&mut decl, new_ns.clone());
+        calculate_namespace(&mut decl, namespace.clone());
     }
 }
 
@@ -1267,9 +1368,9 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
     }
 
     let namespace = if let Some(ref package) = document.package {
-        vec![package.replace(".", "::")]
+        Namespace::new(package, Namespace::AIDL)
     } else {
-        Vec::new()
+        Namespace::default()
     };
 
     for mut decl in &mut document.decls {
@@ -1390,8 +1491,23 @@ mod tests {
         //     ConstExpr::default(),
         // );
 
-        assert_eq!(expr.calculate(None), ConstExpr::new(ValueType::Int64(-20)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int64(-20)));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_namespace_guard() {
+        let _ns_1 = NamespaceGuard::new(&Namespace::new("1", Namespace::AIDL));
+        {
+            assert_eq!(current_namespace(), Namespace::new("1", Namespace::AIDL));
+            let _ns_2 = NamespaceGuard::new(&Namespace::new("2", Namespace::AIDL));
+            {
+                assert_eq!(current_namespace(), Namespace::new("2", Namespace::AIDL));
+                let _ns_3 = NamespaceGuard::new(&Namespace::new("3", Namespace::AIDL));
+                assert_eq!(current_namespace(), Namespace::new("3", Namespace::AIDL));
+            }
+            assert_eq!(current_namespace(), Namespace::new("2", Namespace::AIDL));
+        }
     }
 }

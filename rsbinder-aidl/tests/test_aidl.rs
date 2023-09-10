@@ -497,6 +497,56 @@ mod service_debug_info {
 }
 
 #[test]
+fn test_parcelable_const_name() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+parcelable IServiceManager {
+    const int DUMP_FLAG_PRIORITY_CRITICAL = 1 << 0;
+    const int DUMP_FLAG_PRIORITY_HIGH = 1 << 1;
+    const int DUMP_FLAG_PRIORITY_NORMAL = 1 << 2;
+    const int DUMP_FLAG_PRIORITY_DEFAULT = 1 << 3;
+    const int DUMP_FLAG_PRIORITY_ALL =
+             DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PRIORITY_HIGH
+             | DUMP_FLAG_PRIORITY_NORMAL | DUMP_FLAG_PRIORITY_DEFAULT;
+    const int DUMP_FLAG_PROTO = 1 << 4;
+}
+        "##,
+        r##"
+pub use i_service_manager::*;
+mod i_service_manager {
+    pub const DUMP_FLAG_PRIORITY_CRITICAL: i32 = 1;
+    pub const DUMP_FLAG_PRIORITY_HIGH: i32 = 2;
+    pub const DUMP_FLAG_PRIORITY_NORMAL: i32 = 4;
+    pub const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 8;
+    pub const DUMP_FLAG_PRIORITY_ALL: i32 = 15;
+    pub const DUMP_FLAG_PROTO: i32 = 16;
+    #[derive(Debug, Default)]
+    pub struct IServiceManager {
+    }
+    impl Default for IServiceManager {
+        fn default() -> Self {
+            Self {
+            }
+        }
+    }
+    impl rsbinder::Parcelable for IServiceManager {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            Ok(())
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(IServiceManager);
+    rsbinder::impl_deserialize_for_parcelable!(IServiceManager);
+    impl rsbinder::ParcelableMetadata for IServiceManager {
+        fn get_descriptor() -> &'static str { "IServiceManager" }
+    }
+}
+        "##)?;
+    Ok(())
+}
+
+#[test]
 fn test_parcelable() -> Result<(), Box<dyn Error>> {
     aidl_generator(r##"
         package android.os;
@@ -553,9 +603,25 @@ mod connection_info {
     Ok(())
 }
 
+const UNION: &str = r##"
+    @JavaDerive(toString=true, equals=true)
+    @RustDerive(Clone=true, PartialEq=true)
+    union Union {
+        int[] ns = {};
+        int n;
+        int m;
+        @utf8InCpp String s;
+        @nullable IBinder ibinder;
+        @utf8InCpp List<String> ss;
+        ByteEnum be;
+
+        const @utf8InCpp String S1 = "a string constant in union";
+    }
+"##;
+
 #[test]
 fn test_unions() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(&(r##"
         package android.aidl.tests;
 
         @Backing(type="byte")
@@ -566,20 +632,7 @@ fn test_unions() -> Result<(), Box<dyn Error>> {
             BAZ,
         }
 
-        @JavaDerive(toString=true, equals=true)
-        @RustDerive(Clone=true, PartialEq=true)
-        union Union {
-            int[] ns = {};
-            int n;
-            int m;
-            @utf8InCpp String s;
-            @nullable IBinder ibinder;
-            @utf8InCpp List<String> ss;
-            ByteEnum be;
-
-            const @utf8InCpp String S1 = "a string constant in union";
-        }
-        "##,
+        "##.to_owned() + UNION),
         r##"
 pub use byte_enum::*;
 mod byte_enum {
@@ -1006,46 +1059,189 @@ parcelable StructuredParcelable {
     @nullable Union u;
     @nullable Union shouldBeConstS1;
 
-    // IntEnum defaultWithFoo = IntEnum.FOO;
+    IntEnum defaultWithFoo = IntEnum.FOO;
 }
-        "##.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM),
+        "##.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM + UNION),
         r##"
 pub use structured_parcelable::*;
 mod structured_parcelable {
+    pub const BIT_0: i32 = 1;
+    pub const BIT_1: i32 = 2;
+    pub const BIT_2: i32 = 4;
     #[derive(Debug, Default)]
     pub struct StructuredParcelable {
+        pub should_contain_three_fs: Vec<i32>,
+        pub f: i32,
+        pub should_be_jerry: String,
+        pub should_be_byte_bar: crate::aidl::android::aidl::tests::ByteEnum,
+        pub should_be_int_bar: crate::aidl::android::aidl::tests::IntEnum,
+        pub should_be_long_bar: crate::aidl::android::aidl::tests::LongEnum,
+        pub should_contain_two_byte_foos: Vec<crate::aidl::android::aidl::tests::ByteEnum>,
+        pub should_contain_two_int_foos: Vec<crate::aidl::android::aidl::tests::IntEnum>,
+        pub should_contain_two_long_foos: Vec<crate::aidl::android::aidl::tests::LongEnum>,
+        pub string_defaults_to_foo: String,
+        pub byte_defaults_to_four: i8,
+        pub int_defaults_to_five: i32,
+        pub long_defaults_to_negative_seven: i64,
+        pub boolean_defaults_to_true: bool,
+        pub char_defaults_to_c: u16,
+        pub float_defaults_to_pi: f32,
+        pub double_with_default: f64,
+        pub array_defaults_to_123: Vec<i32>,
+        pub array_defaults_to_empty: Vec<i32>,
         pub int_8_1: Vec<i8>,
         pub int_32_1: Vec<i32>,
         pub int_64_1: Vec<i64>,
         pub hex_int_32_pos_1: i32,
         pub hex_int_64_pos_1: i32,
+        pub const_exprs_1: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_2: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_3: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_4: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_5: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_6: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_7: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_8: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_9: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub const_exprs_10: crate::aidl::android::aidl::tests::ConstantExpressionEnum,
+        pub add_string_1: String,
+        pub add_string_2: String,
+        pub should_set_bit_0_and_bit_2: i32,
+        pub u: Option<crate::aidl::android::aidl::tests::Union>,
+        pub should_be_const_s_1: Option<crate::aidl::android::aidl::tests::Union>,
+        pub default_with_foo: crate::aidl::android::aidl::tests::IntEnum,
     }
     impl Default for StructuredParcelable {
         fn default() -> Self {
             Self {
-                int_8_1 = vec![1,1,1,1,1,],
-                int_32_1 = vec![1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,],
-                int_64_1 = vec![1,1,1,1,1,1,1,1,1,1,],
-                hex_int_32_pos_1 = 1,
-                hex_int_64_pos_1 = 1,
+                should_contain_three_fs: Default::default(),
+                f: Default::default(),
+                should_be_jerry: Default::default(),
+                should_be_byte_bar: Default::default(),
+                should_be_int_bar: Default::default(),
+                should_be_long_bar: Default::default(),
+                should_contain_two_byte_foos: Default::default(),
+                should_contain_two_int_foos: Default::default(),
+                should_contain_two_long_foos: Default::default(),
+                string_defaults_to_foo: "foo".into(),
+                byte_defaults_to_four: 4,
+                int_defaults_to_five: 5,
+                long_defaults_to_negative_seven: -7,
+                boolean_defaults_to_true: true,
+                char_defaults_to_c: '\'',
+                float_defaults_to_pi: 3.14f32,
+                double_with_default: -314000000000000000f64,
+                array_defaults_to_123: vec![1,2,3,],
+                array_defaults_to_empty: Default::default(),
+                int_8_1: vec![1,1,1,1,1,],
+                int_32_1: vec![1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,],
+                int_64_1: vec![1,1,1,1,1,1,1,1,1,1,],
+                hex_int_32_pos_1: 1,
+                hex_int_64_pos_1: 1,
+                const_exprs_1: Default::default(),
+                const_exprs_2: Default::default(),
+                const_exprs_3: Default::default(),
+                const_exprs_4: Default::default(),
+                const_exprs_5: Default::default(),
+                const_exprs_6: Default::default(),
+                const_exprs_7: Default::default(),
+                const_exprs_8: Default::default(),
+                const_exprs_9: Default::default(),
+                const_exprs_10: Default::default(),
+                add_string_1: "hello world!".into(),
+                add_string_2: "The quick brown fox jumps over the lazy dog.".into(),
+                should_set_bit_0_and_bit_2: Default::default(),
+                u: Default::default(),
+                should_be_const_s_1: Default::default(),
+                default_with_foo: crate::aidl::android::aidl::tests::IntEnum::FOO,
             }
         }
     }
     impl rsbinder::Parcelable for StructuredParcelable {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.write(&self.should_contain_three_fs)?;
+            _parcel.write(&self.f)?;
+            _parcel.write(&self.should_be_jerry)?;
+            _parcel.write(&self.should_be_byte_bar)?;
+            _parcel.write(&self.should_be_int_bar)?;
+            _parcel.write(&self.should_be_long_bar)?;
+            _parcel.write(&self.should_contain_two_byte_foos)?;
+            _parcel.write(&self.should_contain_two_int_foos)?;
+            _parcel.write(&self.should_contain_two_long_foos)?;
+            _parcel.write(&self.string_defaults_to_foo)?;
+            _parcel.write(&self.byte_defaults_to_four)?;
+            _parcel.write(&self.int_defaults_to_five)?;
+            _parcel.write(&self.long_defaults_to_negative_seven)?;
+            _parcel.write(&self.boolean_defaults_to_true)?;
+            _parcel.write(&self.char_defaults_to_c)?;
+            _parcel.write(&self.float_defaults_to_pi)?;
+            _parcel.write(&self.double_with_default)?;
+            _parcel.write(&self.array_defaults_to_123)?;
+            _parcel.write(&self.array_defaults_to_empty)?;
             _parcel.write(&self.int_8_1)?;
             _parcel.write(&self.int_32_1)?;
             _parcel.write(&self.int_64_1)?;
             _parcel.write(&self.hex_int_32_pos_1)?;
             _parcel.write(&self.hex_int_64_pos_1)?;
+            _parcel.write(&self.const_exprs_1)?;
+            _parcel.write(&self.const_exprs_2)?;
+            _parcel.write(&self.const_exprs_3)?;
+            _parcel.write(&self.const_exprs_4)?;
+            _parcel.write(&self.const_exprs_5)?;
+            _parcel.write(&self.const_exprs_6)?;
+            _parcel.write(&self.const_exprs_7)?;
+            _parcel.write(&self.const_exprs_8)?;
+            _parcel.write(&self.const_exprs_9)?;
+            _parcel.write(&self.const_exprs_10)?;
+            _parcel.write(&self.add_string_1)?;
+            _parcel.write(&self.add_string_2)?;
+            _parcel.write(&self.should_set_bit_0_and_bit_2)?;
+            _parcel.write(&self.u)?;
+            _parcel.write(&self.should_be_const_s_1)?;
+            _parcel.write(&self.default_with_foo)?;
             Ok(())
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            self.should_contain_three_fs = _parcel.read()?;
+            self.f = _parcel.read()?;
+            self.should_be_jerry = _parcel.read()?;
+            self.should_be_byte_bar = _parcel.read()?;
+            self.should_be_int_bar = _parcel.read()?;
+            self.should_be_long_bar = _parcel.read()?;
+            self.should_contain_two_byte_foos = _parcel.read()?;
+            self.should_contain_two_int_foos = _parcel.read()?;
+            self.should_contain_two_long_foos = _parcel.read()?;
+            self.string_defaults_to_foo = _parcel.read()?;
+            self.byte_defaults_to_four = _parcel.read()?;
+            self.int_defaults_to_five = _parcel.read()?;
+            self.long_defaults_to_negative_seven = _parcel.read()?;
+            self.boolean_defaults_to_true = _parcel.read()?;
+            self.char_defaults_to_c = _parcel.read()?;
+            self.float_defaults_to_pi = _parcel.read()?;
+            self.double_with_default = _parcel.read()?;
+            self.array_defaults_to_123 = _parcel.read()?;
+            self.array_defaults_to_empty = _parcel.read()?;
             self.int_8_1 = _parcel.read()?;
             self.int_32_1 = _parcel.read()?;
             self.int_64_1 = _parcel.read()?;
             self.hex_int_32_pos_1 = _parcel.read()?;
             self.hex_int_64_pos_1 = _parcel.read()?;
+            self.const_exprs_1 = _parcel.read()?;
+            self.const_exprs_2 = _parcel.read()?;
+            self.const_exprs_3 = _parcel.read()?;
+            self.const_exprs_4 = _parcel.read()?;
+            self.const_exprs_5 = _parcel.read()?;
+            self.const_exprs_6 = _parcel.read()?;
+            self.const_exprs_7 = _parcel.read()?;
+            self.const_exprs_8 = _parcel.read()?;
+            self.const_exprs_9 = _parcel.read()?;
+            self.const_exprs_10 = _parcel.read()?;
+            self.add_string_1 = _parcel.read()?;
+            self.add_string_2 = _parcel.read()?;
+            self.should_set_bit_0_and_bit_2 = _parcel.read()?;
+            self.u = _parcel.read()?;
+            self.should_be_const_s_1 = _parcel.read()?;
+            self.default_with_foo = _parcel.read()?;
             Ok(())
         }
     }
@@ -1100,6 +1296,118 @@ mod long_enum {
             FOO = 100000000000,
             BAR = 200000000000,
             BAZ = 200000000001,
+        }
+    }
+}
+pub use union::*;
+mod union {
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Union {
+        Ns(Vec<i32>),
+        N(i32),
+        M(i32),
+        S(String),
+        Ibinder(Option<rsbinder::StrongIBinder>),
+        Ss(Vec<String>),
+        Be(crate::aidl::android::aidl::tests::ByteEnum),
+    }
+    pub const S_1: &str = "a string constant in union";
+    impl Default for Union {
+        fn default() -> Self {
+            Self::Ns(Default::default())
+        }
+    }
+    impl rsbinder::Parcelable for Union {
+        fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            match self {
+                Self::Ns(v) => {
+                    parcel.write(&0i32)?;
+                    parcel.write(v)
+                }
+                Self::N(v) => {
+                    parcel.write(&1i32)?;
+                    parcel.write(v)
+                }
+                Self::M(v) => {
+                    parcel.write(&2i32)?;
+                    parcel.write(v)
+                }
+                Self::S(v) => {
+                    parcel.write(&3i32)?;
+                    parcel.write(v)
+                }
+                Self::Ibinder(v) => {
+                    parcel.write(&4i32)?;
+                    parcel.write(v)
+                }
+                Self::Ss(v) => {
+                    parcel.write(&5i32)?;
+                    parcel.write(v)
+                }
+                Self::Be(v) => {
+                    parcel.write(&6i32)?;
+                    parcel.write(v)
+                }
+            }
+        }
+        fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            let tag: i32 = parcel.read()?;
+            match tag {
+                0 => {
+                    let value: Vec<i32> = parcel.read()?;
+                    *self = Self::Ns(value);
+                    Ok(())
+                }
+                1 => {
+                    let value: i32 = parcel.read()?;
+                    *self = Self::N(value);
+                    Ok(())
+                }
+                2 => {
+                    let value: i32 = parcel.read()?;
+                    *self = Self::M(value);
+                    Ok(())
+                }
+                3 => {
+                    let value: String = parcel.read()?;
+                    *self = Self::S(value);
+                    Ok(())
+                }
+                4 => {
+                    let value: Option<rsbinder::StrongIBinder> = parcel.read()?;
+                    *self = Self::Ibinder(value);
+                    Ok(())
+                }
+                5 => {
+                    let value: Vec<String> = parcel.read()?;
+                    *self = Self::Ss(value);
+                    Ok(())
+                }
+                6 => {
+                    let value: crate::aidl::android::aidl::tests::ByteEnum = parcel.read()?;
+                    *self = Self::Be(value);
+                    Ok(())
+                }
+                _ => Err(rsbinder::StatusCode::BadValue.into()),
+            }
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(Union);
+    rsbinder::impl_deserialize_for_parcelable!(Union);
+    impl rsbinder::ParcelableMetadata for Union {
+        fn get_descriptor() -> &'static str { "android.aidl.tests.Union" }
+    }
+    pub mod tag {
+        rsbinder::declare_binder_enum! {
+            Tag : [i32; 7] {
+                NS = 0,
+                N = 1,
+                M = 2,
+                S = 3,
+                IBINDER = 4,
+                SS = 5,
+                BE = 6,
+            }
         }
     }
 }

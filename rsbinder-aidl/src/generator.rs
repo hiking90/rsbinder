@@ -4,7 +4,7 @@ use std::error::Error;
 use tera::Tera;
 use convert_case::{Case, Casing};
 
-use crate::{parser, add_indent};
+use crate::{parser, add_indent, Namespace};
 
 const ENUM_TEMPLATE: &str = r##"
 pub use {{mod}}::*;
@@ -211,14 +211,6 @@ lazy_static! {
     };
 }
 
-// decl.namespace has "aidl::android::os" and it must be converted from "aidl::android::os" to "android.os".
-fn to_namespace(namespace: &str, name: &str) -> String {
-    let namespace = namespace.trim_start_matches(&(crate::DEFAULT_NAMESPACE.to_owned() + "::"));
-    let namespace = namespace.replace("::", ".");
-
-    format!("{namespace}.{name}")
-}
-
 fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String, Vec<String>, String, String, bool), Box<dyn Error>> {
     let mut build_params = String::new();
     let mut read_params = String::new();
@@ -280,7 +272,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
     context.insert("mod", &decl.name.to_case(Case::Snake));
     context.insert("name", &decl.name);
-    context.insert("namespace", &to_namespace(&decl.namespace, &decl.name));
+    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("const_members", &const_members);
     context.insert("fn_members", &fn_members);
     context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
@@ -320,7 +312,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 
     context.insert("mod", &decl.name.to_case(Case::Snake));
     context.insert("name", &decl.name);
-    context.insert("namespace", &to_namespace(&decl.namespace, &decl.name));
+    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
 
@@ -336,7 +328,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
     let mut enum_val: i64 = 0;
     for enumerator in &decl.enumerator_list {
         if let Some(const_expr) = &enumerator.const_expr {
-            enum_val = const_expr.calculate(None).to_i64(None);
+            enum_val = const_expr.calculate().to_i64();
         }
         members.push((&enumerator.identifier, enum_val));
         enum_val += 1;
@@ -377,7 +369,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     context.insert("mod", &decl.name.to_case(Case::Snake));
     context.insert("union_name", &decl.name);
-    context.insert("namespace", &to_namespace(&decl.namespace, &decl.name));
+    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
 
@@ -393,10 +385,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
     for decl in decls {
         match decl {
             parser::Declaration::Interface(decl) => {
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_interface(decl, indent)?;
             }
 
             parser::Declaration::Parcelable(decl) => {
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_parcelable(decl, indent)?;
             }
 
@@ -405,10 +399,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
             }
 
             parser::Declaration::Enum(decl) => {
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_enum(decl, indent)?;
             }
 
             parser::Declaration::Union(decl) => {
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_union(decl, indent)?;
             }
         }

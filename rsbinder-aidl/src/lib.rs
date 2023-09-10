@@ -13,6 +13,38 @@ pub use generator::gen_document;
 
 pub const DEFAULT_NAMESPACE: &str = "aidl";
 
+#[derive(Default, Hash, Eq, PartialEq, Debug, Clone)]
+pub struct Namespace{
+    ns: Vec<String>,
+}
+
+impl Namespace {
+    pub const AIDL: &str = ".";
+    pub const RUST: &str = "::";
+
+    pub fn new(namespace: &str, style: &str) -> Self {
+        Self {
+            ns: namespace.split(style).map(|s| s.into()).collect(),
+        }
+    }
+
+    pub fn push(&mut self, name: &str) {
+        self.ns.push(name.into())
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        self.ns.pop()
+    }
+
+    pub fn to_string(&self, style: &str) -> String {
+        if style == Self::AIDL {
+            self.ns.join(style)
+        } else {
+            DEFAULT_NAMESPACE.to_owned() + Self::RUST + &self.ns.join(style)
+        }
+    }
+}
+
 pub fn indent_space(step: usize) -> String {
     let indent = "    ";
     let mut ret = String::new();
