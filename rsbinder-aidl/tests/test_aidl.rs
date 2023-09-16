@@ -12,6 +12,9 @@ fn test_service_manager() -> Result<(), Box<dyn Error>> {
         .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
         .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
         .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
+        .source(PathBuf::from("../aidl/android/os/PersistableBundle.aidl"))
+        .source(PathBuf::from("../aidl/android/content/AttributionSource.aidl"))
+        .source(PathBuf::from("../aidl/android/aidl/tests"))
         .generate()?;
 
     Ok(())

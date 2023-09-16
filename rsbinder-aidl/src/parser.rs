@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::sync::Mutex;
 use std::collections::HashMap;
 use std::error::Error;
 
@@ -16,14 +15,19 @@ use crate::{Namespace};
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
+    static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
 }
 
 pub struct NamespaceGuard();
 
 impl NamespaceGuard {
-    pub fn new(ns: &Namespace) -> Self {
+    pub fn new(ns: &Namespace, name: &str) -> Self {
         NAMESPACE_STACK.with(|vec| {
-            vec.borrow_mut().push(ns.clone());
+            let mut ns = ns.clone();
+            if name.is_empty() == false {
+                ns.push(name);
+            }
+            vec.borrow_mut().push(ns);
         });
         Self()
     }
@@ -44,6 +48,33 @@ pub fn current_namespace() -> Namespace {
     })
 }
 
+pub fn set_current_document(document: &Document) {
+    DOCUMENT.with(|doc| {
+        let mut doc = doc.borrow_mut();
+
+        doc.package = document.package.clone();
+        doc.imports = document.imports.clone();
+    })
+}
+
+fn make_ns_from(namespace: &Namespace) -> Vec<Namespace> {
+    let mut cur_ns = current_namespace();
+    let new_len = if cur_ns.ns.len() > namespace.ns.len() { cur_ns.ns.len() - namespace.ns.len() } else { 0 };
+    cur_ns.ns.truncate(new_len);
+
+    let mut first_ns = cur_ns.clone();
+    first_ns.ns.append(&mut namespace.ns.clone());
+
+    if new_len > 0 {
+        cur_ns.ns.truncate(new_len -1);
+        cur_ns.ns.append(&mut namespace.ns.clone());
+
+        vec![first_ns, cur_ns]
+    } else {
+        vec![first_ns]
+    }
+}
+
 pub fn lookup_name_decl(name: &str, style: &str, is_type: bool) -> (Declaration, Namespace, String) {
     let mut namespace = Namespace::new(name, style);
 
@@ -53,16 +84,26 @@ pub fn lookup_name_decl(name: &str, style: &str, is_type: bool) -> (Declaration,
         "".into()
     };
 
-    let mut cur_ns = current_namespace();
-    let new_len = if cur_ns.ns.len() > namespace.ns.len() { cur_ns.ns.len() - namespace.ns.len() } else { 0 };
-    cur_ns.ns.truncate(new_len);
-    cur_ns.ns.append(&mut namespace.ns);
+    let cur_ns = if namespace.ns.len() > 0 {
+        DOCUMENT.with(|curr_doc| {
+            if let Some(imported) = curr_doc.borrow().imports.get(&namespace.ns[0]) {
+                vec![Namespace::new(imported, Namespace::AIDL)]
+            } else {
+                make_ns_from(&namespace)
+            }
+        })
+    } else {
+        make_ns_from(&namespace)
+    };
 
     DECLARATION_MAP.with(|hashmap| {
-        let decl = hashmap.borrow().get(&cur_ns)
-            .expect(&format!("Unknown namespace: {:?} for name: {}", cur_ns, name)).clone();
-
-        (decl, cur_ns, name)
+        for ns in &cur_ns {
+            if let Some(decl) = hashmap.borrow().get(&ns) {
+                return (decl.clone(), ns.clone(), name);
+            }
+        }
+        panic!("Unknown namespace: {:?} for name: [{}]\n{:?}",
+            cur_ns, name, hashmap.borrow().keys());
     })
 }
 
@@ -84,7 +125,7 @@ fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Name
                     return Some(make_const_expr(decl.const_expr.as_ref(), &decl_set));
                 }
             },
-            _ => unreachable!(),
+            _ => unreachable!("Unsupported declaration {:?}\n{:?}\n{:?}", decl, decl_set.1, decl_set.2),
         }
     }
     None
@@ -112,7 +153,6 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
             for enumerator in &decl.enumerator_list {
                 if enumerator.identifier == decl_set.2 {
                     return Some(make_const_expr(None, &decl_set));
-                    // return make_const_expr(enumerator.const_expr.as_ref(), &decl_set);
                 }
             }
             lookup_name_members(&decl.members, &decl_set)
@@ -208,6 +248,7 @@ impl InterfaceDecl {
 
 #[derive(Debug, Default, Clone)]
 pub struct ParcelableDecl {
+    pub annotation_list: Vec<Annotation>,
     pub namespace: Namespace,
     pub name: String,
     pub type_params: Vec<String>,
@@ -218,27 +259,6 @@ pub struct ParcelableDecl {
 
 impl ParcelableDecl {
     pub fn pre_process(&mut self) {
-        // let mut dict = HashMap::new();
-        // for decl in &mut self.members {
-        //     match decl {
-        //         Declaration::Interface(decl) => { decl.pre_process(); }
-        //         Declaration::Parcelable(decl) => { decl.pre_process(); }
-        //         Declaration::Variable(decl) => {
-        //             if let Some(expr) = &decl.const_expr {
-        //                 dict.insert(decl.identifier.clone(), expr.clone());
-        //             }
-        //         },
-        //         _ => {}
-        //     }
-        // }
-
-        // let mut calculated = HashMap::new();
-        // for (key, expr) in dict.iter() {
-        //     calculated.insert(key.into(), expr.calculate());
-        // }
-
-        // self.name_dict = Some(calculated);
-
         for decl in &mut self.members {
             if let Declaration::Variable(decl) = decl {
                 decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate());
@@ -438,7 +458,7 @@ impl Type {
     pub fn type_cast(&self) -> TypeCast {
         let mut cast = TypeCast::new(&self.non_array_type);
 
-        cast.set_more(&self.array_types, is_nullable(&self.annotation_list));
+        cast.set_more(&self.array_types, check_annotation_list(&self.annotation_list, AnnotationType::IsNullable));
 
         cast
     }
@@ -452,6 +472,7 @@ pub struct TypeCast {
     pub is_primitive: bool,
     pub is_string: bool,
     pub is_vector: bool,
+    pub is_map: bool,
     pub is_nullable: bool,
     pub value_type: ValueType,
 }
@@ -462,6 +483,7 @@ impl TypeCast {
         let mut is_primitive = true;
         let mut is_string = false;
         let mut is_vector = false;
+        let mut is_map = false;
         let type_name = match aidl_type.name.as_str() {
             "boolean" => ("bool".to_owned(), ValueType::Bool(false)),
             "byte" => ("i8".to_owned(), ValueType::Int8(0)),
@@ -488,15 +510,26 @@ impl TypeCast {
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
                 }
             }
+            // "Map" => {
+            //     is_primitive = false;
+            //     is_map = true;
+            //     ("HashMap".to_owned(), ValueType::Map())
+            // }
+            "FileDescriptor" => {
+                is_primitive = false;
+                ("rsbinder::FileDescriptor".to_owned(), ValueType::FileDescriptor)
+            }
             "ParcelFileDescriptor" => {
-                todo!("ParcelFileDescriptor is not implemented yet.")
+                is_primitive = false;
+                ("rsbinder::ParcelFileDescriptor".to_owned(), ValueType::FileDescriptor)
             }
             "ParcelableHolder" => {
-                todo!("ParcelableHolder is not implemented yet.")
+                is_primitive = false;
+                ("rsbinder::ParcelableHolder".to_owned(), ValueType::Holder)
             }
             _ => {
                 is_primitive = false;
-                let decl_set = lookup_name_decl(aidl_type.name.as_str(), Namespace::RUST, true);
+                let decl_set = lookup_name_decl(aidl_type.name.as_str(), Namespace::AIDL, true);
                 let type_name = format!("crate::{}", decl_set.1.to_string(Namespace::RUST));
 
                 match decl_set.0 {
@@ -507,21 +540,6 @@ impl TypeCast {
                     }
                     _ => (type_name.to_owned(), ValueType::UserDefined),
                 }
-
-                // if let Some(decl) = lookup_name(aidl_type.name.as_str()) {
-                //     let type_name = format!("crate::{}::{}", decl.namespace(), aidl_type.name.as_str());
-
-                //     match decl {
-                //         Declaration::Interface(_) => {
-                //             is_declared = true;
-                //             let type_name = format!("std::sync::Arc<dyn {}>", type_name);
-                //             (type_name.clone(), ValueType::UserDefined)
-                //         }
-                //         _ => (type_name.to_owned(), ValueType::UserDefined),
-                //     }
-                // } else {
-                //     (aidl_type.name.to_owned(), ValueType::UserDefined)
-                // }
             }
         };
 
@@ -533,6 +551,7 @@ impl TypeCast {
             is_primitive,
             is_string,
             is_vector,
+            is_map,
             is_nullable: false,
         }
     }
@@ -624,11 +643,18 @@ impl TypeCast {
     }
 }
 
+#[derive(PartialEq)]
+pub enum AnnotationType {
+    IsNullable,
+    JavaOnly,
+}
 
-pub fn is_nullable(annotation_list: &Vec<Annotation>) -> bool {
+pub fn check_annotation_list(annotation_list: &Vec<Annotation>, query_type: AnnotationType) -> bool {
     for annotation in annotation_list {
-        if annotation.annotation == "@nullable" {
-            return true
+        match query_type {
+            AnnotationType::IsNullable if annotation.annotation == "@nullable" => return true,
+            AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => return true,
+            _ => {}
         }
     }
 
@@ -798,7 +824,6 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
     lhs
 }
 
-
 fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     match pair.as_rule() {
         Rule::C_STR => {
@@ -827,15 +852,6 @@ fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
     }
 
     expr.expect("Parsing error in String expression.")
-
-    // if expr_list.len() > 1 {
-    //     // ConstExpr::new(ValueType::Array(expr_list))
-    //     for expr in expr_list {
-
-    //     }
-    // } else {
-    //     expr_list.pop().unwrap()
-    // }
 }
 
 fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
@@ -1173,8 +1189,8 @@ fn parse_optional_type_params(pairs: pest::iterators::Pairs<Rule>) -> Vec<String
     res
 }
 
-fn parse_parcelable_decl(pairs: pest::iterators::Pairs<Rule>) -> Declaration {
-    let mut parcelable = ParcelableDecl::default();
+fn parse_parcelable_decl(annotation_list: Vec<Annotation>, pairs: pest::iterators::Pairs<Rule>) -> Declaration {
+    let mut parcelable = ParcelableDecl{ annotation_list, .. Default::default() };
 
     for pair in pairs {
         match pair.as_rule() {
@@ -1290,7 +1306,7 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
             }
 
             Rule::parcelable_decl => {
-                declarations.push(parse_parcelable_decl(pair.into_inner()));
+                declarations.push(parse_parcelable_decl(annotation_list.clone(), pair.into_inner()));
             }
             Rule::enum_decl => {
                 declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner()));
@@ -1498,16 +1514,16 @@ mod tests {
 
     #[test]
     fn test_namespace_guard() {
-        let _ns_1 = NamespaceGuard::new(&Namespace::new("1", Namespace::AIDL));
+        let _ns_1 = NamespaceGuard::new(&Namespace::new("1", Namespace::AIDL), "1");
         {
-            assert_eq!(current_namespace(), Namespace::new("1", Namespace::AIDL));
-            let _ns_2 = NamespaceGuard::new(&Namespace::new("2", Namespace::AIDL));
+            assert_eq!(current_namespace(), Namespace::new("1.1", Namespace::AIDL));
+            let _ns_2 = NamespaceGuard::new(&Namespace::new("2", Namespace::AIDL), "2");
             {
-                assert_eq!(current_namespace(), Namespace::new("2", Namespace::AIDL));
-                let _ns_3 = NamespaceGuard::new(&Namespace::new("3", Namespace::AIDL));
-                assert_eq!(current_namespace(), Namespace::new("3", Namespace::AIDL));
+                assert_eq!(current_namespace(), Namespace::new("2.2", Namespace::AIDL));
+                let _ns_3 = NamespaceGuard::new(&Namespace::new("3", Namespace::AIDL), "3");
+                assert_eq!(current_namespace(), Namespace::new("3.3", Namespace::AIDL));
             }
-            assert_eq!(current_namespace(), Namespace::new("2", Namespace::AIDL));
+            assert_eq!(current_namespace(), Namespace::new("2.2", Namespace::AIDL));
         }
     }
 }

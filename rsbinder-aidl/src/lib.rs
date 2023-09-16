@@ -109,6 +109,7 @@ impl Builder {
     }
 
     fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
+        println!("Parsing: {:?}", filename);
         let unparsed_file = fs::read_to_string(filename.clone())?;
         let document = parser::parse_document(&unparsed_file)?;
 
@@ -202,6 +203,7 @@ impl Builder {
 
         let mut package_list = Vec::new();
         for document in document_list {
+            println!("Generating: {}", document.0);
             let package = generator::gen_document(&document.1)?;
             package_list.push((package.0, package.1, document.0));
         }

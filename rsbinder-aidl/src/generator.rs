@@ -245,15 +245,20 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
         // write_params.push(type_cast.as_ref(&arg_str.0));
     });
 
-    let return_type = method.r#type.type_cast().return_type(parser::is_nullable(&method.annotation_list));
+    let return_type = method.r#type.type_cast()
+        .return_type(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
 
     Ok((method.identifier.to_case(Case::Snake),
         args, return_type, write_params, build_params, read_params, method.oneway))
 }
 
-
 fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut decl = arg_decl.clone();
+
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+        return Ok(String::new())
+    }
+
     decl.pre_process();
 
     let mut const_members = Vec::new();
@@ -288,6 +293,16 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
 fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut decl = arg_decl.clone();
+
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+        println!("Parcelable {} is only used for Java.", decl.name);
+        return Ok(String::new())
+    }
+    if decl.cpp_header.is_empty() == false {
+        println!("cpp_header {} for Parcelable {} is not supported.", decl.cpp_header, decl.name);
+        return Ok(String::new())
+    }
+
     decl.pre_process();
 
     let mut constant_members = Vec::new();
@@ -322,6 +337,10 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 }
 
 fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+        return Ok(String::new())
+    }
+
     let type_cast = &parser::get_backing_type(&decl.annotation_list);
 
     let mut members = Vec::new();
@@ -348,6 +367,10 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 }
 
 fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+        return Ok(String::new())
+    }
+
     let mut constant_members = Vec::new();
     let mut members = Vec::new();
 
@@ -385,12 +408,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
     for decl in decls {
         match decl {
             parser::Declaration::Interface(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
                 content += &gen_interface(decl, indent)?;
             }
 
             parser::Declaration::Parcelable(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
                 content += &gen_parcelable(decl, indent)?;
             }
 
@@ -399,12 +422,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
             }
 
             parser::Declaration::Enum(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
                 content += &gen_enum(decl, indent)?;
             }
 
             parser::Declaration::Union(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
                 content += &gen_union(decl, indent)?;
             }
         }
@@ -414,6 +437,8 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
 }
 
 pub fn gen_document(document: &parser::Document) -> Result<(String, String), Box<dyn Error>> {
+    parser::set_current_document(document);
+
     let mut content = String::new();
 
     content += &gen_declations(&document.decls, 0)?;

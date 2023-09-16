@@ -1,5 +1,4 @@
 use crate::parser;
-use std::collections::HashMap;
 
 macro_rules! arithmetic_bit_op {
     ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
@@ -78,11 +77,12 @@ pub enum ValueType {
     Int8(i8),
     Int32(i32),
     Int64(i64),
-    Array(Vec<ConstExpr>),
     Char(char),
     String(String),
     Float(f64),
     Double(f64),
+    Array(Vec<ConstExpr>),
+    Map(Box<ConstExpr>, Box<ConstExpr>),
     Expr {
         lhs: Box<ConstExpr>,
         operator: String,
@@ -116,23 +116,24 @@ impl ValueType {
 
     fn order(&self) -> u32 {
         match self {
-            ValueType::Void => 0,
-            ValueType::Name(_) => 1,
-            ValueType::Bool(_) => 2,
-            ValueType::Int8(_) => 3,
-            ValueType::Int32(_) => 4,
-            ValueType::Int64(_) => 5,
-            ValueType::Array(_) => 6,
-            ValueType::Char(_) => 7,
-            ValueType::String(_) => 8,
-            ValueType::Float(_) => 9,
-            ValueType::Double(_) => 10,
-            ValueType::Expr{..} => 11,
-            ValueType::Unary{..} => 12,
-            ValueType::IBinder => 13,
-            ValueType::FileDescriptor => 14,
-            ValueType::Holder => 15,
-            ValueType::UserDefined => 16,
+            ValueType::Void =>              0,
+            ValueType::Name(_) =>           1,
+            ValueType::Bool(_) =>           2,
+            ValueType::Int8(_) =>           3,
+            ValueType::Int32(_) =>          4,
+            ValueType::Int64(_) =>          5,
+            ValueType::Char(_) =>           6,
+            ValueType::String(_) =>         7,
+            ValueType::Float(_) =>          8,
+            ValueType::Double(_) =>         9,
+            ValueType::Array(_) =>          10,
+            ValueType::Map(_, _) =>         11,
+            ValueType::Expr{..} =>          12,
+            ValueType::Unary{..} =>         13,
+            ValueType::IBinder =>           14,
+            ValueType::FileDescriptor =>    15,
+            ValueType::Holder =>            16,
+            ValueType::UserDefined =>       17,
         }
     }
 
@@ -427,7 +428,13 @@ impl ValueType {
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
-                    Some(expr) => expr.calculate(),
+                    Some(expr) => {
+                        if let ValueType::Name(_) = expr.value {
+                            expr
+                        } else {
+                            expr.calculate()
+                        }
+                    }
                     None => ConstExpr::new(self.clone()),
                 }
             }
@@ -515,6 +522,7 @@ impl PartialOrd for ConstExpr {
 #[derive(Debug, Clone, Default)]
 pub struct ConstExpr {
     pub raw_expr: String,
+    pub is_calculated: bool,
 
     pub value: ValueType,
 }
@@ -628,7 +636,13 @@ impl ConstExpr {
     }
 
     pub fn calculate(&self) -> ConstExpr {
-        self.value.calculate()
+        if self.is_calculated == true {
+            self.clone()
+        } else {
+            let mut expr = self.value.calculate();
+            expr.is_calculated = true;
+            expr
+        }
     }
 }
 
