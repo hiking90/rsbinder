@@ -12,6 +12,17 @@ fn test_service_manager() -> Result<(), Box<dyn Error>> {
         .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
         .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
         .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
+        // .source(PathBuf::from("../aidl/android/os/PersistableBundle.aidl"))
+        // .source(PathBuf::from("../aidl/android/content/AttributionSource.aidl"))
+        // .source(PathBuf::from("../aidl/android/aidl/tests"))
+        .generate()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_aidl_tests() -> Result<(), Box<dyn Error>> {
+    Builder::new()
         .source(PathBuf::from("../aidl/android/os/PersistableBundle.aidl"))
         .source(PathBuf::from("../aidl/android/content/AttributionSource.aidl"))
         .source(PathBuf::from("../aidl/android/aidl/tests"))
@@ -41,6 +52,196 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(res.1.trim(), expect.trim());
     Ok(())
+}
+
+#[test]
+fn test_nested_type() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+package android.aidl.tests.nested;
+
+parcelable ParcelableWithNested {
+    enum Status { OK, NOT_OK }
+    Status status = Status.OK;
+}
+
+interface INestedService {
+    @RustDerive(PartialEq=true)
+    parcelable Result {
+        ParcelableWithNested.Status status = ParcelableWithNested.Status.OK;
+    }
+
+    Result flipStatus(in ParcelableWithNested p);
+
+    interface ICallback {
+        void done(ParcelableWithNested.Status status);
+    }
+    void flipStatusWithCallback(ParcelableWithNested.Status status, ICallback cb);
+}
+"##,
+    r##"
+pub use parcelable_with_nested::*;
+mod parcelable_with_nested {
+    #[derive(Debug)]
+    pub struct ParcelableWithNested {
+        pub status: crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status,
+    }
+    impl Default for ParcelableWithNested {
+        fn default() -> Self {
+            Self {
+                status: crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status::OK,
+            }
+        }
+    }
+    impl rsbinder::Parcelable for ParcelableWithNested {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.write(&self.status)?;
+            Ok(())
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            self.status = _parcel.read()?;
+            Ok(())
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(ParcelableWithNested);
+    rsbinder::impl_deserialize_for_parcelable!(ParcelableWithNested);
+    impl rsbinder::ParcelableMetadata for ParcelableWithNested {
+        fn get_descriptor() -> &'static str { "android.aidl.tests.nested.ParcelableWithNested" }
+    }
+    pub use status::*;
+    mod status {
+        rsbinder::declare_binder_enum! {
+            Status : [i8; 2] {
+                OK = 0,
+                NOT_OK = 1,
+            }
+        }
+    }
+}
+pub use i_nested_service::*;
+mod i_nested_service {
+    pub trait INestedService: rsbinder::Interface + Send {
+        fn flip_status(&self, _arg_p: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested) -> rsbinder::Result<crate::aidl::android::aidl::tests::nested::INestedService::Result>;
+        fn flip_status_with_callback(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status, _arg_cb: &std::sync::Arc<dyn crate::aidl::android::aidl::tests::nested::INestedService::ICallback>) -> rsbinder::Result<()>;
+    }
+    pub(crate) mod transactions {
+        pub(crate) const FLIP_STATUS: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
+        pub(crate) const FLIP_STATUS_WITH_CALLBACK: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;
+    }
+    rsbinder::declare_binder_interface! {
+        INestedService["android.aidl.tests.nested.INestedService"] {
+            native: BnNestedService(on_transact),
+            proxy: BpNestedService,
+        }
+    }
+    impl BpNestedService {
+        fn build_parcel_flip_status(&self, _arg_p: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested) -> rsbinder::Result<rsbinder::Parcel> {
+            let mut data = self.handle.prepare_transact(true)?;
+            data.write(_arg_p)?;
+            Ok(data)
+        }
+        fn read_response_flip_status(&self, _arg_p: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<crate::aidl::android::aidl::tests::nested::INestedService::Result> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
+            let _aidl_return: crate::aidl::android::aidl::tests::nested::INestedService::Result = _aidl_reply.read()?;
+            Ok(_aidl_return)
+        }
+        fn build_parcel_flip_status_with_callback(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status, _arg_cb: &std::sync::Arc<dyn crate::aidl::android::aidl::tests::nested::INestedService::ICallback>) -> rsbinder::Result<rsbinder::Parcel> {
+            let mut data = self.handle.prepare_transact(true)?;
+            data.write(_arg_status)?;
+            data.write(_arg_cb.as_ref())?;
+            Ok(data)
+        }
+        fn read_response_flip_status_with_callback(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status, _arg_cb: &std::sync::Arc<dyn crate::aidl::android::aidl::tests::nested::INestedService::ICallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
+            Ok(())
+        }
+    }
+    impl INestedService for BpNestedService {
+        fn flip_status(&self, _arg_p: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested) -> rsbinder::Result<crate::aidl::android::aidl::tests::nested::INestedService::Result> {
+            let _aidl_data = self.build_parcel_flip_status(_arg_p, )?;
+            let _aidl_reply = self.handle.submit_transact(transactions::FLIP_STATUS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+            self.read_response_flip_status(_arg_p, _aidl_reply)
+        }
+        fn flip_status_with_callback(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status, _arg_cb: &std::sync::Arc<dyn crate::aidl::android::aidl::tests::nested::INestedService::ICallback>) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_flip_status_with_callback(_arg_status, _arg_cb, )?;
+            let _aidl_reply = self.handle.submit_transact(transactions::FLIP_STATUS_WITH_CALLBACK, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+            self.read_response_flip_status_with_callback(_arg_status, _arg_cb, _aidl_reply)
+        }
+    }
+    fn on_transact(
+        _service: &dyn INestedService, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
+        Ok(())
+    }
+    pub use result::*;
+    mod result {
+        #[derive(Debug)]
+        pub struct Result {
+            pub status: crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status,
+        }
+        impl Default for Result {
+            fn default() -> Self {
+                Self {
+                    status: crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status::OK,
+                }
+            }
+        }
+        impl rsbinder::Parcelable for Result {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.write(&self.status)?;
+                Ok(())
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                self.status = _parcel.read()?;
+                Ok(())
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(Result);
+        rsbinder::impl_deserialize_for_parcelable!(Result);
+        impl rsbinder::ParcelableMetadata for Result {
+            fn get_descriptor() -> &'static str { "android.aidl.tests.nested.INestedService.Result" }
+        }
+    }
+    pub use i_callback::*;
+    mod i_callback {
+        pub trait ICallback: rsbinder::Interface + Send {
+            fn done(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status) -> rsbinder::Result<()>;
+        }
+        pub(crate) mod transactions {
+            pub(crate) const DONE: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
+        }
+        rsbinder::declare_binder_interface! {
+            ICallback["android.aidl.tests.nested.INestedService.ICallback"] {
+                native: BnCallback(on_transact),
+                proxy: BpCallback,
+            }
+        }
+        impl BpCallback {
+            fn build_parcel_done(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_status)?;
+                Ok(data)
+            }
+            fn read_response_done(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+        }
+        impl ICallback for BpCallback {
+            fn done(&self, _arg_status: &crate::aidl::android::aidl::tests::nested::ParcelableWithNested::Status) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_done(_arg_status, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::DONE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_done(_arg_status, _aidl_reply)
+            }
+        }
+        fn on_transact(
+            _service: &dyn ICallback, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+}
+    "##)
 }
 
 #[test]
@@ -96,7 +297,7 @@ parcelable ServiceDebugInfo {
             "##, r##"
 pub use connection_info::*;
 mod connection_info {
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct ConnectionInfo {
         pub ip_address: String,
         pub port: i32,
@@ -130,7 +331,7 @@ mod connection_info {
 pub use i_client_callback::*;
 mod i_client_callback {
     pub trait IClientCallback: rsbinder::Interface + Send {
-        fn on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()>;
+        fn on_clients(&self, _arg_registered: &rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()>;
     }
     pub(crate) mod transactions {
         pub(crate) const ON_CLIENTS: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
@@ -142,19 +343,19 @@ mod i_client_callback {
         }
     }
     impl BpClientCallback {
-        fn build_parcel_on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_on_clients(&self, _arg_registered: &rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
-            data.write(&_arg_registered)?;
+            data.write(_arg_registered)?;
             data.write(&_arg_has_clients)?;
             Ok(data)
         }
-        fn read_response_on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+        fn read_response_on_clients(&self, _arg_registered: &rsbinder::StrongIBinder, _arg_has_clients: bool, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
             Ok(())
         }
     }
     impl IClientCallback for BpClientCallback {
-        fn on_clients(&self, _arg_registered: rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_on_clients(_arg_registered.clone(), _arg_has_clients, )?;
+        fn on_clients(&self, _arg_registered: &rsbinder::StrongIBinder, _arg_has_clients: bool) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_on_clients(_arg_registered, _arg_has_clients, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ON_CLIENTS, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_clients(_arg_registered, _arg_has_clients, _aidl_reply)
         }
@@ -167,7 +368,7 @@ mod i_client_callback {
 pub use i_service_callback::*;
 mod i_service_callback {
     pub trait IServiceCallback: rsbinder::Interface + Send {
-        fn on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder) -> rsbinder::Result<()>;
+        fn on_registration(&self, _arg_name: &str, _arg_binder: &rsbinder::StrongIBinder) -> rsbinder::Result<()>;
     }
     pub(crate) mod transactions {
         pub(crate) const ON_REGISTRATION: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
@@ -179,19 +380,19 @@ mod i_service_callback {
         }
     }
     impl BpServiceCallback {
-        fn build_parcel_on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_on_registration(&self, _arg_name: &str, _arg_binder: &rsbinder::StrongIBinder) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
-            data.write(&_arg_binder)?;
+            data.write(_arg_binder)?;
             Ok(data)
         }
-        fn read_response_on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+        fn read_response_on_registration(&self, _arg_name: &str, _arg_binder: &rsbinder::StrongIBinder, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
             Ok(())
         }
     }
     impl IServiceCallback for BpServiceCallback {
-        fn on_registration(&self, _arg_name: &str, _arg_binder: rsbinder::StrongIBinder) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_on_registration(_arg_name, _arg_binder.clone(), )?;
+        fn on_registration(&self, _arg_name: &str, _arg_binder: &rsbinder::StrongIBinder) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_on_registration(_arg_name, _arg_binder, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ON_REGISTRATION, &_aidl_data, rsbinder::FLAG_ONEWAY | rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_on_registration(_arg_name, _arg_binder, _aidl_reply)
         }
@@ -212,16 +413,16 @@ mod i_service_manager {
     pub trait IServiceManager: rsbinder::Interface + Send {
         fn get_service(&self, _arg_name: &str) -> rsbinder::Result<Option<rsbinder::StrongIBinder>>;
         fn check_service(&self, _arg_name: &str) -> rsbinder::Result<Option<rsbinder::StrongIBinder>>;
-        fn add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<()>;
+        fn add_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<()>;
         fn list_services(&self, _arg_dump_priority: i32) -> rsbinder::Result<Vec<String>>;
-        fn register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()>;
-        fn unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()>;
+        fn register_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()>;
+        fn unregister_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()>;
         fn is_declared(&self, _arg_name: &str) -> rsbinder::Result<bool>;
         fn get_declared_instances(&self, _arg_iface: &str) -> rsbinder::Result<Vec<String>>;
         fn updatable_via_apex(&self, _arg_name: &str) -> rsbinder::Result<Option<String>>;
         fn get_connection_info(&self, _arg_name: &str) -> rsbinder::Result<Option<crate::aidl::android::os::ConnectionInfo>>;
-        fn register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<()>;
-        fn try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder) -> rsbinder::Result<()>;
+        fn register_client_callback(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<()>;
+        fn try_unregister_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder) -> rsbinder::Result<()>;
         fn get_service_debug_info(&self) -> rsbinder::Result<Vec<crate::aidl::android::os::ServiceDebugInfo>>;
     }
     pub(crate) mod transactions {
@@ -268,16 +469,16 @@ mod i_service_manager {
             let _aidl_return: Option<rsbinder::StrongIBinder> = _aidl_reply.read()?;
             Ok(_aidl_return)
         }
-        fn build_parcel_add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_add_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
-            data.write(&_arg_service)?;
+            data.write(_arg_service)?;
             data.write(&_arg_allow_isolated)?;
             data.write(&_arg_dump_priority)?;
             Ok(data)
         }
-        fn read_response_add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
-            let _aidl_reply = _aidl_reply.unwrap();
+        fn read_response_add_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
@@ -292,25 +493,25 @@ mod i_service_manager {
             let _aidl_return: Vec<String> = _aidl_reply.read()?;
             Ok(_aidl_return)
         }
-        fn build_parcel_register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_register_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
             data.write(_arg_callback.as_ref())?;
             Ok(data)
         }
-        fn read_response_register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
-            let _aidl_reply = _aidl_reply.unwrap();
+        fn read_response_register_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
-        fn build_parcel_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
             data.write(_arg_callback.as_ref())?;
             Ok(data)
         }
-        fn read_response_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
-            let _aidl_reply = _aidl_reply.unwrap();
+        fn read_response_unregister_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
@@ -358,26 +559,26 @@ mod i_service_manager {
             let _aidl_return: Option<crate::aidl::android::os::ConnectionInfo> = _aidl_reply.read()?;
             Ok(_aidl_return)
         }
-        fn build_parcel_register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_register_client_callback(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
-            data.write(&_arg_service)?;
+            data.write(_arg_service)?;
             data.write(_arg_callback.as_ref())?;
             Ok(data)
         }
-        fn read_response_register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
-            let _aidl_reply = _aidl_reply.unwrap();
+        fn read_response_register_client_callback(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
-        fn build_parcel_try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_try_unregister_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.handle.prepare_transact(true)?;
             data.write(_arg_name)?;
-            data.write(&_arg_service)?;
+            data.write(_arg_service)?;
             Ok(data)
         }
-        fn read_response_try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
-            let _aidl_reply = _aidl_reply.unwrap();
+        fn read_response_try_unregister_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
         }
@@ -403,8 +604,8 @@ mod i_service_manager {
             let _aidl_reply = self.handle.submit_transact(transactions::CHECK_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_check_service(_arg_name, _aidl_reply)
         }
-        fn add_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_add_service(_arg_name, _arg_service.clone(), _arg_allow_isolated, _arg_dump_priority, )?;
+        fn add_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_allow_isolated: bool, _arg_dump_priority: i32) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_add_service(_arg_name, _arg_service, _arg_allow_isolated, _arg_dump_priority, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::ADD_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_add_service(_arg_name, _arg_service, _arg_allow_isolated, _arg_dump_priority, _aidl_reply)
         }
@@ -413,13 +614,13 @@ mod i_service_manager {
             let _aidl_reply = self.handle.submit_transact(transactions::LIST_SERVICES, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_list_services(_arg_dump_priority, _aidl_reply)
         }
-        fn register_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_register_for_notifications(_arg_name, _arg_callback.clone(), )?;
+        fn register_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_register_for_notifications(_arg_name, _arg_callback, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::REGISTER_FOR_NOTIFICATIONS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_register_for_notifications(_arg_name, _arg_callback, _aidl_reply)
         }
-        fn unregister_for_notifications(&self, _arg_name: &str, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_unregister_for_notifications(_arg_name, _arg_callback.clone(), )?;
+        fn unregister_for_notifications(&self, _arg_name: &str, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IServiceCallback>) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_unregister_for_notifications(_arg_name, _arg_callback, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::UNREGISTER_FOR_NOTIFICATIONS, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_unregister_for_notifications(_arg_name, _arg_callback, _aidl_reply)
         }
@@ -443,13 +644,13 @@ mod i_service_manager {
             let _aidl_reply = self.handle.submit_transact(transactions::GET_CONNECTION_INFO, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_get_connection_info(_arg_name, _aidl_reply)
         }
-        fn register_client_callback(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder, _arg_callback: std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_register_client_callback(_arg_name, _arg_service.clone(), _arg_callback.clone(), )?;
+        fn register_client_callback(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder, _arg_callback: &std::sync::Arc<dyn crate::aidl::android::os::IClientCallback>) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_register_client_callback(_arg_name, _arg_service, _arg_callback, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::REGISTER_CLIENT_CALLBACK, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_register_client_callback(_arg_name, _arg_service, _arg_callback, _aidl_reply)
         }
-        fn try_unregister_service(&self, _arg_name: &str, _arg_service: rsbinder::StrongIBinder) -> rsbinder::Result<()> {
-            let _aidl_data = self.build_parcel_try_unregister_service(_arg_name, _arg_service.clone(), )?;
+        fn try_unregister_service(&self, _arg_name: &str, _arg_service: &rsbinder::StrongIBinder) -> rsbinder::Result<()> {
+            let _aidl_data = self.build_parcel_try_unregister_service(_arg_name, _arg_service, )?;
             let _aidl_reply = self.handle.submit_transact(transactions::TRY_UNREGISTER_SERVICE, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_try_unregister_service(_arg_name, _arg_service, _aidl_reply)
         }
@@ -466,7 +667,7 @@ mod i_service_manager {
 }
 pub use service_debug_info::*;
 mod service_debug_info {
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct ServiceDebugInfo {
         pub name: String,
         pub debug_pid: i32,
@@ -522,7 +723,7 @@ mod i_service_manager {
     pub const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 8;
     pub const DUMP_FLAG_PRIORITY_ALL: i32 = 15;
     pub const DUMP_FLAG_PROTO: i32 = 16;
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct IServiceManager {
     }
     impl Default for IServiceManager {
@@ -571,7 +772,7 @@ fn test_parcelable() -> Result<(), Box<dyn Error>> {
         "##, r##"
 pub use connection_info::*;
 mod connection_info {
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct ConnectionInfo {
         pub ip_address: String,
         pub port: i32,
@@ -639,7 +840,7 @@ fn test_unions() -> Result<(), Box<dyn Error>> {
         r##"
 pub use byte_enum::*;
 mod byte_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         ByteEnum : [i8; 3] {
             FOO = 1,
             BAR = 2,
@@ -831,7 +1032,7 @@ fn test_enums() -> Result<(), Box<dyn Error>> {
         r##"
 pub use byte_enum::*;
 mod byte_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         ByteEnum : [i8; 3] {
             FOO = 1,
             BAR = 2,
@@ -852,7 +1053,7 @@ mod byte_enum {
         r##"
 pub use backend_type::*;
 mod backend_type {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         BackendType : [i8; 4] {
             CPP = 0,
             JAVA = 1,
@@ -867,7 +1068,7 @@ mod backend_type {
         r##"
 pub use constant_expression_enum::*;
 mod constant_expression_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         ConstantExpressionEnum : [i32; 10] {
             decInt32_1 = 1,
             decInt32_2 = 1,
@@ -888,7 +1089,7 @@ mod constant_expression_enum {
         r##"
 pub use int_enum::*;
 mod int_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         IntEnum : [i32; 4] {
             FOO = 1000,
             BAR = 2000,
@@ -903,7 +1104,7 @@ mod int_enum {
         r##"
 pub use long_enum::*;
 mod long_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         LongEnum : [i64; 3] {
             FOO = 100000000000,
             BAR = 200000000000,
@@ -945,6 +1146,33 @@ parcelable StructuredParcelable {
             3,
     };
     int[] arrayDefaultsToEmpty = {};
+
+    boolean boolDefault;
+    byte byteDefault;
+    int intDefault;
+    long longDefault;
+    float floatDefault;
+    double doubleDefault;
+
+    // parse checks only
+    double checkDoubleFromFloat = 3.14f;
+    String[] checkStringArray1 = {"a", "b"};
+    @utf8InCpp String[] checkStringArray2 = {"a", "b"};
+
+    // Add test to verify corner cases
+    int int32_min = -2147483648;
+    int int32_max = 2147483647;
+    long int64_max = 9223372036854775807;
+    int hexInt32_neg_1 = 0xffffffff;
+
+    @nullable IBinder ibinder;
+
+    // Make sure we can send an empty parcelable
+    @JavaDerive(toString=true, equals=true)
+    @RustDerive(Clone=true, PartialEq=true)
+    parcelable Empty {}
+
+    Empty empty;
 
     // Constant expressions that evaluate to 1
     byte[] int8_1 = {
@@ -1071,7 +1299,7 @@ mod structured_parcelable {
     pub const BIT_0: i32 = 1;
     pub const BIT_1: i32 = 2;
     pub const BIT_2: i32 = 4;
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct StructuredParcelable {
         pub should_contain_three_fs: Vec<i32>,
         pub f: i32,
@@ -1092,6 +1320,21 @@ mod structured_parcelable {
         pub double_with_default: f64,
         pub array_defaults_to_123: Vec<i32>,
         pub array_defaults_to_empty: Vec<i32>,
+        pub bool_default: bool,
+        pub byte_default: i8,
+        pub int_default: i32,
+        pub long_default: i64,
+        pub float_default: f32,
+        pub double_default: f64,
+        pub check_double_from_float: f64,
+        pub check_string_array_1: Vec<String>,
+        pub check_string_array_2: Vec<String>,
+        pub int_32_min: i32,
+        pub int_32_max: i32,
+        pub int_64_max: i64,
+        pub hex_int_32_neg_1: i32,
+        pub ibinder: Option<rsbinder::StrongIBinder>,
+        pub empty: crate::aidl::android::aidl::tests::StructuredParcelable::Empty,
         pub int_8_1: Vec<i8>,
         pub int_32_1: Vec<i32>,
         pub int_64_1: Vec<i64>,
@@ -1136,6 +1379,21 @@ mod structured_parcelable {
                 double_with_default: -314000000000000000f64,
                 array_defaults_to_123: vec![1,2,3,],
                 array_defaults_to_empty: Default::default(),
+                bool_default: Default::default(),
+                byte_default: Default::default(),
+                int_default: Default::default(),
+                long_default: Default::default(),
+                float_default: Default::default(),
+                double_default: Default::default(),
+                check_double_from_float: 3.14f64,
+                check_string_array_1: vec!["a".into(),"b".into(),],
+                check_string_array_2: vec!["a".into(),"b".into(),],
+                int_32_min: -2147483648,
+                int_32_max: 2147483647,
+                int_64_max: 9223372036854775807,
+                hex_int_32_neg_1: -1,
+                ibinder: Default::default(),
+                empty: Default::default(),
                 int_8_1: vec![1,1,1,1,1,],
                 int_32_1: vec![1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,],
                 int_64_1: vec![1,1,1,1,1,1,1,1,1,1,],
@@ -1181,6 +1439,21 @@ mod structured_parcelable {
             _parcel.write(&self.double_with_default)?;
             _parcel.write(&self.array_defaults_to_123)?;
             _parcel.write(&self.array_defaults_to_empty)?;
+            _parcel.write(&self.bool_default)?;
+            _parcel.write(&self.byte_default)?;
+            _parcel.write(&self.int_default)?;
+            _parcel.write(&self.long_default)?;
+            _parcel.write(&self.float_default)?;
+            _parcel.write(&self.double_default)?;
+            _parcel.write(&self.check_double_from_float)?;
+            _parcel.write(&self.check_string_array_1)?;
+            _parcel.write(&self.check_string_array_2)?;
+            _parcel.write(&self.int_32_min)?;
+            _parcel.write(&self.int_32_max)?;
+            _parcel.write(&self.int_64_max)?;
+            _parcel.write(&self.hex_int_32_neg_1)?;
+            _parcel.write(&self.ibinder)?;
+            _parcel.write(&self.empty)?;
             _parcel.write(&self.int_8_1)?;
             _parcel.write(&self.int_32_1)?;
             _parcel.write(&self.int_64_1)?;
@@ -1224,6 +1497,21 @@ mod structured_parcelable {
             self.double_with_default = _parcel.read()?;
             self.array_defaults_to_123 = _parcel.read()?;
             self.array_defaults_to_empty = _parcel.read()?;
+            self.bool_default = _parcel.read()?;
+            self.byte_default = _parcel.read()?;
+            self.int_default = _parcel.read()?;
+            self.long_default = _parcel.read()?;
+            self.float_default = _parcel.read()?;
+            self.double_default = _parcel.read()?;
+            self.check_double_from_float = _parcel.read()?;
+            self.check_string_array_1 = _parcel.read()?;
+            self.check_string_array_2 = _parcel.read()?;
+            self.int_32_min = _parcel.read()?;
+            self.int_32_max = _parcel.read()?;
+            self.int_64_max = _parcel.read()?;
+            self.hex_int_32_neg_1 = _parcel.read()?;
+            self.ibinder = _parcel.read()?;
+            self.empty = _parcel.read()?;
             self.int_8_1 = _parcel.read()?;
             self.int_32_1 = _parcel.read()?;
             self.int_64_1 = _parcel.read()?;
@@ -1253,10 +1541,35 @@ mod structured_parcelable {
     impl rsbinder::ParcelableMetadata for StructuredParcelable {
         fn get_descriptor() -> &'static str { "android.aidl.tests.StructuredParcelable" }
     }
+    pub use empty::*;
+    mod empty {
+        #[derive(Debug)]
+        pub struct Empty {
+        }
+        impl Default for Empty {
+            fn default() -> Self {
+                Self {
+                }
+            }
+        }
+        impl rsbinder::Parcelable for Empty {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                Ok(())
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                Ok(())
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(Empty);
+        rsbinder::impl_deserialize_for_parcelable!(Empty);
+        impl rsbinder::ParcelableMetadata for Empty {
+            fn get_descriptor() -> &'static str { "android.aidl.tests.StructuredParcelable.Empty" }
+        }
+    }
 }
 pub use constant_expression_enum::*;
 mod constant_expression_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         ConstantExpressionEnum : [i32; 10] {
             decInt32_1 = 1,
             decInt32_2 = 1,
@@ -1273,7 +1586,7 @@ mod constant_expression_enum {
 }
 pub use byte_enum::*;
 mod byte_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         ByteEnum : [i8; 3] {
             FOO = 1,
             BAR = 2,
@@ -1283,7 +1596,7 @@ mod byte_enum {
 }
 pub use int_enum::*;
 mod int_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         IntEnum : [i32; 4] {
             FOO = 1000,
             BAR = 2000,
@@ -1294,7 +1607,7 @@ mod int_enum {
 }
 pub use long_enum::*;
 mod long_enum {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         LongEnum : [i64; 3] {
             FOO = 100000000000,
             BAR = 200000000000,

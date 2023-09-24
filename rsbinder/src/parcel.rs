@@ -200,6 +200,7 @@ impl Parcel {
     }
 
     pub fn close_file_descriptors(&self) {
+        todo!()
     //     for offset in &self.objects {
     //         unsafe {
     //             let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
@@ -335,6 +336,14 @@ impl Parcel {
         self.write(&interface)?;
 
         Ok(())
+    }
+
+    pub(crate) fn append_all_from(&mut self, other: &mut Parcel) -> Result<()> {
+        self.append_from(other, 0, other.len())
+    }
+
+    pub(crate) fn append_from(&mut self, other: &mut Parcel, start: usize, size: usize) -> Result<()> {
+        todo!()
     }
 
     fn release_objects(&mut self) {

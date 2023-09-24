@@ -283,8 +283,17 @@ impl ValueType {
             ValueType::Double(_) => format!("{}f64", self.to_string()),
             ValueType::Char(_) => format!("'{}'", self.to_string()),
             ValueType::Name(_) => format!("crate::{}", self.to_string()),
-            ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
-            ValueType::Bool(_) | ValueType::Array(_) |
+            ValueType::Array(v) => {
+                let mut res = "vec![".to_owned();
+                for v in v {
+                    res += &(v.value.to_init(is_const) + ",");
+                }
+
+                res += "]";
+
+                res
+            }
+            ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_string(),
             _ => format!("Default::default()"),
         }

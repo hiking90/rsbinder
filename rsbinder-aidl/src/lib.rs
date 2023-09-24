@@ -32,6 +32,10 @@ impl Namespace {
         self.ns.push(name.into())
     }
 
+    pub fn push_ns(&mut self, ns: &Namespace) {
+        self.ns.extend_from_slice(&ns.ns);
+    }
+
     pub fn pop(&mut self) -> Option<String> {
         self.ns.pop()
     }

@@ -21,13 +21,9 @@ thread_local! {
 pub struct NamespaceGuard();
 
 impl NamespaceGuard {
-    pub fn new(ns: &Namespace, name: &str) -> Self {
+    pub fn new(ns: &Namespace) -> Self {
         NAMESPACE_STACK.with(|vec| {
-            let mut ns = ns.clone();
-            if name.is_empty() == false {
-                ns.push(name);
-            }
-            vec.borrow_mut().push(ns);
+            vec.borrow_mut().push(ns.clone());
         });
         Self()
     }
@@ -57,54 +53,76 @@ pub fn set_current_document(document: &Document) {
     })
 }
 
-fn make_ns_from(namespace: &Namespace) -> Vec<Namespace> {
-    let mut cur_ns = current_namespace();
-    let new_len = if cur_ns.ns.len() > namespace.ns.len() { cur_ns.ns.len() - namespace.ns.len() } else { 0 };
-    cur_ns.ns.truncate(new_len);
+fn make_ns_candidate(ns: &Namespace, name: &Namespace) -> Vec<Namespace> {
+    let mut res = Vec::new();
 
-    let mut first_ns = cur_ns.clone();
-    first_ns.ns.append(&mut namespace.ns.clone());
+    let mut curr_ns = ns.clone();
+    curr_ns.push_ns(name);
+    res.push(curr_ns.clone());
 
-    if new_len > 0 {
-        cur_ns.ns.truncate(new_len -1);
-        cur_ns.ns.append(&mut namespace.ns.clone());
-
-        vec![first_ns, cur_ns]
-    } else {
-        vec![first_ns]
+    if name.ns.len() > 1 {
+        curr_ns.pop(); // Remove the last name in case of IntEnum.Foo. Removed the Foo.
+        res.push(curr_ns);
     }
+
+    res
 }
 
-pub fn lookup_name_decl(name: &str, style: &str, is_type: bool) -> (Declaration, Namespace, String) {
-    let mut namespace = Namespace::new(name, style);
+pub fn lookup_decl_from_name(name: &str, style: &str) -> (Declaration, Namespace, String) {
+    let namespace = Namespace::new(name, style);
 
-    let name = if is_type == false {
-        namespace.pop().unwrap()
-    } else {
-        "".into()
-    };
+    let mut ns_vec = Vec::new();
 
-    let cur_ns = if namespace.ns.len() > 0 {
-        DOCUMENT.with(|curr_doc| {
-            if let Some(imported) = curr_doc.borrow().imports.get(&namespace.ns[0]) {
-                vec![Namespace::new(imported, Namespace::AIDL)]
-            } else {
-                make_ns_from(&namespace)
-            }
-        })
-    } else {
-        make_ns_from(&namespace)
-    };
+    // 1, check if the type exists in the current namespace.
+    let mut curr_ns = current_namespace();
+    ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
 
-    DECLARATION_MAP.with(|hashmap| {
-        for ns in &cur_ns {
+    curr_ns.pop();  // For parent namespace
+    ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
+
+    // 2. check if the type exists in the imports from the current document.
+    DOCUMENT.with(|curr_doc| {
+        let curr_doc = curr_doc.borrow();
+
+        if let Some(package) = &curr_doc.package {
+            let package_ns = Namespace::new(&package, Namespace::AIDL);
+            ns_vec.append(&mut make_ns_candidate(&package_ns, &namespace));
+        }
+
+        if let Some(imported) = curr_doc.imports.get(&namespace.ns[0]) {
+            let mut new_ns = Namespace::new(imported, Namespace::AIDL);
+            new_ns.ns.extend_from_slice(&namespace.ns[1..]);
+            ns_vec.push(new_ns);
+        }
+    });
+
+    // println!("namesapce: {:?}\nns_vec: {:?}\n", namespace, ns_vec);
+
+    let (decl, ns) = DECLARATION_MAP.with(|hashmap| {
+        for ns in &ns_vec {
             if let Some(decl) = hashmap.borrow().get(&ns) {
-                return (decl.clone(), ns.clone(), name);
+                // println!("Found: {:?}\n", ns);
+                return (decl.clone(), ns.clone());
             }
         }
+
+        let curr_ns = current_namespace();
+        if let Some(decl) = hashmap.borrow().get(&curr_ns) {
+            // println!("Not Found: {:?}\n", curr_ns);
+            return (decl.clone(), curr_ns)
+        }
+
         panic!("Unknown namespace: {:?} for name: [{}]\n{:?}",
-            cur_ns, name, hashmap.borrow().keys());
-    })
+            ns_vec, name, hashmap.borrow().keys());
+    });
+
+    let name = namespace.ns.last().unwrap();
+
+    if name == ns.ns.last().unwrap() {
+        (decl, ns, "".into())
+    } else {
+        (decl, ns, name.into())
+    }
 }
 
 fn make_const_expr(const_expr: Option<&ConstExpr>, decl_set: &(Declaration, Namespace, String)) -> ConstExpr {
@@ -117,25 +135,15 @@ fn make_const_expr(const_expr: Option<&ConstExpr>, decl_set: &(Declaration, Name
     }
 }
 
-fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
-    for decl in members {
-        match decl {
-            Declaration::Variable(decl) => {
-                if decl.identifier == decl_set.2 {
-                    return Some(make_const_expr(decl.const_expr.as_ref(), &decl_set));
-                }
-            },
-            _ => unreachable!("Unsupported declaration {:?}\n{:?}\n{:?}", decl, decl_set.1, decl_set.2),
-        }
-    }
-    None
-}
-
-// Normally, this function is used to generate Rust source code.
-pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
-    let decl_set = lookup_name_decl(name, Namespace::AIDL, false);
-
-    match decl_set.0 {
+fn lookup_name_from_decl(decl: &Declaration, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
+    match decl {
+        Declaration::Variable(decl) => {
+            if decl.identifier == decl_set.2 {
+                Some(make_const_expr(decl.const_expr.as_ref(), &decl_set))
+            } else {
+                None
+            }
+        },
         Declaration::Interface(ref decl) => {
             for var in &decl.constant_list {
                 if var.identifier == decl_set.2 {
@@ -161,11 +169,23 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
         Declaration::Union(ref decl) => {
             lookup_name_members(&decl.members, &decl_set)
         }
+    }
+}
 
-        _ => {
-            unreachable!("Unexpected Declaration::Variable : {:?}", decl_set);
+fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
+    for decl in members {
+        if let Some(expr) = lookup_name_from_decl(decl, decl_set) {
+            return Some(expr)
         }
     }
+    None
+}
+
+// Normally, this function is used to generate Rust source code.
+pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
+    let decl_set = lookup_decl_from_name(name, Namespace::AIDL);
+
+    lookup_name_from_decl(&decl_set.0, &decl_set)
 }
 
 #[derive(Debug)]
@@ -483,7 +503,7 @@ impl TypeCast {
         let mut is_primitive = true;
         let mut is_string = false;
         let mut is_vector = false;
-        let mut is_map = false;
+        let is_map = false;
         let type_name = match aidl_type.name.as_str() {
             "boolean" => ("bool".to_owned(), ValueType::Bool(false)),
             "byte" => ("i8".to_owned(), ValueType::Int8(0)),
@@ -516,8 +536,7 @@ impl TypeCast {
             //     ("HashMap".to_owned(), ValueType::Map())
             // }
             "FileDescriptor" => {
-                is_primitive = false;
-                ("rsbinder::FileDescriptor".to_owned(), ValueType::FileDescriptor)
+                panic!("FileDescriptor isn't supported by the aidl generator of rsbinder.");
             }
             "ParcelFileDescriptor" => {
                 is_primitive = false;
@@ -529,7 +548,7 @@ impl TypeCast {
             }
             _ => {
                 is_primitive = false;
-                let decl_set = lookup_name_decl(aidl_type.name.as_str(), Namespace::AIDL, true);
+                let decl_set = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
                 let type_name = format!("crate::{}", decl_set.1.to_string(Namespace::RUST));
 
                 match decl_set.0 {
@@ -571,12 +590,23 @@ impl TypeCast {
     }
 
     pub fn fn_def_arg(&self, is_mutable: bool) -> String {
-        let mutable = if is_mutable == true { "mut " } else { "" };
-
-        if self.is_string {
-            format!("&{}str", mutable)
+        if is_mutable {
+            if self.is_string {
+                format!("&mut str")
+            } else if self.is_primitive {
+                format!("mut {}", self.type_name())
+            } else {
+                format!("&mut {}", self.type_name())
+            }
         } else {
-            format!("{}{}", mutable, self.type_name())
+            if self.is_string {
+                format!("&str")
+            } else if self.is_primitive {
+                format!("{}", self.type_name())
+            }
+            else {
+                format!("&{}", self.type_name())
+            }
         }
     }
 
@@ -599,6 +629,7 @@ impl TypeCast {
         array_types.iter().for_each(|t| {
             if t.is_vector() {
                 self.is_vector = true;
+                self.is_primitive = false;
             } else {
                 self.type_name = format!("{}[{}]", self.type_name, t.to_string());
             }
@@ -1514,13 +1545,13 @@ mod tests {
 
     #[test]
     fn test_namespace_guard() {
-        let _ns_1 = NamespaceGuard::new(&Namespace::new("1", Namespace::AIDL), "1");
+        let _ns_1 = NamespaceGuard::new(&Namespace::new("1.1", Namespace::AIDL));
         {
             assert_eq!(current_namespace(), Namespace::new("1.1", Namespace::AIDL));
-            let _ns_2 = NamespaceGuard::new(&Namespace::new("2", Namespace::AIDL), "2");
+            let _ns_2 = NamespaceGuard::new(&Namespace::new("2.2", Namespace::AIDL));
             {
                 assert_eq!(current_namespace(), Namespace::new("2.2", Namespace::AIDL));
-                let _ns_3 = NamespaceGuard::new(&Namespace::new("3", Namespace::AIDL), "3");
+                let _ns_3 = NamespaceGuard::new(&Namespace::new("3.3", Namespace::AIDL));
                 assert_eq!(current_namespace(), Namespace::new("3.3", Namespace::AIDL));
             }
             assert_eq!(current_namespace(), Namespace::new("2.2", Namespace::AIDL));

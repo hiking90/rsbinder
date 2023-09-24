@@ -9,7 +9,7 @@ use crate::{parser, add_indent, Namespace};
 const ENUM_TEMPLATE: &str = r##"
 pub use {{mod}}::*;
 mod {{mod}} {
-    declare_binder_enum! {
+    rsbinder::declare_binder_enum! {
         {{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
             {{ member.0 }} = {{ member.1 }},
@@ -92,7 +92,7 @@ mod {{mod}} {
     {%- for member in const_members %}
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct {{name}} {
     {%- for member in members %}
         pub {{ member.0 }}: {{ member.1 }},
@@ -126,6 +126,9 @@ mod {{mod}} {
     impl rsbinder::ParcelableMetadata for {{name}} {
         fn get_descriptor() -> &'static str { "{{namespace}}" }
     }
+    {%- if nested|length>0 %}
+    {{nested}}
+    {%- endif %}
 }
 "##;
 
@@ -176,7 +179,7 @@ mod {{mod}} {
             let _aidl_return: {{ member.2 }} = _aidl_reply.read()?;
             Ok(_aidl_return)
             {%- else %}
-            let _aidl_reply = _aidl_reply.unwrap();
+            let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
             {%- endif %}
@@ -197,6 +200,9 @@ mod {{mod}} {
         _service: &dyn {{ name }}, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
         Ok(())
     }
+    {%- if nested|length>0 %}
+    {{nested}}
+    {%- endif %}
 }
 "##;
 
@@ -224,7 +230,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
         let type_cast = arg.r#type.type_cast();
 
         if type_cast.is_declared {
-            build_params += &format!("{}.clone(), ", arg_str.0);
+            build_params += &format!("{}, ", arg_str.0);
             write_params.push(format!("{}.as_ref()", arg_str.0))
         } else if type_cast.is_primitive {
             build_params += &format!("{}, ", arg_str.0);
@@ -234,8 +240,9 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
                 build_params += &format!("{}, ", arg_str.0);
                 write_params.push(format!("{}", arg_str.0))
             } else {
-                build_params += &format!("{}.clone(), ", arg_str.0);
-                write_params.push(format!("&{}", arg_str.0))
+                build_params += &format!("{}, ", arg_str.0);
+                // write_params.push(format!("&{}", arg_str.0))
+                write_params.push(format!("{}", arg_str.0))
             }
         }
 
@@ -253,25 +260,32 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String
 }
 
 fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
     if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
-        return Ok(String::new())
+        is_empty = true;
+        // return Ok(String::new())
     }
 
     decl.pre_process();
 
     let mut const_members = Vec::new();
-    for constant in decl.constant_list.iter() {
-        let type_cast = constant.r#type.type_cast();
-        const_members.push((constant.const_identifier(),
-            type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref(), true)));
+    let mut fn_members = Vec::new();
+
+    if is_empty == false {
+        for constant in decl.constant_list.iter() {
+            let type_cast = constant.r#type.type_cast();
+            const_members.push((constant.const_identifier(),
+                type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref(), true)));
+        }
+
+        for method in decl.method_list.iter() {
+            fn_members.push(make_fn_member(method)?);
+        }
     }
 
-    let mut fn_members = Vec::new();
-    for method in decl.method_list.iter() {
-        fn_members.push(make_fn_member(method)?);
-    }
+    let nested = &gen_declations(&decl.members, indent + 1)?;
 
     let mut context = tera::Context::new();
 
@@ -283,6 +297,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
     context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
     context.insert("oneway", &decl.oneway);
+    context.insert("nested", &nested.trim());
     // let native_name = format!("Bn{}", &decl.name[1..]);
     // let proxy_name = format!("Bp{}", &decl.name[1..]);
 
@@ -292,36 +307,47 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 }
 
 fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
     if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
         println!("Parcelable {} is only used for Java.", decl.name);
-        return Ok(String::new())
+        is_empty = true;
+        // return Ok(String::new())
     }
     if decl.cpp_header.is_empty() == false {
         println!("cpp_header {} for Parcelable {} is not supported.", decl.cpp_header, decl.name);
-        return Ok(String::new())
+        is_empty = true;
+        // return Ok(String::new())
     }
 
     decl.pre_process();
 
     let mut constant_members = Vec::new();
     let mut members = Vec::new();
-    // Parse struct variables only.
-    for decl in &decl.members {
-        if let Some(var) = decl.is_variable() {
-            let type_cast = var.r#type.type_cast();
+    let mut declations = Vec::new();
 
-            if var.constant == true {
-                constant_members.push((var.const_identifier(),
-                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
+    if is_empty == false {
+        // Parse struct variables only.
+        for decl in &decl.members {
+            if let Some(var) = decl.is_variable() {
+                let type_cast = var.r#type.type_cast();
+
+                if var.constant == true {
+                    constant_members.push((var.const_identifier(),
+                        type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
+                } else {
+                    members.push(
+                        (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref(), false))
+                    )
+                }
             } else {
-                members.push(
-                    (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref(), false))
-                )
+                declations.push(decl.clone());
             }
         }
     }
+
+    let nested = &gen_declations(&declations, indent+1)?;
 
     let mut context = tera::Context::new();
 
@@ -330,6 +356,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
+    context.insert("nested", &nested.trim());
 
     let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
 
@@ -408,12 +435,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
     for decl in decls {
         match decl {
             parser::Declaration::Interface(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_interface(decl, indent)?;
             }
 
             parser::Declaration::Parcelable(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_parcelable(decl, indent)?;
             }
 
@@ -422,12 +449,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
             }
 
             parser::Declaration::Enum(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_enum(decl, indent)?;
             }
 
             parser::Declaration::Union(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace, &decl.name);
+                let _ns = parser::NamespaceGuard::new(&decl.namespace);
                 content += &gen_union(decl, indent)?;
             }
         }

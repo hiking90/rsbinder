@@ -16,6 +16,8 @@ pub mod binderfs;
 mod service_manager;
 pub mod parcelable;
 pub mod proxy;
+pub mod file_descriptor;
+pub mod parcelable_holder;
 
 pub use process_state::ProcessState;
 // pub use thread_state::Se;
@@ -25,6 +27,8 @@ pub use binder::*;
 pub use service_manager::*;
 pub use proxy::*;
 pub use parcelable::*;
+pub use file_descriptor::ParcelFileDescriptor;
+pub use parcelable_holder::ParcelableHolder;
 // pub use ref_base::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

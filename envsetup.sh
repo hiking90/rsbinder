@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Check if TOP_DIR is already set
+if [ -z "$TOP_DIR" ]; then
+    # Set TOP_DIR to the current working directory if it's not already set
+    TOP_DIR=$(pwd)
+    export TOP_DIR
+else
+    echo "TOP_DIR is already set to $TOP_DIR."
+fi
+
 # Check the operating system
 os_name=$(uname)
 
@@ -22,6 +31,10 @@ function install() {
 
 function prepare() {
     adb root
+}
+
+function aidl_gen_rust() {
+    aidl --lang=rust -I $TOP_DIR/aidl $1 -o gen
 }
 
 prepare
