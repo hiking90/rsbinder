@@ -147,6 +147,18 @@ macro_rules! declare_binder_interface {
                 Ok(())
             }
         }
+
+        impl $crate::parcelable::SerializeOption for dyn $interface {
+            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                parcel.write(&this.map($crate::Interface::as_binder))
+            }
+        }
+
+        impl std::fmt::Debug for dyn $interface + '_ {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.pad(stringify!($interface))
+            }
+        }
     }
 }
 
@@ -288,6 +300,13 @@ macro_rules! declare_binder_enum {
             }
         }
 
+        impl $crate::SerializeOption for $enum {
+            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                todo!()
+                // parcel.write(&self.map(|x| x.0))
+            }
+        }
+
         impl $crate::Deserialize for $enum {
             fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
                 parcel.read().map(Self)
@@ -295,10 +314,17 @@ macro_rules! declare_binder_enum {
         }
 
         impl $crate::DeserializeArray for $enum {
-            fn deserialize_array(parcel: &mut $crate::Parcel) -> $crate::Result<Vec<Self>> {
-                let v: Vec<$backing> =
+            fn deserialize_array(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Vec<Self>>> {
+                let v: Option<Vec<$backing>> =
                     <$backing as $crate::DeserializeArray>::deserialize_array(parcel)?;
-                Ok(v.into_iter().map(Self).collect())
+                Ok(v.map(|v| v.into_iter().map(Self).collect()))
+                // Ok(v.into_iter().map(Self).collect())
+            }
+        }
+
+        impl $crate::DeserializeOption for $enum {
+            fn deserialize_option(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Self>> {
+                todo!()
             }
         }
     };

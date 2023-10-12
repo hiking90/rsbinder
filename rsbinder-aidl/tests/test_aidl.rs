@@ -2,7 +2,7 @@ use rsbinder_aidl::Builder;
 use std::path::PathBuf;
 use std::error::Error;
 use similar::{ChangeTag, TextDiff};
-use rsbinder_aidl;
+
 
 #[test]
 fn test_service_manager() -> Result<(), Box<dyn Error>> {
@@ -55,6 +55,569 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn test_array_of_interfaces() -> Result<(), Box<dyn Error>> {
+    // fn method_nullable_4 is different with Android AIDL. So far, I don't know the policy of Android AIDL.
+
+    aidl_generator(r#"
+package android.aidl.tests;
+
+@SuppressWarnings(value={"inout-parameter", "out-array"})
+parcelable ArrayOfInterfaces {
+    interface IEmptyInterface {}
+
+    interface IMyInterface {
+        @nullable void method_nullable_1(IEmptyInterface iface);
+        @nullable void method_nullable_2(@nullable IEmptyInterface nullable_iface);
+        @nullable void method_nullable_3(in IEmptyInterface[] iface_array_in);
+        @nullable void method_nullable_4(out IEmptyInterface[] iface_array_out);
+        @nullable void method_nullable_5(inout IEmptyInterface[] iface_array_inout);
+        @nullable void method_nullable_6(in @nullable IEmptyInterface[] nullable_iface_array_in);
+        @nullable void method_nullable_7(out @nullable IEmptyInterface[] nullable_iface_array_out);
+        @nullable IEmptyInterface[] method_nullable_8(inout @nullable IEmptyInterface[] nullable_iface_array_inout);
+
+        void method_1(IEmptyInterface iface);
+        void method_2(@nullable IEmptyInterface nullable_iface);
+        void method_3(in IEmptyInterface[] iface_array_in);
+        void method_4(out IEmptyInterface[] iface_array_out);
+        void method_5(inout IEmptyInterface[] iface_array_inout);
+        void method_6(in @nullable IEmptyInterface[] nullable_iface_array_in);
+        void method_7(out @nullable IEmptyInterface[] nullable_iface_array_out);
+        IEmptyInterface[] method_8(inout @nullable IEmptyInterface[] nullable_iface_array_inout);
+    }
+}
+        "#, r#"
+pub mod ArrayOfInterfaces {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
+    #[derive(Debug)]
+    pub struct ArrayOfInterfaces {
+    }
+    impl Default for ArrayOfInterfaces {
+        fn default() -> Self {
+            Self {
+            }
+        }
+    }
+    impl rsbinder::Parcelable for ArrayOfInterfaces {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            Ok(())
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(ArrayOfInterfaces);
+    rsbinder::impl_deserialize_for_parcelable!(ArrayOfInterfaces);
+    impl rsbinder::ParcelableMetadata for ArrayOfInterfaces {
+        fn get_descriptor() -> &'static str { "android.aidl.tests.ArrayOfInterfaces" }
+    }
+    pub mod IEmptyInterface {
+        #![allow(non_upper_case_globals)]
+        #![allow(non_snake_case)]
+        pub trait IEmptyInterface: rsbinder::Interface + Send {
+        }
+        pub(crate) mod transactions {
+        }
+        rsbinder::declare_binder_interface! {
+            IEmptyInterface["android.aidl.tests.ArrayOfInterfaces.IEmptyInterface"] {
+                native: BnEmptyInterface(on_transact),
+                proxy: BpEmptyInterface,
+            }
+        }
+        impl BpEmptyInterface {
+        }
+        impl IEmptyInterface for BpEmptyInterface {
+        }
+        fn on_transact(
+            _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+    pub mod IMyInterface {
+        #![allow(non_upper_case_globals)]
+        #![allow(non_snake_case)]
+        pub trait IMyInterface: rsbinder::Interface + Send {
+            fn method_nullable_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<()>;
+            fn method_nullable_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()>;
+            fn method_nullable_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<()>;
+            fn method_nullable_4(&self, _arg_iface_array_out: &mut Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>) -> rsbinder::Result<()>;
+            fn method_nullable_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()>;
+            fn method_nullable_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<()>;
+            fn method_nullable_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<()>;
+            fn method_nullable_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>;
+            fn method_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<()>;
+            fn method_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()>;
+            fn method_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<()>;
+            fn method_4(&self, _arg_iface_array_out: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()>;
+            fn method_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()>;
+            fn method_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<()>;
+            fn method_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<()>;
+            fn method_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>;
+        }
+        pub(crate) mod transactions {
+            pub(crate) const METHOD_NULLABLE_1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
+            pub(crate) const METHOD_NULLABLE_2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;
+            pub(crate) const METHOD_NULLABLE_3: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 2;
+            pub(crate) const METHOD_NULLABLE_4: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 3;
+            pub(crate) const METHOD_NULLABLE_5: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 4;
+            pub(crate) const METHOD_NULLABLE_6: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 5;
+            pub(crate) const METHOD_NULLABLE_7: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 6;
+            pub(crate) const METHOD_NULLABLE_8: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 7;
+            pub(crate) const METHOD_1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 8;
+            pub(crate) const METHOD_2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 9;
+            pub(crate) const METHOD_3: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 10;
+            pub(crate) const METHOD_4: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 11;
+            pub(crate) const METHOD_5: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 12;
+            pub(crate) const METHOD_6: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 13;
+            pub(crate) const METHOD_7: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 14;
+            pub(crate) const METHOD_8: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 15;
+        }
+        rsbinder::declare_binder_interface! {
+            IMyInterface["android.aidl.tests.ArrayOfInterfaces.IMyInterface"] {
+                native: BnMyInterface(on_transact),
+                proxy: BpMyInterface,
+            }
+        }
+        impl BpMyInterface {
+            fn build_parcel_method_nullable_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface)?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_in.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>], _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_4(&self, _arg_iface_array_out: &mut Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_out.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_4(&self, _arg_iface_array_out: &mut Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_inout.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_in)?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_out)?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_nullable_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_inout)?;
+                Ok(data)
+            }
+            fn read_response_method_nullable_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                let _aidl_return: Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>> = _aidl_reply.read()?;
+                Ok(_aidl_return)
+            }
+            fn build_parcel_method_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface)?;
+                Ok(data)
+            }
+            fn read_response_method_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_in.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>], _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_4(&self, _arg_iface_array_out: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_out.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_4(&self, _arg_iface_array_out: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_iface_array_inout.as_ref())?;
+                Ok(data)
+            }
+            fn read_response_method_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_in)?;
+                Ok(data)
+            }
+            fn read_response_method_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_out)?;
+                Ok(data)
+            }
+            fn read_response_method_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<()> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                Ok(())
+            }
+            fn build_parcel_method_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
+                let mut data = self.handle.prepare_transact(true)?;
+                data.write(_arg_nullable_iface_array_inout)?;
+                Ok(data)
+            }
+            fn read_response_method_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>> {
+                let mut _aidl_reply = _aidl_reply.unwrap();
+                let _status = _aidl_reply.read::<rsbinder::Status>()?;
+                let _aidl_return: Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>> = _aidl_reply.read()?;
+                Ok(_aidl_return)
+            }
+        }
+        impl IMyInterface for BpMyInterface {
+            fn method_nullable_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_1(&_arg_iface, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_1, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_1(_arg_iface, _aidl_reply)
+            }
+            fn method_nullable_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_2(&_arg_nullable_iface, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_2, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_2(_arg_nullable_iface, _aidl_reply)
+            }
+            fn method_nullable_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_3(&_arg_iface_array_in, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_3, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_3(_arg_iface_array_in, _aidl_reply)
+            }
+            fn method_nullable_4(&self, _arg_iface_array_out: &mut Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_4(&mut _arg_iface_array_out, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_4, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_4(_arg_iface_array_out, _aidl_reply)
+            }
+            fn method_nullable_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_5(&mut _arg_iface_array_inout, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_5, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_5(_arg_iface_array_inout, _aidl_reply)
+            }
+            fn method_nullable_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_6(&_arg_nullable_iface_array_in, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_6, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_6(_arg_nullable_iface_array_in, _aidl_reply)
+            }
+            fn method_nullable_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_nullable_7(&mut _arg_nullable_iface_array_out, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_7, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_7(_arg_nullable_iface_array_out, _aidl_reply)
+            }
+            fn method_nullable_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<Option<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>> {
+                let _aidl_data = self.build_parcel_method_nullable_8(&mut _arg_nullable_iface_array_inout, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_NULLABLE_8, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_nullable_8(_arg_nullable_iface_array_inout, _aidl_reply)
+            }
+            fn method_1(&self, _arg_iface: &std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_1(&_arg_iface, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_1, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_1(_arg_iface, _aidl_reply)
+            }
+            fn method_2(&self, _arg_nullable_iface: Option<&std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_2(&_arg_nullable_iface, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_2, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_2(_arg_nullable_iface, _aidl_reply)
+            }
+            fn method_3(&self, _arg_iface_array_in: &[std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>]) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_3(&_arg_iface_array_in, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_3, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_3(_arg_iface_array_in, _aidl_reply)
+            }
+            fn method_4(&self, _arg_iface_array_out: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_4(&mut _arg_iface_array_out, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_4, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_4(_arg_iface_array_out, _aidl_reply)
+            }
+            fn method_5(&self, _arg_iface_array_inout: &mut Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_5(&mut _arg_iface_array_inout, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_5, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_5(_arg_iface_array_inout, _aidl_reply)
+            }
+            fn method_6(&self, _arg_nullable_iface_array_in: Option<&[Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>]>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_6(&_arg_nullable_iface_array_in, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_6, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_6(_arg_nullable_iface_array_in, _aidl_reply)
+            }
+            fn method_7(&self, _arg_nullable_iface_array_out: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<()> {
+                let _aidl_data = self.build_parcel_method_7(&mut _arg_nullable_iface_array_out, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_7, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_7(_arg_nullable_iface_array_out, _aidl_reply)
+            }
+            fn method_8(&self, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<Vec<std::sync::Arc<dyn super::IEmptyInterface::IEmptyInterface>>> {
+                let _aidl_data = self.build_parcel_method_8(&mut _arg_nullable_iface_array_inout, )?;
+                let _aidl_reply = self.handle.submit_transact(transactions::METHOD_8, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR)?;
+                self.read_response_method_8(_arg_nullable_iface_array_inout, _aidl_reply)
+            }
+        }
+        fn on_transact(
+            _service: &dyn IMyInterface, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+}
+        "#)
+}
+
+#[test]
+fn test_compiler_checks() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+interface ITestService {
+    @JavaDerive(equals=true)
+    @RustDerive(Clone=true, PartialEq=true)
+    parcelable Empty {}
+
+    parcelable CompilerChecks {
+        // IBinder
+        IBinder binder;
+        @nullable IBinder nullable_binder;
+        IBinder[] binder_array;
+        @nullable IBinder[] nullable_binder_array;
+        List<IBinder> binder_list;
+        @nullable List<IBinder> nullable_binder_list;
+
+        // ParcelFileDescriptor
+        ParcelFileDescriptor pfd;
+        @nullable ParcelFileDescriptor nullable_pfd;
+        ParcelFileDescriptor[] pfd_array;
+        @nullable ParcelFileDescriptor[] nullable_pfd_array;
+        List<ParcelFileDescriptor> pfd_list;
+        @nullable List<ParcelFileDescriptor> nullable_pfd_list;
+
+        // parcelable
+        Empty parcel;
+        @nullable Empty nullable_parcel;
+        Empty[] parcel_array;
+        @nullable Empty[] nullable_parcel_array;
+        List<Empty> parcel_list;
+        @nullable List<Empty> nullable_parcel_list;
+    }
+}
+    "##, r#"
+pub mod ITestService {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
+    pub trait ITestService: rsbinder::Interface + Send {
+    }
+    pub(crate) mod transactions {
+    }
+    rsbinder::declare_binder_interface! {
+        ITestService["ITestService"] {
+            native: BnTestService(on_transact),
+            proxy: BpTestService,
+        }
+    }
+    impl BpTestService {
+    }
+    impl ITestService for BpTestService {
+    }
+    fn on_transact(
+        _service: &dyn ITestService, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
+        Ok(())
+    }
+    pub mod Empty {
+        #![allow(non_upper_case_globals)]
+        #![allow(non_snake_case)]
+        #[derive(Debug)]
+        pub struct Empty {
+        }
+        impl Default for Empty {
+            fn default() -> Self {
+                Self {
+                }
+            }
+        }
+        impl rsbinder::Parcelable for Empty {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                Ok(())
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                Ok(())
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(Empty);
+        rsbinder::impl_deserialize_for_parcelable!(Empty);
+        impl rsbinder::ParcelableMetadata for Empty {
+            fn get_descriptor() -> &'static str { "ITestService.Empty" }
+        }
+    }
+    pub mod CompilerChecks {
+        #![allow(non_upper_case_globals)]
+        #![allow(non_snake_case)]
+        #[derive(Debug)]
+        pub struct CompilerChecks {
+            pub binder: Option<rsbinder::StrongIBinder>,
+            pub nullable_binder: Option<rsbinder::StrongIBinder>,
+            pub binder_array: Vec<rsbinder::StrongIBinder>,
+            pub nullable_binder_array: Option<Vec<Option<rsbinder::StrongIBinder>>>,
+            pub binder_list: Vec<rsbinder::StrongIBinder>,
+            pub nullable_binder_list: Option<Vec<Option<rsbinder::StrongIBinder>>>,
+            pub pfd: Option<rsbinder::ParcelFileDescriptor>,
+            pub nullable_pfd: Option<rsbinder::ParcelFileDescriptor>,
+            pub pfd_array: Vec<rsbinder::ParcelFileDescriptor>,
+            pub nullable_pfd_array: Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>,
+            pub pfd_list: Vec<rsbinder::ParcelFileDescriptor>,
+            pub nullable_pfd_list: Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>,
+            pub parcel: super::Empty::Empty,
+            pub nullable_parcel: Option<super::Empty::Empty>,
+            pub parcel_array: Vec<super::Empty::Empty>,
+            pub nullable_parcel_array: Option<Vec<Option<super::Empty::Empty>>>,
+            pub parcel_list: Vec<super::Empty::Empty>,
+            pub nullable_parcel_list: Option<Vec<Option<super::Empty::Empty>>>,
+        }
+        impl Default for CompilerChecks {
+            fn default() -> Self {
+                Self {
+                    binder: Default::default(),
+                    nullable_binder: Default::default(),
+                    binder_array: Default::default(),
+                    nullable_binder_array: Default::default(),
+                    binder_list: Default::default(),
+                    nullable_binder_list: Default::default(),
+                    pfd: Default::default(),
+                    nullable_pfd: Default::default(),
+                    pfd_array: Default::default(),
+                    nullable_pfd_array: Default::default(),
+                    pfd_list: Default::default(),
+                    nullable_pfd_list: Default::default(),
+                    parcel: Default::default(),
+                    nullable_parcel: Default::default(),
+                    parcel_array: Default::default(),
+                    nullable_parcel_array: Default::default(),
+                    parcel_list: Default::default(),
+                    nullable_parcel_list: Default::default(),
+                }
+            }
+        }
+        impl rsbinder::Parcelable for CompilerChecks {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.write(&self.binder)?;
+                _parcel.write(&self.nullable_binder)?;
+                _parcel.write(&self.binder_array)?;
+                _parcel.write(&self.nullable_binder_array)?;
+                _parcel.write(&self.binder_list)?;
+                _parcel.write(&self.nullable_binder_list)?;
+                _parcel.write(&self.pfd)?;
+                _parcel.write(&self.nullable_pfd)?;
+                _parcel.write(&self.pfd_array)?;
+                _parcel.write(&self.nullable_pfd_array)?;
+                _parcel.write(&self.pfd_list)?;
+                _parcel.write(&self.nullable_pfd_list)?;
+                _parcel.write(&self.parcel)?;
+                _parcel.write(&self.nullable_parcel)?;
+                _parcel.write(&self.parcel_array)?;
+                _parcel.write(&self.nullable_parcel_array)?;
+                _parcel.write(&self.parcel_list)?;
+                _parcel.write(&self.nullable_parcel_list)?;
+                Ok(())
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                self.binder = _parcel.read()?;
+                self.nullable_binder = _parcel.read()?;
+                self.binder_array = _parcel.read()?;
+                self.nullable_binder_array = _parcel.read()?;
+                self.binder_list = _parcel.read()?;
+                self.nullable_binder_list = _parcel.read()?;
+                self.pfd = _parcel.read()?;
+                self.nullable_pfd = _parcel.read()?;
+                self.pfd_array = _parcel.read()?;
+                self.nullable_pfd_array = _parcel.read()?;
+                self.pfd_list = _parcel.read()?;
+                self.nullable_pfd_list = _parcel.read()?;
+                self.parcel = _parcel.read()?;
+                self.nullable_parcel = _parcel.read()?;
+                self.parcel_array = _parcel.read()?;
+                self.nullable_parcel_array = _parcel.read()?;
+                self.parcel_list = _parcel.read()?;
+                self.nullable_parcel_list = _parcel.read()?;
+                Ok(())
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(CompilerChecks);
+        rsbinder::impl_deserialize_for_parcelable!(CompilerChecks);
+        impl rsbinder::ParcelableMetadata for CompilerChecks {
+            fn get_descriptor() -> &'static str { "ITestService.CompilerChecks" }
+        }
+    }
+}
+    "#)
+}
+
+#[test]
 fn test_nested_type() -> Result<(), Box<dyn Error>> {
     aidl_generator(r##"
 package android.aidl.tests.nested;
@@ -78,7 +641,7 @@ interface INestedService {
     void flipStatusWithCallback(ParcelableWithNested.Status status, ICallback cb);
 }
 "##,
-    r##"
+    r#"
 pub use parcelable_with_nested::*;
 mod parcelable_with_nested {
     #[derive(Debug)]
@@ -241,7 +804,7 @@ mod i_nested_service {
         }
     }
 }
-    "##)
+    "#)
 }
 
 #[test]
@@ -294,7 +857,7 @@ parcelable ServiceDebugInfo {
     @utf8InCpp String name;
     int debugPid;
 }
-            "##, r##"
+            "##, r#"
 pub use connection_info::*;
 mod connection_info {
     #[derive(Debug)]
@@ -697,7 +1260,7 @@ mod service_debug_info {
     impl rsbinder::ParcelableMetadata for ServiceDebugInfo {
         fn get_descriptor() -> &'static str { "android.os.ServiceDebugInfo" }
     }
-}            "##)
+}            "#)
 }
 
 #[test]
@@ -714,7 +1277,7 @@ parcelable IServiceManager {
     const int DUMP_FLAG_PROTO = 1 << 4;
 }
         "##,
-        r##"
+        r#"
 pub use i_service_manager::*;
 mod i_service_manager {
     pub const DUMP_FLAG_PRIORITY_CRITICAL: i32 = 1;
@@ -746,7 +1309,7 @@ mod i_service_manager {
         fn get_descriptor() -> &'static str { "IServiceManager" }
     }
 }
-        "##)?;
+        "#)?;
     Ok(())
 }
 
@@ -769,7 +1332,7 @@ fn test_parcelable() -> Result<(), Box<dyn Error>> {
              */
             int port;
         }
-        "##, r##"
+        "##, r#"
 pub use connection_info::*;
 mod connection_info {
     #[derive(Debug)]
@@ -803,11 +1366,11 @@ mod connection_info {
         fn get_descriptor() -> &'static str { "android.os.ConnectionInfo" }
     }
 }
-        "##)?;
+        "#)?;
     Ok(())
 }
 
-const UNION: &str = r##"
+const UNION: &str = r#"
     @JavaDerive(toString=true, equals=true)
     @RustDerive(Clone=true, PartialEq=true)
     union Union {
@@ -821,11 +1384,11 @@ const UNION: &str = r##"
 
         const @utf8InCpp String S1 = "a string constant in union";
     }
-"##;
+"#;
 
 #[test]
 fn test_unions() -> Result<(), Box<dyn Error>> {
-    aidl_generator(&(r##"
+    aidl_generator(&(r#"
         package android.aidl.tests;
 
         @Backing(type="byte")
@@ -836,8 +1399,8 @@ fn test_unions() -> Result<(), Box<dyn Error>> {
             BAZ,
         }
 
-        "##.to_owned() + UNION),
-        r##"
+        "#.to_owned() + UNION),
+        r#"
 pub use byte_enum::*;
 mod byte_enum {
     rsbinder::declare_binder_enum! {
@@ -960,13 +1523,13 @@ mod union {
         }
     }
 }
-        "##)?;
+        "#)?;
 
     Ok(())
 }
 
 #[cfg(test)]
-const CONSTANT_EXPRESSION_ENUM: &str = r##"
+const CONSTANT_EXPRESSION_ENUM: &str = r#"
         @Backing(type="int")
         enum ConstantExpressionEnum {
             // Should be all true / ones.
@@ -991,10 +1554,10 @@ const CONSTANT_EXPRESSION_ENUM: &str = r##"
             // 0x7FFFFFFFFFFFFFFF is long, hence can be negated
             hexInt64_1 = -0x7FFFFFFFFFFFFFFF < 0
         }
-"##;
+"#;
 
 #[cfg(test)]
-const INT_ENUM: &str = r##"
+const INT_ENUM: &str = r#"
         @Backing(type="int")
         enum IntEnum {
             FOO = 1000,
@@ -1003,20 +1566,20 @@ const INT_ENUM: &str = r##"
             /** @deprecated do not use this */
             QUX,
         }
-"##;
+"#;
 
 #[cfg(test)]
-const LONG_ENUM: &str =r##"
+const LONG_ENUM: &str =r#"
         @Backing(type="long")
         enum LongEnum {
             FOO = 100000000000,
             BAR = 200000000000,
             BAZ,
         }
-"##;
+"#;
 
 #[cfg(test)]
-const BYTE_ENUM: &str = r##"
+const BYTE_ENUM: &str = r#"
         @Backing(type="byte")
         enum ByteEnum {
             // Comment about FOO.
@@ -1024,7 +1587,7 @@ const BYTE_ENUM: &str = r##"
             BAR = 2,
             BAZ,
         }
-"##;
+"#;
 
 #[test]
 fn test_enums() -> Result<(), Box<dyn Error>> {
@@ -1119,7 +1682,7 @@ mod long_enum {
 
 #[test]
 fn test_byte_parcelable() -> Result<(), Box<dyn Error>> {
-    aidl_generator(&(r##"
+    aidl_generator(&(r#"
 package android.aidl.tests;
 parcelable StructuredParcelable {
     int[] shouldContainThreeFs;
@@ -1292,8 +1855,8 @@ parcelable StructuredParcelable {
 
     IntEnum defaultWithFoo = IntEnum.FOO;
 }
-        "##.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM + UNION),
-        r##"
+        "#.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM + UNION),
+        r#"
 pub use structured_parcelable::*;
 mod structured_parcelable {
     pub const BIT_0: i32 = 1;
@@ -1727,6 +2290,6 @@ mod union {
         }
     }
 }
-        "##)?;
+        "#)?;
     Ok(())
 }

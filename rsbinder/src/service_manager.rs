@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Mutex},
     fs::File,
 };
 
@@ -71,7 +71,7 @@ impl BnServiceManager {
                 Some(service.binder.clone())
             }
             None => {
-                if start_if_not_found == true {
+                if start_if_not_found {
                     log::warn!("{} service could not be found. But, starting the service is not implemented yet.", name);
                 }
                 None

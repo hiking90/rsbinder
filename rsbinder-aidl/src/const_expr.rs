@@ -281,8 +281,8 @@ impl ValueType {
             }
             ValueType::Float(_) => format!("{}f32", self.to_string()),
             ValueType::Double(_) => format!("{}f64", self.to_string()),
-            ValueType::Char(_) => format!("'{}'", self.to_string()),
-            ValueType::Name(_) => format!("crate::{}", self.to_string()),
+            ValueType::Char(_) => format!("'{}' as u16", self.to_string()),
+            ValueType::Name(_) => format!("{}", self.to_string()),
             ValueType::Array(v) => {
                 let mut res = "vec![".to_owned();
                 for v in v {
@@ -293,8 +293,12 @@ impl ValueType {
 
                 res
             }
+            // ValueType::Holder => {
+            //     "rsbinder::ParcelableHolder::new(rsbinder::Stability::Local)".to_owned()
+            // }
             ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_string(),
+
             _ => format!("Default::default()"),
         }
     }
@@ -698,7 +702,7 @@ mod tests {
             ValueType::Bool(true),
         );
 
-        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(10 % 1)));
+        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(0)));
     }
 
     // #[test]

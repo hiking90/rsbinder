@@ -17,7 +17,7 @@
 use crate::binder::Stability;
 use crate::error::{StatusCode, Result};
 use crate::{
-    Deserialize, Parcel, Parcelable, Serialize, NON_NULL_PARCELABLE_FLAG,
+    Deserialize, DeserializeArray, DeserializeOption, Parcel, Parcelable, Serialize, SerializeArray, SerializeOption, NON_NULL_PARCELABLE_FLAG,
     NULL_PARCELABLE_FLAG,
 };
 
@@ -72,6 +72,12 @@ pub struct ParcelableHolder {
     // `ParcelableHolder` even for that getter method.
     data: Mutex<ParcelableHolderData>,
     stability: Stability,
+}
+
+impl Default for ParcelableHolder {
+    fn default() -> Self {
+        Self::new(Stability::Local)
+    }
 }
 
 impl ParcelableHolder {
@@ -177,6 +183,18 @@ impl Serialize for ParcelableHolder {
     }
 }
 
+impl SerializeArray for ParcelableHolder {}
+
+impl SerializeOption for ParcelableHolder {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        if let Some(f) = this {
+            f.serialize(parcel)
+        } else {
+            todo!()
+        }
+    }
+}
+
 impl Deserialize for ParcelableHolder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let status: i32 = parcel.read()?;
@@ -187,6 +205,14 @@ impl Deserialize for ParcelableHolder {
             parcelable.read_from_parcel(parcel)?;
             Ok(parcelable)
         }
+    }
+}
+
+impl DeserializeArray for ParcelableHolder {}
+
+impl DeserializeOption for ParcelableHolder {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        todo!();
     }
 }
 

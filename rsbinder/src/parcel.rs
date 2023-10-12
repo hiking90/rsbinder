@@ -221,8 +221,7 @@ impl Parcel {
 
     /// Read a type that implements [`Deserialize`] from the sub-parcel.
     pub fn read<D: Deserialize>(&mut self) -> Result<D> {
-        let result = D::deserialize(self);
-        result
+        D::deserialize(self)
     }
 
     pub fn len(&self) -> usize {
@@ -260,7 +259,7 @@ impl Parcel {
 
         // __bindgen_anon_1 is union type. So, unsafe block is required to read member variable.
         unsafe {
-            if null_meta == false && obj.cookie == 0 && obj.__bindgen_anon_1.binder == 0 {
+            if !null_meta && obj.cookie == 0 && obj.__bindgen_anon_1.binder == 0 {
                 return Ok(obj);
             }
         }
@@ -272,22 +271,22 @@ impl Parcel {
         if count > 0 {
             log::trace!("Parcel looking for obj at {}, hint={}", data_pos, opos);
             if opos < count {
-                while opos < (count - 1) && (objects[opos] as u64) < data_pos {
+                while opos < (count - 1) && objects[opos] < data_pos {
                     opos += 1;
                 }
             } else {
                 opos = count - 1;
             }
-            if objects[opos] as u64 == data_pos {
+            if objects[opos] == data_pos {
                 self.next_object_hint = opos + 1;
                 return Ok(obj);
             }
 
-            while opos > 0 && u64::from(objects[opos]) > data_pos {
+            while opos > 0 && objects[opos] > data_pos {
                 opos -= 1;
             }
 
-            if u64::from(objects[opos]) == data_pos {
+            if objects[opos] == data_pos {
                 self.next_object_hint = opos + 1;
                 return Ok(obj);
             }
@@ -296,7 +295,7 @@ impl Parcel {
     }
 
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
-        if self.request_header_present == false {
+        if !self.request_header_present {
             self.work_source_request_header_pos = self.data.len();
             self.request_header_present = true;
         }
@@ -316,7 +315,7 @@ impl Parcel {
         let data_pos = self.pos;
         self.write_data(data);
 
-        if null_meta == true || unsafe { obj.__bindgen_anon_1.binder } != 0 {
+        if null_meta || unsafe { obj.__bindgen_anon_1.binder } != 0 {
             self.objects.push(data_pos as _);
         }
 
@@ -432,7 +431,7 @@ impl Drop for Parcel {
 
 impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Parcel: pos {}, len {}\n", self.pos, self.data.len())?;
+        writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         write!(f, "{}", pretty_hex(&self.data.as_slice()))
     }
 }
@@ -535,7 +534,6 @@ impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use crate::parcelable::String16;
     use crate::*;
 

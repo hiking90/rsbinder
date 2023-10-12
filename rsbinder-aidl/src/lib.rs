@@ -11,8 +11,6 @@ mod const_expr;
 pub use parser::parse_document;
 pub use generator::gen_document;
 
-pub const DEFAULT_NAMESPACE: &str = "aidl";
-
 #[derive(Default, Hash, Eq, PartialEq, Debug, Clone)]
 pub struct Namespace{
     ns: Vec<String>,
@@ -41,11 +39,27 @@ impl Namespace {
     }
 
     pub fn to_string(&self, style: &str) -> String {
-        if style == Self::AIDL {
-            self.ns.join(style)
-        } else {
-            DEFAULT_NAMESPACE.to_owned() + Self::RUST + &self.ns.join(style)
+        self.ns.join(style)
+    }
+
+    pub fn relative_mod(&self, target: &Namespace) -> String {
+        let mut curr_ns = self.ns.clone();
+        let mut target_ns = target.ns.clone();
+
+        let mut index_to_remove = 0;
+
+        for (item1, item2) in curr_ns.iter().zip(target_ns.iter()) {
+            if item1 == item2 {
+                index_to_remove += 1;
+            } else {
+                break;
+            }
         }
+
+        curr_ns.drain(0..index_to_remove);
+        target_ns.drain(0..index_to_remove);
+
+        "super::".repeat(curr_ns.len()) + &target_ns.join(Self::RUST)
     }
 }
 
@@ -213,7 +227,7 @@ impl Builder {
         }
 
         let content = self.generate_all(package_list)?;
-        let content = add_namespace(DEFAULT_NAMESPACE, &content);
+        // let content = add_namespace(DEFAULT_NAMESPACE, &content);
 
         fs::write(self.dest_dir.join(&self.output), content)?;
 
@@ -225,5 +239,18 @@ impl Builder {
 mod tests {
     // use std::path::Path;
     // use std::fs;
-    // use super::*;
+    use super::*;
+
+    #[test]
+    fn test_relative_mod() {
+        let target = Namespace::new("android.os.IServiceCallback", Namespace::AIDL);
+        let curr = Namespace::new("android.os.IServiceManager", Namespace::AIDL);
+
+        assert_eq!(curr.relative_mod(&target), "super::IServiceCallback");
+
+        let target = Namespace::new("android.aidl.test.IServiceCallback", Namespace::AIDL);
+        let curr = Namespace::new("android.os.IServiceManager", Namespace::AIDL);
+
+        assert_eq!(curr.relative_mod(&target), "super::super::aidl::test::IServiceCallback");
+    }
 }

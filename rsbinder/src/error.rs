@@ -6,7 +6,7 @@ use std::error;
 // use std::string::FromUtf16Error;
 // use std::array::TryFromSliceError;
 
-use libc;
+
 // use thiserror;
 
 use crate::parcelable::*;
@@ -124,7 +124,7 @@ impl Status {
 
     pub fn from_i32_status(status_code: i32, exception_code: ExceptionCode, message: &str) -> Self {
         Status {
-            status_code: status_code,
+            status_code,
             exception_code: exception_code as _,
             message: message.into(),
         }
@@ -260,14 +260,14 @@ mod tests {
             parcel.write(&ok)?;
             parcel.write(&illegal_status)?;
             parcel.write(&service_specific_status)?;
-            assert_eq!(parcel.write(&failed_status).is_err(), true);
+            assert!(parcel.write(&failed_status).is_err());
         }
 
         {
             assert_eq!(parcel.read::<Result<()>>()?, ok);
             assert_eq!(parcel.read::<Result<()>>()?, illegal_status);
             assert_eq!(parcel.read::<Result<()>>()?, service_specific_status);
-            assert_eq!(parcel.read::<Result<()>>().is_err(), true);
+            assert!(parcel.read::<Result<()>>().is_err());
         }
 
         Ok(())

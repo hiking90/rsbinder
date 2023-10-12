@@ -47,7 +47,7 @@ pub type TransactionCode = u32;
 pub type TransactionFlags = u32;
 
 const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
-    (((c1 as u32)<<24)) | (((c2 as u32)<<16)) | (((c3 as u32)<<8)) | (c4 as u32)
+    ((c1 as u32)<<24) | ((c2 as u32)<<16) | ((c3 as u32)<<8) | (c4 as u32)
 }
 
 pub const FIRST_CALL_TRANSACTION: u32 = 0x00000001;
@@ -201,9 +201,9 @@ impl std::fmt::Debug for dyn IBinder {
 
 impl PartialEq for dyn IBinder  {
     fn eq(&self, other: &Self) -> bool {
-        if self.is_remote() == true && other.is_remote() == true {
+        if self.is_remote() && other.is_remote() {
             return self.as_proxy() == other.as_proxy()
-        } else if self.is_remote() == false && other.is_remote() == false {
+        } else if !self.is_remote() && !other.is_remote() {
             return self.as_any().type_id() == other.as_any().type_id()
         }
 
@@ -363,19 +363,15 @@ impl<I: InterfaceClassMethods> InterfaceClass<I> {
 /// makes no stability guarantees ([`Local`]). [`Local`] is
 /// currently the default stability.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default)]
 pub enum Stability {
     /// Default stability, visible to other modules in the same compilation
     /// context (e.g. modules on system.img)
+    #[default]
     Local,
 
     /// A Vendor Interface Object, which promises to be stable
     Vintf,
-}
-
-impl Default for Stability {
-    fn default() -> Self {
-        Stability::Local
-    }
 }
 
 impl From<Stability> for i32 {
@@ -572,7 +568,7 @@ impl WeakIBinder {
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
-        Self { inner: inner }
+        Self { inner }
     }
 
     pub fn upgrade(&self) -> StrongIBinder {

@@ -41,7 +41,7 @@ impl ProxyHandle {
     pub fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let mut data = Parcel::new();
 
-        if write_header == true {
+        if write_header {
             data.write_interface_token(String16(self.descriptor.to_owned()))?;
         }
 

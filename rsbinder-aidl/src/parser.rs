@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
+use std::panic;
 
 use convert_case::{Case, Casing};
 
@@ -68,8 +69,15 @@ fn make_ns_candidate(ns: &Namespace, name: &Namespace) -> Vec<Namespace> {
     res
 }
 
-pub fn lookup_decl_from_name(name: &str, style: &str) -> (Declaration, Namespace, String) {
-    let namespace = Namespace::new(name, style);
+#[derive(Debug)]
+pub struct LookupDecl {
+    pub decl: Declaration,
+    pub ns: Namespace,
+    pub name: Namespace,
+}
+
+pub fn lookup_decl_from_name(name: &str, style: &str) -> LookupDecl {
+    let mut namespace = Namespace::new(name, style);
 
     let mut ns_vec = Vec::new();
 
@@ -116,65 +124,72 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> (Declaration, Namespace
             ns_vec, name, hashmap.borrow().keys());
     });
 
-    let name = namespace.ns.last().unwrap();
+    // leave max 2 items because the other items are for name space.
+    if namespace.ns.len() > 2 {
+        namespace.ns.drain(0..namespace.ns.len()-2);
+    }
 
-    if name == ns.ns.last().unwrap() {
-        (decl, ns, "".into())
-    } else {
-        (decl, ns, name.into())
+    LookupDecl {
+        decl, ns, name: namespace
     }
 }
 
-fn make_const_expr(const_expr: Option<&ConstExpr>, decl_set: &(Declaration, Namespace, String)) -> ConstExpr {
+fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> ConstExpr {
     if let Some(expr) = const_expr {
         expr.clone()
     } else {
-        let name = format!("{}{}{}", decl_set.1.to_string(Namespace::RUST),
-            Namespace::RUST, decl_set.2);
+        let ns = current_namespace().relative_mod(&lookup_decl.ns);
+
+        let name = if ns.len() > 0 {
+            format!("{}{}{}", ns, Namespace::RUST, lookup_decl.name.to_string(Namespace::RUST))
+        } else {
+            lookup_decl.name.to_string(Namespace::RUST)
+        };
         ConstExpr::new(ValueType::Name(name))
     }
 }
 
-fn lookup_name_from_decl(decl: &Declaration, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
+fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option<ConstExpr> {
+    let lookup_ident = lookup_decl.name.ns.last().unwrap().to_owned();
     match decl {
         Declaration::Variable(decl) => {
-            if decl.identifier == decl_set.2 {
-                Some(make_const_expr(decl.const_expr.as_ref(), &decl_set))
+            if decl.identifier == lookup_ident {
+                Some(make_const_expr(decl.const_expr.as_ref(), &lookup_decl))
             } else {
                 None
             }
         },
         Declaration::Interface(ref decl) => {
             for var in &decl.constant_list {
-                if var.identifier == decl_set.2 {
-                    return Some(make_const_expr(var.const_expr.as_ref(), &decl_set));
+                if var.identifier == lookup_ident {
+                    return Some(make_const_expr(var.const_expr.as_ref(), &lookup_decl));
                 }
             }
-            lookup_name_members(&decl.members, &decl_set)
+            lookup_name_members(&decl.members, &lookup_decl)
         }
 
         Declaration::Parcelable(ref decl) => {
-            lookup_name_members(&decl.members, &decl_set)
+            lookup_name_members(&decl.members, &lookup_decl)
         }
 
         Declaration::Enum(ref decl) => {
             for enumerator in &decl.enumerator_list {
-                if enumerator.identifier == decl_set.2 {
-                    return Some(make_const_expr(None, &decl_set));
+                if enumerator.identifier == lookup_ident {
+                    return Some(make_const_expr(None, &lookup_decl));
                 }
             }
-            lookup_name_members(&decl.members, &decl_set)
+            lookup_name_members(&decl.members, &lookup_decl)
         }
 
         Declaration::Union(ref decl) => {
-            lookup_name_members(&decl.members, &decl_set)
+            lookup_name_members(&decl.members, &lookup_decl)
         }
     }
 }
 
-fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Namespace, String)) -> Option<ConstExpr> {
+fn lookup_name_members(members: &Vec<Declaration>, lookup_decl: &LookupDecl) -> Option<ConstExpr> {
     for decl in members {
-        if let Some(expr) = lookup_name_from_decl(decl, decl_set) {
+        if let Some(expr) = lookup_name_from_decl(decl, lookup_decl) {
             return Some(expr)
         }
     }
@@ -183,9 +198,8 @@ fn lookup_name_members(members: &Vec<Declaration>, decl_set: &(Declaration, Name
 
 // Normally, this function is used to generate Rust source code.
 pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
-    let decl_set = lookup_decl_from_name(name, Namespace::AIDL);
-
-    lookup_name_from_decl(&decl_set.0, &decl_set)
+    let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
+    lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
 }
 
 #[derive(Debug)]
@@ -287,25 +301,38 @@ impl ParcelableDecl {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub enum Direction {
+    #[default] None,
+    In,
+    Out,
+    Inout,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct Arg {
-    pub direction: String,
+    pub direction: Direction,
     pub r#type: Type,
     pub identifier: String,
 }
 
 impl Arg {
-    pub fn to_string(&self) -> (String, String) {
-        let is_mutable = if self.direction == "out" || self.direction == "inout" {
-            true
-        } else {
-            false
-        };
-
+    pub fn to_string(&self, is_nullable: bool) -> (String, String, String) {
         let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
-        let arg = format!("{}: {}", param.clone(), self.r#type.type_cast().fn_def_arg(is_mutable));
-        (param, arg)
+        let mut type_cast = self.r#type.type_cast();
+        type_cast.set_fn_nullable(is_nullable);
+        let def_arg = type_cast.fn_def_arg(&self.direction);
+        let arg = format!("{}: {}",
+            param.clone(), def_arg);
+        (param, arg, def_arg)
+    }
+
+    pub fn is_mutable(&self) -> bool {
+        match self.direction {
+            Direction::Inout | Direction::Out => true,
+            Direction::In => false,
+            _ => false,
+        }
     }
 }
 
@@ -411,8 +438,11 @@ fn generic_type_args_to_string(args: &Vec<Type>) -> String {
     let mut args_str = String::new();
 
     args.iter().for_each(|t| {
+        let mut cast = t.type_cast();
+        cast.set_generic(true);
+
         args_str.push_str(", ");
-        args_str.push_str(&t.type_cast().member_type());
+        args_str.push_str(&cast.member_type());
     });
 
     args_str[2..].into()
@@ -422,14 +452,18 @@ impl Generic {
     pub fn to_string(&self) -> String {
         match self {
             Generic::Type1 { type_args1, non_array_type, type_args2 } => {
+                let cast = TypeCast::new(&non_array_type);
+                // cast.set_generic();
                 format!("{}{}{}",
                     generic_type_args_to_string(type_args1),
-                    TypeCast::new(&non_array_type).member_type(),
+                    cast.member_type(),
                     generic_type_args_to_string(&type_args2))
             }
             Generic::Type2 { non_array_type, type_args } => {
+                let cast = TypeCast::new(&non_array_type);
+                // cast.set_generic();
                 format!("{}{}",
-                    TypeCast::new(&non_array_type).member_type(),
+                    cast.member_type(),
                     generic_type_args_to_string(&type_args))
             }
             Generic::Type3 { type_args } => {
@@ -478,7 +512,8 @@ impl Type {
     pub fn type_cast(&self) -> TypeCast {
         let mut cast = TypeCast::new(&self.non_array_type);
 
-        cast.set_more(&self.array_types, check_annotation_list(&self.annotation_list, AnnotationType::IsNullable));
+        cast.set_array_types(&self.array_types);
+        cast.set_nullable(check_annotation_list(&self.annotation_list, AnnotationType::IsNullable));
 
         cast
     }
@@ -489,21 +524,17 @@ pub struct TypeCast {
     pub aidl_type: NonArrayType,
     pub type_name: String,
     pub is_declared: bool,
-    pub is_primitive: bool,
-    pub is_string: bool,
-    pub is_vector: bool,
-    pub is_map: bool,
     pub is_nullable: bool,
+    pub is_fn_nullable: bool,
+    pub is_vector: bool,
+    pub is_generic: bool,
     pub value_type: ValueType,
 }
 
 impl TypeCast {
     fn new(aidl_type: &NonArrayType) -> TypeCast {
         let mut is_declared = false;
-        let mut is_primitive = true;
-        let mut is_string = false;
         let mut is_vector = false;
-        let is_map = false;
         let type_name = match aidl_type.name.as_str() {
             "boolean" => ("bool".to_owned(), ValueType::Bool(false)),
             "byte" => ("i8".to_owned(), ValueType::Int8(0)),
@@ -514,16 +545,12 @@ impl TypeCast {
             "double" => ("f64".to_owned(), ValueType::Double(0.)),
             "void" => ("()".to_owned(), ValueType::Void),
             "String" => {
-                is_primitive = false;
-                is_string = true;
                 ("String".to_owned(), ValueType::String(String::new()))
             }
             "IBinder" => {
-                is_primitive = false;
                 ("rsbinder::StrongIBinder".to_owned(), ValueType::IBinder)
             }
             "List" => {
-                is_primitive = false;
                 is_vector = true;
                 match &aidl_type.generic {
                     Some(gen) => (gen.to_string(), ValueType::Array(Vec::new())),
@@ -539,23 +566,31 @@ impl TypeCast {
                 panic!("FileDescriptor isn't supported by the aidl generator of rsbinder.");
             }
             "ParcelFileDescriptor" => {
-                is_primitive = false;
                 ("rsbinder::ParcelFileDescriptor".to_owned(), ValueType::FileDescriptor)
             }
             "ParcelableHolder" => {
-                is_primitive = false;
                 ("rsbinder::ParcelableHolder".to_owned(), ValueType::Holder)
             }
             _ => {
-                is_primitive = false;
-                let decl_set = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
-                let type_name = format!("crate::{}", decl_set.1.to_string(Namespace::RUST));
+                let lookup_decl = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
+                let curr_ns = current_namespace();
+                let ns = curr_ns.relative_mod(&lookup_decl.ns);
+                let type_name = if ns.len() > 0 {
+                    format!("{}::{}", ns, lookup_decl.name.ns.last().unwrap())
+                } else {
+                    let name = lookup_decl.name.ns.last().unwrap().to_owned();
+                    if curr_ns.ns.last().unwrap() == name.as_str() {
+                        format!("Box<{}>", name)    // To avoid, recursive type issue.
+                    } else {
+                        name
+                    }
+                };
 
-                match decl_set.0 {
+                match lookup_decl.decl {
                     Declaration::Interface(_) => {
                         is_declared = true;
-                        let type_name = format!("std::sync::Arc<dyn {}>", type_name);
-                        (type_name.clone(), ValueType::UserDefined)
+                        // let type_name = format!("std::sync::Arc<dyn {}>", type_name);
+                        (type_name.to_owned(), ValueType::UserDefined)
                     }
                     _ => (type_name.to_owned(), ValueType::UserDefined),
                 }
@@ -567,75 +602,157 @@ impl TypeCast {
             type_name: type_name.0,
             value_type: type_name.1,
             is_declared,
-            is_primitive,
-            is_string,
             is_vector,
-            is_map,
             is_nullable: false,
+            is_generic: false,
+            is_fn_nullable: false,
         }
     }
 
-    pub fn type_name(&self) -> String {
-        let mut type_name = if self.is_vector {
-            format!("Vec<{}>", self.type_name)
+    fn nullable_type(is_ref: bool, name: &str) -> String {
+        if is_ref == true {
+            format!("Option<&{}>", name)
         } else {
-            self.type_name.clone()
+            format!("Option<{}>", name)
+        }
+    }
+
+    fn general_type(is_ref: bool, name: &str) -> String {
+        if is_ref == true {
+            format!("&{}", name)
+        } else {
+            name.to_owned()
+        }
+    }
+
+    pub fn type_name(&self, dir: &Direction) -> String {
+        let mut is_option = false;
+        let type_name = if self.is_declared == true {
+            if self.is_nullable {
+                is_option = true;
+            }
+            format!("std::sync::Arc<dyn {}>", self.type_name)
+        } else {
+            match self.value_type {
+                ValueType::FileDescriptor | ValueType::Holder |
+                ValueType::IBinder => {
+                    if (self.is_generic == false && self.is_vector == false) || self.is_nullable {
+                        is_option = true;
+                    }
+                },
+                _ => {
+                    if self.is_nullable == true {
+                        is_option = true;
+                    }
+                }
+            }
+            self.type_name.to_owned()
         };
 
-        if self.is_nullable {
-            type_name = format!("Option<{}>", type_name);
-        }
+        match dir {
+            Direction::In => {
+                if self.is_vector {
+                    if is_option {
+                        if self.is_nullable {
+                            format!("Option<&[Option<{}>]>", type_name)
+                        } else {
+                            format!("&[Option<{}>]", type_name)
+                        }
+                    } else {
+                        format!("&[{}]", type_name)
+                    }
+                } else {
+                    let type_name = match self.value_type {
+                        ValueType::String(_) => "str".to_owned(),
+                        ValueType::Bool(_) | ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
+                        ValueType::Char(_) | ValueType::Float(_) | ValueType::Double(_) => {
+                            return type_name;
+                        }
+                        _ => type_name,
+                    };
+                    let type_name = if let ValueType::String(_) = self.value_type {
+                        "str".to_owned()
+                    } else {
+                        type_name
+                    };
+                    if is_option {
+                        format!("Option<&{}>", type_name)
+                    } else {
+                        format!("&{}", type_name)
+                    }
+                }
+            }
+            Direction::Out => {
+                if self.is_fn_nullable {
+                    is_option = true;
+                }
+                let type_name = self.type_name(&Direction::None);
+                if type_name.starts_with("Option<") {
+                    is_option = false;
+                }
+                if is_option {
+                    format!("&mut Option<{}>", type_name)
+                } else {
+                    format!("&mut {}", type_name)
+                }
+            }
+            Direction::Inout => {
+                let mut type_cast = self.clone();
+                type_cast.set_fn_nullable(false);
+                type_cast.type_name(&Direction::Out)
+            }
+            Direction::None => {
+                let type_name = if self.is_vector {
+                    if self.is_nullable {
+                        format!("Vec<Option<{}>>", type_name)
+                    } else {
+                        format!("Vec<{}>", type_name)
+                    }
+                } else {
+                    type_name
+                };
 
-        type_name
+                if is_option {
+                    format!("Option<{}>", type_name)
+                } else {
+                    type_name
+                }
+            }
+        }
     }
 
-    pub fn fn_def_arg(&self, is_mutable: bool) -> String {
-        if is_mutable {
-            if self.is_string {
-                format!("&mut str")
-            } else if self.is_primitive {
-                format!("mut {}", self.type_name())
-            } else {
-                format!("&mut {}", self.type_name())
-            }
+    pub fn fn_def_arg(&self, direction: &Direction) -> String {
+        let direction = if let Direction::None = direction {
+            Direction::In
         } else {
-            if self.is_string {
-                format!("&str")
-            } else if self.is_primitive {
-                format!("{}", self.type_name())
-            }
-            else {
-                format!("&{}", self.type_name())
-            }
-        }
+            direction.clone()
+        };
+
+        self.type_name(&direction)
     }
 
-    // Return String for function call.
-    pub fn as_ref(&self, arg_name: &str) -> String {
-        // declared type is wrapped by Arc<T>.
-        if self.is_declared {
-            format!("{}.as_ref()", arg_name)
-        } else if self.is_primitive {
-            format!("&{}", arg_name)
-        } else {
-            // arg is already referenced likes &rsbinder::StrongIBinder.
-            arg_name.into()
-        }
+    fn set_nullable(&mut self, is_nullable: bool) {
+        self.is_nullable = is_nullable;
     }
 
-    fn set_more(&mut self, array_types: &Vec<ArrayType>, is_nullable: bool) {
+    pub fn set_fn_nullable(&mut self, is_nullable: bool) {
+        self.is_fn_nullable = is_nullable;
+    }
+
+    fn set_generic(&mut self, is_generic: bool) {
+        self.is_generic = is_generic;
+    }
+
+    fn set_array_types(&mut self, array_types: &Vec<ArrayType>) {
         // TODO: implement Vector.....
         // &Vec<T>
         array_types.iter().for_each(|t| {
             if t.is_vector() {
                 self.is_vector = true;
-                self.is_primitive = false;
             } else {
                 self.type_name = format!("{}[{}]", self.type_name, t.to_string());
             }
         });
-
-        self.is_nullable = is_nullable;
     }
 
     pub fn value_type(&self) -> ValueType {
@@ -643,16 +760,11 @@ impl TypeCast {
     }
 
     pub fn const_type(&self) -> String {
-        let mut type_string = self.type_name();
-            // public constant string type must be "&str".
-        if type_string == "String" {
-            type_string = "&str".into();
-        }
-        type_string
+        self.type_name(&Direction::In)
     }
 
     pub fn member_type(&self) -> String {
-        self.type_name()
+        self.type_name(&Direction::None)
     }
 
     pub fn init_type(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
@@ -665,11 +777,16 @@ impl TypeCast {
         }
     }
 
-    pub fn return_type(&self, is_nullable: bool) -> String {
-        if is_nullable == true && self.is_nullable == false {
-            format!("Option<{}>", self.type_name())
+    pub fn return_type(&self) -> String {
+        if let ValueType::Void = self.value_type {
+            self.type_name.to_owned()
         } else {
-            self.type_name()
+            let type_name = self.type_name(&Direction::None);
+            if self.is_fn_nullable && !type_name.starts_with("Option<") {
+                format!("Option<{}>", type_name)
+            } else {
+                type_name
+            }
         }
     }
 }
@@ -1101,7 +1218,14 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Arg {
 
     for pair in pairs {
         match pair.as_rule() {
-            Rule::direction => { arg.direction = pair.as_str().into(); }
+            Rule::direction => {
+                arg.direction = match pair.as_str() {
+                    "in" => Direction::In,
+                    "out" => Direction::Out,
+                    "inout" => Direction::Inout,
+                    _ => panic!("Unsupported direction: {}", pair.as_str()),
+                };
+            }
             Rule::r#type => { arg.r#type = parse_type(pair.into_inner()); }
             Rule::identifier => { arg.identifier = pair.as_str().into(); }
             _ => unreachable!("Unexpected rule in parse_arg(): {}", pair),

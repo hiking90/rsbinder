@@ -8,17 +8,16 @@ use std::path::Path;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
 use std::sync::{RwLock};
-use log;
+
 
 use crate::{
     error::*,
     binder::*,
     sys::binder,
     proxy::*,
-    parcel::*,
     native,
     thread_state,
-    service_manager::{BnServiceManager, BpServiceManager},
+    service_manager::{BnServiceManager},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -120,7 +119,7 @@ impl ProcessState {
 
         unsafe {
             let driver_fd = self.driver_fd.read().unwrap();
-            if let Err(_) = binder::set_context_mgr_ext(*driver_fd, &obj) {
+            if binder::set_context_mgr_ext(*driver_fd, &obj).is_err() {
                 //     android_errorWriteLog(0x534e4554, "121035042");
                 let unused: i32 = 0;
                 if let Err(e) = binder::set_context_mgr(*driver_fd, &unused) {
@@ -198,7 +197,6 @@ fn open_driver(driver: &Path, max_threads: u32) -> Option<RawFd> {
             return None;
         }
 
-        let max_threads = max_threads;
         binder::set_max_threads(raw_fd, &max_threads)
             .map_err(|e| log::error!("Binder ioctl to set max threads failed: {}", e.to_string()))
             .ok()?;

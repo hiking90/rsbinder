@@ -62,7 +62,7 @@ unsafe impl<T: Remotable> Sync for Binder<T> {}
 impl<T: Remotable> Binder<T> {
     pub fn new(remotable: T) -> Self {
         Binder {
-            remotable: remotable,
+            remotable,
         }
     }
 

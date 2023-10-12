@@ -1,14 +1,16 @@
-
 use std::error::Error;
+use serde::{Serialize, Deserialize};
 
 use tera::Tera;
 use convert_case::{Case, Casing};
 
 use crate::{parser, add_indent, Namespace};
+use crate::parser::Direction;
 
 const ENUM_TEMPLATE: &str = r##"
-pub use {{mod}}::*;
-mod {{mod}} {
+pub mod {{mod}} {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
     rsbinder::declare_binder_enum! {
         {{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
@@ -19,10 +21,11 @@ mod {{mod}} {
 }
 "##;
 
-const UNION_TEMPLATE: &str = r##"
-pub use {{mod}}::*;
-mod {{mod}} {
-    #[derive(Debug, Clone, PartialEq)]
+const UNION_TEMPLATE: &str = r#"
+pub mod {{mod}} {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
+    #[derive(Debug, PartialEq)]
     pub enum {{union_name}} {
     {%- for member in members %}
         {{ member.0 }}({{ member.1 }}),
@@ -72,23 +75,34 @@ mod {{mod}} {
     impl rsbinder::ParcelableMetadata for {{union_name}} {
         fn get_descriptor() -> &'static str { "{{ namespace }}" }
     }
-    pub mod tag {
-        rsbinder::declare_binder_enum! {
-            Tag : [i32; {{ members|length }}] {
+    rsbinder::declare_binder_enum! {
+        Tag : [i32; {{ members|length }}] {
     {%- set counter = 0 %}
     {%- for member in members %}
-                {{ member.0|upper }} = {{ counter }},
+            {{ member.0|upper }} = {{ counter }},
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
-            }
         }
     }
 }
-"##;
+"#;
 
-const PARCELABLE_TEMPLATE: &str = r##"
-pub use {{mod}}::*;
-mod {{mod}} {
+    // pub mod tag {
+    //     rsbinder::declare_binder_enum! {
+    //         Tag : [i32; {{ members|length }}] {
+    // {%- set counter = 0 %}
+    // {%- for member in members %}
+    //             {{ member.0|upper }} = {{ counter }},
+    // {%- set_global counter = counter + 1 %}
+    // {%- endfor %}
+    //         }
+    //     }
+    // }
+
+const PARCELABLE_TEMPLATE: &str = r#"
+pub mod {{mod}} {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
     {%- for member in const_members %}
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
@@ -130,23 +144,24 @@ mod {{mod}} {
     {{nested}}
     {%- endif %}
 }
-"##;
+"#;
 
-const INTERFACE_TEMPLATE: &str = r##"
-pub use {{mod}}::*;
-mod {{mod}} {
+const INTERFACE_TEMPLATE: &str = r#"
+pub mod {{mod}} {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_snake_case)]
     {%- for member in const_members %}
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     pub trait {{name}}: rsbinder::Interface + Send {
         {%- for member in fn_members %}
-        fn {{ member.0 }}({{ member.1 }}) -> rsbinder::Result<{{ member.2 }}>;
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}>;
         {%- endfor %}
     }
     pub(crate) mod transactions {
         {%- set counter = 0 %}
         {%- for member in fn_members %}
-        pub(crate) const {{ member.0|upper }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
+        pub(crate) const {{ member.identifier|upper }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
         {%- set_global counter = counter + 1 %}
         {%- endfor %}
     }
@@ -158,10 +173,10 @@ mod {{mod}} {
     }
     impl {{ bp_name }} {
         {%- for member in fn_members %}
-        fn build_parcel_{{ member.0 }}({{ member.1 }}) -> rsbinder::Result<rsbinder::Parcel> {
-            {%- if member.3|length > 0 %}
+        fn build_parcel_{{ member.identifier }}({{ member.args }}) -> rsbinder::Result<rsbinder::Parcel> {
+            {%- if member.write_params|length > 0 %}
             let mut data = self.handle.prepare_transact(true)?;
-            {%- for arg in member.3 %}
+            {%- for arg in member.write_params %}
             data.write({{ arg }})?;
             {%- endfor %}
             {%- else %}
@@ -169,14 +184,14 @@ mod {{mod}} {
             {%- endif %}
             Ok(data)
         }
-        fn read_response_{{ member.0 }}({{ member.1 }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{{ member.2 }}> {
-            {%- if oneway or member.6 %}
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{{ member.return_type }}> {
+            {%- if oneway or member.oneway %}
             Ok(())
             {%- else %}
-            {%- if member.2 != "()" %}
+            {%- if member.return_type != "()" %}
             let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            let _aidl_return: {{ member.2 }} = _aidl_reply.read()?;
+            let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
             Ok(_aidl_return)
             {%- else %}
             let mut _aidl_reply = _aidl_reply.unwrap();
@@ -189,10 +204,10 @@ mod {{mod}} {
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn {{ member.0 }}({{ member.1 }}) -> rsbinder::Result<{{ member.2 }}> {
-            let _aidl_data = self.build_parcel_{{ member.0 }}({{ member.4 }})?;
-            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.0|upper }}, &_aidl_data, {% if oneway or member.6 %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
-            self.read_response_{{ member.0 }}({{ member.5 }}_aidl_reply)
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
+            let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.build_params }})?;
+            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.identifier|upper }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
+            self.read_response_{{ member.identifier }}({{ member.read_params }}_aidl_reply)
         }
         {%- endfor %}
     }
@@ -204,7 +219,7 @@ mod {{mod}} {
     {{nested}}
     {%- endif %}
 }
-"##;
+"#;
 
 lazy_static! {
     pub static ref TEMPLATES: Tera = {
@@ -217,53 +232,74 @@ lazy_static! {
     };
 }
 
-fn make_fn_member(method: &parser::MethodDecl) -> Result<(String, String, String, Vec<String>, String, String, bool), Box<dyn Error>> {
+#[derive(Serialize, Deserialize, Debug)]
+struct FnMembers {
+    identifier: String,
+    args: String,
+    return_type: String,
+    write_params: Vec<String>,
+    build_params: String,
+    read_params: String,
+    oneway: bool,
+}
+
+fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
     let mut build_params = String::new();
     let mut read_params = String::new();
     let mut args = "&self".to_string();
     let mut write_params = Vec::new();
+    let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable);
 
     method.arg_list.iter().for_each(|arg| {
-        let arg_str = arg.to_string();
+        let arg_str = arg.to_string(is_nullable);
         args += &format!(", {}", arg_str.1);
 
-        let type_cast = arg.r#type.type_cast();
-
-        if type_cast.is_declared {
+        if arg_str.2.starts_with("&mut") || arg_str.2.starts_with('&') {
             build_params += &format!("{}, ", arg_str.0);
-            write_params.push(format!("{}.as_ref()", arg_str.0))
-        } else if type_cast.is_primitive {
+            write_params.push(arg_str.0.to_string())
+        } else if arg_str.2.starts_with("Option<&") {
             build_params += &format!("{}, ", arg_str.0);
             write_params.push(format!("&{}", arg_str.0))
-        } else {
-            if type_cast.is_string {
-                build_params += &format!("{}, ", arg_str.0);
-                write_params.push(format!("{}", arg_str.0))
+        } else if arg_str.2.starts_with("Option<") {
+            build_params += &format!("{}.as_ref(), ", arg_str.0);
+            write_params.push(format!("&{}", arg_str.0))
+        } else if arg_str.2.starts_with("std::sync::Arc<") || arg_str.2.starts_with("Vec<"){
+            if arg.is_mutable() {
+                build_params += &format!("&mut {}, ", arg_str.0);
             } else {
-                build_params += &format!("{}, ", arg_str.0);
-                // write_params.push(format!("&{}", arg_str.0))
-                write_params.push(format!("{}", arg_str.0))
+                build_params += &format!("&{}, ", arg_str.0);
             }
+            write_params.push(format!("&{}", arg_str.0))
+        } else {
+            build_params += &format!("{}, ", arg_str.0);
+            write_params.push(format!("&{}", arg_str.0))
         }
 
-        // build_params += &format!("{}.clone(), ", arg_str.0);
         read_params += &format!("{}, ", arg_str.0);
 
         // write_params.push(type_cast.as_ref(&arg_str.0));
     });
 
-    let return_type = method.r#type.type_cast()
-        .return_type(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
+    let mut type_cast = method.r#type.type_cast();
+    type_cast.set_fn_nullable(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
+    let return_type = type_cast.return_type();
+    // let return_type = method.r#type.type_cast()
+    //     .return_type(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
 
-    Ok((method.identifier.to_case(Case::Snake),
-        args, return_type, write_params, build_params, read_params, method.oneway))
+    Ok(FnMembers{
+        identifier: method.identifier.to_case(Case::Snake),
+        args, return_type, write_params, build_params, read_params,
+        oneway: method.oneway
+    })
+    // Ok((method.identifier.to_case(Case::Snake),
+    //     args, return_type, write_params, build_params, read_params, method.oneway))
 }
 
 fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
         is_empty = true;
         // return Ok(String::new())
     }
@@ -273,7 +309,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     let mut const_members = Vec::new();
     let mut fn_members = Vec::new();
 
-    if is_empty == false {
+    if !is_empty {
         for constant in decl.constant_list.iter() {
             let type_cast = constant.r#type.type_cast();
             const_members.push((constant.const_identifier(),
@@ -289,7 +325,7 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
     let mut context = tera::Context::new();
 
-    context.insert("mod", &decl.name.to_case(Case::Snake));
+    context.insert("mod", &decl.name);
     context.insert("name", &decl.name);
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("const_members", &const_members);
@@ -303,19 +339,19 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
     let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
 
-    Ok(add_indent(indent, &rendered.trim()))
+    Ok(add_indent(indent, rendered.trim()))
 }
 
 fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
         println!("Parcelable {} is only used for Java.", decl.name);
         is_empty = true;
         // return Ok(String::new())
     }
-    if decl.cpp_header.is_empty() == false {
+    if !decl.cpp_header.is_empty() {
         println!("cpp_header {} for Parcelable {} is not supported.", decl.cpp_header, decl.name);
         is_empty = true;
         // return Ok(String::new())
@@ -327,13 +363,13 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
     let mut members = Vec::new();
     let mut declations = Vec::new();
 
-    if is_empty == false {
+    if !is_empty {
         // Parse struct variables only.
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
                 let type_cast = var.r#type.type_cast();
 
-                if var.constant == true {
+                if var.constant {
                     constant_members.push((var.const_identifier(),
                         type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
                 } else {
@@ -351,7 +387,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 
     let mut context = tera::Context::new();
 
-    context.insert("mod", &decl.name.to_case(Case::Snake));
+    context.insert("mod", &decl.name);
     context.insert("name", &decl.name);
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
@@ -360,11 +396,11 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 
     let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
 
-    Ok(add_indent(indent, &rendered.trim()))
+    Ok(add_indent(indent, rendered.trim()))
 }
 
 fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
         return Ok(String::new())
     }
 
@@ -382,19 +418,19 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 
     let mut context = tera::Context::new();
 
-    context.insert("mod", &decl.name.to_case(Case::Snake));
+    context.insert("mod", &decl.name);
     context.insert("enum_name", &decl.name);
-    context.insert("enum_type", &type_cast.type_name());
+    context.insert("enum_type", &type_cast.type_name(&Direction::None));
     context.insert("enum_len", &decl.enumerator_list.len());
     context.insert("members", &members);
 
     let rendered = TEMPLATES.render("enum", &context).expect("Failed to render enum template");
 
-    Ok(add_indent(indent, &rendered.trim()))
+    Ok(add_indent(indent, rendered.trim()))
 }
 
 fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) == true {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
         return Ok(String::new())
     }
 
@@ -404,7 +440,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
     for member in &decl.members {
         if let parser::Declaration::Variable(var) = member {
             let type_cast = var.r#type.type_cast();
-            if var.constant == true {
+            if var.constant {
                 constant_members.push((var.const_identifier(),
                     type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
             } else {
@@ -417,7 +453,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     let mut context = tera::Context::new();
 
-    context.insert("mod", &decl.name.to_case(Case::Snake));
+    context.insert("mod", &decl.name);
     context.insert("union_name", &decl.name);
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
@@ -425,7 +461,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     let rendered = TEMPLATES.render("union", &context).expect("Failed to render union template");
 
-    Ok(add_indent(indent, &rendered.trim()))
+    Ok(add_indent(indent, rendered.trim()))
 }
 
 

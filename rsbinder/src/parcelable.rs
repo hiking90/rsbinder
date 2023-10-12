@@ -265,6 +265,15 @@ macro_rules! impl_parcelable {
             // }
         }
     };
+    {SerializeOption, $ty:ty} => {
+        impl SerializeOption for $ty {
+        }
+    };
+
+    {DeserializeOption, $ty:ty} => {
+        impl DeserializeOption for $ty {
+        }
+    };
 }
 
 macro_rules! parcelable_primitives_ex {
@@ -306,57 +315,89 @@ macro_rules! impl_parcelable_ex {
         impl DeserializeArray for $ty {
         }
     };
+
+    {SerializeOption, $to_ty:ty, $ty:ty} => {
+        impl SerializeOption for $ty {
+        }
+    };
+
+    {DeserializeOption, $to_ty:ty, $ty:ty} => {
+        impl DeserializeOption for $ty {
+        }
+    };
 }
 
 
 parcelable_primitives! {
     impl SerializeArray for i8;
     impl DeserializeArray for i8;
+    impl SerializeOption for i8;
+    impl DeserializeOption for i8;
 
     impl SerializeArray for u8;
     impl DeserializeArray for u8;
+    impl SerializeOption for u8;
+    impl DeserializeOption for u8;
 
     impl SerializeArray for i16;
     impl DeserializeArray for i16;
+    impl SerializeOption for i16;
+    impl DeserializeOption for i16;
 
     impl SerializeArray for u16;
     impl DeserializeArray for u16;
+    impl SerializeOption for u16;
+    impl DeserializeOption for u16;
 
 
     impl Serialize for i32;
     impl Deserialize for i32;
     impl SerializeArray for i32;
     impl DeserializeArray for i32;
+    impl SerializeOption for i32;
+    impl DeserializeOption for i32;
 
     impl Serialize for u32;
     impl Deserialize for u32;
     impl SerializeArray for u32;
     impl DeserializeArray for u32;
+    impl SerializeOption for u32;
+    impl DeserializeOption for u32;
 
     impl Serialize for f32;
     impl Deserialize for f32;
     impl SerializeArray for f32;
     impl DeserializeArray for f32;
+    impl SerializeOption for f32;
+    impl DeserializeOption for f32;
 
     impl Serialize for i64;
     impl Deserialize for i64;
     impl SerializeArray for i64;
     impl DeserializeArray for i64;
+    impl SerializeOption for i64;
+    impl DeserializeOption for i64;
 
     impl Serialize for u64;
     impl Deserialize for u64;
     impl SerializeArray for u64;
     impl DeserializeArray for u64;
+    impl SerializeOption for u64;
+    impl DeserializeOption for u64;
 
     impl Serialize for f64;
     impl Deserialize for f64;
     impl SerializeArray for f64;
     impl DeserializeArray for f64;
+    impl SerializeOption for f64;
+    impl DeserializeOption for f64;
 
     impl Serialize for u128;
     impl Deserialize for u128;
     impl SerializeArray for u128;
     impl DeserializeArray for u128;
+    impl SerializeOption for u128;
+    impl DeserializeOption for u128;
 }
 
 parcelable_primitives_ex! {
@@ -379,11 +420,23 @@ impl Deserialize for bool {
     }
 }
 
+impl DeserializeArray for bool {
+}
+
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = *self as _;
         parcel.write_data(&val.to_ne_bytes());
         Ok(())
+    }
+}
+
+impl SerializeArray for bool {
+}
+
+impl SerializeOption for str {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        todo!()
     }
 }
 
@@ -395,6 +448,7 @@ impl Serialize for str {
     }
 }
 
+impl SerializeArray for &str {}
 
 macro_rules! parcelable_struct {
     {
@@ -442,6 +496,12 @@ impl Serialize for String {
 }
 
 impl SerializeArray for String {}
+
+impl SerializeOption for String {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        SerializeOption::serialize_option(this.map(String::as_str), parcel)
+    }
+}
 
 impl Deserialize for Option<String> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
@@ -555,7 +615,7 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
 impl Serialize for StrongIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
 
-        let sched_bits = if ProcessState::as_self().background_scheduling_disabled() == false {
+        let sched_bits = if !ProcessState::as_self().background_scheduling_disabled() {
             sched_policy_mask(SCHED_NORMAL, 19)
         } else {
             0
@@ -601,6 +661,8 @@ impl Serialize for StrongIBinder {
 
 impl SerializeOption for StrongIBinder {}
 
+impl SerializeArray for StrongIBinder {}
+
 impl Deserialize for StrongIBinder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let flat: flat_binder_object = parcel.read()?;
@@ -636,6 +698,8 @@ impl DeserializeOption for StrongIBinder {
         Ok(Some(parcel.read()?))
     }
 }
+
+impl DeserializeArray for StrongIBinder {}
 
 // impl DeserializeOption for StrongIBinder {
 //     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
@@ -741,6 +805,52 @@ impl<T: Deserialize> Deserialize for Box<T> {
     }
 }
 
+impl<T: SerializeOption> SerializeOption for Box<T> {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        SerializeOption::serialize_option(this.map(|inner| &**inner), parcel)
+    }
+}
+
+impl<T: DeserializeOption> DeserializeOption for Box<T> {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        DeserializeOption::deserialize_option(parcel).map(|t| t.map(Box::new))
+    }
+}
+
+impl<T: Serialize + ?Sized> Serialize for std::sync::Arc<T> {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        Serialize::serialize(&**self, parcel)
+    }
+}
+
+impl<T: SerializeOption + ?Sized> SerializeOption for std::sync::Arc<T> {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        SerializeOption::serialize_option(this.map(|b| &**b), parcel)
+    }
+}
+
+impl<T: Serialize + ?Sized> SerializeArray for std::sync::Arc<T> {}
+
+impl<T: ?Sized> Deserialize for std::sync::Arc<T> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        todo!()
+        // let ibinder: SpIBinder = parcel.read()?;
+        // FromIBinder::try_from(ibinder)
+    }
+}
+
+impl<T: ?Sized> DeserializeOption for std::sync::Arc<T> {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        todo!()
+        // let ibinder: Option<SpIBinder> = parcel.read()?;
+        // ibinder.map(FromIBinder::try_from).transpose()
+    }
+}
+
+impl<T: ?Sized> DeserializeArray for std::sync::Arc<T> {}
+
+impl<T: DeserializeOption> DeserializeArray for Option<T> {}
+impl<T: SerializeOption> SerializeArray for Option<T> {}
 
 /// Helper trait for types that can be serialized as arrays.
 /// Defaults to calling Serialize::serialize() manually for every element,
@@ -768,7 +878,7 @@ pub trait SerializeArray: Serialize + Sized {
 /// but can be overridden for custom implementations like `readByteArray`.
 pub trait DeserializeArray: Deserialize {
     /// Deserialize an array of type from the given parcel.
-    fn deserialize_array(parcel: &mut Parcel) -> Result<Vec<Self>> {
+    fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
         let len: i32 = parcel.read()?;
         if len < 0 {
             return Err(StatusCode::BadValue.into());
@@ -779,7 +889,7 @@ pub trait DeserializeArray: Deserialize {
             res.push(parcel.read()?);
         }
 
-        Ok(res)
+        Ok(Some(res))
     }
 }
 
@@ -795,8 +905,33 @@ impl<T: SerializeArray> Serialize for Vec<T> {
     }
 }
 
+impl<T: SerializeArray> SerializeOption for [T] {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        if let Some(v) = this {
+            SerializeArray::serialize_array(v, parcel)
+        } else {
+            parcel.write(&-1i32)
+        }
+    }
+}
+
+impl<T: SerializeArray> SerializeOption for Vec<T> {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        SerializeOption::serialize_option(this.map(Vec::as_slice), parcel)
+    }
+}
+
+
 impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        DeserializeArray::deserialize_array(parcel)
+            .transpose()
+            .unwrap_or(Err(StatusCode::UnexpectedNull.into()))
+    }
+}
+
+impl<T: DeserializeArray> DeserializeOption for Vec<T> {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         DeserializeArray::deserialize_array(parcel)
     }
 }
@@ -805,7 +940,9 @@ impl<T: DeserializeArray> Deserialize for Vec<T> {
 
 impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let vec = DeserializeArray::deserialize_array(parcel)?;
+        let vec = DeserializeArray::deserialize_array(parcel)
+            .transpose()
+            .unwrap_or(Err(StatusCode::UnexpectedNull.into()))?;
         vec.try_into().or(Err(StatusCode::BadValue.into()))
     }
 }
