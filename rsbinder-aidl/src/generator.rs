@@ -25,7 +25,10 @@ const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
     #![allow(non_upper_case_globals)]
     #![allow(non_snake_case)]
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug)]
+    {%- if derive|length > 0 %}
+    #[derive({{ derive }})]
+    {%- endif %}
     pub enum {{union_name}} {
     {%- for member in members %}
         {{ member.0 }}({{ member.1 }}),
@@ -107,6 +110,9 @@ pub mod {{mod}} {
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     #[derive(Debug)]
+    {%- if derive|length > 0 %}
+    #[derive({{ derive }})]
+    {%- endif %}
     pub struct {{name}} {
     {%- for member in members %}
         pub {{ member.0 }}: {{ member.1 }},
@@ -157,13 +163,31 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}>;
         {%- endfor %}
+        fn getDefaultImpl() -> {{ name }}DefaultRef where Self: Sized {
+            DEFAULT_IMPL.lock().unwrap().clone()
+        }
+        fn setDefaultImpl(d: {{ name }}DefaultRef) -> {{ name }}DefaultRef where Self: Sized {
+            std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+        }
+    }
+    pub trait {{ name }}Default: Send + Sync {
+        {%- for member in fn_members %}
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
+            Err(rsbinder::StatusCode::UnknownTransaction.into())
+        }
+        {%- endfor %}
     }
     pub(crate) mod transactions {
         {%- set counter = 0 %}
         {%- for member in fn_members %}
-        pub(crate) const {{ member.identifier|upper }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
+        pub(crate) const {{ member.identifier }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
         {%- set_global counter = counter + 1 %}
         {%- endfor %}
+    }
+    pub type {{ name }}DefaultRef = Option<std::sync::Arc<dyn {{ name }}Default>>;
+    use lazy_static::lazy_static;
+    lazy_static! {
+        static ref DEFAULT_IMPL: std::sync::Mutex<{{ name }}DefaultRef> = std::sync::Mutex::new(None);
     }
     rsbinder::declare_binder_interface! {
         {{ name }}["{{ namespace }}"] {
@@ -206,7 +230,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.build_params }})?;
-            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.identifier|upper }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
+            let _aidl_reply = self.handle.submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
             self.read_response_{{ member.identifier }}({{ member.read_params }}_aidl_reply)
         }
         {%- endfor %}
@@ -248,7 +272,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     let mut read_params = String::new();
     let mut args = "&self".to_string();
     let mut write_params = Vec::new();
-    let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable);
+    let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
     method.arg_list.iter().for_each(|arg| {
         let arg_str = arg.to_string(is_nullable);
@@ -276,30 +300,25 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         }
 
         read_params += &format!("{}, ", arg_str.0);
-
-        // write_params.push(type_cast.as_ref(&arg_str.0));
     });
 
     let mut type_cast = method.r#type.type_cast();
-    type_cast.set_fn_nullable(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
+    type_cast.set_fn_nullable(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0);
     let return_type = type_cast.return_type();
-    // let return_type = method.r#type.type_cast()
-    //     .return_type(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable));
 
     Ok(FnMembers{
-        identifier: method.identifier.to_case(Case::Snake),
+        // identifier: method.identifier.to_case(Case::Snake),
+        identifier: method.identifier.to_owned(),
         args, return_type, write_params, build_params, read_params,
         oneway: method.oneway
     })
-    // Ok((method.identifier.to_case(Case::Snake),
-    //     args, return_type, write_params, build_params, read_params, method.oneway))
 }
 
 fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
         is_empty = true;
         // return Ok(String::new())
     }
@@ -346,7 +365,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
         println!("Parcelable {} is only used for Java.", decl.name);
         is_empty = true;
         // return Ok(String::new())
@@ -389,6 +408,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 
     context.insert("mod", &decl.name);
     context.insert("name", &decl.name);
+    context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
@@ -400,7 +420,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
 }
 
 fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
         return Ok(String::new())
     }
 
@@ -430,7 +450,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 }
 
 fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
+    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
         return Ok(String::new())
     }
 
@@ -455,6 +475,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     context.insert("mod", &decl.name);
     context.insert("union_name", &decl.name);
+    context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
     context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
     context.insert("members", &members);
     context.insert("const_members", &constant_members);

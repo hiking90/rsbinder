@@ -245,7 +245,7 @@ impl VariableDecl {
     }
 
     pub fn identifier(&self) -> String {
-        self.identifier.to_case(Case::Snake)
+        self.identifier.to_owned()
     }
 
     pub fn const_identifier(&self) -> String {
@@ -318,7 +318,8 @@ pub struct Arg {
 
 impl Arg {
     pub fn to_string(&self, is_nullable: bool) -> (String, String, String) {
-        let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
+        // let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
+        let param = format!("_arg_{}", self.identifier);
         let mut type_cast = self.r#type.type_cast();
         type_cast.set_fn_nullable(is_nullable);
         let def_arg = type_cast.fn_def_arg(&self.direction);
@@ -513,7 +514,7 @@ impl Type {
         let mut cast = TypeCast::new(&self.non_array_type);
 
         cast.set_array_types(&self.array_types);
-        cast.set_nullable(check_annotation_list(&self.annotation_list, AnnotationType::IsNullable));
+        cast.set_nullable(check_annotation_list(&self.annotation_list, AnnotationType::IsNullable).0);
 
         cast
     }
@@ -609,8 +610,30 @@ impl TypeCast {
         }
     }
 
+    fn format_option(is_ref: bool, name: &str) -> String {
+        let name = if name.starts_with("Option<") {
+            if name.chars().nth(7) == Some('&') {
+                if is_ref {
+                    &name[8..name.len() -1]
+                } else {
+                    &name[7..name.len() -1]
+                }
+            } else {
+                &name[7..name.len() - 1]
+            }
+        } else {
+            name
+        };
+
+        if is_ref {
+            format!("Option<&{}>", name)
+        } else {
+            format!("Option<{}>", name)
+        }
+    }
+
     fn nullable_type(is_ref: bool, name: &str) -> String {
-        if is_ref == true {
+        if is_ref {
             format!("Option<&{}>", name)
         } else {
             format!("Option<{}>", name)
@@ -618,7 +641,7 @@ impl TypeCast {
     }
 
     fn general_type(is_ref: bool, name: &str) -> String {
-        if is_ref == true {
+        if is_ref {
             format!("&{}", name)
         } else {
             name.to_owned()
@@ -627,7 +650,7 @@ impl TypeCast {
 
     pub fn type_name(&self, dir: &Direction) -> String {
         let mut is_option = false;
-        let type_name = if self.is_declared == true {
+        let type_name = if self.is_declared {
             if self.is_nullable {
                 is_option = true;
             }
@@ -636,12 +659,12 @@ impl TypeCast {
             match self.value_type {
                 ValueType::FileDescriptor | ValueType::Holder |
                 ValueType::IBinder => {
-                    if (self.is_generic == false && self.is_vector == false) || self.is_nullable {
+                    if (!self.is_generic && !self.is_vector) || self.is_nullable {
                         is_option = true;
                     }
                 },
                 _ => {
-                    if self.is_nullable == true {
+                    if self.is_nullable {
                         is_option = true;
                     }
                 }
@@ -654,9 +677,9 @@ impl TypeCast {
                 if self.is_vector {
                     if is_option {
                         if self.is_nullable {
-                            format!("Option<&[Option<{}>]>", type_name)
+                            format!("Option<&[{}]>", Self::format_option(false, &type_name))
                         } else {
-                            format!("&[Option<{}>]", type_name)
+                            format!("&[{}]", Self::format_option(false, &type_name))
                         }
                     } else {
                         format!("&[{}]", type_name)
@@ -676,7 +699,7 @@ impl TypeCast {
                         type_name
                     };
                     if is_option {
-                        format!("Option<&{}>", type_name)
+                        Self::format_option(true, &type_name)
                     } else {
                         format!("&{}", type_name)
                     }
@@ -687,11 +710,11 @@ impl TypeCast {
                     is_option = true;
                 }
                 let type_name = self.type_name(&Direction::None);
-                if type_name.starts_with("Option<") {
-                    is_option = false;
-                }
+                // if type_name.starts_with("Option<") {
+                //     is_option = false;
+                // }
                 if is_option {
-                    format!("&mut Option<{}>", type_name)
+                    format!("&mut {}", Self::format_option(false, &type_name))
                 } else {
                     format!("&mut {}", type_name)
                 }
@@ -704,7 +727,7 @@ impl TypeCast {
             Direction::None => {
                 let type_name = if self.is_vector {
                     if self.is_nullable {
-                        format!("Vec<Option<{}>>", type_name)
+                        format!("Vec<{}>", Self::format_option(false, &type_name))
                     } else {
                         format!("Vec<{}>", type_name)
                     }
@@ -713,7 +736,7 @@ impl TypeCast {
                 };
 
                 if is_option {
-                    format!("Option<{}>", type_name)
+                    Self::format_option(false, &type_name)
                 } else {
                     type_name
                 }
@@ -743,7 +766,7 @@ impl TypeCast {
         self.is_generic = is_generic;
     }
 
-    fn set_array_types(&mut self, array_types: &Vec<ArrayType>) {
+    fn set_array_types(&mut self, array_types: &[ArrayType]) {
         // TODO: implement Vector.....
         // &Vec<T>
         array_types.iter().for_each(|t| {
@@ -764,7 +787,12 @@ impl TypeCast {
     }
 
     pub fn member_type(&self) -> String {
-        self.type_name(&Direction::None)
+        let type_name = self.type_name(&Direction::None);
+        if self.is_declared {
+            Self::format_option(false, &type_name)
+        } else {
+            type_name
+        }
     }
 
     pub fn init_type(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
@@ -782,8 +810,8 @@ impl TypeCast {
             self.type_name.to_owned()
         } else {
             let type_name = self.type_name(&Direction::None);
-            if self.is_fn_nullable && !type_name.starts_with("Option<") {
-                format!("Option<{}>", type_name)
+            if self.is_fn_nullable {
+                Self::format_option(false, &type_name)
             } else {
                 type_name
             }
@@ -795,18 +823,30 @@ impl TypeCast {
 pub enum AnnotationType {
     IsNullable,
     JavaOnly,
+    RustDerive,
 }
 
-pub fn check_annotation_list(annotation_list: &Vec<Annotation>, query_type: AnnotationType) -> bool {
+pub fn check_annotation_list(annotation_list: &Vec<Annotation>, query_type: AnnotationType) -> (bool, String) {
     for annotation in annotation_list {
         match query_type {
-            AnnotationType::IsNullable if annotation.annotation == "@nullable" => return true,
-            AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => return true,
+            AnnotationType::IsNullable if annotation.annotation == "@nullable" => return (true, "".to_owned()),
+            AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => return (true, "".to_owned()),
+            AnnotationType::RustDerive if annotation.annotation == "@RustDerive" => {
+                let mut derives = Vec::new();
+
+                for param in &annotation.parameter_list {
+                    if param.const_expr.to_bool() {
+                        derives.push(param.identifier.to_owned())
+                    }
+                }
+
+                return (true, derives.join(","))
+            }
             _ => {}
         }
     }
 
-    false
+    (false, "".to_owned())
 }
 
 pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> TypeCast {
@@ -848,7 +888,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
         (arg_value, 10)
     };
 
-    let value = if value.ends_with("l") || value.ends_with("L") {
+    let value = if value.ends_with('l') || value.ends_with('L') {
         is_long = true;
         &value[..value.len() -1]
     } else if value.ends_with("u8") {
@@ -860,30 +900,30 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
 
     if radix == 16 {
         if is_u8 {
-            let parsed_value = u8::from_str_radix(&value, radix).map_err(|err| {
+            let parsed_value = u8::from_str_radix(value, radix).map_err(|err| {
                     eprintln!("{:?}\nparse_intvalue() - Invalid u8 value: {}, radix: {}\n", err, arg_value, radix);
                     err
                 }).unwrap();
             ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
-        } else if is_long == false {
-            if let Some(parsed_value) = u32::from_str_radix(&value, radix).ok() {
+        } else if !is_long {
+            if let Ok(parsed_value) = u32::from_str_radix(value, radix) {
                 ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
             } else {
-                let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
+                let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
                         eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
                         err
                     }).unwrap();
                 ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
             }
         } else {
-            let parsed_value = u64::from_str_radix(&value, radix).map_err(|err| {
+            let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
                     eprintln!("{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n", err, arg_value, radix);
                     err
                 }).unwrap();
             ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
         }
     } else {
-        let parsed_value = i64::from_str_radix(&value, radix).map_err(|err| {
+        let parsed_value = i64::from_str_radix(value, radix).map_err(|err| {
                 eprintln!("{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n", err, arg_value, radix);
                 err
             }).unwrap();
@@ -892,7 +932,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
                 panic!("u8 is overflowed. {}", parsed_value);
             }
             ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
-        } else if is_long == true {
+        } else if is_long {
             ConstExpr::new(ValueType::Int64(parsed_value as _))
         } else {
             if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
@@ -915,7 +955,7 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
         Rule::HEXVALUE => { parse_intvalue(pair.as_str()) }
         Rule::FLOATVALUE => {
             let value = pair.as_str();
-            let value = if value.ends_with("f") {
+            let value = if value.ends_with('f') {
                 &value[..value.len()-1]
             } else {
                 value

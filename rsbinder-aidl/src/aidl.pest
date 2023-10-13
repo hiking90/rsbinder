@@ -228,3 +228,5 @@ LONG_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n" }
 COMMENT = _{ LONG_COMMENT | LINE_COMMENT }
 WHITESPACE = _{ (" " | "\t" | "\r" | "\n")+ }
+
+rust_derive = { (IDENTIFIER ~ "=" ~ (TRUE_LITERAL | FALSE_LITERAL) ~ ","?)+ }
