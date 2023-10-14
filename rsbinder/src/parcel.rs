@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-use crate::sys::binder_uintptr_t;
+use crate::sys::{binder_uintptr_t, BINDER_TYPE_FD};
 use std::vec::Vec;
 
 use std::default::Default;
@@ -200,15 +200,23 @@ impl Parcel {
     }
 
     pub fn close_file_descriptors(&self) {
-        todo!()
-    //     for offset in &self.objects {
-    //         unsafe {
-    //             let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
-    //             if (*flat).hdr.type_ == BINDER_TYPE_FD {
-    //                 libc::close((*flat).__bindgen_anon_1.handle as _);
-    //             }
-    //         }
-    //     }
+        let objects = match &self.objects {
+            ParcelData::Vec(objects) => {
+                objects.as_slice()
+            }
+            ParcelData::Slice(objects) => {
+                objects
+            }
+        };
+
+        for offset in objects {
+            unsafe {
+                let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
+                if (*flat).hdr.type_ == BINDER_TYPE_FD {
+                    libc::close((*flat).__bindgen_anon_1.handle as _);
+                }
+            }
+        }
     }
 
     pub fn set_data_position(&mut self, pos: usize) {

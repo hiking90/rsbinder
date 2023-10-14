@@ -1,5 +1,5 @@
 [package]
-name = "rsbinder-examples"
+name = "rsbinder-sm"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,10 +8,7 @@ edition = "2021"
 [dependencies]
 lazy_static = "1"
 rsbinder = { path = "../rsbinder" }
-rsbinder-sm = { path = "../rsbinder-sm" }
 env_logger = "0"
-tokio = { version = "1", features = ["full"] }
-backtrace = "0.3"
 
 [build-dependencies]
 # aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }

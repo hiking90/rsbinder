@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 fn main() {
     // rsbinder_aidl::Builder::new()
-    //     .source(PathBuf::from("../aidl/android/os/IServiceManager.aidl"))
-    //     .source(PathBuf::from("../aidl/android/os/IClientCallback.aidl"))
-    //     .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
-    //     .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
-    //     .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
+    //     .source(PathBuf::from("aidl/vold/android/os/IVold.aidl"))
+    //     .source(PathBuf::from("aidl/vold/android/os/IVoldListener.aidl"))
+    //     .source(PathBuf::from("aidl/vold/android/os/IVoldMountCallback.aidl"))
+    //     .source(PathBuf::from("aidl/vold/android/os/IVoldTaskListener.aidl"))
+    //     .output(PathBuf::from("vold.rs"))
     //     .generate().unwrap();
 
     // rsbinder_aidl::Builder::new()

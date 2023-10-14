@@ -77,7 +77,7 @@ pub fn indent_space(step: usize) -> String {
 pub fn add_indent(step: usize, source: &str) -> String {
     let mut content = String::new();
     for line in source.lines() {
-        if line.len() > 0 {
+        if !line.is_empty() {
             content += &(indent_space(step) + line + "\n");
         } else {
             content += "\n";
@@ -86,20 +86,16 @@ pub fn add_indent(step: usize, source: &str) -> String {
     content
 }
 
-fn add_namespace(namespace: &str, source: &str) -> String {
-    let mut content = String::new();
-
-    content += &format!("pub mod {} {{\n", namespace);
-    content += &add_indent(1, source);
-    content += "}\n";
-
-    content
-}
-
 pub struct Builder {
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     output: PathBuf,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Builder {
@@ -117,7 +113,7 @@ impl Builder {
     }
 
     pub fn output(mut self, mut output: PathBuf) -> Self {
-        if let None = output.extension() {
+        if output.extension().is_none() {
             output.set_extension("rs");
         }
 
@@ -128,13 +124,13 @@ impl Builder {
 
     fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
         println!("Parsing: {:?}", filename);
-        let unparsed_file = fs::read_to_string(filename.clone())?;
+        let unparsed_file = fs::read_to_string(filename)?;
         let document = parser::parse_document(&unparsed_file)?;
 
         Ok((filename.file_stem().unwrap().to_str().unwrap().to_string(), document))
     }
 
-    fn traverse_source(&self, dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
+    fn traverse_source(dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
         let entries = fs::read_dir(dir).map_err(|err| {
             eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
             err
@@ -144,7 +140,7 @@ impl Builder {
         for entry in entries {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                package_list.append(&mut self.traverse_source(&path)?);
+                package_list.append(&mut Self::traverse_source(&path)?);
             }
             if path.is_file() && path.extension().unwrap_or_default() == "aidl" {
                 let package = Self::parse_file(&path)?;
@@ -212,10 +208,10 @@ impl Builder {
 
         for source in &self.sources {
             if source.is_file() {
-                let package = Self::parse_file(&source)?;
+                let package = Self::parse_file(source)?;
                 document_list.push(package);
             } else {
-                document_list.append(&mut self.traverse_source(&source)?);
+                document_list.append(&mut Self::traverse_source(source)?);
             };
         }
 

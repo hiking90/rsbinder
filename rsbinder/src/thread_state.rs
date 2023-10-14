@@ -19,7 +19,7 @@ thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
 }
 
-const RETURN_STRINGS: [&'static str; 21] =
+const RETURN_STRINGS: [&str; 21] =
 [
     "BR_ERROR",
     "BR_OK",
@@ -54,7 +54,7 @@ fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
-const COMMAND_STRINGS: [&'static str; 17] =
+const COMMAND_STRINGS: [&str; 17] =
 [
     "BC_TRANSACTION",
     "BC_REPLY",
@@ -238,10 +238,10 @@ impl ThreadState {
         target.handle = handle;
 
         let tr = binder_transaction_data {
-            target: target,
+            target,
             cookie: 0 ,
-            code: code,
-            flags: flags,
+            code,
+            flags,
             sender_pid: 0,
             sender_euid: 0,
             data_size: data.len() as _,
@@ -710,7 +710,7 @@ pub fn inc_strong_handle(handle: u32, proxy: StrongIBinder) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        if flash_if_needed()? == false {
+        if !(flash_if_needed()?) {
             thread_state.borrow_mut().post_strong_derefs.push(proxy);
         }
 
@@ -742,7 +742,7 @@ pub fn inc_weak_handle(handle: u32, weak: WeakIBinder) -> Result<()>{
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        if flash_if_needed()? == false {
+        if !(flash_if_needed()?) {
             // This code is come from IPCThreadState.cpp. Is it necessaryq?
             thread_state.borrow_mut().post_weak_derefs.push(weak);
         }
@@ -789,7 +789,7 @@ pub fn handle_commands() -> Result<()> {
         get_and_execute_command()?;
 
         THREAD_STATE.with(|thread_state| -> bool {
-            thread_state.borrow().in_parcel.len() != 0
+            !thread_state.borrow().in_parcel.is_empty()
         })
     } {
         flash_commands()?;
