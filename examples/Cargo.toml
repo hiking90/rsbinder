@@ -1,6 +1,7 @@
 [package]
-name = "rsbinder-examples"
+name = "examples"
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -8,7 +9,7 @@ edition = "2021"
 [dependencies]
 lazy_static = "1"
 rsbinder = { path = "../rsbinder" }
-rsbinder-sm = { path = "../rsbinder-sm" }
+rsbinder-hub = { path = "../rsbinder-hub" }
 env_logger = "0"
 tokio = { version = "1", features = ["full"] }
 backtrace = "0.3"

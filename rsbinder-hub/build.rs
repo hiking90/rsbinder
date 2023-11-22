@@ -8,6 +8,7 @@ fn main() {
         .source(PathBuf::from("aidl/android/os/IServiceManager.aidl"))
         .source(PathBuf::from("aidl/android/os/PersistableBundle.aidl"))
         .source(PathBuf::from("aidl/android/os/ServiceDebugInfo.aidl"))
+
         .output(PathBuf::from("service_manager.rs"))
         .generate().unwrap();
 }

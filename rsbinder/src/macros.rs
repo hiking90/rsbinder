@@ -116,7 +116,7 @@ macro_rules! declare_binder_interface {
                 self.binder.clone()
             }
 
-            fn box_clone(&self) -> Box<dyn $crate::Interface> { todo!() }
+            // fn box_clone(&self) -> Box<dyn $crate::Interface> { todo!() }
         }
 
         impl $crate::Proxy for $proxy
@@ -136,6 +136,18 @@ macro_rules! declare_binder_interface {
                 }
             }
         }
+
+        pub struct $native(Box<dyn $interface + Sync + Send + 'static>);
+
+        // impl $native {
+        //     /// Create a new binder service.
+        //     pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
+        //         // let mut binder = $crate::binder_impl::Binder::new_with_stability($native(Box::new(inner)), $stability);
+        //         // $crate::binder_impl::IBinderInternal::set_requesting_sid(&mut binder, features.set_requesting_sid);
+        //         std::sync::Arc::new(Box::new(inner))
+        //     }
+        // }
+
 
         impl $crate::parcelable::Serialize for dyn $interface
         where

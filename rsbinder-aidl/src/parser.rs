@@ -140,7 +140,7 @@ fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> 
     } else {
         let ns = current_namespace().relative_mod(&lookup_decl.ns);
 
-        let name = if ns.len() > 0 {
+        let name = if !ns.is_empty() {
             format!("{}{}{}", ns, Namespace::RUST, lookup_decl.name.to_string(Namespace::RUST))
         } else {
             lookup_decl.name.to_string(Namespace::RUST)
@@ -154,7 +154,7 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
     match decl {
         Declaration::Variable(decl) => {
             if decl.identifier == lookup_ident {
-                Some(make_const_expr(decl.const_expr.as_ref(), &lookup_decl))
+                Some(make_const_expr(decl.const_expr.as_ref(), lookup_decl))
             } else {
                 None
             }
@@ -162,27 +162,27 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
         Declaration::Interface(ref decl) => {
             for var in &decl.constant_list {
                 if var.identifier == lookup_ident {
-                    return Some(make_const_expr(var.const_expr.as_ref(), &lookup_decl));
+                    return Some(make_const_expr(var.const_expr.as_ref(), lookup_decl));
                 }
             }
-            lookup_name_members(&decl.members, &lookup_decl)
+            lookup_name_members(&decl.members, lookup_decl)
         }
 
         Declaration::Parcelable(ref decl) => {
-            lookup_name_members(&decl.members, &lookup_decl)
+            lookup_name_members(&decl.members, lookup_decl)
         }
 
         Declaration::Enum(ref decl) => {
             for enumerator in &decl.enumerator_list {
                 if enumerator.identifier == lookup_ident {
-                    return Some(make_const_expr(None, &lookup_decl));
+                    return Some(make_const_expr(None, lookup_decl));
                 }
             }
-            lookup_name_members(&decl.members, &lookup_decl)
+            lookup_name_members(&decl.members, lookup_decl)
         }
 
         Declaration::Union(ref decl) => {
-            lookup_name_members(&decl.members, &lookup_decl)
+            lookup_name_members(&decl.members, lookup_decl)
         }
     }
 }
@@ -453,22 +453,22 @@ impl Generic {
     pub fn to_string(&self) -> String {
         match self {
             Generic::Type1 { type_args1, non_array_type, type_args2 } => {
-                let cast = TypeCast::new(&non_array_type);
+                let cast = TypeCast::new(non_array_type);
                 // cast.set_generic();
                 format!("{}{}{}",
                     generic_type_args_to_string(type_args1),
                     cast.member_type(),
-                    generic_type_args_to_string(&type_args2))
+                    generic_type_args_to_string(type_args2))
             }
             Generic::Type2 { non_array_type, type_args } => {
-                let cast = TypeCast::new(&non_array_type);
+                let cast = TypeCast::new(non_array_type);
                 // cast.set_generic();
                 format!("{}{}",
                     cast.member_type(),
-                    generic_type_args_to_string(&type_args))
+                    generic_type_args_to_string(type_args))
             }
             Generic::Type3 { type_args } => {
-                generic_type_args_to_string(&type_args)
+                generic_type_args_to_string(type_args)
             }
         }
     }
@@ -576,7 +576,7 @@ impl TypeCast {
                 let lookup_decl = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
                 let curr_ns = current_namespace();
                 let ns = curr_ns.relative_mod(&lookup_decl.ns);
-                let type_name = if ns.len() > 0 {
+                let type_name = if !ns.is_empty() {
                     format!("{}::{}", ns, lookup_decl.name.ns.last().unwrap())
                 } else {
                     let name = lookup_decl.name.ns.last().unwrap().to_owned();
@@ -659,7 +659,7 @@ impl TypeCast {
             match self.value_type {
                 ValueType::FileDescriptor | ValueType::Holder |
                 ValueType::IBinder => {
-                    if (!self.is_generic && !self.is_vector) || self.is_nullable {
+                    if (!self.is_generic && !self.is_vector) && self.is_nullable {
                         is_option = true;
                     }
                 },

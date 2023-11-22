@@ -97,33 +97,33 @@ pub trait Interface: Send + Sync {
 
     // /// Convert this binder object into a generic [`SpIBinder`] reference.
     fn as_binder(&self) -> StrongIBinder {
-        panic!("This object was not a Binder object and cannot be converted into an SpIBinder.")
+        panic!("This object was not a Binder object and cannot be converted into an StrongIBinder.")
     }
 
     /// Dump transaction handler for this Binder object.
     ///
     /// This handler is a no-op by default and should be implemented for each
     /// Binder service struct that wishes to respond to dump transactions.
-    // fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
-    //     Ok(())
-    // }
-
-    fn box_clone(&self) -> Box<dyn Interface>;
-}
-
-impl Clone for Box<dyn Interface> {
-    fn clone(&self) -> Box<dyn Interface> {
-        self.box_clone()
+    fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
+        Ok(())
     }
+
+    // fn box_clone(&self) -> Box<dyn Interface>;
 }
 
-pub(crate) struct Unknown {}
+// impl Clone for Box<dyn Interface> {
+//     fn clone(&self) -> Box<dyn Interface> {
+//         self.box_clone()
+//     }
+// }
 
-impl Interface for Unknown {
-    fn box_clone(&self) -> Box<dyn Interface> {
-        Box::new(Self {})
-    }
-}
+// pub(crate) struct Unknown {}
+
+// impl Interface for Unknown {
+//     fn box_clone(&self) -> Box<dyn Interface> {
+//         Box::new(Self {})
+//     }
+// }
 
 
 // ///
@@ -243,71 +243,70 @@ pub trait Remotable: Send + Sync {
     /// Handle a request to invoke the dump transaction on this
     /// object.
     fn on_dump(&self, file: &File, args: &[&str]) -> Result<()>;
-
-    /// Retrieve the class of this remote object.
-    ///
-    /// This method should always return the same InterfaceClass for the same
-    /// type.
-    fn get_class<T: InterfaceClassMethods>() -> InterfaceClass<T> where Self: Sized;
 }
 
-pub trait InterfaceClassMethods {
-    /// Get the interface descriptor string for this object type.
-    fn get_descriptor() -> &'static str
-    where
-        Self: Sized;
-
-    /// Called during construction of a new `AIBinder` object of this interface
-    /// class.
-    ///
-    /// The opaque pointer parameter will be the parameter provided to
-    /// `AIBinder_new`. Returns an opaque userdata to be associated with the new
-    /// `AIBinder` object.
-    ///
-    /// # Safety
-    ///
-    /// Callback called from C++. The parameter argument provided to
-    /// `AIBinder_new` must match the type expected here. The `AIBinder` object
-    /// will take ownership of the returned pointer, which it will free via
-    /// `on_destroy`.
-    fn on_create();
-
-    // /// Called when a transaction needs to be processed by the local service
-    // /// implementation.
-    // ///
-    // /// # Safety
-    // ///
-    // /// Callback called from C++. The `binder` parameter must be a valid pointer
-    // /// to a binder object of this class with userdata initialized via this
-    // /// class's `on_create`. The parcel parameters must be valid pointers to
-    // /// parcel objects.
-    // fn on_transact<T: Remotable>(
-    //     binder: &mut native::Binder<T>,
-    //     code: u32,
-    //     data: &parcel::Reader,
-    //     reply: &parcel::Writer,
-    // ) -> Result<()>;
-
-    /// Called whenever an `AIBinder` object is no longer referenced and needs
-    /// to be destroyed.
-    ///
-    /// # Safety
-    ///
-    /// Callback called from C++. The opaque pointer parameter must be the value
-    /// returned by `on_create` for this class. This function takes ownership of
-    /// the provided pointer and destroys it.
-    fn on_destroy();
-
-    /// Called to handle the `dump` transaction.
-    ///
-    /// # Safety
-    ///
-    /// Must be called with a non-null, valid pointer to a local `AIBinder` that
-    /// contains a `T` pointer in its user data. fd should be a non-owned file
-    /// descriptor, and args must be an array of null-terminated string
-    /// poiinters with length num_args.
-    fn on_dump<T: Remotable>(binder: &mut native::Binder<T>, fd: i32, args: &str, num_args: u32) -> Result<()>;
+pub trait Transactable {
+    fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
 }
+
+
+// pub trait InterfaceClassMethods {
+//     /// Get the interface descriptor string for this object type.
+//     fn get_descriptor() -> &'static str
+//     where
+//         Self: Sized;
+//
+//     /// Called during construction of a new `AIBinder` object of this interface
+//     /// class.
+//     ///
+//     /// The opaque pointer parameter will be the parameter provided to
+//     /// `AIBinder_new`. Returns an opaque userdata to be associated with the new
+//     /// `AIBinder` object.
+//     ///
+//     /// # Safety
+//     ///
+//     /// Callback called from C++. The parameter argument provided to
+//     /// `AIBinder_new` must match the type expected here. The `AIBinder` object
+//     /// will take ownership of the returned pointer, which it will free via
+//     /// `on_destroy`.
+//     fn on_create();
+//
+//     // /// Called when a transaction needs to be processed by the local service
+//     // /// implementation.
+//     // ///
+//     // /// # Safety
+//     // ///
+//     // /// Callback called from C++. The `binder` parameter must be a valid pointer
+//     // /// to a binder object of this class with userdata initialized via this
+//     // /// class's `on_create`. The parcel parameters must be valid pointers to
+//     // /// parcel objects.
+//     // fn on_transact<T: Remotable>(
+//     //     binder: &mut native::Binder<T>,
+//     //     code: u32,
+//     //     data: &parcel::Reader,
+//     //     reply: &parcel::Writer,
+//     // ) -> Result<()>;
+//
+//     /// Called whenever an `AIBinder` object is no longer referenced and needs
+//     /// to be destroyed.
+//     ///
+//     /// # Safety
+//     ///
+//     /// Callback called from C++. The opaque pointer parameter must be the value
+//     /// returned by `on_create` for this class. This function takes ownership of
+//     /// the provided pointer and destroys it.
+//     fn on_destroy();
+//
+//     /// Called to handle the `dump` transaction.
+//     ///
+//     /// # Safety
+//     ///
+//     /// Must be called with a non-null, valid pointer to a local `AIBinder` that
+//     /// contains a `T` pointer in its user data. fd should be a non-owned file
+//     /// descriptor, and args must be an array of null-terminated string
+//     /// poiinters with length num_args.
+//     fn on_dump<T: Remotable>(binder: &mut native::Binder<T>, fd: i32, args: &str, num_args: u32) -> Result<()>;
+// }
 
 
 /// Opaque reference to the type of a Binder interface.
@@ -319,42 +318,42 @@ pub trait InterfaceClassMethods {
 /// given object can only be associated with one class. Two objects with
 /// different classes are incompatible, even if both classes have the same
 /// interface descriptor.
-#[derive(Clone, PartialEq, Eq)]
-pub struct InterfaceClass<I: InterfaceClassMethods> {
-    descriptor: String,
-    class_methods: I,
-}
-
-impl<I: InterfaceClassMethods> InterfaceClass<I> {
-    /// Get a Binder NDK `AIBinder_Class` pointer for this object type.
-    ///
-    /// Note: the returned pointer will not be constant. Calling this method
-    /// multiple times for the same type will result in distinct class
-    /// pointers. A static getter for this value is implemented in
-    /// [`declare_binder_interface!`].
-    pub fn new(methods: I) -> InterfaceClass<I> {
-        InterfaceClass {
-            descriptor: I::get_descriptor().to_string(),
-            class_methods: methods,
-        }
-    }
-
-    // /// Construct an `InterfaceClass` out of a raw, non-null `AIBinder_Class`
-    // /// pointer.
-    // ///
-    // /// # Safety
-    // ///
-    // /// This function is safe iff `ptr` is a valid, non-null pointer to an
-    // /// `AIBinder_Class`.
-    // pub(crate) unsafe fn from_ptr(ptr: *const sys::AIBinder_Class) -> InterfaceClass {
-    //     InterfaceClass(ptr)
-    // }
-
-    /// Get the interface descriptor string of this class.
-    pub fn get_descriptor(&self) -> String {
-        self.descriptor.clone()
-    }
-}
+// #[derive(Clone, PartialEq, Eq)]
+// pub struct InterfaceClass<I: InterfaceClassMethods> {
+//     descriptor: String,
+//     class_methods: I,
+// }
+//
+// impl<I: InterfaceClassMethods> InterfaceClass<I> {
+//     /// Get a Binder NDK `AIBinder_Class` pointer for this object type.
+//     ///
+//     /// Note: the returned pointer will not be constant. Calling this method
+//     /// multiple times for the same type will result in distinct class
+//     /// pointers. A static getter for this value is implemented in
+//     /// [`declare_binder_interface!`].
+//     pub fn new(methods: I) -> InterfaceClass<I> {
+//         InterfaceClass {
+//             descriptor: I::get_descriptor().to_string(),
+//             class_methods: methods,
+//         }
+//     }
+//
+//     // /// Construct an `InterfaceClass` out of a raw, non-null `AIBinder_Class`
+//     // /// pointer.
+//     // ///
+//     // /// # Safety
+//     // ///
+//     // /// This function is safe iff `ptr` is a valid, non-null pointer to an
+//     // /// `AIBinder_Class`.
+//     // pub(crate) unsafe fn from_ptr(ptr: *const sys::AIBinder_Class) -> InterfaceClass {
+//     //     InterfaceClass(ptr)
+//     // }
+//
+//     /// Get the interface descriptor string of this class.
+//     pub fn get_descriptor(&self) -> String {
+//         self.descriptor.clone()
+//     }
+// }
 
 
 /// Interface stability promise
@@ -395,62 +394,6 @@ impl TryFrom<i32> for Stability {
         }
     }
 }
-
-
-/// Interface for transforming a generic SpIBinder into a specific remote
-/// interface trait.
-///
-/// # Example
-///
-/// For Binder interface `IFoo`, the following implementation should be made:
-/// ```no_run
-/// # use binder::{FromIBinder, SpIBinder, Result};
-/// # trait IFoo {}
-/// impl FromIBinder for dyn IFoo {
-///     fn try_from(ibinder: SpIBinder) -> Result<Box<Self>> {
-///         // ...
-///         # Err(binder::StatusCode::OK)
-///     }
-/// }
-/// ```
-// pub trait FromIBinder {
-//     /// Try to interpret a generic Binder object as this interface.
-//     ///
-//     /// Returns a trait object for the `Self` interface if this object
-//     /// implements that interface.
-//     fn try_from(ibinder: StrongIBinder) -> Result<Arc<Self>>;
-// }
-
-
-
-// impl From<InterfaceClass> for *const sys::AIBinder_Class {
-//     fn from(class: InterfaceClass) -> *const sys::AIBinder_Class {
-//         class.0
-//     }
-// }
-
-// #[derive(Debug)]
-// pub enum Object {
-//     Binder {
-//         binder: u64,
-//         stability: i32,
-//     },
-//     Handle {
-//         handle: u32,
-//         stability: i32,
-//     }
-// }
-
-// impl Object {
-//     pub fn local<I: Interface + Remotable>(&self) -> Arc<Box<native::Binder<I>>> {
-//         todo!("")
-//     }
-
-//     pub fn remote<I: Interface>(&self) -> Arc<Box<proxy::Proxy<Unknown>>> {
-//         todo!("")
-//     }
-// }
-
 
 const INITIAL_STRONG_VALUE: usize = i32::MAX as _;
 

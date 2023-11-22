@@ -17,7 +17,7 @@ use crate::{
     proxy::*,
     native,
     thread_state,
-    service_manager::{BnServiceManager},
+    // service_manager::{BnServiceManager},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +40,7 @@ lazy_static! {
 pub struct ProcessState {
     driver_fd: RwLock<RawFd>,
     mmap: RwLock<(*mut std::ffi::c_void, usize)>,
-    context_manager: RwLock<Option<Arc<native::Binder<BnServiceManager>>>>,
+    context_manager: RwLock<Option<Arc<dyn Transactable>>>,
     handle_to_object: RwLock<HashMap<u32, WeakIBinder>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
@@ -91,7 +91,7 @@ impl ProcessState {
             None => return false
         };
 
-        let vm_size = ((1 * 1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
+        let vm_size = ((1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
         unsafe {
             let mut driver_fd = self.driver_fd.write().unwrap();
@@ -112,7 +112,7 @@ impl ProcessState {
         true
     }
 
-    pub fn become_context_manager(& self) -> bool {
+    pub fn become_context_manager(&self, transactable: Arc<dyn Transactable>) -> bool {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
@@ -129,12 +129,12 @@ impl ProcessState {
             }
         }
 
-        *self.context_manager.write().unwrap() = Some(Arc::new(native::Binder::new(BnServiceManager::new())));
+        *self.context_manager.write().unwrap() = Some(transactable);
 
         true
     }
 
-    pub fn context_manager(&self) -> Option<Arc<native::Binder<BnServiceManager>>> {
+    pub fn context_manager(&self) -> Option<Arc<dyn Transactable>> {
         self.context_manager.read().unwrap().clone()
     }
 

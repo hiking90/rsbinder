@@ -17,47 +17,16 @@
  * limitations under the License.
  */
 
+use std::ops::Deref;
 use std::any::Any;
 
 use crate::binder::*;
 use crate::parcel::*;
 use crate::error::*;
 
-pub struct Binder<T: Remotable + ?Sized> {
+pub struct Binder<T: Remotable + ?Sized + Send + Sync> {
     remotable: T,
 }
-
-
-/// # Safety
-///
-/// A `Binder<T>` is a pair of unique owning pointers to two values:
-///   * a C++ ABBinder which the C++ API guarantees can be passed between threads
-///   * a Rust object which implements `Remotable`; this trait requires `Send + Sync`
-///
-/// Both pointers are unique (never escape the `Binder<T>` object and are not copied)
-/// so we can essentially treat `Binder<T>` as a box-like containing the two objects;
-/// the box-like object inherits `Send` from the two inner values, similarly
-/// to how `Box<T>` is `Send` if `T` is `Send`.
-unsafe impl<T: Remotable> Send for Binder<T> {}
-
-/// # Safety
-///
-/// A `Binder<T>` is a pair of unique owning pointers to two values:
-///   * a C++ ABBinder which is thread-safe, i.e. `Send + Sync`
-///   * a Rust object which implements `Remotable`; this trait requires `Send + Sync`
-///
-/// `ABBinder` contains an immutable `mUserData` pointer, which is actually a
-/// pointer to a boxed `T: Remotable`, which is `Sync`. `ABBinder` also contains
-/// a mutable pointer to its class, but mutation of this field is controlled by
-/// a mutex and it is only allowed to be set once, therefore we can concurrently
-/// access this field safely. `ABBinder` inherits from `BBinder`, which is also
-/// thread-safe. Thus `ABBinder` is thread-safe.
-///
-/// Both pointers are unique (never escape the `Binder<T>` object and are not copied)
-/// so we can essentially treat `Binder<T>` as a box-like containing the two objects;
-/// the box-like object inherits `Sync` from the two inner values, similarly
-/// to how `Box<T>` is `Sync` if `T` is `Sync`.
-unsafe impl<T: Remotable> Sync for Binder<T> {}
 
 impl<T: Remotable> Binder<T> {
     pub fn new(remotable: T) -> Self {
@@ -106,9 +75,9 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
     // fn as_any(&self) -> &dyn Any {
     //     self
     // }
-    fn box_clone(&self) -> Box<(dyn Interface + 'static)> {
-        todo!()
-    }
+    // fn box_clone(&self) -> Box<(dyn Interface + 'static)> {
+    //     todo!()
+    // }
 }
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
@@ -137,31 +106,40 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     }
 }
 
-impl<T: Remotable> InterfaceClassMethods for Binder<T> {
-    fn get_descriptor() -> &'static str {
-        <T as Remotable>::get_descriptor()
-    }
+impl<T: Remotable> Deref for Binder<T> {
+    type Target = T;
 
-    fn on_create() {
-
-    }
-
-    // fn on_transact(
-    //     binder: &mut Binder<T>,
-    //     code: u32,
-    //     data: &parcel::Reader,
-    //     reply: &parcel::Writer,
-    // ) -> Result<()> {
-    //     Ok(())
-    // }
-
-    fn on_destroy() {
-    }
-
-    fn on_dump<R: Remotable>(_binder: &mut Binder<R>, _fd: i32, _args: &str, _num_args: u32) -> Result<()> {
-        Ok(())
+    fn deref(&self) -> &Self::Target {
+        &self.remotable
     }
 }
+
+
+// impl<T: Remotable> InterfaceClassMethods for Binder<T> {
+//     fn get_descriptor() -> &'static str {
+//         <T as Remotable>::get_descriptor()
+//     }
+
+//     fn on_create() {
+
+//     }
+
+//     // fn on_transact(
+//     //     binder: &mut Binder<T>,
+//     //     code: u32,
+//     //     data: &parcel::Reader,
+//     //     reply: &parcel::Writer,
+//     // ) -> Result<()> {
+//     //     Ok(())
+//     // }
+
+//     fn on_destroy() {
+//     }
+
+//     fn on_dump<R: Remotable>(_binder: &mut Binder<R>, _fd: i32, _args: &str, _num_args: u32) -> Result<()> {
+//         Ok(())
+//     }
+// }
 
 // impl<B: Remotable> TryFrom<Object> for Arc<Box<Binder<B>>> {
 //     type Error = Error;

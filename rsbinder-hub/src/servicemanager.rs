@@ -4,7 +4,15 @@ use std::sync::{Arc, Once};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rsbinder::*;
-use android::os::IServiceManager::{IServiceManager, BpServiceManager};
+pub use android::os::IServiceManager::{
+    IServiceManager, BpServiceManager,
+    DUMP_FLAG_PRIORITY_CRITICAL,
+    DUMP_FLAG_PRIORITY_HIGH,
+    DUMP_FLAG_PRIORITY_NORMAL,
+    DUMP_FLAG_PRIORITY_DEFAULT,
+    DUMP_FLAG_PRIORITY_ALL,
+    DUMP_FLAG_PROTO,
+};
 
 static INIT: Once = Once::new();
 static mut GLOBAL_SM: Option<Arc<BpServiceManager>> = None;  // Assume SM is i32 for simplicity
