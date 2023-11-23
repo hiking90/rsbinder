@@ -38,9 +38,9 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn process_state() {
-        let process = ProcessState::as_self();
-        process.init("/dev/binderfs/binder", 0);
+    fn process_state() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // let process = ProcessState::as_self();
+        ProcessState::init("/dev/binderfs/binder", 0)
     }
 
     #[test]

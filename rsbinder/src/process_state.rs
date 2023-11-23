@@ -1,12 +1,13 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc};
 use std::path::Path;
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{RwLock};
 
 
@@ -15,9 +16,7 @@ use crate::{
     binder::*,
     sys::binder,
     proxy::*,
-    native,
     thread_state,
-    // service_manager::{BnServiceManager},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -33,12 +32,8 @@ pub enum CallRestriction {
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
-lazy_static! {
-    static ref PROCESS_STATE: Arc<ProcessState> = Arc::new(ProcessState::new());
-}
-
 pub struct ProcessState {
-    driver_fd: RwLock<RawFd>,
+    driver: File,
     mmap: RwLock<(*mut std::ffi::c_void, usize)>,
     context_manager: RwLock<Option<Arc<dyn Transactable>>>,
     handle_to_object: RwLock<HashMap<u32, WeakIBinder>>,
@@ -50,19 +45,13 @@ unsafe impl Sync for ProcessState {}
 unsafe impl Send for ProcessState {}
 
 impl ProcessState {
-    fn new() -> Self {
-        ProcessState {
-            driver_fd: RwLock::new(-1),
-            mmap: RwLock::new((std::ptr::null_mut(), 0)),
-            context_manager: RwLock::new(None),
-            handle_to_object: RwLock::new(HashMap::new()),
-            disable_background_scheduling: AtomicBool::new(false),
-            call_restriction: RwLock::new(CallRestriction::None),
-        }
+    fn instance() -> &'static OnceLock<ProcessState> {
+        static INSTANCE: OnceLock<ProcessState> = OnceLock::new();
+        &INSTANCE
     }
 
-    pub fn as_self() -> Arc<ProcessState> {
-        PROCESS_STATE.clone()
+    pub fn as_self() -> &'static ProcessState {
+        Self::instance().get().expect("ProcessState is not initialized!")
     }
 
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
@@ -74,64 +63,63 @@ impl ProcessState {
         *self.call_restriction.read().unwrap()
     }
 
-    pub fn init(& self, driver: &str, max_threads: u32) -> bool {
-        if *self.driver_fd.read().unwrap() != -1 {
-            log::warn!("ProcessState has been initialized.");
-            return false;
-        }
-
+    pub fn init(driver_name: &str, max_threads: u32) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let max_threads = if max_threads < DEFAULT_MAX_BINDER_THREADS {
             max_threads
         } else {
             DEFAULT_MAX_BINDER_THREADS
         };
 
-        *self.driver_fd.write().unwrap() = match open_driver(Path::new(driver), max_threads) {
-            Some(fd) => fd,
-            None => return false
-        };
+        let driver = open_driver(Path::new(driver_name), max_threads)?;
 
         let vm_size = ((1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
-        unsafe {
-            let mut driver_fd = self.driver_fd.write().unwrap();
+        let mmap = unsafe {
             let vm_start = libc::mmap(std::ptr::null_mut(),
                 vm_size,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_NORESERVE, *driver_fd, 0);
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE, driver.as_raw_fd(), 0);
 
             if vm_start == libc::MAP_FAILED {
-                libc::close(*driver_fd);
-                *driver_fd = -1;
-                return false;
+                return Err(format!("{} mmap is failed!", driver_name).into());
             }
 
-            *self.mmap.write().unwrap() = (vm_start, vm_size);
-        }
+            (vm_start, vm_size)
+        };
 
-        true
+        let this = ProcessState {
+            driver,
+            mmap: RwLock::new(mmap),
+            context_manager: RwLock::new(None),
+            handle_to_object: RwLock::new(HashMap::new()),
+            disable_background_scheduling: AtomicBool::new(false),
+            call_restriction: RwLock::new(CallRestriction::None),
+        };
+
+        Self::instance().set(this).map_err(|_| "ProcessState::init() is failed due to OnceLock::set() error!")?;
+
+        Ok(())
     }
 
-    pub fn become_context_manager(&self, transactable: Arc<dyn Transactable>) -> bool {
+    pub fn become_context_manager(&self, transactable: Arc<dyn Transactable>) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
         unsafe {
-            let driver_fd = self.driver_fd.read().unwrap();
-            if binder::set_context_mgr_ext(*driver_fd, &obj).is_err() {
+            let driver_fd = self.driver.as_raw_fd();
+            if binder::set_context_mgr_ext(driver_fd, &obj).is_err() {
                 //     android_errorWriteLog(0x534e4554, "121035042");
                 let unused: i32 = 0;
-                if let Err(e) = binder::set_context_mgr(*driver_fd, &unused) {
-                    log::error!("Binder ioctl to become context manager failed: {}", e.to_string());
-                    return false;
+                if let Err(e) = binder::set_context_mgr(driver_fd, &unused) {
+                    return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
                 }
             }
         }
 
         *self.context_manager.write().unwrap() = Some(transactable);
 
-        true
+        Ok(())
     }
 
     pub fn context_manager(&self) -> Option<Arc<dyn Transactable>> {
@@ -175,58 +163,48 @@ impl ProcessState {
     }
 }
 
-fn open_driver(driver: &Path, max_threads: u32) -> Option<RawFd> {
+fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box<dyn std::error::Error>> {
     let fd = File::options()
         .read(true)
         .write(true)
         .open(driver)
-        .map_err(|e| log::error!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e.to_string()))
-        .ok()?;
+        .map_err(|e| format!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e))?;
 
     let mut vers = binder::binder_version { protocol_version: 0 };
 
     unsafe {
         let raw_fd = fd.as_raw_fd();
         binder::version(raw_fd, &mut vers)
-            .map_err(|e| log::error!("Binder ioctl to obtain version failed: {}", e.to_string()))
-            .ok()?;
+            .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
 
         if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
-            log::error!("Binder driver protocol({}) does not match user space protocol({})!",
-                vers.protocol_version, binder::BINDER_CURRENT_PROTOCOL_VERSION);
-            return None;
+            return Err(format!("Binder driver protocol({}) does not match user space protocol({})!",
+                vers.protocol_version, binder::BINDER_CURRENT_PROTOCOL_VERSION).into());
         }
 
         binder::set_max_threads(raw_fd, &max_threads)
-            .map_err(|e| log::error!("Binder ioctl to set max threads failed: {}", e.to_string()))
-            .ok()?;
+            .map_err(|e| format!("Binder ioctl to set max threads failed: {}", e))?;
 
         let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
         binder::enable_oneway_spam_detection(raw_fd, &enable)
-            .map_err(|e| log::error!("Binder ioctl to enable oneway spam detection failed: {}", e.to_string()))
-            .ok()?;
+            .map_err(|e| format!("Binder ioctl to enable oneway spam detection failed: {}", e))?;
     }
 
-    Some(fd.into_raw_fd())
+    Ok(fd)
 }
 
 impl AsRawFd for ProcessState {
     fn as_raw_fd(&self) -> RawFd {
-        *self.driver_fd.read().unwrap()
+        self.driver.as_raw_fd()
     }
 }
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mut driver_fd = self.driver_fd.write().unwrap();
-        if *driver_fd != -1 {
-            unsafe {
-                let mut mmap = self.mmap.write().unwrap();
-                libc::munmap(mmap.0, mmap.1);
-                libc::close(*driver_fd);
-                mmap.0 = std::ptr::null_mut();
-            }
-            *driver_fd = -1;
+        unsafe {
+            let mut mmap = self.mmap.write().unwrap();
+            libc::munmap(mmap.0, mmap.1);
+            mmap.0 = std::ptr::null_mut();
         }
     }
 }
