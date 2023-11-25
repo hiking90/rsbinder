@@ -139,7 +139,7 @@ impl Deserialize for ParcelFileDescriptor {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         Deserialize::deserialize(parcel)
             .transpose()
-            .unwrap_or(Err(StatusCode::UnexpectedNull.into()))
+            .unwrap_or(Err(StatusCode::UnexpectedNull))
     }
 }
 

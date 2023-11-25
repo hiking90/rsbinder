@@ -164,8 +164,8 @@ impl ValueType {
         match self {
             ValueType::Void | ValueType::String(_) | ValueType::Bool(_) |
             ValueType::Char(_) => ConstExpr::new(self.clone()),
-            ValueType::Int8(v) => ConstExpr::new(ValueType::Int8((*v as i8).wrapping_neg() as _)),
-            ValueType::Int32(v) => ConstExpr::new(ValueType::Int32((*v as i32).wrapping_neg() as _)),
+            ValueType::Int8(v) => ConstExpr::new(ValueType::Int8((*v).wrapping_neg() as _)),
+            ValueType::Int32(v) => ConstExpr::new(ValueType::Int32((*v).wrapping_neg() as _)),
             ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(v.wrapping_neg())),
             ValueType::Float(v) => ConstExpr::new(ValueType::Float(-(*v as f32) as _)),
             ValueType::Double(v) => ConstExpr::new(ValueType::Double(-*v)),
@@ -214,7 +214,7 @@ impl ValueType {
         match self {
             ValueType::Void => 0.,
             ValueType::String(_) => unimplemented!(),
-            ValueType::Bool(v) => if *v == true { 1.0 } else { 0.0 },
+            ValueType::Bool(v) => if *v { 1.0 } else { 0.0 },
             ValueType::Char(v) => *v as i64 as _,
             ValueType::Int8(v) => *v as _,
             ValueType::Int32(v) => *v as _,
@@ -273,7 +273,7 @@ impl ValueType {
     pub fn to_init(&self, is_const: bool) -> String {
         match self {
             ValueType::String(_) => {
-                if is_const == true {
+                if is_const {
                     format!("\"{}\"", self.to_string())
                 } else {
                     format!("\"{}\".into()", self.to_string())
@@ -282,7 +282,7 @@ impl ValueType {
             ValueType::Float(_) => format!("{}f32", self.to_string()),
             ValueType::Double(_) => format!("{}f64", self.to_string()),
             ValueType::Char(_) => format!("'{}' as u16", self.to_string()),
-            ValueType::Name(_) => format!("{}", self.to_string()),
+            ValueType::Name(_) => self.to_string(),
             ValueType::Array(v) => {
                 let mut res = "vec![".to_owned();
                 for v in v {
@@ -299,7 +299,7 @@ impl ValueType {
             ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_string(),
 
-            _ => format!("Default::default()"),
+            _ => "Default::default()".to_string(),
         }
     }
 
@@ -311,7 +311,7 @@ impl ValueType {
             ValueType::Int32(v) => v.to_string(),
             ValueType::Int64(v) => v.to_string(),
             ValueType::Float(v) => (*v as f32).to_string(),
-            ValueType::Double(v) => (*v as f64).to_string(),
+            ValueType::Double(v) => (*v).to_string(),
             ValueType::Bool(v) => v.to_string(),
             ValueType::Char(v) => Self::char_to_string(*v),
             ValueType::Array(v) => {
@@ -325,7 +325,7 @@ impl ValueType {
                 res
             }
             ValueType::Name(v) => {
-                format!("{}", v)
+                v.to_string()
             }
             ValueType::Expr{ lhs, operator, rhs} => {
                 format!("{} {} {}", lhs.to_string(), operator, rhs.to_string())
@@ -337,7 +337,7 @@ impl ValueType {
         }
     }
 
-    fn calc_expr(lhs: &Box<ConstExpr>, operator: &str, rhs: &Box<ConstExpr>) -> ConstExpr {
+    fn calc_expr(lhs: &ConstExpr, operator: &str, rhs: &ConstExpr) -> ConstExpr {
         let lhs = lhs.calculate();
         let rhs = rhs.calculate();
 
@@ -377,11 +377,7 @@ impl ValueType {
             }
 
             "<<" | ">>" => {
-                let mut is_shl = if operator == "<<" {
-                    true
-                } else {
-                    false
-                };
+                let mut is_shl = operator == "<<";
 
                 let lhs_value = lhs.to_i64();
                 let rhs_value = rhs.to_i64();
@@ -392,7 +388,7 @@ impl ValueType {
                     rhs_value as _
                 };
 
-                let value = if is_shl == true {
+                let value = if is_shl {
                     lhs_value.wrapping_shl(rhs_value)
                 } else {
                     lhs_value.wrapping_shr(rhs_value)
@@ -649,7 +645,7 @@ impl ConstExpr {
     }
 
     pub fn calculate(&self) -> ConstExpr {
-        if self.is_calculated == true {
+        if self.is_calculated {
             self.clone()
         } else {
             let mut expr = self.value.calculate();

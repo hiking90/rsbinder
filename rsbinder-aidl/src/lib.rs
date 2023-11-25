@@ -17,8 +17,8 @@ pub struct Namespace{
 }
 
 impl Namespace {
-    pub const AIDL: &str = ".";
-    pub const RUST: &str = "::";
+    pub const AIDL: &'static str = ".";
+    pub const RUST: &'static str = "::";
 
     pub fn new(namespace: &str, style: &str) -> Self {
         Self {

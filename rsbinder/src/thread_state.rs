@@ -367,16 +367,16 @@ fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
                             return Ok(Some(reply));
                         } else {
                             unsafe {
-                                let status = *(tr.data.ptr.buffer as *const i32);
+                                let status: StatusCode = (*(tr.data.ptr.buffer as *const i32)).into();
                                 free_buffer(None,
                                     tr.data.ptr.buffer,
                                     tr.data_size as _,
                                     tr.data.ptr.offsets,
                                     (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
 
-                                if status != StatusCode::Ok as _ {
-                                    return Err(Status::from_i32_status(status,
-                                        ExceptionCode::None, "binder::BR_REPLY").into())
+                                if status != StatusCode::Ok {
+                                    log::warn!("binder::BR_REPLY ({})", status);
+                                    return Err(status)
                                 }
                             };
                         }
@@ -403,8 +403,9 @@ fn execute_command(cmd: i32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
-                let other = thread_state.borrow_mut().in_parcel.read::<i32>()?;
-                return Err(Status::from_i32_status(other, ExceptionCode::JustError, "binder::BR_ERROR").into());
+                let other: StatusCode = thread_state.borrow_mut().in_parcel.read::<i32>()?.into();
+                log::error!("binder::BR_ERROR ({})", other);
+                return Err(other);
             }
             binder::BR_OK => {}
 
@@ -594,7 +595,7 @@ fn execute_command(cmd: i32) -> Result<()> {
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     let driver_fd = ProcessState::as_self().as_raw_fd();
     if driver_fd < 0 {
-        return Err(Error::from(StatusCode::BadFd));
+        return Err(StatusCode::BadFd);
     }
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -638,7 +639,8 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 match res {
                     Ok(_) => break,
                     Err(errno) if errno != nix::errno::Errno::EINTR => {
-                        return Err(Error::Any(errno.into()));
+                        log::error!("binder::write_read() error : {}", errno);
+                        return Err(StatusCode::InvalidOperation);
                     },
                     _ => {}
                 }
@@ -797,10 +799,10 @@ pub fn handle_commands() -> Result<()> {
     Ok(())
 }
 
-pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
+pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<bool> {
     let mut strict_policy: i32 = reader.read()?;
 
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    let header = THREAD_STATE.with(|thread_state| -> Result<u32> {
         let mut thread_state = thread_state.borrow_mut();
 
         if (thread_state.last_transaction_binder_flags() & FLAG_ONEWAY) != 0 {
@@ -812,22 +814,21 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<()> {
         let work_source: i32 = reader.read()?;
         thread_state.set_calling_work_source_uid_without_propagation(work_source as _);
 
-        let header: u32 = reader.read()?;
-        if header != INTERFACE_HEADER {
-            return Err(Status::new(StatusCode::Ok, ExceptionCode::BadParcelable,
-                &format!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header)).into());
-        }
-
-        Ok(())
+        reader.read()
     })?;
 
-    let parcel_interface: String16 = reader.read()?;
-    if parcel_interface.0.eq(T::get_descriptor()) {
-        Ok(())
+    if header != INTERFACE_HEADER {
+        log::error!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header);
+        return Ok(false);
+    }
+
+
+    let parcel_interface: String = reader.read()?;
+    if parcel_interface.eq(T::get_descriptor()) {
+        Ok(true)
     } else {
-        Err(Status::new(StatusCode::Ok, ExceptionCode::BadParcelable,
-            &format!("check_interface() expected '{}' but read '{}'",
-                T::get_descriptor(), parcel_interface.0)).into())
+        log::error!("check_interface() expected '{}' but read '{}'", T::get_descriptor(), parcel_interface);
+        Ok(false)
     }
 }
 
@@ -882,9 +883,9 @@ fn free_buffer(parcel: Option<&Parcel>, data: binder_uintptr_t, _: usize, _ : bi
 pub(crate) fn query_interface(handle: u32) -> Result<String> {
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    let interface: String16 = reply.expect("INTERFACE_TRANSACTION should have reply parcel").read()?;
+    let interface: String = reply.expect("INTERFACE_TRANSACTION should have reply parcel").read()?;
 
-    Ok(interface.0)
+    Ok(interface)
 }
 
 pub(crate) fn ping_binder(handle: u32) -> Result<()> {

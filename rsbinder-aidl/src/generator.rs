@@ -2,7 +2,6 @@ use std::error::Error;
 use serde::{Serialize, Deserialize};
 
 use tera::Tera;
-use convert_case::{Case, Casing};
 
 use crate::{parser, add_indent, Namespace};
 use crate::parser::Direction;

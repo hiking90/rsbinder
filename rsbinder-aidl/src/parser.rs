@@ -93,7 +93,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> LookupDecl {
         let curr_doc = curr_doc.borrow();
 
         if let Some(package) = &curr_doc.package {
-            let package_ns = Namespace::new(&package, Namespace::AIDL);
+            let package_ns = Namespace::new(package, Namespace::AIDL);
             ns_vec.append(&mut make_ns_candidate(&package_ns, &namespace));
         }
 
@@ -108,7 +108,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> LookupDecl {
 
     let (decl, ns) = DECLARATION_MAP.with(|hashmap| {
         for ns in &ns_vec {
-            if let Some(decl) = hashmap.borrow().get(&ns) {
+            if let Some(decl) = hashmap.borrow().get(ns) {
                 // println!("Found: {:?}\n", ns);
                 return (decl.clone(), ns.clone());
             }
@@ -359,7 +359,7 @@ pub enum Declaration {
 impl Declaration {
     pub fn is_variable(&self) -> Option<&VariableDecl> {
         if let Declaration::Variable(decl) = self {
-            Some(&decl)
+            Some(decl)
         } else {
             None
         }
@@ -435,7 +435,7 @@ pub enum Generic {
     }
 }
 
-fn generic_type_args_to_string(args: &Vec<Type>) -> String {
+fn generic_type_args_to_string(args: &[Type]) -> String {
     let mut args_str = String::new();
 
     args.iter().for_each(|t| {
@@ -891,9 +891,9 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
     let value = if value.ends_with('l') || value.ends_with('L') {
         is_long = true;
         &value[..value.len() -1]
-    } else if value.ends_with("u8") {
+    } else if let Some(stripped) = value.strip_suffix("u8") {
         is_u8 = true;
-        &value[..value.len()-2]
+        stripped
     } else {
         value
     };
@@ -955,8 +955,8 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
         Rule::HEXVALUE => { parse_intvalue(pair.as_str()) }
         Rule::FLOATVALUE => {
             let value = pair.as_str();
-            let value = if value.ends_with('f') {
-                &value[..value.len()-1]
+            let value = if let Some(stripped) = value.strip_suffix('f') {
+                stripped
             } else {
                 value
             };
@@ -1061,10 +1061,10 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
             let mut found = false;
             let mut has_backslash = false;
             for ch in pair.as_str().chars() {
-                if found == false && ch == '\'' {
+                if !found && ch == '\'' {
                     found = true;
-                } else if found == true {
-                    if has_backslash == false && ch == '\\' {
+                } else if found {
+                    if !has_backslash && ch == '\\' {
                         has_backslash = true;
                     } else {
                         return ConstExpr::new(ValueType::Char(ch));
@@ -1530,15 +1530,15 @@ pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
         hashmap.borrow_mut().insert(namespace.clone(), decl.clone());
     });
 
-    for mut decl in decl.members_mut() {
-        calculate_namespace(&mut decl, namespace.clone());
+    for decl in decl.members_mut() {
+        calculate_namespace(decl, namespace.clone());
     }
 }
 
 pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
     let mut document = Document::new();
 
-    match AIDLParser::parse(Rule::document, &data) {
+    match AIDLParser::parse(Rule::document, data) {
         Ok(pairs) => {
             for pair in pairs {
                 match pair.as_rule() {
@@ -1584,8 +1584,8 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
         Namespace::default()
     };
 
-    for mut decl in &mut document.decls {
-        calculate_namespace(&mut decl, namespace.clone());
+    for decl in &mut document.decls {
+        calculate_namespace(decl, namespace.clone());
     }
 
     Ok(document)
@@ -1600,7 +1600,7 @@ mod tests {
     use super::*;
 
     fn parse_str(aidl: &str) -> Result<(), Box<dyn Error>> {
-        match AIDLParser::parse(Rule::document, &aidl) {
+        match AIDLParser::parse(Rule::document, aidl) {
             Ok(_res) => {
                 println!("Success");
                 Ok(())
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn test_parse_only() -> Result<(), Box<dyn Error>> {
-        parse_dir(&Path::new("aidl"), parse_str)
+        parse_dir(Path::new("aidl"), parse_str)
     }
 
     // #[test]

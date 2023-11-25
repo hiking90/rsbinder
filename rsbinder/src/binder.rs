@@ -384,13 +384,13 @@ impl From<Stability> for i32 {
 }
 
 impl TryFrom<i32> for Stability {
-    type Error = Error;
+    type Error = StatusCode;
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
         match stability {
             0 => Ok(Local),
             1 => Ok(Vintf),
-            _ => Err(StatusCode::BadValue.into())
+            _ => Err(StatusCode::BadValue)
         }
     }
 }

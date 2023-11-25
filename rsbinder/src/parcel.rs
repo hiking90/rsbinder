@@ -26,7 +26,7 @@ use std::default::Default;
 use pretty_hex::*;
 
 use crate::{
-    error::{Result, Error, StatusCode},
+    error::{Result, StatusCode},
     sys::binder::{binder_size_t, flat_binder_object},
     parcelable::*,
     thread_state,
@@ -131,6 +131,12 @@ pub struct Parcel {
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>>,
+}
+
+impl Default for Parcel {
+    fn default() -> Self {
+        Parcel::with_capacity(256)
+    }
 }
 
 impl Parcel {
@@ -247,7 +253,7 @@ impl Parcel {
             self.pos = pos + len;
             Ok(&self.data.as_slice()[pos .. pos + len])
         } else {
-            Err(StatusCode::NotEnoughData.into())
+            Err(StatusCode::NotEnoughData)
         }
     }
 
@@ -299,7 +305,7 @@ impl Parcel {
                 return Ok(obj);
             }
         }
-        Err(Error::from(StatusCode::BadType))
+        Err(StatusCode::BadType)
     }
 
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
@@ -330,7 +336,7 @@ impl Parcel {
         Ok(())
     }
 
-    pub(crate) fn write_interface_token(&mut self, interface: String16) -> Result<()> {
+    pub(crate) fn write_interface_token(&mut self, interface: &str) -> Result<()> {
         self.write(&(&thread_state::strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
         self.update_work_source_request_header_pos();
         let work_source: i32 = if thread_state::should_propagate_work_source() {
@@ -446,22 +452,11 @@ impl std::fmt::Debug for Parcel {
 
 
 impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
-    type Error = Error;
+    type Error = StatusCode;
 
-    fn try_from(parcel: &mut Parcel) -> std::result::Result<Self, Self::Error> {
+    fn try_from(parcel: &mut Parcel) -> Result<Self> {
         let data = parcel.read_data(N)?;
-        <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
-            Error::Any(e.into())
-        })
-        // let pos = parcel.inner.pos;
-        // if let Some(data) = parcel.inner.data.get(pos .. (pos + N)) {
-        //     parcel.inner.pos += N;
-        //     <[u8; N] as TryFrom<&[u8]>>::try_from(data).map_err(|e| {
-        //         Error::from(e)
-        //     })
-        // } else {
-        //     Err(Error::from(StatusCode::BadIndex))
-        // }
+        Ok(<[u8; N] as TryFrom<&[u8]>>::try_from(data)?)
     }
 }
 
@@ -542,7 +537,6 @@ impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use crate::parcelable::String16;
     use crate::*;
 
     #[test]
@@ -554,7 +548,7 @@ mod tests {
         let v_u64:u64 = 7890;
         let v_f64:f64 = 9876.0;
 
-        let v_str: String16 = String16("Hello World".to_string());
+        let v_str = "Hello World".to_owned();
 
         let mut parcel = Parcel::new();
 
@@ -578,7 +572,7 @@ mod tests {
             assert_eq!(parcel.read::<i64>()?, v_i64);
             assert_eq!(parcel.read::<u64>()?, v_u64);
             assert_eq!(parcel.read::<f64>()?, v_f64);
-            assert_eq!(parcel.read::<String16>()?, v_str);
+            assert_eq!(parcel.read::<String>()?, v_str);
         }
 
         Ok(())

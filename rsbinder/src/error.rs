@@ -1,275 +1,232 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::string::FromUtf16Error;
-use std::error;
-// use std::string::FromUtf16Error;
-// use std::array::TryFromSliceError;
+use std::fmt;
+use std::error::Error;
 
+pub type Result<T> = std::result::Result<T, StatusCode>;
 
-// use thiserror;
-
-use crate::parcelable::*;
-use crate::parcel::*;
-
-pub type Result<T> = std::result::Result<T, Error>;
-// pub type Status<T> = std::result::Result<T, Exception>;
-
-#[derive(Debug)]
-pub enum Error {
-    Status(Status),
-    Any(Box<dyn error::Error>),
-}
-
-impl PartialEq for Error {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Error::Status(status1), Error::Status(status2)) => status1 == status2,
-            _ => false
-        }
-    }
-}
-
-impl From<FromUtf16Error> for Error {
-    fn from(err: FromUtf16Error) -> Self {
-        Error::Any(err.into())
-    }
-}
-
-
-const UNKNOWN_ERROR: isize = -2147483647-1;
+const UNKNOWN_ERROR: i32 = -2147483647-1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum StatusCode {
-    Ok = 0,
-    Unknown = UNKNOWN_ERROR,
-    NoMemory = -libc::ENOMEM as _,
-    InvalidOperation = -libc::ENOSYS as _,
-    BadValue = -libc::EINVAL as _,
-    BadType = UNKNOWN_ERROR + 1,
-    NameNotFound = -libc::ENOENT as _,
-    PermissionDenied = -libc::EPERM as _,
-    NoInit = -libc::ENODEV as _,
-    AlreadyExists = -libc::EEXIST as _,
-    DeadObject = -libc::EPIPE as _,
-    FailedTransaction = UNKNOWN_ERROR + 2,
-    UnknownTransaction = -libc::EBADMSG as _,
-    BadIndex = -libc::EOVERFLOW as _,
-    FdsNotAllowed = UNKNOWN_ERROR + 7,
-    UnexpectedNull = UNKNOWN_ERROR + 8,
-    NotEnoughData = -libc::ENODATA as _,
-    WouldBlock = -libc::EWOULDBLOCK as _,
-    TimedOut = -libc::ETIMEDOUT as _,
-    BadFd = -libc::EBADF as _,
-    ServiceSpecific = -8,
+    Ok,
+    Unknown,
+    NoMemory,
+    InvalidOperation,
+    BadValue,
+    BadType,
+    NameNotFound,
+    PermissionDenied,
+    NoInit,
+    AlreadyExists,
+    DeadObject,
+    FailedTransaction,
+    UnknownTransaction,
+    BadIndex,
+    FdsNotAllowed,
+    UnexpectedNull,
+    NotEnoughData,
+    WouldBlock,
+    TimedOut,
+    BadFd,
+    ServiceSpecific(i32),
 }
 
-impl From<StatusCode> for Error {
-    fn from(kind: StatusCode) -> Self {
-        Error::Status(Status {
-            status_code: kind as _,
-            exception_code: ExceptionCode::None as _,
-            message: format!("StatusCode: {:?}", kind),
-        })
-    }
-}
+impl Error for StatusCode {}
 
-#[derive(Clone, Copy, Debug)]
-pub enum ExceptionCode {
-    None = 0,
-    Security = -1,
-    BadParcelable = -2,
-    IllegalArgument = -3,
-    NullPointer = -4,
-    IllegalState = -5,
-    NetworkMainThread = -6,
-    UnsupportedOperation = -7,
-    ServiceSpecific = -8,
-    Parcelable = -9,
-
-// This is special and Java specific; see Parcel.java.
-    HasReplyHeader = -128,
-// This is special, and indicates to C++ binder proxies that the
-// transaction has failed at a low level.
-    TransactionFailed = -129,
-    JustError = -256,
-}
-
-impl From<ExceptionCode> for Error {
-    fn from(kind: ExceptionCode) -> Self {
-        Error::Status(Status {
-            status_code: StatusCode::Ok as _,
-            exception_code: kind as _,
-            message: format!("ExceptionCode: {:?}", kind),
-        })
-    }
-}
-
-#[derive(PartialEq, Debug, Clone)]
-pub struct Status {
-    pub status_code: i32,
-    pub exception_code: i32,
-    pub message: String,
-}
-
-impl Status {
-    pub fn new(status_code: StatusCode, exception_code: ExceptionCode, message: &str) -> Self {
-        Status {
-            status_code: status_code as _,
-            exception_code: exception_code as _,
-            message: message.into(),
-        }
-    }
-
-    pub fn from_i32_status(status_code: i32, exception_code: ExceptionCode, message: &str) -> Self {
-        Status {
-            status_code,
-            exception_code: exception_code as _,
-            message: message.into(),
+impl fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StatusCode::Ok => write!(f, "Ok"),
+            StatusCode::Unknown => write!(f, "Unknown"),
+            StatusCode::NoMemory => write!(f, "NoMemory"),
+            StatusCode::InvalidOperation => write!(f, "InvalidOperation"),
+            StatusCode::BadValue => write!(f, "BadValue"),
+            StatusCode::BadType => write!(f, "BadType"),
+            StatusCode::NameNotFound => write!(f, "NameNotFound"),
+            StatusCode::PermissionDenied => write!(f, "PermissionDenied"),
+            StatusCode::NoInit => write!(f, "NoInit"),
+            StatusCode::AlreadyExists => write!(f, "AlreadyExists"),
+            StatusCode::DeadObject => write!(f, "DeadObject"),
+            StatusCode::FailedTransaction => write!(f, "FailedTransaction"),
+            StatusCode::UnknownTransaction => write!(f, "UnknownTransaction"),
+            StatusCode::BadIndex => write!(f, "BadIndex"),
+            StatusCode::FdsNotAllowed => write!(f, "FdsNotAllowed"),
+            StatusCode::UnexpectedNull => write!(f, "UnexpectedNull"),
+            StatusCode::NotEnoughData => write!(f, "NotEnoughData"),
+            StatusCode::WouldBlock => write!(f, "WouldBlock"),
+            StatusCode::TimedOut => write!(f, "TimedOut"),
+            StatusCode::BadFd => write!(f, "BadFd"),
+            StatusCode::ServiceSpecific(v) => write!(f, "ServiceSpecific({v})"),
         }
     }
 }
 
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Exception (code: {}, exception: {}): {}", self.status_code, self.exception_code, self.message)
-    }
-}
-
-impl Serialize for Status {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        parcel.write::<i32>(&self.exception_code)
-    }
-}
-
-impl Deserialize for Status {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let exception = parcel.read::<i32>()?;
-
-        if exception == ExceptionCode::None as _ {
-            Ok(Status {
-                status_code: StatusCode::Ok as _,
-                exception_code: exception,
-                message: "Deserialize Status".to_owned(),
-            })
-        } else {
-            Err(Error::Status(Status {
-                status_code: StatusCode::Ok as _,
-                exception_code: exception,
-                message: "Deserialize Status".to_owned(),
-            }))
+impl From<StatusCode> for i32 {
+    fn from(code: StatusCode) -> Self {
+        match code {
+            StatusCode::Ok => 0,
+            StatusCode::Unknown => UNKNOWN_ERROR as _,
+            StatusCode::NoMemory => -libc::ENOMEM as _,
+            StatusCode::InvalidOperation => -libc::ENOSYS as _,
+            StatusCode::BadValue => -libc::EINVAL as _,
+            StatusCode::BadType => UNKNOWN_ERROR + 1,
+            StatusCode::NameNotFound => -libc::ENOENT as _,
+            StatusCode::PermissionDenied => -libc::EPERM as _,
+            StatusCode::NoInit => -libc::ENODEV as _,
+            StatusCode::AlreadyExists => -libc::EEXIST as _,
+            StatusCode::DeadObject => -libc::EPIPE as _,
+            StatusCode::FailedTransaction => UNKNOWN_ERROR + 2,
+            StatusCode::UnknownTransaction => -libc::EBADMSG as _,
+            StatusCode::BadIndex => -libc::EOVERFLOW as _,
+            StatusCode::FdsNotAllowed => UNKNOWN_ERROR + 7,
+            StatusCode::UnexpectedNull => UNKNOWN_ERROR + 8,
+            StatusCode::NotEnoughData => -libc::ENODATA as _,
+            StatusCode::WouldBlock => -libc::EWOULDBLOCK as _,
+            StatusCode::TimedOut => -libc::ETIMEDOUT as _,
+            StatusCode::BadFd => -libc::EBADF as _,
+            StatusCode::ServiceSpecific(v) => v,
         }
     }
 }
 
 
-impl From<Status> for Error {
-    fn from(status: Status) -> Self {
-        Error::Status(status)
+impl From<i32> for StatusCode {
+    fn from(code: i32) -> Self {
+        match code {
+            code if code == StatusCode::Ok.into() => StatusCode::Ok,
+            code if code == StatusCode::Unknown.into() => StatusCode::Unknown,
+            code if code == StatusCode::NoMemory.into() => StatusCode::NoMemory,
+            code if code == StatusCode::InvalidOperation.into() => StatusCode::InvalidOperation,
+            code if code == StatusCode::BadValue.into() => StatusCode::BadValue,
+            code if code == StatusCode::BadType.into() => StatusCode::BadType,
+            code if code == StatusCode::NameNotFound.into() => StatusCode::NameNotFound,
+            code if code == StatusCode::PermissionDenied.into() => StatusCode::PermissionDenied,
+            code if code == StatusCode::NoInit.into() => StatusCode::NoInit,
+            code if code == StatusCode::AlreadyExists.into() => StatusCode::AlreadyExists,
+            code if code == StatusCode::DeadObject.into() => StatusCode::DeadObject,
+            code if code == StatusCode::FailedTransaction.into() => StatusCode::FailedTransaction,
+            code if code == StatusCode::UnknownTransaction.into() => StatusCode::UnknownTransaction,
+            code if code == StatusCode::BadIndex.into() => StatusCode::BadIndex,
+            code if code == StatusCode::FdsNotAllowed.into() => StatusCode::FdsNotAllowed,
+            code if code == StatusCode::UnexpectedNull.into() => StatusCode::UnexpectedNull,
+            code if code == StatusCode::NotEnoughData.into() => StatusCode::NotEnoughData,
+            code if code == StatusCode::WouldBlock.into() => StatusCode::WouldBlock,
+            code if code == StatusCode::TimedOut.into() => StatusCode::TimedOut,
+            code if code == StatusCode::BadFd.into() => StatusCode::BadFd,
+            _ => StatusCode::ServiceSpecific(code),
+        }
+    }
+}
+
+impl From<std::array::TryFromSliceError> for StatusCode {
+    fn from(code: std::array::TryFromSliceError) -> Self {
+        StatusCode::NotEnoughData
     }
 }
 
 
 // impl error::Error for Status {}
 
-impl<T> Serialize for Result<T> {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        match self {
-            Ok(_) => {
-                parcel.write::<i32>(&0)?;
-            }
-            Err(err) => {
-                let code = match err {
-                    Error::Status(status) => {
-                        if status.exception_code == ExceptionCode::TransactionFailed as i32 {
-                            return Err(Error::Status(status.clone()))
-                        }
+// impl<T> Serialize for Result<T> {
+//     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+//         match self {
+//             Ok(_) => {
+//                 parcel.write::<i32>(&0)?;
+//             }
+//             Err(err) => {
+//                 let code = match err {
+//                     Error::Status(status) => {
+//                         if status.exception_code == ExceptionCode::TransactionFailed as i32 {
+//                             return Err(Error::Status(status.clone()))
+//                         }
 
-                        parcel.write::<i32>(&status.exception_code)?;
-                        if status.exception_code == ExceptionCode::None as i32 {
-                            return Ok(())
-                        }
+//                         parcel.write::<i32>(&status.exception_code)?;
+//                         if status.exception_code == ExceptionCode::None as i32 {
+//                             return Ok(())
+//                         }
 
-                        parcel.write(&String16(status.message.clone()))?;
+//                         parcel.write(&String16(status.message.clone()))?;
 
-                        if status.exception_code == ExceptionCode::ServiceSpecific as i32 {
-                            status.status_code
-                        } else {
-                            0
-                        }
-                    },
-                    _ => {
-                        parcel.write::<i32>(&(ExceptionCode::JustError as i32))?;
-                        let message = format!("{:?}", err);
-                        parcel.write(&String16(message))?;
+//                         if status.exception_code == ExceptionCode::ServiceSpecific as i32 {
+//                             status.status_code
+//                         } else {
+//                             0
+//                         }
+//                     },
+//                     _ => {
+//                         parcel.write::<i32>(&(ExceptionCode::JustError as i32))?;
+//                         let message = format!("{:?}", err);
+//                         parcel.write(&String16(message))?;
 
-                        0
-                    },
-                };
+//                         0
+//                     },
+//                 };
 
-                parcel.write::<i32>(&0)?;
-                parcel.write::<i32>(&code)?;
-            }
-        }
+//                 parcel.write::<i32>(&0)?;
+//                 parcel.write::<i32>(&code)?;
+//             }
+//         }
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }
 
-impl Deserialize for Result<()> {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let exception = parcel.read::<i32>()?;
+// impl Deserialize for Result<()> {
+//     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+//         let exception = parcel.read::<i32>()?;
 
-        let status = if exception == ExceptionCode::None as i32 {
-            Ok(())
-        } else {
-            let message = parcel.read::<String16>()?;
-            _ = parcel.read::<i32>()?;
-            let code = parcel.read::<i32>()?;
+//         let status = if exception == ExceptionCode::None as i32 {
+//             Ok(())
+//         } else {
+//             let message = parcel.read::<String16>()?;
+//             _ = parcel.read::<i32>()?;
+//             let code = parcel.read::<i32>()?;
 
-            Err(Status {
-                status_code: code,
-                exception_code: exception,
-                message: message.0,
-            }.into())
-        };
+//             Err(Status {
+//                 status_code: code,
+//                 exception_code: exception,
+//                 message: message.0,
+//             }.into())
+//         };
 
-        Ok(status)
-    }
-}
+//         Ok(status)
+//     }
+// }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    #[test]
-    fn test_status_parcelable() -> Result<()> {
-        let ok = Ok(());
-        let illegal_status = Result::<()>::Err(
-            Status::new(StatusCode::Ok, ExceptionCode::IllegalArgument, "IllegalArgument").into());
-        let failed_status = Result::<()>::Err(
-            Status::new(StatusCode::Ok, ExceptionCode::TransactionFailed, "TransactionFailed").into());
-        let service_specific_status = Result::<()>::Err(
-            Status::new(StatusCode::NameNotFound,
-                ExceptionCode::ServiceSpecific, "IllegalArgument").into());
+//     #[test]
+//     fn test_status_parcelable() -> Result<()> {
+//         let ok = Ok(());
+//         let illegal_status = Result::<()>::Err(
+//             Status::new(StatusCode::Ok, ExceptionCode::IllegalArgument, "IllegalArgument").into());
+//         let failed_status = Result::<()>::Err(
+//             Status::new(StatusCode::Ok, ExceptionCode::TransactionFailed, "TransactionFailed").into());
+//         let service_specific_status = Result::<()>::Err(
+//             Status::new(StatusCode::NameNotFound,
+//                 ExceptionCode::ServiceSpecific, "IllegalArgument").into());
 
-        let mut parcel = Parcel::new();
+//         let mut parcel = Parcel::new();
 
-        {
-            parcel.write(&ok)?;
-            parcel.write(&illegal_status)?;
-            parcel.write(&service_specific_status)?;
-            assert!(parcel.write(&failed_status).is_err());
-        }
+//         {
+//             parcel.write(&ok)?;
+//             parcel.write(&illegal_status)?;
+//             parcel.write(&service_specific_status)?;
+//             assert!(parcel.write(&failed_status).is_err());
+//         }
 
-        {
-            assert_eq!(parcel.read::<Result<()>>()?, ok);
-            assert_eq!(parcel.read::<Result<()>>()?, illegal_status);
-            assert_eq!(parcel.read::<Result<()>>()?, service_specific_status);
-            assert!(parcel.read::<Result<()>>().is_err());
-        }
+//         {
+//             assert_eq!(parcel.read::<Result<()>>()?, ok);
+//             assert_eq!(parcel.read::<Result<()>>()?, illegal_status);
+//             assert_eq!(parcel.read::<Result<()>>()?, service_specific_status);
+//             assert!(parcel.read::<Result<()>>().is_err());
+//         }
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }

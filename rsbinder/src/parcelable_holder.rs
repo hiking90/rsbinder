@@ -104,7 +104,7 @@ impl ParcelableHolder {
         T: Any + Parcelable + ParcelableMetadata + std::fmt::Debug + Send + Sync,
     {
         if self.stability > p.get_stability() {
-            return Err(StatusCode::BadValue.into());
+            return Err(StatusCode::BadValue);
         }
 
         *self.data.get_mut().unwrap() = ParcelableHolderData::Parcelable {
@@ -141,11 +141,11 @@ impl ParcelableHolder {
                 ref name,
             } => {
                 if name != parcelable_desc {
-                    return Err(StatusCode::BadValue.into());
+                    return Err(StatusCode::BadValue);
                 }
 
                 match Arc::clone(parcelable).downcast_arc::<T>() {
-                    Err(_) => Err(StatusCode::BadValue.into()),
+                    Err(_) => Err(StatusCode::BadValue),
                     Ok(x) => Ok(Some(x)),
                 }
             }
@@ -199,7 +199,7 @@ impl Deserialize for ParcelableHolder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let status: i32 = parcel.read()?;
         if status == NULL_PARCELABLE_FLAG {
-            Err(StatusCode::UnexpectedNull.into())
+            Err(StatusCode::UnexpectedNull)
         } else {
             let mut parcelable = ParcelableHolder::new(Default::default());
             parcelable.read_from_parcel(parcel)?;
@@ -254,14 +254,14 @@ impl Parcelable for ParcelableHolder {
 
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
         if self.stability as i32 != parcel.read::<i32>()? {
-            return Err(StatusCode::BadValue.into());
+            return Err(StatusCode::BadValue);
         }
 
         let data_size: i32 = parcel.read()?;
         if data_size < 0 {
             // C++ returns BAD_VALUE here,
             // while Java returns ILLEGAL_ARGUMENT
-            return Err(StatusCode::BadValue.into());
+            return Err(StatusCode::BadValue);
         }
         if data_size == 0 {
             *self.data.get_mut().unwrap() = ParcelableHolderData::Empty;

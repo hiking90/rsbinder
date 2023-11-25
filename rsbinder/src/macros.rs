@@ -128,9 +128,9 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::StrongIBinder) -> $crate::Result<Self> {
-                let proxy = binder.as_proxy().ok_or($crate::Error::from($crate::StatusCode::BadValue))?.clone();
+                let proxy = binder.as_proxy().ok_or($crate::StatusCode::BadValue)?.clone();
                 if proxy.descriptor() != Self::descriptor() {
-                    Err($crate::StatusCode::BadType.into())
+                    Err($crate::StatusCode::BadType)
                 } else {
                     Ok(Self { binder, handle: proxy, $($fname: $finit),* })
                 }

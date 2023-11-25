@@ -7,7 +7,6 @@ use crate::{
     parcel::*,
     binder::*,
     error::*,
-    parcelable::*,
     thread_state,
 };
 
@@ -42,7 +41,7 @@ impl ProxyHandle {
         let mut data = Parcel::new();
 
         if write_header {
-            data.write_interface_token(String16(self.descriptor.to_owned()))?;
+            data.write_interface_token(&self.descriptor)?;
         }
 
         Ok(data)

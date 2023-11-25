@@ -5,11 +5,10 @@ use env_logger::Env;
 use rsbinder::*;
 // use rsbinder_hub::*;
 
-fn main() -> Result<()> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    let process = ProcessState::as_self();
-    process.init(DEFAULT_BINDER_PATH, 0);
+    ProcessState::init(DEFAULT_BINDER_PATH, 0)?;
     let hub = rsbinder_hub::default();
 
     println!("list services:");
