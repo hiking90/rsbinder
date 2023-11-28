@@ -29,7 +29,7 @@ macro_rules! declare_binder_interface {
             $interface[$descriptor] {
                 native: $native($on_transact),
                 proxy: $proxy {},
-                stability: $crate::binder_impl::Stability::default(),
+                stability: rsbinder::Stability::default(),
             }
         }
     };
@@ -64,7 +64,7 @@ macro_rules! declare_binder_interface {
                 proxy: $proxy {
                     $($fname: $fty = $finit),*
                 },
-                stability: $crate::binder_impl::Stability::default(),
+                stability: $crate::Stability::default(),
             }
         }
     };
@@ -115,8 +115,6 @@ macro_rules! declare_binder_interface {
             fn as_binder(&self) -> $crate::StrongIBinder {
                 self.binder.clone()
             }
-
-            // fn box_clone(&self) -> Box<dyn $crate::Interface> { todo!() }
         }
 
         impl $crate::Proxy for $proxy
@@ -139,15 +137,34 @@ macro_rules! declare_binder_interface {
 
         pub struct $native(Box<dyn $interface + Sync + Send + 'static>);
 
-        // impl $native {
-        //     /// Create a new binder service.
-        //     pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
-        //         // let mut binder = $crate::binder_impl::Binder::new_with_stability($native(Box::new(inner)), $stability);
-        //         // $crate::binder_impl::IBinderInternal::set_requesting_sid(&mut binder, features.set_requesting_sid);
-        //         std::sync::Arc::new(Box::new(inner))
-        //     }
-        // }
+        impl $native {
+            /// Create a new binder service.
+            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
+                let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
+                // $crate::binder_impl::IBinderInternal::set_requesting_sid(&mut binder, features.set_requesting_sid);
+                std::sync::Arc::new(binder)
+            }
+        }
 
+        impl $crate::Remotable for $native {
+            fn descriptor() -> &'static str where Self: Sized {
+                $descriptor
+            }
+
+            fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
+                match $on_transact(&*self.0, code, reader, reply, Self::descriptor()) {
+                    Err($crate::StatusCode::UnexpectedNull) => {
+                        let status: $crate::Status = $crate::ExceptionCode::NullPointer.into();
+                        reply.write(&status)
+                    }
+                    result => result,
+                }
+            }
+
+            fn on_dump(&self, file: &std::fs::File, args: &[&str]) -> $crate::Result<()> {
+                todo!("BnIEcho on_dump")
+            }
+        }
 
         impl $crate::parcelable::Serialize for dyn $interface
         where
@@ -344,24 +361,31 @@ macro_rules! declare_binder_enum {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Interface, TransactionCode, Result};
+    use crate::{Interface, TransactionCode, Result, Binder, Parcel};
 
-    pub trait IServiceManager: Interface {
-        // remote methods...
+    pub trait IEcho: Interface {
+        fn echo(&self, echo: &str) -> Result<String>;
     }
 
     declare_binder_interface! {
-        IServiceManager["android.os.IServiceManager"] {
-            native: BnServiceManager(on_transact),
-            proxy: BpServiceManager{},
+        IEcho["my.echo"] {
+            native: BnEcho(on_transact),
+            proxy: BpEcho{},
+        }
+    }
+
+    impl IEcho for Binder<BnEcho> {
+        fn echo(&self, echo: &str) -> Result<String> {
+            self.0.echo(echo)
         }
     }
 
     fn on_transact(
-        service: &dyn IServiceManager,
+        service: &dyn IEcho,
         code: TransactionCode,
-        // data: &BorrowedParcel,
-        // reply: &mut BorrowedParcel,
+        data: &mut Parcel,
+        reply: &mut Parcel,
+        descriptor: &str,
     ) -> Result<()> {
         // ...
         Ok(())

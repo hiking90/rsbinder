@@ -61,6 +61,7 @@ pub const INTERFACE_TRANSACTION: u32 = b_pack_chars('_', 'N', 'T', 'F');
 pub const SYSPROPS_TRANSACTION: u32 = b_pack_chars('_', 'S', 'P', 'R');
 pub const EXTENSION_TRANSACTION: u32 = b_pack_chars('_', 'E', 'X', 'T');
 pub const DEBUG_PID_TRANSACTION: u32 = b_pack_chars('_', 'P', 'I', 'D');
+pub const SET_RPC_CLIENT_TRANSACTION: u32 = b_pack_chars('_', 'R', 'P', 'C');
 
         // See android.os.IBinder.TWEET_TRANSACTION
         // Most importantly, messages can be anything not exceeding 130 UTF-8
@@ -107,24 +108,7 @@ pub trait Interface: Send + Sync {
     fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
         Ok(())
     }
-
-    // fn box_clone(&self) -> Box<dyn Interface>;
 }
-
-// impl Clone for Box<dyn Interface> {
-//     fn clone(&self) -> Box<dyn Interface> {
-//         self.box_clone()
-//     }
-// }
-
-// pub(crate) struct Unknown {}
-
-// impl Interface for Unknown {
-//     fn box_clone(&self) -> Box<dyn Interface> {
-//         Box::new(Self {})
-//     }
-// }
-
 
 // ///
 // /// # Example
@@ -180,7 +164,7 @@ pub trait IBinder: Send + Sync {
     fn ping_binder(&self) -> Result<()>;
 
     fn as_any(&self) -> &dyn Any;
-    fn is_remote(&self) -> bool;
+    fn as_transactable(&self) -> Option<&dyn Transactable>;
 }
 
 impl dyn IBinder {
@@ -199,25 +183,6 @@ impl std::fmt::Debug for dyn IBinder {
     }
 }
 
-impl PartialEq for dyn IBinder  {
-    fn eq(&self, other: &Self) -> bool {
-        if self.is_remote() && other.is_remote() {
-            return self.as_proxy() == other.as_proxy()
-        } else if !self.is_remote() && !other.is_remote() {
-            return self.as_any().type_id() == other.as_any().type_id()
-        }
-
-        false
-    }
-}
-
-
-pub fn cookie_for_binder(binder: Arc<dyn IBinder>) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    Arc::as_ptr(&binder).hash(&mut hasher);
-    hasher.finish()
-}
-
 /// A local service that can be remotable via Binder.
 ///
 /// An object that implement this interface made be made into a Binder service
@@ -233,7 +198,7 @@ pub trait Remotable: Send + Sync {
     ///
     /// This string is a unique identifier for a Binder interface, and should be
     /// the same between all implementations of that interface.
-    fn get_descriptor() -> &'static str where Self: Sized;
+    fn descriptor() -> &'static str where Self: Sized;
 
     /// Handle and reply to a request to invoke a transaction on this object.
     ///
@@ -245,7 +210,7 @@ pub trait Remotable: Send + Sync {
     fn on_dump(&self, file: &File, args: &[&str]) -> Result<()>;
 }
 
-pub trait Transactable {
+pub trait Transactable: Send + Sync {
     fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
 }
 
@@ -361,13 +326,14 @@ pub trait Transactable {
 /// An interface can promise to be a stable vendor interface ([`Vintf`]), or
 /// makes no stability guarantees ([`Local`]). [`Local`] is
 /// currently the default stability.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(Default)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stability {
     /// Default stability, visible to other modules in the same compilation
     /// context (e.g. modules on system.img)
     #[default]
     Local,
+    Vendor,
+    System,
 
     /// A Vendor Interface Object, which promises to be stable
     Vintf,
@@ -378,7 +344,9 @@ impl From<Stability> for i32 {
         use Stability::*;
         match stability {
             Local => 0,
-            Vintf => 1,
+            Vendor => 0b000011,
+            System => 0b001100,
+            Vintf => 0b111111,
         }
     }
 }
@@ -388,40 +356,47 @@ impl TryFrom<i32> for Stability {
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
         match stability {
-            0 => Ok(Local),
-            1 => Ok(Vintf),
+            stability if stability == Stability::Local.into() => Ok(Local),
+            stability if stability == Stability::Vendor.into() => Ok(Vendor),
+            stability if stability == Stability::System.into() => Ok(System),
+            stability if stability == Stability::Vintf.into() => Ok(Vintf),
             _ => Err(StatusCode::BadValue)
         }
     }
 }
 
-const INITIAL_STRONG_VALUE: usize = i32::MAX as _;
+const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
 
 #[derive(Debug)]
 struct Inner {
-    strong: AtomicUsize,
+    strong: AtomicI32,
+    weak: AtomicI32,
+    is_strong_lifetime: AtomicBool,
     data: Box<dyn IBinder>,
+    descriptor: String,
 }
 
 impl Inner {
-    fn new(data: Box<dyn IBinder>) -> Arc<Self> {
+    fn new(data: Box<dyn IBinder>, is_strong: bool, descriptor: &str) -> Arc<Self> {
         Arc::new(
             Self {
-                strong: AtomicUsize::new(INITIAL_STRONG_VALUE),
+                strong: AtomicI32::new(INITIAL_STRONG_VALUE),
+                weak: AtomicI32::new(1),
+                is_strong_lifetime: AtomicBool::new(is_strong),
                 data,
+                descriptor: descriptor.to_owned(),
             }
         )
     }
 }
 
-impl PartialEq for Inner {
-    fn eq(&self, other: &Self) -> bool {
-        self.data.eq(&other.data)
-    }
-}
-
 impl Drop for Inner {
     fn drop(self: &mut Inner) {
+        let strong = self.strong.load(Ordering::Relaxed);
+        let weak = self.weak.load(Ordering::Relaxed);
+        if strong != 0 || weak != 0{
+            log::error!("The Drop of Inner IBinder was called with strong count({strong}) and weak count({weak}).");
+        }
         if let Some(proxy) = self.data.as_proxy() {
             thread_state::dec_weak_handle(proxy.handle())
                 .expect("Failed to decrease the binder weak reference count.")
@@ -429,21 +404,19 @@ impl Drop for Inner {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct StrongIBinder {
     inner: Arc<Inner>,
 }
 
 impl StrongIBinder {
-    pub fn new(data: Box<dyn IBinder>) -> Self {
-        let this = WeakIBinder::new(data).upgrade();
-        this.inc_strong();
-        this
+    pub fn new(data: Box<dyn IBinder>, descriptor: &str) -> Self {
+        WeakIBinder::new(data, descriptor).upgrade()
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
         let this = Self { inner };
-        this.inc_strong();
+        this.increase();
         this
     }
 
@@ -452,7 +425,13 @@ impl StrongIBinder {
         // drop will be called.
     }
 
-    fn inc_strong(&self) {
+    pub fn descriptor(&self) -> &str {
+        &self.inner.descriptor
+    }
+
+    pub(crate) fn increase(&self) {
+        // In the Android implementation, it simultaneously increases the weak reference,
+        // but until the necessity is confirmed, we will not support the related functionality here.
         let c = self.inner.strong.fetch_add(1, Ordering::Relaxed);
         if c == INITIAL_STRONG_VALUE {
             self.inner.strong.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
@@ -463,7 +442,56 @@ impl StrongIBinder {
         }
     }
 
-    fn dec_strong(&self) {
+    pub(crate) fn attempt_increase(&self) -> bool {
+        let mut curr_count = self.inner.strong.load(Ordering::Relaxed);
+        debug_assert!(curr_count >= 0, "attempt_increase called on [{}] after underflow", self.descriptor());
+        while curr_count > 0 && curr_count != INITIAL_STRONG_VALUE {
+            match self.inner.strong.compare_exchange_weak(curr_count, curr_count + 1,
+                Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(count) => curr_count = count,
+            }
+        }
+
+        if curr_count <= 0 || curr_count == INITIAL_STRONG_VALUE {
+            if self.inner.is_strong_lifetime.load(Ordering::Relaxed) {
+                if curr_count <= 0 {
+                    return false;
+                }
+                while curr_count > 0 {
+                    match self.inner.strong.compare_exchange_weak(curr_count, curr_count + 1,
+                        Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(count) => curr_count = count,
+                    }
+                }
+                if curr_count <= 0 {
+                    return false;
+                }
+            } else {
+                if let Some(proxy) = self.inner.data.as_proxy() {
+                    if let Err(err) = thread_state::attempt_inc_strong_handle(proxy.handle()) {
+                        log::error!("Error in attempt_inc_strong_handle() is {:?}", err);
+                        return false;
+                    }
+                }
+                curr_count = self.inner.strong.fetch_add(1, Ordering::Relaxed);
+                if curr_count != 0 && curr_count != INITIAL_STRONG_VALUE {
+                    if let Some(proxy) = self.inner.data.as_proxy() {
+                        thread_state::dec_strong_handle(proxy.handle())
+                            .expect("Failed to decrease the binder strong reference count.");
+                    }
+                }
+            }
+        }
+        if curr_count == INITIAL_STRONG_VALUE {
+            self.inner.strong.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
+        }
+
+        true
+    }
+
+    pub(crate) fn decrease(&self) {
         let c = self.inner.strong.fetch_sub(1, Ordering::Relaxed);
         if c == 1 {
             if let Some(proxy) = self.inner.data.as_proxy() {
@@ -482,7 +510,7 @@ impl Clone for StrongIBinder {
 
 impl Drop for StrongIBinder {
     fn drop(&mut self) {
-        self.dec_strong();
+        self.decrease();
     }
 }
 
@@ -499,19 +527,30 @@ pub struct WeakIBinder {
 }
 
 impl WeakIBinder {
-    pub(crate) fn new(data: Box<dyn IBinder>) -> Self {
-        let this = Self { inner: Inner::new(data) };
-
-        if let Some(proxy) = this.inner.data.as_proxy() {
-            thread_state::inc_weak_handle(proxy.handle(), this.clone())
-                .expect("Failed to increase the binder weak reference count.")
+    pub(crate) fn new(data: Box<dyn IBinder>, descriptor: &str) -> Self {
+        match data.as_proxy().map(|proxy| proxy.handle()) {
+            Some(handle) => {
+                let this = Self { inner: Inner::new(data, false, descriptor) };
+                thread_state::inc_weak_handle(handle, this.clone())
+                    .expect("Failed to increase the binder weak reference count.");
+                this
+            }
+            None => {
+                Self { inner: Inner::new(data, true, descriptor) }
+            }
         }
-
-        this
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
         Self { inner }
+    }
+
+    pub(crate) fn increase(&self) {
+        self.inner.weak.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn decrease(&self) {
+        self.inner.strong.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn upgrade(&self) -> StrongIBinder {
@@ -533,7 +572,8 @@ mod tests {
 
     #[test]
     fn test_strong() -> Result<()> {
-        let strong = StrongIBinder::new(ProxyHandle::new(0, "interface".to_owned()));
+        let descriptor = "interface";
+        let strong = StrongIBinder::new(ProxyHandle::new(0, descriptor), descriptor);
         assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
 
         let strong2 = strong.clone();

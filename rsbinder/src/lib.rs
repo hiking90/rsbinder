@@ -11,6 +11,7 @@ mod status;
 mod macros;
 pub mod native;
 mod binder;
+mod binder_object;
 pub mod parcel;
 pub mod binderfs;
 pub mod parcelable;
@@ -19,12 +20,12 @@ pub mod file_descriptor;
 pub mod parcelable_holder;
 
 pub use process_state::ProcessState;
-// pub use thread_state::Se;
 pub use parcel::Parcel;
 pub use error::{StatusCode, Result};
 pub use status::*;
 pub use binder::*;
 pub use proxy::*;
+pub use native::*;
 pub use parcelable::*;
 pub use file_descriptor::ParcelFileDescriptor;
 pub use parcelable_holder::ParcelableHolder;
@@ -39,13 +40,8 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn process_state() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn process_state() {
         // let process = ProcessState::as_self();
-        ProcessState::init("/dev/binderfs/binder", 0)
-    }
-
-    #[test]
-    fn thread_state() {
-        process_state();
+        ProcessState::init("/dev/binderfs/binder", 0);
     }
 }

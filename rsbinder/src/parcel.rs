@@ -17,17 +17,16 @@
  * limitations under the License.
  */
 
-use crate::sys::{binder_uintptr_t, BINDER_TYPE_FD};
 use std::vec::Vec;
-
 use std::default::Default;
 
-
 use pretty_hex::*;
+use zerocopy::AsBytes;
 
 use crate::{
     error::{Result, StatusCode},
     sys::binder::{binder_size_t, flat_binder_object},
+    sys::{binder_uintptr_t, BINDER_TYPE_FD},
     parcelable::*,
     thread_state,
     binder,
@@ -69,7 +68,7 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    // fn as_mut_slice(&mut self) -> &[T] {
+    // fn as_mut_slice(&mut self) -> &mut [T] {
     //     match self {
     //         ParcelData::Vec(ref mut v) => v.as_mut_slice(),
     //         ParcelData::Slice(s) => s,
@@ -97,7 +96,15 @@ impl<T: Clone + Default> ParcelData<T> {
     fn set_len(&mut self, len: usize) {
         match self {
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
-            _ => panic!("&[u8] can't be set_len()."),
+            _ => panic!("&[u8] can't support set_len()."),
+        }
+
+    }
+
+    fn resize(&mut self, len: usize) {
+        match self {
+            ParcelData::Vec(v) => v.resize_with(len, Default::default),
+            _ => panic!("&[u8] can't support resize()."),
         }
     }
 
@@ -108,12 +115,23 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    fn extend_from_slice(&mut self, other: &[T]) {
+    fn splice<R, I>(&mut self, range: R, replace_with: I) -> std::vec::Splice<'_, I::IntoIter>
+    where
+        R: std::ops::RangeBounds<usize>,
+        I: IntoIterator<Item = T>,
+    {
         match self {
-            ParcelData::Vec(v) => v.extend_from_slice(other),
-            _ => panic!("extend_from_slice() is only available for ParcelData::Vec."),
+            ParcelData::Vec(v) => v.splice(range, replace_with),
+            _ => panic!("splice() is only available for ParcelData::Vec."),
         }
     }
+
+    // fn extend_from_slice(&mut self, other: &[T]) {
+    //     match self {
+    //         ParcelData::Vec(v) => v.extend_from_slice(other),
+    //         _ => panic!("extend_from_slice() is only available for ParcelData::Vec."),
+    //     }
+    // }
 
     fn push(&mut self, other: T) {
         match self {
@@ -201,25 +219,19 @@ impl Parcel {
         self.pos >= self.data.len()
     }
 
-    pub fn set_len(&mut self, new_len: usize) {
-        self.data.set_len(new_len)
+    pub fn set_data_size(&mut self, new_len: usize) {
+        self.data.set_len(new_len);
+        if new_len < self.pos {
+            self.pos = new_len;
+        }
     }
 
     pub fn close_file_descriptors(&self) {
-        let objects = match &self.objects {
-            ParcelData::Vec(objects) => {
-                objects.as_slice()
-            }
-            ParcelData::Slice(objects) => {
-                objects
-            }
-        };
-
-        for offset in objects {
+        for offset in self.objects.as_slice() {
             unsafe {
-                let flat: *const flat_binder_object = self.data.as_ptr().add(*offset as _) as _;
-                if (*flat).hdr.type_ == BINDER_TYPE_FD {
-                    libc::close((*flat).__bindgen_anon_1.handle as _);
+                let flat: flat_binder_object = self.data.as_ptr().add(*offset as _).into();
+                if flat.header_type() == BINDER_TYPE_FD {
+                    libc::close(flat.handle() as _);
                 }
             }
         }
@@ -233,49 +245,62 @@ impl Parcel {
         self.pos
     }
 
+    pub fn data_size(&self) -> usize {
+        if self.data.len() > self.pos {
+            self.data.len()
+        } else {
+            self.pos
+        }
+    }
+
     /// Read a type that implements [`Deserialize`] from the sub-parcel.
     pub fn read<D: Deserialize>(&mut self) -> Result<D> {
         D::deserialize(self)
     }
 
-    pub fn len(&self) -> usize {
+    pub fn data_avail(&self) -> usize {
         let result = self.data.len() - self.pos;
         assert!(result < i32::MAX as _, "data too big: {}", result);
 
         result
     }
 
-    pub(crate) fn read_data(&mut self, len: usize) -> Result<&[u8]> {
-        let len = pad_size(len);
+    // pub(crate) fn read_aligned<T: Default>(&mut self) -> Result<T> {
+    //     let unaligned = std::mem::size_of::<T>();
+    //     let mut value: T = Default::default();
+    //     unsafe {
+    //         std::ptr::copy_nonoverlapping(
+    //             self.read_aligned_data(unaligned)?.as_ptr(),
+    //             &mut value as *mut _ as *mut u8,
+    //             unaligned,
+    //         );
+    //     }
+
+    //     Ok(value)
+    // }
+
+    pub(crate) fn read_aligned_data(&mut self, len: usize) -> Result<&[u8]> {
+        let aligned = pad_size(len);
         let pos = self.pos;
 
-        if len <= self.len() {
-            self.pos = pos + len;
+        if aligned <= self.data_avail() {
+            self.pos = pos + aligned;
             Ok(&self.data.as_slice()[pos .. pos + len])
         } else {
             Err(StatusCode::NotEnoughData)
         }
     }
 
+    // TODO : Switch the return value to reference likes &flat_binder_object
     pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
         let data_pos = self.pos as u64;
         let size = std::mem::size_of::<flat_binder_object>();
 
-        // To avoid the runtime error "misaligned pointer dereference", memory copy is used.
-        let mut obj: flat_binder_object = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.read_data(size)?.as_ptr(),
-                &mut obj as *mut _ as *mut u8,
-                std::mem::size_of::<flat_binder_object>(),
-            );
-        }
+        let obj: flat_binder_object = self.read_aligned_data(size)?.as_ptr().into();
 
         // __bindgen_anon_1 is union type. So, unsafe block is required to read member variable.
-        unsafe {
-            if !null_meta && obj.cookie == 0 && obj.__bindgen_anon_1.binder == 0 {
-                return Ok(obj);
-            }
+        if !null_meta && obj.cookie == 0 && obj.binder() == 0 {
+            return Ok(obj);
         }
 
         let objects = self.objects.as_slice();
@@ -319,17 +344,31 @@ impl Parcel {
         parcelable.serialize(self)
     }
 
-    pub(crate) fn write_data(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data)
+    pub(crate) fn write_aligned<T>(&mut self, val: &T) {
+        let unaligned = std::mem::size_of::<T>();
+        let val_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(val as *const T as *const u8, unaligned)
+        };
+
+        self.write_aligned_data(val_bytes);
+    }
+
+    pub(crate) fn write_aligned_data(&mut self, data: &[u8]) {
+        let unaligned = data.len();
+        self.data.splice(self.pos.., data.iter().cloned());
+        let aligned = pad_size(unaligned);
+        if aligned > unaligned {
+            self.data.resize(self.data.len() + aligned - unaligned);
+        }
+        self.pos += aligned;
     }
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
-        const SIZE: usize = std::mem::size_of::<flat_binder_object>();
-        let data = unsafe {std::mem::transmute::<&flat_binder_object, &[u8; SIZE]>(obj)};
         let data_pos = self.pos;
-        self.write_data(data);
+        self.write_aligned(obj);
 
-        if null_meta || unsafe { obj.__bindgen_anon_1.binder } != 0 {
+        if null_meta || obj.binder() != 0 {
+            obj.acquire();
             self.objects.push(data_pos as _);
         }
 
@@ -337,7 +376,7 @@ impl Parcel {
     }
 
     pub(crate) fn write_interface_token(&mut self, interface: &str) -> Result<()> {
-        self.write(&(&thread_state::strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
+        self.write(&(thread_state::strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
         self.update_work_source_request_header_pos();
         let work_source: i32 = if thread_state::should_propagate_work_source() {
             thread_state::calling_work_source_uid() as _
@@ -352,31 +391,23 @@ impl Parcel {
     }
 
     pub(crate) fn append_all_from(&mut self, other: &mut Parcel) -> Result<()> {
-        self.append_from(other, 0, other.len())
+        self.append_from(other, 0, other.data_size())
     }
 
-    pub(crate) fn append_from(&mut self, other: &mut Parcel, start: usize, size: usize) -> Result<()> {
+    pub(crate) fn append_from(&mut self, _other: &mut Parcel, _start: usize, _size: usize) -> Result<()> {
         todo!()
     }
 
-    fn release_objects(&mut self) {
+    fn release_objects(&self) {
         if self.objects.len() == 0 {
             return
         }
 
-        todo!();
-
-        // uint8_t* const data = mData;
-        // binder_size_t* const objects = mObjects;
-        // while (i > 0) {
-        //     i--;
-        //     const flat_binder_object* flat
-        //         = reinterpret_cast<flat_binder_object*>(data+objects[i]);
-        //     release_object(proc, *flat, this);
-        // }
-
+        for pos in self.objects.as_slice() {
+            let obj: &flat_binder_object = unsafe { &*(self.data.as_ptr().add(*pos as _) as *const flat_binder_object) };
+            obj.release();
+        }
     }
-
 
     // void Parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
     //     const binder_size_t* objects, size_t objectsCount, release_func relFunc)
@@ -446,48 +477,22 @@ impl Drop for Parcel {
 impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
+        if self.objects.len() > 0 {
+            writeln!(f, "Object count {}\n{}", self.objects.len(), pretty_hex(&self.objects.as_slice().as_bytes()))?;
+        }
         write!(f, "{}", pretty_hex(&self.data.as_slice()))
     }
 }
 
 
-impl<'a, const N: usize> TryFrom<&mut Parcel> for [u8; N] {
+impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
     type Error = StatusCode;
 
     fn try_from(parcel: &mut Parcel) -> Result<Self> {
-        let data = parcel.read_data(N)?;
+        let data = parcel.read_aligned_data(N)?;
         Ok(<[u8; N] as TryFrom<&[u8]>>::try_from(data)?)
     }
 }
-
-// static void release_object(const sp<ProcessState>& proc, const flat_binder_object& obj,
-//                            const void* who) {
-//     switch (obj.hdr.type) {
-//         case BINDER_TYPE_BINDER:
-//             if (obj.binder) {
-//                 LOG_REFS("Parcel %p releasing reference on local %llu", who, obj.cookie);
-//                 reinterpret_cast<IBinder*>(obj.cookie)->decStrong(who);
-//             }
-//             return;
-//         case BINDER_TYPE_HANDLE: {
-//             const sp<IBinder> b = proc->getStrongProxyForHandle(obj.handle);
-//             if (b != nullptr) {
-//                 LOG_REFS("Parcel %p releasing reference on remote %p", who, b.get());
-//                 b->decStrong(who);
-//             }
-//             return;
-//         }
-//         case BINDER_TYPE_FD: {
-//             if (obj.cookie != 0) { // owned
-//                 close(obj.handle);
-//             }
-//             return;
-//         }
-//     }
-
-//     ALOGE("Invalid object type 0x%08x", obj.hdr.type);
-// }
-
 
 // status_t Parcel::writeObject(const flat_binder_object& val, bool nullMetaData)
 // {

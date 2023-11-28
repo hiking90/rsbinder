@@ -22,7 +22,7 @@ if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then
 fi
 
 function build() {
-    cargo ndk -t x86_64 build
+    cargo ndk --no-strip -t x86_64 build
 }
 
 function install() {

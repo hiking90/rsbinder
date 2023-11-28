@@ -1,22 +1,12 @@
-use std::sync::Arc;
-use std::io;
-use std::os::unix::io::{AsRawFd, RawFd, IntoRawFd};
-
 use tokio::io::{unix::AsyncFd, Interest};
 use rsbinder::*;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+    ProcessState::init(DEFAULT_BINDER_PATH, 0).become_context_manager();
 
-    {
-        let mut process_state = ProcessState::as_self();
-
-        process_state.init(DEFAULT_BINDER_PATH, 0);
-        process_state.become_context_manager();
-    }
-
-    let async_fd = AsyncFd::with_interest(ProcessState::as_self().as_raw_fd(), Interest::READABLE)?;
+    let async_fd = AsyncFd::with_interest(ProcessState::as_self().driver(), Interest::READABLE)?;
 
     thread_state::setup_polling().expect("Failed in ThreadState::setup_polling()");
 

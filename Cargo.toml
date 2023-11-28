@@ -5,5 +5,9 @@ members = [
     "rsbinder",
     "rsbinder-aidl",
     "rsbinder-hub",
+    "example-hello",
     "examples",
 ]
+
+[profile.release]
+debug = true

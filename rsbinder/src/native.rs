@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
 use std::ops::Deref;
 use std::any::Any;
 
@@ -25,59 +26,56 @@ use crate::parcel::*;
 use crate::error::*;
 
 pub struct Binder<T: Remotable + ?Sized + Send + Sync> {
-    remotable: T,
+    remotable: Arc<T>,
+    stability: Stability,
 }
 
 impl<T: Remotable> Binder<T> {
     pub fn new(remotable: T) -> Self {
+        Self::new_with_stability(remotable, Default::default())
+    }
+
+    pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
         Binder {
-            remotable,
+            remotable: Arc::new(remotable),
+            stability,
         }
+    }
+
+    pub fn stability(&self) -> Stability {
+        self.stability
     }
 
     /// Retrieve the interface descriptor string for this object's Binder
     /// interface.
-    pub fn get_descriptor(&self) -> &'static str {
-        T::get_descriptor()
+    pub fn descriptor(&self) -> &'static str {
+        T::descriptor()
     }
 
-    pub fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
-        // data.set_data_position(0);
+    // The following functions can be redefined depending on the service.
+    pub fn on_transact(&self, code: TransactionCode, _reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         match code {
-            PING_TRANSACTION => (),
-            EXTENSION_TRANSACTION => {
-                todo!("EXTENSION_TRANSACTION");
-                // CHECK(reply != nullptr);
-                // err = reply->writeStrongBinder(getExtension());
+            INTERFACE_TRANSACTION => {
+                reply.write(self.descriptor())
             }
-            DEBUG_PID_TRANSACTION => {
-                todo!("DEBUG_PID_TRANSACTION");
-                // CHECK(reply != nullptr);
-                // err = reply->writeInt32(getDebugPid());
+            DUMP_TRANSACTION => {
+                unimplemented!("DUMP_TRANSACTION")
             }
-
-            _ => {
-                self.remotable.on_transact(code, reader, reply)?;
+            SHELL_COMMAND_TRANSACTION => {
+                unimplemented!("SHELL_COMMAND_TRANSACTION")
             }
-        };
-
-        Ok(())
+            SYSPROPS_TRANSACTION => {
+                unimplemented!("SYSPROPS_TRANSACTION")
+            }
+            _ => Err(StatusCode::UnknownTransaction),
+        }
     }
 }
 
 impl<T: 'static + Remotable> Interface for Binder<T> {
-    // /// Converts the local remotable object into a generic `SpIBinder`
-    // /// reference.
-    // ///
-    // /// The resulting `SpIBinder` will hold its own strong reference to this
-    // /// remotable object, which will prevent the object from being dropped while
-    // /// the `SpIBinder` is alive.
-    // fn as_any(&self) -> &dyn Any {
-    //     self
-    // }
-    // fn box_clone(&self) -> Box<(dyn Interface + 'static)> {
-    //     todo!()
-    // }
+    fn as_binder(&self) -> StrongIBinder {
+        StrongIBinder::new(Box::new((*self).clone()), T::descriptor())
+    }
 }
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
@@ -101,8 +99,52 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
         self
     }
 
-    fn is_remote(&self) -> bool {
-        false
+    fn as_transactable(&self) -> Option<&dyn Transactable> {
+        Some(self)
+    }
+}
+
+impl<T: Remotable> Transactable for Binder<T> {
+    fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        reader.set_data_position(0);
+        match code {
+            PING_TRANSACTION => {
+                // Noting to do for PING_TRANSACTION.
+                Ok(())
+            }
+            EXTENSION_TRANSACTION => {
+                unimplemented!("EXTENSION_TRANSACTION")
+                // CHECK(reply != nullptr);
+                // err = reply->writeStrongBinder(getExtension());
+            }
+            DEBUG_PID_TRANSACTION => {
+                unimplemented!("DEBUG_PID_TRANSACTION");
+                // CHECK(reply != nullptr);
+                // err = reply->writeInt32(getDebugPid());
+            }
+
+            _ => {
+                match self.remotable.on_transact(code, reader, reply) {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        if err == StatusCode::UnknownTransaction {
+                            self.on_transact(code, reader, reply)
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T: Remotable> Clone for Binder<T> {
+    fn clone(&self) -> Self {
+        Self {
+            remotable: self.remotable.clone(),
+            stability: self.stability,
+        }
     }
 }
 
@@ -113,7 +155,6 @@ impl<T: Remotable> Deref for Binder<T> {
         &self.remotable
     }
 }
-
 
 // impl<T: Remotable> InterfaceClassMethods for Binder<T> {
 //     fn get_descriptor() -> &'static str {
@@ -163,30 +204,17 @@ impl<T: Remotable> Deref for Binder<T> {
 // // This implementation is an idiomatic implementation of the C++
 // // `IBinder::localBinder` interface if the binder object is a Rust binder
 // // service.
-// impl<B: Remotable> TryFrom<SpIBinder> for Binder<B> {
-//     type Error = StatusCode;
+impl<B: Remotable + 'static> TryFrom<StrongIBinder> for Binder<B> {
+    type Error = StatusCode;
 
-//     fn try_from(mut ibinder: SpIBinder) -> Result<Self> {
-//         let class = B::get_class();
-//         if Some(class) != ibinder.get_class() {
-//             return Err(StatusCode::BAD_TYPE);
-//         }
-//         let userdata = unsafe {
-//             // Safety: `SpIBinder` always holds a valid pointer pointer to an
-//             // `AIBinder`, which we can safely pass to
-//             // `AIBinder_getUserData`. `ibinder` retains ownership of the
-//             // returned pointer.
-//             sys::AIBinder_getUserData(ibinder.as_native_mut())
-//         };
-//         if userdata.is_null() {
-//             return Err(StatusCode::UNEXPECTED_NULL);
-//         }
-//         // We are transferring the ownership of the AIBinder into the new Binder
-//         // object.
-//         let mut ibinder = ManuallyDrop::new(ibinder);
-//         Ok(Binder {
-//             ibinder: ibinder.as_native_mut(),
-//             rust_object: userdata as *mut B,
-//         })
-//     }
-// }
+    fn try_from(ibinder: StrongIBinder) -> Result<Self> {
+        if B::descriptor() != ibinder.descriptor() {
+            return Err(StatusCode::BadType);
+        }
+
+        match ibinder.as_any().downcast_ref::<Binder<B>>() {
+            Some(binder) => Ok(binder.clone()),
+            None => Err(StatusCode::BadType),
+        }
+    }
+}

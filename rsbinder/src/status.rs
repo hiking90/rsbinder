@@ -133,7 +133,7 @@ fn read_check_header_size(parcel: &mut Parcel) -> Result<()> {
     // Skip over the blob of Parcelable data
     let header_start = parcel.data_position();
     // Get available size before reading more
-    let header_avail = parcel.len();
+    let header_avail = parcel.data_avail();
 
     let header_size = parcel.read::<i32>()?;
 
@@ -161,7 +161,7 @@ impl Deserialize for Status {
         } else {
             let message = parcel.read::<String>()?;
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
-            if remote_stack_trace_header_size < 0 || remote_stack_trace_header_size as usize > parcel.len() {
+            if remote_stack_trace_header_size < 0 || remote_stack_trace_header_size as usize > parcel.data_avail() {
                 log::error!("0x534e4554:132650049 Invalid remote_stack_trace_header_size({}).", remote_stack_trace_header_size);
                 return Err(StatusCode::Unknown);
             }

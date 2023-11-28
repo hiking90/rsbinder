@@ -593,53 +593,51 @@ impl ConstExpr {
     pub fn convert_to(&self, value_type: &ValueType) -> ConstExpr {
         if self.value.order() == value_type.order() {
             self.clone()
+        } else if let ValueType::Array(list) = &self.value {
+            let mut res = Vec::new();
+
+            for v in list {
+                res.push(v.convert_to(value_type))
+            }
+            ConstExpr::new(ValueType::Array(res))
         } else {
-            if let ValueType::Array(list) = &self.value {
-                let mut res = Vec::new();
-
-                for v in list {
-                    res.push(v.convert_to(value_type))
+            match value_type {
+                ValueType::Void => Self::default(),
+                ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_string())),
+                ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64() as i8 as _)),
+                ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
+                ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
+                ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64() as f32 as _)),
+                ValueType::Double(_) => ConstExpr::new(ValueType::Float(self.to_f64())),
+                ValueType::Bool(_) => ConstExpr::new(ValueType::Bool(self.to_bool())),
+                ValueType::Char(_) => {
+                    let ch = self.to_i64() as u32;
+                    if let Some(ch) = char::from_u32(ch) {
+                        Self::new(ValueType::Char(ch as _))
+                    } else {
+                        panic!("0x{:x} is invalid unicode.", ch)
+                    }
                 }
-                ConstExpr::new(ValueType::Array(res))
-            } else {
-                match value_type {
-                    ValueType::Void => Self::default(),
-                    ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_string())),
-                    ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64() as i8 as _)),
-                    ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
-                    ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
-                    ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64() as f32 as _)),
-                    ValueType::Double(_) => ConstExpr::new(ValueType::Float(self.to_f64())),
-                    ValueType::Bool(_) => ConstExpr::new(ValueType::Bool(self.to_bool())),
-                    ValueType::Char(_) => {
-                        let ch = self.to_i64() as u32;
-                        if let Some(ch) = char::from_u32(ch) {
-                            Self::new(ValueType::Char(ch as _))
-                        } else {
-                            panic!("0x{:x} is invalid unicode.", ch)
-                        }
-                    }
-                    ValueType::Array(_) => {
-                        unimplemented!();
-                        // let mut res = Vec::new();
-                        // for v in &v {
-                        //     res.push(v.convert_to(value_type));
-                        // }
+                ValueType::Array(_) => {
+                    unimplemented!();
+                    // let mut res = Vec::new();
+                    // for v in &v {
+                    //     res.push(v.convert_to(value_type));
+                    // }
 
-                        // Self::new_with_array(res)
-                    }
-                    ValueType::Name(_) => {
-                        unreachable!();
-                    }
-                    ValueType::Expr {..} | ValueType::Unary {..} => {
-                        unreachable!();
-                    }
-                    ValueType::UserDefined => {
-                        self.clone()
-                    }
-                    _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),
-
+                    // Self::new_with_array(res)
                 }
+                ValueType::Name(_) => {
+                    unreachable!();
+                }
+                ValueType::Expr {..} | ValueType::Unary {..} => {
+                    unreachable!();
+                }
+                ValueType::UserDefined => {
+                    self.clone()
+                }
+                _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),
+
             }
         }
     }

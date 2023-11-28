@@ -1,0 +1,19 @@
+[package]
+name = "example-hello"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lazy_static = "1"
+rsbinder = { path = "../rsbinder" }
+rsbinder-hub = { path = "../rsbinder-hub" }
+env_logger = "0"
+tokio = { version = "1", features = ["full"] }
+backtrace = "0.3"
+
+[build-dependencies]
+# aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }
+rsbinder-aidl = { path = "../rsbinder-aidl" }

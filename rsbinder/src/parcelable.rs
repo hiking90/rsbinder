@@ -18,13 +18,12 @@
  */
 
 use crate::{
-    IBinder,
     sys::*,
     error::*,
     process_state::*,
-    proxy::*,
     binder::*,
     parcel::Parcel,
+    binder_object::*,
 };
 
 
@@ -200,7 +199,7 @@ macro_rules! impl_parcelable {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                parcel.write_data(&self.to_ne_bytes());
+                parcel.write_aligned(self);
                 Ok(())
             }
         }
@@ -292,7 +291,7 @@ macro_rules! impl_parcelable_ex {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 let val: $to_ty = *self as _;
-                parcel.write_data(&val.to_ne_bytes());
+                parcel.write_aligned(&val);
                 Ok(())
             }
         }
@@ -426,7 +425,7 @@ impl DeserializeArray for bool {
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = *self as _;
-        parcel.write_data(&val.to_ne_bytes());
+        parcel.write_aligned(&val);
         Ok(())
     }
 }
@@ -450,9 +449,8 @@ impl SerializeOption for str {
                 utf16.push(0);
 
                 parcel.write::<i32>(&(len as i32))?;
-
                 let pad_size = crate::parcel::pad_size(utf16.len() * std::mem::size_of::<u16>());
-                parcel.write_data(
+                parcel.write_aligned_data(
                     unsafe {
                         std::slice::from_raw_parts(utf16.as_ptr() as *const u8, pad_size)
                     }
@@ -461,6 +459,20 @@ impl SerializeOption for str {
                 Ok(())
             }
         }
+    }
+}
+
+impl Deserialize for StatusCode {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        Ok(<i32>::from_ne_bytes(parcel.try_into()?).into())
+    }
+}
+
+impl Serialize for StatusCode {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        let val: i32 = i32::from(*self);
+        parcel.write_aligned(&val);
+        Ok(())
     }
 }
 
@@ -486,8 +498,9 @@ macro_rules! impl_parcelable_struct {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                const SIZE: usize = std::mem::size_of::<$ty>();
-                parcel.write_data(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
+                parcel.write_aligned(self);
+                // const SIZE: usize = std::mem::size_of::<$ty>();
+                // parcel.write_aligned_data(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
                 Ok(())
             }
         }
@@ -530,9 +543,7 @@ impl Deserialize for Option<String> {
         let len = parcel.read::<i32>()?;
 
         if (0..i32::MAX).contains(&len) {
-            let pad_size = crate::parcel::pad_size((len as usize + 1) * std::mem::size_of::<u16>());
-
-            let data = parcel.read_data(pad_size)?;
+            let data = parcel.read_aligned_data((len as usize + 1) * std::mem::size_of::<u16>())?;
             let res = String::from_utf16(
                 unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
@@ -546,9 +557,6 @@ impl Deserialize for Option<String> {
         } else {
             Ok(None)
         }
-
-        // let res = parcel.read::<Option<String16>>()?.map(|s| s.0);
-        // Ok(res)
     }
 }
 
@@ -575,72 +583,29 @@ impl Serialize for flat_binder_object {
     }
 }
 
-impl Deserialize for *const dyn IBinder {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let data = parcel.read::<u128>()?;
-        let ptr = unsafe {std::mem::transmute::<u128, *const dyn IBinder>(data)};
-        Ok(ptr)
-    }
-}
+// impl Deserialize for *const dyn IBinder {
+//     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+//         let data = parcel.read::<u128>()?;
+//         let ptr = unsafe {std::mem::transmute::<u128, *const dyn IBinder>(data)};
+//         Ok(ptr)
+//     }
+// }
 
-impl Serialize for *const dyn IBinder {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        let data = unsafe {std::mem::transmute::<&*const dyn IBinder, &u128>(self)};
-        parcel.write::<u128>(data)?;
-        Ok(())
-    }
-}
+// impl Serialize for *const dyn IBinder {
+//     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+//         let data = unsafe {std::mem::transmute::<&*const dyn IBinder, &u128>(self)};
+//         parcel.write::<u128>(data)?;
+//         Ok(())
+//     }
+// }
 
-
-const SCHED_NORMAL:u32 = 0;
-const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT:u32 = 9;
-
-fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
-    (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
-}
 
 impl Serialize for StrongIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-
-        let sched_bits = if !ProcessState::as_self().background_scheduling_disabled() {
-            sched_policy_mask(SCHED_NORMAL, 19)
-        } else {
-            0
-        };
-
-        let obj = if self.is_remote() {
-            let proxy = self.as_any().downcast_ref::<ProxyHandle>().expect("Downcast to Proxy<Unknown>");
-
-            flat_binder_object {
-                hdr: binder_object_header {
-                    type_: BINDER_TYPE_HANDLE
-                },
-                flags: sched_bits,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    handle: proxy.handle(),
-                },
-                cookie: 0,
-            }
-        } else {
-            let weak = Box::new(StrongIBinder::downgrade(self));
-
-            flat_binder_object {
-                hdr: binder_object_header {
-                    type_: BINDER_TYPE_BINDER
-                },
-                flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    binder: Box::into_raw(weak) as u64,
-                },
-                cookie: 0,
-            }
-        };
-
-        parcel.write(&obj)?;
+        parcel.write::<flat_binder_object>(&self.into())?;
 
         // finishFlattenBinder
-        let stability: i32 = 0;
-        parcel.write(&stability)?;
+        parcel.write::<i32>(&Stability::System.into())?;
 
         Ok(())
     }
@@ -655,26 +620,22 @@ impl Deserialize for StrongIBinder {
         let flat: flat_binder_object = parcel.read()?;
         let _stability: i32 = parcel.read()?;
 
-        unsafe {
-            match flat.hdr.type_ {
-                BINDER_TYPE_BINDER => {
-                    let weak = Box::from_raw(flat.__bindgen_anon_1.binder as *mut Box<WeakIBinder>);
-                    Ok(weak.upgrade())
+        match flat.header_type() {
+            BINDER_TYPE_BINDER => {
+                let weak = raw_pointer_to_weak_binder(flat.binder());
+                let strong = weak.upgrade();
+                Ok(strong)
+            }
 
-                    // Weak::upgrade(&weak)
-                    //     .ok_or_else(|| Error::from(StatusCode::DeadObject))
-                }
+            BINDER_TYPE_HANDLE => {
+                let res = ProcessState::as_self()
+                    .strong_proxy_for_handle(flat.handle());
+                Ok(res?)
+            }
 
-                BINDER_TYPE_HANDLE => {
-                    let res = ProcessState::as_self()
-                        .strong_proxy_for_handle(flat.__bindgen_anon_1.handle);
-                    Ok(res?)
-                }
-
-                _ => {
-                    log::warn!("Unknown Binder Type ({}) was delivered.", flat.hdr.type_);
-                    Err(StatusCode::BadType)
-                }
+            _ => {
+                log::warn!("Unknown Binder Type ({}) was delivered.", flat.header_type());
+                Err(StatusCode::BadType)
             }
         }
     }

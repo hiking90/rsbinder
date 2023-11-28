@@ -317,15 +317,19 @@ pub struct Arg {
 }
 
 impl Arg {
-    pub fn to_string(&self, is_nullable: bool) -> (String, String, String) {
-        // let param = format!("_arg_{}", self.identifier.to_case(Case::Snake));
-        let param = format!("_arg_{}", self.identifier);
+    fn arg_identifier(&self) -> String {
+        format!("_arg_{}", self.identifier)
+    }
+
+    pub fn to_string(&self, is_nullable: bool) -> (String, String, String, String) {
+        let param = self.arg_identifier();
         let mut type_cast = self.r#type.type_cast();
+        let type_cloned = type_cast.clone();
         type_cast.set_fn_nullable(is_nullable);
         let def_arg = type_cast.fn_def_arg(&self.direction);
         let arg = format!("{}: {}",
             param.clone(), def_arg);
-        (param, arg, def_arg)
+        (param, arg, def_arg, type_cloned.return_type())
     }
 
     pub fn is_mutable(&self) -> bool {
@@ -529,6 +533,7 @@ pub struct TypeCast {
     pub is_fn_nullable: bool,
     pub is_vector: bool,
     pub is_generic: bool,
+    pub is_primitive: bool,
     pub value_type: ValueType,
 }
 
@@ -537,24 +542,24 @@ impl TypeCast {
         let mut is_declared = false;
         let mut is_vector = false;
         let type_name = match aidl_type.name.as_str() {
-            "boolean" => ("bool".to_owned(), ValueType::Bool(false)),
-            "byte" => ("i8".to_owned(), ValueType::Int8(0)),
-            "char" => ("u16".to_owned(), ValueType::Char(Default::default())),
-            "int" => ("i32".to_owned(), ValueType::Int32(0)),
-            "long" => ("i64".to_owned(), ValueType::Int64(0)),
-            "float" => ("f32".to_owned(), ValueType::Float(0.)),
-            "double" => ("f64".to_owned(), ValueType::Double(0.)),
-            "void" => ("()".to_owned(), ValueType::Void),
+            "boolean" => ("bool".to_owned(), ValueType::Bool(false), true),
+            "byte" => ("i8".to_owned(), ValueType::Int8(0), true),
+            "char" => ("u16".to_owned(), ValueType::Char(Default::default()), true),
+            "int" => ("i32".to_owned(), ValueType::Int32(0), true),
+            "long" => ("i64".to_owned(), ValueType::Int64(0), true),
+            "float" => ("f32".to_owned(), ValueType::Float(0.), true),
+            "double" => ("f64".to_owned(), ValueType::Double(0.), true),
+            "void" => ("()".to_owned(), ValueType::Void, false),
             "String" => {
-                ("String".to_owned(), ValueType::String(String::new()))
+                ("String".to_owned(), ValueType::String(String::new()), false)
             }
             "IBinder" => {
-                ("rsbinder::StrongIBinder".to_owned(), ValueType::IBinder)
+                ("rsbinder::StrongIBinder".to_owned(), ValueType::IBinder, false)
             }
             "List" => {
                 is_vector = true;
                 match &aidl_type.generic {
-                    Some(gen) => (gen.to_string(), ValueType::Array(Vec::new())),
+                    Some(gen) => (gen.to_string(), ValueType::Array(Vec::new()), false),
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
                 }
             }
@@ -567,10 +572,10 @@ impl TypeCast {
                 panic!("FileDescriptor isn't supported by the aidl generator of rsbinder.");
             }
             "ParcelFileDescriptor" => {
-                ("rsbinder::ParcelFileDescriptor".to_owned(), ValueType::FileDescriptor)
+                ("rsbinder::ParcelFileDescriptor".to_owned(), ValueType::FileDescriptor, false)
             }
             "ParcelableHolder" => {
-                ("rsbinder::ParcelableHolder".to_owned(), ValueType::Holder)
+                ("rsbinder::ParcelableHolder".to_owned(), ValueType::Holder, false)
             }
             _ => {
                 let lookup_decl = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
@@ -591,9 +596,9 @@ impl TypeCast {
                     Declaration::Interface(_) => {
                         is_declared = true;
                         // let type_name = format!("std::sync::Arc<dyn {}>", type_name);
-                        (type_name.to_owned(), ValueType::UserDefined)
+                        (type_name.to_owned(), ValueType::UserDefined, false)
                     }
-                    _ => (type_name.to_owned(), ValueType::UserDefined),
+                    _ => (type_name.to_owned(), ValueType::UserDefined, false),
                 }
             }
         };
@@ -607,6 +612,7 @@ impl TypeCast {
             is_nullable: false,
             is_generic: false,
             is_fn_nullable: false,
+            is_primitive: type_name.2,
         }
     }
 
@@ -934,14 +940,12 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
             ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
         } else if is_long {
             ConstExpr::new(ValueType::Int64(parsed_value as _))
+        } else if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
+            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
+        } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
+            ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
         } else {
-            if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
-                ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
-            } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
-                ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
-            } else {
-                ConstExpr::new(ValueType::Int64(parsed_value as _))
-            }
+            ConstExpr::new(ValueType::Int64(parsed_value as _))
         }
     }
 }

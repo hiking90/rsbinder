@@ -246,7 +246,7 @@ impl Parcelable for ParcelableHolder {
                 Ok(())
             }
             ParcelableHolderData::Parcel(ref mut p) => {
-                parcel.write(&(p.len() as i32))?;
+                parcel.write(&(p.data_size() as i32))?;
                 parcel.append_all_from(p)
             }
         }

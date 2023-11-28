@@ -1,7 +1,8 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc};
+use std::mem::ManuallyDrop;
+use std::sync::{atomic::Ordering};
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use log::error;
@@ -11,8 +12,8 @@ use crate::{
     error::*,
     binder::*,
     process_state::*,
-    parcelable::*,
     sys::*,
+    binder_object::*,
 };
 
 thread_local! {
@@ -121,6 +122,8 @@ pub struct ThreadState {
     strict_mode_policy: i32,
     is_looper: bool,
     is_flushing: bool,
+    pending_strong_derefs: Vec<binder_uintptr_t>,
+    pending_weak_derefs: Vec<binder_uintptr_t>,
     post_strong_derefs: Vec<StrongIBinder>,
     post_weak_derefs: Vec<WeakIBinder>,
     call_restriction: CallRestriction,
@@ -135,6 +138,8 @@ impl ThreadState {
             strict_mode_policy: 0,
             is_looper: false,
             is_flushing: false,
+            pending_strong_derefs: Vec::new(),
+            pending_weak_derefs: Vec::new(),
             post_strong_derefs: Vec::new(),
             post_weak_derefs: Vec::new(),
             call_restriction: ProcessState::as_self().call_restriction(),
@@ -153,6 +158,33 @@ impl ThreadState {
         match self.transaction {
             Some(tr) => tr.last_transaction_binder_flags,
             None => 0,
+        }
+    }
+
+    fn process_pending_derefs(&mut self) {
+        if self.in_parcel.data_position() >= self.in_parcel.data_size() {
+        //     /*
+        //      * The decWeak()/decStrong() calls may cause a destructor to run,
+        //      * which in turn could have initiated an outgoing transaction,
+        //      * which in turn could cause us to add to the pending refs
+        //      * vectors; so instead of simply iterating, loop until they're empty.
+        //      *
+        //      * We do this in an outer loop, because calling decStrong()
+        //      * may result in something being added to mPendingWeakDerefs,
+        //      * which could be delayed until the next incoming command
+        //      * from the driver if we don't process it now.
+        //      */
+            while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
+                for raw_pointer in self.pending_weak_derefs.drain(..) {
+                    let weak = raw_pointer_to_weak_binder(raw_pointer);
+                    weak.decrease();
+                }
+
+                for raw_pointer in self.pending_strong_derefs.drain(..) {
+                    let strong = raw_pointer_to_strong_binder(raw_pointer);
+                    strong.decrease();
+                }
+            }
         }
     }
 
@@ -194,74 +226,57 @@ impl ThreadState {
         }
     }
 
-// status_t IPCThreadState::writeTransactionData(int32_t cmd, uint32_t binderFlags,
-//     int32_t handle, uint32_t code, const Parcel& data, status_t* statusBuffer)
-// {
-//     binder_transaction_data tr;
-
-//     tr.target.ptr = 0; /* Don't pass uninitialized stack data to a remote process */
-//     tr.target.handle = handle;
-//     tr.code = code;
-//     tr.flags = binderFlags;
-//     tr.cookie = 0;
-//     tr.sender_pid = 0;
-//     tr.sender_euid = 0;
-
-//     const status_t err = data.errorCheck();
-//     if (err == NO_ERROR) {
-//         tr.data_size = data.ipcDataSize();
-//         tr.data.ptr.buffer = data.ipcData();
-//         tr.offsets_size = data.ipcObjectsCount()*sizeof(binder_size_t);
-//         tr.data.ptr.offsets = data.ipcObjects();
-//     } else if (statusBuffer) {
-//         tr.flags |= TF_STATUS_CODE;
-//         *statusBuffer = err;
-//         tr.data_size = sizeof(status_t);
-//         tr.data.ptr.buffer = reinterpret_cast<uintptr_t>(statusBuffer);
-//         tr.offsets_size = 0;
-//         tr.data.ptr.offsets = 0;
-//     } else {
-//         return (mLastError = err);
-//     }
-
-//     mOut.writeInt32(cmd);
-//     mOut.write(&tr, sizeof(tr));
-
-//     return NO_ERROR;
-// }
-
-    fn write_transaction_data(&mut self, cmd: u32, flags: u32, handle: u32, code: u32, data: &Parcel) -> Result<()> {
+    fn write_transaction_data(&mut self, cmd: u32, mut flags: u32, handle: u32, code: u32, data: &Parcel, status: &i32) -> Result<()> {
+        log::trace!("write_transaction_data: {} {flags:X} {handle} {code}\n{:?}", command_to_str(cmd), data);
         // ptr is initialized by zero because ptr(64) and handle(32) size is different.
         let mut target = binder_transaction_data__bindgen_ty_1 {
             ptr: 0,
         };
         target.handle = handle;
 
-        let tr = binder_transaction_data {
-            target,
-            cookie: 0 ,
-            code,
-            flags,
-            sender_pid: 0,
-            sender_euid: 0,
-            data_size: data.len() as _,
-            offsets_size: (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _,
-            data: binder_transaction_data__bindgen_ty_2 {
-                ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
-                    buffer: data.as_ptr() as _,
-                    offsets: data.objects.as_ptr() as _,
-                },
-                // buf: ,  // [__u8; 8usize],
+        // let all_flags: u32 = FLAG_PRIVATE_VENDOR | FLAG_CLEAR_BUF | FLAG_ONEWAY;
+        // if (flags & !all_flags) != 0 {
+        //     log::error!("Unrecognized flags sent: {:X}", flags);
+        // }
+        let tr = if *status == StatusCode::Ok.into() {
+            binder_transaction_data {
+                target,
+                cookie: 0,
+                code,
+                flags,
+                sender_pid: 0,
+                sender_euid: 0,
+                data_size: data.data_size() as _,
+                offsets_size: (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _,
+                data: binder_transaction_data__bindgen_ty_2 {
+                    ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
+                        buffer: data.as_ptr() as _,
+                        offsets: data.objects.as_ptr() as _,
+                    },
+                }
+            }
+        } else {
+            flags |= binder::transaction_flags_TF_STATUS_CODE;
+            binder_transaction_data {
+                target,
+                cookie: 0,
+                code,
+                flags,
+                sender_pid: 0,
+                sender_euid: 0,
+                data_size: std::mem::size_of::<i32>() as _,
+                offsets_size: 0,
+                data: binder_transaction_data__bindgen_ty_2 {
+                    ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
+                        buffer: status as *const i32 as _,
+                        offsets: 0,
+                    },
+                }
             }
         };
 
         self.out_parcel.write::<u32>(&cmd)?;
-        unsafe {
-            let ptr = &tr as *const binder_transaction_data;
-            self.out_parcel.write_data(
-                std::slice::from_raw_parts(ptr as _, std::mem::size_of::<binder_transaction_data>())
-            );
-        }
+        self.out_parcel.write_aligned(&tr);
 
         Ok(())
     }
@@ -297,21 +312,22 @@ pub(crate) fn calling_work_source_uid() -> binder::uid_t {
     })
 }
 
-pub fn setup_polling() -> Result<std::os::unix::io::RawFd> {
+
+pub fn setup_polling() -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
     flash_commands()?;
-    Ok(ProcessState::as_self().as_raw_fd())
+    Ok(())
 }
 
 enum UntilResponse {
     Reply,
     TransactionComplete,
-    AcquireResult(StatusCode),
+    AcquireResult,
 }
 
-fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
+fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     THREAD_STATE.with(|thread_state| -> Result<Option<Parcel>> {
         loop {
             talk_with_driver(true)?;
@@ -343,54 +359,54 @@ fn wait_for_response(until: &mut UntilResponse) -> Result<Option<Parcel>> {
                 },
                 binder::BR_ACQUIRE_RESULT => {
                     let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
-                    if let UntilResponse::AcquireResult(exception) = until {
-                        *exception = if result != 0 {
-                            StatusCode::Ok
+                    if let UntilResponse::AcquireResult = until {
+                        let res = if result != 0 {
+                            Ok(None)
                         } else {
-                            StatusCode::InvalidOperation
+                            Err(StatusCode::InvalidOperation)
                         };
-                        break
+                        return res;
+                    } else if cfg!(debug_assertions) {
+                        panic!("Unexpected BR_ACQUIRE_RESULT");
                     }
                 },
                 binder::BR_REPLY => {
                     let tr = thread_state.borrow_mut().in_parcel.read::<binder::binder_transaction_data>()?;
+                    let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
 
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
-                            let reply = unsafe {
-                                Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
-                                    tr.data.ptr.offsets as _,
-                                    (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
-                                    free_buffer)
-                            };
+                            let reply = Parcel::from_ipc_parts(buffer as _, tr.data_size as _,
+                                offsets as _,
+                                (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
+                                free_buffer);
 
                             return Ok(Some(reply));
                         } else {
-                            unsafe {
-                                let status: StatusCode = (*(tr.data.ptr.buffer as *const i32)).into();
-                                free_buffer(None,
-                                    tr.data.ptr.buffer,
-                                    tr.data_size as _,
-                                    tr.data.ptr.offsets,
-                                    (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
+                            let status: StatusCode = unsafe { (*(buffer as *const i32)).into() };
+                            log::trace!("binder::BR_REPLY ({})", status);
+                            free_buffer(None,
+                                buffer,
+                                tr.data_size as _,
+                                offsets,
+                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
 
-                                if status != StatusCode::Ok {
-                                    log::warn!("binder::BR_REPLY ({})", status);
-                                    return Err(status)
-                                }
-                            };
+                            if status != StatusCode::Ok {
+                                log::warn!("binder::BR_REPLY ({})", status);
+                                return Err(status)
+                            }
                         }
                     } else {
-                        unsafe {
-                            free_buffer(None,
-                                tr.data.ptr.buffer,
-                                tr.data_size as _,
-                                tr.data.ptr.offsets,
-                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
-                        }
+                        free_buffer(None,
+                            buffer,
+                            tr.data_size as _,
+                            offsets,
+                            (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
                     }
                 },
-                _ => execute_command(cmd as _)?,
+                _ => {
+                    execute_command(cmd as _)?;
+                }
             };
         };
         Ok(None)
@@ -449,38 +465,50 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 let mut reply = Parcel::new();
 
-                unsafe {
+                let result = unsafe {
                     let target_ptr = tr_secctx.transaction_data.target.ptr;
+                    // reader.set_data_position(0);
                     if target_ptr != 0 {
-                        todo!("need to call BBinder->transact()")
-                        // let weak_ref: *mut ref_base::WeakRef = target_ptr as _;
-                        // let mut ref_base = ref_base::RefBase::<ref_base::RemoteRef>::from_raw(target_ptr as _);
-                        // if ref_base.attempt_inc_strong() {
-                        //     todo!("need to call BBinder->transact()")
-                        // }
-                //     if (reinterpret_cast<RefBase::weakref_type*>(
-                //             tr.target.ptr)->attemptIncStrong(this)) {
-                //         error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
-                //                 &reply, tr.flags);
-                //         reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
-                //     } else {
-                //         error = UNKNOWN_TRANSACTION;
-                //     }
+                        let weak = raw_pointer_to_weak_binder(target_ptr);
+                        let strong = weak.upgrade();
+                        if strong.attempt_increase() {
+                            let binder = raw_pointer_to_strong_binder(tr_secctx.transaction_data.cookie);
+                            let result = binder.as_transactable().expect("Transactable is None.")
+                                .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
+                            strong.decrease();
 
-                    } else {
-                        let context = ProcessState::as_self().context_manager();
-                        if let Some(context) = context {
-                            reader.set_data_position(0);
-                            context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)?;
+                            result
+                        } else {
+                            log::warn!("Failed StrongBinder::attempt_increase.");
+                            Err(StatusCode::UnknownTransaction)
                         }
+                    } else {
+                        let context = ProcessState::as_self().context_manager().expect("Transactable is None.");
+                        context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
                     }
-                }
+                };
                 let flags = tr_secctx.transaction_data.flags;
                 if (flags & transaction_flags_TF_ONE_WAY) == 0 {
                     let flags = flags & transaction_flags_TF_CLEAR_BUF;
-                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply)?;
-                    reply.set_len(0);
-                    wait_for_response(&mut UntilResponse::TransactionComplete)?;
+                    let status: i32 = match result {
+                        Ok(_) => StatusCode::Ok.into(),
+                        Err(err) => err.into(),
+                    };
+                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply, &status)?;
+                    // reply.set_data_size(0);
+                    wait_for_response(UntilResponse::TransactionComplete)?;
+                } else if let Err(err) = result {
+                    let mut log = format!(
+                        "oneway function results for code {} on binder at {:X}",
+                        tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
+                    log += &format!(" will be dropped but finished with status {}", err);
+
+                    if reply.data_size() != 0 {
+                        log += &format!(" and reply parcel size {}", reply.data_size());
+                    }
+                    log::error!("{}", log);
+                } else {
+                    unreachable!();
                 }
 
                 thread_state.borrow_mut().transaction = transaction_old;
@@ -499,53 +527,41 @@ fn execute_command(cmd: i32) -> Result<()> {
                 todo!("execute_command - BR_TRANSACTION_COMPLETE");
             }
             binder::BR_INCREFS => {
-                todo!("execute_command - BR_INCREFS");
-        // refs = (RefBase::weakref_type*)mIn.readPointer();
-        // obj = (BBinder*)mIn.readPointer();
-        // refs->incWeak(mProcess.get());
-        // mOut.writeInt32(BC_INCREFS_DONE);
-        // mOut.writePointer((uintptr_t)refs);
-        // mOut.writePointer((uintptr_t)obj);
+                let mut state = thread_state.borrow_mut();
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
+                let weak = ManuallyDrop::into_inner(raw_pointer_to_weak_binder(refs));
+                weak.increase();
+
+                state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&(Box::into_raw(weak) as _))?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&obj)?;
             }
             binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let raw_pointer = {
-                    state.in_parcel.read::<*const dyn IBinder>()?
-                };
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                let strong: Arc<dyn IBinder> = unsafe { Arc::from_raw(raw_pointer) };
+                let strong = ManuallyDrop::into_inner(raw_pointer_to_strong_binder(obj));
+                strong.increase();
 
-                {
-                    state.out_parcel.write::<i32>(&(binder::BC_ACQUIRE_DONE as i32))?;
-                    state.out_parcel.write::<*const dyn IBinder>(&Arc::into_raw(strong))?;
-                }
+                state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&(Box::into_raw(strong) as _))?;
             }
             binder::BR_RELEASE => {
-                todo!("execute_command - BR_RELEASE");
-        // refs = (RefBase::weakref_type*)mIn.readPointer();
-        // obj = (BBinder*)mIn.readPointer();
-        // ALOG_ASSERT(refs->refBase() == obj,
-        //            "BR_RELEASE: object %p does not match cookie %p (expected %p)",
-        //            refs, obj, refs->refBase());
-        // IF_LOG_REMOTEREFS() {
-        //     LOG_REMOTEREFS("BR_RELEASE from driver on %p", obj);
-        //     obj->printRefs();
-        // }
-        // mPendingStrongDerefs.push(obj);
+                let mut state = thread_state.borrow_mut();
+                let _refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
+                state.pending_strong_derefs.push(obj);
             }
             binder::BR_DECREFS => {
-                todo!("execute_command - BR_DECREFS");
-        // refs = (RefBase::weakref_type*)mIn.readPointer();
-        // obj = (BBinder*)mIn.readPointer();
-        // // NOTE: This assertion is not valid, because the object may no
-        // // longer exist (thus the (BBinder*)cast above resulting in a different
-        // // memory address).
-        // //ALOG_ASSERT(refs->refBase() == obj,
-        // //           "BR_DECREFS: object %p does not match cookie %p (expected %p)",
-        // //           refs, obj, refs->refBase());
-        // mPendingWeakDerefs.push(refs);
+                let mut state = thread_state.borrow_mut();
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                state.pending_weak_derefs.push(refs);
             }
             binder::BR_ATTEMPT_ACQUIRE => {
                 todo!("execute_command - BR_ATTEMPT_ACQUIRE");
@@ -567,7 +583,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 todo!("execute_command - BR_SPAWN_LOOPER");
             }
             binder::BR_FINISHED => {
-                todo!("execute_command - BR_FINISHED");
+                return Err(StatusCode::TimedOut);
             }
             binder::BR_DEAD_BINDER => {
                 todo!("Bexecute_command - R_DEAD_BINDER");
@@ -584,7 +600,10 @@ fn execute_command(cmd: i32) -> Result<()> {
             binder::BR_ONEWAY_SPAM_SUSPECT => {
                 todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
             }
-            _ => {}
+            _ => {
+                log::error!("*** BAD COMMAND {} received from Binder driver\n", cmd);
+                return Err(StatusCode::Unknown);
+            }
         };
 
         Ok(())
@@ -593,17 +612,14 @@ fn execute_command(cmd: i32) -> Result<()> {
 
 
 fn talk_with_driver(do_receive: bool) -> Result<()> {
-    let driver_fd = ProcessState::as_self().as_raw_fd();
-    if driver_fd < 0 {
-        return Err(StatusCode::BadFd);
-    }
+    let driver = ProcessState::as_self().driver();
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut bwr = {
             let mut thread_state = thread_state.borrow_mut();
             let need_read = thread_state.in_parcel.is_empty();
             let out_avail = if !do_receive || need_read {
-                thread_state.out_parcel.len()
+                thread_state.out_parcel.data_size()
             } else {
                 0
             };
@@ -613,6 +629,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             } else {
                 0
             };
+
             binder::binder_write_read {
                 write_size: out_avail as _,
                 write_consumed: 0,
@@ -635,12 +652,12 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
         unsafe {
             loop {
-                let res = binder::write_read(driver_fd, &mut bwr);
+                let res = binder::write_read(driver.as_raw_fd(), &mut bwr);
                 match res {
                     Ok(_) => break,
                     Err(errno) if errno != nix::errno::Errno::EINTR => {
                         log::error!("binder::write_read() error : {}", errno);
-                        return Err(StatusCode::InvalidOperation);
+                        return Err(StatusCode::Errno(-(errno as i32)));
                     },
                     _ => {}
                 }
@@ -648,21 +665,24 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             }
         }
 
+        log::trace!("err: {:?}, write consumed: {} of {}, read consumed: {}",
+            nix::errno::Errno::last(), bwr.write_consumed, bwr.write_size, bwr.read_consumed);
+
         {
             let mut thread_state = thread_state.borrow_mut();
 
             if bwr.write_consumed > 0 {
-                if bwr.write_consumed < thread_state.out_parcel.len() as _ {
+                if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
                     panic!("Driver did not consume write buffer. consumed: {} of {}",
-                        bwr.write_consumed, thread_state.out_parcel.len());
+                        bwr.write_consumed, thread_state.out_parcel.data_size());
                 } else {
-                    thread_state.out_parcel.set_len(0);
+                    thread_state.out_parcel.set_data_size(0);
                     thread_state.process_post_write_derefs();
                 }
             }
 
             if bwr.read_consumed > 0 {
-                thread_state.in_parcel.set_len(bwr.read_consumed as _);
+                thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
 
                 log::trace!("Received commands to driver:\n{:?}", thread_state.in_parcel);
@@ -688,13 +708,11 @@ fn flash_commands() -> Result<()> {
     talk_with_driver(false)?;
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        let out_len = thread_state.borrow().out_parcel.len();
-        if out_len > 0 {
+        if thread_state.borrow().out_parcel.data_size() > 0 {
             talk_with_driver(false)?;
         }
 
-        let out_len = thread_state.borrow().out_parcel.len();
-        if out_len > 0 {
+        if thread_state.borrow().out_parcel.data_size() > 0 {
             log::warn!("self.out_parcel.len() > 0 after flash_commands()");
         }
 
@@ -702,8 +720,20 @@ fn flash_commands() -> Result<()> {
     })
 }
 
+pub fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
+    log::trace!("attempt_inc_strong_handle: {handle}");
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let mut state = thread_state.borrow_mut();
+
+        state.out_parcel.write::<u32>(&(binder::BC_ATTEMPT_ACQUIRE))?;
+        state.out_parcel.write::<u32>(&0)?;     // xxx was thread priority.
+        state.out_parcel.write::<u32>(&(handle))
+    })?;
+    wait_for_response(UntilResponse::AcquireResult).map(|_| ())
+}
 
 pub fn inc_strong_handle(handle: u32, proxy: StrongIBinder) -> Result<()> {
+    log::trace!("inc_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
@@ -721,6 +751,7 @@ pub fn inc_strong_handle(handle: u32, proxy: StrongIBinder) -> Result<()> {
 }
 
 pub fn dec_strong_handle(handle: u32) -> Result<()> {
+    log::trace!("dec_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
@@ -736,6 +767,7 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
 }
 
 pub fn inc_weak_handle(handle: u32, weak: WeakIBinder) -> Result<()>{
+    log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
@@ -754,6 +786,7 @@ pub fn inc_weak_handle(handle: u32, weak: WeakIBinder) -> Result<()>{
 }
 
 pub fn dec_weak_handle(handle: u32) -> Result<()> {
+    log::trace!("dec_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
@@ -799,7 +832,7 @@ pub fn handle_commands() -> Result<()> {
     Ok(())
 }
 
-pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<bool> {
+pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     let mut strict_policy: i32 = reader.read()?;
 
     let header = THREAD_STATE.with(|thread_state| -> Result<u32> {
@@ -822,12 +855,11 @@ pub fn check_interface<T: Remotable>(reader: &mut Parcel) -> Result<bool> {
         return Ok(false);
     }
 
-
     let parcel_interface: String = reader.read()?;
-    if parcel_interface.eq(T::get_descriptor()) {
+    if parcel_interface.eq(descriptor) {
         Ok(true)
     } else {
-        log::error!("check_interface() expected '{}' but read '{}'", T::get_descriptor(), parcel_interface);
+        log::error!("check_interface() expected '{}' but read '{}'", descriptor, parcel_interface);
         Ok(false)
     }
 }
@@ -839,7 +871,7 @@ pub fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result
 
     let call_restriction = THREAD_STATE.with(|thread_state| -> Result<CallRestriction> {
         let mut thread_state = thread_state.borrow_mut();
-        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data)?;
+        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data, &0)?;
         Ok(thread_state.call_restriction)
     })?;
 
@@ -854,9 +886,9 @@ pub fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result
             _ => (),
         }
 
-        reply = wait_for_response(&mut UntilResponse::Reply)?
+        reply = wait_for_response(UntilResponse::Reply)?
     } else {
-        wait_for_response(&mut UntilResponse::TransactionComplete)?;
+        wait_for_response(UntilResponse::TransactionComplete)?;
     }
 
     Ok(reply)
@@ -892,6 +924,61 @@ pub(crate) fn ping_binder(handle: u32) -> Result<()> {
     let data = Parcel::new();
     let _reply = transact(handle, PING_TRANSACTION, &data, 0)?;
     Ok(())
+}
+
+pub fn join_thread_pool(is_main: bool) -> Result<()> {
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        log::debug!("**** THREAD {:?} (PID {}) IS JOINING THE THREAD POOL",
+            std::thread::current().id(), std::process::id());
+
+        ProcessState::as_self().current_threads.fetch_add(1, Ordering::SeqCst);
+
+        let looper = if is_main {
+            binder::BC_ENTER_LOOPER
+        } else {
+            binder::BC_REGISTER_LOOPER
+        };
+
+        {
+            let mut thread_state = thread_state.borrow_mut();
+            thread_state.out_parcel.write::<u32>(&looper)?;
+            thread_state.is_looper = true;
+        }
+
+        let result;
+
+        loop {
+            thread_state.borrow_mut().process_pending_derefs();
+            if let Err(e) = get_and_execute_command() {
+                match e {
+                    StatusCode::TimedOut if !is_main => {
+                        result = e;
+                        break
+                    }
+                    StatusCode::Errno(errno) if errno == -libc::ECONNREFUSED => {
+                        result = e;
+                        break;
+                    }
+                    _ => {
+                        panic!("get_and_execute_command() returned unexpected error {}, aborting", e);
+                    }
+                }
+            }
+        }
+        log::debug!("**** THREAD {:?} (PID {}) IS LEAVING THE THREAD POOL err={}\n",
+            std::thread::current().id(), std::process::id(), result);
+
+        {
+            let mut thread_state = thread_state.borrow_mut();
+
+            thread_state.out_parcel.write::<u32>(&binder::BC_EXIT_LOOPER)?;
+            thread_state.is_looper = false;
+        }
+
+        talk_with_driver(false)?;
+        ProcessState::as_self().current_threads.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    })
 }
 
 

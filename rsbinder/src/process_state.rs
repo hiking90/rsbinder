@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd};
 use std::sync::{RwLock};
-
+use std::thread;
 
 use crate::{
     error::*,
@@ -32,17 +32,27 @@ pub enum CallRestriction {
 const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
+struct MemoryMap {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+}
+unsafe impl Sync for MemoryMap {}
+unsafe impl Send for MemoryMap {}
+
 pub struct ProcessState {
-    driver: File,
-    mmap: RwLock<(*mut std::ffi::c_void, usize)>,
+    max_threads: u32,
+    driver_name: PathBuf,
+    driver: Arc<File>,
+    mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<Arc<dyn Transactable>>>,
     handle_to_object: RwLock<HashMap<u32, WeakIBinder>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
+    thread_pool_started: AtomicBool,
+    thread_pool_seq: AtomicUsize,
+    kernel_started_threads: AtomicUsize,
+    pub(crate) current_threads: AtomicUsize,
 }
-
-unsafe impl Sync for ProcessState {}
-unsafe impl Send for ProcessState {}
 
 impl ProcessState {
     fn instance() -> &'static OnceLock<ProcessState> {
@@ -63,14 +73,16 @@ impl ProcessState {
         *self.call_restriction.read().unwrap()
     }
 
-    pub fn init(driver_name: &str, max_threads: u32) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn inner_init(driver_name: &str, max_threads: u32) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
         let max_threads = if max_threads < DEFAULT_MAX_BINDER_THREADS {
             max_threads
         } else {
             DEFAULT_MAX_BINDER_THREADS
         };
 
-        let driver = open_driver(Path::new(driver_name), max_threads)?;
+        let driver_name = PathBuf::from(driver_name);
+
+        let driver = open_driver(&driver_name, max_threads)?;
 
         let vm_size = ((1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
 
@@ -81,24 +93,37 @@ impl ProcessState {
                 libc::MAP_PRIVATE | libc::MAP_NORESERVE, driver.as_raw_fd(), 0);
 
             if vm_start == libc::MAP_FAILED {
-                return Err(format!("{} mmap is failed!", driver_name).into());
+                return Err(format!("{:?} mmap is failed!", driver_name).into());
             }
 
             (vm_start, vm_size)
         };
 
-        let this = ProcessState {
-            driver,
-            mmap: RwLock::new(mmap),
+        Ok(ProcessState {
+            max_threads,
+            driver_name,
+            driver: driver.into(),
+            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1 }),
             context_manager: RwLock::new(None),
             handle_to_object: RwLock::new(HashMap::new()),
             disable_background_scheduling: AtomicBool::new(false),
             call_restriction: RwLock::new(CallRestriction::None),
-        };
+            thread_pool_started: AtomicBool::new(false),
+            thread_pool_seq: AtomicUsize::new(1),
+            kernel_started_threads: AtomicUsize::new(0),
+            current_threads: AtomicUsize::new(0),
+        })
+    }
 
-        Self::instance().set(this).map_err(|_| "ProcessState::init() is failed due to OnceLock::set() error!")?;
-
-        Ok(())
+    pub fn init(driver_name: &str, max_threads: u32) -> &'static ProcessState {
+        Self::instance().get_or_init(|| {
+            match Self::inner_init(driver_name, max_threads) {
+                Ok(instance) => instance,
+                Err(e) => {
+                    panic!("Error in init(): {}", e);
+                }
+            }
+        })
     }
 
     pub fn become_context_manager(&self, transactable: Arc<dyn Transactable>) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -147,19 +172,63 @@ impl ProcessState {
 
         let interface = thread_state::query_interface(handle)?;
 
-        let weak = WeakIBinder::new(ProxyHandle::new(handle, interface));
+        let weak = WeakIBinder::new(ProxyHandle::new(handle, &interface), &interface);
 
         self.handle_to_object.write().unwrap().insert(handle, weak.clone());
 
         Ok(weak.upgrade())
     }
 
-    pub fn disable_background_scheduling(& self, disable: bool) {
+    pub fn disable_background_scheduling(&self, disable: bool) {
         self.disable_background_scheduling.store(disable, Ordering::Relaxed);
     }
 
     pub fn background_scheduling_disabled(&self) -> bool {
         self.disable_background_scheduling.load(Ordering::Relaxed)
+    }
+
+    pub fn driver(&self) -> Arc<File> {
+        self.driver.clone()
+    }
+
+    pub fn start_thread_pool(&self) {
+        if self.thread_pool_started.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if self.max_threads == 0 {
+                log::warn!("Extra binder thread started, but 0 threads requested.\nDo not use *start_thread_pool when zero threads are requested.");
+            }
+            self.spawn_pooled_thread(true);
+        }
+    }
+
+    fn make_binder_thread_name(&self) -> String {
+        let seq = self.thread_pool_seq.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let driver_name = self.driver_name.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_owned())
+            .unwrap_or("BINDER".to_owned());
+        format!("{}:{}_{:X}", driver_name, pid, seq)
+    }
+
+    pub(crate) fn spawn_pooled_thread(&self, is_main: bool) {
+        if self.thread_pool_started.load(Ordering::Relaxed) {
+            let name = self.make_binder_thread_name();
+            log::info!("Spawning new pooled thread, name={}", name);
+            let _ = thread::Builder::new().name(name).spawn(move || {
+                thread_state::join_thread_pool(is_main)
+            });
+
+            self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
+        }
+        // TODO: if startThreadPool is called on another thread after the process
+        // starts up, the kernel might think that it already requested those
+        // binder threads, and additional won't be started. This is likely to
+        // cause deadlocks, and it will also cause getThreadPoolMaxTotalThreadCount
+        // to return too high of a value.
+    }
+
+    pub fn join_thread_pool() -> Result<()> {
+        thread_state::join_thread_pool(true)
     }
 }
 
@@ -193,18 +262,11 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
     Ok(fd)
 }
 
-impl AsRawFd for ProcessState {
-    fn as_raw_fd(&self) -> RawFd {
-        self.driver.as_raw_fd()
-    }
-}
-
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        unsafe {
-            let mut mmap = self.mmap.write().unwrap();
-            libc::munmap(mmap.0, mmap.1);
-            mmap.0 = std::ptr::null_mut();
-        }
+        let mut mmap = self.mmap.write().unwrap();
+        unsafe { libc::munmap(mmap.ptr, mmap.size); }
+        mmap.ptr = std::ptr::null_mut();
+        mmap.size = 0;
     }
 }

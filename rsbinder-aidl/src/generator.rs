@@ -234,9 +234,45 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
+    impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
+        {%- for member in fn_members %}
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
+            self.0.{{ member.identifier }}({{ member.build_params }})
+        }
+        {%- endfor %}
+    }
     fn on_transact(
-        _service: &dyn {{ name }}, _code: rsbinder::TransactionCode,) -> rsbinder::Result<()> {
-        Ok(())
+        _service: &dyn {{ name }}, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
+        match _code {
+        {%- for member in fn_members %}
+            transactions::{{ member.identifier }} => {
+                if rsbinder::thread_state::check_interface(_reader, _descriptor)? == false {
+                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
+                    return Ok(());
+                }
+            {%- for arg in member.transaction_args %}
+                {{ arg }}
+            {%- endfor %}
+                let _aidl_return = _service.{{ member.identifier }}({{ member.transaction_params }});
+            {%- if member.transaction_has_return %}
+                match &_aidl_return {
+                    Ok(_aidl_return) => {
+                        _reply.write(&rsbinder::StatusCode::Ok)?;
+                        _reply.write(_aidl_return)?;
+                        {%- for arg in member.transaction_write %}
+                        _reply.write(&{{ arg }})?;
+                        {%- endfor %}
+                    }
+                    Err(_aidl_status) => {
+                        _reply.write(_aidl_status)?;
+                    }
+                }
+            {%- endif %}
+                Ok(())
+            }
+        {%- endfor %}
+            _ => Err(rsbinder::StatusCode::UnknownTransaction),
+        }
     }
     {%- if nested|length>0 %}
     {{nested}}
@@ -263,6 +299,10 @@ struct FnMembers {
     write_params: Vec<String>,
     build_params: String,
     read_params: String,
+    transaction_args: Vec<String>,
+    transaction_write: Vec<String>,
+    transaction_params: String,
+    transaction_has_return: bool,
     oneway: bool,
 }
 
@@ -271,6 +311,9 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     let mut read_params = String::new();
     let mut args = "&self".to_string();
     let mut write_params = Vec::new();
+    let mut transaction_args = Vec::new();
+    let mut transaction_write = Vec::new();
+    let mut transaction_params = String::new();
     let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
     method.arg_list.iter().for_each(|arg| {
@@ -299,16 +342,56 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         }
 
         read_params += &format!("{}, ", arg_str.0);
+
+        // prepare data set of on_transact
+        let (is_default, is_mutable) = match arg.direction {
+            Direction::Out => (true, true),
+            Direction::Inout => (false, true),
+            _ => (false, false),
+        };
+
+        let right_str = if is_default {
+            "Default::default()"
+        } else {
+            "_reader.read()?"
+        };
+
+        let mutable_str = if is_mutable {
+            "mut "
+        } else {
+            ""
+        };
+
+        transaction_args.push(format!("let {mutable_str}{}: {} = {right_str};", arg_str.0, arg_str.3));
+        if is_mutable {
+            transaction_write.push(arg_str.0.to_owned());
+        }
+
+        let param = if is_mutable {
+            format!("&{mutable_str}{}", arg_str.0)
+        } else if arg_str.3.starts_with("Option<") {
+            format!("{}.as_ref()", arg_str.0)
+        } else if arg_str.3.starts_with("String") {
+            format!("{}.as_str()", arg_str.0)
+        } else if arg.r#type.type_cast().is_primitive {
+            arg_str.0.to_owned()
+        } else {
+            format!("&{}", arg_str.0)
+        };
+
+        transaction_params += &format!("{param}, ");
     });
 
     let mut type_cast = method.r#type.type_cast();
     type_cast.set_fn_nullable(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0);
     let return_type = type_cast.return_type();
+    let transaction_has_return = return_type != "()";
 
     Ok(FnMembers{
         // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
         args, return_type, write_params, build_params, read_params,
+        transaction_args, transaction_write, transaction_params, transaction_has_return,
         oneway: method.oneway
     })
 }

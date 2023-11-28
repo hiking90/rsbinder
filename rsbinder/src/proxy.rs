@@ -15,13 +15,15 @@ use crate::{
 pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
+    stability: Stability,
 }
 
 impl ProxyHandle {
-    pub fn new(handle: u32, interface: String) -> Box<Self> {
+    pub fn new(handle: u32, interface: &str) -> Box<Self> {
         Box::new(Self {
             handle,
-            descriptor: interface,
+            descriptor: interface.to_owned(),
+            stability: Default::default(),
         })
     }
 
@@ -69,8 +71,8 @@ impl IBinder for ProxyHandle {
         self
     }
 
-    fn is_remote(&self) -> bool {
-        true
+    fn as_transactable(&self) -> Option<&dyn Transactable> {
+        None
     }
 }
 

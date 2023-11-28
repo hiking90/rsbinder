@@ -8,9 +8,10 @@ pub type Result<T> = std::result::Result<T, StatusCode>;
 
 const UNKNOWN_ERROR: i32 = -2147483647-1;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Default, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum StatusCode {
+    #[default]
     Ok,
     Unknown,
     NoMemory,
@@ -31,6 +32,7 @@ pub enum StatusCode {
     WouldBlock,
     TimedOut,
     BadFd,
+    Errno(i32),
     ServiceSpecific(i32),
 }
 
@@ -59,6 +61,7 @@ impl fmt::Display for StatusCode {
             StatusCode::WouldBlock => write!(f, "WouldBlock"),
             StatusCode::TimedOut => write!(f, "TimedOut"),
             StatusCode::BadFd => write!(f, "BadFd"),
+            StatusCode::Errno(errno) => write!(f, "Errno({errno})"),
             StatusCode::ServiceSpecific(v) => write!(f, "ServiceSpecific({v})"),
         }
     }
@@ -88,6 +91,7 @@ impl From<StatusCode> for i32 {
             StatusCode::TimedOut => -libc::ETIMEDOUT as _,
             StatusCode::BadFd => -libc::EBADF as _,
             StatusCode::ServiceSpecific(v) => v,
+            StatusCode::Errno(errno) => errno,
         }
     }
 }
@@ -116,13 +120,14 @@ impl From<i32> for StatusCode {
             code if code == StatusCode::WouldBlock.into() => StatusCode::WouldBlock,
             code if code == StatusCode::TimedOut.into() => StatusCode::TimedOut,
             code if code == StatusCode::BadFd.into() => StatusCode::BadFd,
+            code if code < 0 => StatusCode::Errno(code),
             _ => StatusCode::ServiceSpecific(code),
         }
     }
 }
 
 impl From<std::array::TryFromSliceError> for StatusCode {
-    fn from(code: std::array::TryFromSliceError) -> Self {
+    fn from(_: std::array::TryFromSliceError) -> Self {
         StatusCode::NotEnoughData
     }
 }
