@@ -172,7 +172,7 @@ pub mod {{mod}} {
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+            Err(rsbinder::StatusCode::UnknownTransaction)
         }
         {%- endfor %}
     }
@@ -228,16 +228,20 @@ pub mod {{mod}} {
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
-            let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.build_params }})?;
+            let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
             let _aidl_reply = self.handle.submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
-            self.read_response_{{ member.identifier }}({{ member.read_params }}_aidl_reply)
+            {%- if member.func_call_params|length > 0 %}
+            self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
+            {%- else %}
+            self.read_response_{{ member.identifier }}(_aidl_reply)
+            {%- endif %}
         }
         {%- endfor %}
     }
     impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
-            self.0.{{ member.identifier }}({{ member.build_params }})
+            self.0.{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
     }
@@ -246,12 +250,12 @@ pub mod {{mod}} {
         match _code {
         {%- for member in fn_members %}
             transactions::{{ member.identifier }} => {
-                if rsbinder::thread_state::check_interface(_reader, _descriptor)? == false {
+                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
                     _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
                     return Ok(());
                 }
-            {%- for arg in member.transaction_args %}
-                {{ arg }}
+            {%- for decl in member.transaction_decls %}
+                let {{ decl }};
             {%- endfor %}
                 let _aidl_return = _service.{{ member.identifier }}({{ member.transaction_params }});
             {%- if member.transaction_has_return %}
@@ -297,9 +301,8 @@ struct FnMembers {
     args: String,
     return_type: String,
     write_params: Vec<String>,
-    build_params: String,
-    read_params: String,
-    transaction_args: Vec<String>,
+    func_call_params: String,
+    transaction_decls: Vec<String>,
     transaction_write: Vec<String>,
     transaction_params: String,
     transaction_has_return: bool,
@@ -307,91 +310,60 @@ struct FnMembers {
 }
 
 fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
-    let mut build_params = String::new();
-    let mut read_params = String::new();
+    let mut func_call_params = String::new();
     let mut args = "&self".to_string();
     let mut write_params = Vec::new();
-    let mut transaction_args = Vec::new();
+    let mut transaction_decls = Vec::new();
     let mut transaction_write = Vec::new();
     let mut transaction_params = String::new();
-    let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
+    // let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
     method.arg_list.iter().for_each(|arg| {
-        let arg_str = arg.to_string(is_nullable);
-        args += &format!(", {}", arg_str.1);
+        let generator = arg.to_generator();
 
-        if arg_str.2.starts_with("&mut") || arg_str.2.starts_with('&') {
-            build_params += &format!("{}, ", arg_str.0);
-            write_params.push(arg_str.0.to_string())
-        } else if arg_str.2.starts_with("Option<&") {
-            build_params += &format!("{}, ", arg_str.0);
-            write_params.push(format!("&{}", arg_str.0))
-        } else if arg_str.2.starts_with("Option<") {
-            build_params += &format!("{}.as_ref(), ", arg_str.0);
-            write_params.push(format!("&{}", arg_str.0))
-        } else if arg_str.2.starts_with("std::sync::Arc<") || arg_str.2.starts_with("Vec<"){
-            if arg.is_mutable() {
-                build_params += &format!("&mut {}, ", arg_str.0);
-            } else {
-                build_params += &format!("&{}, ", arg_str.0);
-            }
-            write_params.push(format!("&{}", arg_str.0))
+        let type_decl_for_func = generator.type_decl_for_func();
+        args += &format!(", {}: {}", generator.identifier, type_decl_for_func);
+        func_call_params += &format!("{}, ", generator.identifier);
+        if type_decl_for_func.starts_with('&') {
+            write_params.push(generator.identifier.to_owned());
         } else {
-            build_params += &format!("{}, ", arg_str.0);
-            write_params.push(format!("&{}", arg_str.0))
+            write_params.push(format!("&{}", generator.identifier));
         }
 
-        read_params += &format!("{}, ", arg_str.0);
+        transaction_decls.push(generator.transaction_decl("_reader"));
 
-        // prepare data set of on_transact
-        let (is_default, is_mutable) = match arg.direction {
-            Direction::Out => (true, true),
-            Direction::Inout => (false, true),
-            _ => (false, false),
-        };
-
-        let right_str = if is_default {
-            "Default::default()"
-        } else {
-            "_reader.read()?"
-        };
-
-        let mutable_str = if is_mutable {
-            "mut "
-        } else {
-            ""
-        };
-
-        transaction_args.push(format!("let {mutable_str}{}: {} = {right_str};", arg_str.0, arg_str.3));
-        if is_mutable {
-            transaction_write.push(arg_str.0.to_owned());
+        if matches!(arg.direction, Direction::Out | Direction::Inout) {
+            transaction_write.push(generator.identifier.to_owned());
         }
-
-        let param = if is_mutable {
-            format!("&{mutable_str}{}", arg_str.0)
-        } else if arg_str.3.starts_with("Option<") {
-            format!("{}.as_ref()", arg_str.0)
-        } else if arg_str.3.starts_with("String") {
-            format!("{}.as_str()", arg_str.0)
-        } else if arg.r#type.type_cast().is_primitive {
-            arg_str.0.to_owned()
-        } else {
-            format!("&{}", arg_str.0)
-        };
-
-        transaction_params += &format!("{param}, ");
+        transaction_params += &format!("{}, ", generator.func_call_param());
     });
 
-    let mut type_cast = method.r#type.type_cast();
-    type_cast.set_fn_nullable(parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0);
-    let return_type = type_cast.return_type();
+    let func_call_params = if func_call_params.chars().count() > 2 {
+        func_call_params.chars().take(func_call_params.chars().count() - 2).collect::<String>()
+    } else {
+        func_call_params
+    };
+
+    let transaction_params = if transaction_params.chars().count() > 2 {
+        transaction_params.chars().take(transaction_params.chars().count() - 2).collect::<String>()
+    } else {
+        transaction_params
+    };
+
+    let generator = if parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0 {
+        method.r#type.to_generator().nullable()
+    } else {
+        method.r#type.to_generator()
+    };
+
+    let return_type = generator.type_declaration();
     let transaction_has_return = return_type != "()";
 
     Ok(FnMembers{
         // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
-        args, return_type, write_params, build_params, read_params,
-        transaction_args, transaction_write, transaction_params, transaction_has_return,
+        args, return_type, write_params, func_call_params,
+        transaction_decls, transaction_write, transaction_params, transaction_has_return,
         oneway: method.oneway
     })
 }
@@ -412,9 +384,9 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
     if !is_empty {
         for constant in decl.constant_list.iter() {
-            let type_cast = constant.r#type.type_cast();
+            let generator = constant.r#type.to_generator();
             const_members.push((constant.const_identifier(),
-                type_cast.const_type(), type_cast.init_type(constant.const_expr.as_ref(), true)));
+                generator.const_type_decl(), generator.init_value(constant.const_expr.as_ref(), true)));
         }
 
         for method in decl.method_list.iter() {
@@ -468,14 +440,18 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
         // Parse struct variables only.
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
-                let type_cast = var.r#type.type_cast();
+                let generator = var.r#type.to_generator();
 
                 if var.constant {
                     constant_members.push((var.const_identifier(),
-                        type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
+                        generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
                 } else {
                     members.push(
-                        (var.identifier(), type_cast.member_type(), type_cast.init_type(var.const_expr.as_ref(), false))
+                        (
+                            var.identifier(),
+                            generator.type_declaration(),
+                            generator.init_value(var.const_expr.as_ref(), false)
+                        )
                     )
                 }
             } else {
@@ -506,7 +482,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
         return Ok(String::new())
     }
 
-    let type_cast = &parser::get_backing_type(&decl.annotation_list);
+    let generator = &parser::get_backing_type(&decl.annotation_list);
 
     let mut members = Vec::new();
     let mut enum_val: i64 = 0;
@@ -522,7 +498,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 
     context.insert("mod", &decl.name);
     context.insert("enum_name", &decl.name);
-    context.insert("enum_type", &type_cast.type_name(&Direction::None));
+    context.insert("enum_type", &generator.clone().direction(&Direction::None).type_declaration());
     context.insert("enum_len", &decl.enumerator_list.len());
     context.insert("members", &members);
 
@@ -541,12 +517,12 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 
     for member in &decl.members {
         if let parser::Declaration::Variable(var) = member {
-            let type_cast = var.r#type.type_cast();
+            let generator = var.r#type.to_generator();
             if var.constant {
                 constant_members.push((var.const_identifier(),
-                    type_cast.const_type(), type_cast.init_type(var.const_expr.as_ref(), true)));
+                    generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
             } else {
-                members.push((var.union_identifier(), type_cast.member_type()));
+                members.push((var.union_identifier(), generator.type_declaration()));
             }
         } else {
             todo!();

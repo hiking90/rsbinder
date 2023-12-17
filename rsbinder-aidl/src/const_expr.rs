@@ -95,10 +95,11 @@ pub enum ValueType {
     IBinder,
     FileDescriptor,
     Holder,
-    UserDefined,
+    UserDefined(String),
 }
 
 impl ValueType {
+    #[cfg(test)]
     fn new_expr(lhs: ValueType, operator: &str, rhs: ValueType) -> ValueType {
         ValueType::Expr{
             lhs: Box::new(ConstExpr::new(lhs)),
@@ -113,6 +114,12 @@ impl ValueType {
     //         expr: Box::new(ConstExpr::new(expr)),
     //     }
     // }
+
+    pub fn is_primitive(&self) -> bool {
+        matches!(self, ValueType::Void | ValueType::Bool(_) |
+            ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
+            ValueType::Char(_) | ValueType::Float(_) | ValueType::Double(_))
+    }
 
     fn order(&self) -> u32 {
         match self {
@@ -133,7 +140,7 @@ impl ValueType {
             ValueType::IBinder =>           14,
             ValueType::FileDescriptor =>    15,
             ValueType::Holder =>            16,
-            ValueType::UserDefined =>       17,
+            ValueType::UserDefined(_) =>       17,
         }
     }
 
@@ -633,7 +640,7 @@ impl ConstExpr {
                 ValueType::Expr {..} | ValueType::Unary {..} => {
                     unreachable!();
                 }
-                ValueType::UserDefined => {
+                ValueType::UserDefined(_) => {
                     self.clone()
                 }
                 _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),

@@ -141,7 +141,6 @@ macro_rules! declare_binder_interface {
             /// Create a new binder service.
             pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
                 let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
-                // $crate::binder_impl::IBinderInternal::set_requesting_sid(&mut binder, features.set_requesting_sid);
                 std::sync::Arc::new(binder)
             }
         }
@@ -162,7 +161,7 @@ macro_rules! declare_binder_interface {
             }
 
             fn on_dump(&self, file: &std::fs::File, args: &[&str]) -> $crate::Result<()> {
-                todo!("BnIEcho on_dump")
+                todo!("on_dump")
             }
         }
 

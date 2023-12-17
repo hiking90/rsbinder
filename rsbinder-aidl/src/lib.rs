@@ -8,6 +8,7 @@ use std::fs;
 mod parser;
 mod generator;
 mod const_expr;
+mod type_generator;
 pub use parser::parse_document;
 pub use generator::gen_document;
 

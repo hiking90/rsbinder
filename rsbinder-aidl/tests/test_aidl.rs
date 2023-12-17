@@ -1,42 +1,5 @@
-use rsbinder_aidl::Builder;
-use std::path::PathBuf;
 use std::error::Error;
 use similar::{ChangeTag, TextDiff};
-
-
-#[test]
-fn test_service_manager() -> Result<(), Box<dyn Error>> {
-    Builder::new()
-        .source(PathBuf::from("../aidl/android/os/IServiceManager.aidl"))
-        .source(PathBuf::from("../aidl/android/os/IClientCallback.aidl"))
-        .source(PathBuf::from("../aidl/android/os/IServiceCallback.aidl"))
-        .source(PathBuf::from("../aidl/android/os/ConnectionInfo.aidl"))
-        .source(PathBuf::from("../aidl/android/os/ServiceDebugInfo.aidl"))
-        // .source(PathBuf::from("../aidl/android/os/PersistableBundle.aidl"))
-        // .source(PathBuf::from("../aidl/android/content/AttributionSource.aidl"))
-        // .source(PathBuf::from("../aidl/android/aidl/tests"))
-        .generate()?;
-
-    Ok(())
-}
-
-#[test]
-fn test_aidl_tests() -> Result<(), Box<dyn Error>> {
-    Builder::new()
-        .source(PathBuf::from("../aidl/android/os/PersistableBundle.aidl"))
-        .source(PathBuf::from("../aidl/android/content/AttributionSource.aidl"))
-        .source(PathBuf::from("../aidl/android/aidl/tests"))
-        .generate()?;
-
-    Ok(())
-}
-
-// #[test]
-// fn test_builder() -> Result<(), Box<dyn Error>> {
-//     Builder::new()
-//         .source(PathBuf::from("aidl"))
-//         .generate()
-// }
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
     let document = rsbinder_aidl::parse_document(input)?;
@@ -54,160 +17,25 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// #[test]
-// fn test_array_of_interfaces() -> Result<(), Box<dyn Error>> {
-//     // fn method_nullable_4 is different with Android AIDL. So far, I don't know the policy of Android AIDL.
+#[test]
+fn test_array_of_interfaces_check() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+parcelable ArrayOfInterfaces {
+    interface IEmptyInterface {}
 
-//     aidl_generator(r#"
-// package android.aidl.tests;
-
-// @SuppressWarnings(value={"inout-parameter", "out-array"})
-// parcelable ArrayOfInterfaces {
-//     interface IEmptyInterface {}
-
-//     interface IMyInterface {
-//         @nullable void method_nullable_1(IEmptyInterface iface);
-//         @nullable void method_nullable_2(@nullable IEmptyInterface nullable_iface);
-//         @nullable void method_nullable_3(in IEmptyInterface[] iface_array_in);
-//         @nullable void method_nullable_4(out IEmptyInterface[] iface_array_out);
-//         @nullable void method_nullable_5(inout IEmptyInterface[] iface_array_inout);
-//         @nullable void method_nullable_6(in @nullable IEmptyInterface[] nullable_iface_array_in);
-//         @nullable void method_nullable_7(out @nullable IEmptyInterface[] nullable_iface_array_out);
-//         @nullable IEmptyInterface[] method_nullable_8(inout @nullable IEmptyInterface[] nullable_iface_array_inout);
-
-//         void method_1(IEmptyInterface iface);
-//         void method_2(@nullable IEmptyInterface nullable_iface);
-//         void method_3(in IEmptyInterface[] iface_array_in);
-//         void method_4(out IEmptyInterface[] iface_array_out);
-//         void method_5(inout IEmptyInterface[] iface_array_inout);
-//         void method_6(in @nullable IEmptyInterface[] nullable_iface_array_in);
-//         void method_7(out @nullable IEmptyInterface[] nullable_iface_array_out);
-//         IEmptyInterface[] method_8(inout @nullable IEmptyInterface[] nullable_iface_array_inout);
-//     }
-// }
-//         "#, r#"
-//         "#)
-// }
-
-// #[test]
-// fn test_compiler_checks() -> Result<(), Box<dyn Error>> {
-//     aidl_generator(r##"
-// interface ITestService {
-//     @JavaDerive(equals=true)
-//     @RustDerive(Clone=true, PartialEq=true)
-//     parcelable Empty {}
-
-//     parcelable CompilerChecks {
-//         // IBinder
-//         IBinder binder;
-//         @nullable IBinder nullable_binder;
-//         IBinder[] binder_array;
-//         @nullable IBinder[] nullable_binder_array;
-//         List<IBinder> binder_list;
-//         @nullable List<IBinder> nullable_binder_list;
-
-//         // ParcelFileDescriptor
-//         ParcelFileDescriptor pfd;
-//         @nullable ParcelFileDescriptor nullable_pfd;
-//         ParcelFileDescriptor[] pfd_array;
-//         @nullable ParcelFileDescriptor[] nullable_pfd_array;
-//         List<ParcelFileDescriptor> pfd_list;
-//         @nullable List<ParcelFileDescriptor> nullable_pfd_list;
-
-//         // parcelable
-//         Empty parcel;
-//         @nullable Empty nullable_parcel;
-//         Empty[] parcel_array;
-//         @nullable Empty[] nullable_parcel_array;
-//         List<Empty> parcel_list;
-//         @nullable List<Empty> nullable_parcel_list;
-//     }
-// }
-//     "##, r#"
-//     "#)
-// }
-
-// #[test]
-// fn test_nested_type() -> Result<(), Box<dyn Error>> {
-//     aidl_generator(r##"
-// package android.aidl.tests.nested;
-
-// parcelable ParcelableWithNested {
-//     enum Status { OK, NOT_OK }
-//     Status status = Status.OK;
-// }
-
-// interface INestedService {
-//     @RustDerive(PartialEq=true)
-//     parcelable Result {
-//         ParcelableWithNested.Status status = ParcelableWithNested.Status.OK;
-//     }
-
-//     Result flipStatus(in ParcelableWithNested p);
-
-//     interface ICallback {
-//         void done(ParcelableWithNested.Status status);
-//     }
-//     void flipStatusWithCallback(ParcelableWithNested.Status status, ICallback cb);
-// }
-// "##,
-//     r#"
-//     "#)
-// }
-
-// #[test]
-// fn test_interface() -> Result<(), Box<dyn Error>> {
-//     aidl_generator(r##"
-// package android.os;
-
-// parcelable ConnectionInfo {
-//     @utf8InCpp String ipAddress;
-//     int port;
-// }
-
-// oneway interface IClientCallback {
-//     void onClients(IBinder registered, boolean hasClients);
-// }
-
-// oneway interface IServiceCallback {
-//     void onRegistration(@utf8InCpp String name, IBinder binder);
-// }
-
-// interface IServiceManager {
-//     const int DUMP_FLAG_PRIORITY_CRITICAL = 1 << 0;
-//     const int DUMP_FLAG_PRIORITY_HIGH = 1 << 1;
-//     const int DUMP_FLAG_PRIORITY_NORMAL = 1 << 2;
-//     const int DUMP_FLAG_PRIORITY_DEFAULT = 1 << 3;
-//     const int DUMP_FLAG_PRIORITY_ALL =
-//              DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PRIORITY_HIGH
-//              | DUMP_FLAG_PRIORITY_NORMAL | DUMP_FLAG_PRIORITY_DEFAULT;
-//     const int DUMP_FLAG_PROTO = 1 << 4;
-
-//     @UnsupportedAppUsage
-//     @nullable IBinder getService(@utf8InCpp String name);
-//     @UnsupportedAppUsage
-//     @nullable IBinder checkService(@utf8InCpp String name);
-//     void addService(@utf8InCpp String name, IBinder service,
-//         boolean allowIsolated, int dumpPriority);
-//     @utf8InCpp String[] listServices(int dumpPriority);
-//     void registerForNotifications(@utf8InCpp String name, IServiceCallback callback);
-//     void unregisterForNotifications(@utf8InCpp String name, IServiceCallback callback);
-//     boolean isDeclared(@utf8InCpp String name);
-//     @utf8InCpp String[] getDeclaredInstances(@utf8InCpp String iface);
-//     @nullable @utf8InCpp String updatableViaApex(@utf8InCpp String name);
-//     @nullable ConnectionInfo getConnectionInfo(@utf8InCpp String name);
-//     void registerClientCallback(@utf8InCpp String name, IBinder service, IClientCallback callback);
-//     void tryUnregisterService(@utf8InCpp String name, IBinder service);
-//     ServiceDebugInfo[] getServiceDebugInfo();
-// }
-
-// parcelable ServiceDebugInfo {
-//     @utf8InCpp String name;
-//     int debugPid;
-// }
-//             "##, r#"
-//             "#)
-// }
+    interface IMyInterface {
+        @nullable String[] methodWithInterfaces(IEmptyInterface iface,
+                @nullable IEmptyInterface nullable_iface,
+                in IEmptyInterface[] iface_array_in, out IEmptyInterface[] iface_array_out,
+                inout IEmptyInterface[] iface_array_inout,
+                in @nullable IEmptyInterface[] nullable_iface_array_in,
+                out @nullable IEmptyInterface[] nullable_iface_array_out,
+                inout @nullable IEmptyInterface[] nullable_iface_array_inout);
+    }
+}
+        "##,
+        r##"""##)
+}
 
 #[test]
 fn test_parcelable_const_name() -> Result<(), Box<dyn Error>> {
