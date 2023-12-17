@@ -69,8 +69,8 @@ impl PartialEq for ParcelFileDescriptor {
 impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        let fd = self.0.as_raw_fd();
+    fn serialize(&self, _parcel: &mut Parcel) -> Result<()> {
+        let _fd = self.0.as_raw_fd();
         todo!()
         // let status = unsafe {
         //     // Safety: `Parcel` always contains a valid pointer to an
@@ -105,8 +105,8 @@ impl SerializeOption for ParcelFileDescriptor {
 }
 
 impl DeserializeOption for ParcelFileDescriptor {
-    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        let mut fd = -1i32;
+    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
+        let _fd = -1i32;
         todo!();
         // unsafe {
         //     // Safety: `Parcel` always contains a valid pointer to an
@@ -121,14 +121,14 @@ impl DeserializeOption for ParcelFileDescriptor {
         //         &mut fd,
         //     ))?;
         // }
-        if fd < 0 {
+        if _fd < 0 {
             Ok(None)
         } else {
             let file = unsafe {
                 // Safety: At this point, we know that the file descriptor was
                 // not -1, so must be a valid, owned file descriptor which we
                 // can safely turn into a `File`.
-                File::from_raw_fd(fd)
+                File::from_raw_fd(_fd)
             };
             Ok(Some(ParcelFileDescriptor::new(file)))
         }

@@ -211,7 +211,7 @@ impl Deserialize for ParcelableHolder {
 impl DeserializeArray for ParcelableHolder {}
 
 impl DeserializeOption for ParcelableHolder {
-    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
         todo!();
     }
 }

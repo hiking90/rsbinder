@@ -19,7 +19,6 @@
 
 use std::ops::Deref;
 use std::sync::atomic::*;
-use std::hash::{Hash, Hasher};
 
 use std::any::Any;
 use std::sync::{Arc};

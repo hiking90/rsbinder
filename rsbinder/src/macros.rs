@@ -160,7 +160,7 @@ macro_rules! declare_binder_interface {
                 }
             }
 
-            fn on_dump(&self, file: &std::fs::File, args: &[&str]) -> $crate::Result<()> {
+            fn on_dump(&self, _file: &std::fs::File, _args: &[&str]) -> $crate::Result<()> {
                 todo!("on_dump")
             }
         }
@@ -380,11 +380,11 @@ mod tests {
     }
 
     fn on_transact(
-        service: &dyn IEcho,
-        code: TransactionCode,
-        data: &mut Parcel,
-        reply: &mut Parcel,
-        descriptor: &str,
+        _service: &dyn IEcho,
+        _code: TransactionCode,
+        _data: &mut Parcel,
+        _reply: &mut Parcel,
+        _descriptor: &str,
     ) -> Result<()> {
         // ...
         Ok(())

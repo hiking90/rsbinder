@@ -780,7 +780,7 @@ impl<T: SerializeOption + ?Sized> SerializeOption for std::sync::Arc<T> {
 impl<T: Serialize + ?Sized> SerializeArray for std::sync::Arc<T> {}
 
 impl<T: ?Sized> Deserialize for std::sync::Arc<T> {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+    fn deserialize(_parcel: &mut Parcel) -> Result<Self> {
         todo!()
         // let ibinder: SpIBinder = parcel.read()?;
         // FromIBinder::try_from(ibinder)
@@ -788,7 +788,7 @@ impl<T: ?Sized> Deserialize for std::sync::Arc<T> {
 }
 
 impl<T: ?Sized> DeserializeOption for std::sync::Arc<T> {
-    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
         todo!()
         // let ibinder: Option<SpIBinder> = parcel.read()?;
         // ibinder.map(FromIBinder::try_from).transpose()

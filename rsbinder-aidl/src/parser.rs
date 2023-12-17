@@ -234,17 +234,6 @@ pub struct VariableDecl {
 }
 
 impl VariableDecl {
-    // pub fn to_string(&self) -> String {
-    //     let type_cast = self.r#type.type_cast();
-    //     if self.constant {
-    //         format!("pub const {}: {} = {};\n",
-    //             self.const_identifier(),
-    //             type_cast.const_type(), type_cast.init_type(self.const_expr.as_ref(), true))
-    //     } else {
-    //         format!("pub {}: {},\n", self.identifier(), type_cast.member_type())
-    //     }
-    // }
-
     pub fn identifier(&self) -> String {
         self.identifier.to_owned()
     }
@@ -476,29 +465,6 @@ impl Generic {
 
         generator.value_type
     }
-
-    // pub fn to_string(&self) -> String {
-    //     match self {
-    //         Generic::Type1 { type_args1, non_array_type, type_args2 } => {
-    //             let cast = TypeCast::new(non_array_type);
-    //             // cast.set_generic();
-    //             format!("{}{}{}",
-    //                 generic_type_args_to_string(type_args1),
-    //                 cast.member_type(),
-    //                 generic_type_args_to_string(type_args2))
-    //         }
-    //         Generic::Type2 { non_array_type, type_args } => {
-    //             let cast = TypeCast::new(non_array_type);
-    //             // cast.set_generic();
-    //             format!("{}{}",
-    //                 cast.member_type(),
-    //                 generic_type_args_to_string(type_args))
-    //         }
-    //         Generic::Type3 { type_args } => {
-    //             generic_type_args_to_string(type_args)
-    //         }
-    //     }
-    // }
 }
 
 
@@ -513,22 +479,6 @@ pub struct ArrayType {
     const_expr: Option<ConstExpr>,
 }
 
-// impl ArrayType {
-//     pub fn to_string(&self) -> String {
-//         match &self.const_expr {
-//             Some(expr) => {
-//                 let expr = expr.calculate();
-//                 format!("[{}]", expr.to_string())
-//             }
-//             None => "".to_string(),
-//         }
-//     }
-
-//     pub fn is_vector(&self) -> bool {
-//         self.const_expr.is_none()
-//     }
-// }
-
 #[derive(Debug, Default, Clone)]
 pub struct Type {
     pub annotation_list: Vec<Annotation>,
@@ -540,317 +490,7 @@ impl Type {
     pub fn to_generator(&self) -> type_generator::TypeGenerator {
         type_generator::TypeGenerator::new_with_type(self)
     }
-
-    // pub fn type_cast(&self) -> TypeCast {
-    //     let mut cast = TypeCast::new(&self.non_array_type);
-
-    //     cast.set_array_types(&self.array_types);
-    //     cast.set_nullable(check_annotation_list(&self.annotation_list, AnnotationType::IsNullable).0);
-
-    //     cast
-    // }
 }
-
-// #[derive(Debug, Clone)]
-// pub struct TypeCast {
-//     pub aidl_type: NonArrayType,
-//     pub type_name: String,
-//     pub is_declared: bool,
-//     pub is_nullable: bool,
-//     pub is_fn_nullable: bool,
-//     pub is_vector: bool,
-//     pub is_generic: bool,
-//     pub is_primitive: bool,
-//     pub value_type: ValueType,
-// }
-
-// impl TypeCast {
-//     fn new(aidl_type: &NonArrayType) -> TypeCast {
-//         let mut is_declared = false;
-//         let mut is_vector = false;
-//         let type_name = match aidl_type.name.as_str() {
-//             "boolean" => ("bool".to_owned(), ValueType::Bool(false), true),
-//             "byte" => ("i8".to_owned(), ValueType::Int8(0), true),
-//             "char" => ("u16".to_owned(), ValueType::Char(Default::default()), true),
-//             "int" => ("i32".to_owned(), ValueType::Int32(0), true),
-//             "long" => ("i64".to_owned(), ValueType::Int64(0), true),
-//             "float" => ("f32".to_owned(), ValueType::Float(0.), true),
-//             "double" => ("f64".to_owned(), ValueType::Double(0.), true),
-//             "void" => ("()".to_owned(), ValueType::Void, false),
-//             "String" => {
-//                 ("String".to_owned(), ValueType::String(String::new()), false)
-//             }
-//             "IBinder" => {
-//                 ("rsbinder::StrongIBinder".to_owned(), ValueType::IBinder, false)
-//             }
-//             "List" => {
-//                 is_vector = true;
-//                 match &aidl_type.generic {
-//                     Some(gen) => (gen.to_string(), ValueType::Array(Vec::new()), false),
-//                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
-//                 }
-//             }
-//             // "Map" => {
-//             //     is_primitive = false;
-//             //     is_map = true;
-//             //     ("HashMap".to_owned(), ValueType::Map())
-//             // }
-//             "FileDescriptor" => {
-//                 panic!("FileDescriptor isn't supported by the aidl generator of rsbinder.");
-//             }
-//             "ParcelFileDescriptor" => {
-//                 ("rsbinder::ParcelFileDescriptor".to_owned(), ValueType::FileDescriptor, false)
-//             }
-//             "ParcelableHolder" => {
-//                 ("rsbinder::ParcelableHolder".to_owned(), ValueType::Holder, false)
-//             }
-//             _ => {
-//                 let lookup_decl = lookup_decl_from_name(aidl_type.name.as_str(), Namespace::AIDL);
-//                 let curr_ns = current_namespace();
-//                 let ns = curr_ns.relative_mod(&lookup_decl.ns);
-//                 let type_name = if !ns.is_empty() {
-//                     format!("{}::{}", ns, lookup_decl.name.ns.last().unwrap())
-//                 } else {
-//                     let name = lookup_decl.name.ns.last().unwrap().to_owned();
-//                     if curr_ns.ns.last().unwrap() == name.as_str() {
-//                         format!("Box<{}>", name)    // To avoid, recursive type issue.
-//                     } else {
-//                         name
-//                     }
-//                 };
-
-//                 match lookup_decl.decl {
-//                     Declaration::Interface(_) => {
-//                         is_declared = true;
-//                         // let type_name = format!("std::sync::Arc<dyn {}>", type_name);
-//                         (type_name.to_owned(), ValueType::UserDefined(type_name.to_owned()), false)
-//                     }
-//                     _ => (type_name.to_owned(), ValueType::UserDefined(type_name.to_owned()), false),
-//                 }
-//             }
-//         };
-
-//         Self {
-//             aidl_type: aidl_type.clone(),
-//             type_name: type_name.0,
-//             value_type: type_name.1,
-//             is_declared,
-//             is_vector,
-//             is_nullable: false,
-//             is_generic: false,
-//             is_fn_nullable: false,
-//             is_primitive: type_name.2,
-//         }
-//     }
-
-//     fn format_option(is_ref: bool, name: &str) -> String {
-//         let name = if name.starts_with("Option<") {
-//             if name.chars().nth(7) == Some('&') {
-//                 if is_ref {
-//                     &name[8..name.len() -1]
-//                 } else {
-//                     &name[7..name.len() -1]
-//                 }
-//             } else {
-//                 &name[7..name.len() - 1]
-//             }
-//         } else {
-//             name
-//         };
-
-//         if is_ref {
-//             format!("Option<&{}>", name)
-//         } else {
-//             format!("Option<{}>", name)
-//         }
-//     }
-
-//     fn nullable_type(is_ref: bool, name: &str) -> String {
-//         if is_ref {
-//             format!("Option<&{}>", name)
-//         } else {
-//             format!("Option<{}>", name)
-//         }
-//     }
-
-//     fn general_type(is_ref: bool, name: &str) -> String {
-//         if is_ref {
-//             format!("&{}", name)
-//         } else {
-//             name.to_owned()
-//         }
-//     }
-
-//     pub fn type_name(&self, dir: &Direction) -> String {
-//         let mut is_option = false;
-//         let type_name = if self.is_declared {
-//             if self.is_nullable {
-//                 is_option = true;
-//             }
-//             format!("std::sync::Arc<dyn {}>", self.type_name)
-//         } else {
-//             match self.value_type {
-//                 ValueType::FileDescriptor | ValueType::Holder |
-//                 ValueType::IBinder => {
-//                     if (!self.is_generic && !self.is_vector) && self.is_nullable {
-//                         is_option = true;
-//                     }
-//                 },
-//                 _ => {
-//                     if self.is_nullable {
-//                         is_option = true;
-//                     }
-//                 }
-//             }
-//             self.type_name.to_owned()
-//         };
-
-//         match dir {
-//             Direction::In => {
-//                 if self.is_vector {
-//                     if is_option {
-//                         if self.is_nullable {
-//                             format!("Option<&[{}]>", Self::format_option(false, &type_name))
-//                         } else {
-//                             format!("&[{}]", Self::format_option(false, &type_name))
-//                         }
-//                     } else {
-//                         format!("&[{}]", type_name)
-//                     }
-//                 } else {
-//                     let type_name = match self.value_type {
-//                         ValueType::String(_) => "str".to_owned(),
-//                         ValueType::Bool(_) | ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
-//                         ValueType::Char(_) | ValueType::Float(_) | ValueType::Double(_) => {
-//                             return type_name;
-//                         }
-//                         _ => type_name,
-//                     };
-//                     let type_name = if let ValueType::String(_) = self.value_type {
-//                         "str".to_owned()
-//                     } else {
-//                         type_name
-//                     };
-//                     if is_option {
-//                         Self::format_option(true, &type_name)
-//                     } else {
-//                         format!("&{}", type_name)
-//                     }
-//                 }
-//             }
-//             Direction::Out => {
-//                 if self.is_fn_nullable {
-//                     is_option = true;
-//                 }
-//                 let type_name = self.type_name(&Direction::None);
-//                 // if type_name.starts_with("Option<") {
-//                 //     is_option = false;
-//                 // }
-//                 if is_option {
-//                     format!("&mut {}", Self::format_option(false, &type_name))
-//                 } else {
-//                     format!("&mut {}", type_name)
-//                 }
-//             }
-//             Direction::Inout => {
-//                 let mut type_cast = self.clone();
-//                 type_cast.set_fn_nullable(false);
-//                 type_cast.type_name(&Direction::Out)
-//             }
-//             Direction::None => {
-//                 let type_name = if self.is_vector {
-//                     if self.is_nullable {
-//                         format!("Vec<{}>", Self::format_option(false, &type_name))
-//                     } else {
-//                         format!("Vec<{}>", type_name)
-//                     }
-//                 } else {
-//                     type_name
-//                 };
-
-//                 if is_option {
-//                     Self::format_option(false, &type_name)
-//                 } else {
-//                     type_name
-//                 }
-//             }
-//         }
-//     }
-
-//     pub fn fn_def_arg(&self, direction: &Direction) -> String {
-//         let direction = if let Direction::None = direction {
-//             Direction::In
-//         } else {
-//             direction.clone()
-//         };
-
-//         self.type_name(&direction)
-//     }
-
-//     fn set_nullable(&mut self, is_nullable: bool) {
-//         self.is_nullable = is_nullable;
-//     }
-
-//     pub fn set_fn_nullable(&mut self, is_nullable: bool) {
-//         self.is_fn_nullable = is_nullable;
-//     }
-
-//     fn set_generic(&mut self, is_generic: bool) {
-//         self.is_generic = is_generic;
-//     }
-
-//     fn set_array_types(&mut self, array_types: &[ArrayType]) {
-//         // TODO: implement Vector.....
-//         // &Vec<T>
-//         array_types.iter().for_each(|t| {
-//             if t.is_vector() {
-//                 self.is_vector = true;
-//             } else {
-//                 self.type_name = format!("{}[{}]", self.type_name, t.to_string());
-//             }
-//         });
-//     }
-
-//     pub fn value_type(&self) -> ValueType {
-//         self.value_type.clone()
-//     }
-
-//     pub fn const_type(&self) -> String {
-//         self.type_name(&Direction::In)
-//     }
-
-//     pub fn member_type(&self) -> String {
-//         let type_name = self.type_name(&Direction::None);
-//         if self.is_declared {
-//             Self::format_option(false, &type_name)
-//         } else {
-//             type_name
-//         }
-//     }
-
-//     pub fn init_type(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
-//         match const_expr {
-//             Some(expr) => {
-//                 let expr = expr.calculate().convert_to(&self.value_type());
-//                 expr.value.to_init(is_const)
-//             }
-//             None => ValueType::Void.to_init(is_const),
-//         }
-//     }
-
-//     pub fn return_type(&self) -> String {
-//         if let ValueType::Void = self.value_type {
-//             self.type_name.to_owned()
-//         } else {
-//             let type_name = self.type_name(&Direction::None);
-//             if self.is_fn_nullable {
-//                 Self::format_option(false, &type_name)
-//             } else {
-//                 type_name
-//             }
-//         }
-//     }
-// }
 
 #[derive(PartialEq)]
 pub enum AnnotationType {
@@ -890,7 +530,7 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> type_generator::Ty
                 if param.identifier == "type" {
                     return type_generator::TypeGenerator::new(&NonArrayType {
                     // The cstr is enclosed in quotes.
-                        name: param.const_expr.to_string().trim_matches('"').into(),
+                        name: param.const_expr.to_value_string().trim_matches('"').into(),
                         generic: None,
                     });
                 }
@@ -1341,7 +981,6 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
 }
 
 fn parse_interface_members(pairs: pest::iterators::Pairs<Rule>, interface: &mut InterfaceDecl) {
-
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {

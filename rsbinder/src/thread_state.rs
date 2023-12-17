@@ -91,10 +91,10 @@ pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 
 #[derive(Debug, Clone, Copy)]
 struct TransactionState {
-    calling_pid: binder::pid_t,
-    calling_sid: *const u8,
-    calling_uid: binder::uid_t,
-    strict_mode_policy: i32,
+    // calling_pid: binder::pid_t,
+    // calling_sid: *const u8,
+    // calling_uid: binder::uid_t,
+    // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
     work_source: binder::uid_t,
     propagate_work_source: bool,
@@ -103,10 +103,10 @@ struct TransactionState {
 impl TransactionState {
     fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
         TransactionState {
-            calling_pid: data.transaction_data.sender_pid,
-            calling_sid: data.secctx as _,
-            calling_uid: data.transaction_data.sender_euid,
-            strict_mode_policy: 0,
+            // calling_pid: data.transaction_data.sender_pid,
+            // calling_sid: data.secctx as _,
+            // calling_uid: data.transaction_data.sender_euid,
+            // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
             work_source: 0,
             propagate_work_source: false,
@@ -665,7 +665,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             }
         }
 
-        log::trace!("err: {:?}, write consumed: {} of {}, read consumed: {}",
+        log::trace!("errno: {:?}, write consumed: {} of {}, read consumed: {}",
             nix::errno::Errno::last(), bwr.write_consumed, bwr.write_size, bwr.read_consumed);
 
         {

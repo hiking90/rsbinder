@@ -141,6 +141,7 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 }
 
+pub type FnFreeBuffer = fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
@@ -148,7 +149,7 @@ pub struct Parcel {
     next_object_hint: usize,
     request_header_present: bool,
     work_source_request_header_pos: usize,
-    free_buffer: Option<fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>>,
+    free_buffer: Option<FnFreeBuffer>,
 }
 
 impl Default for Parcel {

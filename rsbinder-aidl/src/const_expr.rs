@@ -40,7 +40,7 @@ macro_rules! arithmetic_basic_op {
             match $promoted {
                 ValueType::Void => ConstExpr::default(),
                 ValueType::String(_) | ValueType::Char(_) => {
-                    let value = format!("{}{}", lhs.to_string(), rhs.to_string());
+                    let value = format!("{}{}", lhs.to_value_string(), rhs.to_value_string());
                     ConstExpr::new(ValueType::String(value))
                 }
                 ValueType::Int8(_) => {
@@ -281,15 +281,15 @@ impl ValueType {
         match self {
             ValueType::String(_) => {
                 if is_const {
-                    format!("\"{}\"", self.to_string())
+                    format!("\"{}\"", self.to_value_string())
                 } else {
-                    format!("\"{}\".into()", self.to_string())
+                    format!("\"{}\".into()", self.to_value_string())
                 }
             }
-            ValueType::Float(_) => format!("{}f32", self.to_string()),
-            ValueType::Double(_) => format!("{}f64", self.to_string()),
-            ValueType::Char(_) => format!("'{}' as u16", self.to_string()),
-            ValueType::Name(_) => self.to_string(),
+            ValueType::Float(_) => format!("{}f32", self.to_value_string()),
+            ValueType::Double(_) => format!("{}f64", self.to_value_string()),
+            ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
+            ValueType::Name(_) => self.to_value_string(),
             ValueType::Array(v) => {
                 let mut res = "vec![".to_owned();
                 for v in v {
@@ -304,13 +304,13 @@ impl ValueType {
             //     "rsbinder::ParcelableHolder::new(rsbinder::Stability::Local)".to_owned()
             // }
             ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
-            ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_string(),
+            ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_value_string(),
 
             _ => "Default::default()".to_string(),
         }
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn to_value_string(&self) -> String {
         match self {
             ValueType::Void => "".into(),
             ValueType::String(v) => v.clone(),
@@ -324,7 +324,7 @@ impl ValueType {
             ValueType::Array(v) => {
                 let mut res = "vec![".to_owned();
                 for v in v {
-                    res += &(v.to_string() + ",");
+                    res += &(v.to_value_string() + ",");
                 }
 
                 res += "]";
@@ -335,10 +335,10 @@ impl ValueType {
                 v.to_string()
             }
             ValueType::Expr{ lhs, operator, rhs} => {
-                format!("{} {} {}", lhs.to_string(), operator, rhs.to_string())
+                format!("{} {} {}", lhs.to_value_string(), operator, rhs.to_value_string())
             }
             ValueType::Unary{ operator, expr } => {
-                format!("{} {}", operator, expr.to_string())
+                format!("{} {}", operator, expr.to_value_string())
             }
             _ => unimplemented!(),
         }
@@ -473,7 +473,7 @@ impl PartialOrd for ValueType {
             } else {
                 Some(std::cmp::Ordering::Less)
             },
-            ValueType::String(v) | ValueType::Name(v) => v.partial_cmp(&rhs.to_string()),
+            ValueType::String(v) | ValueType::Name(v) => v.partial_cmp(&rhs.to_value_string()),
             ValueType::Int8(v) => v.partial_cmp(&(rhs.to_i64() as _)),
             ValueType::Int32(v) => v.partial_cmp(&(rhs.to_i64() as _)),
             ValueType::Int64(v) => v.partial_cmp(&(rhs.to_i64() as _)),
@@ -581,8 +581,8 @@ impl ConstExpr {
         &self.raw_expr
     }
 
-    pub fn to_string(&self) -> String {
-        self.value.to_string()
+    pub fn to_value_string(&self) -> String {
+        self.value.to_value_string()
     }
 
     pub fn to_i64(&self) -> i64 {
@@ -610,7 +610,7 @@ impl ConstExpr {
         } else {
             match value_type {
                 ValueType::Void => Self::default(),
-                ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_string())),
+                ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_value_string())),
                 ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64() as i8 as _)),
                 ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
                 ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
