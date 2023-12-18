@@ -1,7 +1,9 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use rsbinder_aidl::Builder;
 use std::path::PathBuf;
 use std::error::Error;
-
 
 #[test]
 fn test_service_manager() -> Result<(), Box<dyn Error>> {

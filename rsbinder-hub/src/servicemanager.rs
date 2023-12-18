@@ -1,3 +1,6 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 include!(concat!(env!("OUT_DIR"), "/service_manager.rs"));
 
 use std::sync::{Arc, Once};
@@ -18,6 +21,7 @@ static INIT: Once = Once::new();
 static mut GLOBAL_SM: Option<Arc<BpServiceManager>> = None;  // Assume SM is i32 for simplicity
 static IS_INIT: AtomicBool = AtomicBool::new(false);
 
+/// Retrieve the default service manager.
 pub fn default() -> Arc<BpServiceManager> {
     unsafe {
         INIT.call_once(|| {

@@ -1,4 +1,5 @@
-// include!("../rsbinder_generated.rs");
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
 
 use rsbinder_hub::IServiceManager;
 use env_logger::Env;

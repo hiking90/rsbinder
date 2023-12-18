@@ -25,16 +25,19 @@ use crate::binder::*;
 use crate::parcel::*;
 use crate::error::*;
 
+/// A Binder object that can be used to manage the binder service.
 pub struct Binder<T: Remotable + ?Sized + Send + Sync> {
     remotable: Arc<T>,
     stability: Stability,
 }
 
 impl<T: Remotable> Binder<T> {
+    /// Create a new Binder object.
     pub fn new(remotable: T) -> Self {
         Self::new_with_stability(remotable, Default::default())
     }
 
+    /// Create a new Binder object with the specified stability.
     pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
         Binder {
             remotable: Arc::new(remotable),
@@ -42,6 +45,7 @@ impl<T: Remotable> Binder<T> {
         }
     }
 
+    /// Retrieve the stability of this object.
     pub fn stability(&self) -> Stability {
         self.stability
     }
@@ -156,54 +160,9 @@ impl<T: Remotable> Deref for Binder<T> {
     }
 }
 
-// impl<T: Remotable> InterfaceClassMethods for Binder<T> {
-//     fn get_descriptor() -> &'static str {
-//         <T as Remotable>::get_descriptor()
-//     }
-
-//     fn on_create() {
-
-//     }
-
-//     // fn on_transact(
-//     //     binder: &mut Binder<T>,
-//     //     code: u32,
-//     //     data: &parcel::Reader,
-//     //     reply: &parcel::Writer,
-//     // ) -> Result<()> {
-//     //     Ok(())
-//     // }
-
-//     fn on_destroy() {
-//     }
-
-//     fn on_dump<R: Remotable>(_binder: &mut Binder<R>, _fd: i32, _args: &str, _num_args: u32) -> Result<()> {
-//         Ok(())
-//     }
-// }
-
-// impl<B: Remotable> TryFrom<Object> for Arc<Box<Binder<B>>> {
-//     type Error = Error;
-
-//     fn try_from(mut object: Object) -> Result<Self> {
-//         match object {
-//             Object::Binder { binder, stability } => {
-//                 let binder: Self = unsafe { Arc::from_raw(binder as *const Box<Binder<B>>) };
-//                 if binder.get_descriptor() == B::get_descriptor() {
-
-//                 }
-//             },
-//             Object::Handle { .. } => {
-//                 Err(Error::from(ErrorKind::BadType))
-//             }
-//         }
-//     }
-// }
-
-
-// // This implementation is an idiomatic implementation of the C++
-// // `IBinder::localBinder` interface if the binder object is a Rust binder
-// // service.
+// This implementation is an idiomatic implementation of the C++
+// `IBinder::localBinder` interface if the binder object is a Rust binder
+// service.
 impl<B: Remotable + 'static> TryFrom<StrongIBinder> for Binder<B> {
     type Error = StatusCode;
 

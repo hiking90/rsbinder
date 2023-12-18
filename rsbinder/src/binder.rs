@@ -32,8 +32,6 @@ use crate::{
     thread_state,
 };
 
-// use crate::thread_state::*;
-
 /// Binder action to perform.
 ///
 /// This must be a number between [`FIRST_CALL_TRANSACTION`] and
@@ -93,9 +91,7 @@ pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 ///
 /// This is equivalent `IInterface` in C++.
 pub trait Interface: Send + Sync {
-    // fn as_any(&self) -> &dyn Any;
-
-    // /// Convert this binder object into a generic [`SpIBinder`] reference.
+    /// Convert this binder object into a generic [`SpIBinder`] reference.
     fn as_binder(&self) -> StrongIBinder {
         panic!("This object was not a Binder object and cannot be converted into an StrongIBinder.")
     }
@@ -162,15 +158,19 @@ pub trait IBinder: Send + Sync {
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;
 
+    /// To support dynamic interface cast, we need to know the interface
     fn as_any(&self) -> &dyn Any;
+    /// To convert the interface to a transactable object
     fn as_transactable(&self) -> Option<&dyn Transactable>;
 }
 
 impl dyn IBinder {
+    /// Convert this binder object into a native binder object.
     pub fn as_native<T: 'static + Remotable>(&self) -> Option<&native::Binder<T>> {
         self.as_any().downcast_ref::<native::Binder<T>>()
     }
 
+    /// Convert this binder object into a proxy binder object.
     pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
     }
@@ -209,116 +209,10 @@ pub trait Remotable: Send + Sync {
     fn on_dump(&self, file: &File, args: &[&str]) -> Result<()>;
 }
 
+/// A transactable object that can be used to process Binder commands.
 pub trait Transactable: Send + Sync {
     fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
 }
-
-
-// pub trait InterfaceClassMethods {
-//     /// Get the interface descriptor string for this object type.
-//     fn get_descriptor() -> &'static str
-//     where
-//         Self: Sized;
-//
-//     /// Called during construction of a new `AIBinder` object of this interface
-//     /// class.
-//     ///
-//     /// The opaque pointer parameter will be the parameter provided to
-//     /// `AIBinder_new`. Returns an opaque userdata to be associated with the new
-//     /// `AIBinder` object.
-//     ///
-//     /// # Safety
-//     ///
-//     /// Callback called from C++. The parameter argument provided to
-//     /// `AIBinder_new` must match the type expected here. The `AIBinder` object
-//     /// will take ownership of the returned pointer, which it will free via
-//     /// `on_destroy`.
-//     fn on_create();
-//
-//     // /// Called when a transaction needs to be processed by the local service
-//     // /// implementation.
-//     // ///
-//     // /// # Safety
-//     // ///
-//     // /// Callback called from C++. The `binder` parameter must be a valid pointer
-//     // /// to a binder object of this class with userdata initialized via this
-//     // /// class's `on_create`. The parcel parameters must be valid pointers to
-//     // /// parcel objects.
-//     // fn on_transact<T: Remotable>(
-//     //     binder: &mut native::Binder<T>,
-//     //     code: u32,
-//     //     data: &parcel::Reader,
-//     //     reply: &parcel::Writer,
-//     // ) -> Result<()>;
-//
-//     /// Called whenever an `AIBinder` object is no longer referenced and needs
-//     /// to be destroyed.
-//     ///
-//     /// # Safety
-//     ///
-//     /// Callback called from C++. The opaque pointer parameter must be the value
-//     /// returned by `on_create` for this class. This function takes ownership of
-//     /// the provided pointer and destroys it.
-//     fn on_destroy();
-//
-//     /// Called to handle the `dump` transaction.
-//     ///
-//     /// # Safety
-//     ///
-//     /// Must be called with a non-null, valid pointer to a local `AIBinder` that
-//     /// contains a `T` pointer in its user data. fd should be a non-owned file
-//     /// descriptor, and args must be an array of null-terminated string
-//     /// poiinters with length num_args.
-//     fn on_dump<T: Remotable>(binder: &mut native::Binder<T>, fd: i32, args: &str, num_args: u32) -> Result<()>;
-// }
-
-
-/// Opaque reference to the type of a Binder interface.
-///
-/// This object encapsulates the Binder interface descriptor string, along with
-/// the binder transaction callback, if the class describes a local service.
-///
-/// A Binder remotable object may only have a single interface class, and any
-/// given object can only be associated with one class. Two objects with
-/// different classes are incompatible, even if both classes have the same
-/// interface descriptor.
-// #[derive(Clone, PartialEq, Eq)]
-// pub struct InterfaceClass<I: InterfaceClassMethods> {
-//     descriptor: String,
-//     class_methods: I,
-// }
-//
-// impl<I: InterfaceClassMethods> InterfaceClass<I> {
-//     /// Get a Binder NDK `AIBinder_Class` pointer for this object type.
-//     ///
-//     /// Note: the returned pointer will not be constant. Calling this method
-//     /// multiple times for the same type will result in distinct class
-//     /// pointers. A static getter for this value is implemented in
-//     /// [`declare_binder_interface!`].
-//     pub fn new(methods: I) -> InterfaceClass<I> {
-//         InterfaceClass {
-//             descriptor: I::get_descriptor().to_string(),
-//             class_methods: methods,
-//         }
-//     }
-//
-//     // /// Construct an `InterfaceClass` out of a raw, non-null `AIBinder_Class`
-//     // /// pointer.
-//     // ///
-//     // /// # Safety
-//     // ///
-//     // /// This function is safe iff `ptr` is a valid, non-null pointer to an
-//     // /// `AIBinder_Class`.
-//     // pub(crate) unsafe fn from_ptr(ptr: *const sys::AIBinder_Class) -> InterfaceClass {
-//     //     InterfaceClass(ptr)
-//     // }
-//
-//     /// Get the interface descriptor string of this class.
-//     pub fn get_descriptor(&self) -> String {
-//         self.descriptor.clone()
-//     }
-// }
-
 
 /// Interface stability promise
 ///
@@ -403,6 +297,7 @@ impl Drop for Inner {
     }
 }
 
+/// Strong reference to a binder object.
 #[derive(Debug)]
 pub struct StrongIBinder {
     inner: Arc<Inner>,
@@ -520,6 +415,7 @@ impl Deref for StrongIBinder {
     }
 }
 
+/// Weak reference to a binder object.
 #[derive(Clone)]
 pub struct WeakIBinder {
     inner: Arc<Inner>,

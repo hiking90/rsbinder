@@ -1,3 +1,6 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * Copyright (C) 2020 The Android Open Source Project
  *
@@ -21,7 +24,7 @@ use crate::{
 use crate::error::{Result, StatusCode};
 
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 
 /// Rust version of the Java class android.os.ParcelFileDescriptor
 #[derive(Debug)]
@@ -121,17 +124,17 @@ impl DeserializeOption for ParcelFileDescriptor {
         //         &mut fd,
         //     ))?;
         // }
-        if _fd < 0 {
-            Ok(None)
-        } else {
-            let file = unsafe {
-                // Safety: At this point, we know that the file descriptor was
-                // not -1, so must be a valid, owned file descriptor which we
-                // can safely turn into a `File`.
-                File::from_raw_fd(_fd)
-            };
-            Ok(Some(ParcelFileDescriptor::new(file)))
-        }
+        // if _fd < 0 {
+        //     Ok(None)
+        // } else {
+        //     let file = unsafe {
+        //         // Safety: At this point, we know that the file descriptor was
+        //         // not -1, so must be a valid, owned file descriptor which we
+        //         // can safely turn into a `File`.
+        //         File::from_raw_fd(_fd)
+        //     };
+        //     Ok(Some(ParcelFileDescriptor::new(file)))
+        // }
     }
 }
 

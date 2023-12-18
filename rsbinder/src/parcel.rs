@@ -68,13 +68,6 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    // fn as_mut_slice(&mut self) -> &mut [T] {
-    //     match self {
-    //         ParcelData::Vec(ref mut v) => v.as_mut_slice(),
-    //         ParcelData::Slice(s) => s,
-    //     }
-    // }
-
     pub(crate) fn as_ptr(&self) -> *const T {
         match self {
             ParcelData::Vec(ref v) => v.as_ptr(),
@@ -126,13 +119,6 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    // fn extend_from_slice(&mut self, other: &[T]) {
-    //     match self {
-    //         ParcelData::Vec(v) => v.extend_from_slice(other),
-    //         _ => panic!("extend_from_slice() is only available for ParcelData::Vec."),
-    //     }
-    // }
-
     fn push(&mut self, other: T) {
         match self {
             ParcelData::Vec(v) => v.push(other),
@@ -142,6 +128,9 @@ impl<T: Clone + Default> ParcelData<T> {
 }
 
 pub type FnFreeBuffer = fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
+
+/// Parcel converts data into a byte stream (serialization), making it transferable. 
+/// The receiving side then transforms this byte stream back into its original data form (deserialization).
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
@@ -265,20 +254,6 @@ impl Parcel {
 
         result
     }
-
-    // pub(crate) fn read_aligned<T: Default>(&mut self) -> Result<T> {
-    //     let unaligned = std::mem::size_of::<T>();
-    //     let mut value: T = Default::default();
-    //     unsafe {
-    //         std::ptr::copy_nonoverlapping(
-    //             self.read_aligned_data(unaligned)?.as_ptr(),
-    //             &mut value as *mut _ as *mut u8,
-    //             unaligned,
-    //         );
-    //     }
-
-    //     Ok(value)
-    // }
 
     pub(crate) fn read_aligned_data(&mut self, len: usize) -> Result<&[u8]> {
         let aligned = pad_size(len);
@@ -409,53 +384,6 @@ impl Parcel {
             obj.release();
         }
     }
-
-    // void Parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
-    //     const binder_size_t* objects, size_t objectsCount, release_func relFunc)
-    // {
-    //     // this code uses 'mOwner == nullptr' to understand whether it owns memory
-    //     LOG_ALWAYS_FATAL_IF(relFunc == nullptr, "must provide cleanup function");
-
-    //     freeData();
-
-    //     mData = const_cast<uint8_t*>(data);
-    //     mDataSize = mDataCapacity = dataSize;
-    //     mObjects = const_cast<binder_size_t*>(objects);
-    //     mObjectsSize = mObjectsCapacity = objectsCount;
-    //     mOwner = relFunc;
-
-    //     binder_size_t minOffset = 0;
-    //     for (size_t i = 0; i < mObjectsSize; i++) {
-    //         binder_size_t offset = mObjects[i];
-    //         if (offset < minOffset) {
-    //             ALOGE("%s: bad object offset %" PRIu64 " < %" PRIu64 "\n",
-    //                   __func__, (uint64_t)offset, (uint64_t)minOffset);
-    //             mObjectsSize = 0;
-    //             break;
-    //         }
-    //         const flat_binder_object* flat
-    //             = reinterpret_cast<const flat_binder_object*>(mData + offset);
-    //         uint32_t type = flat->hdr.type;
-    //         if (!(type == BINDER_TYPE_BINDER || type == BINDER_TYPE_HANDLE ||
-    //               type == BINDER_TYPE_FD)) {
-    //             // We should never receive other types (eg BINDER_TYPE_FDA) as long as we don't support
-    //             // them in libbinder. If we do receive them, it probably means a kernel bug; try to
-    //             // recover gracefully by clearing out the objects.
-    //             android_errorWriteLog(0x534e4554, "135930648");
-    //             android_errorWriteLog(0x534e4554, "203847542");
-    //             ALOGE("%s: unsupported type object (%" PRIu32 ") at offset %" PRIu64 "\n",
-    //                   __func__, type, (uint64_t)offset);
-
-    //             // WARNING: callers of ipcSetDataReference need to make sure they
-    //             // don't rely on mObjectsSize in their release_func.
-    //             mObjectsSize = 0;
-    //             break;
-    //         }
-    //         minOffset = offset + sizeof(flat_binder_object);
-    //     }
-    //     scanForFds();
-    // }
-
 }
 
 impl Drop for Parcel {
@@ -494,52 +422,6 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
         Ok(<[u8; N] as TryFrom<&[u8]>>::try_from(data)?)
     }
 }
-
-// status_t Parcel::writeObject(const flat_binder_object& val, bool nullMetaData)
-// {
-//     const bool enoughData = (mDataPos+sizeof(val)) <= mDataCapacity;
-//     const bool enoughObjects = mObjectsSize < mObjectsCapacity;
-//     if (enoughData && enoughObjects) {
-// restart_write:
-//         *reinterpret_cast<flat_binder_object*>(mData+mDataPos) = val;
-
-//         // remember if it's a file descriptor
-//         if (val.hdr.type == BINDER_TYPE_FD) {
-//             if (!mAllowFds) {
-//                 // fail before modifying our object index
-//                 return FDS_NOT_ALLOWED;
-//             }
-//             mHasFds = mFdsKnown = true;
-//         }
-
-//         // Need to write meta-data?
-//         if (nullMetaData || val.binder != 0) {
-//             mObjects[mObjectsSize] = mDataPos;
-//             acquire_object(ProcessState::self(), val, this, &mOpenAshmemSize);
-//             mObjectsSize++;
-//         }
-
-//         return finishWrite(sizeof(flat_binder_object));
-//     }
-
-//     if (!enoughData) {
-//         const status_t err = growData(sizeof(val));
-//         if (err != NO_ERROR) return err;
-//     }
-//     if (!enoughObjects) {
-//         if (mObjectsSize > SIZE_MAX - 2) return NO_MEMORY; // overflow
-//         if ((mObjectsSize + 2) > SIZE_MAX / 3) return NO_MEMORY; // overflow
-//         size_t newSize = ((mObjectsSize+2)*3)/2;
-//         if (newSize > SIZE_MAX / sizeof(binder_size_t)) return NO_MEMORY; // overflow
-//         binder_size_t* objects = (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
-//         if (objects == nullptr) return NO_MEMORY;
-//         mObjects = objects;
-//         mObjectsCapacity = newSize;
-//     }
-
-//     goto restart_write;
-// }
-
 
 #[cfg(test)]
 mod tests {

@@ -89,102 +89,6 @@ pub trait Deserialize: Sized {
     }
 }
 
-
-// /// Helper trait for types that can be serialized as arrays.
-// /// Defaults to calling Serialize::serialize() manually for every element,
-// /// but can be overridden for custom implementations like `writeByteArray`.
-// // Until specialization is stabilized in Rust, we need this to be a separate
-// // trait because it's the only way to have a default implementation for a method.
-// // We want the default implementation for most types, but an override for
-// // a few special ones like `readByteArray` for `u8`.
-// pub trait SerializeArray: Serialize + Sized {
-//     /// Serialize an array of this type into the given parcel.
-//     fn serialize_array(slice: &[Self], parcel: &mut BorrowedParcel<'_>) -> Result<()> {
-//         let res = unsafe {
-//             // Safety: Safe FFI, slice will always be a safe pointer to pass.
-//             sys::AParcel_writeParcelableArray(
-//                 parcel.as_native_mut(),
-//                 slice.as_ptr() as *const c_void,
-//                 slice.len().try_into().or(Err(StatusCode::BAD_VALUE))?,
-//                 Some(serialize_element::<Self>),
-//             )
-//         };
-//         status_result(res)
-//     }
-// }
-
-// /// Helper trait for types that can be deserialized as arrays.
-// /// Defaults to calling Deserialize::deserialize() manually for every element,
-// /// but can be overridden for custom implementations like `readByteArray`.
-// pub trait DeserializeArray: Deserialize {
-//     /// Deserialize an array of type from the given parcel.
-//     fn deserialize_array(parcel: &BorrowedParcel<'_>) -> Result<Option<Vec<Self>>> {
-//         let mut vec: Option<Vec<MaybeUninit<Self>>> = None;
-//         let res = unsafe {
-//             // Safety: Safe FFI, vec is the correct opaque type expected by
-//             // allocate_vec and deserialize_element.
-//             sys::AParcel_readParcelableArray(
-//                 parcel.as_native(),
-//                 &mut vec as *mut _ as *mut c_void,
-//                 Some(allocate_vec::<Self>),
-//                 Some(deserialize_element::<Self>),
-//             )
-//         };
-//         status_result(res)?;
-//         let vec: Option<Vec<Self>> = unsafe {
-//             // Safety: We are assuming that the NDK correctly initialized every
-//             // element of the vector by now, so we know that all the
-//             // MaybeUninits are now properly initialized. We can transmute from
-//             // Vec<MaybeUninit<T>> to Vec<T> because MaybeUninit<T> has the same
-//             // alignment and size as T, so the pointer to the vector allocation
-//             // will be compatible.
-//             mem::transmute(vec)
-//         };
-//         Ok(vec)
-//     }
-// }
-
-
-// /// Helper trait for types that can be nullable when serialized.
-// // We really need this trait instead of implementing `Serialize for Option<T>`
-// // because of the Rust orphan rule which prevents us from doing
-// // `impl Serialize for Option<&dyn IFoo>` for AIDL interfaces.
-// // Instead we emit `impl SerializeOption for dyn IFoo` which is allowed.
-// // We also use it to provide a default implementation for AIDL-generated
-// // parcelables.
-// pub trait SerializeOption: Serialize {
-//     /// Serialize an Option of this type into the given parcel.
-//     fn serialize_option(this: Option<&Self>, parcel: &mut BorrowedParcel<'_>) -> Result<()> {
-//         if let Some(inner) = this {
-//             parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
-//             parcel.write(inner)
-//         } else {
-//             parcel.write(&NULL_PARCELABLE_FLAG)
-//         }
-//     }
-// }
-
-// /// Helper trait for types that can be nullable when deserialized.
-// pub trait DeserializeOption: Deserialize {
-//     /// Deserialize an Option of this type from the given parcel.
-//     fn deserialize_option(parcel: &BorrowedParcel<'_>) -> Result<Option<Self>> {
-//         let null: i32 = parcel.read()?;
-//         if null == NULL_PARCELABLE_FLAG {
-//             Ok(None)
-//         } else {
-//             parcel.read().map(Some)
-//         }
-//     }
-
-//     /// Deserialize an Option of this type from the given parcel onto the
-//     /// current object. This operation will overwrite the current value
-//     /// partially or completely, depending on how much data is available.
-//     fn deserialize_option_from(this: &mut Option<Self>, parcel: &BorrowedParcel<'_>) -> Result<()> {
-//         *this = Self::deserialize_option(parcel)?;
-//         Ok(())
-//     }
-// }
-
 macro_rules! parcelable_primitives {
     {
         $(
@@ -499,8 +403,6 @@ macro_rules! impl_parcelable_struct {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 parcel.write_aligned(self);
-                // const SIZE: usize = std::mem::size_of::<$ty>();
-                // parcel.write_aligned_data(unsafe { std::mem::transmute::<&$ty, &[u8;SIZE]>(self) });
                 Ok(())
             }
         }
@@ -583,23 +485,6 @@ impl Serialize for flat_binder_object {
     }
 }
 
-// impl Deserialize for *const dyn IBinder {
-//     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-//         let data = parcel.read::<u128>()?;
-//         let ptr = unsafe {std::mem::transmute::<u128, *const dyn IBinder>(data)};
-//         Ok(ptr)
-//     }
-// }
-
-// impl Serialize for *const dyn IBinder {
-//     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-//         let data = unsafe {std::mem::transmute::<&*const dyn IBinder, &u128>(self)};
-//         parcel.write::<u128>(data)?;
-//         Ok(())
-//     }
-// }
-
-
 impl Serialize for StrongIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         parcel.write::<flat_binder_object>(&self.into())?;
@@ -648,17 +533,6 @@ impl DeserializeOption for StrongIBinder {
 }
 
 impl DeserializeArray for StrongIBinder {}
-
-// impl DeserializeOption for StrongIBinder {
-//     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
-//         if let Some(inner) = this {
-//             parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
-//             parcel.write(inner)
-//         } else {
-//             parcel.write(&NULL_PARCELABLE_FLAG)
-//         }
-//     }
-// }
 
 /// Flag that specifies that the following parcelable is present.
 ///
@@ -894,30 +768,3 @@ impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
         vec.try_into().or(Err(StatusCode::BadValue))
     }
 }
-
-// impl<T: SerializeOption> SerializeOption for Box<T> {
-//     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
-//         SerializeOption::serialize_option(this.map(|inner| &**inner), parcel)
-//     }
-// }
-
-// impl<T: DeserializeOption> DeserializeOption for Box<T> {
-//     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-//         DeserializeOption::deserialize_option(parcel).map(|t| t.map(Box::new))
-//     }
-// }
-
-
-// impl Deserialize for binder_transaction_data_secctx {
-//     fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
-//         const SIZE: usize = std::mem::size_of::<binder_transaction_data_secctx>();
-//         Ok(unsafe { std::mem::transmute::<[u8; SIZE], Self>(parcel.try_into()?) })
-//     }
-// }
-
-// impl Deserialize for binder_transaction_data {
-//     fn deserialize(parcel: &ReadableParcel<'_>) -> Result<Self> {
-//         todo!("Deserialize for binder::binder_transaction_data")
-//         // Ok(<i32>::from_ne_bytes(parcel.try_into()?) != 0)
-//     }
-// }

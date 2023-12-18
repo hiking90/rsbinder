@@ -1,3 +1,6 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::parser::*;
 use crate::const_expr::{ValueType, ConstExpr};
 
@@ -130,26 +133,26 @@ impl TypeGenerator {
         let sub_type = self.array_types.first().expect("array_types is empty.");
         match self.direction {
             Direction::Out => {
-                format!("Vec<Option<{}>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                format!("Vec<Option<{}>>", Self::type_decl(sub_type))
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("Vec<Option<{}>>", Self::type_decl(sub_type))
                 } else {
-                    format!("Vec<{}>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("Vec<{}>", Self::type_decl(sub_type))
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("Vec<Option<{}>>", Self::type_decl(sub_type))
                 } else {
-                    format!("Vec<{}>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("Vec<{}>", Self::type_decl(sub_type))
                 }
             }
         }
     }
 
-    fn type_decl(value_type: &ValueType, sub_value: Option<&ValueType>) -> String {
+    fn type_decl(value_type: &ValueType) -> String {
         match value_type {
             ValueType::Void => "()".into(),
             ValueType::String(_) => "String".into(),
@@ -161,8 +164,9 @@ impl TypeGenerator {
             ValueType::Bool(_) => "bool".into(),
             ValueType::Char(_) => "u16".into(),
             ValueType::Array(_) => {
-                // Vec<> is managed other functions. So, it just return sub_value type.
-                Self::type_decl(sub_value.expect("Array must know the type of item."), None)
+                // Vec<> is managed other functions. Therefore, here we just use a panic.
+                panic!("type_decl() can't process Array Type.")
+                // Self::type_decl(sub_value.expect("Array must know the type of item."), None)
             }
             ValueType::IBinder => "rsbinder::StrongIBinder".into(),
             ValueType::FileDescriptor => "rsbinder::ParcelFileDescriptor".into(),
@@ -175,7 +179,7 @@ impl TypeGenerator {
     pub fn type_declaration(&self) -> String {
         let name = match &self.value_type {
             ValueType::Array(_) => self.list_type_decl(),
-            _ => Self::type_decl(&self.value_type, None),
+            _ => Self::type_decl(&self.value_type),
         };
 
         if self.is_nullable {
@@ -190,23 +194,23 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(sub_type))
                 } else {
-                    format!("&mut Vec<Option<{}>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("&mut Vec<Option<{}>>", Self::type_decl(sub_type))
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(sub_type))
                 } else {
-                    format!("&mut Vec<{}>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("&mut Vec<{}>", Self::type_decl(sub_type))
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<&[Option<{}>]>", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("Option<&[Option<{}>]>", Self::type_decl(sub_type))
                 } else {
-                    format!("&[{}]", Self::type_decl(&self.value_type, Some(sub_type)))
+                    format!("&[{}]", Self::type_decl(sub_type))
                 }
             }
         }
@@ -214,7 +218,7 @@ impl TypeGenerator {
 
     pub fn type_decl_for_func(&self) -> String {
         if self.value_type.is_primitive() {
-            Self::type_decl(&self.value_type, None)
+            Self::type_decl(&self.value_type)
         } else {
             match &self.value_type {
                 ValueType::String(_) => {
@@ -226,7 +230,7 @@ impl TypeGenerator {
                 }
                 ValueType::Array(_) => self.func_list_type_decl(),
                 _  => {
-                    let name = Self::type_decl(&self.value_type, None);
+                    let name = Self::type_decl(&self.value_type);
                     if self.is_nullable {
                         format!("Option<&{name}>")
                     } else {
