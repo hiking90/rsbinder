@@ -3,7 +3,7 @@
 
 use std::mem::ManuallyDrop;
 use crate::{
-    sys::binder::{flat_binder_object},
+    sys::binder::flat_binder_object,
     binder,
     proxy,
     process_state,

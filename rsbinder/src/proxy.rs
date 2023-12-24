@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::any::Any;
-use std::sync::{Mutex, Arc};
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     parcel::*,

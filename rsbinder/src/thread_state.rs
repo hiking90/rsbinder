@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-use std::{mem::ManuallyDrop, os::unix::process};
+use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering;
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
