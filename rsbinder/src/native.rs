@@ -83,14 +83,14 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
 }
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
-    fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn link_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
         todo!("link_to_death")
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
+    fn unlink_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
         todo!("unlink_to_death")
     }
 

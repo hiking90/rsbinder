@@ -18,10 +18,9 @@
  */
 
 use std::ops::Deref;
-use std::sync::atomic::*;
+use std::sync::{Arc, atomic::*};
 
 use std::any::Any;
-use std::sync::{Arc};
 use std::fs::File;
 use std::fmt::Debug;
 use crate::{
@@ -128,8 +127,8 @@ pub trait Interface: Send + Sync {
 // }
 
 
-pub trait DeathRecipient {
-    fn binder_died(&mut self, who: WeakIBinder);
+pub trait DeathRecipient: Send + Sync {
+    fn binder_died(&self, who: WeakIBinder);
 }
 
 /// Interface of binder local or remote objects.
@@ -148,12 +147,12 @@ pub trait IBinder: Send + Sync {
     /// INVALID_OPERATION code being returned and nothing happening.
     ///
     /// This link always holds a weak reference to its recipient.
-    fn link_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()>;
+    fn link_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, recipient: &mut dyn DeathRecipient) -> Result<()>;
+    fn unlink_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()>;
 
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;

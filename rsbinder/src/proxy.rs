@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::any::Any;
+use std::sync::{Mutex, Arc};
+use std::collections::HashMap;
 
 use crate::{
     parcel::*,
     binder::*,
     error::*,
-    thread_state,
+    thread_state, process_state,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,16 +51,79 @@ impl ProxyHandle {
     }
 }
 
+pub(crate) struct ProxyInternal {
+    handle: u32,
+    weak: WeakIBinder,
+    obituary_sent: bool,
+    recipients: Vec<Arc<dyn DeathRecipient>>,
+}
+
+impl ProxyInternal {
+    pub(crate) fn new(handle: u32, descriptor: &str) -> Self {
+        Self {
+            handle,
+            weak: WeakIBinder::new(ProxyHandle::new(handle, descriptor), descriptor),
+            obituary_sent: false,
+            recipients: Vec::new(),
+        }
+    }
+
+    pub(crate) fn weak(&self) -> WeakIBinder {
+        self.weak.clone()
+    }
+
+    pub(crate) fn link_to_death(&mut self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        if self.obituary_sent {
+            return Err(StatusCode::DeadObject);
+        } else {
+            if self.recipients.is_empty() {
+                thread_state::request_death_notification(self.handle)?;
+                thread_state::flush_commands()?;
+            }
+            self.recipients.push(recipient);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unlink_to_death(&mut self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        if self.obituary_sent {
+            return Err(StatusCode::DeadObject);
+        } else {
+            self.recipients.retain(|r| !Arc::ptr_eq(r, &recipient));
+            if self.recipients.is_empty() {
+                thread_state::clear_death_notification(self.handle)?;
+                thread_state::flush_commands()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_obituary(&mut self) -> Result<()> {
+        self.obituary_sent = true;
+        if !self.recipients.is_empty() {
+            thread_state::clear_death_notification(self.handle)?;
+            thread_state::flush_commands()?;
+        }
+
+        for recipient in self.recipients.iter() {
+            recipient.binder_died(self.weak.clone());
+        }
+
+        Ok(())
+    }
+}
+
 impl IBinder for ProxyHandle {
-    fn link_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
-        todo!("IBinder for Proxy<I> - link_to_death")
+    /// Register a death notification for this object.
+    fn link_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        process_state::ProcessState::as_self().link_to_death_for_handle(self.handle, recipient)
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&mut self, _recipient: &mut dyn DeathRecipient) -> Result<()> {
-        todo!("IBinder for Proxy<I> - unlink_to_death")
+    fn unlink_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        process_state::ProcessState::as_self().unlink_to_death_for_handle(self.handle, recipient)
     }
 
     /// Send a ping transaction to this object

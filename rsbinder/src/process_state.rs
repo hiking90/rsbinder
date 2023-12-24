@@ -1,14 +1,12 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc};
+use std::sync::{Arc, RwLock, OnceLock};
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::os::unix::io::{AsRawFd};
-use std::sync::{RwLock};
+use std::os::unix::io::AsRawFd;
 use std::thread;
 
 use crate::{
@@ -45,7 +43,7 @@ pub struct ProcessState {
     driver: Arc<File>,
     mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<Arc<dyn Transactable>>>,
-    handle_to_object: RwLock<HashMap<u32, WeakIBinder>>,
+    handle_to_proxy: RwLock<HashMap<u32, ProxyInternal>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
@@ -105,7 +103,7 @@ impl ProcessState {
             driver: driver.into(),
             mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1 }),
             context_manager: RwLock::new(None),
-            handle_to_object: RwLock::new(HashMap::new()),
+            handle_to_proxy: RwLock::new(HashMap::new()),
             disable_background_scheduling: AtomicBool::new(false),
             call_restriction: RwLock::new(CallRestriction::None),
             thread_pool_started: AtomicBool::new(false),
@@ -157,8 +155,8 @@ impl ProcessState {
     }
 
     pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<StrongIBinder> {
-        if let Some(weak) = self.handle_to_object.read().unwrap().get(&handle) {
-            return Ok(weak.upgrade())
+        if let Some(proxy) = self.handle_to_proxy.read().unwrap().get(&handle) {
+            return Ok(proxy.weak().upgrade())
         }
 
         if handle == 0 {
@@ -172,11 +170,37 @@ impl ProcessState {
 
         let interface = thread_state::query_interface(handle)?;
 
-        let weak = WeakIBinder::new(ProxyHandle::new(handle, &interface), &interface);
+        let proxy = ProxyInternal::new(handle, &interface);
+        let weak = proxy.weak();
 
-        self.handle_to_object.write().unwrap().insert(handle, weak.clone());
+        self.handle_to_proxy.write().unwrap().insert(handle, proxy);
 
         Ok(weak.upgrade())
+    }
+
+    pub(crate) fn link_to_death_for_handle(&self, handle: u32, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        if let Some(proxy) = self.handle_to_proxy.write().unwrap().get_mut(&handle) {
+            proxy.link_to_death(recipient)
+        } else {
+            Err(StatusCode::BadValue)
+        }
+    }
+
+    pub(crate) fn unlink_to_death_for_handle(&self, handle: u32, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        if let Some(proxy) = self.handle_to_proxy.write().unwrap().get_mut(&handle) {
+            proxy.unlink_to_death(recipient)
+        } else {
+            Err(StatusCode::BadValue)
+        }
+    }
+
+    pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
+        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+        if let Some(proxy) = handle_to_proxy.get_mut(&handle) {
+            proxy.send_obituary()?;
+        }
+        handle_to_proxy.remove(&handle);
+        Ok(())
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {

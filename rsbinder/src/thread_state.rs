@@ -17,11 +17,12 @@
  * limitations under the License.
  */
 
-use std::mem::ManuallyDrop;
-use std::sync::{atomic::Ordering};
+use std::{mem::ManuallyDrop, os::unix::process};
+use std::sync::atomic::Ordering;
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use log::error;
+use std::backtrace::Backtrace;
 
 use crate::{
     parcel::*,
@@ -331,7 +332,7 @@ pub fn setup_polling() -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
-    flash_commands()?;
+    flush_commands()?;
     Ok(())
 }
 
@@ -355,7 +356,12 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
 
             match cmd {
                 binder::BR_ONEWAY_SPAM_SUSPECT => {
-                    todo!("wait_for_response - BR_ONEWAY_SPAM_SUSPECT");
+                    log::error!("Process seems to be sending too many oneway calls.");
+                    log::error!("{}", Backtrace::capture());
+
+                    if let UntilResponse::TransactionComplete = until {
+                        break
+                    }
                 },
                 binder::BR_TRANSACTION_COMPLETE => {
                     if let UntilResponse::TransactionComplete = until {
@@ -363,13 +369,13 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     }
                 }
                 binder::BR_DEAD_REPLY => {
-                    todo!("wait_for_response - BR_DEAD_REPLY");
+                    return Err(StatusCode::DeadObject);
                 },
                 binder::BR_FAILED_REPLY => {
-                    todo!("wait_for_response - BR_FAILED_REPLY");
+                    return Err(StatusCode::FailedTransaction);
                 },
                 binder::BR_FROZEN_REPLY => {
-                    todo!("wait_for_response - BR_FROZEN_REPLY");
+                    return Err(StatusCode::FailedTransaction);
                 },
                 binder::BR_ACQUIRE_RESULT => {
                     let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
@@ -479,8 +485,8 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 let mut reply = Parcel::new();
 
-                let result = unsafe {
-                    let target_ptr = tr_secctx.transaction_data.target.ptr;
+                let result = {
+                    let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     // reader.set_data_position(0);
                     if target_ptr != 0 {
                         let weak = raw_pointer_to_weak_binder(target_ptr);
@@ -600,10 +606,22 @@ fn execute_command(cmd: i32) -> Result<()> {
                 return Err(StatusCode::TimedOut);
             }
             binder::BR_DEAD_BINDER => {
-                todo!("Bexecute_command - R_DEAD_BINDER");
+                let handle = {
+                    let mut state = thread_state.borrow_mut();
+                    state.in_parcel.read::<binder::binder_uintptr_t>()?
+                };
+
+                ProcessState::as_self().send_obituary_for_handle(handle as _)?;
+
+                {
+                    let mut state = thread_state.borrow_mut();
+                    state.out_parcel.write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
+                    state.out_parcel.write::<binder::binder_uintptr_t>(&handle)?;
+                }
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
-                todo!("execute_command - BR_CLEAR_DEATH_NOTIFICATION_DONE");
+                let mut state = thread_state.borrow_mut();
+                state.in_parcel.read::<binder::binder_uintptr_t>()?;
             }
             binder::BR_FAILED_REPLY => {
                 todo!("execute_command - BR_FAILED_REPLY");
@@ -713,12 +731,13 @@ fn get_and_execute_command() -> Result<()> {
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
         thread_state.borrow_mut().in_parcel.read::<i32>()
     })?;
+    println!("get_and_execute_command: 0x{:X}", cmd);
     execute_command(cmd)?;
 
     Ok(())
 }
 
-fn flash_commands() -> Result<()> {
+pub(crate) fn flush_commands() -> Result<()> {
     talk_with_driver(false)?;
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -826,7 +845,7 @@ pub fn flash_if_needed() -> Result<bool> {
         }
 
         thread_state.borrow_mut().is_flushing = true;
-        flash_commands()?;
+        flush_commands()?;
         thread_state.borrow_mut().is_flushing = false;
 
         Ok(true)
@@ -841,7 +860,7 @@ pub fn handle_commands() -> Result<()> {
             !thread_state.borrow().in_parcel.is_empty()
         })
     } {
-        flash_commands()?;
+        flush_commands()?;
     }
     Ok(())
 }
@@ -991,6 +1010,38 @@ pub fn join_thread_pool(is_main: bool) -> Result<()> {
 
         talk_with_driver(false)?;
         ProcessState::as_self().current_threads.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    })
+}
+
+pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
+    log::trace!("request_death_notification: {handle}");
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        {
+            let mut state = thread_state.borrow_mut();
+
+            state.out_parcel.write::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
+            state.out_parcel.write::<u32>(&(handle))?;
+            // Android binder calls writePointer(proxy) here, but we just write handle.
+            state.out_parcel.write::<binder::binder_uintptr_t>(&(handle as _))?;
+        }
+
+        Ok(())
+    })
+}
+
+pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
+    log::trace!("clear_death_notification: {handle}");
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        {
+            let mut state = thread_state.borrow_mut();
+
+            state.out_parcel.write::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
+            state.out_parcel.write::<u32>(&(handle))?;
+            // Android binder calls writePointer(proxy) here, but we just write handle.
+            state.out_parcel.write::<binder::binder_uintptr_t>(&(handle as _))?;
+        }
+
         Ok(())
     })
 }

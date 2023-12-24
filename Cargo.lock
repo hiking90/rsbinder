@@ -884,7 +884,6 @@ name = "rsbinder"
 version = "0.1.0"
 dependencies = [
  "downcast-rs",
- "lazy_static",
  "libc",
  "log",
  "nix",
