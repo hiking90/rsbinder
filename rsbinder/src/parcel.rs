@@ -275,7 +275,7 @@ impl Parcel {
         let obj: flat_binder_object = self.read_aligned_data(size)?.as_ptr().into();
 
         // __bindgen_anon_1 is union type. So, unsafe block is required to read member variable.
-        if !null_meta && obj.cookie == 0 && obj.binder() == 0 {
+        if !null_meta && obj.cookie == 0 && obj.pointer() == 0 {
             return Ok(obj);
         }
 
@@ -343,7 +343,7 @@ impl Parcel {
         let data_pos = self.pos;
         self.write_aligned(obj);
 
-        if null_meta || obj.binder() != 0 {
+        if null_meta || obj.pointer() != 0 {
             obj.acquire();
             self.objects.push(data_pos as _);
         }

@@ -19,14 +19,14 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.handle }
     }
 
-    pub(crate) fn binder(&self) -> binder_uintptr_t {
+    pub(crate) fn pointer(&self) -> binder_uintptr_t {
         unsafe { self.__bindgen_anon_1.binder }
     }
 
     pub(crate) fn acquire(&self) {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
-                if self.binder() != 0 {
+                if self.pointer() != 0 {
                     let strong = raw_pointer_to_strong_binder(self.cookie);
                     strong.increase();
                 }
@@ -51,7 +51,7 @@ impl flat_binder_object {
     pub(crate) fn release(&self) {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
-                if self.binder() != 0 {
+                if self.pointer() != 0 {
                     let strong = raw_pointer_to_strong_binder(self.cookie);
                     strong.decrease();
                 }
@@ -138,14 +138,15 @@ impl From<*const u8> for flat_binder_object {
 }
 
 pub(crate) fn raw_pointer_to_weak_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::WeakIBinder>> {
+    assert!(raw_pointer != 0, "raw_pointer_to_weak_binder(): raw_pointer is null");
     unsafe {
         ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::WeakIBinder))
     }
 }
 
 pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::StrongIBinder>> {
+    assert!(raw_pointer != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
     unsafe {
         ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::StrongIBinder))
     }
-
 }

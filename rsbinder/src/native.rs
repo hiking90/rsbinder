@@ -84,19 +84,19 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
     fn link_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        todo!("link_to_death")
+        Err(StatusCode::InvalidOperation)
     }
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
     fn unlink_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        todo!("unlink_to_death")
+        Err(StatusCode::InvalidOperation)
     }
 
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()> {
-        todo!("ping_binder");
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {

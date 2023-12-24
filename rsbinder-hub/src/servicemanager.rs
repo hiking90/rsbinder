@@ -43,5 +43,68 @@ pub fn default() -> Arc<BpServiceManager> {
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
 pub fn get_service(name: &str) -> Option<StrongIBinder> {
-    default().getService(name).unwrap()
+    match default().getService(name) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to get service {}: {}", name, err);
+            None
+        }
+    }
+}
+
+pub fn check_service(name: &str) -> Option<StrongIBinder> {
+    match default().checkService(name) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to check service {}: {}", name, err);
+            None
+        }
+    }
+}
+
+pub fn list_services(dump_priority: i32) -> Vec<String> {
+    match default().listServices(dump_priority) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to list services: {}", err);
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use env_logger;
+
+    fn setup() {
+        env_logger::init();
+        rsbinder::ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 0);
+    }
+
+    #[test]
+    fn test_get_check_list_service() -> rsbinder::Result<()> {
+        setup();
+
+        #[cfg(target_os = "android")]
+        {
+            let manager_name = "manager";
+            let binder = get_service(manager_name);
+            assert!(binder.is_some());
+
+            let binder = check_service(manager_name);
+            assert!(binder.is_some());
+        }
+
+        let unknown_name = "unknown_service";
+        let binder = get_service(unknown_name);
+        assert!(binder.is_none());
+        let binder = check_service(unknown_name);
+        assert!(binder.is_none());
+
+        let services = list_services(DUMP_FLAG_PRIORITY_DEFAULT);
+        assert!(services.len() > 0);
+
+        Ok(())
+    }
 }

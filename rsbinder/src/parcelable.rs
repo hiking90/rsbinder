@@ -502,20 +502,35 @@ impl SerializeArray for StrongIBinder {}
 
 impl Deserialize for StrongIBinder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        match DeserializeOption::deserialize_option(parcel) {
+            Ok(Some(binder)) => Ok(binder),
+            Ok(None) => Err(StatusCode::UnexpectedNull),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl DeserializeOption for StrongIBinder {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let flat: flat_binder_object = parcel.read()?;
         let _stability: i32 = parcel.read()?;
 
         match flat.header_type() {
             BINDER_TYPE_BINDER => {
-                let weak = raw_pointer_to_weak_binder(flat.binder());
-                let strong = weak.upgrade();
-                Ok(strong)
+                let pointer = flat.pointer();
+                if pointer != 0 {
+                    let weak = raw_pointer_to_weak_binder(flat.pointer());
+                    let strong = weak.upgrade();
+                    Ok(Some(strong))    
+                } else {
+                    Ok(None)
+                }
             }
 
             BINDER_TYPE_HANDLE => {
                 let res = ProcessState::as_self()
                     .strong_proxy_for_handle(flat.handle());
-                Ok(res?)
+                Ok(Some(res?))
             }
 
             _ => {
@@ -523,12 +538,6 @@ impl Deserialize for StrongIBinder {
                 Err(StatusCode::BadType)
             }
         }
-    }
-}
-
-impl DeserializeOption for StrongIBinder {
-    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        Ok(Some(parcel.read()?))
     }
 }
 

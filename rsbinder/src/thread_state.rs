@@ -393,14 +393,12 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                 binder::BR_REPLY => {
                     let tr = thread_state.borrow_mut().in_parcel.read::<binder::binder_transaction_data>()?;
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
-
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
                             let reply = Parcel::from_ipc_parts(buffer as _, tr.data_size as _,
                                 offsets as _,
                                 (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
                                 free_buffer);
-
                             return Ok(Some(reply));
                         } else {
                             let status: StatusCode = unsafe { (*(buffer as *const i32)).into() };
@@ -919,7 +917,7 @@ pub fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result
             _ => (),
         }
 
-        reply = wait_for_response(UntilResponse::Reply)?
+        reply = wait_for_response(UntilResponse::Reply)?;
     } else {
         wait_for_response(UntilResponse::TransactionComplete)?;
     }

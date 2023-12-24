@@ -15,6 +15,7 @@ os_name=$(uname)
 if [ "$os_name" = "Darwin" ]; then
     export ANDROID_HOME=$HOME/Library/Android/sdk
 elif [ "$os_name" = "Linux" ]; then
+    export ANDROID_HOME=$HOME/Android/Sdk
 fi
 
 if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then

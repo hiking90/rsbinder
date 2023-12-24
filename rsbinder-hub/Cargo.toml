@@ -9,6 +9,7 @@ edition = "2021"
 lazy_static = "1"
 rsbinder = { path = "../rsbinder" }
 env_logger = "0"
+log = "0.4"
 
 [build-dependencies]
 # aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }
