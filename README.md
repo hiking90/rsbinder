@@ -1,8 +1,9 @@
 # rsbinder
 **rsbinder** is a tool and library for utilizing Android's binder IPC, implemented purely in Rust language.
 
-Android's binder IPC has been integrated into the Linux kernel. However, Android's binder IPC is not widely used in Linux.
-This is believed to be due to a lack of support for Linux, which led to the initiation of **rsbinder** project.
+Android's binder IPC has been integrated into the Linux kernel in 2015. However, Android's binder IPC is not widely used in Linux.
+
+This is thought to stem from the insufficient availability of libraries and tools for Linux, prompting the launch of the **rsbinder** project.
 
 ## Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
@@ -18,9 +19,10 @@ The source code still contains many todo!() macros, and the release of version 0
 
 ## Todo
 - [ ] Remove all todo!() macros.
-- [ ] Enhance error detection in AIDL code generator
 - [ ] Implement Service Manager for Linux
-- [ ] Add test cases for Binder IPC
+- [ ] Add more test cases for Binder IPC
+- [ ] Enhance error detection in AIDL code generator
+- [ ] Support MAC likes selinux and AppArmor.
 
 ## License
 **rsbinder** is licensed under the **Apache License version 2.0**.

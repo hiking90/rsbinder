@@ -219,9 +219,9 @@ impl Parcel {
     pub fn close_file_descriptors(&self) {
         for offset in self.objects.as_slice() {
             unsafe {
-                let flat: flat_binder_object = self.data.as_ptr().add(*offset as _).into();
-                if flat.header_type() == BINDER_TYPE_FD {
-                    libc::close(flat.handle() as _);
+                let obj: flat_binder_object = self.data.as_ptr().add(*offset as _).into();
+                if obj.header_type() == BINDER_TYPE_FD {
+                    libc::close(obj.handle() as _);
                 }
             }
         }
@@ -380,7 +380,7 @@ impl Parcel {
         }
 
         for pos in self.objects.as_slice() {
-            let obj: &flat_binder_object = unsafe { &*(self.data.as_ptr().add(*pos as _) as *const flat_binder_object) };
+            let obj: flat_binder_object = unsafe { self.data.as_ptr().add(*pos as _).into() };
             obj.release();
         }
     }

@@ -17,6 +17,10 @@ pub use android::os::IServiceManager::{
     DUMP_FLAG_PROTO,
 };
 
+pub use android::os::IServiceCallback::{
+    IServiceCallback, BnServiceCallback,
+};
+
 static INIT: Once = Once::new();
 static mut GLOBAL_SM: Option<Arc<BpServiceManager>> = None;  // Assume SM is i32 for simplicity
 static IS_INIT: AtomicBool = AtomicBool::new(false);
@@ -72,14 +76,38 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
     }
 }
 
+pub fn register_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
+    default().registerForNotifications(name, callback)
+}
+
+pub fn unregister_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
+    default().unregisterForNotifications(name, callback)
+}
+
+pub fn is_declared(name: &str) -> bool {
+    match default().isDeclared(name) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to is_declared({}): {}", name, err);
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
     use env_logger;
+    use std::sync::OnceLock;
 
     fn setup() {
-        env_logger::init();
-        rsbinder::ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 0);
+        static INIT: OnceLock<bool> = OnceLock::new();
+
+        let _ = INIT.get_or_init(|| {
+            env_logger::init();
+            rsbinder::ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 0);
+            true
+        });
     }
 
     #[test]
@@ -104,6 +132,37 @@ mod tests {
 
         let services = list_services(DUMP_FLAG_PRIORITY_DEFAULT);
         assert!(services.len() > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_notifications() -> rsbinder::Result<()> {
+        setup();
+
+        struct MyServiceCallback {}
+        impl rsbinder::Interface for MyServiceCallback {}
+        impl IServiceCallback for MyServiceCallback {
+            fn onRegistration(&self, name: &str, service: &rsbinder::StrongIBinder) -> rsbinder::Result<()> {
+                println!("onRegistration: {} {:?}", name, service);
+                Ok(())
+            }
+        }
+
+        let callback = BnServiceCallback::new_binder(MyServiceCallback{});
+
+        register_for_notifications("mytest_service", &callback)?;
+
+        unregister_for_notifications("mytest_service", &callback)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_others() -> rsbinder::Result<()> {
+        setup();
+
+        assert!(is_declared("android.hardware.usb.IUsb/default"));
 
         Ok(())
     }
