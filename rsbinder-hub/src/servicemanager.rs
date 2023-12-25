@@ -56,6 +56,9 @@ pub fn get_service(name: &str) -> Option<StrongIBinder> {
     }
 }
 
+/// Retrieve an existing service called @a name from the service
+/// manager. Non-blocking. Returns null if the service does not
+/// exist.
 pub fn check_service(name: &str) -> Option<StrongIBinder> {
     match default().checkService(name) {
         Ok(result) => result,
@@ -66,6 +69,7 @@ pub fn check_service(name: &str) -> Option<StrongIBinder> {
     }
 }
 
+/// Return a list of all currently running services.
 pub fn list_services(dump_priority: i32) -> Vec<String> {
     match default().listServices(dump_priority) {
         Ok(result) => result,
@@ -76,14 +80,19 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
     }
 }
 
+/// Request a callback when a service is registered.
 pub fn register_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
     default().registerForNotifications(name, callback)
 }
 
+/// Unregisters all requests for notifications for a specific callback.
 pub fn unregister_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
     default().unregisterForNotifications(name, callback)
 }
 
+/// Returns whether a given interface is declared on the device, even if it
+/// is not started yet. For instance, this could be a service declared in the VINTF
+/// manifest.
 pub fn is_declared(name: &str) -> bool {
     match default().isDeclared(name) {
         Ok(result) => result,

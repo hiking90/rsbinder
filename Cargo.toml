@@ -5,6 +5,7 @@ members = [
     "rsbinder",
     "rsbinder-aidl",
     "rsbinder-hub",
+    "rsbinder-tools",
     "example-hello",
     "examples",
 ]
