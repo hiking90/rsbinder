@@ -140,7 +140,7 @@ macro_rules! declare_binder_interface {
         impl $native {
             /// Create a new binder service.
             pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
-                let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
+                    let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
                 std::sync::Arc::new(binder)
             }
         }

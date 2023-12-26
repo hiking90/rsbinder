@@ -31,7 +31,7 @@ pub use parcelable_holder::ParcelableHolder;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
-
+pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 
 #[cfg(test)]
 mod tests {

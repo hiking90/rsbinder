@@ -502,7 +502,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                         }
                     } else {
                         let context = ProcessState::as_self().context_manager().expect("Transactable is None.");
-                        context.transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
+                        context.as_transactable().expect("Transactable is None.").transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
                     }
                 };
                 let flags = tr_secctx.transaction_data.flags;

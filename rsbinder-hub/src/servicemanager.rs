@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rsbinder::*;
 pub use android::os::IServiceManager::{
-    IServiceManager, BpServiceManager,
+    IServiceManager, BpServiceManager, BnServiceManager,
     DUMP_FLAG_PRIORITY_CRITICAL,
     DUMP_FLAG_PRIORITY_HIGH,
     DUMP_FLAG_PRIORITY_NORMAL,

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+
 use env_logger;
 use std::process::Command;
 use rsbinder::*;
@@ -21,26 +23,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     env_logger::init();
 
+    let binderfs_path = Path::new(DEFAULT_BINDERFS_PATH);
     let control_path = Path::new(DEFAULT_BINDER_CONTROL_PATH);
 
     // Create binder control path if it doesn't exist.
-    if !control_path.exists() {
-        std::fs::create_dir_all(control_path)?;
+    if !binderfs_path.exists() {
+        println!("{} doesn't exist. Creating...", binderfs_path.display());
+        std::fs::create_dir_all(binderfs_path)?;
     }
 
     // Check if binder control path is a directory.
-    if !control_path.is_dir() {
-        eprintln!("{} is not a directory", DEFAULT_BINDER_CONTROL_PATH);
+    if !binderfs_path.is_dir() {
+        eprintln!("{} is not a directory", DEFAULT_BINDERFS_PATH);
         return Ok(())
     }
 
     // Mount binderfs if it is not mounted.
     if !is_mounted() {
+        println!("Mounting binderfs on {}", DEFAULT_BINDERFS_PATH);
         let status = Command::new("mount")
             .arg("-t")
             .arg("binder")
             .arg("binder")
-            .arg("/dev/binderfs")
+            .arg(DEFAULT_BINDERFS_PATH)
             .status()?;
 
         if status.success() {
@@ -56,6 +61,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     binderfs::add_device(control_path, device_name)
         .map(|(major, minor)| {
             println!("Allocated new binder device with major {}, minor {}, and name {}", major, minor, device_name);
+
+            let device_path = format!("{}/{}", DEFAULT_BINDERFS_PATH, device_name);
+            let mut perms = std::fs::metadata(device_path.as_str()).expect("IO error").permissions();
+            perms.set_mode(0o666);
+            std::fs::set_permissions(device_path.as_str(), perms).expect("IO error");
         })?;
 
     Ok(())

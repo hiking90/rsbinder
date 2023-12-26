@@ -42,7 +42,7 @@ pub struct ProcessState {
     driver_name: PathBuf,
     driver: Arc<File>,
     mmap: RwLock<MemoryMap>,
-    context_manager: RwLock<Option<Arc<dyn Transactable>>>,
+    context_manager: RwLock<Option<StrongIBinder>>,
     handle_to_proxy: RwLock<HashMap<u32, ProxyInternal>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
@@ -124,7 +124,7 @@ impl ProcessState {
         })
     }
 
-    pub fn become_context_manager(&self, transactable: Arc<dyn Transactable>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub fn become_context_manager(&self, binder: StrongIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
@@ -140,12 +140,12 @@ impl ProcessState {
             }
         }
 
-        *self.context_manager.write().unwrap() = Some(transactable);
+        *self.context_manager.write().unwrap() = Some(binder);
 
         Ok(())
     }
 
-    pub fn context_manager(&self) -> Option<Arc<dyn Transactable>> {
+    pub fn context_manager(&self) -> Option<StrongIBinder> {
         self.context_manager.read().unwrap().clone()
     }
 
