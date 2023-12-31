@@ -155,6 +155,10 @@ impl ProcessState {
     }
 
     pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<StrongIBinder> {
+        self.strong_proxy_for_handle_stability(handle, Default::default())
+    }
+
+    pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<StrongIBinder> {
         if let Some(proxy) = self.handle_to_proxy.read().unwrap().get(&handle) {
             return Ok(proxy.weak().upgrade())
         }
@@ -170,7 +174,7 @@ impl ProcessState {
 
         let interface = thread_state::query_interface(handle)?;
 
-        let proxy = ProxyInternal::new(handle, &interface);
+        let proxy = ProxyInternal::new(handle, &interface, stability);
         let weak = proxy.weak();
 
         self.handle_to_proxy.write().unwrap().insert(handle, proxy);

@@ -912,6 +912,7 @@ name = "rsbinder-tools"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "log",
  "nix",
  "rsbinder",
  "rsbinder-hub",

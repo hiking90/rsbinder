@@ -12,7 +12,7 @@ struct IHelloService;
 impl Interface for IHelloService {}
 
 impl IHello for IHelloService {
-    fn echo(&self, echo: &str) -> rsbinder::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
         Ok(echo.to_owned())
     }
 }

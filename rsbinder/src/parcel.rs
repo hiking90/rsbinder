@@ -263,6 +263,7 @@ impl Parcel {
             self.pos = pos + aligned;
             Ok(&self.data.as_slice()[pos .. pos + len])
         } else {
+            log::error!("Not enough data to read aligned data.: {aligned} <= {}", self.data_avail());
             Err(StatusCode::NotEnoughData)
         }
     }
@@ -305,6 +306,7 @@ impl Parcel {
                 return Ok(obj);
             }
         }
+        log::error!("Parcel: unable to find object at index {}", data_pos);
         Err(StatusCode::BadType)
     }
 

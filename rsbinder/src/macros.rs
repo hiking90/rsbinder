@@ -118,8 +118,8 @@ macro_rules! declare_binder_interface {
         }
 
         impl $crate::Proxy for $proxy
-        // where
-        //     $proxy: $interface,
+        where
+            $proxy: $interface,
         {
             fn descriptor() -> &'static str {
                 $descriptor
@@ -140,7 +140,7 @@ macro_rules! declare_binder_interface {
         impl $native {
             /// Create a new binder service.
             pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
-                    let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
+                let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
                 std::sync::Arc::new(binder)
             }
         }
@@ -151,17 +151,25 @@ macro_rules! declare_binder_interface {
             }
 
             fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
-                match $on_transact(&*self.0, code, reader, reply, Self::descriptor()) {
-                    Err($crate::StatusCode::UnexpectedNull) => {
-                        let status: $crate::Status = $crate::ExceptionCode::NullPointer.into();
-                        reply.write(&status)
-                    }
-                    result => result,
-                }
+                $on_transact(&*self.0, code, reader, reply, Self::descriptor())
             }
 
             fn on_dump(&self, _file: &std::fs::File, _args: &[&str]) -> $crate::Result<()> {
                 todo!("on_dump")
+            }
+        }
+
+        impl $crate::FromIBinder for dyn $interface {
+            fn try_from(binder: $crate::StrongIBinder) -> $crate::Result<std::sync::Arc<dyn $interface>> {
+                match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
+                    Ok(proxy) => Ok(std::sync::Arc::new(proxy)),
+                    Err(err) => {
+                        match binder.as_native::<$native>() {
+                            Some(native) => Ok(std::sync::Arc::new(native.clone())),
+                            None => Err(err),
+                        }
+                    }
+                }
             }
         }
 
@@ -376,6 +384,12 @@ mod tests {
     impl IEcho for Binder<BnEcho> {
         fn echo(&self, echo: &str) -> Result<String> {
             self.0.echo(echo)
+        }
+    }
+
+    impl IEcho for BpEcho {
+        fn echo(&self, _echo: &str) -> Result<String> {
+            unimplemented!("echo")
         }
     }
 

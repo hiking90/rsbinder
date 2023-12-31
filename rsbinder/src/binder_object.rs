@@ -10,6 +10,21 @@ use crate::{
     sys::*,
 };
 
+impl Default for flat_binder_object {
+    fn default() -> Self {
+        flat_binder_object {
+            hdr: binder_object_header {
+                type_: BINDER_TYPE_BINDER
+            },
+            flags: 0,
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: 0,
+            },
+            cookie: 0,
+        }
+    }
+}
+
 impl flat_binder_object {
     pub(crate) fn header_type(&self) -> u32 {
         self.hdr.type_

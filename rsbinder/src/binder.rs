@@ -104,27 +104,27 @@ pub trait Interface: Send + Sync {
     }
 }
 
-// ///
-// /// # Example
-// ///
-// /// For Binder interface `IFoo`, the following implementation should be made:
-// /// ```no_run
-// /// # use binder::{FromIBinder, SpIBinder, Result};
-// /// # trait IFoo {}
-// /// impl FromIBinder for dyn IFoo {
-// ///     fn try_from(ibinder: SpIBinder) -> Result<Box<Self>> {
-// ///         // ...
-// ///         # Err(binder::StatusCode::OK)
-// ///     }
-// /// }
-// /// ```
-// pub trait FromIBinder: Interface {
-//     /// Try to interpret a generic Binder object as this interface.
-//     ///
-//     /// Returns a trait object for the `Self` interface if this object
-//     /// implements that interface.
-//     fn try_from(ibinder: Arc<Box<dyn IBinder>>) -> Result<Arc<Self>>;
-// }
+///
+/// # Example
+///
+/// For Binder interface `IFoo`, the following implementation should be made:
+/// ```no_run
+/// # use rsbinder::{FromIBinder, StrongIBinder, Result};
+/// # trait IFoo {}
+/// impl FromIBinder for dyn IFoo {
+///     fn try_from(ibinder: StrongIBinder) -> Result<Box<Self>> {
+///         // ...
+///         # Err(rsbinder::StatusCode::OK)
+///     }
+/// }
+/// ```
+pub trait FromIBinder: Interface {
+    /// Try to interpret a generic Binder object as this interface.
+    ///
+    /// Returns a trait object for the `Self` interface if this object
+    /// implements that interface.
+    fn try_from(ibinder: StrongIBinder) -> Result<Arc<Self>>;
+}
 
 
 pub trait DeathRecipient: Send + Sync {
@@ -157,8 +157,12 @@ pub trait IBinder: Send + Sync {
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;
 
+    /// Retrieve the identifier for this object's Binder
+    fn id(&self) -> u64;
+
     /// To support dynamic interface cast, we need to know the interface
     fn as_any(&self) -> &dyn Any;
+
     /// To convert the interface to a transactable object
     fn as_transactable(&self) -> Option<&dyn Transactable>;
 }
@@ -286,7 +290,7 @@ impl Drop for Inner {
     fn drop(self: &mut Inner) {
         let strong = self.strong.load(Ordering::Relaxed);
         let weak = self.weak.load(Ordering::Relaxed);
-        if strong != 0 || weak != 0{
+        if strong != 0 || weak != 0 {
             log::error!("The Drop of Inner IBinder was called with strong count({strong}) and weak count({weak}).");
         }
         if let Some(proxy) = self.data.as_proxy() {
@@ -321,6 +325,10 @@ impl StrongIBinder {
     pub fn descriptor(&self) -> &str {
         &self.inner.descriptor
     }
+
+    // pub fn stability(&self) -> Stability {
+    //     self.inner.data.stability()
+    // }
 
     pub(crate) fn increase(&self) {
         // In the Android implementation, it simultaneously increases the weak reference,
@@ -414,8 +422,15 @@ impl Deref for StrongIBinder {
     }
 }
 
+impl PartialEq for StrongIBinder {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.data.id() == other.inner.data.id()
+    }
+}
+
+impl Eq for StrongIBinder {}
+
 /// Weak reference to a binder object.
-#[derive(Clone)]
 pub struct WeakIBinder {
     inner: Arc<Inner>,
 }
@@ -433,10 +448,13 @@ impl WeakIBinder {
                 Self { inner: Inner::new(data, true, descriptor) }
             }
         }
+        // Don't increase the weak reference count. Because the weak reference count is increased in the Inner::new().
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
-        Self { inner }
+        let this = Self { inner };
+        this.increase();
+        this
     }
 
     pub(crate) fn increase(&self) {
@@ -444,7 +462,7 @@ impl WeakIBinder {
     }
 
     pub(crate) fn decrease(&self) {
-        self.inner.strong.fetch_sub(1, Ordering::Relaxed);
+        self.inner.weak.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn upgrade(&self) -> StrongIBinder {
@@ -452,10 +470,28 @@ impl WeakIBinder {
     }
 }
 
+impl Clone for WeakIBinder {
+    fn clone(&self) -> Self {
+        Self::new_with_inner(self.inner.clone())
+    }
+}
+
+impl Drop for WeakIBinder {
+    fn drop(&mut self) {
+        self.decrease();
+    }
+}
+
 impl Deref for WeakIBinder {
     type Target = Box<dyn IBinder>;
     fn deref(&self) -> &Self::Target {
         &self.inner.data
+    }
+}
+
+impl PartialEq for WeakIBinder {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.data.id() == other.inner.data.id()
     }
 }
 
@@ -467,7 +503,7 @@ mod tests {
     #[test]
     fn test_strong() -> Result<()> {
         let descriptor = "interface";
-        let strong = StrongIBinder::new(ProxyHandle::new(0, descriptor), descriptor);
+        let strong = StrongIBinder::new(ProxyHandle::new(0, descriptor, Default::default()), descriptor);
         assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
 
         let strong2 = strong.clone();

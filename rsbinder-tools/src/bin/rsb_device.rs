@@ -60,12 +60,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let device_name = args[1].as_str();
     binderfs::add_device(control_path, device_name)
         .map(|(major, minor)| {
-            println!("Allocated new binder device with major {}, minor {}, and name {}", major, minor, device_name);
+            println!("Allocated new binder device with major {major}, minor {minor}, and name [{}]", device_name);
 
             let device_path = format!("{}/{}", DEFAULT_BINDERFS_PATH, device_name);
             let mut perms = std::fs::metadata(device_path.as_str()).expect("IO error").permissions();
             perms.set_mode(0o666);
             std::fs::set_permissions(device_path.as_str(), perms).expect("IO error");
+
+            println!("The permission of device path({}) has been changed to 0666", device_path);
         })?;
 
     Ok(())

@@ -2,10 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
-use rsbinder_hub::IServiceManager;
+use rsbinder_hub::{IServiceManager, IServiceCallback, BnServiceCallback};
 use env_logger::Env;
 use rsbinder::*;
 use example_hello::*;
+
+struct MyServiceCallback {
+}
+
+impl Interface for MyServiceCallback {}
+
+impl IServiceCallback for MyServiceCallback {
+    fn onRegistration(&self, name: &str, service: &StrongIBinder) -> rsbinder::status::Result<()> {
+        println!("MyServiceCallback: {name}");
+        Ok(())
+    }
+}
 
 struct MyDeathRecipient {
 }
@@ -31,8 +43,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("{}", name);
     }
 
+    let service_callback = BnServiceCallback::new_binder(MyServiceCallback{});
+    hub.registerForNotifications(SERVICE_NAME, &service_callback)?;
+
     // Create a Hello proxy from binder service manager.
-    let hello = BpHello::from_binder(rsbinder_hub::get_service(SERVICE_NAME).expect("Can't find {SERVICE_NAME}"))?;
+    let hello = BpHello::from_binder(rsbinder_hub::get_service(SERVICE_NAME)
+        .expect(&format!("Can't find {SERVICE_NAME}")))?;
 
     hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;
 

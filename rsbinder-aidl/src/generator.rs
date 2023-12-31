@@ -163,7 +163,7 @@ pub mod {{mod}} {
     {%- endfor %}
     pub trait {{name}}: rsbinder::Interface + Send {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}>;
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
         {%- endfor %}
         fn getDefaultImpl() -> {{ name }}DefaultRef where Self: Sized {
             DEFAULT_IMPL.lock().unwrap().clone()
@@ -174,8 +174,8 @@ pub mod {{mod}} {
     }
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
-            Err(rsbinder::StatusCode::UnknownTransaction)
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+            Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
         {%- endfor %}
     }
@@ -210,15 +210,19 @@ pub mod {{mod}} {
             {%- endif %}
             Ok(data)
         }
-        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::Result<{{ member.return_type }}> {
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::status::Result<{{ member.return_type }}> {
             {%- if oneway or member.oneway %}
             Ok(())
             {%- else %}
             {%- if member.return_type != "()" %}
             let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
-            Ok(_aidl_return)
+            if _status.is_ok() {
+                let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
+                Ok(_aidl_return)
+            } else {
+                Err(_status)
+            }
             {%- else %}
             let mut _aidl_reply = _aidl_reply.unwrap();
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
@@ -230,7 +234,7 @@ pub mod {{mod}} {
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
             let _aidl_reply = self.handle.submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
             {%- if member.func_call_params|length > 0 %}
@@ -243,7 +247,7 @@ pub mod {{mod}} {
     }
     impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::Result<{{ member.return_type }}> {
+        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             self.0.{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
@@ -261,14 +265,16 @@ pub mod {{mod}} {
                 let {{ decl }};
             {%- endfor %}
                 let _aidl_return = _service.{{ member.identifier }}({{ member.transaction_params }});
-            {%- if member.transaction_has_return %}
+            {%- if not oneway and not member.oneway %}
                 match &_aidl_return {
                     Ok(_aidl_return) => {
-                        _reply.write(&rsbinder::StatusCode::Ok)?;
+                        _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
+                        {%- if member.transaction_has_return %}
                         _reply.write(_aidl_return)?;
                         {%- for arg in member.transaction_write %}
                         _reply.write(&{{ arg }})?;
                         {%- endfor %}
+                        {%- endif %}
                     }
                     Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;

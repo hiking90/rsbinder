@@ -45,11 +45,6 @@ impl<T: Remotable> Binder<T> {
         }
     }
 
-    /// Retrieve the stability of this object.
-    pub fn stability(&self) -> Stability {
-        self.stability
-    }
-
     /// Retrieve the interface descriptor string for this object's Binder
     /// interface.
     pub fn descriptor(&self) -> &'static str {
@@ -76,6 +71,12 @@ impl<T: Remotable> Binder<T> {
     }
 }
 
+impl<T: 'static + Remotable> PartialEq for Binder<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.remotable, &other.remotable)
+    }
+}
+
 impl<T: 'static + Remotable> Interface for Binder<T> {
     fn as_binder(&self) -> StrongIBinder {
         StrongIBinder::new(Box::new((*self).clone()), T::descriptor())
@@ -97,6 +98,15 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()> {
         Ok(())
+    }
+
+    // /// Retrieve the stability of this object.
+    // fn stability(&self) -> Stability {
+    //     self.stability
+    // }
+
+    fn id(&self) -> u64 {
+        Arc::as_ptr(&self.remotable) as u64
     }
 
     fn as_any(&self) -> &dyn Any {

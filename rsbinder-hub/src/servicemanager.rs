@@ -50,7 +50,7 @@ pub fn get_service(name: &str) -> Option<StrongIBinder> {
     match default().getService(name) {
         Ok(result) => result,
         Err(err) => {
-            log::error!("Failed to get service {}: {}", name, err);
+            log::error!("Failed to get service {}: {:?}", name, err);
             None
         }
     }
@@ -82,12 +82,12 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
 
 /// Request a callback when a service is registered.
 pub fn register_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
-    default().registerForNotifications(name, callback)
+    default().registerForNotifications(name, callback).map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
 pub fn unregister_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
-    default().unregisterForNotifications(name, callback)
+    default().unregisterForNotifications(name, callback).map_err(|e| e.into())
 }
 
 /// Returns whether a given interface is declared on the device, even if it
@@ -152,7 +152,7 @@ mod tests {
         struct MyServiceCallback {}
         impl rsbinder::Interface for MyServiceCallback {}
         impl IServiceCallback for MyServiceCallback {
-            fn onRegistration(&self, name: &str, service: &rsbinder::StrongIBinder) -> rsbinder::Result<()> {
+            fn onRegistration(&self, name: &str, service: &rsbinder::StrongIBinder) -> rsbinder::status::Result<()> {
                 println!("onRegistration: {} {:?}", name, service);
                 Ok(())
             }

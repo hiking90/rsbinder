@@ -28,7 +28,7 @@ use crate::{
     parcel::*,
     error::*,
     binder::*,
-    process_state::*,
+    process_state::{*, self},
     sys::*,
     binder_object::*,
 };
@@ -108,9 +108,9 @@ pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 
 #[derive(Debug, Clone, Copy)]
 struct TransactionState {
-    // calling_pid: binder::pid_t,
-    // calling_sid: *const u8,
-    // calling_uid: binder::uid_t,
+    calling_pid: binder::pid_t,
+    calling_sid: *const u8,
+    calling_uid: binder::uid_t,
     // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
     work_source: binder::uid_t,
@@ -120,9 +120,9 @@ struct TransactionState {
 impl TransactionState {
     fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
         TransactionState {
-            // calling_pid: data.transaction_data.sender_pid,
-            // calling_sid: data.secctx as _,
-            // calling_uid: data.transaction_data.sender_euid,
+            calling_pid: data.transaction_data.sender_pid,
+            calling_sid: data.secctx as _,
+            calling_uid: data.transaction_data.sender_euid,
             // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
             work_source: 0,
@@ -515,18 +515,18 @@ fn execute_command(cmd: i32) -> Result<()> {
                     thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply, &status)?;
                     // reply.set_data_size(0);
                     wait_for_response(UntilResponse::TransactionComplete)?;
-                } else if let Err(err) = result {
-                    let mut log = format!(
-                        "oneway function results for code {} on binder at {:X}",
-                        tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
-                    log += &format!(" will be dropped but finished with status {}", err);
-
-                    if reply.data_size() != 0 {
-                        log += &format!(" and reply parcel size {}", reply.data_size());
-                    }
-                    log::error!("{}", log);
                 } else {
-                    unreachable!();
+                    if let Err(err) = result {
+                        let mut log = format!(
+                            "oneway function results for code {} on binder at {:X}",
+                            tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
+                        log += &format!(" will be dropped but finished with status {}", err);
+
+                        if reply.data_size() != 0 {
+                            log += &format!(" and reply parcel size {}", reply.data_size());
+                        }
+                        log::error!("{}", log);
+                    }
                 }
 
                 thread_state.borrow_mut().transaction = transaction_old;
@@ -598,7 +598,7 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_NOOP => {}
             binder::BR_SPAWN_LOOPER => {
-                todo!("execute_command - BR_SPAWN_LOOPER");
+                ProcessState::as_self().spawn_pooled_thread(false);
             }
             binder::BR_FINISHED => {
                 return Err(StatusCode::TimedOut);
@@ -729,7 +729,6 @@ fn get_and_execute_command() -> Result<()> {
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
         thread_state.borrow_mut().in_parcel.read::<i32>()
     })?;
-    println!("get_and_execute_command: 0x{:X}", cmd);
     execute_command(cmd)?;
 
     Ok(())
@@ -1041,5 +1040,27 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
         }
 
         Ok(())
+    })
+}
+
+pub struct CallingContext {
+    pub pid: binder::pid_t,
+    pub uid: binder::uid_t,
+    pub sid: *const u8,
+}
+
+pub fn get_calling_context() -> Result<CallingContext> {
+    THREAD_STATE.with(|thread_state| -> Result<CallingContext> {
+        let thread_state = thread_state.borrow();
+        let transaction = thread_state.transaction.as_ref().ok_or(StatusCode::Unknown)?;
+        let calling_pid = transaction.calling_pid;
+        let calling_uid = transaction.calling_uid;
+        let calling_sid = transaction.calling_sid;
+
+        Ok(CallingContext {
+            pid: calling_pid,
+            uid: calling_uid,
+            sid: calling_sid,
+        })
     })
 }

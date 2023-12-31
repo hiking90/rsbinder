@@ -19,11 +19,11 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    pub fn new(handle: u32, interface: &str) -> Box<Self> {
+    pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Box<Self> {
         Box::new(Self {
             handle,
-            descriptor: interface.to_owned(),
-            stability: Default::default(),
+            descriptor: descriptor.to_owned(),
+            stability,
         })
     }
 
@@ -58,10 +58,10 @@ pub(crate) struct ProxyInternal {
 }
 
 impl ProxyInternal {
-    pub(crate) fn new(handle: u32, descriptor: &str) -> Self {
+    pub(crate) fn new(handle: u32, descriptor: &str, stability: Stability) -> Self {
         Self {
             handle,
-            weak: WeakIBinder::new(ProxyHandle::new(handle, descriptor), descriptor),
+            weak: WeakIBinder::new(ProxyHandle::new(handle, descriptor, stability), descriptor),
             obituary_sent: false,
             recipients: Vec::new(),
         }
@@ -128,6 +128,14 @@ impl IBinder for ProxyHandle {
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()> {
         thread_state::ping_binder(self.handle)
+    }
+
+    // fn stability(&self) -> Stability {
+    //     self.stability
+    // }
+
+    fn id(&self) -> u64 {
+        self.handle as u64
     }
 
     fn as_any(&self) -> &dyn Any {

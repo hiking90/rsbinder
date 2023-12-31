@@ -1,9 +1,13 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt::{Debug, Display, Formatter};
 use crate::parcelable::*;
 use crate::parcel::*;
-use crate::error::*;
+use crate::error;
+use crate::error::StatusCode;
+
+pub type Result<T> = std::result::Result<T, Status>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
@@ -27,14 +31,35 @@ pub enum ExceptionCode {
     JustError = -256,
 }
 
+impl Display for ExceptionCode {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            ExceptionCode::None => write!(f, "None"),
+            ExceptionCode::Security => write!(f, "Security"),
+            ExceptionCode::BadParcelable => write!(f, "BadParcelable"),
+            ExceptionCode::IllegalArgument => write!(f, "IllegalArgument"),
+            ExceptionCode::NullPointer => write!(f, "NullPointer"),
+            ExceptionCode::IllegalState => write!(f, "IllegalState"),
+            ExceptionCode::NetworkMainThread => write!(f, "NetworkMainThread"),
+            ExceptionCode::UnsupportedOperation => write!(f, "UnsupportedOperation"),
+            ExceptionCode::ServiceSpecific => write!(f, "ServiceSpecific"),
+            ExceptionCode::Parcelable => write!(f, "Parcelable"),
+            ExceptionCode::HasReplyHeader => write!(f, "HasReplyHeader"),
+            ExceptionCode::TransactionFailed => write!(f, "TransactionFailed"),
+            ExceptionCode::JustError => write!(f, "JustError"),
+        }
+    }
+}
+
+
 impl Serialize for ExceptionCode {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
         parcel.write::<i32>(&(*self as i32))
     }
 }
 
 impl Deserialize for ExceptionCode {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
         let exception = parcel.read::<i32>()?;
         let code = match exception {
             exception if exception == ExceptionCode::None as i32 => ExceptionCode::None,
@@ -74,8 +99,30 @@ impl Status {
     pub fn service_specific_error(status: StatusCode, message: Option<String>) -> Self {
         Self::new(ExceptionCode::ServiceSpecific, status, message)
     }
+
+    pub fn is_ok(&self) -> bool {
+        self.exception == ExceptionCode::None
+    }
 }
 
+impl std::error::Error for Status {}
+
+impl Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.exception == ExceptionCode::None {
+            write!(f, "{}", self.code)
+        } else {
+            write!(f, "{} / {}: {}", self.exception, self.code, self.message.as_ref().unwrap_or(&"".to_owned()))
+        }
+    }
+}
+
+impl Debug for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+ 
 impl From<ExceptionCode> for StatusCode {
     fn from(exception: ExceptionCode) -> Self {
         match exception {
@@ -85,10 +132,17 @@ impl From<ExceptionCode> for StatusCode {
     }
 }
 
+impl From<Status> for StatusCode {
+    fn from(status: Status) -> Self {
+        status.code
+    }
+}
+
 impl From<StatusCode> for ExceptionCode {
     fn from(status: StatusCode) -> Self {
         match status {
             StatusCode::Ok => ExceptionCode::None,
+            StatusCode::UnexpectedNull => ExceptionCode::NullPointer,
             StatusCode::ServiceSpecific(_) => ExceptionCode::ServiceSpecific,
             _ => ExceptionCode::TransactionFailed,
         }
@@ -107,8 +161,14 @@ impl From<(ExceptionCode, &str)> for Status {
     }
 }
 
+impl From<StatusCode> for Status {
+    fn from(status: StatusCode) -> Self {
+        Status::new(status.into(), status, None)
+    }
+}
+
 impl Serialize for Status {
-    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+    fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
         if self.exception == ExceptionCode::TransactionFailed {
             return Err(self.code)
         }
@@ -131,7 +191,7 @@ impl Serialize for Status {
     }
 }
 
-fn read_check_header_size(parcel: &mut Parcel) -> Result<()> {
+fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
     // Skip over the blob of Parcelable data
     let header_start = parcel.data_position();
     // Get available size before reading more
@@ -150,7 +210,7 @@ fn read_check_header_size(parcel: &mut Parcel) -> Result<()> {
 
 
 impl Deserialize for Status {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+    fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
         let mut exception = parcel.read::<ExceptionCode>()?;
 
         if exception == ExceptionCode::HasReplyHeader {
@@ -182,5 +242,16 @@ impl Deserialize for Status {
         };
 
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn test_status() -> Result<()> {
+        let _status = Status::from(StatusCode::Unknown);
+        Ok(())
     }
 }

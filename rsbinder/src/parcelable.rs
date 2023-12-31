@@ -487,16 +487,28 @@ impl Serialize for flat_binder_object {
 
 impl Serialize for StrongIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        parcel.write::<flat_binder_object>(&self.into())?;
-
-        // finishFlattenBinder
-        parcel.write::<i32>(&Stability::System.into())?;
-
-        Ok(())
+        SerializeOption::serialize_option(Some(self), parcel)
     }
 }
 
-impl SerializeOption for StrongIBinder {}
+impl SerializeOption for StrongIBinder {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        match this {
+            Some(binder) => {
+                parcel.write::<flat_binder_object>(&binder.into())?;
+                parcel.write::<i32>(&Stability::System.into())?;
+                Ok(())
+            }
+
+            None => {
+                parcel.write::<flat_binder_object>(&flat_binder_object::default())?;
+                parcel.write::<i32>(&Stability::System.into())?;
+
+                Ok(())
+            }
+        }
+    }
+}
 
 impl SerializeArray for StrongIBinder {}
 
@@ -513,7 +525,7 @@ impl Deserialize for StrongIBinder {
 impl DeserializeOption for StrongIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let flat: flat_binder_object = parcel.read()?;
-        let _stability: i32 = parcel.read()?;
+        let stability: i32 = parcel.read()?;
 
         match flat.header_type() {
             BINDER_TYPE_BINDER => {
@@ -529,8 +541,8 @@ impl DeserializeOption for StrongIBinder {
 
             BINDER_TYPE_HANDLE => {
                 let res = ProcessState::as_self()
-                    .strong_proxy_for_handle(flat.handle());
-                Ok(Some(res?))
+                    .strong_proxy_for_handle_stability(flat.handle(), stability.try_into()?)?;
+                Ok(Some(res))
             }
 
             _ => {
@@ -662,23 +674,21 @@ impl<T: SerializeOption + ?Sized> SerializeOption for std::sync::Arc<T> {
 
 impl<T: Serialize + ?Sized> SerializeArray for std::sync::Arc<T> {}
 
-impl<T: ?Sized> Deserialize for std::sync::Arc<T> {
-    fn deserialize(_parcel: &mut Parcel) -> Result<Self> {
-        todo!()
-        // let ibinder: SpIBinder = parcel.read()?;
-        // FromIBinder::try_from(ibinder)
+impl<T: FromIBinder + ?Sized> Deserialize for std::sync::Arc<T> {
+    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+        let binder: StrongIBinder = parcel.read()?;
+        FromIBinder::try_from(binder)
     }
 }
 
-impl<T: ?Sized> DeserializeOption for std::sync::Arc<T> {
-    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
-        todo!()
-        // let ibinder: Option<SpIBinder> = parcel.read()?;
-        // ibinder.map(FromIBinder::try_from).transpose()
+impl<T: FromIBinder + ?Sized> DeserializeOption for std::sync::Arc<T> {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        let binder: Option<StrongIBinder> = parcel.read()?;
+        binder.map(FromIBinder::try_from).transpose()
     }
 }
 
-impl<T: ?Sized> DeserializeArray for std::sync::Arc<T> {}
+impl<T: FromIBinder + ?Sized> DeserializeArray for std::sync::Arc<T> {}
 
 impl<T: DeserializeOption> DeserializeArray for Option<T> {}
 impl<T: SerializeOption> SerializeArray for Option<T> {}
