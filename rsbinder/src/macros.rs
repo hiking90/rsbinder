@@ -107,7 +107,6 @@ macro_rules! declare_binder_interface {
         #[doc = $proxy_doc]
         pub struct $proxy {
             binder: $crate::SIBinder,
-            handle: $crate::ProxyHandle,
             $($fname: $fty,)*
         }
 
@@ -130,7 +129,7 @@ macro_rules! declare_binder_interface {
                 if proxy.descriptor() != Self::descriptor() {
                     Err($crate::StatusCode::BadType)
                 } else {
-                    Ok(Self { binder, handle: proxy, $($fname: $finit),* })
+                    Ok(Self { binder, $($fname: $finit),* })
                 }
             }
         }
