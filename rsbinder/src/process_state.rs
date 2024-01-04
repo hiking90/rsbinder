@@ -42,7 +42,7 @@ pub struct ProcessState {
     driver_name: PathBuf,
     driver: Arc<File>,
     mmap: RwLock<MemoryMap>,
-    context_manager: RwLock<Option<StrongIBinder>>,
+    context_manager: RwLock<Option<SIBinder>>,
     handle_to_proxy: RwLock<HashMap<u32, ProxyInternal>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
@@ -124,7 +124,7 @@ impl ProcessState {
         })
     }
 
-    pub fn become_context_manager(&self, binder: StrongIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub fn become_context_manager(&self, binder: SIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
         obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
@@ -145,20 +145,20 @@ impl ProcessState {
         Ok(())
     }
 
-    pub fn context_manager(&self) -> Option<StrongIBinder> {
+    pub fn context_manager(&self) -> Option<SIBinder> {
         self.context_manager.read().unwrap().clone()
     }
 
-    pub fn context_object(&self) -> Result<StrongIBinder> {
+    pub fn context_object(&self) -> Result<SIBinder> {
         self.strong_proxy_for_handle(0)
         // , Box::new(BpServiceManager::new())
     }
 
-    pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<StrongIBinder> {
+    pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<SIBinder> {
         self.strong_proxy_for_handle_stability(handle, Default::default())
     }
 
-    pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<StrongIBinder> {
+    pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<SIBinder> {
         if let Some(proxy) = self.handle_to_proxy.read().unwrap().get(&handle) {
             return Ok(proxy.weak().upgrade())
         }

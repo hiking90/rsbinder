@@ -7,7 +7,7 @@ use env_logger::Env;
 use rsbinder::*;
 
 struct Service {
-    binder: StrongIBinder,
+    binder: SIBinder,
     allow_isolated: bool,
     dump_priority: i32,
     has_clients: bool,
@@ -20,7 +20,7 @@ impl Service {
         unimplemented!("get_node_strong_ref_count")
     }
 
-    fn try_start_service(&self) -> rsbinder::Result<StrongIBinder> {
+    fn try_start_service(&self) -> rsbinder::Result<SIBinder> {
         unimplemented!("try_start_service")
     }
 }
@@ -31,7 +31,7 @@ struct ServiceManagerInner {
 }
 
 impl ServiceManagerInner {
-    fn try_get_service(&self, name: &str, _start_if_not_found: bool) -> rsbinder::status::Result<Option<StrongIBinder>> {
+    fn try_get_service(&self, name: &str, _start_if_not_found: bool) -> rsbinder::status::Result<Option<SIBinder>> {
         self.name_to_service.write().unwrap().get_mut(name).map(|service| {
             service.guarentee_client = true;
             Ok(Some(service.binder.clone()))
@@ -103,14 +103,14 @@ impl Default for ServiceManagerInner {
 }
 
 impl rsbinder::DeathRecipient for ServiceManagerInner {
-    fn binder_died(&self, who: rsbinder::WeakIBinder) {
+    fn binder_died(&self, who: rsbinder::WIBinder) {
         self.name_to_service.write().unwrap().retain(|_, service| {
-            !(StrongIBinder::downgrade(&service.binder) == who)
+            !(SIBinder::downgrade(&service.binder) == who)
         });
 
         self.name_to_registration_callbacks.write().unwrap().retain(|_, callbacks| {
             callbacks.retain(|callback| {
-                StrongIBinder::downgrade(&callback.as_binder()) != who
+                SIBinder::downgrade(&callback.as_binder()) != who
             });
             !callbacks.is_empty()
         });
@@ -157,11 +157,11 @@ impl Default for ServiceManager {
 impl Interface for ServiceManager {}
 
 impl IServiceManager for ServiceManager {
-    fn getService(&self,_arg_name: &str) -> rsbinder::status::Result<Option<rsbinder::StrongIBinder>> {
+    fn getService(&self,_arg_name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
         self.inner.try_get_service(_arg_name, true)
     }
 
-    fn addService(&self, name: &str, service: &StrongIBinder, allowIsolated: bool, dumpPriority: i32) -> rsbinder::status::Result<()> {
+    fn addService(&self, name: &str, service: &SIBinder, allowIsolated: bool, dumpPriority: i32) -> rsbinder::status::Result<()> {
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
@@ -181,7 +181,7 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<StrongIBinder>> {
+    fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
         self.inner.try_get_service(name, false)
     }
 
@@ -223,12 +223,12 @@ impl IServiceManager for ServiceManager {
         Ok(None)
     }
 
-    fn registerClientCallback(&self,_arg_name: &str,_arg_service: &rsbinder::StrongIBinder,_arg_callback: &std::sync::Arc<dyn rsbinder_hub::android::os::IClientCallback::IClientCallback>) -> rsbinder::status::Result<()> {
+    fn registerClientCallback(&self,_arg_name: &str,_arg_service: &rsbinder::SIBinder,_arg_callback: &std::sync::Arc<dyn rsbinder_hub::android::os::IClientCallback::IClientCallback>) -> rsbinder::status::Result<()> {
         println!("registerClientCallback");
         Ok(())
     }
 
-    fn tryUnregisterService(&self,_arg_name: &str,_arg_service: &rsbinder::StrongIBinder) -> rsbinder::status::Result<()> {
+    fn tryUnregisterService(&self,_arg_name: &str,_arg_service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
         println!("tryUnregisterService");
         Ok(())
     }

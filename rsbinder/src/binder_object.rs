@@ -100,8 +100,8 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
     (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
-impl From<&binder::StrongIBinder> for flat_binder_object {
-    fn from(binder: &binder::StrongIBinder) -> Self {
+impl From<&binder::SIBinder> for flat_binder_object {
+    fn from(binder: &binder::SIBinder) -> Self {
         let sched_bits = if !process_state::ProcessState::as_self().background_scheduling_disabled() {
             sched_policy_mask(SCHED_NORMAL, 19)
         } else {
@@ -120,7 +120,7 @@ impl From<&binder::StrongIBinder> for flat_binder_object {
                 cookie: 0,
             }
         } else {
-            let weak = Box::new(binder::StrongIBinder::downgrade(binder));
+            let weak = Box::new(binder::SIBinder::downgrade(binder));
             let strong = Box::new(binder.clone());
 
             flat_binder_object {
@@ -152,16 +152,16 @@ impl From<*const u8> for flat_binder_object {
     }
 }
 
-pub(crate) fn raw_pointer_to_weak_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::WeakIBinder>> {
+pub(crate) fn raw_pointer_to_weak_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::WIBinder>> {
     assert!(raw_pointer != 0, "raw_pointer_to_weak_binder(): raw_pointer is null");
     unsafe {
-        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::WeakIBinder))
+        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::WIBinder))
     }
 }
 
-pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::StrongIBinder>> {
+pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::SIBinder>> {
     assert!(raw_pointer != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
     unsafe {
-        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::StrongIBinder))
+        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::SIBinder))
     }
 }

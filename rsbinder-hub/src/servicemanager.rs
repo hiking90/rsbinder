@@ -46,7 +46,7 @@ pub fn default() -> Arc<BpServiceManager> {
 
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
-pub fn get_service(name: &str) -> Option<StrongIBinder> {
+pub fn get_service(name: &str) -> Option<SIBinder> {
     match default().getService(name) {
         Ok(result) => result,
         Err(err) => {
@@ -59,7 +59,7 @@ pub fn get_service(name: &str) -> Option<StrongIBinder> {
 /// Retrieve an existing service called @a name from the service
 /// manager. Non-blocking. Returns null if the service does not
 /// exist.
-pub fn check_service(name: &str) -> Option<StrongIBinder> {
+pub fn check_service(name: &str) -> Option<SIBinder> {
     match default().checkService(name) {
         Ok(result) => result,
         Err(err) => {
@@ -152,7 +152,7 @@ mod tests {
         struct MyServiceCallback {}
         impl rsbinder::Interface for MyServiceCallback {}
         impl IServiceCallback for MyServiceCallback {
-            fn onRegistration(&self, name: &str, service: &rsbinder::StrongIBinder) -> rsbinder::status::Result<()> {
+            fn onRegistration(&self, name: &str, service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
                 println!("onRegistration: {} {:?}", name, service);
                 Ok(())
             }

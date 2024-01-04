@@ -78,8 +78,8 @@ impl<T: 'static + Remotable> PartialEq for Binder<T> {
 }
 
 impl<T: 'static + Remotable> Interface for Binder<T> {
-    fn as_binder(&self) -> StrongIBinder {
-        StrongIBinder::new(Box::new((*self).clone()), T::descriptor())
+    fn as_binder(&self) -> SIBinder {
+        SIBinder::new(Box::new((*self).clone()), T::descriptor())
     }
 }
 
@@ -173,10 +173,10 @@ impl<T: Remotable> Deref for Binder<T> {
 // This implementation is an idiomatic implementation of the C++
 // `IBinder::localBinder` interface if the binder object is a Rust binder
 // service.
-impl<B: Remotable + 'static> TryFrom<StrongIBinder> for Binder<B> {
+impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
     type Error = StatusCode;
 
-    fn try_from(ibinder: StrongIBinder) -> Result<Self> {
+    fn try_from(ibinder: SIBinder) -> Result<Self> {
         if B::descriptor() != ibinder.descriptor() {
             return Err(StatusCode::BadType);
         }

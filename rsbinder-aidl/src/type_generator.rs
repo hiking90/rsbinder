@@ -168,7 +168,7 @@ impl TypeGenerator {
                 panic!("type_decl() can't process Array Type.")
                 // Self::type_decl(sub_value.expect("Array must know the type of item."), None)
             }
-            ValueType::IBinder => "rsbinder::StrongIBinder".into(),
+            ValueType::IBinder => "rsbinder::SIBinder".into(),
             ValueType::FileDescriptor => "rsbinder::ParcelFileDescriptor".into(),
             ValueType::Holder => "rsbinder::ParcelableHolder".into(),
             ValueType::UserDefined(name) => Self::make_user_defined_type_name(name),

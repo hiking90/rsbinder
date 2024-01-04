@@ -485,13 +485,13 @@ impl Serialize for flat_binder_object {
     }
 }
 
-impl Serialize for StrongIBinder {
+impl Serialize for SIBinder {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         SerializeOption::serialize_option(Some(self), parcel)
     }
 }
 
-impl SerializeOption for StrongIBinder {
+impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         match this {
             Some(binder) => {
@@ -510,9 +510,9 @@ impl SerializeOption for StrongIBinder {
     }
 }
 
-impl SerializeArray for StrongIBinder {}
+impl SerializeArray for SIBinder {}
 
-impl Deserialize for StrongIBinder {
+impl Deserialize for SIBinder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         match DeserializeOption::deserialize_option(parcel) {
             Ok(Some(binder)) => Ok(binder),
@@ -522,7 +522,7 @@ impl Deserialize for StrongIBinder {
     }
 }
 
-impl DeserializeOption for StrongIBinder {
+impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let flat: flat_binder_object = parcel.read()?;
         let stability: i32 = parcel.read()?;
@@ -553,7 +553,7 @@ impl DeserializeOption for StrongIBinder {
     }
 }
 
-impl DeserializeArray for StrongIBinder {}
+impl DeserializeArray for SIBinder {}
 
 /// Flag that specifies that the following parcelable is present.
 ///
@@ -676,14 +676,14 @@ impl<T: Serialize + ?Sized> SerializeArray for std::sync::Arc<T> {}
 
 impl<T: FromIBinder + ?Sized> Deserialize for std::sync::Arc<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        let binder: StrongIBinder = parcel.read()?;
+        let binder: SIBinder = parcel.read()?;
         FromIBinder::try_from(binder)
     }
 }
 
 impl<T: FromIBinder + ?Sized> DeserializeOption for std::sync::Arc<T> {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        let binder: Option<StrongIBinder> = parcel.read()?;
+        let binder: Option<SIBinder> = parcel.read()?;
         binder.map(FromIBinder::try_from).transpose()
     }
 }

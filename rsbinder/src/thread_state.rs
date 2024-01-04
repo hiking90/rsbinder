@@ -141,8 +141,8 @@ pub struct ThreadState {
     is_flushing: bool,
     pending_strong_derefs: Vec<binder_uintptr_t>,
     pending_weak_derefs: Vec<binder_uintptr_t>,
-    post_strong_derefs: Vec<StrongIBinder>,
-    post_weak_derefs: Vec<WeakIBinder>,
+    post_strong_derefs: Vec<SIBinder>,
+    post_weak_derefs: Vec<WIBinder>,
     call_restriction: CallRestriction,
 }
 
@@ -762,7 +762,7 @@ pub fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
     wait_for_response(UntilResponse::AcquireResult).map(|_| ())
 }
 
-pub fn inc_strong_handle(handle: u32, proxy: StrongIBinder) -> Result<()> {
+pub fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
     log::trace!("inc_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -796,7 +796,7 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub fn inc_weak_handle(handle: u32, weak: WeakIBinder) -> Result<()>{
+pub fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
     log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {

@@ -52,7 +52,7 @@ impl ProxyHandle {
 
 pub(crate) struct ProxyInternal {
     handle: u32,
-    weak: WeakIBinder,
+    weak: WIBinder,
     obituary_sent: bool,
     recipients: Vec<Arc<dyn DeathRecipient>>,
 }
@@ -61,13 +61,13 @@ impl ProxyInternal {
     pub(crate) fn new(handle: u32, descriptor: &str, stability: Stability) -> Self {
         Self {
             handle,
-            weak: WeakIBinder::new(ProxyHandle::new(handle, descriptor, stability), descriptor),
+            weak: WIBinder::new(ProxyHandle::new(handle, descriptor, stability), descriptor),
             obituary_sent: false,
             recipients: Vec::new(),
         }
     }
 
-    pub(crate) fn weak(&self) -> WeakIBinder {
+    pub(crate) fn weak(&self) -> WIBinder {
         self.weak.clone()
     }
 
@@ -156,5 +156,5 @@ pub trait Proxy : Sized + Interface {
 
     /// Create a new interface from the given proxy, if it matches the expected
     /// type of this interface.
-    fn from_binder(binder: StrongIBinder) -> Result<Self>;
+    fn from_binder(binder: SIBinder) -> Result<Self>;
 }

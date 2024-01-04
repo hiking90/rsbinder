@@ -91,7 +91,7 @@ pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 /// This is equivalent `IInterface` in C++.
 pub trait Interface: Send + Sync {
     /// Convert this binder object into a generic [`SpIBinder`] reference.
-    fn as_binder(&self) -> StrongIBinder {
+    fn as_binder(&self) -> SIBinder {
         panic!("This object was not a Binder object and cannot be converted into an StrongIBinder.")
     }
 
@@ -123,12 +123,12 @@ pub trait FromIBinder: Interface {
     ///
     /// Returns a trait object for the `Self` interface if this object
     /// implements that interface.
-    fn try_from(ibinder: StrongIBinder) -> Result<Arc<Self>>;
+    fn try_from(ibinder: SIBinder) -> Result<Arc<Self>>;
 }
 
 
 pub trait DeathRecipient: Send + Sync {
-    fn binder_died(&self, who: WeakIBinder);
+    fn binder_died(&self, who: WIBinder);
 }
 
 /// Interface of binder local or remote objects.
@@ -302,13 +302,13 @@ impl Drop for Inner {
 
 /// Strong reference to a binder object.
 #[derive(Debug)]
-pub struct StrongIBinder {
+pub struct SIBinder {
     inner: Arc<Inner>,
 }
 
-impl StrongIBinder {
+impl SIBinder {
     pub fn new(data: Box<dyn IBinder>, descriptor: &str) -> Self {
-        WeakIBinder::new(data, descriptor).upgrade()
+        WIBinder::new(data, descriptor).upgrade()
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
@@ -317,8 +317,8 @@ impl StrongIBinder {
         this
     }
 
-    pub fn downgrade(this: &Self) -> WeakIBinder {
-        WeakIBinder::new_with_inner(this.inner.clone())
+    pub fn downgrade(this: &Self) -> WIBinder {
+        WIBinder::new_with_inner(this.inner.clone())
         // drop will be called.
     }
 
@@ -403,39 +403,39 @@ impl StrongIBinder {
     }
 }
 
-impl Clone for StrongIBinder {
+impl Clone for SIBinder {
     fn clone(&self) -> Self {
         Self::new_with_inner(self.inner.clone())
     }
 }
 
-impl Drop for StrongIBinder {
+impl Drop for SIBinder {
     fn drop(&mut self) {
         self.decrease();
     }
 }
 
-impl Deref for StrongIBinder {
+impl Deref for SIBinder {
     type Target = Box<dyn IBinder>;
     fn deref(&self) -> &Self::Target {
         &self.inner.data
     }
 }
 
-impl PartialEq for StrongIBinder {
+impl PartialEq for SIBinder {
     fn eq(&self, other: &Self) -> bool {
         self.inner.data.id() == other.inner.data.id()
     }
 }
 
-impl Eq for StrongIBinder {}
+impl Eq for SIBinder {}
 
 /// Weak reference to a binder object.
-pub struct WeakIBinder {
+pub struct WIBinder {
     inner: Arc<Inner>,
 }
 
-impl WeakIBinder {
+impl WIBinder {
     pub(crate) fn new(data: Box<dyn IBinder>, descriptor: &str) -> Self {
         match data.as_proxy().map(|proxy| proxy.handle()) {
             Some(handle) => {
@@ -448,7 +448,7 @@ impl WeakIBinder {
                 Self { inner: Inner::new(data, true, descriptor) }
             }
         }
-        // Don't increase the weak reference count. Because the weak reference count is increased in the Inner::new().
+        // Don't increase the weak reference count. Because the weak reference count is initialized to 1.
     }
 
     fn new_with_inner(inner: Arc<Inner>) -> Self {
@@ -465,31 +465,31 @@ impl WeakIBinder {
         self.inner.weak.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn upgrade(&self) -> StrongIBinder {
-        StrongIBinder::new_with_inner(self.inner.clone())
+    pub fn upgrade(&self) -> SIBinder {
+        SIBinder::new_with_inner(self.inner.clone())
     }
 }
 
-impl Clone for WeakIBinder {
+impl Clone for WIBinder {
     fn clone(&self) -> Self {
         Self::new_with_inner(self.inner.clone())
     }
 }
 
-impl Drop for WeakIBinder {
+impl Drop for WIBinder {
     fn drop(&mut self) {
         self.decrease();
     }
 }
 
-impl Deref for WeakIBinder {
+impl Deref for WIBinder {
     type Target = Box<dyn IBinder>;
     fn deref(&self) -> &Self::Target {
         &self.inner.data
     }
 }
 
-impl PartialEq for WeakIBinder {
+impl PartialEq for WIBinder {
     fn eq(&self, other: &Self) -> bool {
         self.inner.data.id() == other.inner.data.id()
     }
@@ -503,20 +503,20 @@ mod tests {
     #[test]
     fn test_strong() -> Result<()> {
         let descriptor = "interface";
-        let strong = StrongIBinder::new(ProxyHandle::new(0, descriptor, Default::default()), descriptor);
+        let strong = SIBinder::new(ProxyHandle::new(0, descriptor, Default::default()), descriptor);
         assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
 
         let strong2 = strong.clone();
         assert_eq!(strong2.inner.strong.load(Ordering::Relaxed), 2);
 
 
-        let weak = StrongIBinder::downgrade(&strong);
+        let weak = SIBinder::downgrade(&strong);
 
         assert_eq!(weak.inner.strong.load(Ordering::Relaxed), 1);
 
         let strong = weak.upgrade();
         assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 2);
-        StrongIBinder::downgrade(&strong);
+        SIBinder::downgrade(&strong);
         // assert_eq!(*strong2.0.lock().unwrap(), 101);
 
         // let weak = strong2.downgrade();

@@ -106,13 +106,13 @@ macro_rules! declare_binder_interface {
     } => {
         #[doc = $proxy_doc]
         pub struct $proxy {
-            binder: $crate::StrongIBinder,
+            binder: $crate::SIBinder,
             handle: $crate::ProxyHandle,
             $($fname: $fty,)*
         }
 
         impl $crate::Interface for $proxy {
-            fn as_binder(&self) -> $crate::StrongIBinder {
+            fn as_binder(&self) -> $crate::SIBinder {
                 self.binder.clone()
             }
         }
@@ -125,7 +125,7 @@ macro_rules! declare_binder_interface {
                 $descriptor
             }
 
-            fn from_binder(binder: $crate::StrongIBinder) -> $crate::Result<Self> {
+            fn from_binder(binder: $crate::SIBinder) -> $crate::Result<Self> {
                 let proxy = binder.as_proxy().ok_or($crate::StatusCode::BadValue)?.clone();
                 if proxy.descriptor() != Self::descriptor() {
                     Err($crate::StatusCode::BadType)
@@ -160,7 +160,7 @@ macro_rules! declare_binder_interface {
         }
 
         impl $crate::FromIBinder for dyn $interface {
-            fn try_from(binder: $crate::StrongIBinder) -> $crate::Result<std::sync::Arc<dyn $interface>> {
+            fn try_from(binder: $crate::SIBinder) -> $crate::Result<std::sync::Arc<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
                     Ok(proxy) => Ok(std::sync::Arc::new(proxy)),
                     Err(err) => {

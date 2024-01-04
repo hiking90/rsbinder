@@ -13,7 +13,7 @@ struct MyServiceCallback {
 impl Interface for MyServiceCallback {}
 
 impl IServiceCallback for MyServiceCallback {
-    fn onRegistration(&self, name: &str, service: &StrongIBinder) -> rsbinder::status::Result<()> {
+    fn onRegistration(&self, name: &str, service: &SIBinder) -> rsbinder::status::Result<()> {
         println!("MyServiceCallback: {name}");
         Ok(())
     }
@@ -23,7 +23,7 @@ struct MyDeathRecipient {
 }
 
 impl DeathRecipient for MyDeathRecipient {
-    fn binder_died(&self, who: WeakIBinder) {
+    fn binder_died(&self, who: WIBinder) {
         println!("MyDeathRecipient");
     }
 }
