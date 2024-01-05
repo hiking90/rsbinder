@@ -43,7 +43,7 @@ pub struct ProcessState {
     driver: Arc<File>,
     mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<SIBinder>>,
-    handle_to_proxy: RwLock<HashMap<u32, ProxyInternal>>,
+    handle_to_proxy: RwLock<HashMap<u32, WIBinder>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
@@ -159,8 +159,8 @@ impl ProcessState {
     }
 
     pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<SIBinder> {
-        if let Some(proxy) = self.handle_to_proxy.read().unwrap().get(&handle) {
-            return Ok(proxy.weak().upgrade())
+        if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
+            return Ok(weak.upgrade())
         }
 
         if handle == 0 {
@@ -174,34 +174,18 @@ impl ProcessState {
 
         let interface = thread_state::query_interface(handle)?;
 
-        let proxy = ProxyInternal::new(handle, &interface, stability);
-        let weak = proxy.weak();
+        let proxy = ProxyHandle::new(handle, &interface, stability);
+        let weak = WIBinder::new(Box::new(proxy), &interface);
 
-        self.handle_to_proxy.write().unwrap().insert(handle, proxy);
+        self.handle_to_proxy.write().unwrap().insert(handle, weak.clone());
 
         Ok(weak.upgrade())
     }
 
-    pub(crate) fn link_to_death_for_handle(&self, handle: u32, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        if let Some(proxy) = self.handle_to_proxy.write().unwrap().get_mut(&handle) {
-            proxy.link_to_death(recipient)
-        } else {
-            Err(StatusCode::BadValue)
-        }
-    }
-
-    pub(crate) fn unlink_to_death_for_handle(&self, handle: u32, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        if let Some(proxy) = self.handle_to_proxy.write().unwrap().get_mut(&handle) {
-            proxy.unlink_to_death(recipient)
-        } else {
-            Err(StatusCode::BadValue)
-        }
-    }
-
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
-        if let Some(proxy) = handle_to_proxy.get_mut(&handle) {
-            proxy.send_obituary()?;
+        if let Some(weak) = handle_to_proxy.get(&handle) {
+            weak.upgrade().as_proxy().unwrap().send_obituary(&weak);
         }
         handle_to_proxy.remove(&handle);
         Ok(())

@@ -103,14 +103,14 @@ impl Default for ServiceManagerInner {
 }
 
 impl rsbinder::DeathRecipient for ServiceManagerInner {
-    fn binder_died(&self, who: rsbinder::WIBinder) {
+    fn binder_died(&self, who: &rsbinder::WIBinder) {
         self.name_to_service.write().unwrap().retain(|_, service| {
-            !(SIBinder::downgrade(&service.binder) == who)
+            !(SIBinder::downgrade(&service.binder) == *who)
         });
 
         self.name_to_registration_callbacks.write().unwrap().retain(|_, callbacks| {
             callbacks.retain(|callback| {
-                SIBinder::downgrade(&callback.as_binder()) != who
+                SIBinder::downgrade(&callback.as_binder()) != *who
             });
             !callbacks.is_empty()
         });

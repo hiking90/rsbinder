@@ -23,7 +23,7 @@ struct MyDeathRecipient {
 }
 
 impl DeathRecipient for MyDeathRecipient {
-    fn binder_died(&self, who: WIBinder) {
+    fn binder_died(&self, who: &WIBinder) {
         println!("MyDeathRecipient");
     }
 }

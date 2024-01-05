@@ -128,7 +128,7 @@ pub trait FromIBinder: Interface {
 
 
 pub trait DeathRecipient: Send + Sync {
-    fn binder_died(&self, who: WIBinder);
+    fn binder_died(&self, who: &WIBinder);
 }
 
 /// Interface of binder local or remote objects.
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn test_strong() -> Result<()> {
         let descriptor = "interface";
-        let strong = SIBinder::new(ProxyHandle::new(0, descriptor, Default::default()), descriptor);
+        let strong = SIBinder::new(Box::new(ProxyHandle::new(0, descriptor, Default::default())), descriptor);
         assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
 
         let strong2 = strong.clone();
