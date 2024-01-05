@@ -10,7 +10,7 @@ use crate::{
     parcel::*,
     binder::*,
     error::*,
-    thread_state, process_state,
+    thread_state,
 };
 
 struct Inner {

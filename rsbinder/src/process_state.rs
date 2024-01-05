@@ -185,7 +185,7 @@ impl ProcessState {
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
         if let Some(weak) = handle_to_proxy.get(&handle) {
-            weak.upgrade().as_proxy().unwrap().send_obituary(&weak);
+            weak.upgrade().as_proxy().unwrap().send_obituary(&weak)?;
         }
         handle_to_proxy.remove(&handle);
         Ok(())

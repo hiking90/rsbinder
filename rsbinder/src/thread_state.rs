@@ -28,7 +28,7 @@ use crate::{
     parcel::*,
     error::*,
     binder::*,
-    process_state::{*, self},
+    process_state::*,
     sys::*,
     binder_object::*,
 };

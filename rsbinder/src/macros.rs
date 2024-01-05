@@ -403,4 +403,19 @@ mod tests {
         Ok(())
     }
 
+    struct EchoService {}
+
+    impl Interface for EchoService {}
+
+    impl IEcho for EchoService {
+        fn echo(&self, echo: &str) -> Result<String> {
+            Ok(echo.to_owned())
+        }
+    }
+
+    #[test]
+    fn test_declare_binder_interface() {
+        let _ = BnEcho::new_binder(EchoService {});
+    }
+
 }
