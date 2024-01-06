@@ -516,18 +516,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                     thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply, &status)?;
                     // reply.set_data_size(0);
                     wait_for_response(UntilResponse::TransactionComplete)?;
-                } else {
-                    if let Err(err) = result {
-                        let mut log = format!(
-                            "oneway function results for code {} on binder at {:X}",
-                            tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
-                        log += &format!(" will be dropped but finished with status {}", err);
+                } else if let Err(err) = result {
+                    let mut log = format!(
+                        "oneway function results for code {} on binder at {:X}",
+                        tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
+                    log += &format!(" will be dropped but finished with status {}", err);
 
-                        if reply.data_size() != 0 {
-                            log += &format!(" and reply parcel size {}", reply.data_size());
-                        }
-                        log::error!("{}", log);
+                    if reply.data_size() != 0 {
+                        log += &format!(" and reply parcel size {}", reply.data_size());
                     }
+                    log::error!("{}", log);
                 }
 
                 thread_state.borrow_mut().transaction = transaction_old;

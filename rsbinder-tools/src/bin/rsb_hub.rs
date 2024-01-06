@@ -72,7 +72,7 @@ impl ServiceManagerInner {
 
     fn register_for_notifications(&self, name: &str, callback: &rsbinder::Strong<dyn rsbinder_hub::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
         let mut callbacks = self.name_to_registration_callbacks.write().unwrap();
-        let callbacks = callbacks.entry(name.to_owned()).or_insert_with(|| Vec::new());
+        let callbacks = callbacks.entry(name.to_owned()).or_default();
         callbacks.push(callback.clone());
 
         if let Some(service) = self.name_to_service.read().unwrap().get(name) {
@@ -124,20 +124,20 @@ struct ServiceManager {
 
 impl ServiceManager {
     fn is_valid_service_name(name: &str) -> bool {
-        if name.len() == 0 || name.len() > 127 {
+        if name.is_empty() || name.len() > 127 {
             return false;
         }
         for c in name.chars() {
             if c == '_' || c == '-' || c == '.' || c == '/' {
                 continue;
             }
-            if c >= 'a' && c <= 'z' {
+            if c.is_ascii_lowercase() {
                 continue;
             }
-            if c >= 'A' && c <= 'Z' {
+            if c.is_ascii_uppercase() {
                 continue;
             }
-            if c >= '0' && c <= '9' {
+            if c.is_ascii_digit() {
                 continue;
             }
             return false;
@@ -167,7 +167,7 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
-        if let Some(_) = service.as_proxy() {
+        if service.as_proxy().is_some() {
             service.link_to_death(self.inner.clone())?;
         }
         self.inner.add_service(name, Service {

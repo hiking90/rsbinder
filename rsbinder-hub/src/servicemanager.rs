@@ -105,8 +105,9 @@ pub fn is_declared(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)]
+
     use crate::*;
-    use env_logger;
     use std::sync::OnceLock;
 
     fn setup() {
@@ -140,7 +141,7 @@ mod tests {
         assert!(binder.is_none());
 
         let services = list_services(DUMP_FLAG_PRIORITY_DEFAULT);
-        assert!(services.len() > 0);
+        assert!(!services.is_empty());
 
         Ok(())
     }

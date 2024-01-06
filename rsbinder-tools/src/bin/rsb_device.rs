@@ -4,7 +4,6 @@
 use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 
-use env_logger;
 use std::process::Command;
 use rsbinder::*;
 
