@@ -81,12 +81,12 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
 }
 
 /// Request a callback when a service is registered.
-pub fn register_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
+pub fn register_for_notifications(name: &str, callback: &rsbinder::Strong<dyn IServiceCallback>) -> Result<()> {
     default().registerForNotifications(name, callback).map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
-pub fn unregister_for_notifications(name: &str, callback: &std::sync::Arc<dyn IServiceCallback>) -> Result<()> {
+pub fn unregister_for_notifications(name: &str, callback: &rsbinder::Strong<dyn IServiceCallback>) -> Result<()> {
     default().unregisterForNotifications(name, callback).map_err(|e| e.into())
 }
 

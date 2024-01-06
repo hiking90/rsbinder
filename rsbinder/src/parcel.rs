@@ -345,7 +345,7 @@ impl Parcel {
         self.write_aligned(obj);
 
         if null_meta || obj.pointer() != 0 {
-            obj.acquire();
+            obj.acquire()?;
             self.objects.push(data_pos as _);
         }
 
@@ -382,7 +382,7 @@ impl Parcel {
 
         for pos in self.objects.as_slice() {
             let obj: flat_binder_object = unsafe { self.data.as_ptr().add(*pos as _).into() };
-            obj.release();
+            obj.release().map_err(|e| log::error!("Parcel: unable to release object: {:?}", e)).ok();
         }
     }
 }

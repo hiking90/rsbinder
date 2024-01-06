@@ -6,6 +6,7 @@ use crate::{
     sys::binder::flat_binder_object,
     binder,
     proxy,
+    error::*,
     process_state,
     sys::*,
 };
@@ -38,46 +39,41 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.binder }
     }
 
-    pub(crate) fn acquire(&self) {
+    pub(crate) fn acquire(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
                 if self.pointer() != 0 {
                     let strong = raw_pointer_to_strong_binder(self.cookie);
-                    strong.increase();
+                    strong.increase()?;
                 }
+
+                Ok(())
             }
             BINDER_TYPE_HANDLE => {
-                match process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle()) {
-                    Ok(strong) => strong.increase(),
-                    Err(err) => {
-                        log::error!("Error in ProcessState::strong_proxy_for_handle(): {:?}", err);
-                    }
-                };
+                process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle())?.increase()
             }
             BINDER_TYPE_FD => {
                 // Notion to do.
+                unimplemented!("flat_binder_object::acquire(): BINDER_TYPE_FD")
             }
             _ => {
                 log::error!("Invalid object type {:08x}", self.hdr.type_);
+                Err(StatusCode::InvalidOperation)
             }
-        };
+        }
     }
 
-    pub(crate) fn release(&self) {
+    pub(crate) fn release(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
                 if self.pointer() != 0 {
                     let strong = raw_pointer_to_strong_binder(self.cookie);
-                    strong.decrease();
+                    strong.decrease()?;
                 }
+                Ok(())
             }
             BINDER_TYPE_HANDLE => {
-                match process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle()) {
-                    Ok(strong) => strong.decrease(),
-                    Err(err) => {
-                        log::error!("Error in ProcessState::strong_proxy_for_handle(): {:?}", err);
-                    }
-                };
+                process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle())?.decrease()
             }
             BINDER_TYPE_FD => {
                 if self.cookie != 0 {   // owned
@@ -85,9 +81,12 @@ impl flat_binder_object {
                         libc::close(self.handle() as _);
                     }
                 }
+
+                Ok(())
             }
             _ => {
                 log::error!("Invalid object type {:08x}", self.hdr.type_);
+                Err(StatusCode::InvalidOperation)
             }
         }
     }

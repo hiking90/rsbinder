@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::ops::Deref;
 use std::any::Any;
+use std::convert::TryFrom;
 
 use crate::binder::*;
 use crate::parcel::*;
@@ -79,7 +80,7 @@ impl<T: 'static + Remotable> PartialEq for Binder<T> {
 
 impl<T: 'static + Remotable> Interface for Binder<T> {
     fn as_binder(&self) -> SIBinder {
-        SIBinder::new(Box::new((*self).clone()), T::descriptor())
+        SIBinder::new(Box::new((*self).clone()), T::descriptor()).unwrap()
     }
 }
 

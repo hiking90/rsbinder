@@ -160,7 +160,7 @@ impl ProcessState {
 
     pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<SIBinder> {
         if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
-            return Ok(weak.upgrade())
+            return weak.upgrade()
         }
 
         if handle == 0 {
@@ -175,17 +175,17 @@ impl ProcessState {
         let interface = thread_state::query_interface(handle)?;
 
         let proxy = ProxyHandle::new(handle, &interface, stability);
-        let weak = WIBinder::new(Box::new(proxy), &interface);
+        let weak = WIBinder::new(Box::new(proxy), &interface)?;
 
         self.handle_to_proxy.write().unwrap().insert(handle, weak.clone());
 
-        Ok(weak.upgrade())
+        weak.upgrade()
     }
 
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
         if let Some(weak) = handle_to_proxy.get(&handle) {
-            weak.upgrade().as_proxy().unwrap().send_obituary(&weak)?;
+            weak.upgrade()?.as_proxy().unwrap().send_obituary(&weak)?;
         }
         handle_to_proxy.remove(&handle);
         Ok(())

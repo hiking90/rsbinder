@@ -89,7 +89,7 @@ impl TypeGenerator {
 
         match lookup_decl.decl {
             Declaration::Interface(_) => {
-                format!("std::sync::Arc<dyn {}>", name)
+                format!("rsbinder::Strong<dyn {}>", name)
             }
             _ => name,
         }

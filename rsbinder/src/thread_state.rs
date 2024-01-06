@@ -178,7 +178,7 @@ impl ThreadState {
         }
     }
 
-    fn process_pending_derefs(&mut self) {
+    fn process_pending_derefs(&mut self) -> Result<()> {
         if self.in_parcel.data_position() >= self.in_parcel.data_size() {
             // The decWeak()/decStrong() calls may cause a destructor to run,
             // which in turn could have initiated an outgoing transaction,
@@ -197,10 +197,11 @@ impl ThreadState {
 
                 for raw_pointer in self.pending_strong_derefs.drain(..) {
                     let strong = raw_pointer_to_strong_binder(raw_pointer);
-                    strong.decrease();
+                    strong.decrease()?;
                 }
             }
         }
+        Ok(())
     }
 
     fn process_post_write_derefs(&mut self) {
@@ -488,12 +489,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                     // reader.set_data_position(0);
                     if target_ptr != 0 {
                         let weak = raw_pointer_to_weak_binder(target_ptr);
-                        let strong = weak.upgrade();
+                        let strong = weak.upgrade()?;
                         if strong.attempt_increase() {
                             let binder = raw_pointer_to_strong_binder(tr_secctx.transaction_data.cookie);
                             let result = binder.as_transactable().expect("Transactable is None.")
                                 .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
-                            strong.decrease();
+                            strong.decrease()?;
 
                             result
                         } else {
@@ -562,7 +563,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 let strong = ManuallyDrop::into_inner(raw_pointer_to_strong_binder(obj));
-                strong.increase();
+                strong.increase()?;
 
                 state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
                 state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
@@ -978,7 +979,7 @@ pub fn join_thread_pool(is_main: bool) -> Result<()> {
         let result;
 
         loop {
-            thread_state.borrow_mut().process_pending_derefs();
+            thread_state.borrow_mut().process_pending_derefs()?;
             if let Err(e) = get_and_execute_command() {
                 match e {
                     StatusCode::TimedOut if !is_main => {

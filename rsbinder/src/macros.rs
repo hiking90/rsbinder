@@ -138,9 +138,9 @@ macro_rules! declare_binder_interface {
 
         impl $native {
             /// Create a new binder service.
-            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> std::sync::Arc<dyn $interface> {
+            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
                 let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
-                std::sync::Arc::new(binder)
+                $crate::Strong::new(Box::new(binder))
             }
         }
 
@@ -159,12 +159,12 @@ macro_rules! declare_binder_interface {
         }
 
         impl $crate::FromIBinder for dyn $interface {
-            fn try_from(binder: $crate::SIBinder) -> $crate::Result<std::sync::Arc<dyn $interface>> {
+            fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
-                    Ok(proxy) => Ok(std::sync::Arc::new(proxy)),
+                    Ok(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
                     Err(err) => {
                         match binder.as_native::<$native>() {
-                            Some(native) => Ok(std::sync::Arc::new(native.clone())),
+                            Some(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
                             None => Err(err),
                         }
                     }

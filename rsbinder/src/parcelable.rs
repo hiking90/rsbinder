@@ -532,7 +532,7 @@ impl DeserializeOption for SIBinder {
                 let pointer = flat.pointer();
                 if pointer != 0 {
                     let weak = raw_pointer_to_weak_binder(flat.pointer());
-                    let strong = weak.upgrade();
+                    let strong = weak.upgrade()?;
                     Ok(Some(strong))    
                 } else {
                     Ok(None)
@@ -660,35 +660,35 @@ impl<T: DeserializeOption> DeserializeOption for Box<T> {
     }
 }
 
-impl<T: Serialize + ?Sized> Serialize for std::sync::Arc<T> {
+impl<T: FromIBinder + Serialize + ?Sized> Serialize for Strong<T> {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         Serialize::serialize(&**self, parcel)
     }
 }
 
-impl<T: SerializeOption + ?Sized> SerializeOption for std::sync::Arc<T> {
+impl<T: FromIBinder + SerializeOption + ?Sized> SerializeOption for Strong<T> {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         SerializeOption::serialize_option(this.map(|b| &**b), parcel)
     }
 }
 
-impl<T: Serialize + ?Sized> SerializeArray for std::sync::Arc<T> {}
+impl<T: FromIBinder + Serialize + ?Sized> SerializeArray for Strong<T> {}
 
-impl<T: FromIBinder + ?Sized> Deserialize for std::sync::Arc<T> {
+impl<T: FromIBinder + ?Sized> Deserialize for Strong<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let binder: SIBinder = parcel.read()?;
         FromIBinder::try_from(binder)
     }
 }
 
-impl<T: FromIBinder + ?Sized> DeserializeOption for std::sync::Arc<T> {
+impl<T: FromIBinder + ?Sized> DeserializeOption for Strong<T> {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let binder: Option<SIBinder> = parcel.read()?;
         binder.map(FromIBinder::try_from).transpose()
     }
 }
 
-impl<T: FromIBinder + ?Sized> DeserializeArray for std::sync::Arc<T> {}
+impl<T: FromIBinder + ?Sized> DeserializeArray for Strong<T> {}
 
 impl<T: DeserializeOption> DeserializeArray for Option<T> {}
 impl<T: SerializeOption> SerializeArray for Option<T> {}
