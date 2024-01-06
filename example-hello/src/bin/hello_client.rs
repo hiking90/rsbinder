@@ -1,5 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+#![allow(non_snake_case)]
 
 use std::sync::Arc;
 use rsbinder_hub::{IServiceManager, IServiceCallback, BnServiceCallback};
@@ -13,7 +14,7 @@ struct MyServiceCallback {
 impl Interface for MyServiceCallback {}
 
 impl IServiceCallback for MyServiceCallback {
-    fn onRegistration(&self, name: &str, service: &SIBinder) -> rsbinder::status::Result<()> {
+    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::status::Result<()> {
         println!("MyServiceCallback: {name}");
         Ok(())
     }
@@ -23,7 +24,7 @@ struct MyDeathRecipient {
 }
 
 impl DeathRecipient for MyDeathRecipient {
-    fn binder_died(&self, who: &WIBinder) {
+    fn binder_died(&self, _who: &WIBinder) {
         println!("MyDeathRecipient");
     }
 }

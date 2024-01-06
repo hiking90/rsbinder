@@ -17,7 +17,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: rsb_device <device_name>");
+        println!("rsb_device - Create a binder device on binderfs");
+        println!("Usage: rsb_device <device_name>");
         return Ok(())
     }
 

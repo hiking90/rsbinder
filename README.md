@@ -1,11 +1,9 @@
 # rsbinder
 **rsbinder** is a tool and library for utilizing Android's binder IPC, implemented purely in Rust language.
 
-Android's binder IPC has been integrated into the Linux kernel in 2015. However, Android's binder IPC is not widely used in Linux.
+Despite its integration into the Linux kernel in 2015, Android's binder IPC has not been fully utilized in the Linux environment. This shortfall is often attributed to the lack of sufficient libraries and tools available for Linux, which inspired the inception of the **rsbinder** project.
 
-This is thought to stem from the insufficient availability of libraries and tools for Linux, prompting the launch of the **rsbinder** project.
-
-## Status
+## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
 The source code still contains many todo!() macros, and the release of version 0.1 is planned only after all these todo!() macros are resolved.
 
@@ -15,11 +13,51 @@ The source code still contains many todo!() macros, and the release of version 0
 * **rsbinder crate**: A library crate for implementing binder service/client functionality.
 * **rsbinder-aidl crate**: A tool for generating Rust code for rsbinder from aidl.
 * **rsbinder-hub crate**: Provides functionality similar to Binder's ServiceManager.
+* **rsbinder-tools crate**: Provides command line tools likes service manager and binder device initializor.
 * **example-hello crate**: An example of service/client written using rsbinder.
 
+## Prerequisites to build and test
+
+### Android Build
+* Please follow the guideline of https://github.com/bbqsrc/cargo-ndk
+
+### Enable binder for Linux
+* The Linux kernel must be built with support for binderfs. Please check the following kernel configs.
+```
+CONFIG_ASHMEM=y
+CONFIG_ANDROID=y
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ANDROID_BINDERFS=y
+```
+    - Arch Linux users just use the linux-zen kernel. Zen kernel already includes BinderFS.
+    - Ubuntu Linux users refer to https://github.com/anbox/anbox/blob/master/docs/install.md
+
+* Build **rsbinder** crates. It can build **rsb_device** and it can be used to create a new binder device file.
+```
+$ sudo target/debug/rsb_device binder
+```
+* Run **rsb_hub**. It is a binder service manager.
+```
+$ target/debug/rsb_hub
+```
+
+### Test binder for Linux
+* Run **hello_service**
+```
+$ target/debug/hello_service
+```
+* Run **hello_client**
+```
+$ target/debug/hello_client
+```
+
+
 ## Todo
+- [x] Implement Binder crate.
+- [x] Implement AIDL code generator.
+- [ ] Implement Service Manager for Linux (In progress)
+- [ ] Implement File Descriptor Sharing
 - [ ] Remove all todo!() macros.
-- [ ] Implement Service Manager for Linux
 - [ ] Add more test cases for Binder IPC
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support MAC likes selinux and AppArmor.

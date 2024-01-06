@@ -1,5 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+#![allow(non_snake_case)]
 
 use std::{collections::HashMap, sync::{RwLock, Arc}};
 use rsbinder_hub::{IServiceManager, BnServiceManager};
