@@ -7,7 +7,6 @@ members = [
     "rsbinder-hub",
     "rsbinder-tools",
     "example-hello",
-    "examples",
 ]
 
 [profile.release]

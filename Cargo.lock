@@ -378,19 +378,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "examples"
-version = "0.1.0"
-dependencies = [
- "backtrace",
- "env_logger",
- "lazy_static",
- "rsbinder",
- "rsbinder-aidl",
- "rsbinder-hub",
- "tokio",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
