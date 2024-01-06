@@ -10,11 +10,11 @@ The source code still contains many todo!() macros, and the release of version 0
 ## Overview
 **rsbinder** offers the following features:
 
-* **rsbinder crate**: A library crate for implementing binder service/client functionality.
-* **rsbinder-aidl crate**: A tool for generating Rust code for rsbinder from aidl.
-* **rsbinder-hub crate**: Provides functionality similar to Binder's ServiceManager.
-* **rsbinder-tools crate**: Provides command line tools likes service manager and binder device initializor.
-* **example-hello crate**: An example of service/client written using rsbinder.
+* **crate rsbinder**: A library crate for implementing binder service/client functionality.
+* **crate rsbinder-aidl**: A tool for generating Rust code for rsbinder from aidl.
+* **crate rsbinder-hub**: Provides functionality similar to Binder's ServiceManager.
+* **crate rsbinder-tools**: Provides command line tools likes service manager and binder device initializor.
+* **crate example-hello**: An example of service/client written using rsbinder.
 
 ## Prerequisites to build and test
 
@@ -60,6 +60,7 @@ $ target/debug/hello_client
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
 - [ ] Implement File Descriptor Sharing
 - [ ] Remove all todo!() and unimplemented!() macros.
+- [ ] Support Tokio async.
 - [ ] Add more test cases for Binder IPC
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support MAC likes selinux and AppArmor.
@@ -68,4 +69,4 @@ $ target/debug/hello_client
 **rsbinder** is licensed under the **Apache License version 2.0**.
 
 ## Notice
-Many of the source codes in **rsbinder** have been developed by quoting or referencing Android's code.
+Many of the source codes in **rsbinder** have been developed by quoting or referencing Android's binder rust code.
