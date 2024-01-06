@@ -57,9 +57,9 @@ $ target/debug/hello_client
 ## Todo
 - [x] Implement Binder crate.
 - [x] Implement AIDL code generator.
-- [ ] Implement Service Manager for Linux (In progress)
+- [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
 - [ ] Implement File Descriptor Sharing
-- [ ] Remove all todo!() macros.
+- [ ] Remove all todo!() and unimplemented!() macros.
 - [ ] Add more test cases for Binder IPC
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support MAC likes selinux and AppArmor.
