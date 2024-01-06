@@ -30,9 +30,10 @@ CONFIG_ANDROID_BINDER_IPC=y
 CONFIG_ANDROID_BINDERFS=y
 ```
 
-  * Arch Linux users just use the linux-zen kernel. Zen kernel already includes BinderFS.
-  * Ubuntu Linux users refer to https://github.com/anbox/anbox/blob/master/docs/install.md
+* Arch Linux users just use the linux-zen kernel. Zen kernel already includes BinderFS.
+* Ubuntu Linux users refer to https://github.com/anbox/anbox/blob/master/docs/install.md
 
+#### Run rsbinder tools
 * Build **rsbinder** crates. It can build **rsb_device** and it can be used to create a new binder device file.
 ```
 $ sudo target/debug/rsb_device binder
