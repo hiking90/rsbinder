@@ -104,6 +104,7 @@ impl Default for Builder {
 
 impl Builder {
     pub fn new() -> Self {
+        parser::reset();
         Self {
             sources: Vec::new(),
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),

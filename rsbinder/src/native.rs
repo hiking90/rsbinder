@@ -86,6 +86,7 @@ impl<T: 'static + Remotable> Interface for Binder<T> {
 
 impl<T: 'static +  Remotable> IBinder for Binder<T> {
     fn link_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        log::error!("Binder<T> does not support link_to_death.");
         Err(StatusCode::InvalidOperation)
     }
 
@@ -93,6 +94,7 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     /// The recipient will no longer be called if this object
     /// dies.
     fn unlink_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+        log::error!("Binder<T> does not support unlink_to_death.");
         Err(StatusCode::InvalidOperation)
     }
 

@@ -37,6 +37,7 @@ mod tests {
     use crate::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn process_state() {
         // let process = ProcessState::as_self();
         ProcessState::init("/dev/binderfs/binder", 0);

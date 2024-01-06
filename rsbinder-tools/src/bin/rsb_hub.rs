@@ -3,7 +3,7 @@
 #![allow(non_snake_case)]
 
 use std::{collections::HashMap, sync::{RwLock, Arc}};
-use rsbinder_hub::{IServiceManager, BnServiceManager};
+use rsbinder_hub::{IServiceManager, BnServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use env_logger::Env;
 use rsbinder::*;
 
@@ -167,7 +167,9 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
-        service.link_to_death(self.inner.clone())?;
+        if let Some(_) = service.as_proxy() {
+            service.link_to_death(self.inner.clone())?;
+        }
         self.inner.add_service(name, Service {
             binder: service.clone(),
             allow_isolated: allowIsolated,
@@ -248,6 +250,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Create a binder service.
     let service = BnServiceManager::new_binder(ServiceManager::default());
+    service.addService("manager", &service.as_binder(), false, DUMP_FLAG_PRIORITY_DEFAULT)?;
 
     ProcessState::as_self().become_context_manager(service.as_binder())?;
 

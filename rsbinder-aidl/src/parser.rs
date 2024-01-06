@@ -1264,7 +1264,17 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
     Ok(document)
 }
 
-
+pub fn reset() {
+    DECLARATION_MAP.with(|hashmap| {
+        hashmap.borrow_mut().clear();
+    });
+    NAMESPACE_STACK.with(|stack| {
+        stack.borrow_mut().clear();
+    });
+    DOCUMENT.with(|doc| {
+        *doc.borrow_mut() = Document::new();
+    });
+}
 
 #[cfg(test)]
 mod tests {

@@ -302,8 +302,11 @@ impl TypeGenerator {
     pub fn init_value(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
         match const_expr {
             Some(expr) => {
-                let expr = expr.calculate().convert_to(&self.value_type);
-                expr.value.to_init(is_const)
+                if let ValueType::Array(_) = self.value_type {
+                    expr.calculate().convert_to(self.array_types.first().unwrap()).value.to_init(is_const)
+                } else {
+                    expr.calculate().convert_to(&self.value_type).value.to_init(is_const)
+                }
             }
             None => ValueType::Void.to_init(is_const),
         }
@@ -336,22 +339,22 @@ mod tests {
 
     #[test]
     fn test_type_decl_for_func() {
-        let gen = TypeGenerator::new(&NonArrayType{ name: "IEmptyInterface".to_owned(), generic: None });
+        let gen = TypeGenerator::new(&NonArrayType{ name: "ParcelFileDescriptor".to_owned(), generic: None });
 
-        assert_eq!(gen.type_decl_for_func(), "&IEmptyInterface");
+        assert_eq!(gen.type_decl_for_func(), "&rsbinder::ParcelFileDescriptor");
 
         let nullable_gen = gen.clone().nullable();
-        assert_eq!(nullable_gen.type_decl_for_func(), "Option<&IEmptyInterface>");
+        assert_eq!(nullable_gen.type_decl_for_func(), "Option<&rsbinder::ParcelFileDescriptor>");
 
         let array_gen = gen.array();
-        assert_eq!(array_gen.type_decl_for_func(), "&[IEmptyInterface]");
-        assert_eq!(array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Vec<Option<IEmptyInterface>>");
-        assert_eq!(array_gen.clone().direction(&Direction::Inout).type_decl_for_func(), "&mut Vec<IEmptyInterface>");
+        assert_eq!(array_gen.type_decl_for_func(), "&[rsbinder::ParcelFileDescriptor]");
+        assert_eq!(array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>");
+        assert_eq!(array_gen.clone().direction(&Direction::Inout).type_decl_for_func(), "&mut Vec<rsbinder::ParcelFileDescriptor>");
 
         let nullable_array_gen = array_gen.nullable();
-        assert_eq!(nullable_array_gen.type_decl_for_func(), "Option<&[Option<IEmptyInterface>]>");
-        assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Option<Vec<Option<IEmptyInterface>>>");
-        assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_decl_for_func(), "&mut Option<Vec<Option<IEmptyInterface>>>");
+        assert_eq!(nullable_array_gen.type_decl_for_func(), "Option<&[Option<rsbinder::ParcelFileDescriptor>]>");
+        assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>");
+        assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_decl_for_func(), "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>");
     }
 
     #[test]
@@ -361,7 +364,7 @@ mod tests {
         assert_eq!(gen.func_call_param(), "_arg_type.as_str()");
         assert_eq!(gen.nullable().func_call_param(), "_arg_type.as_ref()");
 
-        let gen = TypeGenerator::new(&NonArrayType{ name: "IEmptyInterface".to_owned(), generic: None })
+        let gen = TypeGenerator::new(&NonArrayType{ name: "ParcelFileDescriptor".to_owned(), generic: None })
             .identifier("type");
         assert_eq!(gen.func_call_param(), "&_arg_type");
 
