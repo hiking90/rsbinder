@@ -53,7 +53,7 @@ impl ServiceManagerInner {
                 for callback in callbacks {
                     callback.onRegistration(name, &service.binder)?;
                 }
-            }    
+            }
         }
         Ok(())
     }

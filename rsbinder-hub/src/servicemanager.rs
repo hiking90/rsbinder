@@ -80,6 +80,10 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
     }
 }
 
+pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
+    default().addService(identifier, &binder, false, DUMP_FLAG_PRIORITY_DEFAULT)
+}
+
 /// Request a callback when a service is registered.
 pub fn register_for_notifications(name: &str, callback: &rsbinder::Strong<dyn IServiceCallback>) -> Result<()> {
     default().registerForNotifications(name, callback).map_err(|e| e.into())
@@ -100,6 +104,14 @@ pub fn is_declared(name: &str) -> bool {
             log::error!("Failed to is_declared({}): {}", name, err);
             false
         }
+    }
+}
+
+pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
+    let service = get_service(name);
+    match service {
+        Some(service) => FromIBinder::try_from(service),
+        None => Err(StatusCode::NameNotFound),
     }
 }
 

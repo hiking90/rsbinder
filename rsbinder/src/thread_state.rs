@@ -184,7 +184,7 @@ impl ThreadState {
             // which in turn could have initiated an outgoing transaction,
             // which in turn could cause us to add to the pending refs
             // vectors; so instead of simply iterating, loop until they're empty.
-            // 
+            //
             // We do this in an outer loop, because calling decStrong()
             // may result in something being added to mPendingWeakDerefs,
             // which could be delayed until the next incoming command
@@ -373,9 +373,13 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     return Err(StatusCode::DeadObject);
                 },
                 binder::BR_FAILED_REPLY => {
+                    log::error!("Received FAILED_REPLY transaction reply for pid {}",
+                        thread_state.borrow().transaction.map_or(0, |state| state.calling_pid));
                     return Err(StatusCode::FailedTransaction);
                 },
                 binder::BR_FROZEN_REPLY => {
+                    log::error!("Received FROZEN_REPLY transaction reply for pid {}",
+                        thread_state.borrow().transaction.map_or(0, |state| state.calling_pid));
                     return Err(StatusCode::FailedTransaction);
                 },
                 binder::BR_ACQUIRE_RESULT => {

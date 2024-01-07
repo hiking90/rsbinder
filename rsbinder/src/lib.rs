@@ -26,7 +26,7 @@ pub use proxy::*;
 pub use native::*;
 pub use parcelable::*;
 pub use file_descriptor::ParcelFileDescriptor;
-pub use parcelable_holder::ParcelableHolder;
+pub use parcelable_holder::{ParcelableHolder, ParcelableMetadata};
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";

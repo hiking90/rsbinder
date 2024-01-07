@@ -258,7 +258,10 @@ impl TryFrom<i32> for Stability {
             stability if stability == Stability::Vendor.into() => Ok(Vendor),
             stability if stability == Stability::System.into() => Ok(System),
             stability if stability == Stability::Vintf.into() => Ok(Vintf),
-            _ => Err(StatusCode::BadValue)
+            _ => {
+                log::error!("Stability value is invalid: {}", stability);
+                Err(StatusCode::BadValue)
+            }
         }
     }
 }
@@ -404,6 +407,16 @@ impl SIBinder {
         }
 
         Ok(())
+    }
+
+
+    /// Try to convert this Binder object into a trait object for the given
+    /// Binder interface.
+    ///
+    /// If this object does not implement the expected interface, the error
+    /// `StatusCode::BAD_TYPE` is returned.
+    pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
+        FromIBinder::try_from(self)
     }
 }
 

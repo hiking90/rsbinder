@@ -126,7 +126,7 @@ macro_rules! declare_binder_interface {
 
             fn from_binder(binder: $crate::SIBinder) -> $crate::Result<Self> {
                 let proxy = binder.as_proxy().ok_or($crate::StatusCode::BadValue)?.clone();
-                if proxy.descriptor() != Self::descriptor() {
+                if proxy.descriptor() != $descriptor {
                     Err($crate::StatusCode::BadType)
                 } else {
                     Ok(Self { binder, $($fname: $finit),* })
@@ -335,16 +335,10 @@ macro_rules! declare_binder_enum {
             }
         }
 
-        impl $crate::SerializeOption for $enum {
-            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
-                todo!()
-                // parcel.write(&self.map(|x| x.0))
-            }
-        }
-
         impl $crate::Deserialize for $enum {
             fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
-                parcel.read().map(Self)
+                let res = parcel.read().map(Self);
+                res
             }
         }
 
@@ -353,13 +347,6 @@ macro_rules! declare_binder_enum {
                 let v: Option<Vec<$backing>> =
                     <$backing as $crate::DeserializeArray>::deserialize_array(parcel)?;
                 Ok(v.map(|v| v.into_iter().map(Self).collect()))
-                // Ok(v.into_iter().map(Self).collect())
-            }
-        }
-
-        impl $crate::DeserializeOption for $enum {
-            fn deserialize_option(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Self>> {
-                todo!()
             }
         }
     };

@@ -59,7 +59,7 @@ pub trait ParcelableMetadata {
     /// The Binder parcelable descriptor string.
     ///
     /// This string is a unique identifier for a Binder parcelable.
-    fn get_descriptor() -> &'static str;
+    fn descriptor() -> &'static str;
 
     /// The Binder parcelable stability.
     fn get_stability(&self) -> Stability {
@@ -440,8 +440,8 @@ impl SerializeOption for String {
     }
 }
 
-impl Deserialize for Option<String> {
-    fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+impl DeserializeOption for String {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let len = parcel.read::<i32>()?;
 
         if (0..i32::MAX).contains(&len) {
@@ -466,7 +466,10 @@ impl Deserialize for String {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         Deserialize::deserialize(parcel)
             .transpose()
-            .unwrap_or(Err(StatusCode::UnexpectedNull))
+            .unwrap_or_else(|| {
+                log::error!("Deserialize for String: UnexpectedNull");
+                Err(StatusCode::UnexpectedNull)
+            })
     }
 }
 
@@ -516,7 +519,10 @@ impl Deserialize for SIBinder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         match DeserializeOption::deserialize_option(parcel) {
             Ok(Some(binder)) => Ok(binder),
-            Ok(None) => Err(StatusCode::UnexpectedNull),
+            Ok(None) => {
+                log::error!("Deserialize for SIBinder: UnexpectedNull");
+                Err(StatusCode::UnexpectedNull)
+            }
             Err(err) => Err(err),
         }
     }
@@ -533,7 +539,7 @@ impl DeserializeOption for SIBinder {
                 if pointer != 0 {
                     let weak = raw_pointer_to_weak_binder(flat.pointer());
                     let strong = weak.upgrade()?;
-                    Ok(Some(strong))    
+                    Ok(Some(strong))
                 } else {
                     Ok(None)
                 }
@@ -721,8 +727,12 @@ pub trait DeserializeArray: Deserialize {
     /// Deserialize an array of type from the given parcel.
     fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
         let len: i32 = parcel.read()?;
-        if len < 0 {
+        if len < -1 {
+            log::error!("Negative array size given in parcel: {}", len);
             return Err(StatusCode::BadValue);
+        }
+        if len <= 0 {
+            return Ok(None);
         }
         let mut res: Vec<Self> = Vec::with_capacity(len as _);
 
@@ -767,7 +777,10 @@ impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         DeserializeArray::deserialize_array(parcel)
             .transpose()
-            .unwrap_or(Err(StatusCode::UnexpectedNull))
+            .unwrap_or_else(|| {
+                log::error!("Deserialize for Vec<T>: UnexpectedNull");
+                Err(StatusCode::UnexpectedNull)
+            })
     }
 }
 
@@ -777,13 +790,47 @@ impl<T: DeserializeArray> DeserializeOption for Vec<T> {
     }
 }
 
-// impl<T: SerializeArray, const N: usize> SerializeArray for [T; N] {}
+impl<T: SerializeArray, const N: usize> Serialize for [T; N] {
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        SerializeArray::serialize_array(self, parcel)
+    }
+}
+
+impl<T: SerializeArray, const N: usize> SerializeOption for [T; N] {
+    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        SerializeOption::serialize_option(this.map(|arr| &arr[..]), parcel)
+    }
+}
+
+impl<T: SerializeArray, const N: usize> SerializeArray for [T; N] {}
+
 
 impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let vec = DeserializeArray::deserialize_array(parcel)
             .transpose()
-            .unwrap_or(Err(StatusCode::UnexpectedNull))?;
-        vec.try_into().or(Err(StatusCode::BadValue))
+            .unwrap_or_else(|| {
+                log::error!("Deserialize for [T; N]: UnexpectedNull");
+                Err(StatusCode::UnexpectedNull)
+            })?;
+        vec.try_into()
+            .or_else(|_| {
+                log::error!("Failed to convert Vec<T> to [T; N]");
+                Err(StatusCode::BadValue)
+            })
     }
 }
+
+impl<T: DeserializeArray, const N: usize> DeserializeOption for [T; N] {
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        let vec = DeserializeArray::deserialize_array(parcel)?;
+        vec.map(|v| v.try_into()
+            .or_else(|_| {
+                log::error!("Failed to convert Vec<T> to [T; N]");
+                Err(StatusCode::BadValue)
+            }))
+            .transpose()
+    }
+}
+
+impl<T: DeserializeArray, const N: usize> DeserializeArray for [T; N] {}

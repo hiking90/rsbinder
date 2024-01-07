@@ -11,9 +11,9 @@ macro_rules! arithmetic_bit_op {
                     let value = ($lhs.to_i64() $op $rhs.to_i64()) != 0;
                     ConstExpr::new(ValueType::Bool(value))
                 }
-                ValueType::Int8(_) => {
+                ValueType::Byte(_) => {
                     let value = ($lhs.to_i64() $op $rhs.to_i64());
-                    ConstExpr::new(ValueType::Int8(value as _))
+                    ConstExpr::new(ValueType::Byte(value as _))
                 }
                 ValueType::Int32(_) => {
                     let value = ($lhs.to_i64() $op $rhs.to_i64());
@@ -46,8 +46,8 @@ macro_rules! arithmetic_basic_op {
                     let value = format!("{}{}", lhs.to_value_string(), rhs.to_value_string());
                     ConstExpr::new(ValueType::String(value))
                 }
-                ValueType::Int8(_) => {
-                    ConstExpr::new(ValueType::Int8((lhs.to_i64() $op rhs.to_i64()) as i8 as _))
+                ValueType::Byte(_) => {
+                    ConstExpr::new(ValueType::Byte((lhs.to_i64() $op rhs.to_i64()) as u8 as _))
                 }
                 ValueType::Int32(_) => {
                     ConstExpr::new(ValueType::Int32((lhs.to_i64() $op rhs.to_i64()) as i32 as _))
@@ -77,7 +77,7 @@ pub enum ValueType {
     #[default] Void,
     Name(String),
     Bool(bool),
-    Int8(i8),
+    Byte(i8),
     Int32(i32),
     Int64(i64),
     Char(char),
@@ -120,7 +120,7 @@ impl ValueType {
 
     pub fn is_primitive(&self) -> bool {
         matches!(self, ValueType::Void | ValueType::Bool(_) |
-            ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) |
+            ValueType::Byte(_) | ValueType::Int32(_) | ValueType::Int64(_) |
             ValueType::Char(_) | ValueType::Float(_) | ValueType::Double(_))
     }
 
@@ -129,7 +129,7 @@ impl ValueType {
             ValueType::Void =>              0,
             ValueType::Name(_) =>           1,
             ValueType::Bool(_) =>           2,
-            ValueType::Int8(_) =>           3,
+            ValueType::Byte(_) =>           3,
             ValueType::Int32(_) =>          4,
             ValueType::Int64(_) =>          5,
             ValueType::Char(_) =>           6,
@@ -151,7 +151,7 @@ impl ValueType {
         match self {
             ValueType::Void | ValueType::String(_) |
             ValueType::Char(_) => ConstExpr::new(self.clone()),
-            ValueType::Int8(v) => ConstExpr::new(ValueType::Int8(!*v)),
+            ValueType::Byte(v) => ConstExpr::new(ValueType::Byte(!*v)),
             ValueType::Int32(v) => ConstExpr::new(ValueType::Int32(!*v)),
             ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(!*v)),
             ValueType::Bool(v) => ConstExpr::new(ValueType::Bool(!*v)),
@@ -174,7 +174,7 @@ impl ValueType {
         match self {
             ValueType::Void | ValueType::String(_) | ValueType::Bool(_) |
             ValueType::Char(_) => ConstExpr::new(self.clone()),
-            ValueType::Int8(v) => ConstExpr::new(ValueType::Int8((*v).wrapping_neg() as _)),
+            ValueType::Byte(v) => ConstExpr::new(ValueType::Byte((*v).wrapping_neg() as _)),
             ValueType::Int32(v) => ConstExpr::new(ValueType::Int32((*v).wrapping_neg() as _)),
             ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(v.wrapping_neg())),
             ValueType::Float(v) => ConstExpr::new(ValueType::Float(-(*v as f32) as _)),
@@ -202,7 +202,7 @@ impl ValueType {
             ValueType::String(_) => unimplemented!(),
             ValueType::Bool(v) => *v,
             ValueType::Char(_) => true,
-            ValueType::Int8(v) => *v != 0,
+            ValueType::Byte(v) => *v != 0,
             ValueType::Int32(v) => *v != 0,
             ValueType::Int64(v) => *v != 0,
             ValueType::Float(v) | ValueType::Double(v) => *v != 0.,
@@ -226,7 +226,7 @@ impl ValueType {
             ValueType::String(_) => unimplemented!(),
             ValueType::Bool(v) => if *v { 1.0 } else { 0.0 },
             ValueType::Char(v) => *v as i64 as _,
-            ValueType::Int8(v) => *v as _,
+            ValueType::Byte(v) => *v as _,
             ValueType::Int32(v) => *v as _,
             ValueType::Int64(v) => *v as _,
             ValueType::Float(v) | ValueType::Double(v) => *v as _,
@@ -250,7 +250,7 @@ impl ValueType {
             ValueType::String(_) => unimplemented!(),
             ValueType::Bool(v) => *v as _,
             ValueType::Char(v) => *v as _,
-            ValueType::Int8(v) => *v as _,
+            ValueType::Byte(v) => *v as _,
             ValueType::Int32(v) => *v as _,
             ValueType::Int64(v) => *v as _,
             ValueType::Float(v) | ValueType::Double(v) => *v as _,
@@ -280,7 +280,7 @@ impl ValueType {
         }
     }
 
-    pub fn to_init(&self, is_const: bool) -> String {
+    pub fn to_init(&self, is_const: bool, is_fixed_array: bool, is_nullable: bool) -> String {
         match self {
             ValueType::String(_) => {
                 if is_const {
@@ -294,9 +294,19 @@ impl ValueType {
             ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
             ValueType::Name(_) => self.to_value_string(),
             ValueType::Array(v) => {
-                let mut res = "vec![".to_owned();
+                let mut res = if is_fixed_array { "[".to_owned() } else { "vec![".to_owned() };
                 for v in v {
-                    res += &(v.value.to_init(is_const) + ",");
+                    let init_str = v.value.to_init(is_const, is_fixed_array, is_nullable);
+
+                    let some_str = if let ValueType::Array(_) = v.value {
+                        init_str
+                    } else if is_nullable {
+                        format!("Some({})", init_str)
+                    } else {
+                        init_str
+                    };
+
+                    res += &(some_str + ",");
                 }
 
                 res += "]";
@@ -306,7 +316,7 @@ impl ValueType {
             // ValueType::Holder => {
             //     "rsbinder::ParcelableHolder::new(rsbinder::Stability::Local)".to_owned()
             // }
-            ValueType::Int8(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
+            ValueType::Byte(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_value_string(),
 
             _ => "Default::default()".to_string(),
@@ -317,7 +327,7 @@ impl ValueType {
         match self {
             ValueType::Void => "".into(),
             ValueType::String(v) => v.clone(),
-            ValueType::Int8(v) => v.to_string(),
+            ValueType::Byte(v) => v.to_string(),
             ValueType::Int32(v) => v.to_string(),
             ValueType::Int64(v) => v.to_string(),
             ValueType::Float(v) => (*v as f32).to_string(),
@@ -407,7 +417,7 @@ impl ValueType {
                 match promoted {
                     ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(value as _)),
                     ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(value as _)),
-                    ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(value as _)),
+                    ValueType::Byte(_) => ConstExpr::new(ValueType::Byte(value as _)),
                     _ => panic!("Can't apply operator '{}' for non integer type: {}", operator, lhs.raw_expr()),
                 }
             }
@@ -477,7 +487,7 @@ impl PartialOrd for ValueType {
                 Some(std::cmp::Ordering::Less)
             },
             ValueType::String(v) | ValueType::Name(v) => v.partial_cmp(&rhs.to_value_string()),
-            ValueType::Int8(v) => v.partial_cmp(&(rhs.to_i64() as _)),
+            ValueType::Byte(v) => v.partial_cmp(&(rhs.to_i64() as _)),
             ValueType::Int32(v) => v.partial_cmp(&(rhs.to_i64() as _)),
             ValueType::Int64(v) => v.partial_cmp(&(rhs.to_i64() as _)),
             ValueType::Char(v) => (*v as i64).partial_cmp(&rhs.to_i64()),
@@ -614,7 +624,7 @@ impl ConstExpr {
             match value_type {
                 ValueType::Void => Self::default(),
                 ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_value_string())),
-                ValueType::Int8(_) => ConstExpr::new(ValueType::Int8(self.to_i64() as i8 as _)),
+                ValueType::Byte(_) => ConstExpr::new(ValueType::Byte(self.to_i64() as i8 as _)),
                 ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
                 ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
                 ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64() as f32 as _)),
@@ -674,9 +684,9 @@ mod tests {
         assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(20)));
 
         let expr = ValueType::new_expr(
-            ValueType::Int8(1),
+            ValueType::Byte(1),
             "<<",
-            ValueType::Int8(31),
+            ValueType::Byte(31),
         );
 
         assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(0x80000000u32 as _)));
@@ -684,7 +694,7 @@ mod tests {
         // assert_eq!(expr.calculate(&mut dict), Expression::Int32(100));
 
         let expr = ValueType::new_expr(
-            ValueType::Int8(10),
+            ValueType::Byte(10),
             "/",
             ValueType::Float(2.0),
         );

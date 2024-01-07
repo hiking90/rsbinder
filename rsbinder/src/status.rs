@@ -87,6 +87,12 @@ pub struct Status {
     message: Option<String>,
 }
 
+impl PartialEq for Status {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.exception == other.exception
+    }
+}
+
 impl Status {
     fn new(exception: ExceptionCode, status: StatusCode, message: Option<String>) -> Self {
         Status {
@@ -96,12 +102,32 @@ impl Status {
         }
     }
 
-    pub fn service_specific_error(status: StatusCode, message: Option<String>) -> Self {
-        Self::new(ExceptionCode::ServiceSpecific, status, message)
+    pub fn new_service_specific_error(err: i32, message: Option<String>) -> Self {
+        Self::new(ExceptionCode::ServiceSpecific, StatusCode::ServiceSpecific(err), message)
     }
 
     pub fn is_ok(&self) -> bool {
         self.exception == ExceptionCode::None
+    }
+
+    pub fn exception_code(&self) -> ExceptionCode {
+        self.exception
+    }
+
+    pub fn transaction_error(&self) -> StatusCode {
+        if self.exception == ExceptionCode::TransactionFailed {
+            self.code
+        } else {
+            StatusCode::Ok
+        }
+    }
+
+    pub fn service_specific_error(&self) -> i32 {
+        if let StatusCode::ServiceSpecific(err) = self.code {
+            err
+        } else {
+            0
+        }
     }
 }
 
@@ -122,7 +148,7 @@ impl Debug for Status {
         Display::fmt(self, f)
     }
 }
- 
+
 impl From<ExceptionCode> for StatusCode {
     fn from(exception: ExceptionCode) -> Self {
         match exception {
@@ -203,7 +229,6 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
         log::error!("0x534e4554:132650049 Invalid header_size({}).", header_size);
         return Err(StatusCode::Unknown);
     }
-
     parcel.set_data_position(header_start + (header_size as usize));
     Ok(())
 }

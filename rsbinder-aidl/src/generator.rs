@@ -11,8 +11,7 @@ use crate::parser::Direction;
 
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_snake_case)]
+    #![allow(non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         {{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
@@ -25,8 +24,7 @@ pub mod {{mod}} {
 
 const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_snake_case)]
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
@@ -42,7 +40,7 @@ pub mod {{mod}} {
     impl Default for {{union_name}} {
         fn default() -> Self {
     {%- if members|length > 0 %}
-            Self::{{members[0][0]}}(Default::default())
+            Self::{{members[0][0]}}({{members[0][3]}})
     {%- endif %}
         }
     }
@@ -71,20 +69,20 @@ pub mod {{mod}} {
                 }
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
-                _ => Err(rsbinder::StatusCode::BadValue.into()),
+                _ => Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
     rsbinder::impl_serialize_for_parcelable!({{union_name}});
     rsbinder::impl_deserialize_for_parcelable!({{union_name}});
     impl rsbinder::ParcelableMetadata for {{union_name}} {
-        fn get_descriptor() -> &'static str { "{{ namespace }}" }
+        fn descriptor() -> &'static str { "{{ namespace }}" }
     }
     rsbinder::declare_binder_enum! {
         Tag : [i32; {{ members|length }}] {
     {%- set counter = 0 %}
     {%- for member in members %}
-            {{ member.0|upper }} = {{ counter }},
+            {{ member.2 }} = {{ counter }},
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
         }
@@ -92,22 +90,9 @@ pub mod {{mod}} {
 }
 "#;
 
-    // pub mod tag {
-    //     rsbinder::declare_binder_enum! {
-    //         Tag : [i32; {{ members|length }}] {
-    // {%- set counter = 0 %}
-    // {%- for member in members %}
-    //             {{ member.0|upper }} = {{ counter }},
-    // {%- set_global counter = counter + 1 %}
-    // {%- endfor %}
-    //         }
-    //     }
-    // }
-
 const PARCELABLE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_snake_case)]
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
@@ -131,22 +116,26 @@ pub mod {{mod}} {
     }
     impl rsbinder::Parcelable for {{name}} {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
-            {%- for member in members %}
-            _parcel.write(&self.{{ member.0 }})?;
-            {%- endfor %}
-            Ok(())
+            _parcel.sized_write(|_sub_parcel| {
+                {%- for member in members %}
+                _sub_parcel.write(&self.{{ member.0 }})?;
+                {%- endfor %}
+                Ok(())
+            })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
-            {%- for member in members %}
-            self.{{ member.0 }} = _parcel.read()?;
-            {%- endfor %}
-            Ok(())
+            _parcel.sized_read(|_sub_parcel| {
+                {%- for member in members %}
+                self.{{ member.0 }} = _sub_parcel.read()?;
+                {%- endfor %}
+                Ok(())
+            })
         }
     }
     rsbinder::impl_serialize_for_parcelable!({{name}});
     rsbinder::impl_deserialize_for_parcelable!({{name}});
     impl rsbinder::ParcelableMetadata for {{name}} {
-        fn get_descriptor() -> &'static str { "{{namespace}}" }
+        fn descriptor() -> &'static str { "{{namespace}}" }
     }
     {%- if nested|length>0 %}
     {{nested}}
@@ -156,12 +145,12 @@ pub mod {{mod}} {
 
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_snake_case)]
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
     pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     pub trait {{name}}: rsbinder::Interface + Send {
+        fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
         {%- endfor %}
@@ -210,21 +199,29 @@ pub mod {{mod}} {
             {%- endif %}
             Ok(data)
         }
-        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: Option<rsbinder::Parcel>) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<{{ member.return_type }}> {
             {%- if oneway or member.oneway %}
             Ok(())
             {%- else %}
+            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let Some(_aidl_default_impl) = <Self as {{name}}>::getDefaultImpl() {
+                  return _aidl_default_impl.{{ member.identifier }}({{ member.func_call_params }});
+                }
+            }
             {%- if member.return_type != "()" %}
-            let mut _aidl_reply = _aidl_reply.unwrap();
+            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             if _status.is_ok() {
                 let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
+                {%- for arg in member.read_onto_params %}
+                _aidl_reply.read_onto({{ arg }})?;
+                {%- endfor %}
                 Ok(_aidl_return)
             } else {
                 Err(_status)
             }
             {%- else %}
-            let mut _aidl_reply = _aidl_reply.unwrap();
+            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
             {%- endif %}
@@ -236,7 +233,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR)?;
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -316,6 +313,7 @@ struct FnMembers {
     transaction_params: String,
     transaction_has_return: bool,
     oneway: bool,
+    read_onto_params: Vec<String>,
 }
 
 fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
@@ -325,6 +323,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     let mut transaction_decls = Vec::new();
     let mut transaction_write = Vec::new();
     let mut transaction_params = String::new();
+    let mut read_onto_params = Vec::new();
     // let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
     method.arg_list.iter().for_each(|arg| {
@@ -333,16 +332,20 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         let type_decl_for_func = generator.type_decl_for_func();
         args += &format!(", {}: {}", generator.identifier, type_decl_for_func);
         func_call_params += &format!("{}, ", generator.identifier);
-        if type_decl_for_func.starts_with('&') {
-            write_params.push(generator.identifier.to_owned());
-        } else {
-            write_params.push(format!("&{}", generator.identifier));
+
+        if !matches!(arg.direction, Direction::Out) {
+            if type_decl_for_func.starts_with('&') {
+                write_params.push(generator.identifier.to_owned());
+            } else {
+                write_params.push(format!("&{}", generator.identifier));
+            }
         }
 
         transaction_decls.push(generator.transaction_decl("_reader"));
 
         if matches!(arg.direction, Direction::Out | Direction::Inout) {
             transaction_write.push(generator.identifier.to_owned());
+            read_onto_params.push(generator.identifier.to_owned());
         }
         transaction_params += &format!("{}, ", generator.func_call_param());
     });
@@ -365,7 +368,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         method.r#type.to_generator()
     };
 
-    let return_type = generator.type_declaration();
+    let return_type = generator.type_declaration(false);
     let transaction_has_return = return_type != "()";
 
     Ok(FnMembers{
@@ -373,7 +376,8 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         identifier: method.identifier.to_owned(),
         args, return_type, write_params, func_call_params,
         transaction_decls, transaction_write, transaction_params, transaction_has_return,
-        oneway: method.oneway
+        oneway: method.oneway,
+        read_onto_params,
     })
 }
 
@@ -416,8 +420,6 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
     context.insert("oneway", &decl.oneway);
     context.insert("nested", &nested.trim());
-    // let native_name = format!("Bn{}", &decl.name[1..]);
-    // let proxy_name = format!("Bp{}", &decl.name[1..]);
 
     let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
 
@@ -458,7 +460,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
                     members.push(
                         (
                             var.identifier(),
-                            generator.type_declaration(),
+                            generator.type_declaration(true),
                             generator.init_value(var.const_expr.as_ref(), false)
                         )
                     )
@@ -499,7 +501,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
         if let Some(const_expr) = &enumerator.const_expr {
             enum_val = const_expr.calculate().to_i64();
         }
-        members.push((&enumerator.identifier, enum_val));
+        members.push((enumerator.identifier.to_owned(), enum_val));
         enum_val += 1;
     }
 
@@ -507,7 +509,7 @@ fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Er
 
     context.insert("mod", &decl.name);
     context.insert("enum_name", &decl.name);
-    context.insert("enum_type", &generator.clone().direction(&Direction::None).type_declaration());
+    context.insert("enum_type", &generator.clone().direction(&Direction::None).type_declaration(true));
     context.insert("enum_len", &decl.enumerator_list.len());
     context.insert("members", &members);
 
@@ -531,7 +533,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
                 constant_members.push((var.const_identifier(),
                     generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
             } else {
-                members.push((var.union_identifier(), generator.type_declaration()));
+                members.push((var.union_identifier(), generator.type_declaration(true), var.identifier(), generator.default_value()));
             }
         } else {
             todo!();

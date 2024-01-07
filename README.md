@@ -64,6 +64,7 @@ $ target/debug/hello_client
 - [ ] Add more test cases for Binder IPC
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support MAC likes selinux and AppArmor.
+- [ ] Support AIDL version and hash.
 
 ## License
 **rsbinder** is licensed under the **Apache License version 2.0**.

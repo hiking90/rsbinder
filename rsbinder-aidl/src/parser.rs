@@ -242,7 +242,7 @@ impl VariableDecl {
     }
 
     pub fn const_identifier(&self) -> String {
-        self.identifier.to_case(Case::UpperSnake)
+        self.identifier.to_uppercase()
     }
 
     pub fn union_identifier(&self) -> String {
@@ -479,7 +479,7 @@ pub struct NonArrayType {
 
 #[derive(Debug, Default, Clone)]
 pub struct ArrayType {
-    const_expr: Option<ConstExpr>,
+    pub const_expr: Option<ConstExpr>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -580,7 +580,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
                     eprintln!("{:?}\nparse_intvalue() - Invalid u8 value: {}, radix: {}\n", err, arg_value, radix);
                     err
                 }).unwrap();
-            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
+            ConstExpr::new(ValueType::Byte(parsed_value as _))
         } else if !is_long {
             if let Ok(parsed_value) = u32::from_str_radix(value, radix) {
                 ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
@@ -607,11 +607,11 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
             if parsed_value > u8::MAX.into() || parsed_value < 0 {
                 panic!("u8 is overflowed. {}", parsed_value);
             }
-            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
+            ConstExpr::new(ValueType::Byte(parsed_value as i8 as _))
         } else if is_long {
             ConstExpr::new(ValueType::Int64(parsed_value as _))
         } else if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
-            ConstExpr::new(ValueType::Int8(parsed_value as i8 as _))
+            ConstExpr::new(ValueType::Byte(parsed_value as i8 as _))
         } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
             ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
         } else {
@@ -899,7 +899,7 @@ fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Type {
             Rule::annotation_list => { r#type.annotation_list = parse_annotation_list(pair.into_inner()); }
             Rule::non_array_type => { r#type.non_array_type = parse_non_array_type(pair.into_inner()); }
             Rule::array_type => { r#type.array_types.push(parse_array_type(pair.into_inner())); }
-            _ => { todo!(); }
+            _ => { unreachable!("Unexpected rule in parse_type(): {}", pair); }
         }
     }
 
@@ -969,7 +969,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
             Rule::INTVALUE => {
                 let expr = parse_intvalue(pair.as_str()). calculate();
                 decl.intvalue = match expr.value {
-                    ValueType::Int8(v) => v as _,
+                    ValueType::Byte(v) => v as _,
                     ValueType::Int32(v) => v as _,
                     ValueType::Int64(v) => v,
                     _ => unreachable!("Unexpected Expression in parse_method_decl(): {}, \"{}\"", pair, pair.as_str()),

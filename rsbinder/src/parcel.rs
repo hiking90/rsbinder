@@ -68,6 +68,13 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        match self {
+            ParcelData::Vec(v) => v.as_mut_slice(),
+            ParcelData::Slice(_) => panic!("ParcelData::Slice can't support as_mut_slice()."),
+        }
+    }
+
     pub(crate) fn as_ptr(&self) -> *const T {
         match self {
             ParcelData::Vec(ref v) => v.as_ptr(),
@@ -129,7 +136,7 @@ impl<T: Clone + Default> ParcelData<T> {
 
 pub type FnFreeBuffer = fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
-/// Parcel converts data into a byte stream (serialization), making it transferable. 
+/// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
 pub struct Parcel {
     data: ParcelData<u8>,
@@ -248,6 +255,13 @@ impl Parcel {
         D::deserialize(self)
     }
 
+    /// Attempt to read a type that implements [`Deserialize`] from this parcel
+    /// onto an existing value. This operation will overwrite the old value
+    /// partially or completely, depending on how much data is available.
+    pub fn read_onto<D: Deserialize>(&mut self, x: &mut D) -> Result<()> {
+        x.deserialize_from(self)
+    }
+
     pub fn data_avail(&self) -> usize {
         let result = self.data.len() - self.pos;
         assert!(result < i32::MAX as _, "data too big: {}", result);
@@ -310,6 +324,66 @@ impl Parcel {
         Err(StatusCode::BadType)
     }
 
+
+    /// Safely read a sized parcelable.
+    ///
+    /// Read the size of a parcelable, compute the end position
+    /// of that parcelable, then build a sized readable sub-parcel
+    /// and call a closure with the sub-parcel as its parameter.
+    /// The closure can keep reading data from the sub-parcel
+    /// until it runs out of input data. The closure is responsible
+    /// for calling [`ReadableSubParcel::has_more_data`] to check for
+    /// more data before every read, at least until Rust generators
+    /// are stabilized.
+    /// After the closure returns, skip to the end of the current
+    /// parcelable regardless of how much the closure has read.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// let mut parcelable = Default::default();
+    /// parcel.sized_read(|subparcel| {
+    ///     if subparcel.has_more_data() {
+    ///         parcelable.a = subparcel.read()?;
+    ///     }
+    ///     if subparcel.has_more_data() {
+    ///         parcelable.b = subparcel.read()?;
+    ///     }
+    ///     Ok(())
+    /// });
+    /// ```
+    ///
+    pub fn sized_read<F>(&mut self, f: F) -> Result<()>
+    where
+        for<'b> F: FnOnce(&mut Parcel) -> Result<()>
+    {
+        let start = self.data_position();
+        let parcelable_size: i32 = self.read()?;
+        if parcelable_size < 4 {
+            log::error!("Parcel: bad size for object: {}", parcelable_size);
+            return Err(StatusCode::BadValue);
+        }
+
+        let end = start.checked_add(parcelable_size as _)
+            .ok_or_else(|| {
+                log::error!("Parcel: check_add error: {}", parcelable_size);
+                StatusCode::BadValue
+            })?;
+        if end > self.data_size() {
+            log::error!("Parcel: not enough data: {} > {}", end, self.data_size());
+            return Err(StatusCode::NotEnoughData);
+        }
+
+        f(self)?;
+
+        // Advance the data position to the actual end,
+        // in case the closure read less data than was available
+        self.set_data_position(end);
+
+        Ok(())
+    }
+
+
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
         if !self.request_header_present {
             self.work_source_request_header_pos = self.data.len();
@@ -332,11 +406,11 @@ impl Parcel {
 
     pub(crate) fn write_aligned_data(&mut self, data: &[u8]) {
         let unaligned = data.len();
-        self.data.splice(self.pos.., data.iter().cloned());
         let aligned = pad_size(unaligned);
-        if aligned > unaligned {
-            self.data.resize(self.data.len() + aligned - unaligned);
+        if self.pos + aligned > self.data.len() {
+            self.data.resize(self.data.len() + (self.pos + aligned - self.data.len()));
         }
+        self.data.splice(self.pos..(self.pos+unaligned), data.iter().cloned());
         self.pos += aligned;
     }
 
@@ -367,12 +441,118 @@ impl Parcel {
         Ok(())
     }
 
+
+    /// Perform a series of writes to the parcel, prepended with the length
+    /// (in bytes) of the written data.
+    ///
+    /// The length `0i32` will be written to the parcel first, followed by the
+    /// writes performed by the callback. The initial length will then be
+    /// updated to the length of all data written by the callback, plus the
+    /// size of the length elemement itself (4 bytes).
+    ///
+    /// # Examples
+    ///
+    /// After the following call:
+    ///
+    /// ```
+    /// # use binder::{Binder, Interface, Parcel};
+    /// # let mut parcel = Parcel::new();
+    /// parcel.sized_write(|subparcel| {
+    ///     subparcel.write(&1u32)?;
+    ///     subparcel.write(&2u32)?;
+    ///     subparcel.write(&3u32)
+    /// });
+    /// ```
+    ///
+    /// `parcel` will contain the following:
+    ///
+    /// ```ignore
+    /// [16i32, 1u32, 2u32, 3u32]
+    /// ```
+    pub fn sized_write<F>(&mut self, f: F) -> Result<()>
+    where
+        for<'b> F: FnOnce(&mut Parcel) -> Result<()>
+    {
+        let start = self.data_position();
+        self.write(&0i32)?;
+        {
+            f(self)?;
+        }
+        let end = self.data_position();
+        self.set_data_position(start);
+        assert!(end >= start);
+        self.write(&((end - start) as i32))?;
+        self.set_data_position(end);
+        Ok(())
+    }
+
+
     pub(crate) fn append_all_from(&mut self, other: &mut Parcel) -> Result<()> {
         self.append_from(other, 0, other.data_size())
     }
 
-    pub(crate) fn append_from(&mut self, _other: &mut Parcel, _start: usize, _size: usize) -> Result<()> {
-        todo!()
+    pub(crate) fn append_from(&mut self, other: &mut Parcel, offset: usize, size: usize) -> Result<()> {
+        if size == 0 {
+            return Ok(())
+        }
+        if size > i32::MAX as usize {
+            log::error!("Parcel::append_from: the size is too large: {}", size);
+            return Err(StatusCode::BadValue)
+        }
+        let other_len = other.data_size();
+        if offset > other_len || size > other_len || (offset + size) > other_len {
+            log::error!("Parcel::append_from: The given offset({}) and size({}) exceed the data range of the parcel.",
+                offset, size);
+            return Err(StatusCode::BadValue)
+        }
+
+        let start_pos = self.pos;
+        let mut first_idx: i32 = -1;
+        let mut last_idx: i32 = -2;
+        {
+            let objects = self.objects.as_slice();
+
+            for i in 0..objects.len() {
+                let off: u64 = objects[i];
+                if off >= offset as _ && (off + (std::mem::size_of::<flat_binder_object>() as u64)) <= (offset + size) as u64 {
+                    if first_idx == -1 {
+                        first_idx = i as i32;
+                    }
+                    last_idx = i as i32;
+                }
+            }
+        }
+
+        let num_objects = last_idx - first_idx + 1;
+
+        if self.pos + size > self.data.len() {
+            self.data.resize(self.data.len() + (self.pos + size - self.data.len()));
+        }
+
+        self.data.splice(self.pos..(self.pos+size),
+            other.data.as_slice()[offset..offset+size].iter().cloned());
+        self.pos += size;
+
+        if num_objects > 0 {
+            let mut idx = self.objects.len();
+            self.objects.resize(idx + (num_objects as usize));
+
+            let objects = self.objects.as_mut_slice();
+            for i in first_idx..=last_idx {
+                let off = objects[i as usize] as usize - offset + start_pos;
+                objects[idx] = off as _;
+                idx += 1;
+                let flat = unsafe {
+                    flat_binder_object::from(self.data.as_ptr().add(off))
+                };
+                flat.acquire()?;
+                if flat.header_type() == BINDER_TYPE_FD {
+                    todo!()
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn release_objects(&self) {

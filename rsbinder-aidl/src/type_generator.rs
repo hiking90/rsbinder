@@ -1,14 +1,38 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::parser::*;
+use crate::parser::{*, self};
 use crate::const_expr::{ValueType, ConstExpr};
+
+#[derive(Clone, Debug)]
+struct ArrayInfo {
+    sizes: Vec<i64>,
+    value_type: ValueType,
+}
+
+impl ArrayInfo {
+    fn new(value_type: &ValueType, array_types: &[parser::ArrayType]) -> Self {
+        Self {
+            sizes: array_types.iter()
+            .map(|t| t.const_expr.clone()
+                .map_or_else(|| 0,
+                    |v| v.calculate().to_i64())).collect(),
+            value_type: value_type.clone(),
+        }
+    }
+
+    fn is_fixed(&self) -> bool {
+        !self.sizes.is_empty() && {
+            self.sizes.iter().all(|size| *size > 0)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TypeGenerator {
     is_nullable: bool,
     pub value_type: ValueType,
-    array_types: Vec<ValueType>,
+    array_types: Vec<ArrayInfo>,
     pub identifier: String,
     direction: Direction,
 }
@@ -18,7 +42,7 @@ impl TypeGenerator {
         let mut array_types = Vec::new();
         let value_type = match aidl_type.name.as_str() {
             "boolean" => ValueType::Bool(false),
-            "byte" => ValueType::Int8(0),
+            "byte" => ValueType::Byte(0),
             "char" => ValueType::Char(Default::default()),
             "int" => ValueType::Int32(0),
             "long" => ValueType::Int64(0),
@@ -30,7 +54,7 @@ impl TypeGenerator {
             "List" => {
                 match &aidl_type.generic {
                     Some(gen) => {
-                        array_types.push(gen.to_value_type());
+                        array_types.push(ArrayInfo::new(&gen.to_value_type(), &Vec::new()));
                         ValueType::Array(Vec::new())
                     }
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
@@ -62,13 +86,25 @@ impl TypeGenerator {
         let mut this = Self::new(&_type.non_array_type);
 
         if !_type.array_types.is_empty() {
-            this = this.array();
+            this = this.array(&_type.array_types);
         }
 
         if check_annotation_list(&_type.annotation_list, AnnotationType::IsNullable).0 {
             this.nullable()
         } else {
             this
+        }
+    }
+
+    fn is_aidl_nullable(value_type: &ValueType) -> bool {
+        match value_type {
+            ValueType::String(_) | ValueType::Array(_) |
+            ValueType::FileDescriptor |  ValueType::IBinder => true,
+            ValueType::UserDefined(name) => {
+                let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL);
+                !matches!(lookup_decl.decl, Declaration::Enum(_))
+            }
+            _ => false,
         }
     }
 
@@ -79,7 +115,7 @@ impl TypeGenerator {
         let name = if !ns.is_empty() {
             format!("{}::{}", ns, lookup_decl.name.ns.last().unwrap())
         } else {
-            let name = lookup_decl.name.ns.last().unwrap().to_owned();
+            let name: String = lookup_decl.name.ns.last().unwrap().to_owned();
             if curr_ns.ns.last().unwrap() == name.as_str() {
                 format!("Box<{}>", name)    // To avoid, recursive type issue.
             } else {
@@ -95,8 +131,42 @@ impl TypeGenerator {
         }
     }
 
+    // AIDL Enum is a kind of primitive type.
+    fn is_primitive(value_type: &ValueType) -> bool {
+        match value_type {
+            ValueType::UserDefined(name) => {
+                let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL);
+                matches!(lookup_decl.decl, Declaration::Enum(_))
+            }
+            _ => value_type.is_primitive(),
+        }
+    }
+
+        // Check if this type can be initialized with Default::default().
+    pub fn can_be_defaulted(value_type: &ValueType, is_struct: bool) -> bool {
+        if is_struct {
+            Self::is_primitive(value_type) ||
+            matches!(value_type,
+                ValueType::String(_) | ValueType::Array(_) | ValueType::Map(_, _) |
+                ValueType::Holder | ValueType::UserDefined(_))
+        } else {
+            Self::is_primitive(value_type) ||
+            match value_type {
+                ValueType::String(_) | ValueType::Array(_) | ValueType::Map(_, _) |
+                ValueType::Holder => true,
+                ValueType::UserDefined(name) => {
+                    let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL);
+                    matches!(lookup_decl.decl,
+                        Declaration::Enum(_) | Declaration::Parcelable(_) | Declaration::Union(_))
+                }
+                _ => false,
+            }
+        }
+    }
+
+
     pub fn nullable(mut self) -> Self {
-        if self.value_type.is_primitive() {
+        if Self::is_primitive(&self.value_type) {
             panic!("Primitive type({:?}) cannot get nullable annotation", self.value_type)
         }
 
@@ -111,42 +181,138 @@ impl TypeGenerator {
 
     pub fn direction(mut self, direction: &Direction) -> Self {
         if matches!(direction, Direction::Out | Direction::Inout) &&
-            (self.value_type.is_primitive() || matches!(self.value_type, ValueType::String(_))) {
+            (Self::is_primitive(&self.value_type) || matches!(self.value_type, ValueType::String(_))) {
             panic!("Primitive types and String can be an out or inout parameter.");
         }
         self.direction = direction.clone();
         self
     }
 
-    pub fn array(mut self) -> Self {
+    // Switch to array type.
+    pub fn array(mut self, array_types: &[parser::ArrayType]) -> Self {
         match self.value_type {
             ValueType::Array(_) => self,
             _ => {
-                self.array_types.push(self.value_type.clone());
+                self.array_types.push(ArrayInfo::new(&self.value_type, array_types));
                 self.value_type = ValueType::Array(Vec::new());
                 self
             }
         }
     }
 
-    fn list_type_decl(&self) -> String {
-        let sub_type = self.array_types.first().expect("array_types is empty.");
+    fn array_type_name(value_type: &ValueType) -> String {
+        let name = Self::type_decl(value_type);
+        if name == "i8" {
+            "u8".to_owned()
+        } else {
+            name
+        }
+    }
+
+    fn make_fixed_array(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
+        assert!(!array_info.sizes.is_empty());
+
+        let type_name = Self::array_type_name(&array_info.value_type);
+
+        let value_str = if is_struct {
+            if self.is_nullable && Self::is_aidl_nullable(&array_info.value_type) {
+                format!("Option<{}>", type_name)
+            } else {
+                type_name
+            }
+        } else {
+            match self.direction {
+                Direction::Out | Direction::Inout => {
+                    if self.is_nullable || !Self::can_be_defaulted(&array_info.value_type, is_struct) {
+                        format!("Option<{}>", type_name)
+                    } else {
+                        type_name
+                    }
+                }
+                _ => {
+                    type_name
+                }
+            }
+
+        };
+
+        array_info.sizes.iter().rev().skip(1).fold(
+            format!("[{}; {}]", value_str, array_info.sizes.last().unwrap()),
+            |acc, size| {
+                format!("[{}; {}]", acc, size)
+            }
+        )
+    }
+
+    fn list_type_decl_fixed(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
+        let fixed_array = self.make_fixed_array(array_info, is_struct);
+
         match self.direction {
             Direction::Out => {
-                format!("Vec<Option<{}>>", Self::type_decl(sub_type))
+                if self.is_nullable {
+                    format!("Option<{}>", fixed_array)
+                } else {
+                    fixed_array
+                }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", Self::type_decl(sub_type))
+                    format!("Option<{}>", fixed_array)
                 } else {
-                    format!("Vec<{}>", Self::type_decl(sub_type))
+                    fixed_array
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", Self::type_decl(sub_type))
+                    format!("Option<{}>", fixed_array)
                 } else {
-                    format!("Vec<{}>", Self::type_decl(sub_type))
+                    fixed_array
+                }
+            }
+        }
+    }
+
+    fn list_type_decl(&self, is_struct: bool) -> String {
+        let sub_type = self.array_types.first().expect("array_types is empty.");
+        if sub_type.is_fixed() {
+            return self.list_type_decl_fixed(sub_type, is_struct);
+        }
+
+        let type_name = Self::array_type_name(&sub_type.value_type);
+        match self.direction {
+            Direction::Out => {
+                if self.is_nullable {
+                    format!("Vec<Option<{}>>", type_name)
+                } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
+                    format!("Vec<{}>", type_name)
+                }  else {
+                    format!("Vec<Option<{}>>", type_name)
+                }
+            }
+            Direction::Inout => {
+                if self.is_nullable {
+                    format!("Vec<Option<{}>>", type_name)
+                } else if Self::can_be_defaulted(&sub_type.value_type, true) {
+                    format!("Vec<{}>", type_name)
+                } else {
+                    format!("Vec<Option<{}>>", type_name)
+                }
+            }
+            _ => {
+                if is_struct {
+                    if self.is_nullable && Self::is_aidl_nullable(&sub_type.value_type) {
+                            format!("Vec<Option<{}>>", type_name)
+                    } else {
+                        format!("Vec<{}>", type_name)
+                    }
+                } else if self.is_nullable {
+                    if Self::is_primitive(&sub_type.value_type) {
+                        format!("Option<Vec<{}>>", type_name)
+                    } else {
+                        format!("Option<Vec<Option<{}>>>", type_name)
+                    }
+                } else {
+                    format!("Vec<{}>", type_name)
                 }
             }
         }
@@ -156,7 +322,7 @@ impl TypeGenerator {
         match value_type {
             ValueType::Void => "()".into(),
             ValueType::String(_) => "String".into(),
-            ValueType::Int8(_) => "i8".into(),
+            ValueType::Byte(_) => "i8".into(),
             ValueType::Int32(_) => "i32".into(),
             ValueType::Int64(_) => "i64".into(),
             ValueType::Float(_) => "f32".into(),
@@ -176,65 +342,141 @@ impl TypeGenerator {
         }
     }
 
-    pub fn type_declaration(&self) -> String {
+    pub fn type_declaration(&self, is_struct: bool) -> String {
+        let mut is_nullable = self.is_nullable;
         let name = match &self.value_type {
-            ValueType::Array(_) => self.list_type_decl(),
-            _ => Self::type_decl(&self.value_type),
+            ValueType::Array(_) => {
+                self.list_type_decl(is_struct)
+            }
+            _ => {
+                if !Self::can_be_defaulted(&self.value_type, is_struct) && is_struct {
+                    is_nullable = true;
+                }
+                Self::type_decl(&self.value_type)
+            }
         };
 
-        if self.is_nullable {
+        if is_nullable && !name.starts_with("Option<") {
             format!("Option<{name}>")
         } else {
             name
         }
     }
 
-    fn func_list_type_decl(&self) -> String {
-        let sub_type = self.array_types.first().expect("array_types is empty.");
+    fn func_list_type_decl_fixed(&self, array_info: &ArrayInfo) -> String {
+        let fixed_array = self.make_fixed_array(array_info, false);
+
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(sub_type))
+                    format!("&mut Option<{}>", fixed_array)
                 } else {
-                    format!("&mut Vec<Option<{}>>", Self::type_decl(sub_type))
+                    format!("&mut {}", fixed_array)
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("&mut Option<Vec<Option<{}>>>", Self::type_decl(sub_type))
+                    format!("&mut Option<{}>", fixed_array)
                 } else {
-                    format!("&mut Vec<{}>", Self::type_decl(sub_type))
+                    format!("&mut {}", fixed_array)
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<&[Option<{}>]>", Self::type_decl(sub_type))
+                    format!("Option<&{}>", fixed_array)
                 } else {
-                    format!("&[{}]", Self::type_decl(sub_type))
+                    format!("&{}", fixed_array)
+                }
+            }
+        }
+    }
+
+    fn func_list_type_decl(&self) -> String {
+        let sub_type = self.array_types.first().expect("array_types is empty.");
+        if sub_type.is_fixed() {
+            return self.func_list_type_decl_fixed(sub_type);
+        }
+        let type_name = Self::array_type_name(&sub_type.value_type);
+        match self.direction {
+            Direction::Out => {
+                if self.is_nullable {
+                    // if nullable, it means that the array can have null elements.
+                    format!("&mut Option<Vec<Option<{}>>>", type_name)
+                } else if Self::can_be_defaulted(&sub_type.value_type, false)
+                    || Self::is_primitive(&sub_type.value_type) {   // Enum is a primitive type.
+                    format!("&mut Vec<{}>", type_name)
+                } else {
+                    format!("&mut Vec<Option<{}>>", type_name)
+                }
+            }
+            Direction::Inout => {
+                if self.is_nullable {
+                    if Self::can_be_defaulted(&sub_type.value_type, false)  {
+                        format!("&mut Option<Vec<{}>>", type_name)
+                    } else {
+                        format!("&mut Option<Vec<Option<{}>>>", type_name)
+                    }
+                } else {
+                    format!("&mut Vec<{}>", type_name)
+                }
+            }
+            _ => {
+                if self.is_nullable {
+                    if Self::is_primitive(&sub_type.value_type) {
+                        format!("Option<&[{}]>", type_name)
+                    } else {
+                        format!("Option<&[Option<{}>]>", type_name)
+                    }
+                } else {
+                    format!("&[{}]", type_name)
                 }
             }
         }
     }
 
     pub fn type_decl_for_func(&self) -> String {
-        if self.value_type.is_primitive() {
-            Self::type_decl(&self.value_type)
-        } else {
-            match &self.value_type {
-                ValueType::String(_) => {
-                    if self.is_nullable {
-                        "Option<&str>".into()
-                    } else {
-                        "&str".into()
+        match &self.value_type {
+            ValueType::Array(_) => {
+                self.func_list_type_decl()
+            }
+            ValueType::String(_) => {
+                match self.direction {
+                    Direction::Out | Direction::Inout => {
+                        panic!("String cannot be an out or inout parameter.")
+                    }
+                    _ => {
+                        if self.is_nullable {
+                            "Option<&str>".into()
+                        } else {
+                            "&str".into()
+                        }
                     }
                 }
-                ValueType::Array(_) => self.func_list_type_decl(),
-                _  => {
-                    let name = Self::type_decl(&self.value_type);
-                    if self.is_nullable {
-                        format!("Option<&{name}>")
-                    } else {
-                        format!("&{name}")
+            }
+            _ => {
+                match self.direction {
+                    Direction::Out | Direction::Inout => {
+                        if Self::is_primitive(&self.value_type) {
+                            panic!("{:?} cannot be an out or inout parameter.", self.value_type);
+                        }
+                        let name = Self::type_decl(&self.value_type);
+                        if self.is_nullable {
+                            format!("&mut Option<{}>", name)
+                        } else {
+                            format!("&mut {}", name)
+                        }
+                    }
+                    _ => {
+                        if Self::is_primitive(&self.value_type) {
+                            Self::type_decl(&self.value_type)
+                        } else {
+                            let name = Self::type_decl(&self.value_type);
+                            if self.is_nullable {
+                                format!("Option<&{}>", name)
+                            } else {
+                                format!("&{}", name)
+                            }
+                        }
                     }
                 }
             }
@@ -254,10 +496,10 @@ impl TypeGenerator {
     pub fn func_call_param(&self) -> String {
         self.check_identifier();
 
-        if self.value_type.is_primitive() {
+        if Self::is_primitive(&self.value_type) {
             self.identifier.clone()
         } else {
-            let decl = self.type_declaration();
+            let decl = self.type_declaration(false);
 
             if decl == "String" {
                 format!("{}.as_str()", self.identifier)
@@ -267,14 +509,13 @@ impl TypeGenerator {
                         format!("&mut {}", self.identifier)
                     }
                     _ => {
-                        if decl.starts_with("Option<Vec<") {
+                        if decl.starts_with("Option<Vec<") || decl.starts_with("Option<String>") {
                             format!("{}.as_deref()", self.identifier)
                         } else if decl.starts_with("Option<") {
                             format!("{}.as_ref()", self.identifier)
                         } else {
                             format!("&{}", self.identifier)
                         }
-
                     }
                 }
             }
@@ -296,19 +537,42 @@ impl TypeGenerator {
             }
         };
 
-        format!("{mutable}{}: {} = {init}", self.identifier, self.type_declaration())
+        format!("{mutable}{}: {} = {init}", self.identifier, self.type_declaration(false))
+    }
+
+    pub fn default_value(&self) -> String {
+        match &self.value_type {
+            ValueType::UserDefined(name) => {
+                let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL);
+                match lookup_decl.decl {
+                    Declaration::Enum(enum_decl) => {
+                        let first = enum_decl.enumerator_list.first().unwrap();
+                        format!("{}::{}", Self::make_user_defined_type_name(name), first.identifier)
+                    }
+                    _ => "Default::default()".to_owned(),
+                }
+            }
+            _ => "Default::default()".to_owned(),
+        }
     }
 
     pub fn init_value(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
         match const_expr {
             Some(expr) => {
-                if let ValueType::Array(_) = self.value_type {
-                    expr.calculate().convert_to(self.array_types.first().unwrap()).value.to_init(is_const)
+                let init_str = if let ValueType::Array(_) = self.value_type {
+                    let array_info = self.array_types.first().unwrap();
+                    let is_nullable = self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
+                    expr.calculate().convert_to(&array_info.value_type).value.to_init(is_const, array_info.is_fixed(), is_nullable)
                 } else {
-                    expr.calculate().convert_to(&self.value_type).value.to_init(is_const)
+                    expr.calculate().convert_to(&self.value_type).value.to_init(is_const, false, false)
+                };
+                if self.is_nullable {
+                    format!("Some({})", init_str)
+                } else {
+                    init_str
                 }
             }
-            None => ValueType::Void.to_init(is_const),
+            None => ValueType::Void.to_init(is_const, false, false),
         }
     }
 }
@@ -321,20 +585,40 @@ mod tests {
     fn test_type_declaration() {
         let gen = TypeGenerator::new(&NonArrayType{ name: "String".to_owned(), generic: None });
 
-        assert_eq!(gen.type_declaration(), "String");
+        assert_eq!(gen.type_declaration(false), "String");
 
         let nullable_gen = gen.clone().nullable();
-        assert_eq!(nullable_gen.type_declaration(), "Option<String>");
+        assert_eq!(nullable_gen.type_declaration(false), "Option<String>");
 
-        let array_gen = gen.array();
-        assert_eq!(array_gen.type_declaration(), "Vec<String>");
-        assert_eq!(array_gen.clone().direction(&Direction::Out).type_declaration(), "Vec<Option<String>>");
-        assert_eq!(array_gen.clone().direction(&Direction::Inout).type_declaration(), "Vec<String>");
+        let array_gen = gen.array(&Vec::new());
+        assert_eq!(array_gen.type_declaration(false), "Vec<String>");
+        assert_eq!(array_gen.clone().direction(&Direction::Out).type_declaration(false), "Vec<String>");
+        assert_eq!(array_gen.clone().direction(&Direction::Inout).type_declaration(false), "Vec<String>");
 
         let nullable_array_gen = array_gen.nullable();
-        assert_eq!(nullable_array_gen.type_declaration(), "Option<Vec<Option<String>>>");
-        assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_declaration(), "Option<Vec<Option<String>>>");
-        assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_declaration(), "Option<Vec<Option<String>>>");
+        assert_eq!(nullable_array_gen.type_declaration(false), "Option<Vec<Option<String>>>");
+        assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_declaration(false), "Option<Vec<Option<String>>>");
+        assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_declaration(false), "Option<Vec<Option<String>>>");
+    }
+
+    #[test]
+    fn test_binder_declaration() {
+        let gen = TypeGenerator::new(&NonArrayType{ name: "IBinder".to_owned(), generic: None });
+
+        assert_eq!(gen.type_declaration(false), "rsbinder::SIBinder");
+
+        let nullable_gen = gen.clone().nullable();
+        assert_eq!(nullable_gen.type_declaration(false), "Option<rsbinder::SIBinder>");
+
+        let array_gen = gen.array(&Vec::new());
+        assert_eq!(array_gen.type_declaration(false), "Vec<rsbinder::SIBinder>");
+        assert_eq!(array_gen.clone().direction(&Direction::Out).type_declaration(false), "Vec<Option<rsbinder::SIBinder>>");
+        assert_eq!(array_gen.clone().direction(&Direction::Inout).type_declaration(false), "Vec<Option<rsbinder::SIBinder>>");
+
+        let nullable_array_gen = array_gen.nullable();
+        assert_eq!(nullable_array_gen.type_declaration(false), "Option<Vec<Option<rsbinder::SIBinder>>>");
+        assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_declaration(false), "Option<Vec<Option<rsbinder::SIBinder>>>");
+        assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_declaration(false), "Option<Vec<Option<rsbinder::SIBinder>>>");
     }
 
     #[test]
@@ -346,7 +630,7 @@ mod tests {
         let nullable_gen = gen.clone().nullable();
         assert_eq!(nullable_gen.type_decl_for_func(), "Option<&rsbinder::ParcelFileDescriptor>");
 
-        let array_gen = gen.array();
+        let array_gen = gen.array(&Vec::new());
         assert_eq!(array_gen.type_decl_for_func(), "&[rsbinder::ParcelFileDescriptor]");
         assert_eq!(array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>");
         assert_eq!(array_gen.clone().direction(&Direction::Inout).type_decl_for_func(), "&mut Vec<rsbinder::ParcelFileDescriptor>");
@@ -355,6 +639,17 @@ mod tests {
         assert_eq!(nullable_array_gen.type_decl_for_func(), "Option<&[Option<rsbinder::ParcelFileDescriptor>]>");
         assert_eq!(nullable_array_gen.clone().direction(&Direction::Out).type_decl_for_func(), "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>");
         assert_eq!(nullable_array_gen.direction(&Direction::Inout).type_decl_for_func(), "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>");
+
+        let gen = TypeGenerator::new(&NonArrayType{ name: "boolean".to_owned(), generic: None });
+        let array_gen = gen.array(&Vec::new());
+        assert_eq!(array_gen.direction(&Direction::Out).type_decl_for_func(), "&mut Vec<bool>");
+
+        // ITestService.aidl
+        // fn ReverseUtf8CppStringList(&self, _arg_input: Option<&[Option<String>]>, _arg_repeated: &mut Option<Vec<Option<String>>>) -> binder::Result<Option<Vec<Option<String>>>>;
+        let gen = TypeGenerator::new(&NonArrayType{ name: "String".to_owned(), generic: None });
+        let nullable_array_gen = gen.array(&Vec::new()).nullable();
+        assert_eq!(nullable_array_gen.type_decl_for_func(), "Option<&[Option<String>]>");
+
     }
 
     #[test]
@@ -362,15 +657,23 @@ mod tests {
         let gen = TypeGenerator::new(&NonArrayType{ name: "String".to_owned(), generic: None })
             .identifier("type");
         assert_eq!(gen.func_call_param(), "_arg_type.as_str()");
-        assert_eq!(gen.nullable().func_call_param(), "_arg_type.as_ref()");
+        assert_eq!(gen.nullable().func_call_param(), "_arg_type.as_deref()");
 
         let gen = TypeGenerator::new(&NonArrayType{ name: "ParcelFileDescriptor".to_owned(), generic: None })
             .identifier("type");
         assert_eq!(gen.func_call_param(), "&_arg_type");
 
-        let array_gen = gen.array();
+        let array_gen = gen.array(&Vec::new());
         assert_eq!(array_gen.clone().nullable().func_call_param(), "_arg_type.as_deref()");
         assert_eq!(array_gen.clone().direction(&Direction::Out).func_call_param(), "&mut _arg_type");
         assert_eq!(array_gen.direction(&Direction::Inout).func_call_param(), "&mut _arg_type");
+    }
+
+    #[test]
+    fn test_type_decl_for_struct() {
+        let gen = TypeGenerator::new(&NonArrayType{ name: "boolean".to_owned(), generic: None })
+            .identifier("type");
+        let array_nullable = gen.array(&[ArrayType{const_expr: Some(ConstExpr::new(ValueType::Byte(2)))}]).nullable();
+        assert_eq!(array_nullable.type_declaration(true), "Option<[bool; 2]>");
     }
 }

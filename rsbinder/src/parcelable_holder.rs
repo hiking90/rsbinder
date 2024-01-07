@@ -20,7 +20,7 @@
 use crate::binder::Stability;
 use crate::error::{StatusCode, Result};
 use crate::{
-    Deserialize, DeserializeArray, DeserializeOption, Parcel, Parcelable, Serialize, SerializeArray, SerializeOption, NON_NULL_PARCELABLE_FLAG,
+    Deserialize, Parcel, Parcelable, Serialize, NON_NULL_PARCELABLE_FLAG,
     NULL_PARCELABLE_FLAG,
 };
 
@@ -36,7 +36,7 @@ pub trait ParcelableMetadata {
     /// The Binder parcelable descriptor string.
     ///
     /// This string is a unique identifier for a Binder parcelable.
-    fn get_descriptor() -> &'static str;
+    fn descriptor() -> &'static str;
 
     /// The Binder parcelable stability.
     fn get_stability(&self) -> Stability {
@@ -107,12 +107,16 @@ impl ParcelableHolder {
         T: Any + Parcelable + ParcelableMetadata + std::fmt::Debug + Send + Sync,
     {
         if self.stability > p.get_stability() {
+            log::error!(
+                "ParcelableHolder::set_parcelable: parcelable stability mismatch: {:?} > {:?}",
+                self.stability,
+                p.get_stability());
             return Err(StatusCode::BadValue);
         }
 
         *self.data.get_mut().unwrap() = ParcelableHolderData::Parcelable {
             parcelable: p,
-            name: T::get_descriptor().into(),
+            name: T::descriptor().into(),
         };
 
         Ok(())
@@ -124,7 +128,7 @@ impl ParcelableHolder {
     /// the current object as a parcelable of type `T`.
     /// The object is validated against `T` by checking that
     /// its parcelable descriptor matches the one returned
-    /// by `T::get_descriptor()`.
+    /// by `T::descriptor()`.
     ///
     /// Returns one of the following:
     /// * `Err(_)` in case of error
@@ -135,7 +139,7 @@ impl ParcelableHolder {
     where
         T: Any + Parcelable + ParcelableMetadata + Default + std::fmt::Debug + Send + Sync,
     {
-        let parcelable_desc = T::get_descriptor();
+        let parcelable_desc = T::descriptor();
         let mut data = self.data.lock().unwrap();
         match *data {
             ParcelableHolderData::Empty => Ok(None),
@@ -144,11 +148,20 @@ impl ParcelableHolder {
                 ref name,
             } => {
                 if name != parcelable_desc {
+                    log::error!(
+                        "ParcelableHolder::get_parcelable: parcelable descriptor mismatch: {:?} != {:?}",
+                        name,
+                        parcelable_desc);
                     return Err(StatusCode::BadValue);
                 }
 
                 match Arc::clone(parcelable).downcast_arc::<T>() {
-                    Err(_) => Err(StatusCode::BadValue),
+                    Err(_) => {
+                        log::error!("ParcelableHolder::get_parcelable: parcelable type mismatch: {:?} != {:?}",
+                            parcelable,
+                            parcelable_desc);
+                        Err(StatusCode::BadValue)
+                    }
                     Ok(x) => Ok(Some(x)),
                 }
             }
@@ -186,36 +199,17 @@ impl Serialize for ParcelableHolder {
     }
 }
 
-impl SerializeArray for ParcelableHolder {}
-
-impl SerializeOption for ParcelableHolder {
-    fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
-        if let Some(f) = this {
-            f.serialize(parcel)
-        } else {
-            todo!()
-        }
-    }
-}
-
 impl Deserialize for ParcelableHolder {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let status: i32 = parcel.read()?;
         if status == NULL_PARCELABLE_FLAG {
+            log::error!("ParcelableHolder::deserialize: unexpected null");
             Err(StatusCode::UnexpectedNull)
         } else {
             let mut parcelable = ParcelableHolder::new(Default::default());
             parcelable.read_from_parcel(parcel)?;
             Ok(parcelable)
         }
-    }
-}
-
-impl DeserializeArray for ParcelableHolder {}
-
-impl DeserializeOption for ParcelableHolder {
-    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
-        todo!();
     }
 }
 
@@ -257,6 +251,7 @@ impl Parcelable for ParcelableHolder {
 
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
         if self.stability as i32 != parcel.read::<i32>()? {
+            log::error!("ParcelableHolder::read_from_parcel: parcelable stability mismatch");
             return Err(StatusCode::BadValue);
         }
 
@@ -273,8 +268,8 @@ impl Parcelable for ParcelableHolder {
 
         // TODO: C++ ParcelableHolder accepts sizes up to SIZE_MAX here, but we
         // only go up to i32::MAX because that's what our API uses everywhere
-        let data_start = parcel.data_position();
-        let data_end = data_start
+        let data_start: usize = parcel.data_position();
+        let data_end: usize = data_start
             .checked_add(data_size as usize)
             .ok_or(StatusCode::BadValue)?;
 

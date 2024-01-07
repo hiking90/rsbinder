@@ -58,6 +58,9 @@ impl ProcessState {
         &INSTANCE
     }
 
+    /// Get ProcessState instance.
+    /// If ProcessState is not initialized, it will panic.
+    /// If you want to initialize ProcessState, use init() or init_default().
     pub fn as_self() -> &'static ProcessState {
         Self::instance().get().expect("ProcessState is not initialized!")
     }
@@ -113,7 +116,12 @@ impl ProcessState {
         })
     }
 
+    /// Initialize ProcessState with binder path and max threads.
+    /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
+    /// If you want to use the default binder path, use init_default().
     pub fn init(driver_name: &str, max_threads: u32) -> &'static ProcessState {
+        // TODO: panic! is not good. It should return Result.
+        // But, get_or_try_init is not stable yet.
         Self::instance().get_or_init(|| {
             match Self::inner_init(driver_name, max_threads) {
                 Ok(instance) => instance,
@@ -124,6 +132,14 @@ impl ProcessState {
         })
     }
 
+    /// Initialize ProcessState with default binder path and max threads.
+    /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
+    /// DEFAULT_BINDER_PATH is "/dev/binderfs/binder".
+    pub fn init_default() -> &'static ProcessState {
+        Self::init(crate::DEFAULT_BINDER_PATH, 0)
+    }
+
+    /// Get binder service manager.
     pub fn become_context_manager(&self, binder: SIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
         let mut obj = unsafe { obj.assume_init() };
@@ -145,15 +161,17 @@ impl ProcessState {
         Ok(())
     }
 
-    pub fn context_manager(&self) -> Option<SIBinder> {
+    pub(crate) fn context_manager(&self) -> Option<SIBinder> {
         self.context_manager.read().unwrap().clone()
     }
 
+    /// Get binder service manager.
     pub fn context_object(&self) -> Result<SIBinder> {
         self.strong_proxy_for_handle(0)
-        // , Box::new(BpServiceManager::new())
     }
 
+    /// Get binder from handle.
+    /// If the binder is not cached, it will create a new binder.
     pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<SIBinder> {
         self.strong_proxy_for_handle_stability(handle, Default::default())
     }

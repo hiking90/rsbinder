@@ -50,22 +50,6 @@ generic_type3 = {
     "<" ~ type_args ~ ">"
 }
 
-// non_array_type = {
-//     annotation_list* ~
-//     qualified_name ~
-//     (
-//         generic_type1 | generic_type2 | generic_type3
-//     )?
-// }
-
-// array_type = {
-//     annotation_list* ~ "[" ~ const_expr? ~ "]"
-// }
-
-// type = {
-//     non_array_type ~ array_type*
-// }
-
 // annotation_list is removed from non_array_type and array_type and then moved to type.
 non_array_type = {
     qualified_name ~

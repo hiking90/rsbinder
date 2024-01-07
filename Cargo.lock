@@ -897,6 +897,15 @@ dependencies = [
 [[package]]
 name = "rsbinder-tests"
 version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "lazy_static",
+ "libc",
+ "rsbinder",
+ "rsbinder-aidl",
+ "rsbinder-hub",
+ "tokio",
+]
 
 [[package]]
 name = "rsbinder-tools"
