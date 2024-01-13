@@ -208,21 +208,18 @@ pub mod {{mod}} {
                   return _aidl_default_impl.{{ member.identifier }}({{ member.func_call_params }});
                 }
             }
+            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
+            let _status = _aidl_reply.read::<rsbinder::Status>()?;
+            if !_status.is_ok() { return Err(_status); }
             {%- if member.return_type != "()" %}
-            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
-            let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            if _status.is_ok() {
-                let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
-                {%- for arg in member.read_onto_params %}
-                _aidl_reply.read_onto({{ arg }})?;
-                {%- endfor %}
-                Ok(_aidl_return)
-            } else {
-                Err(_status)
-            }
+            let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
+            {%- endif %}
+            {%- for arg in member.read_onto_params %}
+            _aidl_reply.read_onto({{ arg }})?;
+            {%- endfor %}
+            {%- if member.return_type != "()" %}
+            Ok(_aidl_return)
             {%- else %}
-            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
-            let _status = _aidl_reply.read::<rsbinder::Status>()?;
             Ok(())
             {%- endif %}
             {%- endif %}
@@ -268,10 +265,10 @@ pub mod {{mod}} {
                         _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                         {%- if member.transaction_has_return %}
                         _reply.write(_aidl_return)?;
+                        {%- endif %}
                         {%- for arg in member.transaction_write %}
                         _reply.write(&{{ arg }})?;
                         {%- endfor %}
-                        {%- endif %}
                     }
                     Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
