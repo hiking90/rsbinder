@@ -268,7 +268,6 @@ impl TryFrom<i32> for Stability {
 
 const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
 
-#[derive(Debug)]
 struct Inner {
     strong: AtomicI32,
     weak: AtomicI32,
@@ -302,6 +301,16 @@ impl Drop for Inner {
             thread_state::dec_weak_handle(proxy.handle())
                 .expect("Failed to decrease the binder weak reference count.")
         }
+    }
+}
+
+impl Debug for Inner {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "Inner {{ strong: {}, weak: {}, is_strong_lifetime: {}, descriptor: {}, id: {} }}",
+            self.strong.load(Ordering::Relaxed),
+            self.weak.load(Ordering::Relaxed),
+            self.is_strong_lifetime.load(Ordering::Relaxed),
+            self.descriptor, self.data.id())
     }
 }
 

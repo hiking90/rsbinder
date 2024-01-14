@@ -53,8 +53,8 @@ $ target/debug/hello_service
 $ target/debug/hello_client
 ```
 
-## Compatibility with Android Binder
-* The Binder protocol is mutually compatible. That is, communication between an Android service and an rsbinder client is possible, and vice versa.
+## Compatibility Goal with Android Binder
+* The Binder protocol is mutually compatible. That is, communication between an Android service and an rsbinder client is possible, and vice versa. However, this compatibility work is still ongoing.
 * API compatibility is not provided. Android binder and rsbinder have different operating architectures and cannot offer the same APIs. However, there is a high similarity in APIs.
 
 ## Todo
