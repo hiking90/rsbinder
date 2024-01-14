@@ -34,6 +34,7 @@ pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use crate::*;
     #[test]
     #[cfg(target_os = "linux")]

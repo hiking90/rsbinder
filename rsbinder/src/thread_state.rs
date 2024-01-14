@@ -35,6 +35,7 @@ use crate::{
 
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
+    static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
 }
 
 const RETURN_STRINGS: [&str; 21] =
@@ -109,8 +110,8 @@ pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 #[derive(Debug, Clone, Copy)]
 struct TransactionState {
     calling_pid: binder::pid_t,
-    calling_sid: *const u8,
-    calling_uid: binder::uid_t,
+    _calling_sid: *const u8,
+    _calling_uid: binder::uid_t,
     // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
     work_source: binder::uid_t,
@@ -121,8 +122,8 @@ impl TransactionState {
     fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
         TransactionState {
             calling_pid: data.transaction_data.sender_pid,
-            calling_sid: data.secctx as _,
-            calling_uid: data.transaction_data.sender_euid,
+            _calling_sid: data.secctx as _,
+            _calling_uid: data.transaction_data.sender_euid,
             // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
             work_source: 0,
@@ -131,18 +132,63 @@ impl TransactionState {
     }
 }
 
+// To avoid duplicate calls to borrow_mut() on ThreadState,
+// separate the data related to binder dereference.
+struct BinderDerefs {
+    pending_strong_derefs: Vec<binder_uintptr_t>,
+    pending_weak_derefs: Vec<binder_uintptr_t>,
+    post_strong_derefs: Vec<SIBinder>,
+    post_weak_derefs: Vec<WIBinder>,
+}
 
-pub struct ThreadState {
+impl BinderDerefs {
+    fn new() -> Self {
+        BinderDerefs {
+            pending_strong_derefs: Vec::new(),
+            pending_weak_derefs: Vec::new(),
+            post_strong_derefs: Vec::new(),
+            post_weak_derefs: Vec::new(),
+        }
+    }
+
+    fn process_post_write_derefs(&mut self) {
+        self.post_weak_derefs.clear();
+        self.post_strong_derefs.clear();
+    }
+
+    fn process_pending_derefs(&mut self) -> Result<()> {
+        // The decWeak()/decStrong() calls may cause a destructor to run,
+        // which in turn could have initiated an outgoing transaction,
+        // which in turn could cause us to add to the pending refs
+        // vectors; so instead of simply iterating, loop until they're empty.
+        //
+        // We do this in an outer loop, because calling decStrong()
+        // may result in something being added to mPendingWeakDerefs,
+        // which could be delayed until the next incoming command
+        // from the driver if we don't process it now.
+        while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
+            for raw_pointer in self.pending_weak_derefs.drain(..) {
+                let weak = raw_pointer_to_weak_binder(raw_pointer);
+                weak.decrease();
+            }
+
+            if !self.pending_strong_derefs.is_empty() {
+                let raw_pointer = self.pending_strong_derefs.remove(0);
+                let strong = raw_pointer_to_strong_binder(raw_pointer);
+                strong.decrease()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ThreadState {
     in_parcel: Parcel,
     out_parcel: Parcel,
     transaction: Option<TransactionState>,
     strict_mode_policy: i32,
     is_looper: bool,
     is_flushing: bool,
-    pending_strong_derefs: Vec<binder_uintptr_t>,
-    pending_weak_derefs: Vec<binder_uintptr_t>,
-    post_strong_derefs: Vec<SIBinder>,
-    post_weak_derefs: Vec<WIBinder>,
     call_restriction: CallRestriction,
 }
 
@@ -155,58 +201,27 @@ impl ThreadState {
             strict_mode_policy: 0,
             is_looper: false,
             is_flushing: false,
-            pending_strong_derefs: Vec::new(),
-            pending_weak_derefs: Vec::new(),
-            post_strong_derefs: Vec::new(),
-            post_weak_derefs: Vec::new(),
             call_restriction: ProcessState::as_self().call_restriction(),
         }
     }
 
-    pub fn set_strict_mode_policy(&mut self, policy: i32) {
+    pub(crate) fn set_strict_mode_policy(&mut self, policy: i32) {
         self.strict_mode_policy = policy;
     }
 
-    pub fn strict_mode_policy(&self) -> i32 {
+    pub(crate) fn _strict_mode_policy(&self) -> i32 {
         self.strict_mode_policy
     }
 
-    pub fn last_transaction_binder_flags(&self) -> u32 {
+    pub(crate) fn last_transaction_binder_flags(&self) -> u32 {
         match self.transaction {
             Some(tr) => tr.last_transaction_binder_flags,
             None => 0,
         }
     }
 
-    fn process_pending_derefs(&mut self) -> Result<()> {
-        if self.in_parcel.data_position() >= self.in_parcel.data_size() {
-            // The decWeak()/decStrong() calls may cause a destructor to run,
-            // which in turn could have initiated an outgoing transaction,
-            // which in turn could cause us to add to the pending refs
-            // vectors; so instead of simply iterating, loop until they're empty.
-            //
-            // We do this in an outer loop, because calling decStrong()
-            // may result in something being added to mPendingWeakDerefs,
-            // which could be delayed until the next incoming command
-            // from the driver if we don't process it now.
-            while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
-                for raw_pointer in self.pending_weak_derefs.drain(..) {
-                    let weak = raw_pointer_to_weak_binder(raw_pointer);
-                    weak.decrease();
-                }
-
-                for raw_pointer in self.pending_strong_derefs.drain(..) {
-                    let strong = raw_pointer_to_strong_binder(raw_pointer);
-                    strong.decrease()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn process_post_write_derefs(&mut self) {
-        self.post_weak_derefs.clear();
-        self.post_strong_derefs.clear();
+    fn is_process_pending_derefs(&mut self) -> bool {
+        self.in_parcel.data_position() >= self.in_parcel.data_size()
     }
 
     fn clear_propagate_work_source(&mut self) {
@@ -329,7 +344,7 @@ pub(crate) fn calling_work_source_uid() -> binder::uid_t {
 }
 
 
-pub fn setup_polling() -> Result<()> {
+pub(crate) fn _setup_polling() -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
@@ -576,13 +591,20 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let _refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                state.pending_strong_derefs.push(obj);
+                BINDER_DEREFS.with(|binder_derefs| {
+                    let mut binder_derefs = binder_derefs.borrow_mut();
+                    binder_derefs.pending_strong_derefs.push(obj);
+                });
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let _obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                state.pending_weak_derefs.push(refs);
+
+                BINDER_DEREFS.with(|binder_derefs| {
+                    let mut binder_derefs = binder_derefs.borrow_mut();
+                    binder_derefs.pending_weak_derefs.push(refs);
+                });
             }
             binder::BR_ATTEMPT_ACQUIRE => {
                 todo!("execute_command - BR_ATTEMPT_ACQUIRE");
@@ -710,10 +732,16 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                         bwr.write_consumed, thread_state.out_parcel.data_size());
                 } else {
                     thread_state.out_parcel.set_data_size(0);
-                    thread_state.process_post_write_derefs();
+                    drop(thread_state);
+
+                    BINDER_DEREFS.with(|binder_derefs| {
+                        binder_derefs.borrow_mut().process_post_write_derefs()
+                    });
                 }
             }
-
+        }
+        {
+            let mut thread_state = thread_state.borrow_mut();
             if bwr.read_consumed > 0 {
                 thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
@@ -753,7 +781,7 @@ pub(crate) fn flush_commands() -> Result<()> {
     })
 }
 
-pub fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
+pub(crate) fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
     log::trace!("attempt_inc_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut state = thread_state.borrow_mut();
@@ -765,7 +793,7 @@ pub fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
     wait_for_response(UntilResponse::AcquireResult).map(|_| ())
 }
 
-pub fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
+pub(crate) fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
     log::trace!("inc_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -776,14 +804,16 @@ pub fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
         }
 
         if !(flash_if_needed()?) {
-            thread_state.borrow_mut().post_strong_derefs.push(proxy);
+            BINDER_DEREFS.with(|binder_derefs| {
+                binder_derefs.borrow_mut().post_strong_derefs.push(proxy);
+            });
         }
 
         Ok(())
     })
 }
 
-pub fn dec_strong_handle(handle: u32) -> Result<()> {
+pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     log::trace!("dec_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -799,7 +829,7 @@ pub fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
+pub(crate) fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
     log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -811,14 +841,16 @@ pub fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
 
         if !(flash_if_needed()?) {
             // This code is come from IPCThreadState.cpp. Is it necessaryq?
-            thread_state.borrow_mut().post_weak_derefs.push(weak);
+            BINDER_DEREFS.with(|binder_derefs| {
+                binder_derefs.borrow_mut().post_weak_derefs.push(weak);
+            });
         }
 
         Ok(())
     })
 }
 
-pub fn dec_weak_handle(handle: u32) -> Result<()> {
+pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
     log::trace!("dec_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -835,7 +867,7 @@ pub fn dec_weak_handle(handle: u32) -> Result<()> {
 }
 
 
-pub fn flash_if_needed() -> Result<bool> {
+pub(crate) fn flash_if_needed() -> Result<bool> {
     THREAD_STATE.with(|thread_state| -> Result<bool> {
         {
             let thread_state = thread_state.borrow();
@@ -852,7 +884,7 @@ pub fn flash_if_needed() -> Result<bool> {
     })
 }
 
-pub fn handle_commands() -> Result<()> {
+pub(crate) fn _handle_commands() -> Result<()> {
     while {
         get_and_execute_command()?;
 
@@ -897,7 +929,7 @@ pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     }
 }
 
-pub fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result<Option<Parcel>> {
+pub(crate) fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result<Option<Parcel>> {
     let mut reply: Option<Parcel> = None;
 
     flags |= transaction_flags_TF_ACCEPT_FDS;
@@ -959,7 +991,7 @@ pub(crate) fn ping_binder(handle: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn join_thread_pool(is_main: bool) -> Result<()> {
+pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         log::debug!("**** THREAD {:?} (PID {}) IS JOINING THE THREAD POOL",
             std::thread::current().id(), std::process::id());
@@ -981,7 +1013,11 @@ pub fn join_thread_pool(is_main: bool) -> Result<()> {
         let result;
 
         loop {
-            thread_state.borrow_mut().process_pending_derefs()?;
+            if thread_state.borrow_mut().is_process_pending_derefs() {
+                BINDER_DEREFS.with(|binder_derefs| -> Result<()> {
+                    binder_derefs.borrow_mut().process_pending_derefs()
+                })?;
+            }
             if let Err(e) = get_and_execute_command() {
                 match e {
                     StatusCode::TimedOut if !is_main => {
@@ -1052,13 +1088,13 @@ pub struct CallingContext {
     pub sid: *const u8,
 }
 
-pub fn get_calling_context() -> Result<CallingContext> {
+pub(crate) fn _get_calling_context() -> Result<CallingContext> {
     THREAD_STATE.with(|thread_state| -> Result<CallingContext> {
         let thread_state = thread_state.borrow();
         let transaction = thread_state.transaction.as_ref().ok_or(StatusCode::Unknown)?;
         let calling_pid = transaction.calling_pid;
-        let calling_uid = transaction.calling_uid;
-        let calling_sid = transaction.calling_sid;
+        let calling_uid = transaction._calling_uid;
+        let calling_sid = transaction._calling_sid;
 
         Ok(CallingContext {
             pid: calling_pid,
