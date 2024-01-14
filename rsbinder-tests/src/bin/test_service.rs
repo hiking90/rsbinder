@@ -91,7 +91,6 @@ macro_rules! impl_reverse {
         ) -> std::result::Result<Vec<$type>, Status> {
             repeated.clear();
             repeated.extend_from_slice(input);
-            println!("{}, input: {:?}, repeated: {:?}", stringify!($reverse_name), input, repeated);
             Ok(input.iter().rev().cloned().collect())
         }
     };

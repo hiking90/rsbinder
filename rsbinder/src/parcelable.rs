@@ -119,7 +119,8 @@ macro_rules! impl_parcelable {
 
     {SerializeArray, $ty:ty} => {
         impl SerializeArray for $ty {
-            // fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
+            // fn serialize_array(_slice: &[Self], _parcel: &mut Parcel) -> Result<()> {
+            //     todo!("impl SerializeArray for $ty")
             //     let status = unsafe {
             //         // Safety: `Parcel` always contains a valid pointer to an
             //         // `AParcel`. If the slice is > 0 length, `slice.as_ptr()`
@@ -143,7 +144,8 @@ macro_rules! impl_parcelable {
 
     {DeserializeArray, $ty:ty} => {
         impl DeserializeArray for $ty {
-            // fn deserialize_array(parcel: &mut Parcel) -> Result<Vec<Self>> {
+            // fn deserialize_array(_parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
+            //     todo!("impl DeserializeArray for $ty")
             //     let mut vec: Option<Vec<MaybeUninit<Self>>> = None;
             //     let status = unsafe {
             //         // Safety: `Parcel` always contains a valid pointer to an
@@ -732,7 +734,7 @@ pub trait DeserializeArray: Deserialize {
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         }
         let mut res: Vec<Self> = Vec::with_capacity(len as _);
 
