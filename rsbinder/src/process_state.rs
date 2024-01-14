@@ -75,7 +75,7 @@ impl ProcessState {
     }
 
     fn inner_init(driver_name: &str, max_threads: u32) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
-        let max_threads = if max_threads < DEFAULT_MAX_BINDER_THREADS {
+        let max_threads = if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
             max_threads
         } else {
             DEFAULT_MAX_BINDER_THREADS
@@ -275,6 +275,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
         let raw_fd = fd.as_raw_fd();
         binder::version(raw_fd, &mut vers)
             .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
+        log::info!("Binder driver protocol version: {}", vers.protocol_version);
 
         if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
             return Err(format!("Binder driver protocol({}) does not match user space protocol({})!",
@@ -283,6 +284,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 
         binder::set_max_threads(raw_fd, &max_threads)
             .map_err(|e| format!("Binder ioctl to set max threads failed: {}", e))?;
+        log::info!("Binder driver max threads set to {}", max_threads);
 
         let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
         binder::enable_oneway_spam_detection(raw_fd, &enable)

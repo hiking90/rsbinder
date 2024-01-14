@@ -882,6 +882,7 @@ fn test_versioned_interface_hash() {
 
 #[test]
 fn test_versioned_known_union_field_is_ok() {
+    init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
         rsbinder_hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
@@ -891,6 +892,7 @@ fn test_versioned_known_union_field_is_ok() {
 
 #[test]
 fn test_versioned_unknown_union_field_triggers_error() {
+    init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
         rsbinder_hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");

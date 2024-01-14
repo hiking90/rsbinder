@@ -295,7 +295,7 @@ impl Drop for Inner {
     fn drop(self: &mut Inner) {
         let strong = self.strong.load(Ordering::Relaxed);
         let weak = self.weak.load(Ordering::Relaxed);
-        if strong != 0 || weak != 0 {
+        if (strong != 0 && strong != INITIAL_STRONG_VALUE) || weak != 0 {
             log::error!("The Drop of Inner IBinder was called with strong count({strong}) and weak count({weak}).");
         }
         if let Some(proxy) = self.data.as_proxy() {
@@ -404,6 +404,9 @@ impl SIBinder {
             if let Some(proxy) = self.inner.data.as_proxy() {
                 thread_state::dec_strong_handle(proxy.handle())?;
             }
+            self.inner.strong.compare_exchange(0, INITIAL_STRONG_VALUE,
+                Ordering::Relaxed, Ordering::Relaxed)
+                .expect("Failed to exchange the strong reference count.");
         }
 
         Ok(())
