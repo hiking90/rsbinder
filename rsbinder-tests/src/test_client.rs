@@ -49,9 +49,13 @@ use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
 
-fn init_test() {
-    ProcessState::init_default();
+fn init_logger() {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
+}
+
+fn init_test() {
+    init_logger();
+    ProcessState::init_default();
 }
 
 fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
@@ -642,7 +646,7 @@ fn test_repeat_extendable_parcelable() {
     ep.ext.set_parcelable(Arc::clone(&ext)).expect("error setting parcelable");
 
     let mut ep2 = ExtendableParcelable::default();
-    let result = service.RepeatExtendableParcelable(&ep, &mut ep2);
+    let result: std::prelude::v1::Result<(), Status> = service.RepeatExtendableParcelable(&ep, &mut ep2);
     assert_eq!(result, Ok(()));
     assert_eq!(ep2.a, ep.a);
     assert_eq!(ep2.b, ep.b);
@@ -1103,6 +1107,7 @@ fn test_nullable_binder_array() {
 
 #[test]
 fn test_read_write_fixed_size_array() {
+    init_logger();
     let mut parcel = Parcel::new();
     let mut p: FixedSizeArrayExample = Default::default();
     p.byteMatrix[0][0] = 0;

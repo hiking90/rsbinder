@@ -734,7 +734,7 @@ pub trait DeserializeArray: Deserialize {
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(None)
         }
         let mut res: Vec<Self> = Vec::with_capacity(len as _);
 
@@ -778,11 +778,7 @@ impl<T: SerializeArray> SerializeOption for Vec<T> {
 impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         DeserializeArray::deserialize_array(parcel)
-            .transpose()
-            .unwrap_or_else(|| {
-                log::error!("Deserialize for Vec<T>: UnexpectedNull");
-                Err(StatusCode::UnexpectedNull)
-            })
+            .map(|v| v.unwrap_or_default())
     }
 }
 
@@ -817,18 +813,18 @@ impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
             })?;
         vec.try_into()
             .or_else(|_| {
-                log::error!("Failed to convert Vec<T> to [T; N]");
+                log::error!("Deserialize: Failed to convert Vec<T> to [T; N]");
                 Err(StatusCode::BadValue)
             })
     }
 }
 
-impl<T: DeserializeArray, const N: usize> DeserializeOption for [T; N] {
+impl<T: std::fmt::Debug + DeserializeArray, const N: usize> DeserializeOption for [T; N] {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let vec = DeserializeArray::deserialize_array(parcel)?;
         vec.map(|v| v.try_into()
             .or_else(|_| {
-                log::error!("Failed to convert Vec<T> to [T; N]");
+                log::error!("DeserializeOption: Failed to convert Vec<T> to [T; N]");
                 Err(StatusCode::BadValue)
             }))
             .transpose()

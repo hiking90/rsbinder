@@ -53,10 +53,14 @@ $ target/debug/hello_service
 $ target/debug/hello_client
 ```
 
+## Compatibility with Android Binder
+* The Binder protocol is mutually compatible. That is, communication between an Android service and an rsbinder client is possible, and vice versa.
+* API compatibility is not provided. Android binder and rsbinder have different operating architectures and cannot offer the same APIs. However, there is a high similarity in APIs.
 
 ## Todo
 - [x] Implement Binder crate.
 - [x] Implement AIDL code generator.
+- [x] Port Android test_service and test_client and pass the test cases.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
 - [ ] Implement File Descriptor Sharing
 - [ ] Remove all todo!() and unimplemented!() macros.
@@ -70,4 +74,4 @@ $ target/debug/hello_client
 **rsbinder** is licensed under the **Apache License version 2.0**.
 
 ## Notice
-Many of the source codes in **rsbinder** have been developed by quoting or referencing Android's binder rust code.
+Many of the source codes in **rsbinder** have been developed by quoting or referencing Android's binder implementation.
