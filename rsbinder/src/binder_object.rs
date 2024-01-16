@@ -39,6 +39,10 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.binder }
     }
 
+    pub(crate) fn cookie(&self) -> binder_uintptr_t {
+        self.cookie
+    }
+
     pub(crate) fn acquire(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
@@ -54,7 +58,7 @@ impl flat_binder_object {
             }
             BINDER_TYPE_FD => {
                 // Notion to do.
-                unimplemented!("flat_binder_object::acquire(): BINDER_TYPE_FD")
+                Ok(())
             }
             _ => {
                 log::error!("Invalid object type {:08x}", self.hdr.type_);
@@ -119,8 +123,7 @@ impl From<&binder::SIBinder> for flat_binder_object {
                 cookie: 0,
             }
         } else {
-            let weak = Box::new(binder::SIBinder::downgrade(binder));
-            let strong = Box::new(binder.clone());
+            let strong = binder.clone();
 
             flat_binder_object {
                 hdr: binder_object_header {
@@ -128,9 +131,9 @@ impl From<&binder::SIBinder> for flat_binder_object {
                 },
                 flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    binder: Box::into_raw(weak) as _,
+                    binder: strong.id() as _,
                 },
-                cookie: Box::into_raw(strong) as _,
+                cookie: strong.into_raw() as _,
             }
         }
     }
@@ -151,16 +154,7 @@ impl From<*const u8> for flat_binder_object {
     }
 }
 
-pub(crate) fn raw_pointer_to_weak_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::WIBinder>> {
-    assert!(raw_pointer != 0, "raw_pointer_to_weak_binder(): raw_pointer is null");
-    unsafe {
-        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::WIBinder))
-    }
-}
-
-pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<Box<binder::SIBinder>> {
+pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<binder::SIBinder> {
     assert!(raw_pointer != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
-    unsafe {
-        ManuallyDrop::new(Box::from_raw(raw_pointer as *mut binder::SIBinder))
-    }
+    ManuallyDrop::new(binder::SIBinder::from_raw(raw_pointer as *const binder::SharedIBinder))
 }

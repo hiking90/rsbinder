@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::{Arc, atomic::*};
 use std::any::Any;
@@ -268,7 +269,7 @@ impl TryFrom<i32> for Stability {
 
 const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
 
-struct Inner {
+pub(crate) struct SharedIBinder {
     strong: AtomicI32,
     weak: AtomicI32,
     is_strong_lifetime: AtomicBool,
@@ -276,7 +277,7 @@ struct Inner {
     descriptor: String,
 }
 
-impl Inner {
+impl SharedIBinder {
     fn new(data: Box<dyn IBinder>, is_strong: bool, descriptor: &str) -> Arc<Self> {
         Arc::new(
             Self {
@@ -290,12 +291,12 @@ impl Inner {
     }
 }
 
-impl Drop for Inner {
-    fn drop(self: &mut Inner) {
+impl Drop for SharedIBinder {
+    fn drop(self: &mut SharedIBinder) {
         let strong = self.strong.load(Ordering::Relaxed);
         let weak = self.weak.load(Ordering::Relaxed);
         if (strong != 0 && strong != INITIAL_STRONG_VALUE) || weak != 0 {
-            log::error!("The Drop of Inner IBinder was called with strong count({strong}) and weak count({weak}).");
+            log::error!("The Drop of SharedIBinder was called with strong count({strong}) and weak count({weak}).");
         }
         if let Some(proxy) = self.data.as_proxy() {
             thread_state::dec_weak_handle(proxy.handle())
@@ -304,9 +305,9 @@ impl Drop for Inner {
     }
 }
 
-impl Debug for Inner {
+impl Debug for SharedIBinder {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "Inner {{ strong: {}, weak: {}, is_strong_lifetime: {}, descriptor: {}, id: {} }}",
+        write!(f, "SharedIBinder {{ strong: {}, weak: {}, is_strong_lifetime: {}, descriptor: {}, id: {} }}",
             self.strong.load(Ordering::Relaxed),
             self.weak.load(Ordering::Relaxed),
             self.is_strong_lifetime.load(Ordering::Relaxed),
@@ -317,7 +318,7 @@ impl Debug for Inner {
 /// Strong reference to a binder object.
 #[derive(Debug)]
 pub struct SIBinder {
-    inner: Arc<Inner>,
+    inner: Arc<SharedIBinder>,
 }
 
 impl SIBinder {
@@ -325,10 +326,22 @@ impl SIBinder {
         WIBinder::new(data, descriptor)?.upgrade()
     }
 
-    fn new_with_inner(inner: Arc<Inner>) -> Result<Self> {
+    fn new_with_inner(inner: Arc<SharedIBinder>) -> Result<Self> {
         let this = Self { inner };
         this.increase()?;
         Ok(this)
+    }
+
+    pub(crate) fn into_raw(self) -> *const SharedIBinder {
+        let inner = self.inner.clone();
+        let raw = Arc::into_raw(inner);
+        std::mem::forget(self);
+        raw
+    }
+
+    pub(crate) fn from_raw(raw: *const SharedIBinder) -> Self {
+        let inner = unsafe { Arc::from_raw(raw) };
+        Self { inner }
     }
 
     pub fn downgrade(this: &Self) -> WIBinder {
@@ -421,6 +434,15 @@ impl SIBinder {
         Ok(())
     }
 
+    pub(crate) fn dec_drop_zero(this: ManuallyDrop<Self>) {
+        let c = this.inner.strong.fetch_sub(1, Ordering::Relaxed);
+        if c == 1 {
+            if let Some(_) = this.inner.data.as_proxy() {
+                unreachable!("The strong reference count is zero, but the proxy is not dropped.");
+            }
+            let _ = ManuallyDrop::into_inner(this);
+        }
+    }
 
     /// Try to convert this Binder object into a trait object for the given
     /// Binder interface.
@@ -464,25 +486,25 @@ impl Eq for SIBinder {}
 /// Weak reference to a binder object.
 #[derive(Debug)]
 pub struct WIBinder {
-    inner: Arc<Inner>,
+    inner: Arc<SharedIBinder>,
 }
 
 impl WIBinder {
     pub(crate) fn new(data: Box<dyn IBinder>, descriptor: &str) -> Result<Self> {
         match data.as_proxy().map(|proxy| proxy.handle()) {
             Some(handle) => {
-                let this = Self { inner: Inner::new(data, false, descriptor) };
+                let this = Self { inner: SharedIBinder::new(data, false, descriptor) };
                 thread_state::inc_weak_handle(handle, this.clone())?;
                 Ok(this)
             }
             None => {
-                Ok(Self { inner: Inner::new(data, true, descriptor) })
+                Ok(Self { inner: SharedIBinder::new(data, true, descriptor) })
             }
         }
         // Don't increase the weak reference count. Because the weak reference count is initialized to 1.
     }
 
-    fn new_with_inner(inner: Arc<Inner>) -> Self {
+    fn new_with_inner(inner: Arc<SharedIBinder>) -> Self {
         let this = Self { inner };
         this.increase();
         this

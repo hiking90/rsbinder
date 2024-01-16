@@ -17,7 +17,6 @@
  * limitations under the License.
  */
 
-use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering;
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
@@ -168,14 +167,13 @@ impl BinderDerefs {
         // from the driver if we don't process it now.
         while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
             for raw_pointer in self.pending_weak_derefs.drain(..) {
-                let weak = raw_pointer_to_weak_binder(raw_pointer);
-                weak.decrease();
+                let strong = raw_pointer_to_strong_binder(raw_pointer);
+                SIBinder::downgrade(&strong).decrease();
             }
 
-            if !self.pending_strong_derefs.is_empty() {
-                let raw_pointer = self.pending_strong_derefs.remove(0);
+            if let Some(raw_pointer) = self.pending_strong_derefs.pop() {
                 let strong = raw_pointer_to_strong_binder(raw_pointer);
-                strong.decrease()?;
+                SIBinder::dec_drop_zero(strong);
             }
         }
         Ok(())
@@ -507,11 +505,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     // reader.set_data_position(0);
                     if target_ptr != 0 {
-                        let weak = raw_pointer_to_weak_binder(target_ptr);
-                        let strong = weak.upgrade()?;
+                        let strong = raw_pointer_to_strong_binder(tr_secctx.transaction_data.cookie);
                         if strong.attempt_increase() {
-                            let binder = raw_pointer_to_strong_binder(tr_secctx.transaction_data.cookie);
-                            let result = binder.as_transactable().expect("Transactable is None.")
+                            let result = strong.as_transactable().expect("Transactable is None.")
                                 .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
                             strong.decrease()?;
 
@@ -567,11 +563,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                let weak = ManuallyDrop::into_inner(raw_pointer_to_weak_binder(refs));
+                let strong = raw_pointer_to_strong_binder(obj);
+                let weak = SIBinder::downgrade(&strong);
                 weak.increase();
 
                 state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&(Box::into_raw(weak) as _))?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
                 state.out_parcel.write::<binder::binder_uintptr_t>(&obj)?;
             }
             binder::BR_ACQUIRE => {
@@ -579,12 +576,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                let strong = ManuallyDrop::into_inner(raw_pointer_to_strong_binder(obj));
+                let strong = raw_pointer_to_strong_binder(obj);
+                // strong is ManuallyDrop, so increase() is called once.
                 strong.increase()?;
 
                 state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
                 state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&(Box::into_raw(strong) as _))?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&obj)?;
             }
             binder::BR_RELEASE => {
                 let mut state = thread_state.borrow_mut();
@@ -598,12 +596,12 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let _obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_weak_derefs.push(refs);
+                    binder_derefs.pending_weak_derefs.push(obj);
                 });
             }
             binder::BR_ATTEMPT_ACQUIRE => {

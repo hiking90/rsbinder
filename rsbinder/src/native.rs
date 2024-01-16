@@ -80,7 +80,10 @@ impl<T: 'static + Remotable> PartialEq for Binder<T> {
 
 impl<T: 'static + Remotable> Interface for Binder<T> {
     fn as_binder(&self) -> SIBinder {
-        SIBinder::new(Box::new((*self).clone()), T::descriptor()).unwrap()
+        SIBinder::new(Box::new((*self).clone()), T::descriptor())
+            .unwrap_or_else(|e| {
+                panic!("Failed to create SIBinder for {}. StatusCode({:?})", T::descriptor(), e)
+            })
     }
 }
 

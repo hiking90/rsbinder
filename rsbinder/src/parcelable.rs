@@ -539,9 +539,8 @@ impl DeserializeOption for SIBinder {
             BINDER_TYPE_BINDER => {
                 let pointer = flat.pointer();
                 if pointer != 0 {
-                    let weak = raw_pointer_to_weak_binder(flat.pointer());
-                    let strong = weak.upgrade()?;
-                    Ok(Some(strong))
+                    let strong = raw_pointer_to_strong_binder(flat.cookie());
+                    Ok(Some(SIBinder::clone(&strong)))
                 } else {
                     Ok(None)
                 }
