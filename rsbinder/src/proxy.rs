@@ -13,7 +13,7 @@ use crate::{
     thread_state,
 };
 
-struct Inner {
+pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
     stability: Stability,
@@ -21,41 +21,23 @@ struct Inner {
     recipients: RwLock<Vec<Arc<dyn DeathRecipient>>>,
 }
 
-impl Debug for Inner {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner")
-            .field("handle", &self.handle)
-            .field("descriptor", &self.descriptor)
-            .field("stability", &self.stability)
-            .field("obituary_sent", &self.obituary_sent)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProxyHandle {
-    inner: Arc<Inner>,
-}
-
 impl ProxyHandle {
     pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                handle,
-                descriptor: descriptor.to_owned(),
-                stability,
-                obituary_sent: AtomicBool::new(false),
-                recipients: RwLock::new(Vec::new()),
-            })
+            handle,
+            descriptor: descriptor.to_owned(),
+            stability,
+            obituary_sent: AtomicBool::new(false),
+            recipients: RwLock::new(Vec::new()),
         }
     }
 
     pub fn handle(&self) -> u32 {
-        self.inner.handle
+        self.handle
     }
 
     pub fn descriptor(&self) -> &str {
-        &self.inner.descriptor
+        &self.descriptor
     }
 
     pub fn submit_transact(&self, code: TransactionCode, data: &Parcel, flags: TransactionFlags) -> Result<Option<Parcel>> {
@@ -73,18 +55,29 @@ impl ProxyHandle {
     }
 
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
-        self.inner.obituary_sent.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.obituary_sent.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        if !self.inner.recipients.read().unwrap().is_empty() {
+        if !self.recipients.read().unwrap().is_empty() {
             thread_state::clear_death_notification(self.handle())?;
             thread_state::flush_commands()?;
         }
 
-        for recipient in self.inner.recipients.read().unwrap().iter() {
+        for recipient in self.recipients.read().unwrap().iter() {
             recipient.binder_died(who);
         }
 
         Ok(())
+    }
+}
+
+impl Debug for ProxyHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("handle", &self.handle)
+            .field("descriptor", &self.descriptor)
+            .field("stability", &self.stability)
+            .field("obituary_sent", &self.obituary_sent)
+            .finish()
     }
 }
 
@@ -97,15 +90,15 @@ impl PartialEq for ProxyHandle {
 impl IBinder for ProxyHandle {
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        if self.inner.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
-            if self.inner.recipients.read().unwrap().is_empty() {
+            if self.recipients.read().unwrap().is_empty() {
                 thread_state::request_death_notification(self.handle())?;
                 thread_state::flush_commands()?;
             }
 
-            self.inner.recipients.write().unwrap().push(recipient);
+            self.recipients.write().unwrap().push(recipient);
         }
         Ok(())
     }
@@ -114,11 +107,11 @@ impl IBinder for ProxyHandle {
     /// The recipient will no longer be called if this object
     /// dies.
     fn unlink_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
-        if self.inner.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
-            self.inner.recipients.write().unwrap().retain(|r| !Arc::ptr_eq(r, &recipient));
-            if self.inner.recipients.read().unwrap().is_empty() {
+            self.recipients.write().unwrap().retain(|r| !Arc::ptr_eq(r, &recipient));
+            if self.recipients.read().unwrap().is_empty() {
                 thread_state::clear_death_notification(self.handle())?;
                 thread_state::flush_commands()?;
             }
