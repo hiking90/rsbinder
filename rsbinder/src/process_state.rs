@@ -141,22 +141,25 @@ impl ProcessState {
 
     /// Get binder service manager.
     pub fn become_context_manager(&self, binder: SIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
-        let mut obj = unsafe { obj.assume_init() };
-        obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        let mut context_manager = self.context_manager.write().unwrap();
 
-        unsafe {
-            let driver_fd = self.driver.as_raw_fd();
-            if binder::set_context_mgr_ext(driver_fd, &obj).is_err() {
-                //     android_errorWriteLog(0x534e4554, "121035042");
-                let unused: i32 = 0;
-                if let Err(e) = binder::set_context_mgr(driver_fd, &unused) {
-                    return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
+        if context_manager.is_none() {
+            let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
+            let mut obj = unsafe { obj.assume_init() };
+            obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+
+            unsafe {
+                let driver_fd = self.driver.as_raw_fd();
+                if binder::set_context_mgr_ext(driver_fd, &obj).is_err() {
+                    //     android_errorWriteLog(0x534e4554, "121035042");
+                    let unused: i32 = 0;
+                    if let Err(e) = binder::set_context_mgr(driver_fd, &unused) {
+                        return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
+                    }
                 }
             }
+            *context_manager = Some(binder);
         }
-
-        *self.context_manager.write().unwrap() = Some(binder);
 
         Ok(())
     }
@@ -196,7 +199,7 @@ impl ProcessState {
             thread_state::set_call_restriction(original_call_restriction);
         }
 
-        let interface = thread_state::query_interface(handle)?;
+        let interface: String = thread_state::query_interface(handle)?;
 
         let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, &interface, stability);
         let weak = WIBinder::new(proxy)?;
