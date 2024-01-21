@@ -19,7 +19,7 @@
 
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::sync::{Arc, atomic::*};
+use std::sync::Arc;
 use std::any::Any;
 use std::fs::File;
 use std::fmt::{Debug, Formatter};
@@ -29,9 +29,7 @@ use std::borrow::Borrow;
 use crate::{
     error::*,
     parcel::*,
-    native,
     proxy,
-    thread_state,
 };
 
 /// Binder action to perform.
@@ -138,7 +136,7 @@ pub trait DeathRecipient: Send + Sync {
 ///
 /// This trait corresponds to the parts of the interface of the C++ `IBinder`
 /// class which are public.
-pub trait IBinder: Send + Sync {
+pub trait IBinder: Any + Send + Sync {
     /// Register the recipient for a notification if this binder
     /// goes away. If this binder object unexpectedly goes away
     /// (typically because its hosting process has been killed),
@@ -160,22 +158,23 @@ pub trait IBinder: Send + Sync {
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;
 
-    /// Retrieve the identifier for this object's Binder
-    fn id(&self) -> u64;
-
     /// To support dynamic interface cast, we need to know the interface
     fn as_any(&self) -> &dyn Any;
 
     /// To convert the interface to a transactable object
     fn as_transactable(&self) -> Option<&dyn Transactable>;
+
+    fn descriptor(&self) -> &str;
+    fn is_remote(&self) -> bool;
+
+    fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
+    fn attempt_inc_strong(&self) -> bool;
+    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()>;
+    fn inc_weak(&self, weak: &WIBinder) -> Result<()>;
+    fn dec_weak(&self) -> Result<()>;
 }
 
 impl dyn IBinder {
-    /// Convert this binder object into a native binder object.
-    pub fn as_native<T: 'static + Remotable>(&self) -> Option<&native::Binder<T>> {
-        self.as_any().downcast_ref::<native::Binder<T>>()
-    }
-
     /// Convert this binder object into a proxy binder object.
     pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
@@ -267,90 +266,37 @@ impl TryFrom<i32> for Stability {
     }
 }
 
-const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
-
-pub(crate) struct SharedIBinder {
-    strong: AtomicI32,
-    weak: AtomicI32,
-    is_strong_lifetime: AtomicBool,
-    data: Box<dyn IBinder>,
-    descriptor: String,
-}
-
-impl SharedIBinder {
-    fn new(data: Box<dyn IBinder>, is_strong: bool, descriptor: &str) -> Arc<Self> {
-        Arc::new(
-            Self {
-                strong: AtomicI32::new(INITIAL_STRONG_VALUE),
-                weak: AtomicI32::new(1),
-                is_strong_lifetime: AtomicBool::new(is_strong),
-                data,
-                descriptor: descriptor.to_owned(),
-            }
-        )
-    }
-}
-
-impl Drop for SharedIBinder {
-    fn drop(self: &mut SharedIBinder) {
-        let strong = self.strong.load(Ordering::Relaxed);
-        let weak = self.weak.load(Ordering::Relaxed);
-        if (strong != 0 && strong != INITIAL_STRONG_VALUE) || weak != 0 {
-            log::error!("The Drop of SharedIBinder was called with strong count({strong}) and weak count({weak}).");
-        }
-        if let Some(proxy) = self.data.as_proxy() {
-            thread_state::dec_weak_handle(proxy.handle())
-                .expect("Failed to decrease the binder weak reference count.")
-        }
-    }
-}
-
-impl Debug for SharedIBinder {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "SharedIBinder {{ strong: {}, weak: {}, is_strong_lifetime: {}, descriptor: {}, id: {} }}",
-            self.strong.load(Ordering::Relaxed),
-            self.weak.load(Ordering::Relaxed),
-            self.is_strong_lifetime.load(Ordering::Relaxed),
-            self.descriptor, self.data.id())
-    }
-}
 
 /// Strong reference to a binder object.
-#[derive(Debug)]
 pub struct SIBinder {
-    inner: Arc<SharedIBinder>,
+    inner: Arc<dyn IBinder>,
 }
 
 impl SIBinder {
-    pub fn new(data: Box<dyn IBinder>, descriptor: &str) -> Result<Self> {
-        WIBinder::new(data, descriptor)?.upgrade()
+    pub fn new(data: Arc<dyn IBinder>) -> Result<Self> {
+        WIBinder::new(data)?.upgrade()
     }
 
-    fn new_with_inner(inner: Arc<SharedIBinder>) -> Result<Self> {
+    fn new_with_inner(inner: Arc<dyn IBinder>) -> Result<Self> {
         let this = Self { inner };
         this.increase()?;
         Ok(this)
     }
 
-    pub(crate) fn into_raw(self) -> *const SharedIBinder {
-        let inner = self.inner.clone();
+    pub(crate) fn into_raw(self) -> *const dyn IBinder {
+        let inner = Arc::clone(&self.inner);
         let raw = Arc::into_raw(inner);
         std::mem::forget(self);
         raw
     }
 
-    pub(crate) fn from_raw(raw: *const SharedIBinder) -> Self {
+    pub(crate) fn from_raw(raw: *const dyn IBinder) -> Self {
         let inner = unsafe { Arc::from_raw(raw) };
         Self { inner }
     }
 
     pub fn downgrade(this: &Self) -> WIBinder {
-        WIBinder::new_with_inner(this.inner.clone())
-        // drop will be called.
-    }
-
-    pub fn descriptor(&self) -> &str {
-        &self.inner.descriptor
+        WIBinder::new_with_inner(Arc::clone(&this.inner))
     }
 
     // pub fn stability(&self) -> Stability {
@@ -358,90 +304,20 @@ impl SIBinder {
     // }
 
     pub(crate) fn increase(&self) -> Result<()> {
-        // In the Android implementation, it simultaneously increases the weak reference,
-        // but until the necessity is confirmed, we will not support the related functionality here.
-        let c = self.inner.strong.fetch_add(1, Ordering::Relaxed);
-        if c == INITIAL_STRONG_VALUE {
-            self.inner.strong.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
-            if let Some(proxy) = self.inner.data.as_proxy() {
-                thread_state::inc_strong_handle(proxy.handle(), self.clone())?;
-            }
-        }
-
-        Ok(())
+        self.inner.inc_strong(self)
     }
 
     pub(crate) fn attempt_increase(&self) -> bool {
-        let mut curr_count = self.inner.strong.load(Ordering::Relaxed);
-        debug_assert!(curr_count >= 0, "attempt_increase called on [{}] after underflow", self.descriptor());
-        while curr_count > 0 && curr_count != INITIAL_STRONG_VALUE {
-            match self.inner.strong.compare_exchange_weak(curr_count, curr_count + 1,
-                Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(count) => curr_count = count,
-            }
-        }
-
-        if curr_count <= 0 || curr_count == INITIAL_STRONG_VALUE {
-            if self.inner.is_strong_lifetime.load(Ordering::Relaxed) {
-                if curr_count <= 0 {
-                    return false;
-                }
-                while curr_count > 0 {
-                    match self.inner.strong.compare_exchange_weak(curr_count, curr_count + 1,
-                        Ordering::Relaxed, Ordering::Relaxed) {
-                        Ok(_) => break,
-                        Err(count) => curr_count = count,
-                    }
-                }
-                if curr_count <= 0 {
-                    return false;
-                }
-            } else {
-                if let Some(proxy) = self.inner.data.as_proxy() {
-                    if let Err(err) = thread_state::attempt_inc_strong_handle(proxy.handle()) {
-                        log::error!("Error in attempt_inc_strong_handle() is {:?}", err);
-                        return false;
-                    }
-                }
-                curr_count = self.inner.strong.fetch_add(1, Ordering::Relaxed);
-                if curr_count != 0 && curr_count != INITIAL_STRONG_VALUE {
-                    if let Some(proxy) = self.inner.data.as_proxy() {
-                        thread_state::dec_strong_handle(proxy.handle())
-                            .expect("Failed to decrease the binder strong reference count.");
-                    }
-                }
-            }
-        }
-        if curr_count == INITIAL_STRONG_VALUE {
-            self.inner.strong.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
-        }
-
-        true
+        self.inner.attempt_inc_strong()
     }
 
     pub(crate) fn decrease(&self) -> Result<()> {
-        let c = self.inner.strong.fetch_sub(1, Ordering::Relaxed);
-        if c == 1 {
-            if let Some(proxy) = self.inner.data.as_proxy() {
-                thread_state::dec_strong_handle(proxy.handle())?;
-            }
-            self.inner.strong.compare_exchange(0, INITIAL_STRONG_VALUE,
-                Ordering::Relaxed, Ordering::Relaxed)
-                .expect("Failed to exchange the strong reference count.");
-        }
-
-        Ok(())
+        self.inner.dec_strong(None)
     }
 
-    pub(crate) fn dec_drop_zero(this: ManuallyDrop<Self>) {
-        let c = this.inner.strong.fetch_sub(1, Ordering::Relaxed);
-        if c == 1 {
-            if let Some(_) = this.inner.data.as_proxy() {
-                unreachable!("The strong reference count is zero, but the proxy is not dropped.");
-            }
-            let _ = ManuallyDrop::into_inner(this);
-        }
+    pub(crate) fn decrease_drop(this: ManuallyDrop<Self>) -> Result<()> {
+        let inner = Arc::clone(&this.inner);
+        inner.dec_strong(Some(this))
     }
 
     /// Try to convert this Binder object into a trait object for the given
@@ -454,9 +330,18 @@ impl SIBinder {
     }
 }
 
+impl Debug for SIBinder {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        f.debug_struct("SIBinder")
+            .field("descriptor", &self.descriptor())
+            .field("ptr", &Arc::as_ptr(&self.inner))
+            .finish()
+    }
+}
+
 impl Clone for SIBinder {
     fn clone(&self) -> Self {
-        Self::new_with_inner(self.inner.clone()).unwrap()
+        Self::new_with_inner(Arc::clone(&self.inner)).unwrap()
     }
 }
 
@@ -469,63 +354,65 @@ impl Drop for SIBinder {
 }
 
 impl Deref for SIBinder {
-    type Target = Box<dyn IBinder>;
+    type Target = dyn IBinder;
     fn deref(&self) -> &Self::Target {
-        &self.inner.data
+        self.inner.deref()
     }
 }
 
 impl PartialEq for SIBinder {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.data.id() == other.inner.data.id()
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
 impl Eq for SIBinder {}
 
 /// Weak reference to a binder object.
-#[derive(Debug)]
 pub struct WIBinder {
-    inner: Arc<SharedIBinder>,
+    inner: Arc<dyn IBinder>,
 }
 
 impl WIBinder {
-    pub(crate) fn new(data: Box<dyn IBinder>, descriptor: &str) -> Result<Self> {
-        match data.as_proxy().map(|proxy| proxy.handle()) {
-            Some(handle) => {
-                let this = Self { inner: SharedIBinder::new(data, false, descriptor) };
-                thread_state::inc_weak_handle(handle, this.clone())?;
-                Ok(this)
-            }
-            None => {
-                Ok(Self { inner: SharedIBinder::new(data, true, descriptor) })
-            }
-        }
-        // Don't increase the weak reference count. Because the weak reference count is initialized to 1.
+    pub(crate) fn new(inner: Arc<dyn IBinder>) -> Result<Self> {
+        let this = Self { inner };
+        this.inner.inc_weak(&this)?;
+
+        Ok(this)
     }
 
-    fn new_with_inner(inner: Arc<SharedIBinder>) -> Self {
+    fn new_with_inner(inner: Arc<dyn IBinder>) -> Self {
         let this = Self { inner };
         this.increase();
         this
     }
 
     pub(crate) fn increase(&self) {
-        self.inner.weak.fetch_add(1, Ordering::Relaxed);
+        self.inner.inc_weak(self).ok();
     }
 
     pub(crate) fn decrease(&self) {
-        self.inner.weak.fetch_sub(1, Ordering::Relaxed);
+        self.inner.dec_weak().ok();
     }
 
     pub fn upgrade(&self) -> Result<SIBinder> {
-        SIBinder::new_with_inner(self.inner.clone())
+        SIBinder::new_with_inner(Arc::clone(&self.inner))
+    }
+}
+
+impl Debug for WIBinder {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        f.debug_struct("WIBinder")
+            .field("self", &(self as *const WIBinder))
+            .field("descriptor", &self.inner.descriptor())
+            .field("inner_ptr", &Arc::as_ptr(&self.inner))
+            .finish()
     }
 }
 
 impl Clone for WIBinder {
     fn clone(&self) -> Self {
-        Self::new_with_inner(self.inner.clone())
+        Self::new_with_inner(Arc::clone(&self.inner))
     }
 }
 
@@ -535,16 +422,9 @@ impl Drop for WIBinder {
     }
 }
 
-impl Deref for WIBinder {
-    type Target = Box<dyn IBinder>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner.data
-    }
-}
-
 impl PartialEq for WIBinder {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.data.id() == other.inner.data.id()
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -639,15 +519,6 @@ impl<I: FromIBinder + ?Sized> Clone for Weak<I> {
         }
     }
 }
-
-impl<I: FromIBinder + ?Sized> PartialEq for Weak<I> {
-    fn eq(&self, other: &Self) -> bool {
-        self.weak_binder == other.weak_binder
-    }
-}
-
-impl<I: FromIBinder + ?Sized> Eq for Weak<I> {}
-
 
 #[cfg(test)]
 mod tests {

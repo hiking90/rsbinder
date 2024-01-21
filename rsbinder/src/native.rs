@@ -21,42 +21,28 @@ use std::sync::Arc;
 use std::ops::Deref;
 use std::any::Any;
 use std::convert::TryFrom;
+use std::mem::ManuallyDrop;
 
-use crate::binder::*;
-use crate::parcel::*;
-use crate::error::*;
+use crate::{
+    binder::*,
+    parcel::*,
+    error::*,
+    ref_counter::RefCounter,
+};
 
-/// A Binder object that can be used to manage the binder service.
-pub struct Binder<T: Remotable + ?Sized + Send + Sync> {
-    remotable: Arc<T>,
-    stability: Stability,
+struct Inner<T: Remotable + Send + Sync> {
+    remotable: T,
+    _stability: Stability,
+    strong: RefCounter,
+    weak: RefCounter,
 }
 
-impl<T: Remotable> Binder<T> {
-    /// Create a new Binder object.
-    pub fn new(remotable: T) -> Self {
-        Self::new_with_stability(remotable, Default::default())
-    }
-
-    /// Create a new Binder object with the specified stability.
-    pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
-        Binder {
-            remotable: Arc::new(remotable),
-            stability,
-        }
-    }
-
-    /// Retrieve the interface descriptor string for this object's Binder
-    /// interface.
-    pub fn descriptor(&self) -> &'static str {
-        T::descriptor()
-    }
-
+impl<T: Remotable> Inner<T> {
     // The following functions can be redefined depending on the service.
-    pub fn on_transact(&self, code: TransactionCode, _reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+    fn on_transact(&self, code: TransactionCode, _reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         match code {
             INTERFACE_TRANSACTION => {
-                reply.write(self.descriptor())
+                reply.write(T::descriptor())
             }
             DUMP_TRANSACTION => {
                 unimplemented!("DUMP_TRANSACTION")
@@ -72,22 +58,7 @@ impl<T: Remotable> Binder<T> {
     }
 }
 
-impl<T: 'static + Remotable> PartialEq for Binder<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.remotable, &other.remotable)
-    }
-}
-
-impl<T: 'static + Remotable> Interface for Binder<T> {
-    fn as_binder(&self) -> SIBinder {
-        SIBinder::new(Box::new((*self).clone()), T::descriptor())
-            .unwrap_or_else(|e| {
-                panic!("Failed to create SIBinder for {}. StatusCode({:?})", T::descriptor(), e)
-            })
-    }
-}
-
-impl<T: 'static +  Remotable> IBinder for Binder<T> {
+impl<T: 'static +  Remotable> IBinder for Inner<T> {
     fn link_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support link_to_death.");
         Err(StatusCode::InvalidOperation)
@@ -111,10 +82,6 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     //     self.stability
     // }
 
-    fn id(&self) -> u64 {
-        Arc::as_ptr(&self.remotable) as u64
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -122,9 +89,42 @@ impl<T: 'static +  Remotable> IBinder for Binder<T> {
     fn as_transactable(&self) -> Option<&dyn Transactable> {
         Some(self)
     }
+
+    fn descriptor(&self) -> &str {
+        T::descriptor()
+    }
+
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
+        self.strong.inc(|| { Ok(()) })
+    }
+
+    fn attempt_inc_strong(&self) -> bool {
+        self.strong.attempt_inc(true, || { true }, || {})
+    }
+
+    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
+        self.strong.dec(|| {
+            if let Some(strong) = strong {
+                let _ = ManuallyDrop::into_inner(strong);
+            }
+            Ok(())
+        })
+    }
+
+    fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
+        self.weak.inc(|| { Ok(()) })
+    }
+
+    fn dec_weak(&self) -> Result<()> {
+        self.weak.dec(|| { Ok(()) })
+    }
 }
 
-impl<T: Remotable> Transactable for Binder<T> {
+impl<T: Remotable> Transactable for Inner<T> {
     fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
         reader.set_data_position(0);
         match code {
@@ -159,20 +159,52 @@ impl<T: Remotable> Transactable for Binder<T> {
     }
 }
 
-impl<T: Remotable> Clone for Binder<T> {
-    fn clone(&self) -> Self {
-        Self {
-            remotable: self.remotable.clone(),
-            stability: self.stability,
+
+/// A Binder object that can be used to manage the binder service.
+pub struct Binder<T: 'static + Remotable + Send + Sync> {
+    inner: Arc<Inner<T>>,
+}
+
+impl<T: 'static + Remotable> Binder<T> {
+    /// Create a new Binder object.
+    pub fn new(remotable: T) -> Self {
+        Self::new_with_stability(remotable, Default::default())
+    }
+
+    /// Create a new Binder object with the specified stability.
+    pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
+        Binder::<T> {
+            inner: Arc::new(Inner {
+                remotable,
+                _stability: stability,
+                strong: Default::default(),
+                weak: Default::default(),
+            }),
         }
     }
 }
 
-impl<T: Remotable> Deref for Binder<T> {
+impl<T: 'static + Remotable> Interface for Binder<T> {
+    fn as_binder(&self) -> SIBinder {
+        SIBinder::new(self.inner.clone()).unwrap_or_else(|e| {
+            panic!("Failed to create SIBinder for {}. StatusCode({:?})", T::descriptor(), e)
+        })
+    }
+}
+
+impl<T: Remotable> Clone for Binder<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: 'static + Remotable> Deref for Binder<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.remotable
+        &self.inner.remotable
     }
 }
 
@@ -187,9 +219,14 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             return Err(StatusCode::BadType);
         }
 
-        match ibinder.as_any().downcast_ref::<Binder<B>>() {
-            Some(binder) => Ok(binder.clone()),
-            None => Err(StatusCode::BadType),
+        // Safety: Check if ibinder has the same type as Inner<B>. And then, covert it to Arc<Inner<B>>.
+        if let Some(_) = ibinder.as_any().downcast_ref::<Inner<B>>() {
+            let inner_raw = ibinder.into_raw() as *const Inner<B>;
+            let inner = unsafe { Arc::from_raw(inner_raw) };
+
+            Ok(Self { inner, })
+        } else {
+            Err(StatusCode::BadValue)
         }
     }
 }

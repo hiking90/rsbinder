@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::mem::ManuallyDrop;
+
 use crate::{
     sys::binder::flat_binder_object,
-    binder,
-    proxy,
+    binder::*,
     error::*,
     process_state,
     sys::*,
@@ -47,7 +47,7 @@ impl flat_binder_object {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder(self.cookie);
+                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
                     strong.increase()?;
                 }
 
@@ -71,7 +71,7 @@ impl flat_binder_object {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder(self.cookie);
+                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
                     strong.decrease()?;
                 }
                 Ok(())
@@ -96,6 +96,18 @@ impl flat_binder_object {
     }
 }
 
+fn split_fat_pointer(ptr: *const dyn IBinder) -> (u64, u64) {
+    unsafe {
+        std::mem::transmute(ptr)
+    }
+}
+
+fn make_fat_pointer(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> *const dyn IBinder {
+    unsafe {
+        std::mem::transmute(raw_pointer)
+    }
+}
+
 const SCHED_NORMAL:u32 = 0;
 const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT:u32 = 9;
 
@@ -103,15 +115,15 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
     (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
-impl From<&binder::SIBinder> for flat_binder_object {
-    fn from(binder: &binder::SIBinder) -> Self {
+impl From<&SIBinder> for flat_binder_object {
+    fn from(binder: &SIBinder) -> Self {
         let sched_bits = if !process_state::ProcessState::as_self().background_scheduling_disabled() {
             sched_policy_mask(SCHED_NORMAL, 19)
         } else {
             0
         };
 
-        if let Some(proxy) = binder.as_any().downcast_ref::<proxy::ProxyHandle>() {
+        if let Some(proxy) = binder.as_proxy() {
             flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_HANDLE
@@ -124,6 +136,7 @@ impl From<&binder::SIBinder> for flat_binder_object {
             }
         } else {
             let strong = binder.clone();
+            let (binder, cookie) = split_fat_pointer(strong.into_raw());
 
             flat_binder_object {
                 hdr: binder_object_header {
@@ -131,9 +144,9 @@ impl From<&binder::SIBinder> for flat_binder_object {
                 },
                 flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    binder: strong.id() as _,
+                    binder: binder as _,
                 },
-                cookie: strong.into_raw() as _,
+                cookie: cookie as _,
             }
         }
     }
@@ -154,7 +167,7 @@ impl From<*const u8> for flat_binder_object {
     }
 }
 
-pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: binder_uintptr_t) -> ManuallyDrop<binder::SIBinder> {
-    assert!(raw_pointer != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
-    ManuallyDrop::new(binder::SIBinder::from_raw(raw_pointer as *const binder::SharedIBinder))
+pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> ManuallyDrop<SIBinder> {
+    assert!(raw_pointer.0 != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
+    ManuallyDrop::new(SIBinder::from_raw(make_fat_pointer(raw_pointer)))
 }

@@ -85,7 +85,7 @@ impl ServiceManagerInner {
     fn unregister_for_notifications(&self, name: &str, callback: &rsbinder::Strong<dyn rsbinder_hub::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
         let mut callbacks = self.name_to_registration_callbacks.write().unwrap();
         if let Some(callbacks) = callbacks.get_mut(name) {
-            callbacks.retain(|c| c.as_binder().id() != callback.as_binder().id());
+            callbacks.retain(|c| c.as_binder() != callback.as_binder());
             Ok(())
         } else {
             log::error!("Trying to unregister callback, but none exists {}", name);

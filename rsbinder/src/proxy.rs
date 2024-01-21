@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::mem::ManuallyDrop;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -11,6 +12,7 @@ use crate::{
     binder::*,
     error::*,
     thread_state,
+    ref_counter::RefCounter,
 };
 
 pub struct ProxyHandle {
@@ -19,17 +21,22 @@ pub struct ProxyHandle {
     stability: Stability,
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<Arc<dyn DeathRecipient>>>,
+
+    strong: RefCounter,
+    weak: RefCounter,
 }
 
 impl ProxyHandle {
-    pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Self {
-        Self {
+    pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Arc<Self> {
+        Arc::new(Self {
             handle,
             descriptor: descriptor.to_owned(),
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
-        }
+            strong: Default::default(),
+            weak: Default::default(),
+        })
     }
 
     pub fn handle(&self) -> u32 {
@@ -128,16 +135,62 @@ impl IBinder for ProxyHandle {
     //     self.stability
     // }
 
-    fn id(&self) -> u64 {
-        self.handle() as u64
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_transactable(&self) -> Option<&dyn Transactable> {
         None
+    }
+
+    fn descriptor(&self) -> &str {
+        self.descriptor()
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn inc_strong(&self, strong: &SIBinder) -> Result<()> {
+        // In the Android implementation, it simultaneously increases the weak reference,
+        // but until the necessity is confirmed, we will not support the related functionality here.
+        self.strong.inc(|| {
+            thread_state::inc_strong_handle(self.handle(), strong.clone())
+        })
+    }
+
+    fn attempt_inc_strong(&self) -> bool {
+        self.strong.attempt_inc(false, || {
+                if let Err(err) = thread_state::attempt_inc_strong_handle(self.handle()) {
+                    log::error!("Error in attempt_inc_strong_handle() is {:?}", err);
+                    false
+                } else {
+                    true
+                }
+            },
+            || {
+                thread_state::dec_strong_handle(self.handle())
+                    .expect("Failed to decrease the binder strong reference count.");
+            }
+        )
+    }
+
+    fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
+        self.strong.dec(|| {
+            thread_state::dec_strong_handle(self.handle())
+        })
+    }
+
+    fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
+        self.weak.inc(|| {
+            thread_state::inc_weak_handle(self.handle(), weak)
+        })
+    }
+
+    fn dec_weak(&self) -> Result<()> {
+        self.weak.dec(|| {
+            thread_state::dec_weak_handle(self.handle())
+        })
     }
 }
 
@@ -150,5 +203,5 @@ pub trait Proxy : Sized + Interface {
 
     /// Create a new interface from the given proxy, if it matches the expected
     /// type of this interface.
-    fn from_binder(binder: SIBinder) -> Result<Self>;
+    fn from_binder(binder: SIBinder) -> Option<Self>;
 }

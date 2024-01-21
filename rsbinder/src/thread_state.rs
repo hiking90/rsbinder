@@ -134,8 +134,8 @@ impl TransactionState {
 // To avoid duplicate calls to borrow_mut() on ThreadState,
 // separate the data related to binder dereference.
 struct BinderDerefs {
-    pending_strong_derefs: Vec<binder_uintptr_t>,
-    pending_weak_derefs: Vec<binder_uintptr_t>,
+    pending_strong_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
+    pending_weak_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
     post_strong_derefs: Vec<SIBinder>,
     post_weak_derefs: Vec<WIBinder>,
 }
@@ -173,7 +173,7 @@ impl BinderDerefs {
 
             if let Some(raw_pointer) = self.pending_strong_derefs.pop() {
                 let strong = raw_pointer_to_strong_binder(raw_pointer);
-                SIBinder::dec_drop_zero(strong);
+                SIBinder::decrease_drop(strong)?;
             }
         }
         Ok(())
@@ -505,7 +505,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     // reader.set_data_position(0);
                     if target_ptr != 0 {
-                        let strong = raw_pointer_to_strong_binder(tr_secctx.transaction_data.cookie);
+                        let strong = raw_pointer_to_strong_binder((target_ptr, tr_secctx.transaction_data.cookie));
                         if strong.attempt_increase() {
                             let result = strong.as_transactable().expect("Transactable is None.")
                                 .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
@@ -563,7 +563,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                let strong = raw_pointer_to_strong_binder(obj);
+                let strong = raw_pointer_to_strong_binder((refs, obj));
                 let weak = SIBinder::downgrade(&strong);
                 weak.increase();
 
@@ -576,7 +576,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-                let strong = raw_pointer_to_strong_binder(obj);
+                let strong = raw_pointer_to_strong_binder((refs, obj));
                 // strong is ManuallyDrop, so increase() is called once.
                 strong.increase()?;
 
@@ -586,22 +586,22 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_RELEASE => {
                 let mut state = thread_state.borrow_mut();
-                let _refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_strong_derefs.push(obj);
+                    binder_derefs.pending_strong_derefs.push((refs, obj));
                 });
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
-                let _refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_weak_derefs.push(obj);
+                    binder_derefs.pending_weak_derefs.push((refs, obj));
                 });
             }
             binder::BR_ATTEMPT_ACQUIRE => {
@@ -827,7 +827,7 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub(crate) fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
+pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()>{
     log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -840,7 +840,7 @@ pub(crate) fn inc_weak_handle(handle: u32, weak: WIBinder) -> Result<()>{
         if !(flash_if_needed()?) {
             // This code is come from IPCThreadState.cpp. Is it necessaryq?
             BINDER_DEREFS.with(|binder_derefs| {
-                binder_derefs.borrow_mut().post_weak_derefs.push(weak);
+                binder_derefs.borrow_mut().post_weak_derefs.push(weak.clone());
             });
         }
 

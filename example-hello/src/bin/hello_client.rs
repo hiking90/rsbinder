@@ -49,7 +49,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Create a Hello proxy from binder service manager.
     let hello = BpHello::from_binder(rsbinder_hub::get_service(SERVICE_NAME)
-        .unwrap_or_else(|| panic!("Can't find {SERVICE_NAME}")))?;
+        .unwrap_or_else(|| panic!("Can't find {SERVICE_NAME}"))).unwrap();
 
     hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;
 

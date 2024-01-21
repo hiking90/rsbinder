@@ -124,12 +124,14 @@ macro_rules! declare_binder_interface {
                 $descriptor
             }
 
-            fn from_binder(binder: $crate::SIBinder) -> $crate::Result<Self> {
-                let proxy = binder.as_proxy().ok_or($crate::StatusCode::BadValue)?.clone();
-                if proxy.descriptor() != $descriptor {
-                    Err($crate::StatusCode::BadType)
+            fn from_binder(binder: $crate::SIBinder) -> std::option::Option<Self> {
+                if binder.descriptor() != $descriptor {
+                    return None
+                }
+                if let Some(_) = binder.as_proxy() {
+                    Some(Self { binder, $($fname: $finit),* })
                 } else {
-                    Ok(Self { binder, $($fname: $finit),* })
+                    None
                 }
             }
         }
@@ -161,11 +163,11 @@ macro_rules! declare_binder_interface {
         impl $crate::FromIBinder for dyn $interface {
             fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
-                    Ok(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
-                    Err(err) => {
-                        match binder.as_native::<$native>() {
-                            Some(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
-                            None => Err(err),
+                    Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
+                    None => {
+                        match $crate::native::Binder::<$native>::try_from(binder) {
+                            Ok(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
+                            Err(err) => Err(err),
                         }
                     }
                 }

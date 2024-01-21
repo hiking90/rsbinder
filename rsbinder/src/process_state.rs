@@ -180,7 +180,6 @@ impl ProcessState {
         if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
             return weak.upgrade()
         }
-
         if handle == 0 {
             let original_call_restriction = thread_state::call_restriction();
             thread_state::set_call_restriction(CallRestriction::None);
@@ -192,10 +191,16 @@ impl ProcessState {
 
         let interface = thread_state::query_interface(handle)?;
 
-        let proxy = ProxyHandle::new(handle, &interface, stability);
-        let weak = WIBinder::new(Box::new(proxy), &interface)?;
+        let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, &interface, stability);
+        let weak = WIBinder::new(proxy)?;
 
-        self.handle_to_proxy.write().unwrap().insert(handle, weak.clone());
+        {
+            let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+            if let Some(weak) = handle_to_proxy.get(&handle) {
+                return weak.upgrade()
+            }
+            handle_to_proxy.insert(handle, weak.clone());
+        }
 
         weak.upgrade()
     }

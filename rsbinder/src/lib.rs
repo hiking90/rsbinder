@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod file_descriptor;
 pub mod parcelable_holder;
 pub mod error;
+mod ref_counter;
 
 pub use process_state::ProcessState;
 pub use parcel::Parcel;
