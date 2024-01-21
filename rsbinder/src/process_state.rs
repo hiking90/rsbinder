@@ -177,9 +177,16 @@ impl ProcessState {
     }
 
     pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<SIBinder> {
+        // Double-Checked Locking Pattern is used.
         if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
             return weak.upgrade()
         }
+
+        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+        if let Some(weak) = handle_to_proxy.get(&handle) {
+            return weak.upgrade()
+        }
+
         if handle == 0 {
             let original_call_restriction = thread_state::call_restriction();
             thread_state::set_call_restriction(CallRestriction::None);
@@ -194,13 +201,7 @@ impl ProcessState {
         let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, &interface, stability);
         let weak = WIBinder::new(proxy)?;
 
-        {
-            let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
-            if let Some(weak) = handle_to_proxy.get(&handle) {
-                return weak.upgrade()
-            }
-            handle_to_proxy.insert(handle, weak.clone());
-        }
+        handle_to_proxy.insert(handle, weak.clone());
 
         weak.upgrade()
     }
