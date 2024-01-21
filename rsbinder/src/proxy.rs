@@ -64,12 +64,13 @@ impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
         self.obituary_sent.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        if !self.recipients.read().unwrap().is_empty() {
+        let recipients = self.recipients.read().unwrap();
+        if !recipients.is_empty() {
             thread_state::clear_death_notification(self.handle())?;
             thread_state::flush_commands()?;
         }
 
-        for recipient in self.recipients.read().unwrap().iter() {
+        for recipient in recipients.iter() {
             recipient.binder_died(who);
         }
 
@@ -100,12 +101,13 @@ impl IBinder for ProxyHandle {
         if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
-            if self.recipients.read().unwrap().is_empty() {
+            let mut recipients = self.recipients.write().unwrap();
+            if recipients.is_empty() {
                 thread_state::request_death_notification(self.handle())?;
                 thread_state::flush_commands()?;
             }
 
-            self.recipients.write().unwrap().push(recipient);
+            recipients.push(recipient);
         }
         Ok(())
     }
@@ -117,8 +119,10 @@ impl IBinder for ProxyHandle {
         if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
-            self.recipients.write().unwrap().retain(|r| !Arc::ptr_eq(r, &recipient));
-            if self.recipients.read().unwrap().is_empty() {
+            let mut recipients = self.recipients.write().unwrap();
+
+            recipients.retain(|r| !Arc::ptr_eq(r, &recipient));
+            if recipients.is_empty() {
                 thread_state::clear_death_notification(self.handle())?;
                 thread_state::flush_commands()?;
             }
