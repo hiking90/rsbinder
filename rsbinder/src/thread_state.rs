@@ -1022,7 +1022,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         result = e;
                         break
                     }
-                    StatusCode::Errno(errno) if errno == -libc::ECONNREFUSED => {
+                    StatusCode::Errno(errno) if errno == (nix::errno::Errno::ECONNREFUSED as i32) => {
                         result = e;
                         break;
                     }

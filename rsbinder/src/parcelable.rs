@@ -811,9 +811,9 @@ impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
                 Err(StatusCode::UnexpectedNull)
             })?;
         vec.try_into()
-            .or_else(|_| {
+            .map_err(|_| {
                 log::error!("Deserialize: Failed to convert Vec<T> to [T; N]");
-                Err(StatusCode::BadValue)
+                StatusCode::BadValue
             })
     }
 }
@@ -822,9 +822,9 @@ impl<T: std::fmt::Debug + DeserializeArray, const N: usize> DeserializeOption fo
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let vec = DeserializeArray::deserialize_array(parcel)?;
         vec.map(|v| v.try_into()
-            .or_else(|_| {
+            .map_err(|_| {
                 log::error!("DeserializeOption: Failed to convert Vec<T> to [T; N]");
-                Err(StatusCode::BadValue)
+                StatusCode::BadValue
             }))
             .transpose()
     }

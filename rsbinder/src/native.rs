@@ -220,7 +220,7 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
         }
 
         // Safety: Check if ibinder has the same type as Inner<B>. And then, covert it to Arc<Inner<B>>.
-        if let Some(_) = ibinder.as_any().downcast_ref::<Inner<B>>() {
+        if ibinder.as_any().downcast_ref::<Inner<B>>().is_some() {
             let inner_raw = ibinder.into_raw() as *const Inner<B>;
             let inner = unsafe { Arc::from_raw(inner_raw) };
 

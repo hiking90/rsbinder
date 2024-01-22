@@ -228,7 +228,7 @@ impl Parcel {
             unsafe {
                 let obj: flat_binder_object = self.data.as_ptr().add(*offset as _).into();
                 if obj.header_type() == BINDER_TYPE_FD {
-                    libc::close(obj.handle() as _);
+                    nix::unistd::close(obj.handle() as _).unwrap();
                 }
             }
         }
@@ -510,11 +510,11 @@ impl Parcel {
         let mut first_idx: i32 = -1;
         let mut last_idx: i32 = -2;
         {
+            let object_size = std::mem::size_of::<flat_binder_object>() as u64;
             let objects = self.objects.as_slice();
 
-            for i in 0..objects.len() {
-                let off: u64 = objects[i];
-                if off >= offset as _ && (off + (std::mem::size_of::<flat_binder_object>() as u64)) <= (offset + size) as u64 {
+            for (i, &off) in objects.iter().enumerate() {
+                if off >= offset as _ && (off + object_size) <= (offset + size) as u64 {
                     if first_idx == -1 {
                         first_idx = i as i32;
                     }

@@ -3,8 +3,8 @@
 
 use std::mem::ManuallyDrop;
 
+pub(crate) use crate::sys::binder::flat_binder_object;
 use crate::{
-    sys::binder::flat_binder_object,
     binder::*,
     error::*,
     process_state,
@@ -27,6 +27,19 @@ impl Default for flat_binder_object {
 }
 
 impl flat_binder_object {
+    pub(crate) fn new_with_fd(fd: i32, take_ownership: bool) -> Self {
+        flat_binder_object {
+            hdr: binder_object_header {
+                type_: BINDER_TYPE_FD
+            },
+            flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                handle: fd as _,
+            },
+            cookie: if take_ownership { 1 } else { 0 },
+        }
+    }
+
     pub(crate) fn header_type(&self) -> u32 {
         self.hdr.type_
     }
@@ -81,9 +94,7 @@ impl flat_binder_object {
             }
             BINDER_TYPE_FD => {
                 if self.cookie != 0 {   // owned
-                    unsafe {
-                        libc::close(self.handle() as _);
-                    }
+                    nix::unistd::close(self.handle() as _)?;
                 }
 
                 Ok(())

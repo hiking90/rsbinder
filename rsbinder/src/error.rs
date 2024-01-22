@@ -72,24 +72,24 @@ impl From<StatusCode> for i32 {
         match code {
             StatusCode::Ok => 0,
             StatusCode::Unknown => UNKNOWN_ERROR as _,
-            StatusCode::NoMemory => -libc::ENOMEM as _,
-            StatusCode::InvalidOperation => -libc::ENOSYS as _,
-            StatusCode::BadValue => -libc::EINVAL as _,
+            StatusCode::NoMemory => -(nix::errno::Errno::ENOMEM as i32),
+            StatusCode::InvalidOperation => -(nix::errno::Errno::ENOSYS as i32),
+            StatusCode::BadValue => -(nix::errno::Errno::EINVAL as i32),
             StatusCode::BadType => UNKNOWN_ERROR + 1,
-            StatusCode::NameNotFound => -libc::ENOENT as _,
-            StatusCode::PermissionDenied => -libc::EPERM as _,
-            StatusCode::NoInit => -libc::ENODEV as _,
-            StatusCode::AlreadyExists => -libc::EEXIST as _,
-            StatusCode::DeadObject => -libc::EPIPE as _,
+            StatusCode::NameNotFound => -(nix::errno::Errno::ENOENT as i32),
+            StatusCode::PermissionDenied => -(nix::errno::Errno::EPERM as i32),
+            StatusCode::NoInit => -(nix::errno::Errno::ENODEV as i32),
+            StatusCode::AlreadyExists => -(nix::errno::Errno::EEXIST as i32),
+            StatusCode::DeadObject => -(nix::errno::Errno::EPIPE as i32),
             StatusCode::FailedTransaction => UNKNOWN_ERROR + 2,
-            StatusCode::UnknownTransaction => -libc::EBADMSG as _,
-            StatusCode::BadIndex => -libc::EOVERFLOW as _,
+            StatusCode::UnknownTransaction => -(nix::errno::Errno::EBADMSG as i32),
+            StatusCode::BadIndex => -(nix::errno::Errno::EOVERFLOW as i32),
             StatusCode::FdsNotAllowed => UNKNOWN_ERROR + 7,
             StatusCode::UnexpectedNull => UNKNOWN_ERROR + 8,
-            StatusCode::NotEnoughData => -libc::ENODATA as _,
-            StatusCode::WouldBlock => -libc::EWOULDBLOCK as _,
-            StatusCode::TimedOut => -libc::ETIMEDOUT as _,
-            StatusCode::BadFd => -libc::EBADF as _,
+            StatusCode::NotEnoughData => -(nix::errno::Errno::ENODATA as i32),
+            StatusCode::WouldBlock => -(nix::errno::Errno::EWOULDBLOCK as i32),
+            StatusCode::TimedOut => -(nix::errno::Errno::ETIMEDOUT as i32),
+            StatusCode::BadFd => -(nix::errno::Errno::EBADF as i32),
             StatusCode::ServiceSpecific(v) => v,
             StatusCode::Errno(errno) => errno,
         }
@@ -129,5 +129,27 @@ impl From<i32> for StatusCode {
 impl From<std::array::TryFromSliceError> for StatusCode {
     fn from(_: std::array::TryFromSliceError) -> Self {
         StatusCode::NotEnoughData
+    }
+}
+
+impl From<nix::errno::Errno> for StatusCode {
+    fn from(errno: nix::errno::Errno) -> Self {
+        match errno {
+            nix::errno::Errno::ENOMEM => StatusCode::NoMemory,
+            nix::errno::Errno::ENOSYS => StatusCode::InvalidOperation,
+            nix::errno::Errno::EINVAL => StatusCode::BadValue,
+            nix::errno::Errno::ENOENT => StatusCode::NameNotFound,
+            nix::errno::Errno::EPERM => StatusCode::PermissionDenied,
+            nix::errno::Errno::ENODEV => StatusCode::NoInit,
+            nix::errno::Errno::EEXIST => StatusCode::AlreadyExists,
+            nix::errno::Errno::EPIPE => StatusCode::DeadObject,
+            nix::errno::Errno::EBADMSG => StatusCode::UnknownTransaction,
+            nix::errno::Errno::EOVERFLOW => StatusCode::BadIndex,
+            nix::errno::Errno::ENODATA => StatusCode::NotEnoughData,
+            nix::errno::Errno::EWOULDBLOCK => StatusCode::WouldBlock,
+            nix::errno::Errno::ETIMEDOUT => StatusCode::TimedOut,
+            nix::errno::Errno::EBADF => StatusCode::BadFd,
+            _ => StatusCode::Errno(errno as i32),
+        }
     }
 }

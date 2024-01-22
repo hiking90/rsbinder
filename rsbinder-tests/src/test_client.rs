@@ -3,8 +3,6 @@
 use env_logger::Env;
 use std::collections::HashMap;
 
-use libc;
-
 pub use rsbinder::*;
 pub use rsbinder_hub;
 
@@ -325,17 +323,12 @@ fn test_interface_list_exchange() {
 }
 
 fn build_pipe() -> (File, File) {
+    let fds = nix::unistd::pipe().expect("error creating pipe");
     // Safety: we get two file descriptors from pipe()
     // and pass them after checking if the function returned
     // without an error, so the descriptors should be valid
     // by that point
-    unsafe {
-        let mut fds = [0, 0];
-        if libc::pipe(fds.as_mut_ptr()) != 0 {
-            panic!("pipe() error");
-        }
-        (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))
-    }
+    unsafe { (File::from_raw_fd(fds.0), File::from_raw_fd(fds.1)) }
 }
 
 #[test]

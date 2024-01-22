@@ -31,8 +31,7 @@ pub use android::aidl::versioned::tests::{
 };
 
 fn dup_fd(fd: &ParcelFileDescriptor) -> ParcelFileDescriptor {
-    // ParcelFileDescriptor::new(fd.as_ref().try_clone().unwrap())
-    todo!()
+    ParcelFileDescriptor::new(fd.as_ref().try_clone().unwrap())
 }
 
 struct NamedCallback(String);

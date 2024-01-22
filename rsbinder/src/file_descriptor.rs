@@ -19,12 +19,13 @@
 
 use crate::{
     Deserialize, DeserializeArray, DeserializeOption, Serialize, SerializeArray,
-    SerializeOption, Parcel
+    SerializeOption, Parcel,
+    binder_object::flat_binder_object,
 };
 use crate::error::{Result, StatusCode};
 
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, FromRawFd};
 
 /// Rust version of the Java class android.os.ParcelFileDescriptor
 #[derive(Debug)]
@@ -72,18 +73,28 @@ impl PartialEq for ParcelFileDescriptor {
 impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
-    fn serialize(&self, _parcel: &mut Parcel) -> Result<()> {
-        let _fd = self.0.as_raw_fd();
-        todo!()
-        // let status = unsafe {
-        //     // Safety: `Parcel` always contains a valid pointer to an
-        //     // `AParcel`. Likewise, `ParcelFileDescriptor` always contains a
-        //     // valid file, so we can borrow a valid file
-        //     // descriptor. `AParcel_writeParcelFileDescriptor` does NOT take
-        //     // ownership of the fd, so we need not duplicate it first.
-        //     sys::AParcel_writeParcelFileDescriptor(parcel.as_native_mut(), fd)
-        // };
-        // status_result(status)
+    fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        let fd = self.0.as_raw_fd();
+
+        // Not null
+        parcel.write::<i32>(&1)?;
+        let dup_fd = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))?;
+
+        let result = || -> Result<()> {
+            parcel.write::<i32>(&0)?;
+            let obj = flat_binder_object::new_with_fd(dup_fd, true);
+            parcel.write_object(&obj, true)?;
+            Ok(())
+        }();
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Close the duplicated fd
+                nix::unistd::close(dup_fd)?;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -94,47 +105,35 @@ impl SerializeOption for ParcelFileDescriptor {
         if let Some(f) = this {
             f.serialize(parcel)
         } else {
-            todo!()
-            // let status = unsafe {
-            //     // Safety: `Parcel` always contains a valid pointer to an
-            //     // `AParcel`. `AParcel_writeParcelFileDescriptor` accepts the
-            //     // value `-1` as the file descriptor to signify serializing a
-            //     // null file descriptor.
-            //     sys::AParcel_writeParcelFileDescriptor(parcel.as_native_mut(), -1i32)
-            // };
-            // status_result(status)
+            parcel.write::<i32>(&0)
         }
     }
 }
 
 impl DeserializeOption for ParcelFileDescriptor {
-    fn deserialize_option(_parcel: &mut Parcel) -> Result<Option<Self>> {
-        let _fd = -1i32;
-        todo!();
-        // unsafe {
-        //     // Safety: `Parcel` always contains a valid pointer to an
-        //     // `AParcel`. We pass a valid mutable pointer to an i32, which
-        //     // `AParcel_readParcelFileDescriptor` assigns the valid file
-        //     // descriptor into, or `-1` if deserializing a null file
-        //     // descriptor. The read function passes ownership of the file
-        //     // descriptor to its caller if it was non-null, so we must take
-        //     // ownership of the file and ensure that it is eventually closed.
-        //     status_result(sys::AParcel_readParcelFileDescriptor(
-        //         parcel.as_native(),
-        //         &mut fd,
-        //     ))?;
-        // }
-        // if _fd < 0 {
-        //     Ok(None)
-        // } else {
-        //     let file = unsafe {
-        //         // Safety: At this point, we know that the file descriptor was
-        //         // not -1, so must be a valid, owned file descriptor which we
-        //         // can safely turn into a `File`.
-        //         File::from_raw_fd(_fd)
-        //     };
-        //     Ok(Some(ParcelFileDescriptor::new(file)))
-        // }
+    fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        let present = parcel.read::<i32>()?;
+        if present == 0 {
+            return Ok(None);
+        }
+
+        let has_comm = parcel.read::<i32>()?;
+        if has_comm != 0 {
+            return Err(StatusCode::BadValue);
+        }
+
+        let obj = parcel.read_object(true)?;
+
+        let fd = nix::fcntl::fcntl(obj.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))?;
+
+        let file = unsafe {
+            // Safety: At this point, we know that the file descriptor was
+            // not -1, so must be a valid, owned file descriptor which we
+            // can safely turn into a `File`.
+            File::from_raw_fd(fd)
+        };
+
+        Ok(Some(ParcelFileDescriptor::new(file)))
     }
 }
 

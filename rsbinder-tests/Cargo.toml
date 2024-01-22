@@ -12,7 +12,7 @@ rsbinder = { path = "../rsbinder" }
 rsbinder-hub = { path = "../rsbinder-hub" }
 tokio = { version = "1", features = ["full"] }
 env_logger = "0"
-libc = "0"
+nix = "0"
 
 [build-dependencies]
 rsbinder-aidl = { path = "../rsbinder-aidl" }

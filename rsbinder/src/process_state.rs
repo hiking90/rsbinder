@@ -85,17 +85,16 @@ impl ProcessState {
 
         let driver = open_driver(&driver_name, max_threads)?;
 
-        let vm_size = ((1024 * 1024) - unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } * 2) as usize;
+        let vm_size = ((1024 * 1024) - nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)?.unwrap() * 2) as usize;
+        let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
 
         let mmap = unsafe {
-            let vm_start = libc::mmap(std::ptr::null_mut(),
+            let vm_start = nix::sys::mman::mmap(None,
                 vm_size,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_NORESERVE, driver.as_raw_fd(), 0);
-
-            if vm_start == libc::MAP_FAILED {
-                return Err(format!("{:?} mmap is failed!", driver_name).into());
-            }
+                nix::sys::mman::ProtFlags::PROT_READ,
+                nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
+                Some(&driver),
+                0)?;
 
             (vm_start, vm_size)
         };
@@ -104,7 +103,7 @@ impl ProcessState {
             max_threads,
             driver_name,
             driver: driver.into(),
-            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1 }),
+            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1.get() }),
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             disable_background_scheduling: AtomicBool::new(false),
@@ -306,7 +305,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
         let mut mmap = self.mmap.write().unwrap();
-        unsafe { libc::munmap(mmap.ptr, mmap.size); }
+        unsafe { nix::sys::mman::munmap(mmap.ptr, mmap.size).unwrap(); }
         mmap.ptr = std::ptr::null_mut();
         mmap.size = 0;
     }
