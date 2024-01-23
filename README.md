@@ -61,8 +61,8 @@ $ target/debug/hello_client
 - [x] Implement Binder crate.
 - [x] Implement AIDL code generator.
 - [x] Port Android test_service and test_client and pass the test cases.
+- [x] Implement ParcelFileDescriptor.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] Implement File Descriptor Sharing
 - [ ] Remove all todo!() and unimplemented!() macros.
 - [ ] Support Tokio async.
 - [ ] Add more test cases for Binder IPC

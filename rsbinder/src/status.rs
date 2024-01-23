@@ -204,7 +204,7 @@ impl Serialize for Status {
             return Ok(())
         }
 
-        parcel.write(&self.message)?;
+        parcel.write::<String>(self.message.as_ref().unwrap_or(&"".to_owned()))?;
         parcel.write::<i32>(&0)?; // Empty remote stack trace header
 
         if self.exception == ExceptionCode::ServiceSpecific {
@@ -242,11 +242,10 @@ impl Deserialize for Status {
             read_check_header_size(parcel)?;
             exception = ExceptionCode::None;
         }
-
         let status = if exception == ExceptionCode::None {
             exception.into()
         } else {
-            let message = parcel.read::<String>()?;
+            let message: String = parcel.read::<String>()?;
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
             if remote_stack_trace_header_size < 0 || remote_stack_trace_header_size as usize > parcel.data_avail() {
                 log::error!("0x534e4554:132650049 Invalid remote_stack_trace_header_size({}).", remote_stack_trace_header_size);
@@ -255,7 +254,8 @@ impl Deserialize for Status {
             parcel.set_data_position(parcel.data_position() + remote_stack_trace_header_size as usize);
 
             let code = if exception == ExceptionCode::ServiceSpecific {
-                parcel.read::<i32>()?.into()
+                let code = parcel.read::<i32>()?;
+                StatusCode::ServiceSpecific(code)
             } else if exception == ExceptionCode::Parcelable {
                 read_check_header_size(parcel)?;
                 StatusCode::Ok

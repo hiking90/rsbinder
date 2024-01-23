@@ -251,10 +251,6 @@ pub mod {{mod}} {
         match _code {
         {%- for member in fn_members %}
             transactions::{{ member.identifier }} => {
-                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                    return Ok(());
-                }
             {%- for decl in member.transaction_decls %}
                 let {{ decl }};
             {%- endfor %}

@@ -27,6 +27,7 @@ use crate::{
     binder::*,
     parcel::*,
     error::*,
+    thread_state,
     ref_counter::RefCounter,
 };
 
@@ -144,6 +145,12 @@ impl<T: Remotable> Transactable for Inner<T> {
             }
 
             _ => {
+                if (code >= FIRST_CALL_TRANSACTION && code <= LAST_CALL_TRANSACTION) &&
+                    !(thread_state::check_interface(reader, T::descriptor())?) {
+                    reply.write(&StatusCode::BadType)?;
+                    return Ok(());
+                }
+
                 match self.remotable.on_transact(code, reader, reply) {
                     Ok(_) => Ok(()),
                     Err(err) => {
