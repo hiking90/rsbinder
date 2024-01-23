@@ -60,14 +60,14 @@ $ target/debug/hello_client
 ## Todo
 - [x] Implement Binder crate.
 - [x] Implement AIDL code generator.
-- [x] Port Android test_service and test_client and pass the test cases.
 - [x] Implement ParcelFileDescriptor.
+- [x] Port Android test_service and test_client and pass the test cases.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
 - [ ] Remove all todo!() and unimplemented!() macros.
+- [ ] Performed compatibility testing with Binder on Android.
 - [ ] Support Tokio async.
-- [ ] Add more test cases for Binder IPC
 - [ ] Enhance error detection in AIDL code generator
-- [ ] Support MAC likes selinux and AppArmor.
+- [ ] Support Mandatory Access Control likes selinux and AppArmor.
 - [ ] Support AIDL version and hash.
 
 ## License
