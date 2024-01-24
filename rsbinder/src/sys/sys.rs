@@ -2007,7 +2007,7 @@ fn bindgen_test_layout_binder_object_header() {
     }
     test_field_type();
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Copy, Clone)]
 pub struct flat_binder_object {
     pub hdr: binder_object_header,

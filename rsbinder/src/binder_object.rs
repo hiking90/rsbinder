@@ -48,12 +48,20 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.handle }
     }
 
+    pub(crate) fn set_handle(&mut self, handle: u32) {
+        self.__bindgen_anon_1.handle = handle
+    }
+
     pub(crate) fn pointer(&self) -> binder_uintptr_t {
         unsafe { self.__bindgen_anon_1.binder }
     }
 
     pub(crate) fn cookie(&self) -> binder_uintptr_t {
         self.cookie
+    }
+
+    pub(crate) fn set_cookie(&mut self, cookie: binder_uintptr_t) {
+        self.cookie = cookie;
     }
 
     pub(crate) fn acquire(&self) -> Result<()> {
@@ -163,18 +171,15 @@ impl From<&SIBinder> for flat_binder_object {
     }
 }
 
-impl From<*const u8> for flat_binder_object {
-    fn from(raw_pointer: *const u8) -> Self {
-        // To avoid the runtime error "misaligned pointer dereference", memory copy is used.
-        let mut obj: flat_binder_object = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                raw_pointer,
-                &mut obj as *mut _ as *mut u8,
-                std::mem::size_of::<flat_binder_object>(),
-            );
-        }
-        obj
+impl From<(*const u8, usize)> for &flat_binder_object {
+    fn from(pointer: (*const u8, usize)) -> Self {
+        unsafe { & *(pointer.0.add(pointer.1) as *const flat_binder_object) }
+    }
+}
+
+impl From<(*mut u8, usize)> for &mut flat_binder_object {
+    fn from(pointer: (*mut u8, usize)) -> Self {
+        unsafe { &mut *(pointer.0.add(pointer.1) as *mut flat_binder_object) }
     }
 }
 

@@ -225,11 +225,9 @@ impl Parcel {
 
     pub fn close_file_descriptors(&self) {
         for offset in self.objects.as_slice() {
-            unsafe {
-                let obj: flat_binder_object = self.data.as_ptr().add(*offset as _).into();
-                if obj.header_type() == BINDER_TYPE_FD {
-                    nix::unistd::close(obj.handle() as _).unwrap();
-                }
+            let obj: &flat_binder_object = (self.data.as_ptr(), *offset as usize).into();
+            if obj.header_type() == BINDER_TYPE_FD {
+                nix::unistd::close(obj.handle() as _).unwrap();
             }
         }
     }
@@ -282,12 +280,11 @@ impl Parcel {
         }
     }
 
-    // TODO : Switch the return value to reference likes &flat_binder_object
-    pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
+    pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<&flat_binder_object> {
         let data_pos = self.pos as u64;
         let size = std::mem::size_of::<flat_binder_object>();
 
-        let obj: flat_binder_object = self.read_aligned_data(size)?.as_ptr().into();
+        let obj: &flat_binder_object = (self.read_aligned_data(size)?.as_ptr(), 0).into();
 
         if !null_meta && obj.cookie == 0 && obj.pointer() == 0 {
             return Ok(obj);
@@ -542,12 +539,11 @@ impl Parcel {
                 let off = objects[i as usize] as usize - offset + start_pos;
                 objects[idx] = off as _;
                 idx += 1;
-                let flat = unsafe {
-                    flat_binder_object::from(self.data.as_ptr().add(off))
-                };
+                let flat: &mut flat_binder_object = (self.data.as_mut_ptr(), off).into();
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
-                    todo!()
+                    flat.set_handle(nix::fcntl::fcntl(flat.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))? as _);
+                    flat.set_cookie(1);
                 }
             }
         }
@@ -561,7 +557,7 @@ impl Parcel {
         }
 
         for pos in self.objects.as_slice() {
-            let obj: flat_binder_object = unsafe { self.data.as_ptr().add(*pos as _).into() };
+            let obj: &flat_binder_object = (self.data.as_ptr(), *pos as usize).into();
             obj.release().map_err(|e| log::error!("Parcel: unable to release object: {:?}", e)).ok();
         }
     }

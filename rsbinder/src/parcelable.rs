@@ -479,7 +479,7 @@ impl DeserializeArray for String {}
 
 impl Deserialize for flat_binder_object {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        parcel.read_object(false)
+        parcel.read_object(false).map(|obj| *obj)
     }
 }
 
