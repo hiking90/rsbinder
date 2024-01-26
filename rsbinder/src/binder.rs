@@ -91,7 +91,7 @@ pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 ///
 /// This is equivalent `IInterface` in C++.
 pub trait Interface: Send + Sync {
-    /// Convert this binder object into a generic [`SpIBinder`] reference.
+    /// Convert this binder object into a generic [`SIBinder`] reference.
     fn as_binder(&self) -> SIBinder {
         panic!("This object was not a Binder object and cannot be converted into an StrongIBinder.")
     }
@@ -105,6 +105,7 @@ pub trait Interface: Send + Sync {
     }
 }
 
+/// Trait for converting a generic Binder object into a specific Binder
 ///
 /// # Example
 ///
@@ -128,6 +129,11 @@ pub trait FromIBinder: Interface {
 }
 
 
+/// Interface for receiving a notification when a binder object is no longer
+/// valid.
+///
+/// This trait corresponds to the parts of the interface of the C++ `DeathRecipient`
+/// class which are public.
 pub trait DeathRecipient: Send + Sync {
     fn binder_died(&self, who: &WIBinder);
 }
@@ -324,7 +330,7 @@ impl SIBinder {
     /// Binder interface.
     ///
     /// If this object does not implement the expected interface, the error
-    /// `StatusCode::BAD_TYPE` is returned.
+    /// `StatusCode::BadType` is returned.
     pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         FromIBinder::try_from(self)
     }

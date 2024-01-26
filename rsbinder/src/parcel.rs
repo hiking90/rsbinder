@@ -328,10 +328,7 @@ impl Parcel {
     /// of that parcelable, then build a sized readable sub-parcel
     /// and call a closure with the sub-parcel as its parameter.
     /// The closure can keep reading data from the sub-parcel
-    /// until it runs out of input data. The closure is responsible
-    /// for calling [`ReadableSubParcel::has_more_data`] to check for
-    /// more data before every read, at least until Rust generators
-    /// are stabilized.
+    /// until it runs out of input data.
     /// After the closure returns, skip to the end of the current
     /// parcelable regardless of how much the closure has read.
     ///
@@ -340,12 +337,8 @@ impl Parcel {
     /// ```no_run
     /// let mut parcelable = Default::default();
     /// parcel.sized_read(|subparcel| {
-    ///     if subparcel.has_more_data() {
-    ///         parcelable.a = subparcel.read()?;
-    ///     }
-    ///     if subparcel.has_more_data() {
-    ///         parcelable.b = subparcel.read()?;
-    ///     }
+    ///     parcelable.a = subparcel.read()?;
+    ///     parcelable.b = subparcel.read()?;
     ///     Ok(())
     /// });
     /// ```

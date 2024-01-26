@@ -17,6 +17,9 @@
  * limitations under the License.
  */
 
+/// Declare a binder interface.
+///
+/// This is mainly used internally by the AIDL compiler.
 #[macro_export]
 macro_rules! declare_binder_interface {
     {

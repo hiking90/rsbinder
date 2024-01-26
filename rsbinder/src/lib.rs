@@ -1,6 +1,18 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! A library for Binder communication developed purely in Rust.
+//!
+//! # License
+//!
+//! Licensed under Apache License, Version 2.0.
+//!
+//! # References
+//!
+//! * [AIDL](https://source.android.com/docs/core/architecture/aidl)
+//! * [Binder](https://source.android.com/docs/core/architecture/hidl/binder-ipc)
+//!
+
 mod sys;
 mod process_state;
 pub mod thread_state;

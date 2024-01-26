@@ -10,16 +10,19 @@ The source code still contains many todo!() macros, and the release of version 0
 ## Overview
 **rsbinder** offers the following features:
 
-* **crate rsbinder**: A library crate for implementing binder service/client functionality.
-* **crate rsbinder-aidl**: A tool for generating Rust code for rsbinder from aidl.
-* **crate rsbinder-hub**: Provides functionality similar to Binder's ServiceManager.
-* **crate rsbinder-tools**: Provides command line tools likes service manager and binder device initializor.
-* **crate example-hello**: An example of service/client written using rsbinder.
+* **[crate rsbinder][rsbinder-readme]**: A library crate for implementing binder service/client functionality.
+* **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
+* **[crate rsbinder-hub][rsbinder-hub-readme]**: Provides functionality similar to Binder's ServiceManager.
+* **[crate rsbinder-tools][rsbinder-tools-readme]**: Provides command line tools likes service manager and binder device initializor.
+* **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
+
+[rsbinder-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder/README.md
+[rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
+[rsbinder-hub-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-hub/README.md
+[rsbinder-tools-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
+[example-hello-readme]: https://github.com/hiking90/rsbinder/tree/master/example-hello/README.md
 
 ## Prerequisites to build and test
-
-### Android Build
-* Please follow the guideline of https://github.com/bbqsrc/cargo-ndk
 
 ### Enable binder for Linux
 * The Linux kernel must be built with support for binderfs. Please check the following kernel configs.
@@ -30,17 +33,26 @@ CONFIG_ANDROID_BINDER_IPC=y
 CONFIG_ANDROID_BINDERFS=y
 ```
 
-* Arch Linux users just use the linux-zen kernel. Zen kernel already includes BinderFS.
-* Ubuntu Linux users refer to https://github.com/anbox/anbox/blob/master/docs/install.md
+* Arch Linux - Install linux-zen kernel. Zen kernel already includes BinderFS.
+```
+$ pacman -S linux-zen
+```
+* Ubuntu Linux - https://github.com/anbox/anbox/blob/master/docs/install.md
+
+### Build rsbinder
+Build all rsbinder crates.
+```
+$ cargo build
+```
 
 #### Run rsbinder tools
-* Build **rsbinder** crates. It can build **rsb_device** and it can be used to create a new binder device file.
+* Run **rsb_device** command to create a binder device file.
 ```
 $ sudo target/debug/rsb_device binder
 ```
 * Run **rsb_hub**. It is a binder service manager.
 ```
-$ target/debug/rsb_hub
+$ cargo run --bin rsb_hub
 ```
 
 ### Test binder for Linux
@@ -52,6 +64,9 @@ $ target/debug/hello_service
 ```
 $ target/debug/hello_client
 ```
+
+### Cross compile to Android device
+* Please follow the guideline of https://github.com/bbqsrc/cargo-ndk
 
 ## Compatibility Goal with Android Binder
 * The Binder protocol is mutually compatible. That is, communication between an Android service and an rsbinder client is possible, and vice versa. However, this compatibility work is still ongoing.
