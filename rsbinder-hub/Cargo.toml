@@ -15,7 +15,7 @@ lazy_static = "1"
 rsbinder = { version = "0.1.0", path = "../rsbinder" }
 env_logger = "0"
 log = "0.4"
-tokio = "1.35"
+tokio = { version = "1.35", features = ["full"] }
 
 [build-dependencies]
 rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }
