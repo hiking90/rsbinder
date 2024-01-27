@@ -2,6 +2,11 @@
 name = "rsbinder-aidl"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "This is a code generator that generates Rust source code for rsbinder from AIDL files."
+homepage = "https://github.com/hiking90/rsbinder"
+repository = "https://github.com/hiking90/rsbinder/rsbinder-aidl"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

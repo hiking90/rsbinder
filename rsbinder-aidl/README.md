@@ -1,5 +1,5 @@
 # rsbinder-aidl
-This is a code generator that generates Rust source code from AIDL files.
+This is a code generator that generates Rust source code for **rsbinder** from AIDL files.
 
 ## How to use the AIDL Code Generator
 * Add the build-dependencies to Cargo.toml:

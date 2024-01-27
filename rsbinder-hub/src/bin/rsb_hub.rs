@@ -207,7 +207,6 @@ impl IServiceManager for ServiceManager {
     }
 
     fn isDeclared(&self,_arg_name: &str) -> rsbinder::status::Result<bool> {
-        println!("isDeclared");
         Ok(false)
     }
 

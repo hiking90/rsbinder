@@ -7,12 +7,11 @@ edition = "2021"
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { path = "../rsbinder" }
-rsbinder-hub = { path = "../rsbinder-hub" }
+rsbinder = { version = "0.1.0", path = "../rsbinder" }
+rsbinder-hub = { version = "0.1.0", path = "../rsbinder-hub" }
 env_logger = "0"
 tokio = { version = "1", features = ["full"] }
 backtrace = "0.3"
 
 [build-dependencies]
-# aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }
-rsbinder-aidl = { path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }

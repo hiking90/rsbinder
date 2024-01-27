@@ -21,7 +21,6 @@ use std::vec::Vec;
 use std::default::Default;
 
 use pretty_hex::*;
-use zerocopy::AsBytes;
 
 use crate::{
     error::{Result, StatusCode},
@@ -459,7 +458,7 @@ impl Parcel {
         parcelable.serialize(self)
     }
 
-    pub(crate) fn write_array<S: Serialize + Sized + AsBytes>(&mut self, parcelable: &[S]) -> Result<()> {
+    pub(crate) fn write_array<S: Serialize + Sized>(&mut self, parcelable: &[S]) -> Result<()> {
         let len = parcelable.len();
         self.write::<i32>(&(len as _))?;
 
@@ -487,7 +486,7 @@ impl Parcel {
         Ok(())
     }
 
-    pub(crate) fn write_array_char<S: CharType + AsBytes>(&mut self, parcelable: &[S]) -> Result<()> {
+    pub(crate) fn write_array_char<S: CharType>(&mut self, parcelable: &[S]) -> Result<()> {
         let len = parcelable.len();
         self.write::<i32>(&(len as _))?;
 
@@ -707,7 +706,13 @@ impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         if self.objects.len() > 0 {
-            writeln!(f, "Object count {}\n{}", self.objects.len(), pretty_hex(&self.objects.as_slice().as_bytes()))?;
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    self.objects.as_ptr() as *const u8,
+                    self.objects.len() * std::mem::size_of::<binder_size_t>(),
+                )
+            };
+            writeln!(f, "Object count {}\n{}", self.objects.len(), pretty_hex(&bytes))?;
         }
         write!(f, "{}", pretty_hex(&self.data.as_slice()))
     }

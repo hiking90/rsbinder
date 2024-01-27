@@ -2,6 +2,11 @@
 name = "rsbinder"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "This is a library for Linux Binder communication."
+homepage = "https://github.com/hiking90/rsbinder"
+repository = "https://github.com/hiking90/rsbinder"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,7 +15,4 @@ nix = { version = "0", features = ["ioctl", "mount", "fs", "feature", "mman"] }
 log = "0.4"
 pretty_hex = { version = "0", package = "pretty-hex" }
 downcast-rs = "1.2"
-zerocopy = "0.7"
-
-[build-dependencies]
-rsbinder-aidl = { path = "../rsbinder-aidl" }
+env_logger = "0.11"

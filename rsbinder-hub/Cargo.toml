@@ -2,15 +2,20 @@
 name = "rsbinder-hub"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "This provides an API for the Binder service manager."
+homepage = "https://github.com/hiking90/rsbinder"
+repository = "https://github.com/hiking90/rsbinder/rsbinder-hub"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { path = "../rsbinder" }
+rsbinder = { version = "0.1.0", path = "../rsbinder" }
 env_logger = "0"
 log = "0.4"
+tokio = "1.35"
 
 [build-dependencies]
-# aidlgen = { package="rsbinder-aidl", path = "../rsbinder-aidl" }
-rsbinder-aidl = { path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }

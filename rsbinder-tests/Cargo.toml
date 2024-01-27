@@ -8,11 +8,11 @@ publish = false
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { path = "../rsbinder" }
-rsbinder-hub = { path = "../rsbinder-hub" }
+rsbinder = { version = "0.1.0", path = "../rsbinder" }
+rsbinder-hub = { version = "0.1.0", path = "../rsbinder-hub" }
 tokio = { version = "1", features = ["full"] }
 env_logger = "0"
 nix = "0"
 
 [build-dependencies]
-rsbinder-aidl = { path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }
