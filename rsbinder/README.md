@@ -50,10 +50,11 @@ $ cargo build
 ```
 
 #### Run rsbinder tools
-* Run **rsb_device** command to create a binder device file.
+* Run **[rsb_device]** command to create a binder device file.
 ```
 $ sudo target/debug/rsb_device binder
 ```
+[rsb_device]: https://github.com/hiking90/rsbinder/blob/master/rsbinder/src/bin/rsb_device.md
 * Run **rsb_hub**. It is a binder service manager.
 ```
 $ cargo run --bin rsb_hub
@@ -62,11 +63,11 @@ $ cargo run --bin rsb_hub
 ### Test binder for Linux
 * Run **hello_service**
 ```
-$ target/debug/hello_service
+$ cargo run --bin hello_service
 ```
 * Run **hello_client**
 ```
-$ target/debug/hello_client
+$ cargo run --bin hello_client
 ```
 
 ### Cross compile to Android device
