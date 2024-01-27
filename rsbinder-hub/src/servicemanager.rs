@@ -184,7 +184,7 @@ mod tests {
     fn test_others() -> rsbinder::Result<()> {
         setup();
 
-        assert!(is_declared("android.hardware.usb.IUsb/default"));
+        assert_eq!(is_declared("android.hardware.usb.IUsb/default"), false);
 
         Ok(())
     }

@@ -93,7 +93,7 @@ pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 pub trait Interface: Send + Sync {
     /// Convert this binder object into a generic [`SIBinder`] reference.
     fn as_binder(&self) -> SIBinder {
-        panic!("This object was not a Binder object and cannot be converted into an StrongIBinder.")
+        panic!("This object was not a Binder object and cannot be converted into an SIBinder.")
     }
 
     /// Dump transaction handler for this Binder object.
@@ -111,12 +111,12 @@ pub trait Interface: Send + Sync {
 ///
 /// For Binder interface `IFoo`, the following implementation should be made:
 /// ```no_run
-/// # use rsbinder::{FromIBinder, StrongIBinder, Result};
-/// # trait IFoo {}
+/// # use rsbinder::{FromIBinder, SIBinder, Interface, Result, Strong};
+/// # trait IFoo : Interface {}
 /// impl FromIBinder for dyn IFoo {
-///     fn try_from(ibinder: StrongIBinder) -> Result<Box<Self>> {
+///     fn try_from(ibinder: SIBinder) -> Result<Strong<Self>> {
 ///         // ...
-///         # Err(rsbinder::StatusCode::OK)
+///         # Err(rsbinder::StatusCode::Ok)
 ///     }
 /// }
 /// ```

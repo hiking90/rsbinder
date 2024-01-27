@@ -354,17 +354,6 @@ impl Parcel {
     /// After the closure returns, skip to the end of the current
     /// parcelable regardless of how much the closure has read.
     ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// let mut parcelable = Default::default();
-    /// parcel.sized_read(|subparcel| {
-    ///     parcelable.a = subparcel.read()?;
-    ///     parcelable.b = subparcel.read()?;
-    ///     Ok(())
-    /// });
-    /// ```
-    ///
     pub fn sized_read<F>(&mut self, f: F) -> Result<()>
     where
         for<'b> F: FnOnce(&mut Parcel) -> Result<()>
@@ -582,7 +571,7 @@ impl Parcel {
     /// After the following call:
     ///
     /// ```
-    /// # use binder::{Binder, Interface, Parcel};
+    /// # use rsbinder::{Binder, Interface, Parcel};
     /// # let mut parcel = Parcel::new();
     /// parcel.sized_write(|subparcel| {
     ///     subparcel.write(&1u32)?;

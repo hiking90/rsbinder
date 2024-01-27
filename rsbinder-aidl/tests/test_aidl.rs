@@ -160,10 +160,6 @@ pub mod ITestService {
         _service: &dyn ITestService, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
         match _code {
             transactions::ReverseBoolean => {
-                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                    return Ok(());
-                }
                 let _arg_input: Vec<bool> = _reader.read()?;
                 let mut _arg_repeated: Vec<bool> = Default::default();
                 let _aidl_return = _service.ReverseBoolean(&_arg_input, &mut _arg_repeated);
@@ -180,10 +176,6 @@ pub mod ITestService {
                 Ok(())
             }
             transactions::RepeatNullableIntArray => {
-                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                    return Ok(());
-                }
                 let _arg_input: Option<Vec<i32>> = _reader.read()?;
                 let _aidl_return = _service.RepeatNullableIntArray(_arg_input.as_deref());
                 match &_aidl_return {
@@ -198,10 +190,6 @@ pub mod ITestService {
                 Ok(())
             }
             transactions::FillOutStructuredParcelable => {
-                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                    return Ok(());
-                }
                 let mut _arg_parcel: rsbinder::Strong<dyn StructuredParcelable> = _reader.read()?;
                 let _aidl_return = _service.FillOutStructuredParcelable(&mut _arg_parcel);
                 match &_aidl_return {
@@ -362,10 +350,6 @@ pub mod FixedSizeArrayExample {
             _service: &dyn IRepeatFixedSizeArray, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
             match _code {
                 transactions::Repeat2dParcelables => {
-                    if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                        _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                        return Ok(());
-                    }
                     let _arg_input: [[super::IntParcelable::IntParcelable; 3]; 2] = _reader.read()?;
                     let mut _arg_repeated: [[super::IntParcelable::IntParcelable; 3]; 2] = Default::default();
                     let _aidl_return = _service.Repeat2dParcelables(&_arg_input, &mut _arg_repeated);
@@ -631,10 +615,6 @@ pub mod ArrayOfInterfaces {
             _service: &dyn IMyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
             match _code {
                 transactions::methodWithInterfaces => {
-                    if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                        _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                        return Ok(());
-                    }
                     let _arg_iface: rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface> = _reader.read()?;
                     let _arg_nullable_iface: Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let _arg_iface_array_in: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
@@ -1170,10 +1150,6 @@ pub mod ITestService {
         _service: &dyn ITestService, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
         match _code {
             transactions::RepeatByteEnum => {
-                if !(rsbinder::thread_state::check_interface(_reader, _descriptor)?) {
-                    _reply.write(&rsbinder::StatusCode::PermissionDenied)?;
-                    return Ok(());
-                }
                 let _arg_token: super::ByteEnum::ByteEnum = _reader.read()?;
                 let _aidl_return = _service.RepeatByteEnum(_arg_token);
                 match &_aidl_return {
