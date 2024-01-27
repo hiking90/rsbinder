@@ -39,6 +39,32 @@ pub(crate) fn pad_size(len: usize) -> usize {
     (len+3) & (!3)
 }
 
+pub(crate) trait CharType : Clone {
+    type Output;
+    fn as_i32(&self) -> i32;
+    fn from(v: &i32) -> Self::Output;
+}
+
+impl CharType for i16 {
+    type Output = i16;
+    fn as_i32(&self) -> i32 {
+        *self as _
+    }
+    fn from(v: &i32) -> Self::Output {
+        *v as _
+    }
+}
+
+impl CharType for u16 {
+    type Output = u16;
+    fn as_i32(&self) -> i32 {
+        *self as _
+    }
+    fn from(v: &i32) -> Self::Output {
+        *v as _
+    }
+}
+
 pub(crate) enum ParcelData<T: Clone + Default + 'static> {
     Vec(Vec<T>),
     Slice(&'static mut [T]),
@@ -115,14 +141,10 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    fn splice<R, I>(&mut self, range: R, replace_with: I) -> std::vec::Splice<'_, I::IntoIter>
-    where
-        R: std::ops::RangeBounds<usize>,
-        I: IntoIterator<Item = T>,
-    {
+    fn reserve(&mut self, additional: usize) {
         match self {
-            ParcelData::Vec(v) => v.splice(range, replace_with),
-            _ => panic!("splice() is only available for ParcelData::Vec."),
+            ParcelData::Vec(v) => v.reserve(additional),
+            _ => panic!("&[u8] can't support reserve()."),
         }
     }
 
@@ -373,6 +395,69 @@ impl Parcel {
         Ok(())
     }
 
+    pub(crate) fn read_array<D: Deserialize + ?Sized>(&mut self) -> Result<Option<Vec<D>>> {
+        let len: i32 = self.read()?;
+        if len < -1 {
+            log::error!("Parcel: bad array length: {}", len);
+            return Err(StatusCode::BadValue);
+        }
+        if len <= 0 {
+            return Ok(None);
+        }
+
+        let size = len as usize * std::mem::size_of::<D>();
+        let padded = pad_size(size);
+
+        if padded > self.data_avail() {
+            log::error!("Parcel: not enough data to read array: {} > {}", padded, self.data_avail());
+            return Err(StatusCode::NotEnoughData);
+        }
+
+        let mut result = Vec::with_capacity(len as usize);
+        let pos = self.pos;
+        unsafe {
+            std::ptr::copy_nonoverlapping::<u8>(
+                self.data.as_slice()[pos .. pos + size].as_ptr(),
+                result.as_mut_ptr() as _, size);
+            result.set_len(len as usize);
+        }
+        self.set_data_position(pos + padded);
+
+        Ok(Some(result))
+    }
+
+    pub(crate) fn read_array_char<D: CharType>(&mut self) -> Result<Option<Vec<<D as CharType>::Output>>> {
+        let len: i32 = self.read()?;
+        if len < -1 {
+            log::error!("Parcel: bad array length: {}", len);
+            return Err(StatusCode::BadValue);
+        }
+        if len <= 0 {
+            return Ok(None);
+        }
+
+        let size = len as usize * 4;
+        let padded = pad_size(size);
+
+        if padded > self.data_avail() {
+            log::error!("Parcel: not enough data to read array char: {} > {}", padded, self.data_avail());
+            return Err(StatusCode::NotEnoughData);
+        }
+
+        let mut result = Vec::with_capacity(len as usize);
+        let pos = self.pos;
+        let (_, ints, _) = unsafe {
+            self.data.as_slice()[pos .. pos + size].align_to::<i32>()
+        };
+        for i in ints {
+            result.push(D::from(i));
+        }
+
+        self.set_data_position(pos + padded);
+
+        Ok(Some(result))
+    }
+
 
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
         if !self.request_header_present {
@@ -383,6 +468,49 @@ impl Parcel {
 
     pub fn write<S: Serialize + ?Sized>(&mut self, parcelable: &S) -> Result<()> {
         parcelable.serialize(self)
+    }
+
+    pub(crate) fn write_array<S: Serialize + Sized + AsBytes>(&mut self, parcelable: &[S]) -> Result<()> {
+        let len = parcelable.len();
+        self.write::<i32>(&(len as _))?;
+
+        if len == 0 {
+            return Ok(())
+        }
+
+        let size = std::mem::size_of::<S>() * len;
+        let padded = pad_size(size);
+        let pos = self.pos;
+
+        self.data.reserve(pos + padded);
+        unsafe {
+            std::ptr::copy_nonoverlapping::<u8>(
+                parcelable.as_ptr() as _,
+                self.data.as_mut_ptr().add(pos) as _,
+                size);
+            if self.data.len() < pos + padded {
+                self.data.set_len((pos + padded) as usize);
+            }
+        }
+
+        self.set_data_position(pos + padded);
+
+        Ok(())
+    }
+
+    pub(crate) fn write_array_char<S: CharType + AsBytes>(&mut self, parcelable: &[S]) -> Result<()> {
+        let len = parcelable.len();
+        self.write::<i32>(&(len as _))?;
+
+        let size = 4 * len;
+        let padded = pad_size(size);
+
+        self.data.reserve(self.pos + padded);
+        for c in parcelable {
+            self.write(&c.as_i32())?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn write_aligned<T>(&mut self, val: &T) {
@@ -397,11 +525,20 @@ impl Parcel {
     pub(crate) fn write_aligned_data(&mut self, data: &[u8]) {
         let unaligned = data.len();
         let aligned = pad_size(unaligned);
-        if self.pos + aligned > self.data.len() {
-            self.data.resize(self.data.len() + (self.pos + aligned - self.data.len()));
+        let pos = self.pos;
+
+        self.data.reserve(pos + aligned);
+        unsafe {
+            std::ptr::copy_nonoverlapping::<u8>(
+                data.as_ptr() as _,
+                self.data.as_mut_ptr().add(pos) as _,
+                unaligned);
+            if pos + aligned > self.data.len() {
+                self.data.set_len((pos + aligned) as usize);
+            }
         }
-        self.data.splice(self.pos..(self.pos+unaligned), data.iter().cloned());
-        self.pos += aligned;
+
+        self.set_data_position(pos + aligned);
     }
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
@@ -471,7 +608,7 @@ impl Parcel {
         let end = self.data_position();
         self.set_data_position(start);
         assert!(end >= start);
-        self.write(&((end - start) as i32))?;
+        self.write::<i32>(&((end - start) as _))?;
         self.set_data_position(end);
         Ok(())
     }
@@ -515,13 +652,17 @@ impl Parcel {
 
         let num_objects = last_idx - first_idx + 1;
 
-        if self.pos + size > self.data.len() {
-            self.data.resize(self.data.len() + (self.pos + size - self.data.len()));
+        self.data.reserve(self.pos + size);
+        unsafe {
+            std::ptr::copy_nonoverlapping::<u8>(
+                other.data.as_slice()[offset..offset+size].as_ptr() as _,
+                self.data.as_mut_ptr().add(self.pos) as _,
+                size);
+            if self.pos + size > self.data.len() {
+                self.data.set_len((self.pos + size) as usize);
+            }
         }
-
-        self.data.splice(self.pos..(self.pos+size),
-            other.data.as_slice()[offset..offset+size].iter().cloned());
-        self.pos += size;
+        self.set_data_position(self.pos + size);
 
         if num_objects > 0 {
             let mut idx = self.objects.len();
@@ -634,6 +775,62 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_array_byte() {
+        let array = vec![255u8, 0u8, 127u8];
+        let mut reverse = array.clone();
+        reverse.reverse();
+        let mut parcel = Parcel::new();
+
+        parcel.write_array(&array).unwrap();
+        parcel.write_array(&reverse).unwrap();
+
+        parcel.set_data_position(0);
+
+        let res = parcel.read_array::<u8>().unwrap();
+        assert_eq!(array, res.unwrap());
+        let res = parcel.read_array::<u8>().unwrap();
+        assert_eq!(reverse, res.unwrap());
+    }
+
+    #[test]
+    fn test_array_double() {
+        let array = vec![1.0f64 / 3.0f64, 1.0f64 / 7.0f64, 42.0f64];
+        let mut reverse = array.clone();
+        reverse.reverse();
+        let mut parcel = Parcel::new();
+
+        parcel.write_array(&array).unwrap();
+        parcel.write_array(&reverse).unwrap();
+
+        println!("{:?}", parcel);
+
+        parcel.set_data_position(0);
+
+        let res = parcel.read_array::<f64>().unwrap();
+        assert_eq!(array, res.unwrap());
+        let res = parcel.read_array::<f64>().unwrap();
+        assert_eq!(reverse, res.unwrap());
+    }
+
+    #[test]
+    fn test_array_char() {
+        let array = vec![255u16, 0u16, 127u16];
+        let mut reverse = array.clone();
+        reverse.reverse();
+        let mut parcel = Parcel::new();
+
+        parcel.write_array_char(&array).unwrap();
+        parcel.write_array_char(&reverse).unwrap();
+
+        parcel.set_data_position(0);
+
+        let res = parcel.read_array_char::<u16>().unwrap();
+        assert_eq!(array, res.unwrap());
+        let res = parcel.read_array_char::<u16>().unwrap();
+        assert_eq!(reverse, res.unwrap());
     }
 
     // #[test]

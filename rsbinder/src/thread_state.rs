@@ -546,18 +546,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                 thread_state.borrow_mut().transaction = transaction_old;
             }
 
-            binder::BR_REPLY => {
-                todo!("execute_command - BR_REPLY");
-            }
-            binder::BR_ACQUIRE_RESULT => {
-                todo!("execute_command - BR_ACQUIRE_RESULT");
-            }
-            binder::BR_DEAD_REPLY => {
-                todo!("execute_command - BR_DEAD_REPLY");
-            }
-            binder::BR_TRANSACTION_COMPLETE => {
-                todo!("execute_command - BR_TRANSACTION_COMPLETE");
-            }
             binder::BR_INCREFS => {
                 let mut state = thread_state.borrow_mut();
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
@@ -605,19 +593,15 @@ fn execute_command(cmd: i32) -> Result<()> {
                 });
             }
             binder::BR_ATTEMPT_ACQUIRE => {
-                todo!("execute_command - BR_ATTEMPT_ACQUIRE");
-        // refs = (RefBase::weakref_type*)mIn.readPointer();
-        // obj = (BBinder*)mIn.readPointer();
+                let mut state = thread_state.borrow_mut();
+                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
-        // {
-        //     const bool success = refs->attemptIncStrong(mProcess.get());
-        //     ALOG_ASSERT(success && refs->refBase() == obj,
-        //                "BR_ATTEMPT_ACQUIRE: object %p does not match cookie %p (expected %p)",
-        //                refs, obj, refs->refBase());
+                let strong = raw_pointer_to_strong_binder((refs, obj));
+                let success = strong.attempt_increase();
 
-        //     mOut.writeInt32(BC_ACQUIRE_RESULT);
-        //     mOut.writeInt32((int32_t)success);
-        // }
+                state.out_parcel.write::<u32>(&binder::BC_ACQUIRE_RESULT)?;
+                state.out_parcel.write::<i32>(&(success as _))?;
             }
             binder::BR_NOOP => {}
             binder::BR_SPAWN_LOOPER => {
@@ -643,15 +627,6 @@ fn execute_command(cmd: i32) -> Result<()> {
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
                 let mut state = thread_state.borrow_mut();
                 state.in_parcel.read::<binder::binder_uintptr_t>()?;
-            }
-            binder::BR_FAILED_REPLY => {
-                todo!("execute_command - BR_FAILED_REPLY");
-            }
-            binder::BR_FROZEN_REPLY => {
-                todo!("execute_command - BR_FROZEN_REPLY");
-            }
-            binder::BR_ONEWAY_SPAM_SUSPECT => {
-                todo!("execute_command - BR_ONEWAY_SPAM_SUSPECT");
             }
             _ => {
                 log::error!("*** BAD COMMAND {} received from Binder driver\n", cmd);

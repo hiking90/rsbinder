@@ -119,55 +119,17 @@ macro_rules! impl_parcelable {
 
     {SerializeArray, $ty:ty} => {
         impl SerializeArray for $ty {
-            // fn serialize_array(_slice: &[Self], _parcel: &mut Parcel) -> Result<()> {
-            //     todo!("impl SerializeArray for $ty")
-            //     let status = unsafe {
-            //         // Safety: `Parcel` always contains a valid pointer to an
-            //         // `AParcel`. If the slice is > 0 length, `slice.as_ptr()`
-            //         // will be a valid pointer to an array of elements of type
-            //         // `$ty`. If the slice length is 0, `slice.as_ptr()` may be
-            //         // dangling, but this is safe since the pointer is not
-            //         // dereferenced if the length parameter is 0.
-            //         $write_array_fn(
-            //             parcel.as_native_mut(),
-            //             slice.as_ptr(),
-            //             slice
-            //                 .len()
-            //                 .try_into()
-            //                 .or(Err(StatusCode::BAD_VALUE))?,
-            //         )
-            //     };
-            //     status_result(status)
-            // }
+            fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
+                parcel.write_array(slice)
+            }
         }
     };
 
     {DeserializeArray, $ty:ty} => {
         impl DeserializeArray for $ty {
-            // fn deserialize_array(_parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
-            //     todo!("impl DeserializeArray for $ty")
-            //     let mut vec: Option<Vec<MaybeUninit<Self>>> = None;
-            //     let status = unsafe {
-            //         // Safety: `Parcel` always contains a valid pointer to an
-            //         // `AParcel`. `allocate_vec<T>` expects the opaque pointer to
-            //         // be of type `*mut Option<Vec<MaybeUninit<T>>>`, so `&mut vec` is
-            //         // correct for it.
-            //         $read_array_fn(
-            //             parcel.as_native(),
-            //             &mut vec as *mut _ as *mut c_void,
-            //             Some(allocate_vec_with_buffer),
-            //         )
-            //     };
-            //     status_result(status)?;
-            //     let vec: Option<Vec<Self>> = unsafe {
-            //         // Safety: We are assuming that the NDK correctly
-            //         // initialized every element of the vector by now, so we
-            //         // know that all the MaybeUninits are now properly
-            //         // initialized.
-            //         vec.map(|vec| vec_assume_init(vec))
-            //     };
-            //     Ok(vec)
-            // }
+            fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
+                parcel.read_array()
+            }
         }
     };
     {SerializeOption, $ty:ty} => {
@@ -210,26 +172,6 @@ macro_rules! impl_parcelable_ex {
             }
         }
     };
-
-    {SerializeArray, $to_ty:ty, $ty:ty} => {
-        impl SerializeArray for $ty {
-        }
-    };
-
-    {DeserializeArray, $to_ty:ty, $ty:ty} => {
-        impl DeserializeArray for $ty {
-        }
-    };
-
-    {SerializeOption, $to_ty:ty, $ty:ty} => {
-        impl SerializeOption for $ty {
-        }
-    };
-
-    {DeserializeOption, $to_ty:ty, $ty:ty} => {
-        impl DeserializeOption for $ty {
-        }
-    };
 }
 
 
@@ -244,16 +186,11 @@ parcelable_primitives! {
     impl SerializeOption for u8;
     impl DeserializeOption for u8;
 
-    impl SerializeArray for i16;
-    impl DeserializeArray for i16;
     impl SerializeOption for i16;
     impl DeserializeOption for i16;
 
-    impl SerializeArray for u16;
-    impl DeserializeArray for u16;
     impl SerializeOption for u16;
     impl DeserializeOption for u16;
-
 
     impl Serialize for i32;
     impl Deserialize for i32;
@@ -317,6 +254,30 @@ parcelable_primitives_ex! {
 
     impl Serialize for u16 = u32;
     impl Deserialize for u16 = u32;
+}
+
+impl SerializeArray for i16 {
+    fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
+        parcel.write_array_char(slice)
+    }
+}
+
+impl DeserializeArray for i16 {
+    fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
+        parcel.read_array_char::<Self>()
+    }
+}
+
+impl SerializeArray for u16 {
+    fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
+        parcel.write_array_char(slice)
+    }
+}
+
+impl DeserializeArray for u16 {
+    fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
+        parcel.read_array_char::<Self>()
+    }
 }
 
 impl Deserialize for bool {
