@@ -9,7 +9,7 @@ If you wish to use C++ based binder IPC in a Linux environment, please refer to 
 
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
-The source code still contains many todo!() macros, and the release of version 0.1 is planned only after all these todo!() macros are resolved.
+The source code still contains todo!() and unimplemented!().
 
 ## Overview
 **rsbinder** offers the following features:
