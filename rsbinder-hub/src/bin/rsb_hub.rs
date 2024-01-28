@@ -9,19 +9,19 @@ use rsbinder::*;
 
 struct Service {
     binder: SIBinder,
-    allow_isolated: bool,
+    _allow_isolated: bool,
     dump_priority: i32,
-    has_clients: bool,
+    _has_clients: bool,
     guarentee_client: bool,
-    debug_pid: u32,
+    _debug_pid: u32,
 }
 
 impl Service {
-    fn get_node_strong_ref_count(&self) -> usize {
+    fn _get_node_strong_ref_count(&self) -> usize {
         unimplemented!("get_node_strong_ref_count")
     }
 
-    fn try_start_service(&self) -> rsbinder::Result<SIBinder> {
+    fn _try_start_service(&self) -> rsbinder::Result<SIBinder> {
         unimplemented!("try_start_service")
     }
 }
@@ -172,11 +172,11 @@ impl IServiceManager for ServiceManager {
         }
         self.inner.add_service(name, Service {
             binder: service.clone(),
-            allow_isolated: allowIsolated,
+            _allow_isolated: allowIsolated,
             dump_priority: dumpPriority,
-            has_clients: false,
+            _has_clients: false,
             guarentee_client: false,
-            debug_pid: 0,
+            _debug_pid: 0,
         })?;
 
         self.inner.on_registration(name)?;

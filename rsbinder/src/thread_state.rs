@@ -17,11 +17,12 @@
  * limitations under the License.
  */
 
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
 use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use log::error;
 use std::backtrace::Backtrace;
+use std::fs::File;
 
 use crate::{
     parcel::*,
@@ -188,6 +189,7 @@ pub(crate) struct ThreadState {
     is_looper: bool,
     is_flushing: bool,
     call_restriction: CallRestriction,
+    driver: Arc<File>,
 }
 
 impl ThreadState {
@@ -200,6 +202,7 @@ impl ThreadState {
             is_looper: false,
             is_flushing: false,
             call_restriction: ProcessState::as_self().call_restriction(),
+            driver: ProcessState::as_self().driver(),
         }
     }
 
@@ -640,8 +643,6 @@ fn execute_command(cmd: i32) -> Result<()> {
 
 
 fn talk_with_driver(do_receive: bool) -> Result<()> {
-    let driver = ProcessState::as_self().driver();
-
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut bwr = {
             let mut thread_state = thread_state.borrow_mut();
@@ -680,21 +681,20 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
         unsafe {
             loop {
-                let res = binder::write_read(driver.as_raw_fd(), &mut bwr);
+                let res = binder::write_read(thread_state.borrow().driver.as_raw_fd(), &mut bwr);
                 match res {
                     Ok(_) => break,
                     Err(errno) if errno != nix::errno::Errno::EINTR => {
                         log::error!("binder::write_read() error : {}", errno);
-                        return Err(StatusCode::Errno(-(errno as i32)));
+                        return Err(StatusCode::Errno(errno as i32));
                     },
                     _ => {}
                 }
-
             }
         }
 
-        log::trace!("errno: {:?}, write consumed: {} of {}, read consumed: {}",
-            nix::errno::Errno::last(), bwr.write_consumed, bwr.write_size, bwr.read_consumed);
+        log::trace!("write consumed: {} of {}, read consumed: {} of {}",
+            bwr.write_consumed, bwr.write_size, bwr.read_consumed, bwr.read_size);
 
         {
             let mut thread_state = thread_state.borrow_mut();

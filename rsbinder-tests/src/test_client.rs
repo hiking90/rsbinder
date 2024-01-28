@@ -1,7 +1,6 @@
-#![allow(non_snake_case, dead_code)]
+#![allow(non_snake_case, dead_code, unused_imports, unused_macros)]
 
 use env_logger::Env;
-use std::collections::HashMap;
 
 pub use rsbinder::*;
 pub use rsbinder_hub;
@@ -1227,7 +1226,7 @@ fn test_dump() {
     let (mut read_file, mut write_file) = build_pipe();
 
     let args = vec!["dump".to_owned(), "ITestService".to_owned()];
-    let mut expected = args.join("\n") + "\n";
+    let expected = args.join("\n") + "\n";
 
     test_service.dump(&mut write_file, &args).unwrap();
     std::mem::drop(write_file);
