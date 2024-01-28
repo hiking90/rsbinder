@@ -31,7 +31,7 @@ function ndk_sync() {
         # macOS
         find_command="find \"$source_directory\" -maxdepth 1 -type f -perm +111"
     else
-        # Linux 
+        # Linux
         find_command="find \"$source_directory\" -maxdepth 1 -type f -executable"
     fi
 
@@ -110,4 +110,28 @@ function remote_sync() {
 function remote_shell() {
     read_remote_linux
     command ssh "$remote_user_host" -t "cd $remote_directory; bash"
+}
+
+declare -a publish_dirs=("rsbinder" "rsbinder-aidl" "rsbinder-hub")
+
+function publish() {
+    local cargo_options=()
+    if [[ "$1" == "--dry-run" ]]; then
+        cargo_options=("$1" "--allow-dirty")
+    fi
+
+    for dir in "${publish_dirs[@]}"; do
+        echo "Publishing $dir with options: $cargo_options"
+        pushd "$dir" > /dev/null
+
+        cargo publish "${cargo_options[@]}"
+        local result=$?
+
+        popd > /dev/null
+        if [ $result -ne 0 ]; then
+            echo "Error occurred in $dir, exiting..."
+            return $result
+        fi
+    done
+    return 0
 }
