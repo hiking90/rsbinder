@@ -1,4 +1,4 @@
-#![allow(non_snake_case)]
+#![allow(non_snake_case, dead_code)]
 
 use env_logger::Env;
 use std::collections::HashMap;
@@ -331,6 +331,14 @@ fn build_pipe() -> (File, File) {
     unsafe { (File::from_raw_fd(fds.0), File::from_raw_fd(fds.1)) }
 }
 
+/// Helper function that constructs a `File` from a `ParcelFileDescriptor`.
+///
+/// This is needed because `File` is currently the way to read and write
+/// to pipes using the `Read` and `Write` traits.
+fn file_from_pfd(fd: &rsbinder::ParcelFileDescriptor) -> File {
+    fd.as_ref().try_clone().expect("failed to clone file descriptor").into()
+}
+
 #[test]
 fn test_parcel_file_descriptor() {
     let service = get_test_service();
@@ -342,7 +350,7 @@ fn test_parcel_file_descriptor() {
         .expect("error calling RepeatParcelFileDescriptor");
 
     const TEST_DATA: &[u8] = b"FrazzleSnazzleFlimFlamFlibbityGumboChops";
-    result_pfd.as_ref().write_all(TEST_DATA).expect("error writing to pipe");
+    file_from_pfd(&result_pfd).write_all(TEST_DATA).expect("error writing to pipe");
 
     let mut buf = [0u8; TEST_DATA.len()];
     read_file.read_exact(&mut buf).expect("error reading from pipe");
@@ -373,18 +381,15 @@ fn test_parcel_file_descriptor_array() {
         .ReverseParcelFileDescriptorArray(&input[..], &mut repeated)
         .expect("error calling ReverseParcelFileDescriptorArray");
 
-    input[1].as_ref().write_all(b"First").expect("error writing to pipe");
-    repeated[1]
-        .as_mut()
-        .expect("received None for ParcelFileDescriptor")
-        .as_ref()
+    file_from_pfd(&input[1]).write_all(b"First").expect("error writing to pipe");
+    file_from_pfd(repeated[1].as_ref().expect("received None for ParcelFileDescriptor"))
         .write_all(b"Second")
         .expect("error writing to pipe");
-    result[0].as_ref().write_all(b"Third").expect("error writing to pipe");
+    file_from_pfd(&result[0]).write_all(b"Third").expect("error writing to pipe");
 
     const TEST_DATA: &[u8] = b"FirstSecondThird";
     let mut buf = [0u8; TEST_DATA.len()];
-    input[0].as_ref().read_exact(&mut buf).expect("error reading from pipe");
+    file_from_pfd(&input[0]).read_exact(&mut buf).expect("error reading from pipe");
     assert_eq!(&buf[..], TEST_DATA);
 }
 
@@ -1214,4 +1219,19 @@ fn test_fixed_size_array_over_binder() {
 fn test_ping() {
     let test_service = get_test_service();
     assert_eq!(test_service.as_binder().ping_binder(), Ok(()));
+}
+
+#[test]
+fn test_dump() {
+    let test_service = get_test_service();
+    let (mut read_file, mut write_file) = build_pipe();
+
+    let args = vec!["dump".to_owned(), "ITestService".to_owned()];
+    let mut expected = args.join("\n") + "\n";
+
+    test_service.dump(&mut write_file, &args).unwrap();
+    std::mem::drop(write_file);
+    let mut buf = String::new();
+    read_file.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, expected);
 }

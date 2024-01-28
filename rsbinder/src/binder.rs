@@ -21,15 +21,16 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::any::Any;
-use std::fs::File;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::borrow::Borrow;
+use std::os::fd::OwnedFd;
 
 use crate::{
     error::*,
     parcel::*,
     proxy,
+    sys,
 };
 
 /// Binder action to perform.
@@ -42,6 +43,14 @@ pub type TransactionCode = u32;
 ///
 /// `FLAG_*` values.
 pub type TransactionFlags = u32;
+
+/// Corresponds to TF_ONE_WAY -- an asynchronous call.
+pub const FLAG_ONEWAY: TransactionFlags = sys::transaction_flags_TF_ONE_WAY;
+/// Corresponds to TF_CLEAR_BUF -- clear transaction buffers after call is made.
+pub const FLAG_CLEAR_BUF: TransactionFlags = sys::transaction_flags_TF_CLEAR_BUF;
+/// Set to the vendor flag if we are building for the VNDK, 0 otherwise
+pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
+pub const FLAG_PRIVATE_VENDOR: TransactionFlags = FLAG_PRIVATE_LOCAL;
 
 const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
     ((c1 as u32)<<24) | ((c2 as u32)<<16) | ((c3 as u32)<<8) | (c4 as u32)
@@ -60,28 +69,31 @@ pub const EXTENSION_TRANSACTION: u32 = b_pack_chars('_', 'E', 'X', 'T');
 pub const DEBUG_PID_TRANSACTION: u32 = b_pack_chars('_', 'P', 'I', 'D');
 pub const SET_RPC_CLIENT_TRANSACTION: u32 = b_pack_chars('_', 'R', 'P', 'C');
 
-        // See android.os.IBinder.TWEET_TRANSACTION
-        // Most importantly, messages can be anything not exceeding 130 UTF-8
-        // characters, and callees should exclaim "jolly good message old boy!"
+pub const START_RECORDING_TRANSACTION: u32 = b_pack_chars('_', 'S', 'R', 'D');
+pub const STOP_RECORDING_TRANSACTION: u32 = b_pack_chars('_', 'E', 'R', 'D');
+
+// See android.os.IBinder.TWEET_TRANSACTION
+// Most importantly, messages can be anything not exceeding 130 UTF-8
+// characters, and callees should exclaim "jolly good message old boy!"
 pub const TWEET_TRANSACTION: u32 = b_pack_chars('_', 'T', 'W', 'T');
 
-        // See android.os.IBinder.LIKE_TRANSACTION
-        // Improve binder self-esteem.
+// See android.os.IBinder.LIKE_TRANSACTION
+// Improve binder self-esteem.
 pub const LIKE_TRANSACTION: u32 = b_pack_chars('_', 'L', 'I', 'K');
-
-        // Corresponds to TF_ONE_WAY -- an asynchronous call.
-pub const FLAG_ONEWAY: u32 = 0x00000001;
-
-        // Corresponds to TF_CLEAR_BUF -- clear transaction buffers after call
-        // is made
-pub const FLAG_CLEAR_BUF: u32 = 0x00000020;
-
-        // Private userspace flag for transaction which is being requested from
-        // a vendor context.
-pub const FLAG_PRIVATE_VENDOR: u32 = 0x10000000;
 
 pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 
+/// To add the capability of acquiring an ownedfd in std::io::write,
+/// a new write has been defined.
+pub trait WriteExt : std::io::Write {
+    fn as_owned_fd(&self) -> std::io::Result<OwnedFd>;
+}
+
+impl WriteExt for std::fs::File {
+    fn as_owned_fd(&self) -> std::io::Result<OwnedFd> {
+        self.try_clone().map(|file| file.into())
+    }
+}
 
 /// Super-trait for Binder interfaces.
 ///
@@ -100,7 +112,7 @@ pub trait Interface: Send + Sync {
     ///
     /// This handler is a no-op by default and should be implemented for each
     /// Binder service struct that wishes to respond to dump transactions.
-    fn dump(&self, _file: &File, _args: &[&str]) -> Result<()> {
+    fn dump(&self, _writer: &mut dyn WriteExt, _args: &[String]) -> Result<()> {
         Ok(())
     }
 }
@@ -217,7 +229,7 @@ pub trait Remotable: Send + Sync {
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
-    fn on_dump(&self, file: &File, args: &[&str]) -> Result<()>;
+    fn on_dump(&self, writer: &mut dyn WriteExt, args: &[String]) -> Result<()>;
 }
 
 /// A transactable object that can be used to process Binder commands.

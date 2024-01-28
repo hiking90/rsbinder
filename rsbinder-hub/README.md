@@ -3,4 +3,4 @@ This provides an API for the Binder service manager. Using this API, one can cre
 
 In rsbinder, instead of the long word 'servicemanager', 'hub' is used. Therefore, the crate name is **rsbinder-hub**.
 
-The CLI command that offers the functionalities of the servicemanager is **rsb_hub** in the **rsbinder-tools** crate.
+The CLI command that offers the functionalities of the servicemanager is **rsb_hub**.

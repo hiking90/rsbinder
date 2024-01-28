@@ -71,7 +71,14 @@ struct TestService {
     service_map: Mutex<HashMap<String, rsbinder::Strong<dyn INamedCallback::INamedCallback>>>,
 }
 
-impl Interface for TestService {}
+impl Interface for TestService {
+    fn dump(&self, writer: &mut dyn rsbinder::WriteExt, args: &[String]) -> Result<()> {
+        for arg in args {
+            writeln!(writer, "{}", arg).unwrap();
+        }
+        Ok(())
+    }
+}
 
 macro_rules! impl_repeat {
     ($repeat_name:ident, $type:ty) => {

@@ -13,6 +13,7 @@ use crate::{
     error::*,
     thread_state,
     ref_counter::RefCounter,
+    file_descriptor::ParcelFileDescriptor,
 };
 
 pub struct ProxyHandle {
@@ -74,6 +75,22 @@ impl ProxyHandle {
             recipient.binder_died(who);
         }
 
+        Ok(())
+    }
+
+    pub fn dump(&self, writer: &mut dyn WriteExt, args: &[String]) -> Result<()> {
+        let fd = writer.as_owned_fd().map_err(|err| {
+            log::error!("Failed to as_owned_fd() from writer. {:?}", err);
+            StatusCode::BadValue
+        })?;
+        let file_descriptor = ParcelFileDescriptor::new(fd);
+        let mut send = Parcel::new();
+        send.write(&file_descriptor)?;
+        send.write::<i32>(&(args.len() as i32))?;
+        for arg in args {
+            send.write(arg)?;
+        }
+        self.submit_transact(DUMP_TRANSACTION, &send, FLAG_PRIVATE_LOCAL)?;
         Ok(())
     }
 }

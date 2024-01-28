@@ -24,29 +24,28 @@ use crate::{
 };
 use crate::error::{Result, StatusCode};
 
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, FromRawFd, OwnedFd};
 
 /// Rust version of the Java class android.os.ParcelFileDescriptor
 #[derive(Debug)]
-pub struct ParcelFileDescriptor(File);
+pub struct ParcelFileDescriptor(OwnedFd);
 
 impl ParcelFileDescriptor {
     /// Create a new `ParcelFileDescriptor`
-    pub fn new(file: File) -> Self {
-        Self(file)
+    pub fn new<F: Into<OwnedFd>>(fd: F) -> Self {
+        Self(fd.into())
     }
 }
 
-impl AsRef<File> for ParcelFileDescriptor {
-    fn as_ref(&self) -> &File {
+impl AsRef<OwnedFd> for ParcelFileDescriptor {
+    fn as_ref(&self) -> &OwnedFd {
         &self.0
     }
 }
 
-impl From<ParcelFileDescriptor> for File {
-    fn from(file: ParcelFileDescriptor) -> File {
-        file.0
+impl From<ParcelFileDescriptor> for OwnedFd {
+    fn from(fd: ParcelFileDescriptor) -> OwnedFd {
+        fd.0
     }
 }
 
@@ -130,7 +129,7 @@ impl DeserializeOption for ParcelFileDescriptor {
             // Safety: At this point, we know that the file descriptor was
             // not -1, so must be a valid, owned file descriptor which we
             // can safely turn into a `File`.
-            File::from_raw_fd(fd)
+            OwnedFd::from_raw_fd(fd)
         };
 
         Ok(Some(ParcelFileDescriptor::new(file)))

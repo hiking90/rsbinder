@@ -14,13 +14,12 @@ The source code still contains many todo!() macros, and the release of version 0
 ## Overview
 **rsbinder** offers the following features:
 
-* **[crate rsbinder][rsbinder-readme]**: A library crate for implementing binder service/client functionality.
+* **crate rsbinder**: A library crate for implementing binder service/client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
 * **[crate rsbinder-hub][rsbinder-hub-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate rsbinder-tests][rsbinder-tests-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
 
-[rsbinder-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder/README.md
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
 [rsbinder-hub-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-hub/README.md
 [rsbinder-tests-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tests/README.md

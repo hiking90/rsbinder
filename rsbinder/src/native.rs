@@ -17,10 +17,12 @@
  * limitations under the License.
  */
 
-use std::sync::Arc;
-use std::ops::Deref;
+use std::{sync::Arc, os::fd::AsRawFd};
+use std::ops::{Deref, DerefMut};
 use std::any::Any;
 use std::convert::TryFrom;
+use std::fs::File;
+use std::os::fd::FromRawFd;
 use std::mem::ManuallyDrop;
 
 use crate::{
@@ -29,6 +31,7 @@ use crate::{
     error::*,
     thread_state,
     ref_counter::RefCounter,
+    file_descriptor::ParcelFileDescriptor,
 };
 
 struct Inner<T: Remotable + Send + Sync> {
@@ -46,13 +49,26 @@ impl<T: Remotable> Inner<T> {
                 reply.write(T::descriptor())
             }
             DUMP_TRANSACTION => {
-                unimplemented!("DUMP_TRANSACTION")
+                let fd = _reader.read::<ParcelFileDescriptor>()?;
+                let argc = _reader.read::<i32>()?;
+                let mut argv = Vec::new();
+                for _ in 0..argc {
+                    argv.push(_reader.read::<String>()?);
+                }
+
+                let mut file = unsafe {
+                    ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd()))
+                };
+
+                self.remotable.on_dump(file.deref_mut(), argv.as_slice())
             }
             SHELL_COMMAND_TRANSACTION => {
-                unimplemented!("SHELL_COMMAND_TRANSACTION")
+                log::error!("SHELL_COMMAND_TRANSACTION is not supported.");
+                Err(StatusCode::InvalidOperation)
             }
             SYSPROPS_TRANSACTION => {
-                unimplemented!("SYSPROPS_TRANSACTION")
+                log::error!("SYSPROPS_TRANSACTION is not supported.");
+                Err(StatusCode::InvalidOperation)
             }
             _ => Err(StatusCode::UnknownTransaction),
         }
@@ -134,14 +150,24 @@ impl<T: Remotable> Transactable for Inner<T> {
                 Ok(())
             }
             EXTENSION_TRANSACTION => {
-                unimplemented!("EXTENSION_TRANSACTION")
+                log::error!("EXTENSION_TRANSACTION is not supported.");
+                Err(StatusCode::InvalidOperation)
                 // CHECK(reply != nullptr);
                 // err = reply->writeStrongBinder(getExtension());
             }
+
+            STOP_RECORDING_TRANSACTION => {
+                log::error!("STOP_RECORDING_TRANSACTION is not supported.");
+                Err(StatusCode::InvalidOperation)
+            }
+
+            START_RECORDING_TRANSACTION => {
+                log::error!("START_RECORDING_TRANSACTION is not supported.");
+                Err(StatusCode::InvalidOperation)
+            }
+
             DEBUG_PID_TRANSACTION => {
-                unimplemented!("DEBUG_PID_TRANSACTION");
-                // CHECK(reply != nullptr);
-                // err = reply->writeInt32(getDebugPid());
+                reply.write::<i32>(&nix::unistd::getpid().as_raw())
             }
 
             _ => {
