@@ -30,7 +30,7 @@ impl ArrayInfo {
 
 #[derive(Clone)]
 pub struct TypeGenerator {
-    is_nullable: bool,
+    pub(crate) is_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
     pub identifier: String,
@@ -142,6 +142,16 @@ impl TypeGenerator {
         }
     }
 
+    pub fn is_variable_array(&self) -> bool {
+        if matches!(self.value_type, ValueType::Array(_)) {
+            let sub_type = self.array_types.first().expect("array_types is empty.");
+            if !sub_type.is_fixed() {
+                return true;
+            }
+        }
+        false
+    }
+
         // Check if this type can be initialized with Default::default().
     pub fn can_be_defaulted(value_type: &ValueType, is_struct: bool) -> bool {
         if is_struct {
@@ -163,7 +173,6 @@ impl TypeGenerator {
             }
         }
     }
-
 
     pub fn nullable(mut self) -> Self {
         if Self::is_primitive(&self.value_type) {

@@ -189,10 +189,10 @@ pub mod {{mod}} {
     impl {{ bp_name }} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> rsbinder::Result<rsbinder::Parcel> {
-            {%- if member.write_params|length > 0 %}
+            {%- if member.write_funcs|length > 0 %}
             let mut data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
-            {%- for arg in member.write_params %}
-            data.write({{ arg }})?;
+            {%- for func in member.write_funcs %}
+            {{ func }}
             {%- endfor %}
             {%- else %}
             let data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
@@ -252,7 +252,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
             transactions::{{ member.identifier }} => {
             {%- for decl in member.transaction_decls %}
-                let {{ decl }};
+                {{ decl }}
             {%- endfor %}
                 let _aidl_return = _service.{{ member.identifier }}({{ member.transaction_params }});
             {%- if not oneway and not member.oneway %}
@@ -299,7 +299,7 @@ struct FnMembers {
     identifier: String,
     args: String,
     return_type: String,
-    write_params: Vec<String>,
+    write_funcs: Vec<String>,
     func_call_params: String,
     transaction_decls: Vec<String>,
     transaction_write: Vec<String>,
@@ -312,7 +312,7 @@ struct FnMembers {
 fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
     let mut func_call_params = String::new();
     let mut args = "&self".to_string();
-    let mut write_params = Vec::new();
+    let mut write_funcs = Vec::new();
     let mut transaction_decls = Vec::new();
     let mut transaction_write = Vec::new();
     let mut transaction_params = String::new();
@@ -327,14 +327,28 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         func_call_params += &format!("{}, ", generator.identifier);
 
         if !matches!(arg.direction, Direction::Out) {
-            if type_decl_for_func.starts_with('&') {
-                write_params.push(generator.identifier.to_owned());
+            let param = if type_decl_for_func.starts_with('&') {
+                generator.identifier.to_owned()
             } else {
-                write_params.push(format!("&{}", generator.identifier));
+                format!("&{}", generator.identifier)
+            };
+            write_funcs.push(format!("data.write({})?;", param));
+        } else if generator.is_variable_array() {
+            if generator.is_nullable {
+                write_funcs.push(format!("data.write_slice_size({}.as_deref())?;", generator.identifier));
+            } else {
+                write_funcs.push(format!("data.write_slice_size(Some({}))?;", generator.identifier));
             }
         }
 
-        transaction_decls.push(generator.transaction_decl("_reader"));
+        transaction_decls.push(format!("let {};", generator.transaction_decl("_reader")));
+        if matches!(arg.direction, Direction::Out) && generator.is_variable_array() {
+            if generator.is_nullable {
+                transaction_decls.push(format!("_reader.resize_nullable_out_vec(&mut {})?;", generator.identifier));
+            } else {
+                transaction_decls.push(format!("_reader.resize_out_vec(&mut {})?;", generator.identifier));
+            }
+        }
 
         if matches!(arg.direction, Direction::Out | Direction::Inout) {
             transaction_write.push(generator.identifier.to_owned());
@@ -367,7 +381,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     Ok(FnMembers{
         // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
-        args, return_type, write_params, func_call_params,
+        args, return_type, write_funcs, func_call_params,
         transaction_decls, transaction_write, transaction_params, transaction_has_return,
         oneway: method.oneway,
         read_onto_params,

@@ -446,6 +446,50 @@ impl Parcel {
         Ok(Some(result))
     }
 
+    /// Read a vector size from the parcel and resize the given output vector to
+    /// be correctly sized for that amount of data.
+    ///
+    /// This method is used in AIDL-generated server side code for methods that
+    /// take a mutable slice reference parameter.
+    pub fn resize_out_vec<D: Default + Deserialize>(&mut self, out_vec: &mut Vec<D>) -> Result<()> {
+        let len: i32 = self.read()?;
+
+        if len < 0 {
+            return Err(StatusCode::UnexpectedNull);
+        }
+
+        // usize in Rust may be 16-bit, so i32 may not fit
+        let len = len.try_into().or(Err(StatusCode::BadValue))?;
+        out_vec.resize_with(len, Default::default);
+
+        Ok(())
+    }
+
+
+    /// Read a vector size from the parcel and either create a correctly sized
+    /// vector for that amount of data or set the output parameter to None if
+    /// the vector should be null.
+    ///
+    /// This method is used in AIDL-generated server side code for methods that
+    /// take a mutable slice reference parameter.
+    pub fn resize_nullable_out_vec<D: Default + Deserialize>(
+        &mut self,
+        out_vec: &mut Option<Vec<D>>,
+    ) -> Result<()> {
+        let len: i32 = self.read()?;
+
+        if len < 0 {
+            *out_vec = None;
+        } else {
+            // usize in Rust may be 16-bit, so i32 may not fit
+            let len = len.try_into().or(Err(StatusCode::BadValue))?;
+            let mut vec = Vec::with_capacity(len);
+            vec.resize_with(len, Default::default);
+            *out_vec = Some(vec);
+        }
+
+        Ok(())
+    }
 
     pub(crate) fn update_work_source_request_header_pos(&mut self) {
         if !self.request_header_present {
@@ -499,6 +543,19 @@ impl Parcel {
         }
 
         Ok(())
+    }
+
+    /// Writes the length of a slice to the parcel.
+    ///
+    /// This is used in AIDL-generated client side code to indicate the
+    /// allocated space for an output array parameter.
+    pub fn write_slice_size<T>(&mut self, slice: Option<&[T]>) -> Result<()> {
+        if let Some(slice) = slice {
+            let len: i32 = slice.len().try_into().or(Err(StatusCode::BadValue))?;
+            self.write(&len)
+        } else {
+            self.write(&-1i32)
+        }
     }
 
     pub(crate) fn write_aligned<T>(&mut self, val: &T) {
