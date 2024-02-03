@@ -78,7 +78,7 @@ $ cargo run --bin hello_client
 
 ## Todo
 - [x] Implement Binder crate.
-- [x] Implement AIDL code generator.
+- [x] Implement AIDL compiler.
 - [x] Implement ParcelFileDescriptor.
 - [x] Port Android test_service and test_client and pass the test cases.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux

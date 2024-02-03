@@ -543,7 +543,7 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
                 members.push((var.union_identifier(), generator.type_declaration(true), var.identifier(), generator.default_value()));
             }
         } else {
-            todo!();
+            unreachable!();
         }
     }
 

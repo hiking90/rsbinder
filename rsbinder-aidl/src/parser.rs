@@ -374,7 +374,7 @@ impl Declaration {
             Declaration::Interface(decl) => &decl.namespace,
             Declaration::Enum(decl) => &decl.namespace,
             Declaration::Union(decl) => &decl.namespace,
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 
@@ -384,7 +384,7 @@ impl Declaration {
             Declaration::Interface(decl) => decl.namespace = namespace,
             Declaration::Enum(decl) => decl.namespace = namespace,
             Declaration::Union(decl) => decl.namespace = namespace,
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 
@@ -394,7 +394,7 @@ impl Declaration {
             Declaration::Interface(decl) => &decl.name,
             Declaration::Enum(decl) => &decl.name,
             Declaration::Union(decl) => &decl.name,
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 
@@ -404,7 +404,7 @@ impl Declaration {
             Declaration::Interface(decl) => &mut decl.members,
             Declaration::Enum(decl) => &mut decl.members,
             Declaration::Union(decl) => &mut decl.members,
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 }
@@ -868,7 +868,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> NonArrayType {
 
                 non_array_type.generic = Some(Box::new(generic));
             }
-            _ => { todo!(); }
+            _ => { unreachable!(); }
         }
     }
 
