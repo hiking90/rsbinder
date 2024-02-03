@@ -1,6 +1,6 @@
 [package]
 name = "rsbinder-hub"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "This provides an API for the Binder service manager."
@@ -12,10 +12,10 @@ readme = "README.md"
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { version = "0.1.0", path = "../rsbinder" }
+rsbinder = { version = "0.1.1", path = "../rsbinder" }
 env_logger = "0"
 log = "0.4"
 tokio = { version = "1.35", features = ["full"] }
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.1.1", path = "../rsbinder-aidl" }

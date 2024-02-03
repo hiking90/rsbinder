@@ -1,6 +1,6 @@
 [package]
 name = "rsbinder-tests"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 
@@ -8,11 +8,11 @@ publish = false
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { version = "0.1.0", path = "../rsbinder" }
-rsbinder-hub = { version = "0.1.0", path = "../rsbinder-hub" }
+rsbinder = { version = "0.1.1", path = "../rsbinder" }
+rsbinder-hub = { version = "0.1.1", path = "../rsbinder-hub" }
 tokio = { version = "1", features = ["full"] }
 env_logger = "0"
 nix = "0"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.1.0", path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.1.1", path = "../rsbinder-aidl" }

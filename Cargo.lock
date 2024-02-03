@@ -829,7 +829,7 @@ checksum = "c08c74e62047bb2de4ff487b251e4a92e24f48745648451635cec7d591162d9f"
 
 [[package]]
 name = "rsbinder"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anstyle",
  "downcast-rs",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "convert_case",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "lazy_static",
