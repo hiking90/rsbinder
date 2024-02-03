@@ -10,3 +10,20 @@ The 6 failed ones require the development of new features.
 - [ ] test_renamed_interface_new_as_new
 - [ ] test_renamed_interface_old_as_new
 - [ ] test_renamed_interface_new_as_old
+
+## How to run test cases
+
+* Run **rsb_hub** in a terminal
+```
+$ cargo run --bin rsb_hub
+```
+
+* Run **test_service** in another terminal
+```
+$ cargo run --bin test_service
+```
+
+* Run test cases in another terminal
+```
+$ cargo test test_client::
+```
