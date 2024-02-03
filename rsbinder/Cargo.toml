@@ -16,3 +16,4 @@ log = "0.4"
 pretty_hex = { version = "0", package = "pretty-hex" }
 downcast-rs = "1.2"
 env_logger = "0.11"
+anstyle = "1.0"
