@@ -90,7 +90,7 @@ impl ProxyHandle {
         for arg in args {
             send.write(arg)?;
         }
-        self.submit_transact(DUMP_TRANSACTION, &send, FLAG_PRIVATE_LOCAL)?;
+        self.submit_transact(DUMP_TRANSACTION, &send, FLAG_CLEAR_BUF)?;
         Ok(())
     }
 }

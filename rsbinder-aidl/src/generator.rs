@@ -416,11 +416,14 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
 
     let nested = &gen_declations(&decl.members, indent + 1)?;
 
+    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
+
     let mut context = tera::Context::new();
 
     context.insert("mod", &decl.name);
     context.insert("name", &decl.name);
-    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
+    context.insert("namespace", &namespace);
     context.insert("const_members", &const_members);
     context.insert("fn_members", &fn_members);
     context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
@@ -479,13 +482,15 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
     }
 
     let nested = &gen_declations(&declations, indent+1)?;
+    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
     let mut context = tera::Context::new();
 
     context.insert("mod", &decl.name);
     context.insert("name", &decl.name);
     context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
-    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
+    context.insert("namespace", &namespace);
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
     context.insert("nested", &nested.trim());
@@ -547,12 +552,15 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
         }
     }
 
+    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
+
     let mut context = tera::Context::new();
 
     context.insert("mod", &decl.name);
     context.insert("union_name", &decl.name);
     context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
-    context.insert("namespace", &decl.namespace.to_string(Namespace::AIDL));
+    context.insert("namespace", &namespace);
     context.insert("members", &members);
     context.insert("const_members", &constant_members);
 

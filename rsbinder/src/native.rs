@@ -249,6 +249,7 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 
     fn try_from(ibinder: SIBinder) -> Result<Self> {
         if B::descriptor() != ibinder.descriptor() {
+            log::error!("Binder type mismatch: expected {}, got {}", B::descriptor(), ibinder.descriptor());
             return Err(StatusCode::BadType);
         }
 
@@ -259,6 +260,7 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 
             Ok(Self { inner, })
         } else {
+            log::error!("Downcast failed: expected {}, got {}", B::descriptor(), ibinder.descriptor());
             Err(StatusCode::BadValue)
         }
     }

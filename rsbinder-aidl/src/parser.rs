@@ -525,6 +525,20 @@ pub fn check_annotation_list(annotation_list: &Vec<Annotation>, query_type: Anno
     (false, "".to_owned())
 }
 
+pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
+    for annotation in annotation_list {
+        if annotation.annotation == "@Descriptor" {
+            for param in &annotation.parameter_list {
+                if param.identifier == "value" {
+                    return Some(param.const_expr.to_value_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> type_generator::TypeGenerator {
     // parse "@Backing(type="byte")"
     for annotation in annotation_list {

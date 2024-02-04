@@ -556,7 +556,7 @@ fn test_utf8_string() {
 
     // Java can't return a null list as a parameter
     let backend = service.getBackendType().expect("error getting backend type");
-    let null_output = if backend == BackendType::JAVA { Some(vec![]) } else { None };
+    let null_output: Option<Vec<Option<String>>> = if backend == BackendType::JAVA { Some(vec![]) } else { None };
     test_reverse_null_array!(service, ReverseUtf8CppStringList, null_output);
 
     test_reverse_null_array!(service, ReverseNullableUtf8CppString, None);
