@@ -8,17 +8,25 @@ use crate::const_expr::{ValueType, ConstExpr};
 struct ArrayInfo {
     sizes: Vec<i64>,
     value_type: ValueType,
+    is_list: bool,
 }
 
 impl ArrayInfo {
     fn new(value_type: &ValueType, array_types: &[parser::ArrayType]) -> Self {
         Self {
             sizes: array_types.iter()
-            .map(|t| t.const_expr.clone()
-                .map_or_else(|| 0,
-                    |v| v.calculate().to_i64())).collect(),
+                .map(|t| t.const_expr.clone()
+                    .map_or_else(|| 0,
+                        |v| v.calculate().to_i64())).collect(),
             value_type: value_type.clone(),
+            is_list: false,
         }
+    }
+
+    fn new_list(value_type: &ValueType, array_types: &[parser::ArrayType]) -> Self {
+        let mut this = Self::new(value_type, array_types);
+        this.is_list = true;
+        this
     }
 
     fn is_fixed(&self) -> bool {
@@ -54,7 +62,7 @@ impl TypeGenerator {
             "List" => {
                 match &aidl_type.generic {
                     Some(gen) => {
-                        array_types.push(ArrayInfo::new(&gen.to_value_type(), &Vec::new()));
+                        array_types.push(ArrayInfo::new_list(&gen.to_value_type(), &Vec::new()));
                         ValueType::Array(Vec::new())
                     }
                     None => panic!("Type \"List\" of AIDL must have Generic Type!"),
@@ -66,7 +74,7 @@ impl TypeGenerator {
             //     ("HashMap".to_owned(), ValueType::Map())
             // }
             "FileDescriptor" => {
-                panic!("FileDescriptor isn't supported by the aidl generator of rsbinder.");
+                panic!("FileDescriptor isn't supported by the AIDL compiler of rsbinder.");
             }
             "ParcelFileDescriptor" => ValueType::FileDescriptor,
             "ParcelableHolder" => ValueType::Holder,
@@ -145,7 +153,7 @@ impl TypeGenerator {
     pub fn is_variable_array(&self) -> bool {
         if matches!(self.value_type, ValueType::Array(_)) {
             let sub_type = self.array_types.first().expect("array_types is empty.");
-            if !sub_type.is_fixed() {
+            if !sub_type.is_fixed() && !sub_type.is_list {
                 return true;
             }
         }
