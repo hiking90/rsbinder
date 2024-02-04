@@ -18,6 +18,8 @@ package android.aidl.tests;
 
 import android.aidl.tests.BackendType;
 import android.aidl.tests.ByteEnum;
+import android.aidl.tests.CircularParcelable;
+import android.aidl.tests.ICircular;
 import android.aidl.tests.INamedCallback;
 import android.aidl.tests.INewName;
 import android.aidl.tests.IOldName;
@@ -31,7 +33,7 @@ import android.aidl.tests.extension.ExtendableParcelable;
 /**
  * interface comment
  */
-@SuppressWarnings(value={"inout-parameter", "mixed-oneway", "out-array"})
+@SuppressWarnings(value={"inout-parameter", "mixed-oneway", "out-array", "interface-name"})
 @SensitiveData
 @JavaDefault
 @JavaDelegator
@@ -66,6 +68,24 @@ interface ITestService {
 
     const String STRING_TEST_CONSTANT = "foo";
     const String STRING_TEST_CONSTANT2 = "bar";
+
+    const float FLOAT_TEST_CONSTANT = 1.0f;
+    const float FLOAT_TEST_CONSTANT2 = -1.0f;
+    const float FLOAT_TEST_CONSTANT3 = +1.0f;
+    const float FLOAT_TEST_CONSTANT4 = +2.2f;
+    const float FLOAT_TEST_CONSTANT5 = -2.2f;
+    const float FLOAT_TEST_CONSTANT6 = -0.0f;
+    const float FLOAT_TEST_CONSTANT7 = +0.0f;
+
+    const double DOUBLE_TEST_CONSTANT = 1.0;
+    const double DOUBLE_TEST_CONSTANT2 = -1.0;
+    const double DOUBLE_TEST_CONSTANT3 = +1.0;
+    const double DOUBLE_TEST_CONSTANT4 = +2.2;
+    const double DOUBLE_TEST_CONSTANT5 = -2.2;
+    const double DOUBLE_TEST_CONSTANT6 = -0.0;
+    const double DOUBLE_TEST_CONSTANT7 = +0.0;
+    const double DOUBLE_TEST_CONSTANT8 = 1.1f;
+    const double DOUBLE_TEST_CONSTANT9 = -1.1f;
 
     const @utf8InCpp String STRING_TEST_CONSTANT_UTF8 = "baz";
 
@@ -118,6 +138,8 @@ interface ITestService {
 
     // Test that clients can send and receive Binders.
     @PropagateAllowBlocking INamedCallback GetOtherTestService(String name);
+    // returns true if the same service is already registered with the same name
+    boolean SetOtherTestService(String name, INamedCallback service);
     boolean VerifyName(INamedCallback service, String name);
     INamedCallback[] GetInterfaceArray(in String[] names);
     boolean VerifyNamesWithInterfaceArray(in INamedCallback[] services, in String[] names);
@@ -291,5 +313,19 @@ interface ITestService {
         @nullable Empty[] nullable_parcel_array;
         List<Empty> parcel_list;
         @nullable List<Empty> nullable_parcel_list;
+
+        // interface without I-
+        interface Foo {}
+
+        parcelable HasDeprecated {
+            /** @deprecated field */
+            int deprecated;
+        }
+        union UsingHasDeprecated {
+            int n;
+            HasDeprecated m;
+        }
     }
+
+    ICircular GetCircular(out CircularParcelable cp);
 }

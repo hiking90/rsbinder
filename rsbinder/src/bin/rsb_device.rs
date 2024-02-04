@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use std::process::Command;
 use rsbinder::*;
@@ -48,22 +48,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Check if binder control path is a directory.
     if !binderfs_path.is_dir() {
-        log_err(&format!("{} is not a directory", DEFAULT_BINDERFS_PATH));
+        log_err(&format!("{} is not a directory", binderfs_path.display()));
     }
 
     // Mount binderfs if it is not mounted.
     if !is_mounted() {
-        // println!("Mounting binderfs on {}", DEFAULT_BINDERFS_PATH);
         Command::new("mount")
             .arg("-t")
             .arg("binder")
             .arg("binder")
-            .arg(DEFAULT_BINDERFS_PATH)
+            .arg(binderfs_path)
             .status()
-            .map(|_| log_ok(&format!("binder mounted successfully on {}", DEFAULT_BINDERFS_PATH)))
+            .map(|_| log_ok(&format!("binder mounted successfully on {}", binderfs_path.display())))
             .map_err(|err| log_err(&format!("Failed to mount binderfs\n{}", err))).ok();
     } else {
-        log_ok(&format!("binderfs is already mounted on {}", DEFAULT_BINDERFS_PATH));
+        log_ok(&format!("binderfs is already mounted on {}", binderfs_path.display()));
     }
 
     // Add binder device.
@@ -71,14 +70,27 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     binderfs::add_device(control_path, device_name)
         .map(|(major, minor)| {
             log_ok(&format!("Allocated new binder device with major {major}, minor {minor}, and name [{}]", device_name));
+        })
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                log_ok(&format!("Device {} already exists", device_name));
+            } else {
+                log_err(&format!("Failed to allocate new binder device\n{}", err));
+            }
+        }).ok();
 
-            let device_path = format!("{}/{}", DEFAULT_BINDERFS_PATH, device_name);
-            let mut perms = std::fs::metadata(device_path.as_str()).expect("IO error").permissions();
-            perms.set_mode(0o666);
-            std::fs::set_permissions(device_path.as_str(), perms)
-                .map(|_| log_ok(&format!("The permission of device path({}) has been changed to 0666", device_path)))
-                .map_err(|err| log_err(&format!("Failed to change the permission of device path({}) to 0666\n{}", device_path, err))).ok();
-        })?;
+    let device_path = binderfs_path.join(device_name);
+    let mut perms = std::fs::metadata(&device_path).expect("IO error").permissions();
+    perms.set_mode(0o666);
+    std::fs::set_permissions(&device_path, perms)
+        .map(|_| log_ok(&format!("The permission of device path({}) has been changed to 0666",
+            device_path.display())))
+        .map_err(|err| log_err(&format!("Failed to change the permission of device path({}) to 0666\n{}",
+            device_path.display(), err))).ok();
+
+    symlink(binderfs_path.join(device_name), Path::new("/dev").join(device_name))
+        .map(|_| log_ok(&format!("Created a symlink from {} to /dev/{}", binderfs_path.join(device_name).display(), device_name)))
+        .map_err(|err| log_err(&format!("Failed to create a symlink from {} to /dev/{}\n{}", binderfs_path.join(device_name).display(), device_name, err))).ok();
 
     Ok(())
 }

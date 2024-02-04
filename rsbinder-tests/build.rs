@@ -31,6 +31,8 @@ fn main() {
         .source(PathBuf::from("aidl/android/aidl/tests/RecursiveList.aidl"))
         .source(PathBuf::from("aidl/android/aidl/tests/StructuredParcelable.aidl"))
         .source(PathBuf::from("aidl/android/aidl/tests/Union.aidl"))
+        .source(PathBuf::from("aidl/android/aidl/tests/ICircular.aidl"))
+        .source(PathBuf::from("aidl/android/aidl/tests/CircularParcelable.aidl"))
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/BazUnion.aidl"))
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/Foo.aidl"))
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/IFooInterface.aidl"))

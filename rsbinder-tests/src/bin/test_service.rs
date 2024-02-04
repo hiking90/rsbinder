@@ -21,7 +21,8 @@ pub use android::aidl::tests::ITestService::{
 };
 pub use android::aidl::tests::{
     extension::ExtendableParcelable::ExtendableParcelable, extension::MyExt::MyExt,
-    BackendType::BackendType, ByteEnum::ByteEnum, ConstantExpressionEnum::ConstantExpressionEnum,
+    BackendType::BackendType, ByteEnum::ByteEnum, CircularParcelable::CircularParcelable,
+    ConstantExpressionEnum::ConstantExpressionEnum, ICircular,
     INamedCallback, INewName, IOldName, IntEnum::IntEnum, LongEnum::LongEnum,
     RecursiveList::RecursiveList, StructuredParcelable, Union,
 };
@@ -62,6 +63,19 @@ impl rsbinder::Interface for NewName {}
 impl INewName::INewName for NewName {
     fn RealName(&self) -> std::result::Result<String, Status> {
         Ok("NewName".into())
+    }
+}
+
+#[derive(Debug, Default)]
+struct Circular;
+
+impl Interface for Circular {}
+
+impl ICircular::ICircular for Circular {
+    fn GetTestService(
+        &self,
+    ) -> std::result::Result<Option<rsbinder::Strong<dyn ITestService::ITestService>>, Status> {
+        Ok(None)
     }
 }
 
@@ -168,6 +182,21 @@ impl ITestService::ITestService for TestService {
             INamedCallback::BnNamedCallback::new_binder(named_callback)
         });
         Ok(other_service.to_owned())
+    }
+
+    fn SetOtherTestService(
+        &self,
+        name: &str,
+        service: &rsbinder::Strong<dyn INamedCallback::INamedCallback>,
+    ) -> std::result::Result<bool, rsbinder::Status> {
+        let mut service_map = self.service_map.lock().unwrap();
+        if let Some(existing_service) = service_map.get(name) {
+            if existing_service == service {
+                return Ok(true);
+            }
+        }
+        service_map.insert(name.into(), service.clone());
+        Ok(false)
     }
 
     fn VerifyName(
@@ -460,6 +489,13 @@ impl ITestService::ITestService for TestService {
     fn getBackendType(&self) -> std::result::Result<BackendType, rsbinder::Status> {
         Ok(BackendType::RUST)
     }
+
+    fn GetCircular(
+        &self,
+        _: &mut CircularParcelable,
+    ) -> std::result::Result<rsbinder::Strong<dyn ICircular::ICircular>, rsbinder::Status> {
+        Ok(ICircular::BnCircular::new_binder(Circular))
+    }
 }
 
 
@@ -608,7 +644,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor();
     let nested_service =
         INestedService::BnNestedService::new_binder(NestedService);
-        rsbinder_hub::add_service(nested_service_name, nested_service.as_binder())
+    rsbinder_hub::add_service(nested_service_name, nested_service.as_binder())
         .expect("Could not register service");
 
     let fixed_size_array_service_name =

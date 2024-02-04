@@ -468,7 +468,7 @@ impl SerializeOption for SIBinder {
 
             None => {
                 parcel.write::<flat_binder_object>(&flat_binder_object::default())?;
-                parcel.write::<i32>(&Stability::System.into())?;
+                parcel.write::<i32>(&Stability::Local.into())?;
 
                 Ok(())
             }

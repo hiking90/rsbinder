@@ -230,7 +230,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_PRIVATE_VENDOR);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_CLEAR_BUF);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
