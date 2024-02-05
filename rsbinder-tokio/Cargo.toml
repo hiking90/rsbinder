@@ -1,9 +1,9 @@
 [package]
-name = "rsbinder-hub"
+name = "rsbinder-tokio"
 version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
-description = "This provides an API for the Binder service manager."
+description = "This crate supports the operation of rsbinder on the tokio runtime."
 homepage = "https://github.com/hiking90/rsbinder"
 repository = "https://github.com/hiking90/rsbinder/rsbinder-hub"
 readme = "README.md"
@@ -14,12 +14,9 @@ rust-version = "1.75"
 [dependencies]
 lazy_static = "1"
 rsbinder = { version = "0.1.2", path = "../rsbinder" }
+rsbinder-hub = { version = "0.1.2", path = "../rsbinder-hub" }
 log = "0.4"
-async-trait = "0.1"
-# tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["full"] }
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.1.2", path = "../rsbinder-aidl" }
-
-[dev-dependencies]
-env_logger = "0"
+rsbinder-aidl = { version = "0.1", path = "../rsbinder-aidl" }

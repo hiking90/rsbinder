@@ -229,12 +229,13 @@ impl ProcessState {
         self.driver.clone()
     }
 
-    pub fn start_thread_pool(&self) {
-        if self.thread_pool_started.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            if self.max_threads == 0 {
+    pub fn start_thread_pool() {
+        let this = Self::as_self();
+        if this.thread_pool_started.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if this.max_threads == 0 {
                 log::warn!("Extra binder thread started, but 0 threads requested.\nDo not use *start_thread_pool when zero threads are requested.");
             }
-            self.spawn_pooled_thread(true);
+            this.spawn_pooled_thread(true);
         }
     }
 

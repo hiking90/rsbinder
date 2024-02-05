@@ -13,9 +13,9 @@ const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
     #![allow(non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
-        {{enum_name}} : [{{enum_type}}; {{enum_len}}] {
+        r#{{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
-            {{ member.0 }} = {{ member.1 }},
+            r#{{ member.0 }} = {{ member.1 }},
     {%- endfor %}
         }
     }
@@ -29,27 +29,27 @@ pub mod {{mod}} {
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
     {%- endif %}
-    pub enum {{union_name}} {
+    pub enum r#{{union_name}} {
     {%- for member in members %}
-        {{ member.0 }}({{ member.1 }}),
+        r#{{ member.0 }}({{ member.1 }}),
     {%- endfor %}
     }
     {%- for member in const_members %}
-    pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
+    pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
-    impl Default for {{union_name}} {
+    impl Default for r#{{union_name}} {
         fn default() -> Self {
     {%- if members|length > 0 %}
             Self::{{members[0][0]}}({{members[0][3]}})
     {%- endif %}
         }
     }
-    impl rsbinder::Parcelable for {{union_name}} {
+    impl rsbinder::Parcelable for r#{{union_name}} {
         fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             match self {
     {%- set counter = 0 %}
     {%- for member in members %}
-                Self::{{member.0}}(v) => {
+                Self::r#{{member.0}}(v) => {
                     parcel.write(&{{counter}}i32)?;
                     parcel.write(v)
                 }
@@ -64,7 +64,7 @@ pub mod {{mod}} {
     {%- for member in members %}
                 {{counter}} => {
                     let value: {{member.1}} = parcel.read()?;
-                    *self = Self::{{member.0}}(value);
+                    *self = Self::r#{{member.0}}(value);
                     Ok(())
                 }
     {%- set_global counter = counter + 1 %}
@@ -73,16 +73,16 @@ pub mod {{mod}} {
             }
         }
     }
-    rsbinder::impl_serialize_for_parcelable!({{union_name}});
-    rsbinder::impl_deserialize_for_parcelable!({{union_name}});
-    impl rsbinder::ParcelableMetadata for {{union_name}} {
+    rsbinder::impl_serialize_for_parcelable!(r#{{union_name}});
+    rsbinder::impl_deserialize_for_parcelable!(r#{{union_name}});
+    impl rsbinder::ParcelableMetadata for r#{{union_name}} {
         fn descriptor() -> &'static str { "{{ namespace }}" }
     }
     rsbinder::declare_binder_enum! {
         Tag : [i32; {{ members|length }}] {
     {%- set counter = 0 %}
     {%- for member in members %}
-            {{ member.2 }} = {{ counter }},
+            r#{{ member.2 }} = {{ counter }},
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
         }
@@ -94,7 +94,7 @@ const PARCELABLE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
-    pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
+    pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     #[derive(Debug)]
     {%- if derive|length > 0 %}
@@ -102,14 +102,14 @@ pub mod {{mod}} {
     {%- endif %}
     pub struct {{name}} {
     {%- for member in members %}
-        pub {{ member.0 }}: {{ member.1 }},
+        pub r#{{ member.0 }}: {{ member.1 }},
     {%- endfor %}
     }
     impl Default for {{ name }} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
-                {{ member.0 }}: {{ member.2 }},
+                r#{{ member.0 }}: {{ member.2 }},
             {%- endfor %}
             }
         }
@@ -118,7 +118,7 @@ pub mod {{mod}} {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
-                _sub_parcel.write(&self.{{ member.0 }})?;
+                _sub_parcel.write(&self.r#{{ member.0 }})?;
                 {%- endfor %}
                 Ok(())
             })
@@ -126,7 +126,7 @@ pub mod {{mod}} {
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
-                self.{{ member.0 }} = _sub_parcel.read()?;
+                self.r#{{ member.0 }} = _sub_parcel.read()?;
                 {%- endfor %}
                 Ok(())
             })
@@ -147,12 +147,12 @@ const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
-    pub const {{ member.0 }}: {{ member.1 }} = {{ member.2 }};
+    pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     pub trait {{name}}: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
+        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
         {%- endfor %}
         fn getDefaultImpl() -> {{ name }}DefaultRef where Self: Sized {
             DEFAULT_IMPL.lock().unwrap().clone()
@@ -161,9 +161,65 @@ pub mod {{mod}} {
             std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
         }
     }
+    pub trait {{name}}Async<P>: rsbinder::Interface + Send {
+        fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>>;
+        {%- endfor %}
+    }
+    #[::async_trait::async_trait]
+    pub trait {{name}}AsyncService: rsbinder::Interface + Send {
+        fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
+        {%- for member in fn_members %}
+        async fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
+        {%- endfor %}
+    }
+    impl {{bn_name}}
+    {
+        pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn {{name}}>
+        where
+            T: {{name}}AsyncService + Sync + Send + 'static,
+            R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+        {
+            struct Wrapper<T, R> {
+                _inner: T,
+                _rt: R,
+            }
+            impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
+                fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
+                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
+            }
+            impl<T, R> {{bn_name}}Adapter for Wrapper<T, R>
+            where
+                T: {{name}}AsyncService + Sync + Send + 'static,
+                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+            {
+                fn as_sync(&self) -> &dyn {{name}} {
+                    self
+                }
+                fn as_async(&self) -> &dyn {{name}}AsyncService {
+                    &self._inner
+                }
+            }
+            impl<T, R> {{name}} for Wrapper<T, R>
+            where
+                T: {{name}}AsyncService + Sync + Send + 'static,
+                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+            {
+                {%- for member in fn_members %}
+                fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+                    self._rt.block_on(self._inner.r#{{ member.identifier }}({{ member.func_call_params }}))
+                }
+                {%- endfor %}
+            }
+            let wrapped = Wrapper { _inner: inner, _rt: rt };
+            let binder = rsbinder::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), rsbinder::Stability::default());
+            rsbinder::Strong::new(Box::new(binder))
+        }
+    }
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
         {%- endfor %}
@@ -171,7 +227,7 @@ pub mod {{mod}} {
     pub(crate) mod transactions {
         {%- set counter = 0 %}
         {%- for member in fn_members %}
-        pub(crate) const {{ member.identifier }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
+        pub(crate) const r#{{ member.identifier }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
         {%- set_global counter = counter + 1 %}
         {%- endfor %}
     }
@@ -182,8 +238,13 @@ pub mod {{mod}} {
     }
     rsbinder::declare_binder_interface! {
         {{ name }}["{{ namespace }}"] {
-            native: {{ bn_name }}(on_transact),
+            native: {
+                {{ bn_name }}(on_transact),
+                adapter: {{ bn_name }}Adapter,
+                async: {{ name }}AsyncService,
+            },
             proxy: {{ bp_name }},
+            r#async: {{ name }}Async,
         }
     }
     impl {{ bp_name }} {
@@ -205,7 +266,7 @@ pub mod {{mod}} {
             {%- else %}
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as {{name}}>::getDefaultImpl() {
-                  return _aidl_default_impl.{{ member.identifier }}({{ member.func_call_params }});
+                  return _aidl_default_impl.r#{{ member.identifier }}({{ member.func_call_params }});
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
@@ -228,9 +289,9 @@ pub mod {{mod}} {
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_CLEAR_BUF);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -239,10 +300,39 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
+    impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
+            let _aidl_data = match self.build_parcel_{{ member.identifier }}({{ member.func_call_params }}) {
+                Ok(_aidl_data) => _aidl_data,
+                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+            };
+            let binder = self.binder.clone();
+            P::spawn(
+                move || binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
+                move |_aidl_reply| async move {
+                    {%- if member.func_call_params|length > 0 %}
+                    self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
+                    {%- else %}
+                    self.read_response_{{ member.identifier }}(_aidl_reply)
+                    {%- endif %}
+                }
+            )
+        }
+        {%- endfor %}
+    }
     impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
         {%- for member in fn_members %}
-        fn {{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
-            self.0.{{ member.identifier }}({{ member.func_call_params }})
+        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+            self.0.as_sync().r#{{ member.identifier }}({{ member.func_call_params }})
+        }
+        {%- endfor %}
+    }
+    impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for rsbinder::Binder<{{bn_name}}>
+    {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
+            self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
     }
@@ -250,11 +340,11 @@ pub mod {{mod}} {
         _service: &dyn {{ name }}, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
         match _code {
         {%- for member in fn_members %}
-            transactions::{{ member.identifier }} => {
+            transactions::r#{{ member.identifier }} => {
             {%- for decl in member.transaction_decls %}
                 {{ decl }}
             {%- endfor %}
-                let _aidl_return = _service.{{ member.identifier }}({{ member.transaction_params }});
+                let _aidl_return = _service.r#{{ member.identifier }}({{ member.transaction_params }});
             {%- if not oneway and not member.oneway %}
                 match &_aidl_return {
                     Ok(_aidl_return) => {
@@ -298,6 +388,7 @@ lazy_static! {
 struct FnMembers {
     identifier: String,
     args: String,
+    args_async: String,
     return_type: String,
     write_funcs: Vec<String>,
     func_call_params: String,
@@ -312,6 +403,7 @@ struct FnMembers {
 fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
     let mut func_call_params = String::new();
     let mut args = "&self".to_string();
+    let mut args_async = "&'a self".to_string();
     let mut write_funcs = Vec::new();
     let mut transaction_decls = Vec::new();
     let mut transaction_write = Vec::new();
@@ -323,7 +415,16 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         let generator = arg.to_generator();
 
         let type_decl_for_func = generator.type_decl_for_func();
-        args += &format!(", {}: {}", generator.identifier, type_decl_for_func);
+
+        let arg_str = format!(", {}: {}", generator.identifier, type_decl_for_func);
+
+        args += &arg_str;
+        args_async += &arg_str.replace("&", "&'a ");
+        // args_async += &if type_decl_for_func.starts_with('&') {
+        //     format!(", {}: &'a {}", generator.identifier, &type_decl_for_func[1..])
+        // } else {
+        //     format!(", {}: {}", generator.identifier, type_decl_for_func)
+        // };
         func_call_params += &format!("{}, ", generator.identifier);
 
         if !matches!(arg.direction, Direction::Out) {
@@ -381,7 +482,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     Ok(FnMembers{
         // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
-        args, return_type, write_funcs, func_call_params,
+        args, args_async, return_type, write_funcs, func_call_params,
         transaction_decls, transaction_write, transaction_params, transaction_has_return,
         oneway: method.oneway,
         read_onto_params,

@@ -48,8 +48,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     hub.registerForNotifications(SERVICE_NAME, &service_callback)?;
 
     // Create a Hello proxy from binder service manager.
-    let hello = BpHello::from_binder(rsbinder_hub::get_service(SERVICE_NAME)
-        .unwrap_or_else(|| panic!("Can't find {SERVICE_NAME}"))).unwrap();
+    let hello: rsbinder::Strong<dyn IHello> = rsbinder_hub::get_interface(SERVICE_NAME)
+        .expect(&format!("Can't find {SERVICE_NAME}"));
 
     hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;
 

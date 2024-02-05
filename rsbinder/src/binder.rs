@@ -224,6 +224,36 @@ pub trait Transactable: Send + Sync {
     fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
 }
 
+
+/// Implemented by sync interfaces to specify what the associated async interface is.
+/// Generic to handle the fact that async interfaces are generic over a thread pool.
+///
+/// The binder in any object implementing this trait should be compatible with the
+/// `Target` associated type, and using `FromIBinder` to convert it to the target
+/// should not fail.
+pub trait ToAsyncInterface<P>
+where
+    Self: Interface,
+    Self::Target: FromIBinder,
+{
+    /// The async interface associated with this sync interface.
+    type Target: ?Sized;
+}
+
+/// Implemented by async interfaces to specify what the associated sync interface is.
+///
+/// The binder in any object implementing this trait should be compatible with the
+/// `Target` associated type, and using `FromIBinder` to convert it to the target
+/// should not fail.
+pub trait ToSyncInterface
+where
+    Self: Interface,
+    Self::Target: FromIBinder,
+{
+    /// The sync interface associated with this async interface.
+    type Target: ?Sized;
+}
+
 /// Interface stability promise
 ///
 /// An interface can promise to be a stable vendor interface ([`Vintf`]), or
@@ -446,6 +476,26 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     /// Construct a new weak reference to this binder
     pub fn downgrade(this: &Strong<I>) -> Weak<I> {
         Weak::new(this)
+    }
+
+    /// Convert this synchronous binder handle into an asynchronous one.
+    pub fn into_async<P>(self) -> Strong<<I as ToAsyncInterface<P>>::Target>
+    where
+        I: ToAsyncInterface<P>,
+    {
+        // By implementing the ToAsyncInterface trait, it is guaranteed that the binder
+        // object is also valid for the target type.
+        FromIBinder::try_from(self.0.as_binder()).unwrap()
+    }
+
+    /// Convert this asynchronous binder handle into a synchronous one.
+    pub fn into_sync(self) -> Strong<<I as ToSyncInterface>::Target>
+    where
+        I: ToSyncInterface,
+    {
+        // By implementing the ToSyncInterface trait, it is guaranteed that the binder
+        // object is also valid for the target type.
+        FromIBinder::try_from(self.0.as_binder()).unwrap()
     }
 }
 

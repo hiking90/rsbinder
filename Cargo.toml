@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "rsbinder",
     "rsbinder-aidl",
+    "rsbinder-tokio",
     "rsbinder-hub",
     "rsbinder-tools",
     "rsbinder-tests",
