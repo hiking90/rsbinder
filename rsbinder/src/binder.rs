@@ -24,7 +24,6 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::borrow::Borrow;
-use std::os::fd::OwnedFd;
 
 use crate::{
     error::*,
@@ -83,18 +82,6 @@ pub const LIKE_TRANSACTION: u32 = b_pack_chars('_', 'L', 'I', 'K');
 
 pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
 
-/// To add the capability of acquiring an ownedfd in std::io::write,
-/// a new write has been defined.
-pub trait WriteExt : std::io::Write {
-    fn as_owned_fd(&self) -> std::io::Result<OwnedFd>;
-}
-
-impl WriteExt for std::fs::File {
-    fn as_owned_fd(&self) -> std::io::Result<OwnedFd> {
-        self.try_clone().map(|file| file.into())
-    }
-}
-
 /// Super-trait for Binder interfaces.
 ///
 /// This trait allows conversion of a Binder interface trait object into an
@@ -112,7 +99,7 @@ pub trait Interface: Send + Sync {
     ///
     /// This handler is a no-op by default and should be implemented for each
     /// Binder service struct that wishes to respond to dump transactions.
-    fn dump(&self, _writer: &mut dyn WriteExt, _args: &[String]) -> Result<()> {
+    fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
         Ok(())
     }
 }
@@ -229,7 +216,7 @@ pub trait Remotable: Send + Sync {
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
-    fn on_dump(&self, writer: &mut dyn WriteExt, args: &[String]) -> Result<()>;
+    fn on_dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()>;
 }
 
 /// A transactable object that can be used to process Binder commands.

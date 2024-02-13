@@ -1223,13 +1223,12 @@ fn test_ping() {
 #[test]
 fn test_dump() {
     let test_service = get_test_service();
-    let (mut read_file, mut write_file) = build_pipe();
+    let (mut read_file, write_file) = build_pipe();
 
     let args = vec!["dump".to_owned(), "ITestService".to_owned()];
     let expected = args.join("\n") + "\n";
 
-    test_service.dump(&mut write_file, &args).unwrap();
-    std::mem::drop(write_file);
+    test_service.as_binder().as_proxy().unwrap().dump(write_file, &args).unwrap();
     let mut buf = String::new();
     read_file.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, expected);

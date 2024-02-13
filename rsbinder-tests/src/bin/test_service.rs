@@ -86,7 +86,7 @@ struct TestService {
 }
 
 impl Interface for TestService {
-    fn dump(&self, writer: &mut dyn rsbinder::WriteExt, args: &[String]) -> Result<()> {
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
         for arg in args {
             writeln!(writer, "{}", arg).unwrap();
         }

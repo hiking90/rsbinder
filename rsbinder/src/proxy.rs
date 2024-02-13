@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +14,7 @@ use crate::{
     error::*,
     thread_state,
     ref_counter::RefCounter,
-    file_descriptor::ParcelFileDescriptor,
+    binder_object::*,
 };
 
 pub struct ProxyHandle {
@@ -78,14 +79,11 @@ impl ProxyHandle {
         Ok(())
     }
 
-    pub fn dump(&self, writer: &mut dyn WriteExt, args: &[String]) -> Result<()> {
-        let fd = writer.as_owned_fd().map_err(|err| {
-            log::error!("Failed to as_owned_fd() from writer. {:?}", err);
-            StatusCode::BadValue
-        })?;
-        let file_descriptor = ParcelFileDescriptor::new(fd);
+    pub fn dump<F: AsRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
         let mut send = Parcel::new();
-        send.write(&file_descriptor)?;
+        let obj = flat_binder_object::new_with_fd(fd.as_raw_fd(), true);
+        send.write_object(&obj, true)?;
+
         send.write::<i32>(&(args.len() as i32))?;
         for arg in args {
             send.write(arg)?;

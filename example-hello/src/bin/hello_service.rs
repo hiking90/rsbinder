@@ -9,7 +9,12 @@ use example_hello::*;
 
 struct IHelloService;
 
-impl Interface for IHelloService {}
+impl Interface for IHelloService {
+    fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
+        writeln!(writer, "Dump IHelloService")?;
+        Ok(())
+    }
+}
 
 impl IHello for IHelloService {
     fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {

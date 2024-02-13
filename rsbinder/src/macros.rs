@@ -117,10 +117,6 @@ macro_rules! declare_binder_interface {
             fn as_binder(&self) -> $crate::SIBinder {
                 self.binder.clone()
             }
-            fn dump(&self, writer: &mut dyn $crate::WriteExt, args: &[String]) -> $crate::Result<()> {
-                let proxy = self.binder.as_any().downcast_ref::<$crate::ProxyHandle>().ok_or($crate::StatusCode::BadType)?;
-                proxy.dump(writer, args)
-            }
         }
 
         impl $crate::Proxy for $proxy
@@ -162,7 +158,7 @@ macro_rules! declare_binder_interface {
                 $on_transact(&*self.0, code, reader, reply, Self::descriptor())
             }
 
-            fn on_dump(&self, _writer: &mut dyn $crate::WriteExt, _args: &[String]) -> $crate::Result<()> {
+            fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
                 self.0.dump(_writer, _args)
             }
         }

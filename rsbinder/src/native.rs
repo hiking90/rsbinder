@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-use std::{sync::Arc, os::fd::AsRawFd};
+use std::sync::Arc;
 use std::ops::{Deref, DerefMut};
 use std::any::Any;
 use std::convert::TryFrom;
@@ -31,7 +31,6 @@ use crate::{
     error::*,
     thread_state,
     ref_counter::RefCounter,
-    file_descriptor::ParcelFileDescriptor,
 };
 
 struct Inner<T: Remotable + Send + Sync> {
@@ -49,7 +48,13 @@ impl<T: Remotable> Inner<T> {
                 reply.write(T::descriptor())
             }
             DUMP_TRANSACTION => {
-                let fd = _reader.read::<ParcelFileDescriptor>()?;
+                let obj = _reader.read_object(true)?;
+                if obj.header_type() != crate::sys::BINDER_TYPE_FD {
+                    return Err(StatusCode::BadType);
+                }
+
+                let fd = obj.handle();
+
                 let argc = _reader.read::<i32>()?;
                 let mut argv = Vec::new();
                 for _ in 0..argc {
@@ -57,7 +62,7 @@ impl<T: Remotable> Inner<T> {
                 }
 
                 let mut file = unsafe {
-                    ManuallyDrop::new(File::from_raw_fd(fd.as_raw_fd()))
+                    ManuallyDrop::new(File::from_raw_fd(fd as _))
                 };
 
                 self.remotable.on_dump(file.deref_mut(), argv.as_slice())

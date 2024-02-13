@@ -132,6 +132,12 @@ impl From<std::array::TryFromSliceError> for StatusCode {
     }
 }
 
+impl From<std::io::Error> for StatusCode {
+    fn from(_: std::io::Error) -> Self {
+        StatusCode::BadFd
+    }
+}
+
 impl From<nix::errno::Errno> for StatusCode {
     fn from(errno: nix::errno::Errno) -> Self {
         match errno {
