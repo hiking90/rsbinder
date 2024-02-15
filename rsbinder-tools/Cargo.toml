@@ -1,8 +1,13 @@
 [package]
-name = "rsbinder-tests"
+name = "rsbinder-tools"
 version = "0.1.2"
 edition = "2021"
-publish = false
+license = "Apache-2.0"
+description = "This provides a few CLI binder tools for Linux."
+homepage = "https://github.com/hiking90/rsbinder"
+repository = "https://github.com/hiking90/rsbinder/rsbinder-tools"
+readme = "README.md"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,8 +15,10 @@ publish = false
 lazy_static = "1"
 rsbinder = { version = "0.1.2", path = "../rsbinder" }
 rsbinder-hub = { version = "0.1.2", path = "../rsbinder-hub" }
+log = "0.4"
 env_logger = "0"
 nix = "0"
+anstyle = "1.0"
 
 [build-dependencies]
 rsbinder-aidl = { version = "0.1.2", path = "../rsbinder-aidl" }

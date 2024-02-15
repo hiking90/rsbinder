@@ -241,8 +241,7 @@ impl IServiceManager for ServiceManager {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     ProcessState::init(DEFAULT_BINDER_PATH, 1);

@@ -22,8 +22,7 @@ impl IHello for IHelloService {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // Initialize ProcessState with binder path and max threads.

@@ -78,6 +78,7 @@ pub mod ITestService {
         fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
             data.write(_arg_input)?;
+            data.write_slice_size(Some(_arg_repeated))?;
             Ok(data)
         }
         fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<Vec<bool>> {
@@ -131,17 +132,17 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
             let _aidl_data = self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated)?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::ReverseBoolean, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
         }
         fn RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
             let _aidl_data = self.build_parcel_RepeatNullableIntArray(_arg_input)?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
         }
         fn FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
             let _aidl_data = self.build_parcel_FillOutStructuredParcelable(_arg_parcel)?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
         }
     }
@@ -162,6 +163,7 @@ pub mod ITestService {
             transactions::ReverseBoolean => {
                 let _arg_input: Vec<bool> = _reader.read()?;
                 let mut _arg_repeated: Vec<bool> = Default::default();
+                _reader.resize_out_vec(&mut _arg_repeated)?;
                 let _aidl_return = _service.ReverseBoolean(&_arg_input, &mut _arg_repeated);
                 match &_aidl_return {
                     Ok(_aidl_return) => {
@@ -337,7 +339,7 @@ pub mod FixedSizeArrayExample {
         impl IRepeatFixedSizeArray for BpRepeatFixedSizeArray {
             fn Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 let _aidl_data = self.build_parcel_Repeat2dParcelables(_arg_input, _arg_repeated)?;
-                let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+                let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
                 self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
             }
         }
@@ -577,8 +579,10 @@ pub mod ArrayOfInterfaces {
                 data.write(_arg_iface)?;
                 data.write(&_arg_nullable_iface)?;
                 data.write(_arg_iface_array_in)?;
+                data.write_slice_size(Some(_arg_iface_array_out))?;
                 data.write(_arg_iface_array_inout)?;
                 data.write(&_arg_nullable_iface_array_in)?;
+                data.write_slice_size(_arg_nullable_iface_array_out.as_deref())?;
                 data.write(_arg_nullable_iface_array_inout)?;
                 Ok(data)
             }
@@ -602,7 +606,7 @@ pub mod ArrayOfInterfaces {
         impl IMyInterface for BpMyInterface {
             fn methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
                 let _aidl_data = self.build_parcel_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)?;
-                let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::methodWithInterfaces, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+                let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::methodWithInterfaces, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
                 self.read_response_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout, _aidl_reply)
             }
         }
@@ -619,9 +623,11 @@ pub mod ArrayOfInterfaces {
                     let _arg_nullable_iface: Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let _arg_iface_array_in: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let mut _arg_iface_array_out: Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>> = Default::default();
+                    _reader.resize_out_vec(&mut _arg_iface_array_out)?;
                     let mut _arg_iface_array_inout: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let _arg_nullable_iface_array_in: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
                     let mut _arg_nullable_iface_array_out: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = Default::default();
+                    _reader.resize_nullable_out_vec(&mut _arg_nullable_iface_array_out)?;
                     let mut _arg_nullable_iface_array_inout: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
                     let _aidl_return = _service.methodWithInterfaces(&_arg_iface, _arg_nullable_iface.as_ref(), &_arg_iface_array_in, &mut _arg_iface_array_out, &mut _arg_iface_array_inout, _arg_nullable_iface_array_in.as_deref(), &mut _arg_nullable_iface_array_out, &mut _arg_nullable_iface_array_inout);
                     match &_aidl_return {
@@ -1137,7 +1143,7 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
             let _aidl_data = self.build_parcel_RepeatByteEnum(_arg_token)?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::RepeatByteEnum, &_aidl_data, rsbinder::FLAG_PRIVATE_VENDOR);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }

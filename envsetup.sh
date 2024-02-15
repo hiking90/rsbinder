@@ -112,7 +112,7 @@ function remote_shell() {
     command ssh "$remote_user_host" -t "cd $remote_directory; bash"
 }
 
-declare -a publish_dirs=("rsbinder" "rsbinder-aidl" "rsbinder-hub")
+declare -a publish_dirs=("rsbinder" "rsbinder-aidl" "rsbinder-hub" "rsbinder-tools")
 
 function publish() {
     local cargo_options=()
@@ -134,4 +134,15 @@ function publish() {
         fi
     done
     return 0
+}
+
+function publish_dry_run() {
+    publish --dry-run
+}
+
+function version_update() {
+    local NEW_VERSION="$1"
+
+    find . -name "Cargo.toml" -exec sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" {} \;
+    find . -name "Cargo.toml" -exec sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
 }
