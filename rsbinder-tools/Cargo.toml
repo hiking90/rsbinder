@@ -8,7 +8,6 @@ homepage = "https://github.com/hiking90/rsbinder"
 repository = "https://github.com/hiking90/rsbinder/rsbinder-tools"
 readme = "README.md"
 
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

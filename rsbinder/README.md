@@ -1,7 +1,7 @@
 # rsbinder
 **rsbinder** offers libraries and tools, purely implemented in Rust, for utilizing Binder IPC on Android and Linux.
 
-Despite the integration of Android's binder IPC into the Linux kernel in 2015, the binder IPC is not being used at all in the Linux environment. 
+Despite the integration of Android's binder IPC into the Linux kernel in 2015, the binder IPC is not being used at all in the Linux environment.
 The reason is believed to be the lack of libraries and tools operating in the Linux environment, and this has motivated the initiation of this project.
 
 To maximize the performance of Binder IPC, it is essential to actively utilize threads, and this is why the project was started using Rust.
@@ -12,7 +12,6 @@ If you wish to use C++ based binder IPC in a Linux environment, please refer to 
 
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
-The source code still contains todo!() and unimplemented!().
 
 ## Overview
 **rsbinder** offers the following features:
