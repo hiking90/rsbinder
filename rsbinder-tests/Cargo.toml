@@ -3,6 +3,7 @@ name = "rsbinder-tests"
 version = "0.1.2"
 edition = "2021"
 publish = false
+rust-version = "1.75"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,8 +11,11 @@ publish = false
 lazy_static = "1"
 rsbinder = { version = "0.1.2", path = "../rsbinder" }
 rsbinder-hub = { version = "0.1.2", path = "../rsbinder-hub" }
+rsbinder-tokio = { version = "0.1.2", path = "../rsbinder-tokio"  }
+tokio = { version = "1", features = ["full"] }
 env_logger = "0"
 nix = "0"
+async-trait = "0.1"
 
 [build-dependencies]
 rsbinder-aidl = { version = "0.1.2", path = "../rsbinder-aidl" }

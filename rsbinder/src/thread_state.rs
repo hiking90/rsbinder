@@ -1076,3 +1076,9 @@ pub(crate) fn _get_calling_context() -> Result<CallingContext> {
         })
     })
 }
+
+pub fn is_handling_transaction() -> bool {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow().transaction.is_some()
+    })
+}

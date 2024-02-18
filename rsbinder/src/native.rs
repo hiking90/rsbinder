@@ -270,3 +270,10 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
         }
     }
 }
+
+
+/// Determine whether the current thread is currently executing an incoming
+/// transaction.
+pub fn is_handling_transaction() -> bool {
+    thread_state::is_handling_transaction()
+}

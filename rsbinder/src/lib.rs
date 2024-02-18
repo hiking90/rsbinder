@@ -29,6 +29,7 @@ pub mod file_descriptor;
 pub mod parcelable_holder;
 pub mod error;
 mod ref_counter;
+pub mod binder_async;
 
 pub use process_state::ProcessState;
 pub use parcel::Parcel;
@@ -40,6 +41,7 @@ pub use native::*;
 pub use parcelable::*;
 pub use file_descriptor::ParcelFileDescriptor;
 pub use parcelable_holder::{ParcelableHolder, ParcelableMetadata};
+pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
