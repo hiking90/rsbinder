@@ -1,6 +1,6 @@
 [package]
 name = "rsbinder-tools"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "This provides a few CLI binder tools for Linux."
@@ -12,12 +12,12 @@ readme = "README.md"
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { version = "0.1.2", path = "../rsbinder" }
-rsbinder-hub = { version = "0.1.2", path = "../rsbinder-hub" }
+rsbinder = { version = "0.2.0", path = "../rsbinder" }
+rsbinder-hub = { version = "0.2.0", path = "../rsbinder-hub" }
 log = "0.4"
-env_logger = "0"
+env_logger = "0.11"
 nix = "0"
 anstyle = "1.0"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.1.2", path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.2.0", path = "../rsbinder-aidl" }

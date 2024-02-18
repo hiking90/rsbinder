@@ -214,46 +214,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap"
-version = "4.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c918d541ef2913577a0f9566e9ce27cb35b6df072075769e0b26cb5a554520da"
-dependencies = [
- "clap_builder",
- "clap_derive",
-]
-
-[[package]]
-name = "clap_builder"
-version = "4.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3e7391dad68afb0c2ede1bf619f579a3dc9c2ec67f089baa397123a2f3d1eb"
-dependencies = [
- "anstream",
- "anstyle",
- "clap_lex",
- "strsim",
-]
-
-[[package]]
-name = "clap_derive"
-version = "4.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "307bc0538d5f0f83b8248db3087aa92fe504e4691294d0c96c0eabc33f47ba47"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "clap_lex"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
-
-[[package]]
 name = "colorchoice"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,10 +325,9 @@ dependencies = [
 
 [[package]]
 name = "example-hello"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
- "backtrace",
  "env_logger",
  "lazy_static",
  "rsbinder",
@@ -426,12 +385,6 @@ dependencies = [
  "ignore",
  "walkdir",
 ]
-
-[[package]]
-name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "hermit-abi"
@@ -840,12 +793,10 @@ checksum = "c08c74e62047bb2de4ff487b251e4a92e24f48745648451635cec7d591162d9f"
 
 [[package]]
 name = "rsbinder"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
- "anstyle",
  "async-trait",
  "downcast-rs",
- "env_logger",
  "log",
  "nix",
  "pretty-hex",
@@ -853,9 +804,8 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
- "clap",
  "convert_case",
  "lazy_static",
  "pest",
@@ -867,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-hub"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -879,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tests"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -894,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tokio"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "lazy_static",
  "log",
@@ -906,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tools"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anstyle",
  "env_logger",
@@ -1033,12 +983,6 @@ dependencies = [
  "libc",
  "windows-sys 0.48.0",
 ]
-
-[[package]]
-name = "strsim"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ee073c9e4cd00e28217186dbe12796d692868f432bf2e97ee73bed0c56dfa01"
 
 [[package]]
 name = "syn"

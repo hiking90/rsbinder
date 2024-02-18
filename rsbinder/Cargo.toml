@@ -1,13 +1,13 @@
 [package]
 name = "rsbinder"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "This is a library for Linux Binder communication."
 homepage = "https://github.com/hiking90/rsbinder"
 repository = "https://github.com/hiking90/rsbinder"
 readme = "README.md"
-rust-version = "1.75"
+rust-version = "1.71"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,8 +16,6 @@ nix = { version = "0", features = ["ioctl", "mount", "fs", "feature", "mman", "p
 log = "0.4"
 pretty_hex = { version = "0", package = "pretty-hex" }
 downcast-rs = "1.2"
-env_logger = "0.11"
-anstyle = "1.0"
 
 [dev-dependencies]
 async-trait = "0.1"

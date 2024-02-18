@@ -1,19 +1,19 @@
 [package]
 name = "rsbinder-aidl"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "This is a AIDL compiler for rsbinder."
 homepage = "https://github.com/hiking90/rsbinder"
 repository = "https://github.com/hiking90/rsbinder/rsbinder-aidl"
 readme = "README.md"
+rust-version = "1.71"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 pest = "2"
 pest_derive = "2"
-clap = { version = "4", features = ["derive"] }
 convert_case = "0"
 lazy_static = "1"
 serde = { version = "1", features = ["derive"] }
