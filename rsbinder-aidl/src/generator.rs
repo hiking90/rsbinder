@@ -337,7 +337,7 @@ pub mod {{mod}} {
         {%- endfor %}
     }
     fn on_transact(
-        _service: &dyn {{ name }}, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel, _descriptor: &str) -> rsbinder::Result<()> {
+        _service: &dyn {{ name }}, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
         match _code {
         {%- for member in fn_members %}
             transactions::r#{{ member.identifier }} => {

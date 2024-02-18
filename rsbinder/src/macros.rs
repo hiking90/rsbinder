@@ -216,8 +216,7 @@ macro_rules! declare_binder_interface {
             }
 
             fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
-                // $on_transact(&*self.0, code, reader, reply, Self::descriptor())
-                $on_transact(self.0.as_sync(), code, reader, reply, Self::descriptor())
+                $on_transact(self.0.as_sync(), code, reader, reply)
             }
 
             fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
@@ -514,7 +513,6 @@ mod tests {
         _code: TransactionCode,
         _data: &mut Parcel,
         _reply: &mut Parcel,
-        _descriptor: &str,
     ) -> Result<()> {
         // ...
         Ok(())
