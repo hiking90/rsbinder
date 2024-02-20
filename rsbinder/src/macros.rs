@@ -202,7 +202,7 @@ macro_rules! declare_binder_interface {
                 {
                     fn as_sync(&self) -> &dyn $interface { &self._inner }
                     fn as_async(&self) -> &dyn $native_async {
-                        unimplemented!("{} doesn't implement async interface", stringify!($interface))
+                        unreachable!("{} doesn't support async interface.", stringify!($interface))
                     }
                 }
                 let binder = $crate::native::Binder::new_with_stability($native(Box::new(Wrapper {_inner: inner})), $stability);

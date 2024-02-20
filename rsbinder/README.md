@@ -1,14 +1,17 @@
 # rsbinder
-**rsbinder** offers libraries and tools, purely implemented in Rust, for utilizing Binder IPC on Android and Linux.
 
-Despite the integration of Android's binder IPC into the Linux kernel in 2015, the binder IPC is not being used at all in the Linux environment.
-The reason is believed to be the lack of libraries and tools operating in the Linux environment, and this has motivated the initiation of this project.
+**rsbinder** provides crates implemented in pure Rust that make Binder IPC available on both Android and Linux.
 
-To maximize the performance of Binder IPC, it is essential to actively utilize threads, and this is why the project was started using Rust.
+## Binder IPC: Available on Linux, Untapped Potential
 
-If you wish to use C++ based binder IPC in a Linux environment, please refer to the **[binder-linux]** project.
+While Android's Binder IPC mechanism was merged into the Linux kernel back in 2015, its adoption within the broader Linux ecosystem remains limited. This project aims to address that by providing libraries and tools specifically designed for using Binder IPC in Linux environments.
 
+One key reason for limited adoption is the lack of readily available tools and libraries optimized for the Linux world. This project tackles that challenge by leveraging Rust's strengths for efficient thread utilization, a crucial aspect for maximizing Binder IPC performance on Linux.
+
+However, this project focuses on pure Rust implementations. If you're interested in C++-based Binder IPC for Linux, consider checking out the [binder-linux] project.
 [binder-linux]: https://github.com/hiking90/binder-linux
+
+Although this project focuses on supporting Binder IPC in the Linux environment, it also provides compatibility with Android's Binder IPC. [Compatibility Goal with Android Binder](#Compatibility-Goal-with-Android-Binder)
 
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
@@ -20,12 +23,14 @@ If you wish to use C++ based binder IPC in a Linux environment, please refer to 
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
 * **[crate rsbinder-hub][rsbinder-hub-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate rsbinder-tools][rsbinder-tools-readme]**: Provides CLI tools for Linux.
+* **[crate rsbinder-tokio][rsbinder-tokio-readme]**: Provides Tokio async
 * **[crate rsbinder-tests][rsbinder-tests-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
 [rsbinder-hub-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-hub/README.md
 [rsbinder-tools-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
+[rsbinder-tokio-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tokio/README.md
 [rsbinder-tests-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tests/README.md
 [example-hello-readme]: https://github.com/hiking90/rsbinder/tree/master/example-hello/README.md
 
@@ -57,11 +62,12 @@ $ cargo build
 ```
 $ sudo target/debug/rsb_device binder
 ```
-[rsb_device]: https://github.com/hiking90/rsbinder/blob/master/rsbinder/src/bin/rsb_device.md
-* Run **rsb_hub**. It is a binder service manager.
+[rsb_device]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
+* Run **[rsb_hub]**. It is a binder service manager.
 ```
 $ cargo run --bin rsb_hub
 ```
+[rsb_hub]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
 
 ### Test binder for Linux
 * Run **hello_service**
@@ -77,18 +83,21 @@ $ cargo run --bin hello_client
 * Please follow the guideline of https://github.com/bbqsrc/cargo-ndk
 
 ## Compatibility Goal with Android Binder
-* The Binder protocol is mutually compatible. That is, communication between an Android service and an rsbinder client is possible, and vice versa. However, this compatibility work is still ongoing.
-* API compatibility is not provided. Android binder and rsbinder have different operating architectures and cannot offer the same APIs. However, there is a high similarity in APIs.
+### Mutual Communication:
+Both rsbinder and Android Binder utilize the same core protocol, enabling seamless communication between Android services and rsbinder clients, and vice versa. However, continued development is currently underway to further refine this interoperability.
+
+### API Differences:
+Complete API parity between rsbinder and Android Binder isn't available due to fundamental differences in their underlying architectures. Nonetheless, both APIs share a high degree of similarity, minimizing the learning curve for developers familiar with either system.
 
 ## Todo
 - [x] Implement Binder crate.
 - [x] Implement AIDL compiler.
 - [x] Implement ParcelFileDescriptor.
 - [x] Port Android test_service and test_client and pass the test cases.
+- [x] Support Tokio async.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] Remove all todo!() and unimplemented!() macros.
-- [ ] Performed compatibility testing with Binder on Android.
-- [ ] Support Tokio async.
+- [ ] (In Progress) Remove all todo!() and unimplemented!() macros.
+- [ ] (In Progress) Performed compatibility testing with Binder on Android.
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support Mandatory Access Control likes selinux and AppArmor.
 - [ ] Support AIDL version and hash.
