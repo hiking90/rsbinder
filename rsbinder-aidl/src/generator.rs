@@ -161,6 +161,7 @@ pub mod {{mod}} {
             std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
         }
     }
+    {%- if enabled_async %}
     pub trait {{name}}Async<P>: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
@@ -217,6 +218,7 @@ pub mod {{mod}} {
             rsbinder::Strong::new(Box::new(binder))
         }
     }
+    {%- endif %}
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
@@ -240,11 +242,15 @@ pub mod {{mod}} {
         {{ name }}["{{ namespace }}"] {
             native: {
                 {{ bn_name }}(on_transact),
+                {%- if enabled_async %}
                 adapter: {{ bn_name }}Adapter,
-                async: {{ name }}AsyncService,
+                r#async: {{ name }}AsyncService,
+                {%- endif %}
             },
             proxy: {{ bp_name }},
+            {%- if enabled_async %}
             r#async: {{ name }}Async,
+            {%- endif %}
         }
     }
     impl {{ bp_name }} {
@@ -300,6 +306,7 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
+    {%- if enabled_async %}
     impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
@@ -321,18 +328,23 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
-    impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
-        {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
-            self.0.as_sync().r#{{ member.identifier }}({{ member.func_call_params }})
-        }
-        {%- endfor %}
-    }
     impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for rsbinder::Binder<{{bn_name}}>
     {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
             self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
+        }
+        {%- endfor %}
+    }
+    {%- endif %}
+    impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+            {%- if enabled_async %}
+            self.0.as_sync().r#{{ member.identifier }}({{ member.func_call_params }})
+            {%- else %}
+            self.0.r#{{ member.identifier }}({{ member.func_call_params }})
+            {%- endif %}
         }
         {%- endfor %}
     }
@@ -489,7 +501,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     })
 }
 
-fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
@@ -515,7 +527,9 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
         }
     }
 
-    let nested = &gen_declations(&decl.members, indent + 1)?;
+    let enabled_async = if enabled_async || cfg!(feature = "async") { true } else { false };
+
+    let nested = &gen_declations(&decl.members, indent + 1, enabled_async)?;
 
     let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
         .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
@@ -531,13 +545,14 @@ fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<Stri
     context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
     context.insert("oneway", &decl.oneway);
     context.insert("nested", &nested.trim());
+    context.insert("enabled_async", &enabled_async);
 
     let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
 
     Ok(add_indent(indent, rendered.trim()))
 }
 
-fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
     let mut is_empty = false;
     let mut decl = arg_decl.clone();
 
@@ -582,7 +597,7 @@ fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<St
         }
     }
 
-    let nested = &gen_declations(&declations, indent+1)?;
+    let nested = &gen_declations(&declations, indent+1, enabled_async)?;
     let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
         .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
@@ -671,19 +686,19 @@ fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn 
 }
 
 
-pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result<String, Box<dyn Error>> {
+pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
     let mut content = String::new();
 
     for decl in decls {
         match decl {
             parser::Declaration::Interface(decl) => {
                 let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_interface(decl, indent)?;
+                content += &gen_interface(decl, indent, enabled_async)?;
             }
 
             parser::Declaration::Parcelable(decl) => {
                 let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_parcelable(decl, indent)?;
+                content += &gen_parcelable(decl, indent, enabled_async)?;
             }
 
             parser::Declaration::Variable(_decl) => {
@@ -705,12 +720,12 @@ pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize) -> Result
     Ok(content)
 }
 
-pub fn gen_document(document: &parser::Document) -> Result<(String, String), Box<dyn Error>> {
+pub fn gen_document(document: &parser::Document, enabled_async: bool) -> Result<(String, String), Box<dyn Error>> {
     parser::set_current_document(document);
 
     let mut content = String::new();
 
-    content += &gen_declations(&document.decls, 0)?;
+    content += &gen_declations(&document.decls, 0, enabled_async)?;
 
     Ok((document.package.clone().unwrap_or_default(), content))
 }

@@ -10,6 +10,10 @@ readme = "README.md"
 rust-version = "1.71"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["async"]
+sync = []
+async = []
 
 [dependencies]
 pest = "2"

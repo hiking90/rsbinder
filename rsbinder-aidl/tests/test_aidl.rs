@@ -6,7 +6,7 @@ use similar::{ChangeTag, TextDiff};
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
     let document = rsbinder_aidl::parse_document(input)?;
-    let res = rsbinder_aidl::gen_document(&document)?;
+    let res = rsbinder_aidl::gen_document(&document, false)?;
     let diff = TextDiff::from_lines(res.1.trim(), expect.trim());
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {

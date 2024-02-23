@@ -94,6 +94,7 @@ pub struct Builder {
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     output: PathBuf,
+    enabled_async: bool,
 }
 
 impl Default for Builder {
@@ -109,6 +110,7 @@ impl Builder {
             sources: Vec::new(),
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
             output: "rsbinder_generated_aidl.rs".into(),
+            enabled_async: false,
         }
     }
 
@@ -124,6 +126,11 @@ impl Builder {
 
         self.output = output;
 
+        self
+    }
+
+    pub fn set_async_support(mut self, enable: bool) -> Self {
+        self.enabled_async = enable;
         self
     }
 
@@ -225,7 +232,7 @@ impl Builder {
         let mut package_list = Vec::new();
         for document in document_list {
             println!("Generating: {}", document.0);
-            let package = generator::gen_document(&document.1)?;
+            let package = generator::gen_document(&document.1, self.enabled_async)?;
             package_list.push((package.0, package.1, document.0));
         }
 

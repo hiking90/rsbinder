@@ -17,97 +17,15 @@
  * limitations under the License.
  */
 
-/// Declare a binder interface.
-///
-/// This is mainly used internally by the AIDL compiler.
+#[cfg(feature = "async")]
 #[macro_export]
-macro_rules! declare_binder_interface {
+macro_rules! __declare_binder_interface {
     {
         $interface:path[$descriptor:expr] {
             native: {
                 $native:ident($on_transact:path),
-                adapter: $native_adapter:ident,
-                async: $native_async:ident,
-            },
-            proxy: $proxy:ident,
-            $(r#async: $async_interface:ident,)?
-        }
-    } => {
-        $crate::declare_binder_interface! {
-            $interface[$descriptor] {
-                native: {
-                    $native($on_transact),
-                    adapter: $native_adapter,
-                    async: $native_async,
-                },
-                proxy: $proxy {},
-                $(r#async: $async_interface,)?
-                stability: rsbinder::Stability::default(),
-            }
-        }
-    };
-
-    {
-        $interface:path[$descriptor:expr] {
-            native: {
-                $native:ident($on_transact:path),
-                adapter: $native_adapter:ident,
-                async: $native_async:ident,
-            },
-            proxy: $proxy:ident,
-            $(r#async: $async_interface:ident,)?
-            stability: $stability:expr,
-        }
-    } => {
-        $crate::declare_binder_interface! {
-            $interface[$descriptor] {
-                native: {
-                    $native($on_transact),
-                    adapter: $native_adapter,
-                    async: $native_async,
-                },
-                proxy: $proxy {},
-                $(r#async: $async_interface,)?
-                stability: $stability,
-            }
-        }
-    };
-
-    {
-        $interface:path[$descriptor:expr] {
-            native: {
-                $native:ident($on_transact:path),
-                adapter: $native_adapter:ident,
-                async: $native_async:ident,
-            },
-            proxy: $proxy:ident {
-                $($fname:ident: $fty:ty = $finit:expr),*
-            },
-            $(r#async: $async_interface:ident,)?
-        }
-    } => {
-        $crate::declare_binder_interface! {
-            $interface[$descriptor] {
-                native: {
-                    $native($on_transact),
-                    adapter: $native_adapter,
-                    async: $native_async,
-                },
-                proxy: $proxy {
-                    $($fname: $fty = $finit),*
-                },
-                $(r#async: $async_interface,)?
-                stability: $crate::Stability::default(),
-            }
-        }
-    };
-
-    {
-        $interface:path[$descriptor:expr] {
-            native: {
-                $native:ident($on_transact:path),
-                adapter: $native_adapter:ident,
-                async: $native_async:ident,
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
             },
             proxy: $proxy:ident {
                 $($fname:ident: $fty:ty = $finit:expr),*
@@ -116,150 +34,48 @@ macro_rules! declare_binder_interface {
             stability: $stability:expr,
         }
     } => {
-        $crate::declare_binder_interface! {
-            $interface[$descriptor] {
-                @doc[concat!("A binder [`Remotable`]($crate::binder_impl::Remotable) that holds an [`", stringify!($interface), "`] object.")]
-                native: {
-                    $native($on_transact),
-                    adapter: $native_adapter,
-                    async: $native_async,
-                },
-                @doc[concat!("A binder [`Proxy`]($crate::binder_impl::Proxy) that holds an [`", stringify!($interface), "`] remote interface.")]
-                proxy: $proxy {
-                    $($fname: $fty = $finit),*
-                },
-                $(r#async: $async_interface,)?
-                stability: $stability,
-            }
-        }
-    };
-
-    {
-        $interface:path[$descriptor:expr] {
-            @doc[$native_doc:expr]
-            native: {
-                $native:ident($on_transact:path),
-                adapter: $native_adapter:ident,
-                async: $native_async:ident,
-            },
-            @doc[$proxy_doc:expr]
-            proxy: $proxy:ident {
-                $($fname:ident: $fty:ty = $finit:expr),*
-            },
-            $( r#async: $async_interface:ident, )?
-
-            stability: $stability:expr,
-        }
-    } => {
-        #[doc = $proxy_doc]
-        pub struct $proxy {
-            binder: $crate::SIBinder,
-            $($fname: $fty,)*
-        }
-
-        impl $crate::Interface for $proxy {
-            fn as_binder(&self) -> $crate::SIBinder {
-                self.binder.clone()
-            }
-        }
-
-        impl $crate::Proxy for $proxy
-        where
-            $proxy: $interface,
-        {
-            fn descriptor() -> &'static str {
-                $descriptor
+        $(
+            pub trait $native_adapter {
+                fn as_sync(&self) -> &dyn $interface;
+                fn as_async(&self) -> &dyn $native_async;
             }
 
-            fn from_binder(binder: $crate::SIBinder) -> std::option::Option<Self> {
-                if binder.descriptor() != $descriptor {
-                    return None
-                }
-                if let Some(_) = binder.as_proxy() {
-                    Some(Self { binder, $($fname: $finit),* })
-                } else {
-                    None
-                }
-            }
-        }
+            pub struct $native(Box<dyn $native_adapter + Send + Sync + 'static>);
 
-        pub trait $native_adapter {
-            fn as_sync(&self) -> &dyn $interface;
-            fn as_async(&self) -> &dyn $native_async;
-        }
-
-        pub struct $native(Box<dyn $native_adapter + Send + Sync + 'static>);
-
-        impl $native {
-            /// Create a new binder service.
-            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
-                struct Wrapper<T> {
-                    _inner: T,
-                }
-                impl<T> $native_adapter for Wrapper<T>
-                where
-                    T: $interface + Sync + Send + 'static,
-                {
-                    fn as_sync(&self) -> &dyn $interface { &self._inner }
-                    fn as_async(&self) -> &dyn $native_async {
-                        unreachable!("{} doesn't support async interface.", stringify!($interface))
+            impl $native {
+                /// Create a new binder service.
+                pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+                    struct Wrapper<T> {
+                        _inner: T,
                     }
-                }
-                let binder = $crate::native::Binder::new_with_stability($native(Box::new(Wrapper {_inner: inner})), $stability);
-                $crate::Strong::new(Box::new(binder))
-            }
-        }
-
-        impl $crate::Remotable for $native {
-            fn descriptor() -> &'static str where Self: Sized {
-                $descriptor
-            }
-
-            fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
-                $on_transact(self.0.as_sync(), code, reader, reply)
-            }
-
-            fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
-                self.0.as_sync().dump(_writer, _args)
-            }
-        }
-
-        impl $crate::FromIBinder for dyn $interface {
-            fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
-                match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
-                    Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
-                    None => {
-                        match $crate::native::Binder::<$native>::try_from(binder) {
-                            Ok(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
-                            Err(err) => Err(err),
+                    impl<T> $native_adapter for Wrapper<T>
+                    where
+                        T: $interface + Sync + Send + 'static,
+                    {
+                        fn as_sync(&self) -> &dyn $interface { &self._inner }
+                        fn as_async(&self) -> &dyn $native_async {
+                            unreachable!("{} doesn't support async interface.", stringify!($interface))
                         }
                     }
+                    let binder = $crate::native::Binder::new_with_stability($native(Box::new(Wrapper {_inner: inner})), $stability);
+                    $crate::Strong::new(Box::new(binder))
                 }
             }
-        }
 
-        impl $crate::parcelable::Serialize for dyn $interface
-        where
-            dyn $interface: $crate::Interface
-        {
-            fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
-                let binder = $crate::Interface::as_binder(self);
-                parcel.write(&binder)?;
-                Ok(())
-            }
-        }
+            impl $crate::Remotable for $native {
+                fn descriptor() -> &'static str where Self: Sized {
+                    $descriptor
+                }
 
-        impl $crate::parcelable::SerializeOption for dyn $interface {
-            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
-                parcel.write(&this.map($crate::Interface::as_binder))
-            }
-        }
+                fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
+                    $on_transact(self.0.as_sync(), code, reader, reply)
+                }
 
-        impl std::fmt::Debug for dyn $interface + '_ {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.pad(stringify!($interface))
+                fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
+                    self.0.as_sync().dump(_writer, _args)
+                }
             }
-        }
+        )?
 
         $(
             // Async interface trait implementations.
@@ -315,6 +131,269 @@ macro_rules! declare_binder_interface {
                 type Target = dyn $interface;
             }
         )?
+    };
+}
+
+#[cfg(not(feature = "async"))]
+#[macro_export]
+macro_rules! __declare_binder_interface {
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+        }
+    } => {
+        pub struct $native(Box<dyn $interface + Send + Sync + 'static>);
+
+        impl $native {
+            /// Create a new binder service.
+            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+                let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
+                $crate::Strong::new(Box::new(binder))
+            }
+        }
+
+        impl $crate::Remotable for $native {
+            fn descriptor() -> &'static str where Self: Sized {
+                $descriptor
+            }
+
+            fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
+                $on_transact(&*self.0, code, reader, reply)
+            }
+
+            fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
+                self.0.dump(_writer, _args)
+            }
+        }
+    };
+}
+
+/// Declare a binder interface.
+///
+/// This is mainly used internally by the AIDL compiler.
+#[macro_export]
+macro_rules! declare_binder_interface {
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            proxy: $proxy:ident,
+            $(r#async: $async_interface:ident,)?
+        }
+    } => {
+        $crate::declare_binder_interface! {
+            $interface[$descriptor] {
+                native: {
+                    $native($on_transact),
+                    $(adapter: $native_adapter,)?
+                    $(r#async: $native_async,)?
+                },
+                proxy: $proxy {},
+                $(r#async: $async_interface,)?
+                stability: rsbinder::Stability::default(),
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            proxy: $proxy:ident,
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+        }
+    } => {
+        $crate::declare_binder_interface! {
+            $interface[$descriptor] {
+                native: {
+                    $native($on_transact),
+                    $(adapter: $native_adapter,)?
+                    $(r#async: $native_async,)?
+                },
+                proxy: $proxy {},
+                $(r#async: $async_interface,)?
+                stability: $stability,
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+        }
+    } => {
+        $crate::declare_binder_interface! {
+            $interface[$descriptor] {
+                native: {
+                    $native($on_transact),
+                    $(adapter: $native_adapter,)?
+                    $(r#async: $native_async,)?
+                },
+                proxy: $proxy {
+                    $($fname: $fty = $finit),*
+                },
+                $(r#async: $async_interface,)?
+                stability: $crate::Stability::default(),
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+        }
+    } => {
+        $crate::declare_binder_interface! {
+            $interface[$descriptor] {
+                @doc[concat!("A binder [`Remotable`]($crate::binder_impl::Remotable) that holds an [`", stringify!($interface), "`] object.")]
+                native: {
+                    $native($on_transact),
+                    $(adapter: $native_adapter,)?
+                    $(r#async: $native_async,)?
+                },
+                @doc[concat!("A binder [`Proxy`]($crate::binder_impl::Proxy) that holds an [`", stringify!($interface), "`] remote interface.")]
+                proxy: $proxy {
+                    $($fname: $fty = $finit),*
+                },
+                $(r#async: $async_interface,)?
+                stability: $stability,
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            @doc[$native_doc:expr]
+            native: {
+                $native:ident($on_transact:path),
+                $(adapter: $native_adapter:ident,)?
+                $(r#async: $native_async:ident,)?
+            },
+            @doc[$proxy_doc:expr]
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $( r#async: $async_interface:ident, )?
+
+            stability: $stability:expr,
+        }
+    } => {
+        #[doc = $proxy_doc]
+        pub struct $proxy {
+            binder: $crate::SIBinder,
+            $($fname: $fty,)*
+        }
+
+        impl $crate::Interface for $proxy {
+            fn as_binder(&self) -> $crate::SIBinder {
+                self.binder.clone()
+            }
+        }
+
+        impl $crate::Proxy for $proxy
+        where
+            $proxy: $interface,
+        {
+            fn descriptor() -> &'static str {
+                $descriptor
+            }
+
+            fn from_binder(binder: $crate::SIBinder) -> std::option::Option<Self> {
+                if binder.descriptor() != $descriptor {
+                    return None
+                }
+                if let Some(_) = binder.as_proxy() {
+                    Some(Self { binder, $($fname: $finit),* })
+                } else {
+                    None
+                }
+            }
+        }
+
+        $crate::__declare_binder_interface!{
+            $interface[$descriptor] {
+                native: {
+                    $native($on_transact),
+                    $(adapter: $native_adapter,)?
+                    $(r#async: $native_async,)?
+                },
+                proxy: $proxy {
+                    $($fname: $fty = $finit),*
+                },
+                $(r#async: $async_interface,)?
+                stability: $stability,
+            }
+        }
+
+        impl $crate::FromIBinder for dyn $interface {
+            fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
+                match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
+                    Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
+                    None => {
+                        match $crate::native::Binder::<$native>::try_from(binder) {
+                            Ok(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
+                            Err(err) => Err(err),
+                        }
+                    }
+                }
+            }
+        }
+
+        impl $crate::parcelable::Serialize for dyn $interface
+        where
+            dyn $interface: $crate::Interface
+        {
+            fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                let binder = $crate::Interface::as_binder(self);
+                parcel.write(&binder)?;
+                Ok(())
+            }
+        }
+
+        impl $crate::parcelable::SerializeOption for dyn $interface {
+            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+                parcel.write(&this.map($crate::Interface::as_binder))
+            }
+        }
+
+        impl std::fmt::Debug for dyn $interface + '_ {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.pad(stringify!($interface))
+            }
+        }
     }
 }
 
@@ -490,15 +569,20 @@ mod tests {
             native: {
                 BnEcho(on_transact),
                 adapter: BnEchoAdapter,
-                async: IEchoAsyncService,
+                r#async: IEchoAsyncService,
             },
             proxy: BpEcho{},
         }
     }
 
     impl IEcho for Binder<BnEcho> {
+        #[cfg(feature = "async")]
         fn echo(&self, echo: &str) -> Result<String> {
             self.0.as_sync().echo(echo)
+        }
+        #[cfg(not(feature = "async"))]
+        fn echo(&self, echo: &str) -> Result<String> {
+            self.0.echo(echo)
         }
     }
 
@@ -533,6 +617,7 @@ mod tests {
         let _ = BnEcho::new_binder(EchoService {});
     }
 
+    #[cfg(feature = "async")]
     #[test]
     fn test_try_from() {
         use async_trait::async_trait;

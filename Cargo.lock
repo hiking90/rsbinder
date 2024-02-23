@@ -849,7 +849,6 @@ dependencies = [
  "lazy_static",
  "log",
  "rsbinder",
- "rsbinder-aidl",
  "rsbinder-hub",
  "tokio",
 ]
@@ -864,7 +863,6 @@ dependencies = [
  "log",
  "nix",
  "rsbinder",
- "rsbinder-aidl",
  "rsbinder-hub",
 ]
 

@@ -12,10 +12,7 @@ readme = "README.md"
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { version = "0.2.0", path = "../rsbinder" }
-rsbinder-hub = { version = "0.2.0", path = "../rsbinder-hub" }
+rsbinder = { version = "0.2.0", path = "../rsbinder", features = ["async"] }
+rsbinder-hub = { version = "0.2.0", path = "../rsbinder-hub", features = ["async"] }
 log = "0.4"
 tokio = { version = "1.35", features = ["full"] }
-
-[build-dependencies]
-rsbinder-aidl = { version = "0.2.0", path = "../rsbinder-aidl" }
