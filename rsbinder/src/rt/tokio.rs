@@ -31,8 +31,7 @@
 //!
 //! [`Tokio`]: crate::Tokio
 
-use rsbinder::BinderAsyncRuntime;
-use rsbinder::{BinderAsyncPool, BoxFuture, FromIBinder, StatusCode, Strong};
+use crate::{hub, BinderAsyncRuntime, BinderAsyncPool, BoxFuture, FromIBinder, StatusCode, Strong};
 use std::future::Future;
 
 /// Retrieve an existing service for a particular interface, sleeping for a few
@@ -40,13 +39,13 @@ use std::future::Future;
 pub async fn get_interface<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {
-    if rsbinder::is_handling_transaction() {
+    if crate::is_handling_transaction() {
         // See comment in the BinderAsyncPool impl.
-        return rsbinder_hub::get_interface::<T>(name);
+        return hub::get_interface::<T>(name);
     }
 
     let name = name.to_string();
-    let res = tokio::task::spawn_blocking(move || rsbinder_hub::get_interface::<T>(&name)).await;
+    let res = tokio::task::spawn_blocking(move || hub::get_interface::<T>(&name)).await;
 
     // The `is_panic` branch is not actually reachable in Android as we compile
     // with `panic = abort`.
@@ -99,7 +98,7 @@ impl BinderAsyncPool for Tokio {
         B: Send + 'a,
         E: From<crate::StatusCode>,
     {
-        if rsbinder::is_handling_transaction() {
+        if crate::is_handling_transaction() {
             // We are currently on the thread pool for a binder server, so we should execute the
             // transaction on the current thread so that the binder kernel driver is able to apply
             // its deadlock prevention strategy to the sub-call.

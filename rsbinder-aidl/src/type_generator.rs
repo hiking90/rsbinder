@@ -1,8 +1,26 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::OnceLock;
+
 use crate::parser::{*, self};
 use crate::const_expr::{ValueType, ConstExpr};
+
+static CRATE_NAME: OnceLock<String> = OnceLock::new();
+
+pub fn crate_name() -> String {
+    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).clone()
+}
+
+pub fn set_crate_support(support: bool) {
+    CRATE_NAME.get_or_init(|| {
+        if support {
+            "crate".to_owned()
+        } else {
+            "rsbinder".to_owned()
+        }
+    });
+}
 
 #[derive(Clone, Debug)]
 struct ArrayInfo {
@@ -116,7 +134,7 @@ impl TypeGenerator {
         }
     }
 
-    fn make_user_defined_type_name(type_name: &str) -> String {
+    fn make_user_defined_type_name(&self, type_name: &str) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL);
         let curr_ns = current_namespace();
         let ns = curr_ns.relative_mod(&lookup_decl.ns);
@@ -133,7 +151,7 @@ impl TypeGenerator {
 
         match lookup_decl.decl {
             Declaration::Interface(_) => {
-                format!("rsbinder::Strong<dyn {}>", name)
+                format!("{}::Strong<dyn {}>", crate_name(), name)
             }
             _ => name,
         }
@@ -217,8 +235,8 @@ impl TypeGenerator {
         }
     }
 
-    fn array_type_name(value_type: &ValueType) -> String {
-        let name = Self::type_decl(value_type);
+    fn array_type_name(&self, value_type: &ValueType) -> String {
+        let name = self.type_decl(value_type);
         if name == "i8" {
             "u8".to_owned()
         } else {
@@ -229,7 +247,7 @@ impl TypeGenerator {
     fn make_fixed_array(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
         assert!(!array_info.sizes.is_empty());
 
-        let type_name = Self::array_type_name(&array_info.value_type);
+        let type_name = self.array_type_name(&array_info.value_type);
 
         let value_str = if is_struct {
             if self.is_nullable && Self::is_aidl_nullable(&array_info.value_type) {
@@ -295,7 +313,7 @@ impl TypeGenerator {
             return self.list_type_decl_fixed(sub_type, is_struct);
         }
 
-        let type_name = Self::array_type_name(&sub_type.value_type);
+        let type_name = self.array_type_name(&sub_type.value_type);
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
@@ -335,7 +353,7 @@ impl TypeGenerator {
         }
     }
 
-    fn type_decl(value_type: &ValueType) -> String {
+    fn type_decl(&self, value_type: &ValueType) -> String {
         match value_type {
             ValueType::Void => "()".into(),
             ValueType::String(_) => "String".into(),
@@ -351,10 +369,10 @@ impl TypeGenerator {
                 panic!("type_decl() can't process Array Type.")
                 // Self::type_decl(sub_value.expect("Array must know the type of item."), None)
             }
-            ValueType::IBinder => "rsbinder::SIBinder".into(),
-            ValueType::FileDescriptor => "rsbinder::ParcelFileDescriptor".into(),
-            ValueType::Holder => "rsbinder::ParcelableHolder".into(),
-            ValueType::UserDefined(name) => Self::make_user_defined_type_name(name),
+            ValueType::IBinder => format!("{}::SIBinder", crate_name()),
+            ValueType::FileDescriptor => format!("{}::ParcelFileDescriptor", crate_name()),
+            ValueType::Holder => format!("{}::ParcelableHolder", crate_name()),
+            ValueType::UserDefined(name) => self.make_user_defined_type_name(name),
             _ => unreachable!(),
         }
     }
@@ -369,7 +387,7 @@ impl TypeGenerator {
                 if !Self::can_be_defaulted(&self.value_type, is_struct) && is_struct {
                     is_nullable = true;
                 }
-                Self::type_decl(&self.value_type)
+                self.type_decl(&self.value_type)
             }
         };
 
@@ -413,7 +431,7 @@ impl TypeGenerator {
         if sub_type.is_fixed() {
             return self.func_list_type_decl_fixed(sub_type);
         }
-        let type_name = Self::array_type_name(&sub_type.value_type);
+        let type_name = self.array_type_name(&sub_type.value_type);
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
@@ -476,7 +494,7 @@ impl TypeGenerator {
                         if Self::is_primitive(&self.value_type) {
                             panic!("{:?} cannot be an out or inout parameter.", self.value_type);
                         }
-                        let name = Self::type_decl(&self.value_type);
+                        let name = self.type_decl(&self.value_type);
                         if self.is_nullable {
                             format!("&mut Option<{}>", name)
                         } else {
@@ -485,9 +503,9 @@ impl TypeGenerator {
                     }
                     _ => {
                         if Self::is_primitive(&self.value_type) {
-                            Self::type_decl(&self.value_type)
+                            self.type_decl(&self.value_type)
                         } else {
-                            let name = Self::type_decl(&self.value_type);
+                            let name = self.type_decl(&self.value_type);
                             if self.is_nullable {
                                 format!("Option<&{}>", name)
                             } else {
@@ -564,7 +582,7 @@ impl TypeGenerator {
                 match lookup_decl.decl {
                     Declaration::Enum(enum_decl) => {
                         let first = enum_decl.enumerator_list.first().unwrap();
-                        format!("{}::{}", Self::make_user_defined_type_name(name), first.identifier)
+                        format!("{}::{}", self.make_user_defined_type_name(name), first.identifier)
                     }
                     _ => "Default::default()".to_owned(),
                 }

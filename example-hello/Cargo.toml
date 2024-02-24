@@ -5,13 +5,16 @@ publish = false
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["async"]
+sync = ["rsbinder/sync", "rsbinder-aidl/sync"]
+async = ["rsbinder/async", "rsbinder-aidl/async"]
 
 [dependencies]
 lazy_static = "1"
-rsbinder = { version = "0.2.0", path = "../rsbinder" }
-rsbinder-hub = { version = "0.2.0", path = "../rsbinder-hub" }
+rsbinder = { version = "0.2.0", path = "../rsbinder", default-features = false }
 env_logger = "0.11"
 async-trait = "0.1"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.2.0", path = "../rsbinder-aidl" }
+rsbinder-aidl = { version = "0.2.0", path = "../rsbinder-aidl", default-features = false }

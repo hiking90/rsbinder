@@ -21,16 +21,12 @@ Although this project focuses on supporting Binder IPC in the Linux environment,
 
 * **crate rsbinder**: A library crate for implementing binder service/client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
-* **[crate rsbinder-hub][rsbinder-hub-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate rsbinder-tools][rsbinder-tools-readme]**: Provides CLI tools for Linux.
-* **[crate rsbinder-tokio][rsbinder-tokio-readme]**: Provides Tokio async
 * **[crate rsbinder-tests][rsbinder-tests-readme]**: Provides functionality similar to Binder's ServiceManager.
 * **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
-[rsbinder-hub-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-hub/README.md
 [rsbinder-tools-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
-[rsbinder-tokio-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tokio/README.md
 [rsbinder-tests-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tests/README.md
 [example-hello-readme]: https://github.com/hiking90/rsbinder/tree/master/example-hello/README.md
 

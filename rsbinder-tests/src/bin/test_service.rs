@@ -636,18 +636,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let service_name = <BpTestService as ITestService::ITestService>::descriptor();
     let service = BnTestService::new_binder(TestService::default());
-    rsbinder_hub::add_service(service_name, service.as_binder()).expect("Could not register service");
+    hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
     let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
     let versioned_service = BnFooInterface::new_binder(FooInterface);
-    rsbinder_hub::add_service(versioned_service_name, versioned_service.as_binder())
+    hub::add_service(versioned_service_name, versioned_service.as_binder())
         .expect("Could not register service");
 
     let nested_service_name =
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor();
     let nested_service =
         INestedService::BnNestedService::new_binder(NestedService);
-    rsbinder_hub::add_service(nested_service_name, nested_service.as_binder())
+    hub::add_service(nested_service_name, nested_service.as_binder())
         .expect("Could not register service");
 
     let fixed_size_array_service_name =
@@ -655,7 +655,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let fixed_size_array_service = IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_binder(
         FixedSizeArrayService
     );
-    rsbinder_hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
+    hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
         .expect("Could not register service");
 
     Ok(ProcessState::join_thread_pool()?)

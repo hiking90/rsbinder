@@ -12,7 +12,7 @@ use crate::parser::Direction;
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
     #![allow(non_upper_case_globals, non_snake_case)]
-    rsbinder::declare_binder_enum! {
+    {{crate}}::declare_binder_enum! {
         r#{{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
             r#{{ member.0 }} = {{ member.1 }},
@@ -44,8 +44,8 @@ pub mod {{mod}} {
     {%- endif %}
         }
     }
-    impl rsbinder::Parcelable for r#{{union_name}} {
-        fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+    impl {{crate}}::Parcelable for r#{{union_name}} {
+        fn write_to_parcel(&self, parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             match self {
     {%- set counter = 0 %}
     {%- for member in members %}
@@ -57,7 +57,7 @@ pub mod {{mod}} {
     {%- endfor %}
             }
         }
-        fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        fn read_from_parcel(&mut self, parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             let tag: i32 = parcel.read()?;
             match tag {
     {%- set counter = 0 %}
@@ -69,16 +69,16 @@ pub mod {{mod}} {
                 }
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => Err({{crate}}::StatusCode::BadValue),
             }
         }
     }
-    rsbinder::impl_serialize_for_parcelable!(r#{{union_name}});
-    rsbinder::impl_deserialize_for_parcelable!(r#{{union_name}});
-    impl rsbinder::ParcelableMetadata for r#{{union_name}} {
+    {{crate}}::impl_serialize_for_parcelable!(r#{{union_name}});
+    {{crate}}::impl_deserialize_for_parcelable!(r#{{union_name}});
+    impl {{crate}}::ParcelableMetadata for r#{{union_name}} {
         fn descriptor() -> &'static str { "{{ namespace }}" }
     }
-    rsbinder::declare_binder_enum! {
+    {{crate}}::declare_binder_enum! {
         Tag : [i32; {{ members|length }}] {
     {%- set counter = 0 %}
     {%- for member in members %}
@@ -114,8 +114,8 @@ pub mod {{mod}} {
             }
         }
     }
-    impl rsbinder::Parcelable for {{name}} {
-        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+    impl {{crate}}::Parcelable for {{name}} {
+        fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
                 _sub_parcel.write(&self.r#{{ member.0 }})?;
@@ -123,7 +123,7 @@ pub mod {{mod}} {
                 Ok(())
             })
         }
-        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        fn read_from_parcel(&mut self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
                 self.r#{{ member.0 }} = _sub_parcel.read()?;
@@ -132,9 +132,9 @@ pub mod {{mod}} {
             })
         }
     }
-    rsbinder::impl_serialize_for_parcelable!({{name}});
-    rsbinder::impl_deserialize_for_parcelable!({{name}});
-    impl rsbinder::ParcelableMetadata for {{name}} {
+    {{crate}}::impl_serialize_for_parcelable!({{name}});
+    {{crate}}::impl_deserialize_for_parcelable!({{name}});
+    impl {{crate}}::ParcelableMetadata for {{name}} {
         fn descriptor() -> &'static str { "{{namespace}}" }
     }
     {%- if nested|length>0 %}
@@ -149,10 +149,10 @@ pub mod {{mod}} {
     {%- for member in const_members %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
-    pub trait {{name}}: rsbinder::Interface + Send {
+    pub trait {{name}}: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
         {%- endfor %}
         fn getDefaultImpl() -> {{ name }}DefaultRef where Self: Sized {
             DEFAULT_IMPL.lock().unwrap().clone()
@@ -162,38 +162,38 @@ pub mod {{mod}} {
         }
     }
     {%- if enabled_async %}
-    pub trait {{name}}Async<P>: rsbinder::Interface + Send {
+    pub trait {{name}}Async<P>: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>>;
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>>;
         {%- endfor %}
     }
     #[::async_trait::async_trait]
-    pub trait {{name}}AsyncService: rsbinder::Interface + Send {
+    pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        async fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}>;
+        async fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
         {%- endfor %}
     }
     impl {{bn_name}}
     {
-        pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn {{name}}>
+        pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
         where
             T: {{name}}AsyncService + Sync + Send + 'static,
-            R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+            R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
         {
             struct Wrapper<T, R> {
                 _inner: T,
                 _rt: R,
             }
-            impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
+            impl<T, R> {{crate}}::Interface for Wrapper<T, R> where T: {{crate}}::Interface, R: Send + Sync {
+                fn as_binder(&self) -> {{crate}}::SIBinder { self._inner.as_binder() }
+                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> {{crate}}::Result<()> { self._inner.dump(_writer, _args) }
             }
             impl<T, R> {{bn_name}}Adapter for Wrapper<T, R>
             where
                 T: {{name}}AsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+                R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
             {
                 fn as_sync(&self) -> &dyn {{name}} {
                     self
@@ -205,31 +205,31 @@ pub mod {{mod}} {
             impl<T, R> {{name}} for Wrapper<T, R>
             where
                 T: {{name}}AsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
+                R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
             {
                 {%- for member in fn_members %}
-                fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+                fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
                     self._rt.block_on(self._inner.r#{{ member.identifier }}({{ member.func_call_params }}))
                 }
                 {%- endfor %}
             }
             let wrapped = Wrapper { _inner: inner, _rt: rt };
-            let binder = rsbinder::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), rsbinder::Stability::default());
-            rsbinder::Strong::new(Box::new(binder))
+            let binder = {{crate}}::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default());
+            {{crate}}::Strong::new(Box::new(binder))
         }
     }
     {%- endif %}
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
+            Err({{crate}}::StatusCode::UnknownTransaction.into())
         }
         {%- endfor %}
     }
     pub(crate) mod transactions {
         {%- set counter = 0 %}
         {%- for member in fn_members %}
-        pub(crate) const r#{{ member.identifier }}: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + {{ counter }};
+        pub(crate) const r#{{ member.identifier }}: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + {{ counter }};
         {%- set_global counter = counter + 1 %}
         {%- endfor %}
     }
@@ -238,7 +238,7 @@ pub mod {{mod}} {
     lazy_static! {
         static ref DEFAULT_IMPL: std::sync::Mutex<{{ name }}DefaultRef> = std::sync::Mutex::new(None);
     }
-    rsbinder::declare_binder_interface! {
+    {{crate}}::declare_binder_interface! {
         {{ name }}["{{ namespace }}"] {
             native: {
                 {{ bn_name }}(on_transact),
@@ -255,7 +255,7 @@ pub mod {{mod}} {
     }
     impl {{ bp_name }} {
         {%- for member in fn_members %}
-        fn build_parcel_{{ member.identifier }}({{ member.args }}) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
             let mut data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
             {%- for func in member.write_funcs %}
@@ -266,17 +266,17 @@ pub mod {{mod}} {
             {%- endif %}
             Ok(data)
         }
-        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<{{ member.return_type }}> {
             {%- if oneway or member.oneway %}
             Ok(())
             {%- else %}
-            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+            if let Err({{crate}}::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as {{name}}>::getDefaultImpl() {
                   return _aidl_default_impl.r#{{ member.identifier }}({{ member.func_call_params }});
                 }
             }
-            let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
-            let _status = _aidl_reply.read::<rsbinder::Status>()?;
+            let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
+            let _status = _aidl_reply.read::<{{crate}}::Status>()?;
             if !_status.is_ok() { return Err(_status); }
             {%- if member.return_type != "()" %}
             let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
@@ -295,9 +295,9 @@ pub mod {{mod}} {
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}rsbinder::FLAG_ONEWAY | {% endif %}rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -307,16 +307,16 @@ pub mod {{mod}} {
         {%- endfor %}
     }
     {%- if enabled_async %}
-    impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
+    impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>> {
             let _aidl_data = match self.build_parcel_{{ member.identifier }}({{ member.func_call_params }}) {
                 Ok(_aidl_data) => _aidl_data,
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
             P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
+                move || binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
                     self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
@@ -328,18 +328,18 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
-    impl<P: rsbinder::BinderAsyncPool> {{name}}Async<P> for rsbinder::Binder<{{bn_name}}>
+    impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{crate}}::Binder<{{bn_name}}>
     {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<{{ member.return_type }}>> {
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>> {
             self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
     }
     {%- endif %}
-    impl {{ name }} for rsbinder::Binder<{{ bn_name }}> {
+    impl {{ name }} for {{crate}}::Binder<{{ bn_name }}> {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> rsbinder::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
             {%- if enabled_async %}
             self.0.as_sync().r#{{ member.identifier }}({{ member.func_call_params }})
             {%- else %}
@@ -349,7 +349,7 @@ pub mod {{mod}} {
         {%- endfor %}
     }
     fn on_transact(
-        _service: &dyn {{ name }}, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        _service: &dyn {{ name }}, _code: {{crate}}::TransactionCode, _reader: &mut {{crate}}::Parcel, _reply: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
         match _code {
         {%- for member in fn_members %}
             transactions::r#{{ member.identifier }} => {
@@ -360,7 +360,7 @@ pub mod {{mod}} {
             {%- if not oneway and not member.oneway %}
                 match &_aidl_return {
                     Ok(_aidl_return) => {
-                        _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
+                        _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
                         {%- if member.transaction_has_return %}
                         _reply.write(_aidl_return)?;
                         {%- endif %}
@@ -376,7 +376,7 @@ pub mod {{mod}} {
                 Ok(())
             }
         {%- endfor %}
-            _ => Err(rsbinder::StatusCode::UnknownTransaction),
+            _ => Err({{crate}}::StatusCode::UnknownTransaction),
         }
     }
     {%- if nested|length>0 %}
@@ -501,231 +501,251 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     })
 }
 
-fn gen_interface(arg_decl: &parser::InterfaceDecl, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
-    let mut is_empty = false;
-    let mut decl = arg_decl.clone();
-
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
-        is_empty = true;
-        // return Ok(String::new())
-    }
-
-    decl.pre_process();
-
-    let mut const_members = Vec::new();
-    let mut fn_members = Vec::new();
-
-    if !is_empty {
-        for constant in decl.constant_list.iter() {
-            let generator = constant.r#type.to_generator();
-            const_members.push((constant.const_identifier(),
-                generator.const_type_decl(), generator.init_value(constant.const_expr.as_ref(), true)));
-        }
-
-        for method in decl.method_list.iter() {
-            fn_members.push(make_fn_member(method)?);
-        }
-    }
-
-    let enabled_async = if enabled_async || cfg!(feature = "async") { true } else { false };
-
-    let nested = &gen_declations(&decl.members, indent + 1, enabled_async)?;
-
-    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
-        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
-
-    let mut context = tera::Context::new();
-
-    context.insert("mod", &decl.name);
-    context.insert("name", &decl.name);
-    context.insert("namespace", &namespace);
-    context.insert("const_members", &const_members);
-    context.insert("fn_members", &fn_members);
-    context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
-    context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
-    context.insert("oneway", &decl.oneway);
-    context.insert("nested", &nested.trim());
-    context.insert("enabled_async", &enabled_async);
-
-    let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
-
-    Ok(add_indent(indent, rendered.trim()))
+pub struct Generator {
+    enabled_async: bool,
+    is_crate: bool,
 }
 
-fn gen_parcelable(arg_decl: &parser::ParcelableDecl, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
-    let mut is_empty = false;
-    let mut decl = arg_decl.clone();
-
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
-        println!("Parcelable {} is only used for Java.", decl.name);
-        is_empty = true;
-        // return Ok(String::new())
-    }
-    if !decl.cpp_header.is_empty() {
-        println!("cpp_header {} for Parcelable {} is not supported.", decl.cpp_header, decl.name);
-        is_empty = true;
-        // return Ok(String::new())
+impl Generator {
+    pub fn new(enabled_async: bool, is_crate: bool) -> Self {
+        Self { enabled_async, is_crate }
     }
 
-    decl.pre_process();
+    fn new_context(&self) -> tera::Context {
+        let mut context = tera::Context::new();
+        if self.is_crate {
+            context.insert("crate", "crate");
+        } else {
+            context.insert("crate", "rsbinder");
+        }
+        context
+    }
 
-    let mut constant_members = Vec::new();
-    let mut members = Vec::new();
-    let mut declations = Vec::new();
+    pub fn document(&self, document: &parser::Document) -> Result<(String, String), Box<dyn Error>> {
+        parser::set_current_document(document);
 
-    if !is_empty {
-        // Parse struct variables only.
-        for decl in &decl.members {
-            if let Some(var) = decl.is_variable() {
+        let mut content = String::new();
+
+        content += &self.declarations(&document.decls, 0)?;
+
+        Ok((document.package.clone().unwrap_or_default(), content))
+    }
+
+    pub fn declarations(&self, decls: &Vec<parser::Declaration>, indent: usize) -> Result<String, Box<dyn Error>> {
+        let mut content = String::new();
+
+        for decl in decls {
+            match decl {
+                parser::Declaration::Interface(decl) => {
+                    let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                    content += &self.decl_interface(decl, indent)?;
+                }
+
+                parser::Declaration::Parcelable(decl) => {
+                    let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                    content += &self.decl_parcelable(decl, indent)?;
+                }
+
+                parser::Declaration::Variable(_decl) => {
+                    unreachable!("Unexpected Declaration::Variable : {:?}", _decl);
+                }
+
+                parser::Declaration::Enum(decl) => {
+                    let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                    content += &self.decl_enum(decl, indent)?;
+                }
+
+                parser::Declaration::Union(decl) => {
+                    let _ns = parser::NamespaceGuard::new(&decl.namespace);
+                    content += &self.decl_union(decl, indent)?;
+                }
+            }
+        }
+
+        Ok(content)
+    }
+
+    fn decl_interface(&self, arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+        let mut is_empty = false;
+        let mut decl = arg_decl.clone();
+
+        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
+            is_empty = true;
+            // return Ok(String::new())
+        }
+
+        decl.pre_process();
+
+        let mut const_members = Vec::new();
+        let mut fn_members = Vec::new();
+
+        if !is_empty {
+            for constant in decl.constant_list.iter() {
+                let generator = constant.r#type.to_generator();
+                const_members.push((constant.const_identifier(),
+                    generator.const_type_decl(), generator.init_value(constant.const_expr.as_ref(), true)));
+            }
+
+            for method in decl.method_list.iter() {
+                fn_members.push(make_fn_member(method)?);
+            }
+        }
+
+        let enabled_async = if self.enabled_async || cfg!(feature = "async") { true } else { false };
+
+        let nested = &self.declarations(&decl.members, indent + 1)?;
+
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+            .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
+
+        let mut context = self.new_context();
+
+        context.insert("mod", &decl.name);
+        context.insert("name", &decl.name);
+        context.insert("namespace", &namespace);
+        context.insert("const_members", &const_members);
+        context.insert("fn_members", &fn_members);
+        context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
+        context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
+        context.insert("oneway", &decl.oneway);
+        context.insert("nested", &nested.trim());
+        context.insert("enabled_async", &enabled_async);
+
+        let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
+
+        Ok(add_indent(indent, rendered.trim()))
+    }
+
+    fn decl_parcelable(&self, arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+        let mut is_empty = false;
+        let mut decl = arg_decl.clone();
+
+        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
+            println!("Parcelable {} is only used for Java.", decl.name);
+            is_empty = true;
+            // return Ok(String::new())
+        }
+        if !decl.cpp_header.is_empty() {
+            println!("cpp_header {} for Parcelable {} is not supported.", decl.cpp_header, decl.name);
+            is_empty = true;
+            // return Ok(String::new())
+        }
+
+        decl.pre_process();
+
+        let mut constant_members = Vec::new();
+        let mut members = Vec::new();
+        let mut declations = Vec::new();
+
+        if !is_empty {
+            // Parse struct variables only.
+            for decl in &decl.members {
+                if let Some(var) = decl.is_variable() {
+                    let generator = var.r#type.to_generator();
+
+                    if var.constant {
+                        constant_members.push((var.const_identifier(),
+                            generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
+                    } else {
+                        members.push(
+                            (
+                                var.identifier(),
+                                generator.type_declaration(true),
+                                generator.init_value(var.const_expr.as_ref(), false)
+                            )
+                        )
+                    }
+                } else {
+                    declations.push(decl.clone());
+                }
+            }
+        }
+
+        let nested = &self.declarations(&declations, indent+1)?;
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+            .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
+
+        let mut context = self.new_context();
+
+        context.insert("mod", &decl.name);
+        context.insert("name", &decl.name);
+        context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
+        context.insert("namespace", &namespace);
+        context.insert("members", &members);
+        context.insert("const_members", &constant_members);
+        context.insert("nested", &nested.trim());
+
+        let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
+
+        Ok(add_indent(indent, rendered.trim()))
+    }
+
+    fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
+            return Ok(String::new())
+        }
+
+        let generator = &parser::get_backing_type(&decl.annotation_list);
+
+        let mut members = Vec::new();
+        let mut enum_val: i64 = 0;
+        for enumerator in &decl.enumerator_list {
+            if let Some(const_expr) = &enumerator.const_expr {
+                enum_val = const_expr.calculate().to_i64();
+            }
+            members.push((enumerator.identifier.to_owned(), enum_val));
+            enum_val += 1;
+        }
+
+        let mut context = self.new_context();
+
+        context.insert("mod", &decl.name);
+        context.insert("enum_name", &decl.name);
+        context.insert("enum_type", &generator.clone().direction(&Direction::None).type_declaration(true));
+        context.insert("enum_len", &decl.enumerator_list.len());
+        context.insert("members", &members);
+
+        let rendered = TEMPLATES.render("enum", &context).expect("Failed to render enum template");
+
+        Ok(add_indent(indent, rendered.trim()))
+    }
+
+    fn decl_union(&self, decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
+            return Ok(String::new())
+        }
+
+        let mut constant_members = Vec::new();
+        let mut members = Vec::new();
+
+        for member in &decl.members {
+            if let parser::Declaration::Variable(var) = member {
                 let generator = var.r#type.to_generator();
-
                 if var.constant {
                     constant_members.push((var.const_identifier(),
                         generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
                 } else {
-                    members.push(
-                        (
-                            var.identifier(),
-                            generator.type_declaration(true),
-                            generator.init_value(var.const_expr.as_ref(), false)
-                        )
-                    )
+                    members.push((var.union_identifier(), generator.type_declaration(true), var.identifier(), generator.default_value()));
                 }
             } else {
-                declations.push(decl.clone());
+                unreachable!();
             }
         }
+
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+            .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
+
+        let mut context = self.new_context();
+
+        context.insert("mod", &decl.name);
+        context.insert("union_name", &decl.name);
+        context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
+        context.insert("namespace", &namespace);
+        context.insert("members", &members);
+        context.insert("const_members", &constant_members);
+
+        let rendered = TEMPLATES.render("union", &context).expect("Failed to render union template");
+
+        Ok(add_indent(indent, rendered.trim()))
     }
-
-    let nested = &gen_declations(&declations, indent+1, enabled_async)?;
-    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
-        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
-
-    let mut context = tera::Context::new();
-
-    context.insert("mod", &decl.name);
-    context.insert("name", &decl.name);
-    context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
-    context.insert("namespace", &namespace);
-    context.insert("members", &members);
-    context.insert("const_members", &constant_members);
-    context.insert("nested", &nested.trim());
-
-    let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
-
-    Ok(add_indent(indent, rendered.trim()))
-}
-
-fn gen_enum(decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
-        return Ok(String::new())
-    }
-
-    let generator = &parser::get_backing_type(&decl.annotation_list);
-
-    let mut members = Vec::new();
-    let mut enum_val: i64 = 0;
-    for enumerator in &decl.enumerator_list {
-        if let Some(const_expr) = &enumerator.const_expr {
-            enum_val = const_expr.calculate().to_i64();
-        }
-        members.push((enumerator.identifier.to_owned(), enum_val));
-        enum_val += 1;
-    }
-
-    let mut context = tera::Context::new();
-
-    context.insert("mod", &decl.name);
-    context.insert("enum_name", &decl.name);
-    context.insert("enum_type", &generator.clone().direction(&Direction::None).type_declaration(true));
-    context.insert("enum_len", &decl.enumerator_list.len());
-    context.insert("members", &members);
-
-    let rendered = TEMPLATES.render("enum", &context).expect("Failed to render enum template");
-
-    Ok(add_indent(indent, rendered.trim()))
-}
-
-fn gen_union(decl: &parser::UnionDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-    if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
-        return Ok(String::new())
-    }
-
-    let mut constant_members = Vec::new();
-    let mut members = Vec::new();
-
-    for member in &decl.members {
-        if let parser::Declaration::Variable(var) = member {
-            let generator = var.r#type.to_generator();
-            if var.constant {
-                constant_members.push((var.const_identifier(),
-                    generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
-            } else {
-                members.push((var.union_identifier(), generator.type_declaration(true), var.identifier(), generator.default_value()));
-            }
-        } else {
-            unreachable!();
-        }
-    }
-
-    let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
-        .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
-
-    let mut context = tera::Context::new();
-
-    context.insert("mod", &decl.name);
-    context.insert("union_name", &decl.name);
-    context.insert("derive", &parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::RustDerive).1);
-    context.insert("namespace", &namespace);
-    context.insert("members", &members);
-    context.insert("const_members", &constant_members);
-
-    let rendered = TEMPLATES.render("union", &context).expect("Failed to render union template");
-
-    Ok(add_indent(indent, rendered.trim()))
-}
-
-
-pub fn gen_declations(decls: &Vec<parser::Declaration>, indent: usize, enabled_async: bool) -> Result<String, Box<dyn Error>> {
-    let mut content = String::new();
-
-    for decl in decls {
-        match decl {
-            parser::Declaration::Interface(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_interface(decl, indent, enabled_async)?;
-            }
-
-            parser::Declaration::Parcelable(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_parcelable(decl, indent, enabled_async)?;
-            }
-
-            parser::Declaration::Variable(_decl) => {
-                unreachable!("Unexpected Declaration::Variable : {:?}", _decl);
-            }
-
-            parser::Declaration::Enum(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_enum(decl, indent)?;
-            }
-
-            parser::Declaration::Union(decl) => {
-                let _ns = parser::NamespaceGuard::new(&decl.namespace);
-                content += &gen_union(decl, indent)?;
-            }
-        }
-    }
-
-    Ok(content)
-}
-
-pub fn gen_document(document: &parser::Document, enabled_async: bool) -> Result<(String, String), Box<dyn Error>> {
-    parser::set_current_document(document);
-
-    let mut content = String::new();
-
-    content += &gen_declations(&document.decls, 0, enabled_async)?;
-
-    Ok((document.package.clone().unwrap_or_default(), content))
 }

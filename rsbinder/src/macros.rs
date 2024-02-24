@@ -80,7 +80,7 @@ macro_rules! __declare_binder_interface {
         $(
             // Async interface trait implementations.
             impl<P: $crate::BinderAsyncPool> $crate::FromIBinder for dyn $async_interface<P> {
-                fn try_from(mut ibinder: $crate::SIBinder) -> std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
+                fn try_from(ibinder: $crate::SIBinder) -> std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
                         Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
                         None => {
@@ -202,7 +202,7 @@ macro_rules! declare_binder_interface {
                 },
                 proxy: $proxy {},
                 $(r#async: $async_interface,)?
-                stability: rsbinder::Stability::default(),
+                stability: $crate::Stability::default(),
             }
         }
     };

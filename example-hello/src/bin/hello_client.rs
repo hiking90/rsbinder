@@ -3,9 +3,9 @@
 #![allow(non_snake_case)]
 
 use std::sync::Arc;
-use rsbinder_hub::{IServiceManager, IServiceCallback, BnServiceCallback};
 use env_logger::Env;
 use rsbinder::*;
+use hub::{IServiceManager, IServiceCallback, BnServiceCallback};
 use example_hello::*;
 
 struct MyServiceCallback {
@@ -36,11 +36,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // The meaning of zero max threads is to use the default value. It is dependent on the kernel.
     ProcessState::init(DEFAULT_BINDER_PATH, 0);
     // Get binder service manager.
-    let hub = rsbinder_hub::default();
+    let hub = hub::default();
 
     println!("list services:");
     // This is an example of how to use service manager.
-    for name in hub.listServices(rsbinder_hub::DUMP_FLAG_PRIORITY_DEFAULT)? {
+    for name in hub.listServices(hub::DUMP_FLAG_PRIORITY_DEFAULT)? {
         println!("{}", name);
     }
 
@@ -48,7 +48,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     hub.registerForNotifications(SERVICE_NAME, &service_callback)?;
 
     // Create a Hello proxy from binder service manager.
-    let hello: rsbinder::Strong<dyn IHello> = rsbinder_hub::get_interface(SERVICE_NAME)
+    let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
         .expect(&format!("Can't find {SERVICE_NAME}"));
 
     hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;

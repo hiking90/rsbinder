@@ -6,7 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/service_manager.rs"));
 use std::sync::{Arc, Once};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rsbinder::*;
+use crate::*;
 pub use android::os::IServiceManager::{
     IServiceManager, BpServiceManager, BnServiceManager,
     DUMP_FLAG_PRIORITY_CRITICAL,
@@ -85,12 +85,12 @@ pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<()
 }
 
 /// Request a callback when a service is registered.
-pub fn register_for_notifications(name: &str, callback: &rsbinder::Strong<dyn IServiceCallback>) -> Result<()> {
+pub fn register_for_notifications(name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
     default().registerForNotifications(name, callback).map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
-pub fn unregister_for_notifications(name: &str, callback: &rsbinder::Strong<dyn IServiceCallback>) -> Result<()> {
+pub fn unregister_for_notifications(name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
     default().unregisterForNotifications(name, callback).map_err(|e| e.into())
 }
 
@@ -119,7 +119,7 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
 mod tests {
     #![allow(non_snake_case)]
 
-    use crate::*;
+    use super::*;
     use std::sync::OnceLock;
 
     fn setup() {
@@ -127,13 +127,13 @@ mod tests {
 
         let _ = INIT.get_or_init(|| {
             env_logger::init();
-            rsbinder::ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 0);
+            crate::ProcessState::init(crate::DEFAULT_BINDER_PATH, 0);
             true
         });
     }
 
     #[test]
-    fn test_get_check_list_service() -> rsbinder::Result<()> {
+    fn test_get_check_list_service() -> crate::Result<()> {
         setup();
 
         #[cfg(target_os = "android")]
@@ -159,13 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn test_notifications() -> rsbinder::Result<()> {
+    fn test_notifications() -> crate::Result<()> {
         setup();
 
         struct MyServiceCallback {}
-        impl rsbinder::Interface for MyServiceCallback {}
+        impl crate::Interface for MyServiceCallback {}
         impl IServiceCallback for MyServiceCallback {
-            fn onRegistration(&self, name: &str, service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
+            fn onRegistration(&self, name: &str, service: &crate::SIBinder) -> crate::status::Result<()> {
                 println!("onRegistration: {} {:?}", name, service);
                 Ok(())
             }
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_others() -> rsbinder::Result<()> {
+    fn test_others() -> crate::Result<()> {
         setup();
 
         assert_eq!(is_declared("android.hardware.usb.IUsb/default"), false);

@@ -43,7 +43,6 @@ use android::aidl::versioned::tests::{
     BazUnion::BazUnion, Foo::Foo, IFooInterface, IFooInterface::BnFooInterface,
     IFooInterface::BpFooInterface,
 };
-use rsbinder_tokio::Tokio;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -693,9 +692,9 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
     }
 }
 
-fn rt() -> rsbinder_tokio::TokioRuntime<tokio::runtime::Runtime> {
+fn rt() -> TokioRuntime<tokio::runtime::Runtime> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rsbinder_tokio::TokioRuntime(rt)
+    TokioRuntime(rt)
 }
 
 fn main() {
@@ -707,12 +706,12 @@ fn main() {
     let service_name = <BpTestService as ITestService::ITestService>::descriptor();
     let service =
         BnTestService::new_async_binder(TestService::default(), rt());
-    rsbinder_hub::add_service(service_name, service.as_binder()).expect("Could not register service");
+    hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
     let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
     let versioned_service =
         BnFooInterface::new_async_binder(FooInterface, rt());
-    rsbinder_hub::add_service(versioned_service_name, versioned_service.as_binder())
+    hub::add_service(versioned_service_name, versioned_service.as_binder())
         .expect("Could not register service");
 
     let nested_service_name =
@@ -721,7 +720,7 @@ fn main() {
         NestedService,
         rt(),
     );
-    rsbinder_hub::add_service(nested_service_name, nested_service.as_binder())
+    hub::add_service(nested_service_name, nested_service.as_binder())
         .expect("Could not register service");
 
     let fixed_size_array_service_name =
@@ -730,7 +729,7 @@ fn main() {
         FixedSizeArrayService,
         rt(),
     );
-    rsbinder_hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
+    hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
     .expect("Could not register service");
 
     ProcessState::join_thread_pool().expect("Failed to join thread pool");

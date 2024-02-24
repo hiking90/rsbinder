@@ -13,7 +13,7 @@ mod generator;
 mod const_expr;
 mod type_generator;
 pub use parser::parse_document;
-pub use generator::gen_document;
+pub use generator::Generator;
 
 #[derive(Default, Hash, Eq, PartialEq, Debug, Clone)]
 pub struct Namespace{
@@ -95,6 +95,7 @@ pub struct Builder {
     dest_dir: PathBuf,
     output: PathBuf,
     enabled_async: bool,
+    is_crate: bool,
 }
 
 impl Default for Builder {
@@ -111,6 +112,7 @@ impl Builder {
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
             output: "rsbinder_generated_aidl.rs".into(),
             enabled_async: false,
+            is_crate: false,
         }
     }
 
@@ -131,6 +133,12 @@ impl Builder {
 
     pub fn set_async_support(mut self, enable: bool) -> Self {
         self.enabled_async = enable;
+        self
+    }
+
+    pub fn set_crate_support(mut self, enable: bool) -> Self {
+        self.is_crate = enable;
+        type_generator::set_crate_support(enable);
         self
     }
 
@@ -232,7 +240,8 @@ impl Builder {
         let mut package_list = Vec::new();
         for document in document_list {
             println!("Generating: {}", document.0);
-            let package = generator::gen_document(&document.1, self.enabled_async)?;
+            let gen = generator::Generator::new(self.enabled_async, self.is_crate);
+            let package = gen.document(&document.1)?;
             package_list.push((package.0, package.1, document.0));
         }
 
