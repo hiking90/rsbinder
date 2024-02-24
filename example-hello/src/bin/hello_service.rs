@@ -1,9 +1,9 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use rsbinder_hub::IServiceManager;
 use env_logger::Env;
 use rsbinder::*;
+use hub::IServiceManager;
 
 use example_hello::*;
 
@@ -33,8 +33,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let service = BnHello::new_binder(IHelloService{});
 
     // Add the service to binder service manager.
-    let hub = rsbinder_hub::default();
-    hub.addService(SERVICE_NAME, &service.as_binder(), false, rsbinder_hub::DUMP_FLAG_PRIORITY_DEFAULT)?;
+    let hub = hub::default();
+    hub.addService(SERVICE_NAME, &service.as_binder(), false, hub::DUMP_FLAG_PRIORITY_DEFAULT)?;
 
     Ok(ProcessState::join_thread_pool()?)
 }

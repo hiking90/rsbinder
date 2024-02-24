@@ -32,6 +32,10 @@ mod ref_counter;
 #[cfg(feature = "async")]
 pub mod binder_async;
 
+pub mod hub;
+#[cfg(feature = "async")]
+mod rt;
+
 pub use process_state::ProcessState;
 pub use parcel::Parcel;
 pub use status::{ExceptionCode, Status};
@@ -44,6 +48,8 @@ pub use file_descriptor::ParcelFileDescriptor;
 pub use parcelable_holder::{ParcelableHolder, ParcelableMetadata};
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
+#[cfg(all(feature = "tokio"))]
+pub use rt::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";

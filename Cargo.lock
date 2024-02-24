@@ -332,7 +332,6 @@ dependencies = [
  "lazy_static",
  "rsbinder",
  "rsbinder-aidl",
- "rsbinder-hub",
 ]
 
 [[package]]
@@ -797,9 +796,13 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "downcast-rs",
+ "env_logger",
+ "lazy_static",
  "log",
  "nix",
  "pretty-hex",
+ "rsbinder-aidl",
+ "tokio",
 ]
 
 [[package]]
@@ -816,18 +819,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsbinder-hub"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "env_logger",
- "lazy_static",
- "log",
- "rsbinder",
- "rsbinder-aidl",
-]
-
-[[package]]
 name = "rsbinder-tests"
 version = "0.2.0"
 dependencies = [
@@ -837,19 +828,6 @@ dependencies = [
  "nix",
  "rsbinder",
  "rsbinder-aidl",
- "rsbinder-hub",
- "rsbinder-tokio",
- "tokio",
-]
-
-[[package]]
-name = "rsbinder-tokio"
-version = "0.2.0"
-dependencies = [
- "lazy_static",
- "log",
- "rsbinder",
- "rsbinder-hub",
  "tokio",
 ]
 
@@ -863,7 +841,6 @@ dependencies = [
  "log",
  "nix",
  "rsbinder",
- "rsbinder-hub",
 ]
 
 [[package]]

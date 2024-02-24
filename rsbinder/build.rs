@@ -13,5 +13,8 @@ fn main() {
         .source(PathBuf::from("aidl/android/os/ServiceDebugInfo.aidl"))
 
         .output(PathBuf::from("service_manager.rs"))
+
+        .set_crate_support(true)
+
         .generate().unwrap();
 }
