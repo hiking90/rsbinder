@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "This provides a few CLI binder tools for Linux."
-homepage = "https://github.com/hiking90/rsbinder"
+homepage = "https://hiking90.github.io/rsbinder-book/"
 repository = "https://github.com/hiking90/rsbinder/rsbinder-tools"
 readme = "README.md"
 

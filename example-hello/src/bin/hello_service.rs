@@ -3,20 +3,24 @@
 
 use env_logger::Env;
 use rsbinder::*;
-use hub::IServiceManager;
 
 use example_hello::*;
 
+// Define the name of the service to be registered in the HUB(service manager).
 struct IHelloService;
 
+// Implement the IHello interface for the IHelloService.
 impl Interface for IHelloService {
+    // Reimplement the dump method. This is optional.
     fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
         writeln!(writer, "Dump IHelloService")?;
         Ok(())
     }
 }
 
+// Implement the IHello interface for the IHelloService.
 impl IHello for IHelloService {
+    // Implement the echo method.
     fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
         Ok(echo.to_owned())
     }
@@ -25,16 +29,20 @@ impl IHello for IHelloService {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with binder path and max threads.
-    // The meaning of zero max threads is to use the default value. It is dependent on the kernel.
-    ProcessState::init(DEFAULT_BINDER_PATH, 0);
+    // Initialize ProcessState with the default binder path and the default max threads.
+    ProcessState::init_default();
+
+    // Start the thread pool.
+    // This is optional. If you don't call this, only one thread will be created to handle the binder transactions.
+    ProcessState::start_thread_pool();
 
     // Create a binder service.
     let service = BnHello::new_binder(IHelloService{});
 
     // Add the service to binder service manager.
-    let hub = hub::default();
-    hub.addService(SERVICE_NAME, &service.as_binder(), false, hub::DUMP_FLAG_PRIORITY_DEFAULT)?;
+    hub::add_service(SERVICE_NAME, service.as_binder())?;
 
+    // Join the thread pool.
+    // This is a blocking call. It will return when the thread pool is terminated.
     Ok(ProcessState::join_thread_pool()?)
 }
