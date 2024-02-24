@@ -112,7 +112,7 @@ function remote_shell() {
     command ssh "$remote_user_host" -t "cd $remote_directory; bash"
 }
 
-declare -a publish_dirs=("rsbinder" "rsbinder-aidl" "rsbinder-hub" "rsbinder-tools" "rsbinder-tokio")
+declare -a publish_dirs=("rsbinder-aidl" "rsbinder" "rsbinder-tools")
 
 function publish() {
     local cargo_options=()
