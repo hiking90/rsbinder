@@ -11,9 +11,9 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = "1"
+lazy_static = "1.4"
 rsbinder = { version = "0.2.0", path = "../rsbinder" }
 log = "0.4"
 env_logger = "0.11"
-nix = "0"
+nix = "0.28"
 anstyle = "1.0"

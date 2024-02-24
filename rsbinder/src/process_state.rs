@@ -1,6 +1,8 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::os::raw::c_void;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, OnceLock};
@@ -31,7 +33,7 @@ const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
 struct MemoryMap {
-    ptr: *mut std::ffi::c_void,
+    ptr: NonNull<c_void>,
     size: usize,
 }
 unsafe impl Sync for MemoryMap {}
@@ -93,7 +95,7 @@ impl ProcessState {
                 vm_size,
                 nix::sys::mman::ProtFlags::PROT_READ,
                 nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
-                Some(&driver),
+                &driver,
                 0)?;
 
             (vm_start, vm_size)
@@ -305,9 +307,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mut mmap = self.mmap.write().unwrap();
+        let mmap = self.mmap.write().unwrap();
         unsafe { nix::sys::mman::munmap(mmap.ptr, mmap.size).unwrap(); }
-        mmap.ptr = std::ptr::null_mut();
-        mmap.size = 0;
     }
 }

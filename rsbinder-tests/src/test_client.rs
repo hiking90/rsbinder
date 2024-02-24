@@ -40,7 +40,7 @@ use android::aidl::versioned::tests::{
 use android::aidl::tests::vintf::{
     VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
 };
-use std::fs::File;
+use std::{fs::File, os::fd::IntoRawFd};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
@@ -326,7 +326,7 @@ fn build_pipe() -> (File, File) {
     // and pass them after checking if the function returned
     // without an error, so the descriptors should be valid
     // by that point
-    unsafe { (File::from_raw_fd(fds.0), File::from_raw_fd(fds.1)) }
+    unsafe { (File::from_raw_fd(fds.0.into_raw_fd()), File::from_raw_fd(fds.1.into_raw_fd())) }
 }
 
 /// Helper function that constructs a `File` from a `ParcelFileDescriptor`.

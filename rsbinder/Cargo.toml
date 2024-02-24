@@ -18,12 +18,12 @@ tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
 
 [dependencies]
-nix = { version = "0", features = ["ioctl", "mount", "fs", "feature", "mman", "process"] }
+nix = { version = "0.28", features = ["ioctl", "mount", "fs", "feature", "mman", "process"] }
 log = "0.4"
-pretty_hex = { version = "0", package = "pretty-hex" }
+pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "1.2"
 async-trait = { version = "0.1", optional = true }
-lazy_static = "1"
+lazy_static = "1.4"
 tokio = { version = "1.35", optional = true, default-features = false }
 
 [build-dependencies]
