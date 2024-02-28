@@ -57,8 +57,8 @@ fn init_test() {
 fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
     init_test();
     hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-        .expect(format!("did not get binder service: {}",
-            <BpTestService as ITestService::ITestService>::descriptor()).as_str())
+        .unwrap_or_else(|_| panic!("did not get binder service: {}",
+            <BpTestService as ITestService::ITestService>::descriptor()))
 }
 
 #[test]

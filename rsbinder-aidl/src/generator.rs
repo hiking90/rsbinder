@@ -431,12 +431,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         let arg_str = format!(", {}: {}", generator.identifier, type_decl_for_func);
 
         args += &arg_str;
-        args_async += &arg_str.replace("&", "&'a ");
-        // args_async += &if type_decl_for_func.starts_with('&') {
-        //     format!(", {}: &'a {}", generator.identifier, &type_decl_for_func[1..])
-        // } else {
-        //     format!(", {}: {}", generator.identifier, type_decl_for_func)
-        // };
+        args_async += &arg_str.replace('&', "&'a ");
         func_call_params += &format!("{}, ", generator.identifier);
 
         if !matches!(arg.direction, Direction::Out) {
@@ -591,7 +586,7 @@ impl Generator {
             }
         }
 
-        let enabled_async = if self.enabled_async || cfg!(feature = "async") { true } else { false };
+        let enabled_async = self.enabled_async || cfg!(feature = "async");
 
         let nested = &self.declarations(&decl.members, indent + 1)?;
 

@@ -665,7 +665,7 @@ mod tests {
                 if binder.descriptor() != Self::descriptor() {
                     return None
                 }
-                if let Some(_) = binder.as_proxy() {
+                if binder.as_proxy().is_some() {
                     Some(Self { binder })
                 } else {
                     None
