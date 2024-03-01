@@ -8,8 +8,7 @@ While Android's Binder IPC mechanism was merged into the Linux kernel back in 20
 
 One key reason for limited adoption is the lack of readily available tools and libraries optimized for the Linux world. This project tackles that challenge by leveraging Rust's strengths for efficient thread utilization, a crucial aspect for maximizing Binder IPC performance on Linux.
 
-However, this project focuses on pure Rust implementations. If you're interested in C++-based Binder IPC for Linux, consider checking out the [binder-linux] project.
-[binder-linux]: https://github.com/hiking90/binder-linux
+However, this project focuses on pure Rust implementations. If you're interested in C++-based Binder IPC for Linux, consider checking out the [binder-linux](https://github.com/hiking90/binder-linux) project.
 
 Although this project focuses on supporting Binder IPC in the Linux environment, it also provides compatibility with Android's Binder IPC. [Compatibility Goal with Android Binder](#Compatibility-Goal-with-Android-Binder)
 
