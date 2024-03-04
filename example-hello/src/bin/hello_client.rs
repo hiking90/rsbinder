@@ -46,7 +46,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Create a Hello proxy from binder service manager.
     let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
-        .expect(&format!("Can't find {SERVICE_NAME}"));
+        .unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
 
     hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;
 

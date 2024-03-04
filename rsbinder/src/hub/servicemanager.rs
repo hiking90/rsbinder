@@ -184,7 +184,7 @@ mod tests {
     fn test_others() -> crate::Result<()> {
         setup();
 
-        assert_eq!(is_declared("android.hardware.usb.IUsb/default"), false);
+        assert!(!is_declared("android.hardware.usb.IUsb/default"));
 
         Ok(())
     }

@@ -510,7 +510,7 @@ impl Parcel {
             return Ok(())
         }
 
-        let size = std::mem::size_of::<S>() * len;
+        let size = std::mem::size_of_val(parcelable);
         let padded = pad_size(size);
         let pos = self.pos;
 
@@ -521,7 +521,7 @@ impl Parcel {
                 self.data.as_mut_ptr().add(pos) as _,
                 size);
             if self.data.len() < pos + padded {
-                self.data.set_len((pos + padded) as usize);
+                self.data.set_len(pos + padded);
             }
         }
 
@@ -579,7 +579,7 @@ impl Parcel {
                 self.data.as_mut_ptr().add(pos) as _,
                 unaligned);
             if pos + aligned > self.data.len() {
-                self.data.set_len((pos + aligned) as usize);
+                self.data.set_len(pos + aligned);
             }
         }
 
@@ -704,7 +704,7 @@ impl Parcel {
                 self.data.as_mut_ptr().add(self.pos) as _,
                 size);
             if self.pos + size > self.data.len() {
-                self.data.set_len((self.pos + size) as usize);
+                self.data.set_len(self.pos + size);
             }
         }
         self.set_data_position(self.pos + size);

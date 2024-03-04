@@ -48,7 +48,7 @@ pub use file_descriptor::ParcelFileDescriptor;
 pub use parcelable_holder::{ParcelableHolder, ParcelableMetadata};
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
-#[cfg(all(feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub use rt::*;
 
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

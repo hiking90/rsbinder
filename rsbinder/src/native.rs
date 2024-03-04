@@ -176,7 +176,7 @@ impl<T: Remotable> Transactable for Inner<T> {
             }
 
             _ => {
-                if (code >= FIRST_CALL_TRANSACTION && code <= LAST_CALL_TRANSACTION) &&
+                if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code) &&
                     !(thread_state::check_interface(reader, T::descriptor())?) {
                     reply.write(&StatusCode::BadType)?;
                     return Ok(());
