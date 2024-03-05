@@ -298,8 +298,9 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
         log::info!("Binder driver max threads set to {}", max_threads);
 
         let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
-        binder::enable_oneway_spam_detection(raw_fd, &enable)
-            .map_err(|e| format!("Binder ioctl to enable oneway spam detection failed: {}", e))?;
+        if let Err(e) = binder::enable_oneway_spam_detection(raw_fd, &enable){
+            log::warn!("Binder ioctl to enable oneway spam detection failed: {}", e)
+        }
     }
 
     Ok(fd)
