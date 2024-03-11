@@ -272,6 +272,7 @@ pub enum Stability {
     Vintf,
 }
 
+#[cfg(not(target_os = "android"))]
 impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
         use Stability::*;
@@ -284,15 +285,66 @@ impl From<Stability> for i32 {
     }
 }
 
+// Android 12 version uses "Category" as the stability format for passed on the wire lines,
+// whereas other versions do not. Therefore, we can use the android_properties crate
+// to determine the Android version and perform different handling accordingly.
+// http://aospxref.com/android-11.0.0_r21/xref/frameworks/native/libs/binder/include/binder/Stability.h
+// http://aospxref.com/android-12.0.0_r3/xref/frameworks/native/include/binder/Stability.h
+// http://aospxref.com/android-13.0.0_r3/xref/frameworks/native/libs/binder/include/binder/Stability.h
+// http://aospxref.com/android-14.0.0_r2/xref/frameworks/native/libs/binder/include/binder/Stability.h
+#[cfg(target_os = "android")]
+use android_properties::AndroidProperty;
+
+#[cfg(target_os = "android")]
+use lazy_static::lazy_static;
+
+#[cfg(target_os = "android")]
+lazy_static! {
+    #[derive(Debug)]
+    static ref ANDROID_VERSION: String  = {
+            let mut android_version = AndroidProperty::new("ro.build.version.release");
+            match android_version.value() {
+                Some(value) => value,
+                None => "".to_string(),
+            }
+    };
+}
+
+#[cfg(target_os = "android")]
+impl From<Stability> for i32 {
+    fn from(stability: Stability) -> i32 {
+        use Stability::*;
+        match ANDROID_VERSION.as_str() {
+            "12" => {
+                match stability {
+                    Local => 0,
+                    Vendor => 0x0c000003,
+                    System => 0x0c00000c,
+                    Vintf => 0x0c00003f,
+                }
+            }
+            _ => {
+                match stability {
+                    Local => 0,
+                    Vendor => 0b000011,
+                    System => 0b001100,
+                    Vintf => 0b111111,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 impl TryFrom<i32> for Stability {
     type Error = StatusCode;
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
         match stability {
-            stability if stability == Stability::Local.into() => Ok(Local),
-            stability if stability == Stability::Vendor.into() => Ok(Vendor),
-            stability if stability == Stability::System.into() => Ok(System),
-            stability if stability == Stability::Vintf.into() => Ok(Vintf),
+            stability if stability == Local.into() => Ok(Local),
+            stability if stability == Vendor.into() => Ok(Vendor),
+            stability if stability == System.into() => Ok(System),
+            stability if stability == Vintf.into() => Ok(Vintf),
             _ => {
                 log::error!("Stability value is invalid: {}", stability);
                 Err(StatusCode::BadValue)
@@ -301,6 +353,23 @@ impl TryFrom<i32> for Stability {
     }
 }
 
+#[cfg(target_os = "android")]
+impl TryFrom<i32> for Stability {
+    type Error = StatusCode;
+    fn try_from(stability: i32) -> Result<Stability> {
+        use Stability::*;
+        match stability {
+            stability if stability == Local.into() => Ok(Local),
+            stability if stability == Vendor.into() => Ok(Vendor),
+            stability if stability == System.into() => Ok(System),
+            stability if stability == Vintf.into() => Ok(Vintf),
+            _ => {
+                log::error!("Stability value is invalid: {}", stability);
+                Err(StatusCode::BadValue)
+            }
+        }
+    }
+}
 
 /// Strong reference to a binder object.
 pub struct SIBinder {

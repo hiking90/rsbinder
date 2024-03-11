@@ -26,6 +26,9 @@ async-trait = { version = "0.1", optional = true }
 lazy_static = "1.4"
 tokio = { version = "1.35", optional = true, default-features = false }
 
+[target.'cfg(target_os = "android")'.dependencies]
+android-properties = "0.2.2"
+
 [build-dependencies]
 rsbinder-aidl = { version = "0.2.1", path = "../rsbinder-aidl", default-features = false }
 
