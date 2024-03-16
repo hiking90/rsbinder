@@ -29,6 +29,8 @@ impl IHello for IHelloService {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
+    process_with_args();
+
     // Initialize ProcessState with the default binder path and the default max threads.
     ProcessState::init_default();
 
