@@ -55,6 +55,24 @@ pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
 pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 
+#[cfg(target_os = "android")]
+static ANDROID_VERSION: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+pub fn set_android_version(version: i32) {
+    ANDROID_VERSION.set(version).expect("Android version is already set.");
+}
+
+pub fn is_new_stability() -> bool {
+    #[cfg(target_os = "android")]
+    match ANDROID_VERSION.get() {
+        Some(version) => *version >= 12,
+        None => true,   // Support the latest version by default.
+    }
+    #[cfg(not(target_os = "android"))]
+    true
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
