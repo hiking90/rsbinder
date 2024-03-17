@@ -15,7 +15,7 @@ pub fn process_with_args() {
         #[cfg(target_os = "android")]
         if _arg.starts_with("--android-version=") {
             let version = _arg.split('=').collect::<Vec<&str>>()[1];
-            set_android_version(version.parse().expect("Invalid version"));
+            rsbinder::set_android_version(version.parse().expect("Invalid version"));
         }
     });
 }
