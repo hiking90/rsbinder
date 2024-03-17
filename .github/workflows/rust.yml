@@ -23,7 +23,9 @@ jobs:
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
-        targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+        targets: aarch64-linux-android, armv7-linux-androideabi
+    - name: Install ndk targets
+      run: rustup target add x86_64-linux-android
     - name: Build for Linux
       run: cargo build --verbose
     - name: Build for Android
