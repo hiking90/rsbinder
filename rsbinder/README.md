@@ -1,3 +1,4 @@
+[![Rust](https://github.com/hiking90/rsbinder/actions/workflows/rust.yml/badge.svg)](https://github.com/hiking90/rsbinder/actions/workflows/rust.yml)
 # rsbinder
 
 **rsbinder** provides crates implemented in pure Rust that make Binder IPC available on both Android and Linux.
