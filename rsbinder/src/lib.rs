@@ -58,11 +58,13 @@ pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 #[cfg(target_os = "android")]
 static ANDROID_VERSION: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
+/// Set the Android version for compatibility.
 #[cfg(target_os = "android")]
 pub fn set_android_version(version: i32) {
     ANDROID_VERSION.set(version).expect("Android version is already set.");
 }
 
+/// Get binder stability version.
 pub fn is_new_stability() -> bool {
     #[cfg(target_os = "android")]
     match ANDROID_VERSION.get() {
