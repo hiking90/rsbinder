@@ -24,6 +24,7 @@ jobs:
       with:
         toolchain: ${{ matrix.rust }}
         targets: aarch64-linux-android, armv7-linux-androideabi
+        components: rustfmt, clippy
     - name: Install ndk targets
       run: rustup target add x86_64-linux-android
     - name: Build for Linux
