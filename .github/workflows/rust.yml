@@ -49,20 +49,3 @@ jobs:
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
-  binder-prepare:
-    name: binder-prepare
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Anbox Modules
-        uses: actions/checkout@v2
-        with:
-          repository: choff/anbox-modules
-          ref: master 
-  
-      - name: Install DKMS
-        run: sudo apt-get update && sudo apt-get install -y dkms
-  
-      - name: Run install.sh from Anbox Modules
-        run: |
-          chmod +x INSTALL.sh
-          ./INSTALL.sh
