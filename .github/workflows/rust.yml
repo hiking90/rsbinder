@@ -25,12 +25,10 @@ jobs:
         add-to-path: false
     - name: Install ndk targets
       run: rustup target add x86_64-linux-android
-    - name: Build for Linux
-      run: cargo build --verbose
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
     - name: Build for Android
       run: cargo ndk -t x86_64-linux-android build --verbose
-    - name: Run tests
-      run: cargo test --verbose
 
   minrust:
     name: minrust
