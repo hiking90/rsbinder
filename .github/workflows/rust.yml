@@ -11,10 +11,11 @@ env:
   rust_min: '1.71'
 
 jobs:
-  build:
+  android-build:
+    name: android-build
     runs-on: ubuntu-latest
     needs:
-      - minrust
+      - linux-build
 
     steps:
     - uses: actions/checkout@v4
@@ -23,15 +24,16 @@ jobs:
       with:
         ndk-version: r26c
         add-to-path: false
+        local-cache: true
     - name: Install ndk targets
       run: rustup target add x86_64-linux-android
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
     - name: Build for Android
-      run: cargo ndk -t x86_64-linux-android build --verbose
+      run: cargo ndk -t x86_64-linux-android build
 
-  minrust:
-    name: minrust
+  linux-build:
+    name: linux-build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
