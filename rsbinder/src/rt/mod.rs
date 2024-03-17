@@ -1,4 +1,4 @@
 #[cfg(feature = "tokio")]
-mod tokio;
+mod tokio_rt;
 #[cfg(feature = "tokio")]
-pub use tokio::*;
+pub use tokio_rt::*;
