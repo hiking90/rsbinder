@@ -68,11 +68,11 @@ pub fn set_android_version(version: i32) {
 pub fn is_new_stability() -> bool {
     #[cfg(target_os = "android")]
     match ANDROID_VERSION.get() {
-        Some(version) => *version >= 12,
-        None => true,   // Support the latest version by default.
+        Some(version) => *version == 12,
+        None => false,   // Support the latest version by default.
     }
     #[cfg(not(target_os = "android"))]
-    true
+    false
 }
 
 #[cfg(test)]
