@@ -55,24 +55,24 @@ pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
 pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 
+
 #[cfg(target_os = "android")]
 static ANDROID_VERSION: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
 /// Set the Android version for compatibility.
+/// There are compatibility issues with Binder IPC depending on the Android version.
+/// The current findings indicate there are compatibility issues before and after Android 12.
+/// If your software needs to work on both Android 11 and 12,
+/// you must set the Android version using the rsbinder::set_android_version() API.
 #[cfg(target_os = "android")]
 pub fn set_android_version(version: i32) {
     ANDROID_VERSION.set(version).expect("Android version is already set.");
 }
 
-/// Get binder stability version.
-pub fn is_new_stability() -> bool {
-    #[cfg(target_os = "android")]
-    match ANDROID_VERSION.get() {
-        Some(version) => *version == 12,
-        None => false,   // Support the latest version by default.
-    }
-    #[cfg(not(target_os = "android"))]
-    false
+/// Get the Android version.
+#[cfg(target_os = "android")]
+pub fn get_android_version() -> i32 {
+    *ANDROID_VERSION.get().unwrap_or(&0)
 }
 
 #[cfg(test)]

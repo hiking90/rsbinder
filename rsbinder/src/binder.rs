@@ -282,21 +282,22 @@ pub enum Stability {
 impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
         use Stability::*;
-        if crate::is_new_stability() {
-            match stability {
-                Local => 0,
-                Vendor => 0x0c000003,
-                System => 0x0c00000c,
-                Vintf => 0x0c00003f,
-            }
+
+        let stability = match stability {
+            Local => 0,
+            Vendor => 0b000011,
+            System => 0b001100,
+            Vintf => 0b111111,
+        };
+
+        #[cfg(target_os = "android")]
+        if crate::get_android_version() == 12 {
+            stability | 0x0c000000
         } else {
-            match stability {
-                Local => 0,
-                Vendor => 0b000011,
-                System => 0b001100,
-                Vintf => 0b111111,
-            }
+            stability
         }
+        #[cfg(not(target_os = "android"))]
+        stability
     }
 }
 
