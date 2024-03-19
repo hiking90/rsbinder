@@ -1,5 +1,5 @@
 # rsbinder-aidl
-This is a AIDL compiler for **rsbinder**.
+This is an AIDL compiler for **rsbinder**.
 
 ## How to use the AIDL Code Generator
 * Add the build-dependencies to Cargo.toml:
