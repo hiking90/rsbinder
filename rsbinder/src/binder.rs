@@ -263,9 +263,9 @@ where
 pub enum Stability {
     /// Default stability, visible to other modules in the same compilation
     /// context (e.g. modules on system.img)
-    #[default]
     Local,
     Vendor,
+    #[default]
     System,
 
     /// A Vendor Interface Object, which promises to be stable
