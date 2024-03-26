@@ -1,6 +1,6 @@
 [package]
 name = "rsbinder"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "This is a library for Linux Binder communication."
@@ -27,7 +27,7 @@ lazy_static = "1.4"
 tokio = { version = "1.35", optional = true, default-features = false }
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.2.2", path = "../rsbinder-aidl", default-features = false }
+rsbinder-aidl = { version = "0.2.3", path = "../rsbinder-aidl", default-features = false }
 
 [dev-dependencies]
 env_logger = "0.11"

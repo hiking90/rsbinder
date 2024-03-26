@@ -1,6 +1,6 @@
 [package]
 name = "example-hello"
-version = "0.2.2"
+version = "0.2.3"
 publish = false
 edition = "2021"
 
@@ -12,9 +12,9 @@ async = ["rsbinder/async", "rsbinder-aidl/async"]
 
 [dependencies]
 lazy_static = "1.4"
-rsbinder = { version = "0.2.2", path = "../rsbinder", default-features = false }
+rsbinder = { version = "0.2.3", path = "../rsbinder", default-features = false }
 env_logger = "0.11"
 async-trait = "0.1"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.2.2", path = "../rsbinder-aidl", default-features = false }
+rsbinder-aidl = { version = "0.2.3", path = "../rsbinder-aidl", default-features = false }
