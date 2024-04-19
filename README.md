@@ -96,7 +96,6 @@ Complete API parity between rsbinder and Android Binder isn't available due to f
 - [ ] (In Progress) Remove all todo!() and unimplemented!() macros.
 - [ ] (In Progress) Performed compatibility testing with Binder on Android.
 - [ ] Enhance error detection in AIDL code generator
-- [ ] Support Mandatory Access Control likes selinux and AppArmor.
 - [ ] Support AIDL version and hash.
 
 ## License
