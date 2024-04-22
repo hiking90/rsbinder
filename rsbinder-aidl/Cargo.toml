@@ -1,13 +1,13 @@
 [package]
 name = "rsbinder-aidl"
-version = "0.2.3"
-edition = "2021"
-license = "Apache-2.0"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
 description = "This is a AIDL compiler for rsbinder."
-homepage = "https://hiking90.github.io/rsbinder-book/"
-repository = "https://github.com/hiking90/rsbinder/rsbinder-aidl"
+homepage = { workspace = true }
+repository = { workspace = true }
 readme = "README.md"
-rust-version = "1.71"
+rust-version = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
@@ -16,12 +16,12 @@ sync = []
 async = []
 
 [dependencies]
-pest = "2.7"
-pest_derive = "2.7"
-convert_case = "0.6"
-lazy_static = "1.4"
-serde = { version = "1.0", features = ["derive"] }
-tera = "1.19"
+pest = { workspace = true }
+pest_derive = { workspace = true }
+convert_case = { workspace = true }
+lazy_static = { workspace = true }
+serde = { workspace = true }
+tera = { workspace = true }
 
 [dev-dependencies]
-similar = "2.4"
+similar = { workspace = true }

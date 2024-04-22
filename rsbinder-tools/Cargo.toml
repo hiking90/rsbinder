@@ -1,19 +1,19 @@
 [package]
 name = "rsbinder-tools"
-version = "0.2.3"
-edition = "2021"
-license = "Apache-2.0"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
 description = "This provides a few CLI binder tools for Linux."
-homepage = "https://hiking90.github.io/rsbinder-book/"
-repository = "https://github.com/hiking90/rsbinder/rsbinder-tools"
+homepage = { workspace = true }
+repository = { workspace = true }
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = "1.4"
-rsbinder = { version = "0.2.3", path = "../rsbinder" }
-log = "0.4"
-env_logger = "0.11"
-nix = "0.28"
-anstyle = "1.0"
+lazy_static = { workspace = true }
+rsbinder = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+nix = { workspace = true }
+anstyle = { workspace = true }

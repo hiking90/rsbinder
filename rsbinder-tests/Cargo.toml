@@ -1,18 +1,18 @@
 [package]
 name = "rsbinder-tests"
-version = "0.2.3"
-edition = "2021"
+version = { workspace = true }
+edition = { workspace = true }
 publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = "1.4"
-rsbinder = { version = "0.2.3", path = "../rsbinder" }
-tokio = { version = "1.37", features = ["full"] }
-env_logger = "0.11"
-nix = "0.28"
-async-trait = "0.1"
+lazy_static = { workspace = true }
+rsbinder = { workspace = true }
+tokio = { workspace = true }
+env_logger = { workspace = true }
+nix = { workspace = true }
+async-trait = { workspace = true }
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.2.3", path = "../rsbinder-aidl" }
+rsbinder-aidl = { workspace = true }
