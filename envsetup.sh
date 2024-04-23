@@ -139,3 +139,10 @@ function publish() {
 function publish_dry_run() {
     publish --dry-run
 }
+
+function version_update() {
+    local NEW_VERSION="$1"
+
+    sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" $TOP_DIR/Cargo.toml
+    sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" $TOP_DIR/Cargo.toml
+}
