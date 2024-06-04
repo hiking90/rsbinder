@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 homepage = "https://hiking90.github.io/rsbinder-book/"
@@ -19,14 +19,14 @@ rust-version = "1.71"
 
 [workspace.dependencies]
 lazy_static = "1.4"
-rsbinder = { version = "0.2.3", path = "rsbinder", default-features = false }
+rsbinder = { version = "0.2.4", path = "rsbinder", default-features = false }
 log = "0.4"
 env_logger = "0.11"
 nix = "0.28"
 anstyle = "1.0"
 tokio = { version = "1.37", default-features = false }
 async-trait = "0.1"
-rsbinder-aidl = { version = "0.2.3", path = "rsbinder-aidl", default-features = false }
+rsbinder-aidl = { version = "0.2.4", path = "rsbinder-aidl", default-features = false }
 pest = "2.7"
 pest_derive = "2.7"
 convert_case = "0.6"
