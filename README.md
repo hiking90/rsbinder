@@ -92,8 +92,8 @@ Complete API parity between rsbinder and Android Binder isn't available due to f
 - [x] Implement ParcelFileDescriptor.
 - [x] Port Android test_service and test_client and pass the test cases.
 - [x] Support Tokio async.
+- [x] Remove all todo!() and unimplemented!() macros.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] (In Progress) Remove all todo!() and unimplemented!() macros.
 - [ ] (In Progress) Performed compatibility testing with Binder on Android.
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support AIDL version and hash.
