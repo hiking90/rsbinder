@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::os::raw::c_void;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, OnceLock};
 use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::thread;
 
 use crate::{
@@ -33,7 +31,7 @@ const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
 struct MemoryMap {
-    ptr: NonNull<c_void>,
+    ptr: *mut c_void,
     size: usize,
 }
 unsafe impl Sync for MemoryMap {}
@@ -87,16 +85,22 @@ impl ProcessState {
 
         let driver = open_driver(&driver_name, max_threads)?;
 
-        let vm_size = ((1024 * 1024) - nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)?.unwrap() * 2) as usize;
-        let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
+        let vm_size = ((1024 * 1024) - rustix::param::page_size() * 2) as usize;
+        // let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
 
         let mmap = unsafe {
-            let vm_start = nix::sys::mman::mmap(None,
+            // let vm_start = nix::sys::mman::mmap(None,
+            //     vm_size,
+            //     nix::sys::mman::ProtFlags::PROT_READ,
+            //     nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
+            //     &driver,
+            //     0)?;
+
+            let vm_start = rustix::mm::mmap(std::ptr::null_mut(),
                 vm_size,
-                nix::sys::mman::ProtFlags::PROT_READ,
-                nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
-                &driver,
-                0)?;
+                rustix::mm::ProtFlags::READ,
+                rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
+                &driver, 0)?;
 
             (vm_start, vm_size)
         };
@@ -105,7 +109,7 @@ impl ProcessState {
             max_threads,
             driver_name,
             driver: driver.into(),
-            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1.get() }),
+            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1 }),
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             disable_background_scheduling: AtomicBool::new(false),
@@ -145,18 +149,14 @@ impl ProcessState {
         let mut context_manager = self.context_manager.write().unwrap();
 
         if context_manager.is_none() {
-            let obj = std::mem::MaybeUninit::<binder::flat_binder_object>::zeroed();
-            let mut obj = unsafe { obj.assume_init() };
+            let mut obj: binder::flat_binder_object = unsafe { std::mem::zeroed() };
             obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
-            unsafe {
-                let driver_fd = self.driver.as_raw_fd();
-                if binder::set_context_mgr_ext(driver_fd, &obj).is_err() {
-                    //     android_errorWriteLog(0x534e4554, "121035042");
-                    let unused: i32 = 0;
-                    if let Err(e) = binder::set_context_mgr(driver_fd, &unused) {
-                        return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
-                    }
+            if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
+                //     android_errorWriteLog(0x534e4554, "121035042");
+                // let unused: i32 = 0;
+                if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
+                    return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
                 }
             }
             *context_manager = Some(binder);
@@ -282,25 +282,22 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 
     let mut vers = binder::binder_version { protocol_version: 0 };
 
-    unsafe {
-        let raw_fd = fd.as_raw_fd();
-        binder::version(raw_fd, &mut vers)
-            .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
-        log::info!("Binder driver protocol version: {}", vers.protocol_version);
+    binder::version(&fd, &mut vers)
+        .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
+    log::info!("Binder driver protocol version: {}", vers.protocol_version);
 
-        if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
-            return Err(format!("Binder driver protocol({}) does not match user space protocol({})!",
-                vers.protocol_version, binder::BINDER_CURRENT_PROTOCOL_VERSION).into());
-        }
+    if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
+        return Err(format!("Binder driver protocol({}) does not match user space protocol({})!",
+            vers.protocol_version, binder::BINDER_CURRENT_PROTOCOL_VERSION).into());
+    }
 
-        binder::set_max_threads(raw_fd, &max_threads)
-            .map_err(|e| format!("Binder ioctl to set max threads failed: {}", e))?;
-        log::info!("Binder driver max threads set to {}", max_threads);
+    binder::set_max_threads(&fd, max_threads)
+        .map_err(|e| format!("Binder ioctl to set max threads failed: {}", e))?;
+    log::info!("Binder driver max threads set to {}", max_threads);
 
-        let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
-        if let Err(e) = binder::enable_oneway_spam_detection(raw_fd, &enable){
-            log::warn!("Binder ioctl to enable oneway spam detection failed: {}", e)
-        }
+    let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
+    if let Err(e) = binder::enable_oneway_spam_detection(&fd, enable) {
+        log::warn!("Binder ioctl to enable oneway spam detection failed: {}", e)
     }
 
     Ok(fd)
@@ -309,6 +306,9 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
         let mmap = self.mmap.write().unwrap();
-        unsafe { nix::sys::mman::munmap(mmap.ptr, mmap.size).unwrap(); }
+        unsafe {
+            rustix::mm::munmap(mmap.ptr, mmap.size)
+                .expect("Failed to unmap memory");
+        }
     }
 }

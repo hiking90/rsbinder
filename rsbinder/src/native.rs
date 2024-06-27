@@ -172,7 +172,7 @@ impl<T: Remotable> Transactable for Inner<T> {
             }
 
             DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&nix::unistd::getpid().as_raw())
+                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
             }
 
             _ => {

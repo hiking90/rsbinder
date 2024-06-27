@@ -11,7 +11,7 @@ lazy_static = { workspace = true }
 rsbinder = { workspace = true }
 tokio = { workspace = true }
 env_logger = { workspace = true }
-nix = { workspace = true }
+rustix = { workspace = true, features = ["pipe"] }
 async-trait = { workspace = true }
 
 [build-dependencies]

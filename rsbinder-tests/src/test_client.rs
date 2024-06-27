@@ -40,6 +40,7 @@ use android::aidl::versioned::tests::{
 use android::aidl::tests::vintf::{
     VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
 };
+use rustix::fd::OwnedFd;
 use std::{fs::File, os::fd::IntoRawFd};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
@@ -321,7 +322,7 @@ fn test_interface_list_exchange() {
 }
 
 fn build_pipe() -> (File, File) {
-    let fds = nix::unistd::pipe().expect("error creating pipe");
+    let fds = rustix::pipe::pipe().expect("error creating pipe");
     // Safety: we get two file descriptors from pipe()
     // and pass them after checking if the function returned
     // without an error, so the descriptors should be valid

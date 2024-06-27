@@ -22,7 +22,6 @@ lazy_static = "1.4"
 rsbinder = { version = "0.2.4", path = "rsbinder", default-features = false }
 log = "0.4"
 env_logger = "0.11"
-nix = "0.28"
 anstyle = "1.0"
 tokio = { version = "1.37", default-features = false }
 async-trait = "0.1"
@@ -35,3 +34,4 @@ tera = "1.19"
 similar = "2.4"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "1.2"
+rustix = "0.38"

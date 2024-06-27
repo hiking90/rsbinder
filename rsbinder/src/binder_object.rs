@@ -3,6 +3,8 @@
 
 use std::mem::ManuallyDrop;
 
+use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
+
 pub(crate) use crate::sys::binder::flat_binder_object;
 use crate::{
     binder::*,
@@ -46,6 +48,14 @@ impl flat_binder_object {
 
     pub(crate) fn handle(&self) -> u32 {
         unsafe { self.__bindgen_anon_1.handle }
+    }
+
+    pub(crate) fn borrowed_fd(&self) -> BorrowedFd {
+        unsafe { BorrowedFd::borrow_raw(self.handle() as _) }
+    }
+
+    pub(crate) fn owned_fd(&self) -> OwnedFd {
+        unsafe { OwnedFd::from_raw_fd(self.handle() as _) }
     }
 
     pub(crate) fn set_handle(&mut self, handle: u32) {
@@ -101,8 +111,9 @@ impl flat_binder_object {
                 process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle())?.decrease()
             }
             BINDER_TYPE_FD => {
-                if self.cookie != 0 {   // owned
-                    nix::unistd::close(self.handle() as _)?;
+                if self.cookie != 0 {
+                    // Get owned fd and close it.
+                    self.owned_fd();
                 }
 
                 Ok(())

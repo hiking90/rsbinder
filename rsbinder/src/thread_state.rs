@@ -18,7 +18,6 @@
  */
 
 use std::sync::{atomic::Ordering, Arc};
-use std::os::unix::io::AsRawFd;
 use std::cell::RefCell;
 use log::error;
 use std::backtrace::Backtrace;
@@ -678,18 +677,29 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             log::trace!("Size of receive buffer: {}, need_read: {}, do_receive: {}",
                 bwr.read_size, thread_state.borrow().in_parcel.is_empty(), do_receive);
         }
+        // unsafe {
+        //     loop {
+        //         let res = binder::write_read(thread_state.borrow().driver.as_raw_fd(), &mut bwr);
+        //         match res {
+        //             Ok(_) => break,
+        //             Err(errno) if errno != nix::errno::Errno::EINTR => {
+        //                 log::error!("binder::write_read() error : {}", errno);
+        //                 return Err(StatusCode::Errno(errno as _));
+        //             },
+        //             _ => {}
+        //         }
+        //     }
+        // }
 
-        unsafe {
-            loop {
-                let res = binder::write_read(thread_state.borrow().driver.as_raw_fd(), &mut bwr);
-                match res {
-                    Ok(_) => break,
-                    Err(errno) if errno != nix::errno::Errno::EINTR => {
-                        log::error!("binder::write_read() error : {}", errno);
-                        return Err(StatusCode::Errno(errno as i32));
-                    },
-                    _ => {}
-                }
+        loop {
+            let res = binder::write_read(&thread_state.borrow().driver, &mut bwr);
+            match res {
+                Ok(_) => break,
+                Err(errno) if errno != rustix::io::Errno::INTR => {
+                    log::error!("binder::write_read() error : {}", errno);
+                    return Err(StatusCode::Errno(errno.raw_os_error()));
+                },
+                _ => {}
             }
         }
 
@@ -997,7 +1007,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         result = e;
                         break
                     }
-                    StatusCode::Errno(errno) if errno == (nix::errno::Errno::ECONNREFUSED as i32) => {
+                    StatusCode::Errno(errno) if errno == (rustix::io::Errno::CONNREFUSED.raw_os_error()) => {
                         result = e;
                         break;
                     }

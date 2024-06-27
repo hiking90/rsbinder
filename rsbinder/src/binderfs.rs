@@ -3,7 +3,6 @@
 
 use std::path::Path;
 use std::fs::File;
-use std::os::unix::io::{AsRawFd};
 use log;
 use crate::sys::binder;
 use std::ffi::CString;
@@ -27,15 +26,11 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
         *a = *c as std::os::raw::c_char;
     }
 
-    unsafe {
-        binder::binder_ctl_add(fd.as_raw_fd(), &mut device)
-            .map_err(|e| {
-                log::error!("Binder ioctl to add binder failed: {}", e.to_string());
-                e
-            })?;
-    }
-
-    drop(fd);
+    binder::binder_ctl_add(fd, &mut device)
+        .map_err(|e| {
+            log::error!("Binder ioctl to add binder failed: {}", e.to_string());
+            e
+        })?;
 
     Ok((device.major, device.minor))
 }

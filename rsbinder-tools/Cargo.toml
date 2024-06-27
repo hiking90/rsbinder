@@ -15,5 +15,4 @@ lazy_static = { workspace = true }
 rsbinder = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-nix = { workspace = true }
 anstyle = { workspace = true }

@@ -207,10 +207,6 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
 }
 
 #[derive(Debug)]
-pub struct Interface {
-}
-
-#[derive(Debug)]
 pub struct Document {
     pub package: Option<String>,
     pub imports: HashMap<String, String>,

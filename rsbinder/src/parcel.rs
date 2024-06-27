@@ -21,6 +21,7 @@ use std::vec::Vec;
 use std::default::Default;
 
 use pretty_hex::*;
+use rustix::fd::IntoRawFd;
 
 use crate::{
     error::{Result, StatusCode},
@@ -248,7 +249,8 @@ impl Parcel {
         for offset in self.objects.as_slice() {
             let obj: &flat_binder_object = (self.data.as_ptr(), *offset as usize).into();
             if obj.header_type() == BINDER_TYPE_FD {
-                nix::unistd::close(obj.handle() as _).unwrap();
+                // Close the file descriptor
+                obj.owned_fd();
             }
         }
     }
@@ -721,7 +723,8 @@ impl Parcel {
                 let flat: &mut flat_binder_object = (self.data.as_mut_ptr(), off).into();
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
-                    flat.set_handle(nix::fcntl::fcntl(flat.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))? as _);
+//                    flat.set_handle(nix::fcntl::fcntl(flat.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))? as _);
+                    flat.set_handle(rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0)?.into_raw_fd() as _);
                     flat.set_cookie(1);
                 }
             }

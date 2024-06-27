@@ -18,7 +18,7 @@ tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
 
 [dependencies]
-nix = { workspace = true, features = ["ioctl", "mount", "fs", "feature", "mman", "process"] }
+rustix = { workspace = true, features = ["process", "param", "mm"] }
 log = { workspace = true }
 pretty_hex = { workspace = true }
 downcast-rs = { workspace = true }

@@ -24,7 +24,7 @@ use crate::{
 };
 use crate::error::{Result, StatusCode};
 
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, OwnedFd};
 
 /// Rust version of the Java class android.os.ParcelFileDescriptor
 #[derive(Debug)]
@@ -73,27 +73,19 @@ impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        let fd = self.0.as_raw_fd();
-
         // Not null
         parcel.write::<i32>(&1)?;
-        let dup_fd = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))?;
+        let dup_fd = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
 
-        let result = || -> Result<()> {
-            parcel.write::<i32>(&0)?;
-            let obj = flat_binder_object::new_with_fd(dup_fd, true);
-            parcel.write_object(&obj, true)?;
-            Ok(())
-        }();
+        parcel.write::<i32>(&0)?;
+        let obj = flat_binder_object::new_with_fd(dup_fd.as_raw_fd(), true);
+        parcel.write_object(&obj, true)?;
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Close the duplicated fd
-                nix::unistd::close(dup_fd)?;
-                Err(e)
-            }
-        }
+        // The dup_fd has been sent, so the file descriptor is now owned by the Parcel.
+        // So, we need to forget the OwnedFd to avoid double-closing the file descriptor.
+        dup_fd.into_raw_fd();
+
+        Ok(())
     }
 }
 
@@ -123,16 +115,9 @@ impl DeserializeOption for ParcelFileDescriptor {
 
         let obj = parcel.read_object(true)?;
 
-        let fd = nix::fcntl::fcntl(obj.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))?;
+        let fd = rustix::io::fcntl_dupfd_cloexec(&obj.borrowed_fd(), 0)?;
 
-        let file = unsafe {
-            // Safety: At this point, we know that the file descriptor was
-            // not -1, so must be a valid, owned file descriptor which we
-            // can safely turn into a `File`.
-            OwnedFd::from_raw_fd(fd)
-        };
-
-        Ok(Some(ParcelFileDescriptor::new(file)))
+        Ok(Some(ParcelFileDescriptor::new(fd)))
     }
 }
 
