@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "example-hello"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -795,7 +795,7 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
 name = "rsbinder"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "downcast-rs",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "convert_case",
  "lazy_static",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tests"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tools"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anstyle",
  "env_logger",
