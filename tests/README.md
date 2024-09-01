@@ -1,4 +1,4 @@
-# rsbinder-tests
+# tests
 This is a port of Android's test cases to the rsbinder environment.
 
 There are a total of 96 test cases, of which 90 are currently in a passed state.

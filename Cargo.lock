@@ -822,19 +822,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsbinder-tests"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "env_logger",
- "lazy_static",
- "rsbinder",
- "rsbinder-aidl",
- "rustix",
- "tokio",
-]
-
-[[package]]
 name = "rsbinder-tools"
 version = "0.3.0"
 dependencies = [
@@ -1005,6 +992,19 @@ dependencies = [
  "serde_json",
  "slug",
  "unic-segment",
+]
+
+[[package]]
+name = "tests"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "env_logger",
+ "lazy_static",
+ "rsbinder",
+ "rsbinder-aidl",
+ "rustix",
+ "tokio",
 ]
 
 [[package]]
