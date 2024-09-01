@@ -23,7 +23,6 @@ Utilizing **rsbinder**, developers can not only achieve more reliable and effici
 
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
-However, it is being utilized for the development of some service software in Android mass production projects.
 
 ## Overview
 **rsbinder** offers the following features:
