@@ -1,18 +1,20 @@
 [package]
 name = "rsbinder-tools"
-version = { workspace = true }
-edition = { workspace = true }
-license = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "This provides a few CLI binder tools for Linux."
-homepage = { workspace = true }
-repository = { workspace = true }
+homepage.workspace = true
+repository.workspace = true
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = { workspace = true }
-rsbinder = { workspace = true }
-log = { workspace = true }
-env_logger = { workspace = true }
-anstyle = { workspace = true }
+lazy_static.workspace = true
+rsbinder.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anstyle.workspace = true
+clap.workspace = true
