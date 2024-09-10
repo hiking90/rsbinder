@@ -5,6 +5,7 @@
 use std::{collections::HashMap, sync::{RwLock, Arc}};
 use hub::{IServiceManager, BnServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use env_logger::Env;
+use clap;
 use rsbinder::*;
 
 struct Service {
@@ -242,6 +243,12 @@ impl IServiceManager for ServiceManager {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let _ = clap::Command::new("rsb_hub")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .about("Linux daemon that emulates functionality similar to Android's ServiceManager")
+        .get_matches();
+
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     ProcessState::init(DEFAULT_BINDER_PATH, 1);
