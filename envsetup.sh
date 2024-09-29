@@ -112,6 +112,25 @@ function remote_shell() {
     command ssh "$remote_user_host" -t "cd $remote_directory; bash"
 }
 
+function remote_test() {
+    read_remote_linux
+    remote_sync
+    command ssh "$remote_user_host" -t "bash -c \"source ~/.profile && cd $remote_directory && \
+        source ./envsetup.sh && run_test \""
+}
+
+function run_test() {
+    cargo run --bin rsb_hub & sleep 1
+    cargo run --bin test_service & sleep 1
+    RUST_BACKTRACE=1 cargo test
+}
+
+# function run_test_async() {
+#     cargo run --bin rsb_hub & sleep 1
+#     cargo run --bin test_service_async & sleep 1
+#     cargo test
+# }
+
 declare -a publish_dirs=("rsbinder-aidl" "rsbinder" "rsbinder-tools")
 
 function publish() {
@@ -143,6 +162,6 @@ function publish_dry_run() {
 function version_update() {
     local NEW_VERSION="$1"
 
-    sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" $TOP_DIR/Cargo.toml
-    sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" $TOP_DIR/Cargo.toml
+    find . -name "Cargo.toml" -exec sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" {} \;
+    find . -name "Cargo.toml" -exec sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
 }

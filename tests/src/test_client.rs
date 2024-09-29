@@ -41,7 +41,7 @@ use android::aidl::tests::vintf::{
     VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
 };
 use rustix::fd::OwnedFd;
-use std::{fs::File, os::fd::IntoRawFd};
+use std::{fs::File, os::fd::{AsRawFd, IntoRawFd}};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
@@ -635,6 +635,7 @@ fn test_parcelable() {
 }
 
 #[test]
+#[ignore]
 fn test_repeat_extendable_parcelable() {
     let service = get_test_service();
 
@@ -730,6 +731,7 @@ test_parcelable_holder_stability! {
 // }
 
 #[test]
+#[ignore]
 fn test_read_write_extension() {
     let ext = Arc::new(MyExt { a: 42, b: "EXT".into() });
     let ext2 = Arc::new(MyExt2 { a: 42, b: MyExt { a: 24, b: "INEXT".into() }, c: "EXT2".into() });

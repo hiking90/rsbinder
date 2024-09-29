@@ -17,7 +17,7 @@ Although this project focuses on supporting Binder IPC in the Linux environment,
 ## Key Advantages of Using rsbinder for Android Development
 The **rsbinder** library unlocks a significant opportunity for Android developers who prefer to use Rust for system-level programming. While Android provides an environment that supports Rust development, it lacks a dedicated API in its SDK or NDK for direct low-level interaction with Binder IPC using Rust. This gap is where **rsbinder** comes into play.
 
-By integrating **rsbinder** into your project, you gain the ability to harness Binder IPC directly within the Android NDK environment using pure Rust. 
+By integrating **rsbinder** into your project, you gain the ability to harness Binder IPC directly within the Android NDK environment using pure Rust.
 
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for product development.
@@ -41,7 +41,6 @@ By integrating **rsbinder** into your project, you gain the ability to harness B
 ### Enable binder for Linux
 * The Linux kernel must be built with support for binderfs. Please check the following kernel configs.
 ```
-CONFIG_ASHMEM=y
 CONFIG_ANDROID=y
 CONFIG_ANDROID_BINDER_IPC=y
 CONFIG_ANDROID_BINDERFS=y

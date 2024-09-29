@@ -4,7 +4,7 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
-use std::os::fd::AsRawFd;
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -79,9 +79,9 @@ impl ProxyHandle {
         Ok(())
     }
 
-    pub fn dump<F: AsRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
+    pub fn dump<F: IntoRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
         let mut send = Parcel::new();
-        let obj = flat_binder_object::new_with_fd(fd.as_raw_fd(), true);
+        let obj = flat_binder_object::new_with_fd(fd.into_raw_fd(), true);
         send.write_object(&obj, true)?;
 
         send.write::<i32>(&(args.len() as i32))?;
