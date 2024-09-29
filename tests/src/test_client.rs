@@ -635,7 +635,6 @@ fn test_parcelable() {
 }
 
 #[test]
-#[ignore]
 fn test_repeat_extendable_parcelable() {
     let service = get_test_service();
 

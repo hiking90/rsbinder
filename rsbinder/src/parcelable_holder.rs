@@ -206,7 +206,7 @@ impl Deserialize for ParcelableHolder {
             log::error!("ParcelableHolder::deserialize: unexpected null");
             Err(StatusCode::UnexpectedNull)
         } else {
-            let mut parcelable = ParcelableHolder::new(Default::default());
+            let mut parcelable = ParcelableHolder::default();
             parcelable.read_from_parcel(parcel)?;
             Ok(parcelable)
         }
@@ -250,8 +250,11 @@ impl Parcelable for ParcelableHolder {
     }
 
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
-        if self.stability as i32 != parcel.read::<i32>()? {
-            log::error!("ParcelableHolder::read_from_parcel: parcelable stability mismatch");
+        let wire_stability: i32 = parcel.read()?;
+        if self.stability as i32 != wire_stability {
+            log::error!("ParcelableHolder::read_from_parcel: parcelable stability mismatch: {:?} != {:?}",
+                self.stability, wire_stability);
+
             return Err(StatusCode::BadValue);
         }
 
