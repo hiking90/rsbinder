@@ -692,9 +692,9 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
     }
 }
 
-fn rt() -> TokioRuntime<tokio::runtime::Runtime> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    TokioRuntime(rt)
+fn rt() -> TokioRuntime<tokio::runtime::Handle> {
+    // let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    TokioRuntime(tokio::runtime::Handle::current())
 }
 
 fn main() {
@@ -703,34 +703,40 @@ fn main() {
     ProcessState::init_default();
     ProcessState::start_thread_pool();
 
-    let service_name = <BpTestService as ITestService::ITestService>::descriptor();
-    let service =
-        BnTestService::new_async_binder(TestService::default(), rt());
-    hub::add_service(service_name, service.as_binder()).expect("Could not register service");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let service_name = <BpTestService as ITestService::ITestService>::descriptor();
+        let service =
+            BnTestService::new_async_binder(TestService::default(), rt());
+        hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
-    let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
-    let versioned_service =
-        BnFooInterface::new_async_binder(FooInterface, rt());
-    hub::add_service(versioned_service_name, versioned_service.as_binder())
+        let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
+        let versioned_service =
+            BnFooInterface::new_async_binder(FooInterface, rt());
+        hub::add_service(versioned_service_name, versioned_service.as_binder())
+            .expect("Could not register service");
+
+        let nested_service_name =
+            <INestedService::BpNestedService as INestedService::INestedService>::descriptor();
+        let nested_service = INestedService::BnNestedService::new_async_binder(
+            NestedService,
+            rt(),
+        );
+        hub::add_service(nested_service_name, nested_service.as_binder())
+            .expect("Could not register service");
+
+        let fixed_size_array_service_name =
+            <IRepeatFixedSizeArray::BpRepeatFixedSizeArray as IRepeatFixedSizeArray::IRepeatFixedSizeArray>::descriptor();
+        let fixed_size_array_service = IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_async_binder(
+            FixedSizeArrayService,
+            rt(),
+        );
+        hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
         .expect("Could not register service");
 
-    let nested_service_name =
-        <INestedService::BpNestedService as INestedService::INestedService>::descriptor();
-    let nested_service = INestedService::BnNestedService::new_async_binder(
-        NestedService,
-        rt(),
-    );
-    hub::add_service(nested_service_name, nested_service.as_binder())
-        .expect("Could not register service");
-
-    let fixed_size_array_service_name =
-        <IRepeatFixedSizeArray::BpRepeatFixedSizeArray as IRepeatFixedSizeArray::IRepeatFixedSizeArray>::descriptor();
-    let fixed_size_array_service = IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_async_binder(
-        FixedSizeArrayService,
-        rt(),
-    );
-    hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
-    .expect("Could not register service");
-
-    ProcessState::join_thread_pool().expect("Failed to join thread pool");
+        // By awaiting `pending`, we yield to the runtime. This results in the current-thread
+        // runtime being driven by the current thread (the main thread in this case). E.g., this
+        // means that anything spawned with `tokio::spawn` will run on this thread.
+        std::future::pending().await
+    })
 }
