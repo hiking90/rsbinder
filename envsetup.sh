@@ -112,6 +112,25 @@ function remote_shell() {
     command ssh "$remote_user_host" -t "cd $remote_directory; bash"
 }
 
+function run_test() {
+    cargo run --bin rsb_hub & sleep 1
+    cargo run --bin test_service & sleep 1
+    for i in $(seq 1 100); do RUST_BACKTRACE=1 cargo test || break; done
+}
+
+function remote_test_async() {
+    read_remote_linux
+    remote_sync
+    command ssh "$remote_user_host" -t "bash -c \"source ~/.profile && cd $remote_directory && \
+        source ./envsetup.sh && run_test_async \""
+}
+
+function run_test_async() {
+    cargo run --bin rsb_hub & sleep 1
+    cargo run --bin test_service_async & sleep 1
+    for i in $(seq 1 100); do RUST_BACKTRACE=1 cargo test || break; done
+}
+
 declare -a publish_dirs=("rsbinder-aidl" "rsbinder" "rsbinder-tools")
 
 function publish() {
