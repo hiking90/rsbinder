@@ -968,40 +968,40 @@ fn test_renamed_interface_old_as_old() {
     });
 }
 
-// #[test]
-// fn test_renamed_interface_new_as_new() {
-//     test_renamed_interface(|_, new_name| {
-//         assert_eq!(
-//             <BpNewName as INewName::INewName>::descriptor(),
-//             "android.aidl.tests.IOldName"
-//         );
+#[test]
+fn test_renamed_interface_new_as_new() {
+    test_renamed_interface(|_, new_name| {
+        assert_eq!(
+            <BpNewName as INewName::INewName>::descriptor(),
+            "android.aidl.tests.IOldName"
+        );
 
-//         let real_name = new_name.RealName();
-//         assert_eq!(real_name.as_ref().map(String::as_str), Ok("NewName"));
-//     });
-// }
+        let real_name = new_name.RealName();
+        assert_eq!(real_name.as_ref().map(String::as_str), Ok("NewName"));
+    });
+}
 
-// #[test]
-// fn test_renamed_interface_old_as_new() {
-//     test_renamed_interface(|old_name, _| {
-//         let new_name = old_name.as_binder().into_interface::<dyn INewName::INewName>();
-//         assert!(new_name.is_ok());
+#[test]
+fn test_renamed_interface_old_as_new() {
+    test_renamed_interface(|old_name, _| {
+        let new_name = old_name.as_binder().into_interface::<dyn INewName::INewName>();
+        assert!(new_name.is_ok());
 
-//         let real_name = new_name.unwrap().RealName();
-//         assert_eq!(real_name.as_ref().map(String::as_str), Ok("OldName"));
-//     });
-// }
+        let real_name = new_name.unwrap().RealName();
+        assert_eq!(real_name.as_ref().map(String::as_str), Ok("OldName"));
+    });
+}
 
-// #[test]
-// fn test_renamed_interface_new_as_old() {
-//     test_renamed_interface(|_, new_name| {
-//         let old_name = new_name.as_binder().into_interface::<dyn IOldName::IOldName>();
-//         assert!(old_name.is_ok());
+#[test]
+fn test_renamed_interface_new_as_old() {
+    test_renamed_interface(|_, new_name| {
+        let old_name = new_name.as_binder().into_interface::<dyn IOldName::IOldName>();
+        assert!(old_name.is_ok());
 
-//         let real_name = old_name.unwrap().RealName();
-//         assert_eq!(real_name.as_ref().map(String::as_str), Ok("NewName"));
-//     });
-// }
+        let real_name = old_name.unwrap().RealName();
+        assert_eq!(real_name.as_ref().map(String::as_str), Ok("NewName"));
+    });
+}
 
 #[derive(Debug, Default)]
 struct Callback {

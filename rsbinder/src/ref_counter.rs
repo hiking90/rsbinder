@@ -69,10 +69,10 @@ impl RefCounter {
     pub fn dec(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
         let c = self.count.fetch_sub(1, Ordering::Relaxed);
         if c == 1 {
-            self.count.compare_exchange(0, INITIAL_STRONG_VALUE,
-                Ordering::Relaxed, Ordering::Relaxed)
-                .expect("Failed to exchange the reference count.");
-            f()?;
+            if self.count.compare_exchange(0, INITIAL_STRONG_VALUE,
+                Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                f()?;
+            }
         }
         Ok(())
     }
