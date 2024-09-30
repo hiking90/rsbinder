@@ -3,7 +3,7 @@ name = "rsbinder"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
-description = "This is a library for Linux Binder communication."
+description = "rsbinder provides crates implemented in pure Rust that make Binder IPC available on both Android and Linux."
 homepage = { workspace = true }
 repository = { workspace = true }
 readme = "README.md"
