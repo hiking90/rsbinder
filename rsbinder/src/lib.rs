@@ -45,7 +45,7 @@ pub use proxy::*;
 pub use native::*;
 pub use parcelable::*;
 pub use file_descriptor::ParcelFileDescriptor;
-pub use parcelable_holder::{ParcelableHolder, ParcelableMetadata};
+pub use parcelable_holder::ParcelableHolder;
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 #[cfg(feature = "tokio")]

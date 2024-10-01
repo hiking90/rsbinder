@@ -20,29 +20,13 @@
 use crate::binder::Stability;
 use crate::error::{StatusCode, Result};
 use crate::{
-    Deserialize, Parcel, Parcelable, Serialize, NON_NULL_PARCELABLE_FLAG,
+    Deserialize, Parcel, Parcelable, ParcelableMetadata, Serialize, NON_NULL_PARCELABLE_FLAG,
     NULL_PARCELABLE_FLAG,
 };
 
 use downcast_rs::{impl_downcast, DowncastSync};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
-
-/// Metadata that `ParcelableHolder` needs for all parcelables.
-///
-/// The compiler auto-generates implementations of this trait
-/// for AIDL parcelables.
-pub trait ParcelableMetadata {
-    /// The Binder parcelable descriptor string.
-    ///
-    /// This string is a unique identifier for a Binder parcelable.
-    fn descriptor() -> &'static str;
-
-    /// The Binder parcelable stability.
-    fn get_stability(&self) -> Stability {
-        Stability::Local
-    }
-}
 
 trait AnyParcelable: DowncastSync + Parcelable + std::fmt::Debug {}
 impl_downcast!(sync AnyParcelable);
@@ -106,11 +90,11 @@ impl ParcelableHolder {
     where
         T: Any + Parcelable + ParcelableMetadata + std::fmt::Debug + Send + Sync,
     {
-        if self.stability > p.get_stability() {
+        if self.stability > p.stability() {
             log::error!(
                 "ParcelableHolder::set_parcelable: parcelable stability mismatch: {:?} > {:?}",
                 self.stability,
-                p.get_stability());
+                p.stability());
             return Err(StatusCode::BadValue);
         }
 

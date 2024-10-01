@@ -707,27 +707,27 @@ test_parcelable_holder_stability! {
     UnstableParcelable
 }
 
-// #[test]
-// fn test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable() {
-//     let mut holder = VintfExtendableParcelable::default();
-//     let parcelable = Arc::new(NonVintfParcelable::default());
-//     let result = holder.ext.set_parcelable(Arc::clone(&parcelable));
-//     assert_eq!(result, Err(rsbinder::StatusCode::BadValue));
+#[test]
+fn test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable() {
+    let mut holder = VintfExtendableParcelable::default();
+    let parcelable = Arc::new(NonVintfParcelable::default());
+    let result = holder.ext.set_parcelable(Arc::clone(&parcelable));
+    assert_eq!(result, Err(rsbinder::StatusCode::BadValue));
 
-//     let parcelable2 = holder.ext.get_parcelable::<NonVintfParcelable>();
-//     assert!(parcelable2.unwrap().is_none());
-// }
+    let parcelable2 = holder.ext.get_parcelable::<NonVintfParcelable>();
+    assert!(parcelable2.unwrap().is_none());
+}
 
-// #[test]
-// fn test_vintf_parcelable_holder_cannot_contain_unstable_parcelable() {
-//     let mut holder = VintfExtendableParcelable::default();
-//     let parcelable = Arc::new(UnstableParcelable::default());
-//     let result = holder.ext.set_parcelable(Arc::clone(&parcelable));
-//     assert_eq!(result, Err(rsbinder::StatusCode::BadValue));
+#[test]
+fn test_vintf_parcelable_holder_cannot_contain_unstable_parcelable() {
+    let mut holder = VintfExtendableParcelable::default();
+    let parcelable = Arc::new(UnstableParcelable::default());
+    let result = holder.ext.set_parcelable(Arc::clone(&parcelable));
+    assert_eq!(result, Err(rsbinder::StatusCode::BadValue));
 
-//     let parcelable2 = holder.ext.get_parcelable::<UnstableParcelable>();
-//     assert!(parcelable2.unwrap().is_none());
-// }
+    let parcelable2 = holder.ext.get_parcelable::<UnstableParcelable>();
+    assert!(parcelable2.unwrap().is_none());
+}
 
 #[test]
 #[ignore]

@@ -62,7 +62,7 @@ pub trait ParcelableMetadata {
     fn descriptor() -> &'static str;
 
     /// The Binder parcelable stability.
-    fn get_stability(&self) -> Stability {
+    fn stability(&self) -> Stability {
         Stability::Local
     }
 }
