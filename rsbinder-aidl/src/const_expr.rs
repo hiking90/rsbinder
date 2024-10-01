@@ -72,6 +72,52 @@ macro_rules! arithmetic_basic_op {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InitParam {
+    pub is_const: bool,
+    pub is_fixed_array: bool,
+    pub is_nullable: bool,
+    pub is_vintf: bool,
+    pub crate_name: String,
+}
+
+impl InitParam {
+    pub(crate) fn builder() -> Self {
+        Self {
+            is_const: false,
+            is_fixed_array: false,
+            is_nullable: false,
+            is_vintf: false,
+            crate_name: "rsbinder".into(),
+        }
+    }
+
+    pub(crate) fn with_const(mut self, is_const: bool) -> Self {
+        self.is_const = is_const;
+        self
+    }
+
+    pub(crate) fn with_fixed_array(mut self, is_fixed_array: bool) -> Self {
+        self.is_fixed_array = is_fixed_array;
+        self
+    }
+
+    pub(crate) fn with_nullable(mut self, is_nullable: bool) -> Self {
+        self.is_nullable = is_nullable;
+        self
+    }
+
+    pub(crate) fn with_vintf(mut self, is_vintf: bool) -> Self {
+        self.is_vintf = is_vintf;
+        self
+    }
+
+    pub(crate) fn with_crate_name(mut self, crate_name: &str) -> Self {
+        self.crate_name = crate_name.to_owned();
+        self
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub enum ValueType {
     #[default] Void,
@@ -280,10 +326,10 @@ impl ValueType {
         }
     }
 
-    pub fn to_init(&self, is_const: bool, is_fixed_array: bool, is_nullable: bool) -> String {
+    pub(crate) fn to_init(&self, param: InitParam) -> String {
         match self {
             ValueType::String(_) => {
-                if is_const {
+                if param.is_const {
                     format!("\"{}\"", self.to_value_string())
                 } else {
                     format!("\"{}\".into()", self.to_value_string())
@@ -294,13 +340,13 @@ impl ValueType {
             ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
             ValueType::Name(_) => self.to_value_string(),
             ValueType::Array(v) => {
-                let mut res = if is_fixed_array { "[".to_owned() } else { "vec![".to_owned() };
+                let mut res = if param.is_fixed_array { "[".to_owned() } else { "vec![".to_owned() };
                 for v in v {
-                    let init_str = v.value.to_init(is_const, is_fixed_array, is_nullable);
+                    let init_str = v.value.to_init(param.clone());
 
                     let some_str = if let ValueType::Array(_) = v.value {
                         init_str
-                    } else if is_nullable {
+                    } else if param.is_nullable {
                         format!("Some({})", init_str)
                     } else {
                         init_str
@@ -313,13 +359,20 @@ impl ValueType {
 
                 res
             }
-            // ValueType::Holder => {
-            //     "rsbinder::ParcelableHolder::new(rsbinder::Stability::Local)".to_owned()
-            // }
+            ValueType::Holder => {
+                println!("Init Holder: {:?}", param);
+                if param.is_vintf {
+                    format!("{}::ParcelableHolder::new({}::Stability::Vintf)", param.crate_name, param.crate_name)
+                } else {
+                    "Default::default()".to_string()
+                }
+            }
             ValueType::Byte(_) | ValueType::Int32(_) | ValueType::Int64(_) | ValueType::Bool(_) |
             ValueType::Expr{ .. } | ValueType::Unary{ .. } => self.to_value_string(),
 
-            _ => "Default::default()".to_string(),
+            _ => {
+                "Default::default()".to_string()
+            }
         }
     }
 

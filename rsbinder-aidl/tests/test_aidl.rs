@@ -1034,6 +1034,98 @@ pub mod ArrayOfInterfaces {
 }
 
 #[test]
+fn test_parcelable_vintf() -> Result<(), Box<dyn Error>> {
+    aidl_generator(r##"
+package android.aidl.tests.vintf;
+
+@VintfStability
+parcelable VintfExtendableParcelable {
+    ParcelableHolder ext;
+}
+        "##, r#"
+pub mod VintfExtendableParcelable {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub struct VintfExtendableParcelable {
+        pub r#ext: rsbinder::ParcelableHolder,
+    }
+    impl Default for VintfExtendableParcelable {
+        fn default() -> Self {
+            Self {
+                r#ext: rsbinder::ParcelableHolder::new(rsbinder::Stability::Vintf),
+            }
+        }
+    }
+    impl rsbinder::Parcelable for VintfExtendableParcelable {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_write(|_sub_parcel| {
+                _sub_parcel.write(&self.r#ext)?;
+                Ok(())
+            })
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_read(|_sub_parcel| {
+                self.r#ext = _sub_parcel.read()?;
+                Ok(())
+            })
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(VintfExtendableParcelable);
+    rsbinder::impl_deserialize_for_parcelable!(VintfExtendableParcelable);
+    impl rsbinder::ParcelableMetadata for VintfExtendableParcelable {
+        fn descriptor() -> &'static str { "android.aidl.tests.vintf.VintfExtendableParcelable" }
+        fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
+    }
+}
+        "#)?;
+
+        aidl_generator(r##"
+package android.aidl.tests.vintf;
+
+@VintfStability
+parcelable VintfParcelable {
+    int a;
+}
+        "##, r#"
+pub mod VintfParcelable {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub struct VintfParcelable {
+        pub r#a: i32,
+    }
+    impl Default for VintfParcelable {
+        fn default() -> Self {
+            Self {
+                r#a: Default::default(),
+            }
+        }
+    }
+    impl rsbinder::Parcelable for VintfParcelable {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_write(|_sub_parcel| {
+                _sub_parcel.write(&self.r#a)?;
+                Ok(())
+            })
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_read(|_sub_parcel| {
+                self.r#a = _sub_parcel.read()?;
+                Ok(())
+            })
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(VintfParcelable);
+    rsbinder::impl_deserialize_for_parcelable!(VintfParcelable);
+    impl rsbinder::ParcelableMetadata for VintfParcelable {
+        fn descriptor() -> &'static str { "android.aidl.tests.vintf.VintfParcelable" }
+        fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
+    }
+}
+        "#)?;
+        Ok(())
+}
+
+#[test]
 fn test_parcelable_const_name() -> Result<(), Box<dyn Error>> {
     aidl_generator(r##"
 parcelable IServiceManager {

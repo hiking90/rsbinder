@@ -8,6 +8,7 @@ use tera::Tera;
 
 use crate::{parser, add_indent, Namespace};
 use crate::parser::Direction;
+use crate::const_expr::{ConstExpr, InitParam, ValueType};
 
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
@@ -77,6 +78,9 @@ pub mod {{mod}} {
     {{crate}}::impl_deserialize_for_parcelable!(r#{{union_name}});
     impl {{crate}}::ParcelableMetadata for r#{{union_name}} {
         fn descriptor() -> &'static str { "{{ namespace }}" }
+        {%- if is_vintf %}
+        fn stability(&self) -> {{crate}}::Stability { {{crate}}::Stability::Vintf }
+        {%- endif %}
     }
     {{crate}}::declare_binder_enum! {
         Tag : [i32; {{ members|length }}] {
@@ -136,6 +140,9 @@ pub mod {{mod}} {
     {{crate}}::impl_deserialize_for_parcelable!({{name}});
     impl {{crate}}::ParcelableMetadata for {{name}} {
         fn descriptor() -> &'static str { "{{namespace}}" }
+        {%- if is_vintf %}
+        fn stability(&self) -> {{crate}}::Stability { {{crate}}::Stability::Vintf }
+        {%- endif %}
     }
     {%- if nested|length>0 %}
     {{nested}}
@@ -214,7 +221,11 @@ pub mod {{mod}} {
                 {%- endfor %}
             }
             let wrapped = Wrapper { _inner: inner, _rt: rt };
+            {%- if is_vintf %}
+            let binder = {{crate}}::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf);
+            {%- else %}
             let binder = {{crate}}::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default());
+            {%- endif %}
             {{crate}}::Strong::new(Box::new(binder))
         }
     }
@@ -506,13 +517,19 @@ impl Generator {
         Self { enabled_async, is_crate }
     }
 
+    fn get_crate_name(&self) -> &str {
+        if self.is_crate {
+            "crate"
+        } else {
+            "rsbinder"
+        }
+    }
+
     fn new_context(&self) -> tera::Context {
         let mut context = tera::Context::new();
-        if self.is_crate {
-            context.insert("crate", "crate");
-        } else {
-            context.insert("crate", "rsbinder");
-        }
+
+        context.insert("crate", self.get_crate_name());
+
         context
     }
 
@@ -561,13 +578,10 @@ impl Generator {
     }
 
     fn decl_interface(&self, arg_decl: &parser::InterfaceDecl, indent: usize) -> Result<String, Box<dyn Error>> {
-        let mut is_empty = false;
         let mut decl = arg_decl.clone();
 
-        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
-            is_empty = true;
-            // return Ok(String::new())
-        }
+        let is_empty = parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0;
+        let is_vintf = parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::VintfStability).0;
 
         decl.pre_process();
 
@@ -578,7 +592,10 @@ impl Generator {
             for constant in decl.constant_list.iter() {
                 let generator = constant.r#type.to_generator();
                 const_members.push((constant.const_identifier(),
-                    generator.const_type_decl(), generator.init_value(constant.const_expr.as_ref(), true)));
+                    generator.const_type_decl(),
+                    generator.init_value(constant.const_expr.as_ref(),
+                        InitParam::builder().with_const(true))
+                ));
             }
 
             for method in decl.method_list.iter() {
@@ -605,6 +622,7 @@ impl Generator {
         context.insert("oneway", &decl.oneway);
         context.insert("nested", &nested.trim());
         context.insert("enabled_async", &enabled_async);
+        context.insert("is_vintf", &is_vintf);
 
         let rendered = TEMPLATES.render("interface", &context).expect("Failed to render interface template");
 
@@ -614,6 +632,8 @@ impl Generator {
     fn decl_parcelable(&self, arg_decl: &parser::ParcelableDecl, indent: usize) -> Result<String, Box<dyn Error>> {
         let mut is_empty = false;
         let mut decl = arg_decl.clone();
+
+        let is_vintf = parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::VintfStability).0;
 
         if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0 {
             println!("Parcelable {} is only used for Java.", decl.name);
@@ -636,17 +656,30 @@ impl Generator {
             // Parse struct variables only.
             for decl in &decl.members {
                 if let Some(var) = decl.is_variable() {
+                    println!("Parcelable variable: {:?}", var);
                     let generator = var.r#type.to_generator();
 
                     if var.constant {
                         constant_members.push((var.const_identifier(),
-                            generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
+                            generator.const_type_decl(),
+                            generator.init_value(var.const_expr.as_ref(),
+                                InitParam::builder().with_const(true))
+                        ));
                     } else {
+                        let init_value = match generator.value_type {
+                            ValueType::Holder => Some(ConstExpr::new(ValueType::Holder)),
+                            _ => var.const_expr.clone()
+                        };
+
                         members.push(
                             (
                                 var.identifier(),
                                 generator.type_declaration(true),
-                                generator.init_value(var.const_expr.as_ref(), false)
+                                generator.init_value(init_value.as_ref(),
+                                    InitParam::builder().with_const(false)
+                                        .with_vintf(is_vintf)
+                                        .with_crate_name(self.get_crate_name())
+                                )
                             )
                         )
                     }
@@ -669,6 +702,7 @@ impl Generator {
         context.insert("members", &members);
         context.insert("const_members", &constant_members);
         context.insert("nested", &nested.trim());
+        context.insert("is_vintf", &is_vintf);
 
         let rendered = TEMPLATES.render("parcelable", &context).expect("Failed to render parcelable template");
 
@@ -710,6 +744,8 @@ impl Generator {
             return Ok(String::new())
         }
 
+        let is_vintf = parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::VintfStability).0;
+
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
 
@@ -718,7 +754,9 @@ impl Generator {
                 let generator = var.r#type.to_generator();
                 if var.constant {
                     constant_members.push((var.const_identifier(),
-                        generator.const_type_decl(), generator.init_value(var.const_expr.as_ref(), true)));
+                        generator.const_type_decl(),
+                        generator.init_value(var.const_expr.as_ref(),
+                            InitParam::builder().with_const(true))));
                 } else {
                     members.push((var.union_identifier(), generator.type_declaration(true), var.identifier(), generator.default_value()));
                 }
@@ -738,6 +776,7 @@ impl Generator {
         context.insert("namespace", &namespace);
         context.insert("members", &members);
         context.insert("const_members", &constant_members);
+        context.insert("is_vintf", &is_vintf);
 
         let rendered = TEMPLATES.render("union", &context).expect("Failed to render union template");
 

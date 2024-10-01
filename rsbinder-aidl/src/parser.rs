@@ -496,11 +496,13 @@ pub enum AnnotationType {
     IsNullable,
     JavaOnly,
     RustDerive,
+    VintfStability,
 }
 
 pub fn check_annotation_list(annotation_list: &Vec<Annotation>, query_type: AnnotationType) -> (bool, String) {
     for annotation in annotation_list {
         match query_type {
+            AnnotationType::VintfStability if annotation.annotation == "@VintfStability" => return (true, "".to_owned()),
             AnnotationType::IsNullable if annotation.annotation == "@nullable" => return (true, "".to_owned()),
             AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => return (true, "".to_owned()),
             AnnotationType::RustDerive if annotation.annotation == "@RustDerive" => {

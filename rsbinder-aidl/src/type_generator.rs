@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use crate::parser::{*, self};
-use crate::const_expr::{ValueType, ConstExpr};
+use crate::const_expr::{ValueType, ConstExpr, InitParam};
 
 static CRATE_NAME: OnceLock<String> = OnceLock::new();
 
@@ -591,15 +591,20 @@ impl TypeGenerator {
         }
     }
 
-    pub fn init_value(&self, const_expr: Option<&ConstExpr>, is_const: bool) -> String {
+    pub(crate) fn init_value(&self, const_expr: Option<&ConstExpr>, param: InitParam) -> String {
         match const_expr {
             Some(expr) => {
                 let init_str = if let ValueType::Array(_) = self.value_type {
                     let array_info = self.array_types.first().unwrap();
                     let is_nullable = self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
-                    expr.calculate().convert_to(&array_info.value_type).value.to_init(is_const, array_info.is_fixed(), is_nullable)
+                    expr.calculate().convert_to(&array_info.value_type).value.to_init(
+                        param.with_fixed_array(array_info.is_fixed())
+                            .with_nullable(is_nullable))
                 } else {
-                    expr.calculate().convert_to(&self.value_type).value.to_init(is_const, false, false)
+                    expr.calculate().convert_to(&self.value_type).value.to_init(
+                        param.with_fixed_array(false)
+                            .with_nullable(false)
+                    )
                 };
                 if self.is_nullable {
                     format!("Some({})", init_str)
@@ -607,7 +612,9 @@ impl TypeGenerator {
                     init_str
                 }
             }
-            None => ValueType::Void.to_init(is_const, false, false),
+            None => ValueType::Void.to_init(param.with_fixed_array(false)
+                .with_nullable(false)
+            ),
         }
     }
 }
