@@ -18,6 +18,8 @@ homepage = "https://hiking90.github.io/rsbinder-book/"
 repository = "https://github.com/hiking90/rsbinder"
 rust-version = "1.74"
 
+keywords = ["android", "binder", "aidl", "linux"]
+
 [workspace.dependencies]
 lazy_static = "1.4"
 rsbinder = { version = "0.3.0", path = "rsbinder" }
