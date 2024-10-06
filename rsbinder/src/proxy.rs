@@ -6,7 +6,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::{self, Arc, RwLock};
 
 use crate::{
     parcel::*,
@@ -22,7 +22,7 @@ pub struct ProxyHandle {
     descriptor: String,
     stability: Stability,
     obituary_sent: AtomicBool,
-    recipients: RwLock<Vec<Arc<dyn DeathRecipient>>>,
+    recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
 
     strong: RefCounter,
     weak: RefCounter,
@@ -72,8 +72,24 @@ impl ProxyHandle {
             thread_state::flush_commands()?;
         }
 
+        // To remember the recipients to remove
+        let mut recipients_to_remove = Vec::new();
         for recipient in recipients.iter() {
-            recipient.binder_died(who);
+            if let Some(recipient) = recipient.upgrade() {
+                recipient.binder_died(who);
+            } else {
+                // The recipient is already dead
+                recipients_to_remove.push(recipient.clone());
+            }
+        }
+
+        drop(recipients); // Release the read lock before acquiring the write lock
+
+        if !recipients_to_remove.is_empty() {
+            let mut recipients = self.recipients.write().unwrap();
+            for recipient in recipients_to_remove {
+                recipients.retain(|r| !sync::Weak::ptr_eq(r, &recipient));
+            }
         }
 
         Ok(())
@@ -112,7 +128,7 @@ impl PartialEq for ProxyHandle {
 
 impl IBinder for ProxyHandle {
     /// Register a death notification for this object.
-    fn link_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+    fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
@@ -130,13 +146,13 @@ impl IBinder for ProxyHandle {
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+    fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         } else {
             let mut recipients = self.recipients.write().unwrap();
 
-            recipients.retain(|r| !Arc::ptr_eq(r, &recipient));
+            recipients.retain(|r| !sync::Weak::ptr_eq(r, &recipient));
             if recipients.is_empty() {
                 thread_state::clear_death_notification(self.handle())?;
                 thread_state::flush_commands()?;

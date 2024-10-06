@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::ops::{Deref, DerefMut};
 use std::any::Any;
 use std::convert::TryFrom;
@@ -81,7 +81,7 @@ impl<T: Remotable> Inner<T> {
 }
 
 impl<T: 'static +  Remotable> IBinder for Inner<T> {
-    fn link_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+    fn link_to_death(&self, _recipient: Weak<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support link_to_death.");
         Err(StatusCode::InvalidOperation)
     }
@@ -89,7 +89,7 @@ impl<T: 'static +  Remotable> IBinder for Inner<T> {
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&self, _recipient: Arc<dyn DeathRecipient>) -> Result<()> {
+    fn unlink_to_death(&self, _recipient: Weak<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support unlink_to_death.");
         Err(StatusCode::InvalidOperation)
     }

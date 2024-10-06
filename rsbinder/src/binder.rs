@@ -19,7 +19,7 @@
 
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{self, Arc};
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
@@ -153,12 +153,12 @@ pub trait IBinder: Any + Send + Sync {
     /// INVALID_OPERATION code being returned and nothing happening.
     ///
     /// This link always holds a weak reference to its recipient.
-    fn link_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()>;
+    fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.
     /// The recipient will no longer be called if this object
     /// dies.
-    fn unlink_to_death(&self, recipient: Arc<dyn DeathRecipient>) -> Result<()>;
+    fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;
@@ -169,7 +169,9 @@ pub trait IBinder: Any + Send + Sync {
     /// To convert the interface to a transactable object
     fn as_transactable(&self) -> Option<&dyn Transactable>;
 
+    /// Retrieve the descriptor of this object.
     fn descriptor(&self) -> &str;
+    /// Retrieve if this object is remote.
     fn is_remote(&self) -> bool;
 
     fn inc_strong(&self, strong: &SIBinder) -> Result<()>;

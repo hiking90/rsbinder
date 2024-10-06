@@ -17,4 +17,11 @@ fn main() {
         .set_crate_support(true)
 
         .generate().unwrap();
+
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/android/sm/tests/IFoo.aidl"))
+
+        .output(PathBuf::from("sm_tests_aidl.rs"))
+        .set_crate_support(true)
+        .generate().unwrap();
 }

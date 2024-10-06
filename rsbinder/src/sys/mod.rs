@@ -64,6 +64,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(write_read, b'b', 1, binder_write_read);
     pub(crate) fn write_read<Fd: AsFd>(fd: Fd, write_read: &mut binder_write_read) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_WRITE_READ
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 1, binder_write_read>, binder_write_read>::new(write_read);
             ioctl::ioctl(fd, ctl)
         }
@@ -72,6 +73,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(set_max_threads, b'b', 5, __u32);
     pub(crate) fn set_max_threads<Fd: AsFd>(fd: Fd, max_threads: u32) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_SET_MAX_THREADS
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 5, __u32>, _>::new(max_threads);
             ioctl::ioctl(fd, ctl)
         }
@@ -80,6 +82,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(set_context_mgr, b'b', 7, __s32);
     pub(crate) fn set_context_mgr<Fd: AsFd>(fd: Fd, pid: i32) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_SET_CONTEXT_MGR
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 7, __s32>, _>::new(pid);
             ioctl::ioctl(fd, ctl)
         }
@@ -88,6 +91,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(version, b'b', 9, binder_version);
     pub(crate) fn version<Fd: AsFd>(fd: Fd, ver: &mut binder_version) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_VERSION
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 9, binder_version>, binder_version>::new(ver);
             ioctl::ioctl(fd, ctl)
         }
@@ -96,6 +100,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(set_context_mgr_ext, b'b', 13, flat_binder_object);
     pub(crate) fn set_context_mgr_ext<Fd: AsFd>(fd: Fd, obj: flat_binder_object) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_SET_CONTEXT_MGR_EXT
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 13, flat_binder_object>, _>::new(obj);
             ioctl::ioctl(fd, ctl)
         }
@@ -104,6 +109,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(enable_oneway_spam_detection, b'b', 16, __u32);
     pub(crate) fn enable_oneway_spam_detection<Fd: AsFd>(fd: Fd, enable: __u32) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_ENABLE_ONEWAY_SPAM_DETECTION
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 16, __u32>, _>::new(enable);
             ioctl::ioctl(fd, ctl)
         }
@@ -112,6 +118,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(binder_ctl_add, b'b', 1, binderfs_device);
     pub(crate) fn binder_ctl_add<Fd: AsFd>(fd: Fd, device: &mut binderfs_device) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_CTL_ADD
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 1, binderfs_device>, _>::new(device);
             ioctl::ioctl(fd, ctl)
         }
@@ -120,6 +127,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(set_idle_timeout, b'b', 3, __s64);
     pub(crate) fn set_idle_timeout<Fd: AsFd>(fd: Fd, timeout: i64) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_SET_IDLE_TIMEOUT
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 3, __s64>, _>::new(timeout);
             ioctl::ioctl(fd, ctl)
         }
@@ -128,6 +136,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(set_idle_priority, b'b', 6, __s32);
     pub(crate) fn set_idle_priority<Fd: AsFd>(fd: Fd, priority: i32) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_SET_IDLE_PRIORITY
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 6, __s32>, _>::new(priority);
             ioctl::ioctl(fd, ctl)
         }
@@ -136,6 +145,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(thread_exit, b'b', 8, __s32);
     pub(crate) fn thread_exit<Fd: AsFd>(fd: Fd, pid: i32) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_THREAD_EXIT
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 8, __s32>, _>::new(pid);
             ioctl::ioctl(fd, ctl)
         }
@@ -144,6 +154,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(get_node_debug_info, b'b', 11, binder_node_debug_info);
     pub(crate) fn get_node_debug_info<Fd: AsFd>(fd: Fd, node_debug_info: &mut binder_node_debug_info) -> std::result::Result<(), rustix::io::Errno> {
         unsafe {
+            // BINDER_GET_NODE_DEBUG_INFO
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 11, binder_node_debug_info>, _>::new(node_debug_info);
             ioctl::ioctl(fd, ctl)
         }
@@ -152,6 +163,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(get_node_info_for_ref, b'b', 12, binder_node_info_for_ref);
     pub(crate) fn get_node_info_for_ref<Fd: AsFd>(fd: Fd, node_info: &mut binder_node_info_for_ref) -> std::result::Result<(), rustix::io::Errno> {
         unsafe {
+            // BINDER_GET_NODE_INFO_FOR_REF
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 12, binder_node_info_for_ref>, _>::new(node_info);
             ioctl::ioctl(fd, ctl)
         }
@@ -160,6 +172,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(freeze, b'b', 14, binder_freeze_info);
     pub(crate) fn freeze<Fd: AsFd>(fd: Fd, info: binder_freeze_info) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_FREEZE
             let ctl = ioctl::Setter::<ioctl::WriteOpcode<b'b', 14, binder_freeze_info>, _>::new(info);
             ioctl::ioctl(fd, ctl)
         }
@@ -168,6 +181,7 @@ pub mod binder {
     // nix::ioctl_readwrite!(get_frozen_info, b'b', 15, binder_frozen_status_info);
     pub(crate) fn get_frozen_info<Fd: AsFd>(fd: Fd, frozen_info: &mut binder_frozen_status_info) -> std::result::Result<(), io::Errno> {
         unsafe {
+            // BINDER_GET_FROZEN_INFO
             let ctl = ioctl::Updater::<ioctl::ReadWriteOpcode<b'b', 15, binder_frozen_status_info>, _>::new(frozen_info);
             ioctl::ioctl(fd, ctl)
         }

@@ -17,6 +17,8 @@
  * limitations under the License.
  */
 
+use std::ffi::{CString, CStr};
+use std::fmt::Debug;
 use std::sync::{atomic::Ordering, Arc};
 use std::cell::RefCell;
 use log::error;
@@ -109,8 +111,8 @@ pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 #[derive(Debug, Clone, Copy)]
 struct TransactionState {
     calling_pid: binder::pid_t,
-    _calling_sid: *const u8,
-    _calling_uid: binder::uid_t,
+    calling_sid: *const u8,
+    calling_uid: binder::uid_t,
     // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
     work_source: binder::uid_t,
@@ -121,8 +123,8 @@ impl TransactionState {
     fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
         TransactionState {
             calling_pid: data.transaction_data.sender_pid,
-            _calling_sid: data.secctx as _,
-            _calling_uid: data.transaction_data.sender_euid,
+            calling_sid: data.secctx as _,
+            calling_uid: data.transaction_data.sender_euid,
             // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
             work_source: 0,
@@ -1065,26 +1067,43 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     })
 }
 
+#[derive(Debug)]
 pub struct CallingContext {
     pub pid: binder::pid_t,
     pub uid: binder::uid_t,
-    pub sid: *const u8,
+    pub sid: Option<CString>,
 }
 
-pub(crate) fn _get_calling_context() -> Result<CallingContext> {
-    THREAD_STATE.with(|thread_state| -> Result<CallingContext> {
-        let thread_state = thread_state.borrow();
-        let transaction = thread_state.transaction.as_ref().ok_or(StatusCode::Unknown)?;
-        let calling_pid = transaction.calling_pid;
-        let calling_uid = transaction._calling_uid;
-        let calling_sid = transaction._calling_sid;
-
-        Ok(CallingContext {
-            pid: calling_pid,
-            uid: calling_uid,
-            sid: calling_sid,
+impl CallingContext {
+    pub fn new() -> CallingContext {
+        THREAD_STATE.with(|thread_state| -> CallingContext {
+            let thread_state = thread_state.borrow();
+            match thread_state.transaction.as_ref() {
+                Some(transaction) => {
+                    let calling_sid = if transaction.calling_sid != std::ptr::null() {
+                        unsafe {
+                            Some(CStr::from_ptr(transaction.calling_sid as _).to_owned())
+                        }
+                    } else {
+                        None
+                    };
+                    CallingContext {
+                        pid: transaction.calling_pid,
+                        uid: transaction.calling_uid,
+                        sid: calling_sid,
+                    }
+                }
+                None => {
+                    log::debug!("CallingContext::new() called outside of transaction");
+                    CallingContext {
+                        pid: rustix::process::getpid().as_raw_nonzero().get() as _,
+                        uid: rustix::process::getuid().as_raw(),
+                        sid: None,
+                    }
+                }
+            }
         })
-    })
+    }
 }
 
 pub fn is_handling_transaction() -> bool {
