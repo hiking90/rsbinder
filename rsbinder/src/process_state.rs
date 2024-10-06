@@ -268,6 +268,24 @@ impl ProcessState {
         // to return too high of a value.
     }
 
+    pub fn strong_ref_count_for_node(&self, node: &ProxyHandle) -> Result<usize> {
+        let mut info = binder::binder_node_info_for_ref {
+            handle: node.handle(),
+            strong_count: 0,
+            weak_count: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+
+        binder::get_node_info_for_ref(&self.driver, &mut info)
+            .map_err(|e| {
+                log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {:?}", e);
+                e
+            })?;
+        Ok(info.strong_count as usize)
+    }
+
     pub fn join_thread_pool() -> Result<()> {
         thread_state::join_thread_pool(true)
     }

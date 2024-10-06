@@ -36,6 +36,7 @@ fn main() {
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/BazUnion.aidl"))
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/Foo.aidl"))
         .source(PathBuf::from("aidl/android/aidl/versioned/tests/IFooInterface.aidl"))
+        .source(PathBuf::from("aidl/android/aidl/tests/sm/IFoo.aidl"))
 
         .output(PathBuf::from("test_aidl.rs"))
         .generate().unwrap();

@@ -50,7 +50,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
         .unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
 
-    hello.as_binder().link_to_death(Arc::new(MyDeathRecipient{}))?;
+    let recipient = Arc::new(MyDeathRecipient{});
+    hello.as_binder().link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
 
     // Call echo method of Hello proxy.
     let echo = hello.echo("Hello World!")?;
