@@ -120,9 +120,10 @@ function remote_test() {
 }
 
 function run_test() {
+    local MAX_TRIES=${1:-"100"}
     cargo run --bin rsb_hub & sleep 1
     cargo run --bin test_service & sleep 1
-    for i in $(seq 1 100); do RUST_BACKTRACE=1 cargo test || break; done
+    for i in $(seq 1 $MAX_TRIES); do RUST_BACKTRACE=1 cargo test || break; done
 }
 
 function remote_test_async() {
@@ -133,9 +134,44 @@ function remote_test_async() {
 }
 
 function run_test_async() {
+    local MAX_TRIES=${1:-"100"}
     cargo run --bin rsb_hub & sleep 1
     cargo run --bin test_service_async & sleep 1
-    for i in $(seq 1 100); do RUST_BACKTRACE=1 cargo test || break; done
+    for i in $(seq 1 $MAX_TRIES); do RUST_BACKTRACE=1 cargo test || break; done
+}
+
+function remote_coverage() {
+    read_remote_linux
+    remote_sync
+    command ssh "$remote_user_host" -t "bash -c \"source ~/.profile && cd $remote_directory && \
+        source ./envsetup.sh && run_coverage \""
+    command rsync -avz "$remote_user_host:$remote_directory/coverage" $TOP_DIR
+}
+
+function run_coverage() {
+    rustup override set nightly
+    if [ $? -ne 0 ]; then
+        echo "Failed to set nightly toolchain. Exiting shell."
+        exit 1
+    fi
+    export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Clink-dead-code"
+    export CARGO_INCREMENTAL=0
+    export RUSTDOCFLAGS="-Cpanic=abort"
+    cargo clean && cargo build && cargo test --no-run
+    (
+        run_test 1
+    )
+    (
+        run_test_async 1
+    )
+
+    rm -rf coverage && grcov . -s . --binary-path ./target/debug -t html -o coverage \
+        --ignore "example-hello/*" \
+        --ignore "target/*" \
+        --ignore "tests/*" \
+        --ignore "rsbinder-aidl/tests/*"
+
+    rustup override unset
 }
 
 declare -a publish_dirs=("rsbinder-aidl" "rsbinder" "rsbinder-tools")

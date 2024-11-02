@@ -83,7 +83,7 @@ impl Serialize for ParcelFileDescriptor {
 
         // The dup_fd has been sent, so the file descriptor is now owned by the Parcel.
         // So, we need to forget the OwnedFd to avoid double-closing the file descriptor.
-        dup_fd.into_raw_fd();
+        let _ = dup_fd.into_raw_fd();
 
         Ok(())
     }
