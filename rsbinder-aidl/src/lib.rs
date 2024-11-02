@@ -136,6 +136,8 @@ impl Builder {
         self
     }
 
+    /// It must be used in rsbinder's build.rs.
+    /// It generates the rust output file with crate::??? instead of rsbinder::???.
     pub fn set_crate_support(mut self, enable: bool) -> Self {
         self.is_crate = enable;
         type_generator::set_crate_support(enable);

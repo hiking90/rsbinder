@@ -7,6 +7,7 @@ use log;
 use crate::sys::binder;
 use std::ffi::CString;
 
+/// Add a new binder device to the binderfs.
 pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
     let fd = File::options()
         .read(true)
@@ -26,11 +27,40 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
         *a = *c as std::os::raw::c_char;
     }
 
+    #[cfg(not(test))]
     binder::binder_ctl_add(fd, &mut device)
         .map_err(|e| {
             log::error!("Binder ioctl to add binder failed: {}", e.to_string());
             e
         })?;
 
+    #[cfg(test)]
+    tests::binder_ctl_add(fd, &mut device)
+        .map_err(|e| {
+            log::error!("Binder ioctl to add binder failed: {}", e.to_string());
+            e
+        })?;
+
     Ok((device.major, device.minor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    pub(crate) fn binder_ctl_add<Fd: AsFd>(_fd: Fd, device: &mut binder::binderfs_device) -> std::result::Result<(), rustix::io::Errno> {
+        device.major = 511;
+        device.minor = 0;
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_device() {
+        let driver = Path::new("/dev/binder");
+        let name = "rsbinder";
+        let (major, minor) = add_device(driver, name).unwrap();
+        assert_eq!(major, 511);
+        assert_eq!(minor, 0);
+    }
 }
