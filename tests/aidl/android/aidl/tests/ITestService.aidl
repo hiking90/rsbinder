@@ -328,4 +328,6 @@ interface ITestService {
     }
 
     ICircular GetCircular(out CircularParcelable cp);
+
+    oneway void killService();
 }

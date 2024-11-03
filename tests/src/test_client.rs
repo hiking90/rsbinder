@@ -53,6 +53,7 @@ fn init_logger() {
 fn init_test() {
     init_logger();
     ProcessState::init_default();
+    ProcessState::start_thread_pool();
 }
 
 fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
@@ -1233,4 +1234,58 @@ fn test_dump() {
     let mut buf = String::new();
     read_file.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, expected);
+}
+
+#[test]
+#[ignore]
+fn test_death_recipient() {
+    let test_service = get_test_service();
+    let (mut read_file, write_file) = build_pipe();
+
+    struct MyDeathRecipient {
+        write_file: Mutex<File>,
+    }
+
+    impl DeathRecipient for MyDeathRecipient {
+        fn binder_died(&self, _who: &WIBinder) {
+            let mut writer = self.write_file.lock().unwrap();
+
+            writer.write_all(b"binder_died\n").unwrap();
+            // writer.flush().unwrap();
+        }
+    }
+
+    {
+        let recipient = Arc::new(MyDeathRecipient{ write_file: Mutex::new(write_file) });
+        test_service.as_binder()
+            .link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
+        test_service.as_binder()
+            .unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
+
+        test_service.as_binder()
+            .link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
+
+        println!("Killing the service...");
+        test_service.killService().unwrap();
+
+        println!("Waiting for the service to die...");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let result = test_service.as_binder()
+            .unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+        assert_eq!(result, Err(rsbinder::StatusCode::DeadObject));
+    }
+
+    let mut buf = String::new();
+    read_file.read_to_string(&mut buf).unwrap();
+    assert_eq!(buf, "binder_died\n");
+}
+
+#[test]
+fn test_hub() {
+    hub::get_service(ITestService::BpTestService::descriptor()).unwrap();
+    let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
+    assert!(list.iter().any(|s| s == ITestService::BpTestService::descriptor()));
+
+    let service_debug_info_list = hub::get_service_debug_info().unwrap();
+    assert!(service_debug_info_list.iter().any(|s| s.name == ITestService::BpTestService::descriptor()));
 }

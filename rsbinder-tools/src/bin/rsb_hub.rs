@@ -515,3 +515,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     Ok(ProcessState::join_thread_pool()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_service_name() {
+        assert!(ServiceManager::is_valid_service_name("test"));
+        assert!(ServiceManager::is_valid_service_name("test-"));
+        assert!(ServiceManager::is_valid_service_name("test_"));
+        assert!(ServiceManager::is_valid_service_name("test."));
+        assert!(ServiceManager::is_valid_service_name("test/"));
+        assert!(ServiceManager::is_valid_service_name("test0"));
+        assert!(ServiceManager::is_valid_service_name("test1"));
+        assert!(ServiceManager::is_valid_service_name("TEST2"));
+    }
+}

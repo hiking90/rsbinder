@@ -330,3 +330,41 @@ impl Drop for ProcessState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_state() {
+        let process = ProcessState::init_default();
+        assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
+        assert_eq!(process.driver_name, PathBuf::from(crate::DEFAULT_BINDER_PATH));
+    }
+
+    #[test]
+    fn test_process_state_context_object() {
+        let process = ProcessState::init_default();
+        assert!(process.context_object().is_ok());
+    }
+
+    #[test]
+    fn test_process_state_strong_proxy_for_handle() {
+        let process = ProcessState::init_default();
+        assert!(process.strong_proxy_for_handle(0).is_ok());
+    }
+
+    #[test]
+    fn test_process_state_disable_background_scheduling() {
+        let process = ProcessState::init_default();
+        process.disable_background_scheduling(true);
+        assert!(process.background_scheduling_disabled());
+    }
+
+    #[test]
+    fn test_process_state_start_thread_pool() {
+        test_process_state();
+        ProcessState::start_thread_pool();
+        assert_eq!(ProcessState::as_self().kernel_started_threads.load(Ordering::SeqCst), 1);
+    }
+}

@@ -65,16 +65,20 @@ const RETURN_STRINGS: [&str; 21] =
 ];
 
 fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
-    let idx: usize = (cmd & binder::_IOC_NRMASK) as _;
-
-    if idx < RETURN_STRINGS.len() {
-        RETURN_STRINGS[idx]
+    if cmd == binder::BR_TRANSACTION_SEC_CTX {
+        return "BR_TRANSACTION_SEC_CTX";
     } else {
-        "Unknown BR_ return"
+        let idx: usize = (cmd & binder::_IOC_NRMASK) as _;
+
+        if idx < RETURN_STRINGS.len() {
+            RETURN_STRINGS[idx]
+        } else {
+            "Unknown BR_ return"
+        }
     }
 }
 
-const COMMAND_STRINGS: [&str; 17] =
+const COMMAND_STRINGS: [&str; 19] =
 [
     "BC_TRANSACTION",
     "BC_REPLY",
@@ -92,7 +96,9 @@ const COMMAND_STRINGS: [&str; 17] =
     "BC_EXIT_LOOPER",
     "BC_REQUEST_DEATH_NOTIFICATION",
     "BC_CLEAR_DEATH_NOTIFICATION",
-    "BC_DEAD_BINDER_DONE"
+    "BC_DEAD_BINDER_DONE",
+    "BC_TRANSACTION_SG",
+    "BC_REPLY_SG"
 ];
 
 fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
@@ -620,6 +626,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     state.in_parcel.read::<binder::binder_uintptr_t>()?
                 };
 
+                log::trace!("BR_DEAD_BINDER: handle {:X}", handle);
                 ProcessState::as_self().send_obituary_for_handle(handle as _)?;
 
                 {
@@ -731,7 +738,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
 
-                log::trace!("Received commands to driver:\n{:?}", thread_state.in_parcel);
+                log::trace!("Received commands from driver:\n{:?}", thread_state.in_parcel);
             }
         };
 
@@ -1110,4 +1117,59 @@ pub fn is_handling_transaction() -> bool {
     THREAD_STATE.with(|thread_state| {
         thread_state.borrow().transaction.is_some()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_return_to_str() {
+        assert_eq!(return_to_str(binder::BR_OK), "BR_OK");
+        assert_eq!(return_to_str(binder::BR_TRANSACTION), "BR_TRANSACTION");
+        assert_eq!(return_to_str(binder::BR_REPLY), "BR_REPLY");
+        assert_eq!(return_to_str(binder::BR_ACQUIRE), "BR_ACQUIRE");
+        assert_eq!(return_to_str(binder::BR_INCREFS), "BR_INCREFS");
+        assert_eq!(return_to_str(binder::BR_ACQUIRE_RESULT), "BR_ACQUIRE_RESULT");
+        assert_eq!(return_to_str(binder::BR_DEAD_BINDER), "BR_DEAD_BINDER");
+        assert_eq!(return_to_str(binder::BR_CLEAR_DEATH_NOTIFICATION_DONE), "BR_CLEAR_DEATH_NOTIFICATION_DONE");
+        assert_eq!(return_to_str(binder::BR_FAILED_REPLY), "BR_FAILED_REPLY");
+        assert_eq!(return_to_str(binder::BR_DEAD_REPLY), "BR_DEAD_REPLY");
+        assert_eq!(return_to_str(binder::BR_FINISHED), "BR_FINISHED");
+        assert_eq!(return_to_str(binder::BR_SPAWN_LOOPER), "BR_SPAWN_LOOPER");
+        assert_eq!(return_to_str(binder::BR_ATTEMPT_ACQUIRE), "BR_ATTEMPT_ACQUIRE");
+        assert_eq!(return_to_str(binder::BR_NOOP), "BR_NOOP");
+        assert_eq!(return_to_str(binder::BR_SPAWN_LOOPER), "BR_SPAWN_LOOPER");
+        assert_eq!(return_to_str(binder::BR_ERROR), "BR_ERROR");
+        assert_eq!(return_to_str(binder::BR_DEAD_REPLY), "BR_DEAD_REPLY");
+        assert_eq!(return_to_str(binder::BR_FAILED_REPLY), "BR_FAILED_REPLY");
+        assert_eq!(return_to_str(binder::BR_FROZEN_REPLY), "BR_FROZEN_REPLY");
+        assert_eq!(return_to_str(binder::BR_TRANSACTION_SEC_CTX), "BR_TRANSACTION_SEC_CTX");
+        assert_eq!(return_to_str(binder::BR_DECREFS), "BR_DECREFS");
+        assert_eq!(return_to_str(binder::BR_TRANSACTION_COMPLETE), "BR_TRANSACTION_COMPLETE");
+        assert_eq!(return_to_str(binder::BR_ONEWAY_SPAM_SUSPECT), "BR_ONEWAY_SPAM_SUSPECT");
+    }
+
+    #[test]
+    fn test_command_to_str() {
+        assert_eq!(command_to_str(binder::BC_TRANSACTION), "BC_TRANSACTION");
+        assert_eq!(command_to_str(binder::BC_REPLY), "BC_REPLY");
+        assert_eq!(command_to_str(binder::BC_ACQUIRE_RESULT), "BC_ACQUIRE_RESULT");
+        assert_eq!(command_to_str(binder::BC_FREE_BUFFER), "BC_FREE_BUFFER");
+        assert_eq!(command_to_str(binder::BC_INCREFS), "BC_INCREFS");
+        assert_eq!(command_to_str(binder::BC_ACQUIRE), "BC_ACQUIRE");
+        assert_eq!(command_to_str(binder::BC_RELEASE), "BC_RELEASE");
+        assert_eq!(command_to_str(binder::BC_DECREFS), "BC_DECREFS");
+        assert_eq!(command_to_str(binder::BC_INCREFS_DONE), "BC_INCREFS_DONE");
+        assert_eq!(command_to_str(binder::BC_ACQUIRE_DONE), "BC_ACQUIRE_DONE");
+        assert_eq!(command_to_str(binder::BC_ATTEMPT_ACQUIRE), "BC_ATTEMPT_ACQUIRE");
+        assert_eq!(command_to_str(binder::BC_REGISTER_LOOPER), "BC_REGISTER_LOOPER");
+        assert_eq!(command_to_str(binder::BC_ENTER_LOOPER), "BC_ENTER_LOOPER");
+        assert_eq!(command_to_str(binder::BC_EXIT_LOOPER), "BC_EXIT_LOOPER");
+        assert_eq!(command_to_str(binder::BC_REQUEST_DEATH_NOTIFICATION), "BC_REQUEST_DEATH_NOTIFICATION");
+        assert_eq!(command_to_str(binder::BC_CLEAR_DEATH_NOTIFICATION), "BC_CLEAR_DEATH_NOTIFICATION");
+        assert_eq!(command_to_str(binder::BC_DEAD_BINDER_DONE), "BC_DEAD_BINDER_DONE");
+        assert_eq!(command_to_str(binder::BC_TRANSACTION_SG), "BC_TRANSACTION_SG");
+        assert_eq!(command_to_str(binder::BC_REPLY_SG), "BC_REPLY_SG");
+    }
 }

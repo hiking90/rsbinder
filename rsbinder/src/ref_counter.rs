@@ -39,7 +39,7 @@ impl RefCounter {
                     return false;
                 }
                 while curr_count > 0 {
-                    match self.count.compare_exchange_weak(curr_count, curr_count + 1,
+                    match self.count.compare_exchange_weak(curr_count, curr_count.wrapping_add(1),
                         Ordering::Relaxed, Ordering::Relaxed) {
                         Ok(_) => break,
                         Err(count) => curr_count = count,
@@ -87,5 +87,59 @@ impl Default for RefCounter {
         Self {
             count: AtomicI32::new(INITIAL_STRONG_VALUE),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ref_counter() {
+        let counter = RefCounter::default();
+        assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
+
+        let result = counter.inc(|| {
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(counter.count.load(Ordering::Relaxed), 1);
+
+        let result = counter.dec(|| {
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
+    }
+
+    #[test]
+    fn test_ref_counter_attempt_inc() {
+        let counter = RefCounter::default();
+        assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
+
+        let result = counter.attempt_inc(false, || {
+            false
+        }, || {});
+        assert!(!result);
+        assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
+
+        let result = counter.attempt_inc(true, || {
+            true
+        }, || {});
+        assert!(result);
+        assert_eq!(counter.count.load(Ordering::Relaxed), 1);
+
+
+        let result = counter.attempt_inc(true, || {
+            true
+        }, || {});
+        assert!(result);
+        assert_eq!(counter.count.load(Ordering::Relaxed), 2);
+
+        let result = counter.attempt_inc(false, || {
+            false
+        }, || {});
+        assert!(result);
+        assert_eq!(counter.count.load(Ordering::Relaxed), 3);
     }
 }
