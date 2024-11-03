@@ -3,6 +3,7 @@
 **rsbinder** provides crates implemented in pure Rust that make Binder IPC available on both Android and Linux.
 
 [![Rust](https://github.com/hiking90/rsbinder/actions/workflows/build.yml/badge.svg)](https://github.com/hiking90/rsbinder/actions/workflows/build.yml)
+![Test Coverage](coverage.svg)
 
 ## Binder IPC: Available on Linux, Untapped Potential
 
