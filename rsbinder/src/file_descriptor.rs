@@ -130,3 +130,26 @@ impl Deserialize for ParcelFileDescriptor {
 }
 
 impl DeserializeArray for ParcelFileDescriptor {}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::FromRawFd;
+
+    use super::*;
+
+    #[test]
+    fn test_parcel_file_descriptor() {
+        let fd = unsafe {
+            OwnedFd::from_raw_fd(1)
+        };
+        let pfd = ParcelFileDescriptor::new(fd);
+
+        assert_eq!(pfd.as_raw_fd(), 1);
+
+        let owned_fd: OwnedFd = pfd.into();
+
+        let pfd = ParcelFileDescriptor::new(owned_fd);
+
+        assert_eq!(pfd.into_raw_fd(), 1);
+    }
+}

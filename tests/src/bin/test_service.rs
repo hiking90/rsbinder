@@ -6,7 +6,7 @@
 use env_logger::Env;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc};
 
 pub use rsbinder::*;
 
@@ -499,6 +499,10 @@ impl ITestService::ITestService for TestService {
     ) -> std::result::Result<rsbinder::Strong<dyn ICircular::ICircular>, rsbinder::Status> {
         Ok(ICircular::BnCircular::new_binder(Circular))
     }
+
+    fn r#killService(&self) -> rsbinder::status::Result<()> {
+        std::process::exit(0);
+    }
 }
 
 
@@ -626,6 +630,15 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArray for FixedSizeArrayService {
     }
 }
 
+struct MyDeathRecipient {
+}
+
+impl DeathRecipient for MyDeathRecipient {
+    fn binder_died(&self, _who: &WIBinder) {
+    }
+}
+
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
@@ -637,6 +650,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let service_name = <BpTestService as ITestService::ITestService>::descriptor();
     let service = BnTestService::new_binder(TestService::default());
     hub::add_service(service_name, service.as_binder()).expect("Could not register service");
+
+    let recipient = Arc::new(MyDeathRecipient{});
+    let result = service.as_binder().link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+    assert!(result.is_err());
+
+    let result = service.as_binder().unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+    assert!(result.is_err());
+
+    service.as_binder().ping_binder().expect("Could not ping binder");
+    assert_eq!(service.as_binder().is_remote(), false);
 
     let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
     let versioned_service = BnFooInterface::new_binder(FooInterface);

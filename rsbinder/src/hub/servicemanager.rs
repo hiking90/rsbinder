@@ -116,3 +116,8 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
         None => Err(StatusCode::NameNotFound),
     }
 }
+
+pub fn get_service_debug_info() -> Result<Vec<hub::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+    default().getServiceDebugInfo()
+        .map_err(|e| e.into())
+}

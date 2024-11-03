@@ -63,4 +63,12 @@ mod tests {
         assert_eq!(major, 511);
         assert_eq!(minor, 0);
     }
+
+    #[test]
+    fn test_add_device_error() {
+        let driver = Path::new("/dev/binder_error");
+        let name = "rsbinder";
+        let result = add_device(driver, name);
+        assert!(result.is_err());
+    }
 }

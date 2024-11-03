@@ -155,7 +155,151 @@ impl From<rustix::io::Errno> for StatusCode {
             rustix::io::Errno::WOULDBLOCK => StatusCode::WouldBlock,
             rustix::io::Errno::TIMEDOUT => StatusCode::TimedOut,
             rustix::io::Errno::BADF => StatusCode::BadFd,
-            _ => StatusCode::Errno(errno.raw_os_error()),
+            _ => StatusCode::Errno(-errno.raw_os_error()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_code() {
+        let code = StatusCode::Ok;
+        assert_eq!(code, StatusCode::from(0));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::Ok)));
+
+        let code = StatusCode::Unknown;
+        assert_eq!(code, StatusCode::from(UNKNOWN_ERROR));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::Unknown)));
+
+        let code = StatusCode::NoMemory;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::NOMEM.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::NoMemory)));
+
+        let code = StatusCode::InvalidOperation;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::NOSYS.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::InvalidOperation)));
+
+        let code = StatusCode::BadValue;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::INVAL.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::BadValue)));
+
+        let code = StatusCode::BadType;
+        assert_eq!(code, StatusCode::from(UNKNOWN_ERROR + 1));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::BadType)));
+
+        let code = StatusCode::NameNotFound;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::NOENT.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::NameNotFound)));
+
+        let code = StatusCode::PermissionDenied;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::PERM.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::PermissionDenied)));
+
+        let code = StatusCode::NoInit;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::NODEV.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::NoInit)));
+
+        let code = StatusCode::AlreadyExists;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::EXIST.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::AlreadyExists)));
+
+        let code = StatusCode::DeadObject;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::PIPE.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::DeadObject)));
+
+        let code = StatusCode::FailedTransaction;
+        assert_eq!(code, StatusCode::from(UNKNOWN_ERROR + 2));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::FailedTransaction)));
+
+        let code = StatusCode::UnknownTransaction;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::BADMSG.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::UnknownTransaction)));
+
+        let code = StatusCode::BadIndex;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::OVERFLOW.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::BadIndex)));
+
+        let code = StatusCode::FdsNotAllowed;
+        assert_eq!(code, StatusCode::from(UNKNOWN_ERROR + 7));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::FdsNotAllowed)));
+
+        let code = StatusCode::UnexpectedNull;
+        assert_eq!(code, StatusCode::from(UNKNOWN_ERROR + 8));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::UnexpectedNull)));
+
+        let code = StatusCode::NotEnoughData;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::NODATA.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::NotEnoughData)));
+
+        let code = StatusCode::WouldBlock;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::WOULDBLOCK.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::WouldBlock)));
+
+        let code = StatusCode::TimedOut;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::TIMEDOUT.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::TimedOut)));
+
+        let code = StatusCode::BadFd;
+        assert_eq!(code, StatusCode::from(-(rustix::io::Errno::BADF.raw_os_error())));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::BadFd)));
+
+        let code = StatusCode::ServiceSpecific(1);
+        assert_eq!(code, StatusCode::from(1));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::ServiceSpecific(1))));
+
+        let code: StatusCode = StatusCode::Errno(-64);
+        assert_eq!(code, StatusCode::from(-64));
+        assert_eq!(code, StatusCode::from(Into::<i32>::into(StatusCode::Errno(-64))));
+    }
+
+    #[test]
+    fn test_status_code_from_errno() {
+        let code = StatusCode::from(rustix::io::Errno::NOMEM);
+        assert_eq!(code, StatusCode::NoMemory);
+
+        let code = StatusCode::from(rustix::io::Errno::NOSYS);
+        assert_eq!(code, StatusCode::InvalidOperation);
+
+        let code = StatusCode::from(rustix::io::Errno::INVAL);
+        assert_eq!(code, StatusCode::BadValue);
+
+        let code = StatusCode::from(rustix::io::Errno::NOENT);
+        assert_eq!(code, StatusCode::NameNotFound);
+
+        let code = StatusCode::from(rustix::io::Errno::PERM);
+        assert_eq!(code, StatusCode::PermissionDenied);
+
+        let code = StatusCode::from(rustix::io::Errno::NODEV);
+        assert_eq!(code, StatusCode::NoInit);
+
+        let code = StatusCode::from(rustix::io::Errno::EXIST);
+        assert_eq!(code, StatusCode::AlreadyExists);
+
+        let code = StatusCode::from(rustix::io::Errno::PIPE);
+        assert_eq!(code, StatusCode::DeadObject);
+
+        let code = StatusCode::from(rustix::io::Errno::BADMSG);
+        assert_eq!(code, StatusCode::UnknownTransaction);
+
+        let code = StatusCode::from(rustix::io::Errno::OVERFLOW);
+        assert_eq!(code, StatusCode::BadIndex);
+
+        let code = StatusCode::from(rustix::io::Errno::NODATA);
+        assert_eq!(code, StatusCode::NotEnoughData);
+
+        let code = StatusCode::from(rustix::io::Errno::WOULDBLOCK);
+        assert_eq!(code, StatusCode::WouldBlock);
+
+        let code = StatusCode::from(rustix::io::Errno::TIMEDOUT);
+        assert_eq!(code, StatusCode::TimedOut);
+
+        let code = StatusCode::from(rustix::io::Errno::BADF);
+        assert_eq!(code, StatusCode::BadFd);
+
+        let code = StatusCode::from(rustix::io::Errno::from_raw_os_error(64));
+        assert_eq!(code, StatusCode::Errno(-64));
     }
 }

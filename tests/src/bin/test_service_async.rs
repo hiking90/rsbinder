@@ -555,6 +555,10 @@ impl ITestService::ITestServiceAsyncService for TestService {
     ) -> rsbinder::status::Result<rsbinder::Strong<dyn ICircular::ICircular>> {
         Ok(ICircular::BnCircular::new_async_binder(Circular, rt()))
     }
+
+    async fn r#killService(&self) -> rsbinder::status::Result<()> {
+        std::process::exit(0);
+    }
 }
 
 struct FooInterface;

@@ -623,4 +623,34 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_b_pack_chars() {
+        assert_eq!(b_pack_chars('_', 'P', 'N', 'G'), PING_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'D', 'M', 'P'), DUMP_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'C', 'M', 'D'), SHELL_COMMAND_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'N', 'T', 'F'), INTERFACE_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'S', 'P', 'R'), SYSPROPS_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'E', 'X', 'T'), EXTENSION_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'P', 'I', 'D'), DEBUG_PID_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'R', 'P', 'C'), SET_RPC_CLIENT_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'S', 'R', 'D'), START_RECORDING_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'E', 'R', 'D'), STOP_RECORDING_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'T', 'W', 'T'), TWEET_TRANSACTION);
+        assert_eq!(b_pack_chars('_', 'L', 'I', 'K'), LIKE_TRANSACTION);
+    }
+
+    #[test]
+    fn test_stability() {
+        assert_eq!(Into::<i32>::into(Stability::Local), 0);
+        assert_eq!(Into::<i32>::into(Stability::Vendor), 0b000011);
+        assert_eq!(Into::<i32>::into(Stability::System), 0b001100);
+        assert_eq!(Into::<i32>::into(Stability::Vintf), 0b111111);
+
+        assert_eq!(Stability::try_from(0).unwrap(), Stability::Local);
+        assert_eq!(Stability::try_from(0b000011).unwrap(), Stability::Vendor);
+        assert_eq!(Stability::try_from(0b001100).unwrap(), Stability::System);
+        assert_eq!(Stability::try_from(0b111111).unwrap(), Stability::Vintf);
+        assert_eq!(Stability::try_from(0b1111111).unwrap_err(), StatusCode::BadValue);
+    }
 }

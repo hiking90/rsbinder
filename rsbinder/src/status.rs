@@ -277,6 +277,45 @@ mod tests {
     #[test]
     fn test_status() -> Result<()> {
         let _status = Status::from(StatusCode::Unknown);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_status_display() -> Result<()> {
+        let unknown = Status::from(StatusCode::Unknown);
+        assert_eq!(format!("{}", unknown), "TransactionFailed / Unknown: ");
+
+        let service_specific = Status::new_service_specific_error(1, Some("Service specific error".to_owned()));
+        assert_eq!(format!("{}", service_specific), "ServiceSpecific / ServiceSpecific(1): Service specific error");
+
+        let exception = Status::new(ExceptionCode::BadParcelable, StatusCode::Unknown, Some("Bad parcelable".to_owned()));
+        assert_eq!(format!("{}", exception), "BadParcelable / Unknown: Bad parcelable");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_status_serialize() -> Result<()> {
+        let status = Status::from(StatusCode::ServiceSpecific(1));
+        let mut parcel = Parcel::new();
+        status.serialize(&mut parcel).unwrap();
+
+        // deserialize
+        parcel.set_data_position(0);
+        let deserialized = Status::deserialize(&mut parcel).unwrap();
+        assert_eq!(status, deserialized);
+
+        // serialize parcelable
+        let status = Status::new(ExceptionCode::Parcelable, StatusCode::Ok, Some("Parcelable".to_owned()));
+        let mut parcel = Parcel::new();
+        status.serialize(&mut parcel).unwrap();
+
+        // deserialize parcelable
+        parcel.set_data_position(0);
+        let deserialized = Status::deserialize(&mut parcel).unwrap();
+        assert_eq!(status, deserialized);
+
         Ok(())
     }
 }

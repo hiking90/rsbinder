@@ -240,3 +240,26 @@ pub trait Proxy : Sized + Interface {
     /// type of this interface.
     fn from_binder(binder: SIBinder) -> Option<Self>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_handle() {
+        let handle = ProxyHandle::new(1, "test", Stability::Local);
+        assert_eq!(handle.handle(), 1);
+        assert_eq!(handle.descriptor(), "test");
+
+        assert!(handle.as_transactable().is_none());
+        assert_eq!(handle.is_remote(), true);
+
+        // Test for Debug trait
+        let debug_str = format!("{:?}", handle);
+        assert_eq!(debug_str, "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }");
+
+        // Test for PartialEq trait
+        let handle2 = ProxyHandle::new(1, "test", Stability::Local);
+        assert_eq!(handle, handle2);
+    }
+}

@@ -124,6 +124,7 @@ function run_test() {
     cargo run --bin rsb_hub & sleep 1
     cargo run --bin test_service & sleep 1
     for i in $(seq 1 $MAX_TRIES); do RUST_BACKTRACE=1 cargo test || break; done
+    cargo test test_death_recipient -- --ignored
 }
 
 function remote_test_async() {
@@ -138,6 +139,7 @@ function run_test_async() {
     cargo run --bin rsb_hub & sleep 1
     cargo run --bin test_service_async & sleep 1
     for i in $(seq 1 $MAX_TRIES); do RUST_BACKTRACE=1 cargo test || break; done
+    cargo test test_death_recipient -- --ignored
 }
 
 function remote_coverage() {
@@ -145,6 +147,10 @@ function remote_coverage() {
     remote_sync
     command ssh "$remote_user_host" -t "bash -c \"source ~/.profile && cd $remote_directory && \
         source ./envsetup.sh && run_coverage \""
+    # Restore rustup override
+    command ssh "$remote_user_host" -t "bash -c \"source ~/.profile && cd $remote_directory && \
+        source ./envsetup.sh && rustup override unset \""
+    # Sync coverage report
     command rsync -avz "$remote_user_host:$remote_directory/coverage" $TOP_DIR
 }
 
@@ -157,6 +163,7 @@ function run_coverage() {
     export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Clink-dead-code"
     export CARGO_INCREMENTAL=0
     export RUSTDOCFLAGS="-Cpanic=abort"
+    export CARGO_TARGET_DIR="target/coverage"
     cargo clean && cargo build && cargo test --no-run
     (
         run_test 1
