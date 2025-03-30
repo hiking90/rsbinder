@@ -31,11 +31,11 @@ async-trait = "0.1"
 rsbinder-aidl = { version = "0.3.0", path = "rsbinder-aidl" }
 pest = "2.7"
 pest_derive = "2.7"
-convert_case = "0.6"
+convert_case = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 tera = "1.19"
 similar = "2.4"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
-downcast-rs = "1.2"
+downcast-rs = "2.0"
 rustix = "1.0"
 clap = "4.5"
