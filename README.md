@@ -28,8 +28,8 @@ By integrating **rsbinder** into your project, you gain the ability to harness B
 
 * **crate rsbinder**: A library crate for implementing binder service/client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
-* **[crate rsbinder-tools][rsbinder-tools-readme]**: Provides CLI tools for Linux.
-* **[crate tests][tests-readme]**: Provides functionality similar to Binder's ServiceManager.
+* **[crate rsbinder-tools][rsbinder-tools-readme]**: Provide CLI tools including a Binder Service Manager for Linux.
+* **[crate tests][tests-readme]**: Port Android’s binder test cases to provide various client/server testing features.
 * **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
