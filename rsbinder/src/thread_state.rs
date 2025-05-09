@@ -513,7 +513,6 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 let result = {
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
-                    // reader.set_data_position(0);
                     if target_ptr != 0 {
                         let strong = raw_pointer_to_strong_binder((target_ptr, tr_secctx.transaction_data.cookie));
                         if strong.attempt_increase() {
@@ -539,7 +538,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                         Err(err) => err.into(),
                     };
                     thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply, &status)?;
-                    // reply.set_data_size(0);
                     wait_for_response(UntilResponse::TransactionComplete)?;
                 } else if let Err(err) = result {
                     let mut log = format!(
