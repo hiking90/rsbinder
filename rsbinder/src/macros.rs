@@ -37,6 +37,7 @@ macro_rules! __declare_binder_interface {
         $(
             pub trait $native_adapter {
                 fn as_sync(&self) -> &dyn $interface;
+                #[allow(dead_code)]
                 fn as_async(&self) -> &dyn $native_async;
             }
 

@@ -66,10 +66,10 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
     #[cfg(target_os = "android")]
     {
         let manager_name = "manager";
-        let binder = get_service(manager_name);
+        let binder = hub::get_service(manager_name);
         assert!(binder.is_some());
 
-        let binder = check_service(manager_name);
+        let binder = hub::check_service(manager_name);
         assert!(binder.is_some());
     }
 

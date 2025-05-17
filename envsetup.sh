@@ -21,7 +21,7 @@ fi
 
 function ndk_build() {
     read_remote_android
-    cargo ndk --no-strip -t $ndk_target build && cargo ndk --no-strip -t $ndk_target -- test --no-run
+    cargo ndk --no-strip -t $cargo_ndk_target build && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run
 }
 
 function ndk_sync() {
@@ -51,12 +51,14 @@ function read_remote_android() {
         echo "and the remote directory information on the second line."
         echo
         echo "Example:"
-        echo "x86_64"
+        echo "arm64-v8a"
+        echo "aarch64"
         echo "/data/rsbinder"
         exit 1
     fi
 
     {
+        read cargo_ndk_target
         read ndk_target
         read remote_directory
     } <"$file"
