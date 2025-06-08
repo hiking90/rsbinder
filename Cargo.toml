@@ -16,7 +16,7 @@ license = "Apache-2.0"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
 homepage = "https://hiking90.github.io/rsbinder-book/"
 repository = "https://github.com/hiking90/rsbinder"
-rust-version = "1.75"
+rust-version = "1.77"
 
 keywords = ["android", "binder", "aidl", "linux"]
 
