@@ -26,6 +26,7 @@ downcast-rs = { workspace = true }
 async-trait = { workspace = true, optional = true }
 lazy_static = { workspace = true }
 tokio = { workspace = true, optional = true }
+rsproperties.workspace = true
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true }

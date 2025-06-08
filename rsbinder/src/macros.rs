@@ -562,6 +562,7 @@ mod tests {
     }
 
     pub trait IEchoAsyncService: Interface {
+        #[allow(dead_code)]
         fn echo(&self, echo: &str) -> Result<String>;
     }
 
@@ -627,6 +628,7 @@ mod tests {
             fn echo(&self, echo: &str) -> crate::status::Result<String>;
         }
         pub trait IEchoAsync<P> : Interface + Send {
+            #[allow(dead_code)]
             fn echo<'a>(&'a self, echo: &'a str) -> crate::BoxFuture<'a, crate::status::Result<String>>;
         }
         #[async_trait]

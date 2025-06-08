@@ -9,13 +9,3 @@ pub use crate::hello::IHello::*;
 
 // Define the name of the service to be registered in the HUB(service manager).
 pub const SERVICE_NAME: &str = "my.hello";
-
-pub fn process_with_args() {
-    std::env::args().for_each(|_arg| {
-        #[cfg(target_os = "android")]
-        if _arg.starts_with("--android-version=") {
-            let version = _arg.split('=').collect::<Vec<&str>>()[1];
-            rsbinder::set_android_version(version.parse().expect("Invalid version"));
-        }
-    });
-}
