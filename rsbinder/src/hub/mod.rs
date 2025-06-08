@@ -53,7 +53,7 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
 
     #[cfg(not(target_os = "android"))]
     {
-        v1::list_services()
+        v1::list_services(dump_priority)
     }
 }
 
