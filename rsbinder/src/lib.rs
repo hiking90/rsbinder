@@ -55,24 +55,23 @@ pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
 pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
 
-
 #[cfg(target_os = "android")]
-static ANDROID_VERSION: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-
-/// Set the Android version for compatibility.
-/// There are compatibility issues with Binder IPC depending on the Android version.
-/// The current findings indicate there are compatibility issues before and after Android 12.
-/// If your software needs to work on both Android 11 and 12,
-/// you must set the Android version using the rsbinder::set_android_version() API.
-#[cfg(target_os = "android")]
-pub fn set_android_version(version: i32) {
-    ANDROID_VERSION.set(version).expect("Android version is already set.");
-}
+static ANDROID_SDK_VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 /// Get the Android version.
 #[cfg(target_os = "android")]
-pub fn get_android_version() -> i32 {
-    *ANDROID_VERSION.get().unwrap_or(&0)
+pub fn get_android_sdk_version() -> u32 {
+    *ANDROID_SDK_VERSION.get_or_init(|| {
+        match rsproperties::get_with_result("ro.build.version.sdk") {
+            Ok(version) => {
+                version.parse::<u32>().unwrap_or(0)
+            }
+            Err(_) => {
+                log::warn!("Failed to get Android SDK version, defaulting to 0");
+                0
+            }
+        }
+    })
 }
 
 #[cfg(test)]

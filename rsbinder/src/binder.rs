@@ -293,10 +293,13 @@ impl From<Stability> for i32 {
         };
 
         #[cfg(target_os = "android")]
-        if crate::get_android_version() == 12 {
-            stability | 0x0c000000
-        } else {
-            stability
+        {
+            let android_sdk_version = crate::get_android_sdk_version();
+            if android_sdk_version == 31 || android_sdk_version == 32 {
+                stability | 0x0c000000
+            } else {
+                stability
+            }
         }
         #[cfg(not(target_os = "android"))]
         stability
