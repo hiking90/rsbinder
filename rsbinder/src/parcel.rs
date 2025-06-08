@@ -403,14 +403,24 @@ impl Parcel {
             return Err(StatusCode::NotEnoughData);
         }
 
-        let mut result = Vec::with_capacity(len as usize);
         let pos = self.pos;
+
+        // Safer approach: bounds-checked access using slice
+        let data_slice = self.data.as_slice()
+            .get(pos..pos + size)
+            .ok_or(StatusCode::NotEnoughData)?;
+
+        let mut result = Vec::with_capacity(len as usize);
         unsafe {
-            std::ptr::copy_nonoverlapping::<u8>(
-                self.data.as_slice()[pos .. pos + size].as_ptr(),
-                result.as_mut_ptr() as _, size);
+            // Copy from bounds-checked slice
+            std::ptr::copy_nonoverlapping(
+                data_slice.as_ptr(),
+                result.as_mut_ptr() as *mut u8,
+                size
+            );
             result.set_len(len as usize);
         }
+
         self.set_data_position(pos + padded);
 
         Ok(Some(result))

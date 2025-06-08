@@ -429,7 +429,13 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                                 free_buffer);
                             return Ok(Some(reply));
                         } else {
-                            let status: StatusCode = unsafe { (*(buffer as *const i32)).into() };
+                            // Safe approach: verify buffer size before reading
+                            let status: StatusCode = if tr.data_size >= std::mem::size_of::<i32>() as u64 {
+                                unsafe { (*(buffer as *const i32)).into() }
+                            } else {
+                                log::error!("Buffer too small for status code: {} < {}", tr.data_size, std::mem::size_of::<i32>());
+                                StatusCode::BadValue
+                            };
                             log::trace!("binder::BR_REPLY ({})", status);
                             free_buffer(None,
                                 buffer,
