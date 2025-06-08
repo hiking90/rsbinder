@@ -14,6 +14,11 @@ use crate::{
 };
 
 impl Default for flat_binder_object {
+    /// Creates a new flat_binder_object with safe default values.
+    ///
+    /// This provides a safe alternative to `std::mem::zeroed()` which can be
+    /// undefined behavior for some types. All fields are explicitly initialized
+    /// to known safe values.
     fn default() -> Self {
         flat_binder_object {
             hdr: binder_object_header {
@@ -39,6 +44,21 @@ impl flat_binder_object {
                 handle: fd as _,
             },
             cookie: if take_ownership { 1 } else { 0 },
+        }
+    }
+
+    /// Creates a new flat_binder_object for a binder with the specified flags.
+    /// This is a safe alternative to using Default::default() and manually setting flags.
+    pub(crate) fn new_binder_with_flags(flags: u32) -> Self {
+        flat_binder_object {
+            hdr: binder_object_header {
+                type_: BINDER_TYPE_BINDER
+            },
+            flags,
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: 0,
+            },
+            cookie: 0,
         }
     }
 
