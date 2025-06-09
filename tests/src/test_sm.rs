@@ -110,7 +110,7 @@ fn test_notifications() -> rsbinder::Result<()> {
 fn test_others() -> rsbinder::Result<()> {
     setup();
 
-    assert!(!hub::is_declared("android.hardware.usb.IUsb/default"));
+    assert!(!hub::is_declared("android.debug.IAdbManager/default"));
 
     Ok(())
 }

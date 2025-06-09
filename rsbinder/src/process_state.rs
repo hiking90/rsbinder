@@ -149,8 +149,7 @@ impl ProcessState {
         let mut context_manager = self.context_manager.write().unwrap();
 
         if context_manager.is_none() {
-            let mut obj: binder::flat_binder_object = unsafe { std::mem::zeroed() };
-            obj.flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+            let obj = binder::flat_binder_object::new_binder_with_flags(binder::FLAT_BINDER_FLAG_ACCEPTS_FDS);
 
             if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
                 //     android_errorWriteLog(0x534e4554, "121035042");

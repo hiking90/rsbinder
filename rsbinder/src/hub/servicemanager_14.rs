@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-include!(concat!(env!("OUT_DIR"), "/service_manager_v2.rs"));
+include!(concat!(env!("OUT_DIR"), "/service_manager_14.rs"));
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -15,12 +15,13 @@ pub use android::os::IServiceManager::{
     DUMP_FLAG_PRIORITY_DEFAULT,
     DUMP_FLAG_PRIORITY_ALL,
     DUMP_FLAG_PROTO,
-    FLAG_IS_LAZY_SERVICE,
 };
 
 pub use android::os::IServiceCallback::{
     IServiceCallback, BnServiceCallback,
 };
+
+pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
 static GLOBAL_SM: OnceLock<Arc<BpServiceManager>> = OnceLock::new();
 
@@ -38,19 +39,11 @@ pub fn default() -> Arc<BpServiceManager> {
 
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
-pub fn get_service(name: &str) -> Option<crate::hub::v2::android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    match default().getService2(name) {
-        Ok(service) => {
-            match service {
-                crate::hub::v2::android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
-                crate::hub::v2::android::os::Service::Service::Accessor(_accessor) => {
-                    log::warn!("Service {} is an Accessor, not a ServiceWithMetadata", name);
-                    None
-                }
-            }
-        }
+pub fn get_service(name: &str) -> Option<SIBinder> {
+    match default().getService(name) {
+        Ok(result) => result,
         Err(err) => {
-            log::error!("Failed to get service {}: {}", name, err);
+            log::error!("Failed to get service {}: {:?}", name, err);
             None
         }
     }
@@ -59,17 +52,9 @@ pub fn get_service(name: &str) -> Option<crate::hub::v2::android::os::ServiceWit
 /// Retrieve an existing service called @a name from the service
 /// manager. Non-blocking. Returns null if the service does not
 /// exist.
-pub fn check_service(name: &str) -> Option<crate::hub::v2::android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    match default().checkService2(name) {
-        Ok(service) => {
-            match service {
-                crate::hub::v2::android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
-                crate::hub::v2::android::os::Service::Service::Accessor(_accessor) => {
-                    log::warn!("Service {} is an Accessor, not a ServiceWithMetadata", name);
-                    None
-                }
-            }
-        }
+pub fn check_service(name: &str) -> Option<SIBinder> {
+    match default().checkService(name) {
+        Ok(result) => result,
         Err(err) => {
             log::error!("Failed to check service {}: {}", name, err);
             None
@@ -118,24 +103,22 @@ pub fn is_declared(name: &str) -> bool {
 }
 
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
-    match get_service(name) {
-        Some(service) => {
-            match service.service {
-                Some(service) => FromIBinder::try_from(service).map_err(|e| e.into()),
-                None => {
-                    log::error!("Service {} is not a valid IBinder", name);
-                    Err(StatusCode::NameNotFound)
-                }
-            }
+    match default().getService(name) {
+        Ok(Some(service)) => {
+            FromIBinder::try_from(service).map_err(|e| e.into())
         }
-        None => {
-            log::error!("Failed to get interface {}", name);
+        Ok(None) => {
+            log::error!("Service {} not found", name);
+            Err(StatusCode::NameNotFound)
+        }
+        Err(err) => {
+            log::error!("Failed to get interface {}: {}", name, err);
             Err(StatusCode::NameNotFound)
         }
     }
 }
 
-pub fn get_service_debug_info() -> Result<Vec<hub::v2::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+pub fn get_service_debug_info() -> Result<Vec<android::os::ServiceDebugInfo::ServiceDebugInfo>> {
     default().getServiceDebugInfo()
         .map_err(|e| e.into())
 }

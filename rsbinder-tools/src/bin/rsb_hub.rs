@@ -3,7 +3,7 @@
 #![allow(non_snake_case)]
 
 use std::{collections::HashMap, sync::{mpsc, Arc, Mutex}};
-use hub::{v1::IServiceManager, v1::BnServiceManager, v1::DUMP_FLAG_PRIORITY_DEFAULT};
+use hub::android_13::{IServiceManager, BnServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use env_logger::Env;
 use clap;
 use rsbinder::*;
@@ -42,8 +42,8 @@ impl rsbinder::DeathRecipient for DeathRecipientWrapper {
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
     name_to_service: HashMap<String, Service>,
-    name_to_registration_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::v1::android::os::IServiceCallback::IServiceCallback>>>,
-    name_to_client_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::v1::android::os::IClientCallback::IClientCallback>>>,
+    name_to_registration_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>>>,
+    name_to_client_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>>>,
 }
 
 impl Inner {
@@ -330,7 +330,7 @@ impl IServiceManager for ServiceManager {
         Ok(services)
     }
 
-    fn registerForNotifications(&self, name: &str, arg_callback: &rsbinder::Strong<dyn hub::v1::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
+    fn registerForNotifications(&self, name: &str, arg_callback: &rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
@@ -354,7 +354,7 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    fn unregisterForNotifications(&self, name: &str, callback: &rsbinder::Strong<dyn hub::v1::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
+    fn unregisterForNotifications(&self, name: &str, callback: &rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
 
         if inner.remove_registration_callback(Some(name),
@@ -381,12 +381,12 @@ impl IServiceManager for ServiceManager {
         Ok(None)
     }
 
-    fn getConnectionInfo(&self,_arg_name: &str) -> rsbinder::status::Result<Option<hub::v1::android::os::ConnectionInfo::ConnectionInfo>> {
+    fn getConnectionInfo(&self,_arg_name: &str) -> rsbinder::status::Result<Option<hub::android_13::android::os::ConnectionInfo::ConnectionInfo>> {
         log::warn!("getConnectionInfo is not implemented");
         Ok(None)
     }
 
-    fn registerClientCallback(&self, name: &str, arg_service: &rsbinder::SIBinder, arg_callback: &rsbinder::Strong<dyn hub::v1::android::os::IClientCallback::IClientCallback>) -> rsbinder::status::Result<()> {
+    fn registerClientCallback(&self, name: &str, arg_service: &rsbinder::SIBinder, arg_callback: &rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
 
         let service = if let Some(service) = inner.name_to_service.get(name) {
@@ -480,13 +480,13 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    fn getServiceDebugInfo(&self) -> rsbinder::status::Result<Vec<hub::v1::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+    fn getServiceDebugInfo(&self) -> rsbinder::status::Result<Vec<hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
         let inner = self.inner.lock().unwrap();
 
         let mut out = Vec::with_capacity(inner.name_to_service.len());
 
         for (name, service) in inner.name_to_service.iter() {
-            out.push(hub::v1::android::os::ServiceDebugInfo::ServiceDebugInfo {
+            out.push(hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo {
                 name: name.clone(),
                 debugPid: service.context.pid,
             });
