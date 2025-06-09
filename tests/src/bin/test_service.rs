@@ -651,6 +651,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let service = BnTestService::new_binder(TestService::default());
     hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
+    log::warn!("Intentional error output for testing purposes.");
+    log::warn!("This message indicates an expected failure case.");
     let recipient = Arc::new(MyDeathRecipient{});
     let result = service.as_binder().link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
     assert!(result.is_err());

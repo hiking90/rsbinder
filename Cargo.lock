@@ -1095,6 +1095,7 @@ dependencies = [
  "async-trait",
  "env_logger",
  "lazy_static",
+ "log",
  "rsbinder",
  "rsbinder-aidl",
  "rustix",

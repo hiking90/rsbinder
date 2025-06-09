@@ -1,12 +1,16 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_os = "android")]
 mod servicemanager_11;
+#[cfg(target_os = "android")]
 pub mod android_11 {
     pub use super::servicemanager_11::*;
 }
 
+#[cfg(target_os = "android")]
 mod servicemanager_12;
+#[cfg(target_os = "android")]
 pub mod android_12 {
     pub use super::servicemanager_12::*;
 }
@@ -16,12 +20,16 @@ pub mod android_13 {
     pub use super::servicemanager_13::*;
 }
 
+#[cfg(target_os = "android")]
 mod servicemanager_14;
+#[cfg(target_os = "android")]
 pub mod android_14 {
     pub use super::servicemanager_14::*;
 }
 
+#[cfg(target_os = "android")]
 mod servicemanager_16;
+#[cfg(target_os = "android")]
 pub mod android_16 {
     pub use super::servicemanager_16::*;
 }
