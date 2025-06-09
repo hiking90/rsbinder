@@ -1286,6 +1286,12 @@ fn test_hub() {
     let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
     assert!(list.iter().any(|s| s == ITestService::BpTestService::descriptor()));
 
+    #[cfg(target_os = "android")]
+    if get_android_sdk_version() < 31 {
+        // On Android 11 and below, the service debug info is not available.
+        return;
+    }
+
     let service_debug_info_list = hub::get_service_debug_info().unwrap();
     assert!(service_debug_info_list.iter().any(|s| s.name == ITestService::BpTestService::descriptor()));
 }

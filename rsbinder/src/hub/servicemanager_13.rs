@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-include!(concat!(env!("OUT_DIR"), "/service_manager_v1.rs"));
+include!(concat!(env!("OUT_DIR"), "/service_manager_13.rs"));
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -118,7 +118,7 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     }
 }
 
-pub fn get_service_debug_info() -> Result<Vec<hub::v1::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+pub fn get_service_debug_info() -> Result<Vec<android::os::ServiceDebugInfo::ServiceDebugInfo>> {
     default().getServiceDebugInfo()
         .map_err(|e| e.into())
 }

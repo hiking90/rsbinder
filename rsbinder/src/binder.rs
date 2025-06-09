@@ -316,8 +316,9 @@ impl TryFrom<i32> for Stability {
             stability if stability == System.into() => Ok(System),
             stability if stability == Vintf.into() => Ok(Vintf),
             _ => {
-                log::error!("Stability value is invalid: {}", stability);
-                Err(StatusCode::BadValue)
+                log::error!("Stability value is invalid: {:X}", stability);
+                // Err(StatusCode::BadValue)
+                Ok(Local)
             }
         }
     }
