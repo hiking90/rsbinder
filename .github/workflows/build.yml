@@ -11,12 +11,49 @@ env:
   rust_min: '1.77'
 
 jobs:
-  android-build:
-    name: android-build
+  test:
+    name: Test Suite
     runs-on: ubuntu-latest
-    needs:
-      - linux-build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-features
 
+  linux-build:
+    name: Linux Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: "" # remove -Dwarnings
+      - name: Build release
+        run: cargo build --workspace --release
+
+  android-build:
+    name: Android Build
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        target: [x86_64-linux-android, aarch64-linux-android, armv7-linux-androideabi]
     steps:
     - uses: actions/checkout@v4
     - uses: nttld/setup-ndk@v1
@@ -25,26 +62,16 @@ jobs:
         ndk-version: r26c
         add-to-path: false
         local-cache: true
-    - name: Install ndk targets
-      run: rustup target add x86_64-linux-android
+    - name: Install Rust ${{ env.rust_min }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ env.rust_min }}
+        targets: ${{ matrix.target }}
     - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
     - name: Install cargo-ndk
-      run: cargo install cargo-ndk
-    - name: Build for Android
-      run: cargo ndk -t x86_64-linux-android build
-
-  linux-build:
-    name: linux-build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_min }}
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.rust_min }}
-      - uses: Swatinem/rust-cache@v2
-      - name: "check --workspace --all-features"
-        run: cargo check --workspace --all-features
-        env:
-          RUSTFLAGS: "" # remove -Dwarnings
+      run: cargo install cargo-ndk --version "^3.0"
+    - name: Build for Android (${{ matrix.target }})
+      run: cargo ndk -t ${{ matrix.target }} build --release
 
