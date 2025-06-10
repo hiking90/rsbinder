@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(non_snake_case)]
 
-use std::{collections::HashMap, sync::{mpsc, Arc, Mutex}};
-use hub::android_13::{IServiceManager, BnServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use env_logger::Env;
+use hub::android_13::{BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use rsbinder::*;
+use std::{
+    collections::HashMap,
+    sync::{mpsc, Arc, Mutex},
+};
 
 struct Service {
     binder: SIBinder,
@@ -31,18 +34,23 @@ struct DeathRecipientWrapper(mpsc::Sender<rsbinder::WIBinder>);
 
 impl rsbinder::DeathRecipient for DeathRecipientWrapper {
     fn binder_died(&self, who: &rsbinder::WIBinder) {
-        self.0.send(who.clone())
-            .unwrap_or_else(|e| {
-                log::error!("Failed to send death notification: {:?}", e);
-            });
+        self.0.send(who.clone()).unwrap_or_else(|e| {
+            log::error!("Failed to send death notification: {:?}", e);
+        });
     }
 }
 
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
     name_to_service: HashMap<String, Service>,
-    name_to_registration_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>>>,
-    name_to_client_callbacks: HashMap<String, Vec<rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>>>,
+    name_to_registration_callbacks: HashMap<
+        String,
+        Vec<rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>>,
+    >,
+    name_to_client_callbacks: HashMap<
+        String,
+        Vec<rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>>,
+    >,
 }
 
 impl Inner {
@@ -60,23 +68,39 @@ impl Inner {
         Ok(())
     }
 
-    fn send_client_callback_notification(&mut self, service_name: &str, has_clients: bool, context: &str) {
+    fn send_client_callback_notification(
+        &mut self,
+        service_name: &str,
+        has_clients: bool,
+        context: &str,
+    ) {
         let service = if let Some(service) = self.name_to_service.get_mut(service_name) {
             service
         } else {
-            log::warn!("send_client_callback_notification could not find service {} when {}", service_name, context);
+            log::warn!(
+                "send_client_callback_notification could not find service {} when {}",
+                service_name,
+                context
+            );
             return;
         };
 
         if service.has_clients == has_clients {
-            log::error!("send_client_callback_notification called with the same state {} when {}",
-                has_clients, context);
+            log::error!(
+                "send_client_callback_notification called with the same state {} when {}",
+                has_clients,
+                context
+            );
             std::process::abort()
         }
 
-        log::info!("Notifying {} they {} (previously: {}) have clients when {}",
-            service_name, if has_clients { "do" } else { "don't" },
-            if service.has_clients { "do" } else { "don't" }, context);
+        log::info!(
+            "Notifying {} they {} (previously: {}) have clients when {}",
+            service_name,
+            if has_clients { "do" } else { "don't" },
+            if service.has_clients { "do" } else { "don't" },
+            context
+        );
 
         self.name_to_client_callbacks.get(service_name).map(|callbacks| {
             for callback in callbacks {
@@ -92,9 +116,18 @@ impl Inner {
         service.has_clients = has_clients;
     }
 
-    fn handle_service_client_callback(&mut self, known_clients: usize, service_name: &str, is_called_on_interval: bool) -> Result<bool> {
+    fn handle_service_client_callback(
+        &mut self,
+        known_clients: usize,
+        service_name: &str,
+        is_called_on_interval: bool,
+    ) -> Result<bool> {
         let service = if let Some(service) = self.name_to_service.get(service_name) {
-            if self.name_to_client_callbacks.get(service_name).is_none_or(|callbacks| callbacks.is_empty()) {
+            if self
+                .name_to_client_callbacks
+                .get(service_name)
+                .map_or(true, |callbacks| callbacks.is_empty())
+            {
                 return Ok(true);
             }
             service
@@ -103,10 +136,15 @@ impl Inner {
         };
 
         let count = match rsbinder::ProcessState::as_self()
-            .strong_ref_count_for_node(service.binder.as_proxy().expect("Service must be a proxy")) {
+            .strong_ref_count_for_node(service.binder.as_proxy().expect("Service must be a proxy"))
+        {
             Ok(count) => count,
             Err(e) => {
-                log::error!("Failed to get strong ref count for {}: {:?}", service_name, e);
+                log::error!(
+                    "Failed to get strong ref count for {}: {:?}",
+                    service_name,
+                    e
+                );
                 return Ok(true);
             }
         };
@@ -117,8 +155,11 @@ impl Inner {
 
         if service.guarentee_client {
             if !has_clients && !has_kernel_reported_clients {
-                self.send_client_callback_notification(service_name, true,
-                    "service is guaranteed to be in use");
+                self.send_client_callback_notification(
+                    service_name,
+                    true,
+                    "service is guaranteed to be in use",
+                );
             }
 
             if let Some(service) = self.name_to_service.get_mut(service_name) {
@@ -129,16 +170,22 @@ impl Inner {
         }
 
         if has_kernel_reported_clients && !has_clients {
-            self.send_client_callback_notification(service_name, true,
-                "we now have a record of a client");
+            self.send_client_callback_notification(
+                service_name,
+                true,
+                "we now have a record of a client",
+            );
             if let Some(service) = self.name_to_service.get(service_name) {
                 has_clients = service.has_clients;
             }
         }
 
         if is_called_on_interval && !has_kernel_reported_clients && has_clients {
-            self.send_client_callback_notification(service_name, false,
-                "we now have no record of a client");
+            self.send_client_callback_notification(
+                service_name,
+                false,
+                "we now have no record of a client",
+            );
             if let Some(service) = self.name_to_service.get(service_name) {
                 has_clients = service.has_clients;
             }
@@ -147,8 +194,11 @@ impl Inner {
         Ok(has_clients)
     }
 
-
-    fn try_get_binder(&mut self, name:&str, _start_if_not_found: bool) -> rsbinder::status::Result<Option<SIBinder>> {
+    fn try_get_binder(
+        &mut self,
+        name: &str,
+        _start_if_not_found: bool,
+    ) -> rsbinder::status::Result<Option<SIBinder>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
             service
         } else {
@@ -166,7 +216,11 @@ impl Inner {
         Ok(Some(out))
     }
 
-    fn remove_registration_callback(&mut self, name: Option<&str>, who: &rsbinder::WIBinder) -> bool {
+    fn remove_registration_callback(
+        &mut self,
+        name: Option<&str>,
+        who: &rsbinder::WIBinder,
+    ) -> bool {
         let mut found = false;
         if let Some(name) = name {
             if let Some(callbacks) = self.name_to_registration_callbacks.get_mut(name) {
@@ -217,9 +271,9 @@ impl ServiceManager {
             for who in death_receiver {
                 let mut inner = inner_clone.lock().unwrap();
 
-                inner.name_to_service.retain(|_, service| {
-                    !(SIBinder::downgrade(&service.binder) == who)
-                });
+                inner
+                    .name_to_service
+                    .retain(|_, service| !(SIBinder::downgrade(&service.binder) == who));
 
                 inner.remove_registration_callback(None, &who);
             }
@@ -257,7 +311,13 @@ impl IServiceManager for ServiceManager {
         self.inner.lock().unwrap().try_get_binder(name, false)
     }
 
-    fn addService(&self, name: &str, service: &SIBinder, allowIsolated: bool, dumpPriority: i32) -> rsbinder::status::Result<()> {
+    fn addService(
+        &self,
+        name: &str,
+        service: &SIBinder,
+        allowIsolated: bool,
+        dumpPriority: i32,
+    ) -> rsbinder::status::Result<()> {
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
@@ -267,7 +327,9 @@ impl IServiceManager for ServiceManager {
         // Only if the service is a proxy, link to death.
         // Because the native service does not support death notification.
         if service.as_proxy().is_some() {
-            service.link_to_death(Arc::downgrade(&(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>)))?;
+            service.link_to_death(Arc::downgrade(
+                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+            ))?;
         }
 
         let mut prev_clients = false;
@@ -277,15 +339,18 @@ impl IServiceManager for ServiceManager {
             }
         }
 
-        inner.add_service(name, Service {
-            binder: service.clone(),
-            _allow_isolated: allowIsolated,
-            dump_priority: dumpPriority,
-            has_clients: prev_clients,
-            guarentee_client: false,
-            _debug_pid: 0,
-            context: rsbinder::thread_state::CallingContext::default(),
-        })?;
+        inner.add_service(
+            name,
+            Service {
+                binder: service.clone(),
+                _allow_isolated: allowIsolated,
+                dump_priority: dumpPriority,
+                has_clients: prev_clients,
+                guarentee_client: false,
+                _debug_pid: 0,
+                context: rsbinder::thread_state::CallingContext::default(),
+            },
+        )?;
 
         if inner.name_to_registration_callbacks.contains_key(name) {
             if let Some(service) = inner.name_to_service.get_mut(name) {
@@ -298,7 +363,9 @@ impl IServiceManager for ServiceManager {
                 service.guarentee_client = true;
             }
 
-            let callbacks = inner.name_to_registration_callbacks.get(name)
+            let callbacks = inner
+                .name_to_registration_callbacks
+                .get(name)
                 .expect("name_to_registration_callbacks must have key");
             for callback in callbacks {
                 callback.onRegistration(name, service)?;
@@ -326,22 +393,32 @@ impl IServiceManager for ServiceManager {
         Ok(services)
     }
 
-    fn registerForNotifications(&self, name: &str, arg_callback: &rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
+    fn registerForNotifications(
+        &self,
+        name: &str,
+        arg_callback: &rsbinder::Strong<
+            dyn hub::android_13::android::os::IServiceCallback::IServiceCallback,
+        >,
+    ) -> rsbinder::status::Result<()> {
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
         let mut inner = self.inner.lock().unwrap();
 
-        arg_callback.as_binder().link_to_death(Arc::downgrade(&(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>)))?;
+        arg_callback.as_binder().link_to_death(Arc::downgrade(
+            &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+        ))?;
 
-        inner.name_to_registration_callbacks
+        inner
+            .name_to_registration_callbacks
             .entry(name.to_string())
             .or_default()
             .push(arg_callback.clone());
 
         if let Some(service) = inner.name_to_service.get(name) {
-            arg_callback.onRegistration(name, &service.binder)
+            arg_callback
+                .onRegistration(name, &service.binder)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to notify client callback: {:?}", e);
                 });
@@ -350,39 +427,58 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    fn unregisterForNotifications(&self, name: &str, callback: &rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::status::Result<()> {
+    fn unregisterForNotifications(
+        &self,
+        name: &str,
+        callback: &rsbinder::Strong<
+            dyn hub::android_13::android::os::IServiceCallback::IServiceCallback,
+        >,
+    ) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.remove_registration_callback(Some(name),
-            &SIBinder::downgrade(&callback.as_binder())) {
+        if inner
+            .remove_registration_callback(Some(name), &SIBinder::downgrade(&callback.as_binder()))
+        {
             Ok(())
         } else {
             Err(ExceptionCode::IllegalState.into())
         }
     }
 
-    fn isDeclared(&self,_arg_name: &str) -> rsbinder::status::Result<bool> {
+    fn isDeclared(&self, _arg_name: &str) -> rsbinder::status::Result<bool> {
         // TODO: Implement this
         log::warn!("isDeclared is not implemented");
         Ok(false)
     }
 
-    fn getDeclaredInstances(&self,_arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
+    fn getDeclaredInstances(&self, _arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
         log::warn!("getDeclaredInstances is not implemented");
         Ok(vec![])
     }
 
-    fn updatableViaApex(&self,_arg_name: &str) -> rsbinder::status::Result<Option<String>> {
+    fn updatableViaApex(&self, _arg_name: &str) -> rsbinder::status::Result<Option<String>> {
         log::warn!("updatableViaApex is not implemented");
         Ok(None)
     }
 
-    fn getConnectionInfo(&self,_arg_name: &str) -> rsbinder::status::Result<Option<hub::android_13::android::os::ConnectionInfo::ConnectionInfo>> {
+    fn getConnectionInfo(
+        &self,
+        _arg_name: &str,
+    ) -> rsbinder::status::Result<
+        Option<hub::android_13::android::os::ConnectionInfo::ConnectionInfo>,
+    > {
         log::warn!("getConnectionInfo is not implemented");
         Ok(None)
     }
 
-    fn registerClientCallback(&self, name: &str, arg_service: &rsbinder::SIBinder, arg_callback: &rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>) -> rsbinder::status::Result<()> {
+    fn registerClientCallback(
+        &self,
+        name: &str,
+        arg_service: &rsbinder::SIBinder,
+        arg_callback: &rsbinder::Strong<
+            dyn hub::android_13::android::os::IClientCallback::IClientCallback,
+        >,
+    ) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
 
         let service = if let Some(service) = inner.name_to_service.get(name) {
@@ -394,8 +490,10 @@ impl IServiceManager for ServiceManager {
         };
 
         if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
-            let msg = format!("{:?} Only a server can register for client callbacks (for {})",
-                service.context, name);
+            let msg = format!(
+                "{:?} Only a server can register for client callbacks (for {})",
+                service.context, name
+            );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::Security, msg.as_str()).into());
         }
@@ -406,42 +504,53 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         }
 
-        arg_callback.as_binder().link_to_death(Arc::downgrade(&(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>)))?;
+        arg_callback.as_binder().link_to_death(Arc::downgrade(
+            &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+        ))?;
 
         if service.has_clients {
-            arg_callback.onClients(&service.binder, true)
+            arg_callback
+                .onClients(&service.binder, true)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to notify client callback: {:?}", e);
                 });
         }
 
-        inner.name_to_client_callbacks
+        inner
+            .name_to_client_callbacks
             .entry(name.to_string())
             .or_default()
             .push(arg_callback.clone());
 
-        inner.handle_service_client_callback(2 /* sm + transaction */,
-            name, false)?;
+        inner.handle_service_client_callback(2 /* sm + transaction */, name, false)?;
 
         Ok(())
     }
 
-    fn tryUnregisterService(&self, name: &str, arg_service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
+    fn tryUnregisterService(
+        &self,
+        name: &str,
+        arg_service: &rsbinder::SIBinder,
+    ) -> rsbinder::status::Result<()> {
         let context = rsbinder::thread_state::CallingContext::default();
 
         let mut inner = self.inner.lock().unwrap();
         let service = if let Some(service) = inner.name_to_service.get(name) {
             service
         } else {
-            let msg = format!("{:?} Tried to unregister {}, but that service wasn't registered to begin with.",
-                context, name);
+            let msg = format!(
+                "{:?} Tried to unregister {}, but that service wasn't registered to begin with.",
+                context, name
+            );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         };
 
         if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
-            let msg = format!("{:?} Only a server can register for client callbacks (for {})",
-                service.context, name);
+            let msg = format!(
+                "{:?} Only a server can register for client callbacks (for {})",
+                service.context, name
+            );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::Security, msg.as_str()).into());
         }
@@ -454,16 +563,20 @@ impl IServiceManager for ServiceManager {
         }
 
         if service.guarentee_client {
-            let msg = format!("{:?} Tried to unregister {}, but there is about to be a client.",
-                context, name);
+            let msg = format!(
+                "{:?} Tried to unregister {}, but there is about to be a client.",
+                context, name
+            );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalState, msg.as_str()).into());
         }
 
         let res = inner.handle_service_client_callback(2, name, false);
         if res.is_err() {
-            let msg = format!("{:?} Tried to unregister {}, but there are clients.",
-                context, name);
+            let msg = format!(
+                "{:?} Tried to unregister {}, but there are clients.",
+                context, name
+            );
             log::warn!("{}", &msg);
             if let Some(service) = inner.name_to_service.get_mut(name) {
                 service.guarentee_client = true;
@@ -476,16 +589,22 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    fn getServiceDebugInfo(&self) -> rsbinder::status::Result<Vec<hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+    fn getServiceDebugInfo(
+        &self,
+    ) -> rsbinder::status::Result<
+        Vec<hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo>,
+    > {
         let inner = self.inner.lock().unwrap();
 
         let mut out = Vec::with_capacity(inner.name_to_service.len());
 
         for (name, service) in inner.name_to_service.iter() {
-            out.push(hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo {
-                name: name.clone(),
-                debugPid: service.context.pid,
-            });
+            out.push(
+                hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo {
+                    name: name.clone(),
+                    debugPid: service.context.pid,
+                },
+            );
         }
 
         Ok(out)
@@ -505,7 +624,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Create a binder service.
     let service = BnServiceManager::new_binder(ServiceManager::new());
-    service.addService("manager", &service.as_binder(), false, DUMP_FLAG_PRIORITY_DEFAULT)?;
+    service.addService(
+        "manager",
+        &service.as_binder(),
+        false,
+        DUMP_FLAG_PRIORITY_DEFAULT,
+    )?;
 
     ProcessState::as_self().become_context_manager(service.as_binder())?;
 

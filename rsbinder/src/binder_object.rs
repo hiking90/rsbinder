@@ -6,12 +6,7 @@ use std::mem::ManuallyDrop;
 use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
 
 pub(crate) use crate::sys::binder::flat_binder_object;
-use crate::{
-    binder::*,
-    error::*,
-    process_state,
-    sys::*,
-};
+use crate::{binder::*, error::*, process_state, sys::*};
 
 impl Default for flat_binder_object {
     /// Creates a new flat_binder_object with safe default values.
@@ -22,12 +17,10 @@ impl Default for flat_binder_object {
     fn default() -> Self {
         flat_binder_object {
             hdr: binder_object_header {
-                type_: BINDER_TYPE_BINDER
+                type_: BINDER_TYPE_BINDER,
             },
             flags: 0,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                binder: 0,
-            },
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
             cookie: 0,
         }
     }
@@ -37,12 +30,10 @@ impl flat_binder_object {
     pub(crate) fn new_with_fd(fd: i32, take_ownership: bool) -> Self {
         flat_binder_object {
             hdr: binder_object_header {
-                type_: BINDER_TYPE_FD
+                type_: BINDER_TYPE_FD,
             },
             flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                handle: fd as _,
-            },
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { handle: fd as _ },
             cookie: if take_ownership { 1 } else { 0 },
         }
     }
@@ -52,12 +43,10 @@ impl flat_binder_object {
     pub(crate) fn new_binder_with_flags(flags: u32) -> Self {
         flat_binder_object {
             hdr: binder_object_header {
-                type_: BINDER_TYPE_BINDER
+                type_: BINDER_TYPE_BINDER,
             },
             flags,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                binder: 0,
-            },
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
             cookie: 0,
         }
     }
@@ -104,9 +93,9 @@ impl flat_binder_object {
 
                 Ok(())
             }
-            BINDER_TYPE_HANDLE => {
-                process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle())?.increase()
-            }
+            BINDER_TYPE_HANDLE => process_state::ProcessState::as_self()
+                .strong_proxy_for_handle(self.handle())?
+                .increase(),
             BINDER_TYPE_FD => {
                 // Notion to do.
                 Ok(())
@@ -127,9 +116,9 @@ impl flat_binder_object {
                 }
                 Ok(())
             }
-            BINDER_TYPE_HANDLE => {
-                process_state::ProcessState::as_self().strong_proxy_for_handle(self.handle())?.decrease()
-            }
+            BINDER_TYPE_HANDLE => process_state::ProcessState::as_self()
+                .strong_proxy_for_handle(self.handle())?
+                .decrease(),
             BINDER_TYPE_FD => {
                 if self.cookie != 0 {
                     // Get owned fd and close it.
@@ -147,27 +136,25 @@ impl flat_binder_object {
 }
 
 fn split_fat_pointer(ptr: *const dyn IBinder) -> (u64, u64) {
-    unsafe {
-        std::mem::transmute(ptr)
-    }
+    unsafe { std::mem::transmute(ptr) }
 }
 
 fn make_fat_pointer(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> *const dyn IBinder {
-    unsafe {
-        std::mem::transmute(raw_pointer)
-    }
+    unsafe { std::mem::transmute(raw_pointer) }
 }
 
-const SCHED_NORMAL:u32 = 0;
-const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT:u32 = 9;
+const SCHED_NORMAL: u32 = 0;
+const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT: u32 = 9;
 
 fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
-    (priority & FLAT_BINDER_FLAG_PRIORITY_MASK) | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
+    (priority & FLAT_BINDER_FLAG_PRIORITY_MASK)
+        | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
 impl From<&SIBinder> for flat_binder_object {
     fn from(binder: &SIBinder) -> Self {
-        let sched_bits = if !process_state::ProcessState::as_self().background_scheduling_disabled() {
+        let sched_bits = if !process_state::ProcessState::as_self().background_scheduling_disabled()
+        {
             sched_policy_mask(SCHED_NORMAL, 19)
         } else {
             0
@@ -176,7 +163,7 @@ impl From<&SIBinder> for flat_binder_object {
         if let Some(proxy) = binder.as_proxy() {
             flat_binder_object {
                 hdr: binder_object_header {
-                    type_: BINDER_TYPE_HANDLE
+                    type_: BINDER_TYPE_HANDLE,
                 },
                 flags: sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
@@ -190,7 +177,7 @@ impl From<&SIBinder> for flat_binder_object {
 
             flat_binder_object {
                 hdr: binder_object_header {
-                    type_: BINDER_TYPE_BINDER
+                    type_: BINDER_TYPE_BINDER,
                 },
                 flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
@@ -214,7 +201,12 @@ impl From<(*mut u8, usize)> for &mut flat_binder_object {
     }
 }
 
-pub(crate) fn raw_pointer_to_strong_binder(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> ManuallyDrop<SIBinder> {
-    assert!(raw_pointer.0 != 0, "raw_pointer_to_strong_binder(): raw_pointer is null");
+pub(crate) fn raw_pointer_to_strong_binder(
+    raw_pointer: (binder_uintptr_t, binder_uintptr_t),
+) -> ManuallyDrop<SIBinder> {
+    assert!(
+        raw_pointer.0 != 0,
+        "raw_pointer_to_strong_binder(): raw_pointer is null"
+    );
     ManuallyDrop::new(SIBinder::from_raw(make_fat_pointer(raw_pointer)))
 }

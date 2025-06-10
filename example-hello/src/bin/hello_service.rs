@@ -40,7 +40,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Create a binder service.
     println!("Creating service...");
-    let service = BnHello::new_binder(IHelloService{});
+    let service = BnHello::new_binder(IHelloService {});
 
     // Add the service to binder service manager.
     println!("Adding service to hub...");

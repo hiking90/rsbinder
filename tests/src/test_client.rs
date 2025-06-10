@@ -11,10 +11,19 @@ use android::aidl::fixedsizearray::FixedSizeArrayExample::{
     IRepeatFixedSizeArray::{BpRepeatFixedSizeArray, IRepeatFixedSizeArray},
     IntParcelable::IntParcelable,
 };
-use android::aidl::tests::nested::{
-    INestedService, ParcelableWithNested,
+use android::aidl::tests::nested::{INestedService, ParcelableWithNested};
+use android::aidl::tests::nonvintf::{
+    NonVintfExtendableParcelable::NonVintfExtendableParcelable,
+    NonVintfParcelable::NonVintfParcelable,
 };
 use android::aidl::tests::unions::EnumUnion::EnumUnion;
+use android::aidl::tests::unstable::{
+    UnstableExtendableParcelable::UnstableExtendableParcelable,
+    UnstableParcelable::UnstableParcelable,
+};
+use android::aidl::tests::vintf::{
+    VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
+};
 use android::aidl::tests::INewName::{self, BpNewName};
 use android::aidl::tests::IOldName::{self, BpOldName};
 use android::aidl::tests::ITestService::{
@@ -26,25 +35,17 @@ use android::aidl::tests::{
     ByteEnum::ByteEnum, IntEnum::IntEnum, LongEnum::LongEnum, RecursiveList::RecursiveList,
     StructuredParcelable, Union,
 };
-use android::aidl::tests::nonvintf::{
-    NonVintfExtendableParcelable::NonVintfExtendableParcelable,
-    NonVintfParcelable::NonVintfParcelable,
-};
-use android::aidl::tests::unstable::{
-    UnstableExtendableParcelable::UnstableExtendableParcelable,
-    UnstableParcelable::UnstableParcelable,
-};
 use android::aidl::versioned::tests::{
     BazUnion::BazUnion, Foo::Foo, IFooInterface, IFooInterface::BpFooInterface,
 };
-use android::aidl::tests::vintf::{
-    VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
-};
 use rustix::fd::OwnedFd;
-use std::{fs::File, os::fd::{AsRawFd, IntoRawFd}};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
+use std::{
+    fs::File,
+    os::fd::{AsRawFd, IntoRawFd},
+};
 
 fn init_logger() {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
@@ -58,9 +59,14 @@ fn init_test() {
 
 fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
     init_test();
-    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-        .unwrap_or_else(|_| panic!("did not get binder service: {}",
-            <BpTestService as ITestService::ITestService>::descriptor()))
+    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor()).unwrap_or_else(
+        |_| {
+            panic!(
+                "did not get binder service: {}",
+                <BpTestService as ITestService::ITestService>::descriptor()
+            )
+        },
+    )
 }
 
 #[test]
@@ -268,7 +274,9 @@ test_reverse_array! {
 fn test_binder_exchange() {
     const NAME: &str = "Smythe";
     let service = get_test_service();
-    let got = service.GetOtherTestService(NAME).expect("error calling GetOtherTestService");
+    let got = service
+        .GetOtherTestService(NAME)
+        .expect("error calling GetOtherTestService");
     assert_eq!(got.GetName().as_ref().map(String::as_ref), Ok(NAME));
     assert_eq!(service.VerifyName(&got, NAME), Ok(true));
 }
@@ -277,9 +285,19 @@ fn test_binder_exchange() {
 fn test_binder_array_exchange() {
     let names = vec!["Fizz".into(), "Buzz".into()];
     let service = get_test_service();
-    let got = service.GetInterfaceArray(&names).expect("error calling GetInterfaceArray");
-    assert_eq!(got.iter().map(|s| s.GetName()).collect::<std::result::Result<Vec<_>, _>>(), Ok(names.clone()));
-    assert_eq!(service.VerifyNamesWithInterfaceArray(&got, &names), Ok(true));
+    let got = service
+        .GetInterfaceArray(&names)
+        .expect("error calling GetInterfaceArray");
+    assert_eq!(
+        got.iter()
+            .map(|s| s.GetName())
+            .collect::<std::result::Result<Vec<_>, _>>(),
+        Ok(names.clone())
+    );
+    assert_eq!(
+        service.VerifyNamesWithInterfaceArray(&got, &names),
+        Ok(true)
+    );
 }
 
 #[test]
@@ -292,7 +310,9 @@ fn test_binder_nullable_array_exchange() {
     assert_eq!(
         got.as_ref().map(|arr| arr
             .iter()
-            .map(|opt_s| opt_s.as_ref().map(|s| s.GetName().expect("error calling GetName")))
+            .map(|opt_s| opt_s
+                .as_ref()
+                .map(|s| s.GetName().expect("error calling GetName")))
             .collect::<Vec<_>>()),
         Some(names.clone())
     );
@@ -306,11 +326,15 @@ fn test_binder_nullable_array_exchange() {
 fn test_interface_list_exchange() {
     let names = vec![Some("Fizz".into()), None, Some("Buzz".into())];
     let service = get_test_service();
-    let got = service.GetInterfaceList(Some(&names)).expect("error calling GetInterfaceList");
+    let got = service
+        .GetInterfaceList(Some(&names))
+        .expect("error calling GetInterfaceList");
     assert_eq!(
         got.as_ref().map(|arr| arr
             .iter()
-            .map(|opt_s| opt_s.as_ref().map(|s| s.GetName().expect("error calling GetName")))
+            .map(|opt_s| opt_s
+                .as_ref()
+                .map(|s| s.GetName().expect("error calling GetName")))
             .collect::<Vec<_>>()),
         Some(names.clone())
     );
@@ -326,7 +350,12 @@ fn build_pipe() -> (File, File) {
     // and pass them after checking if the function returned
     // without an error, so the descriptors should be valid
     // by that point
-    unsafe { (File::from_raw_fd(fds.0.into_raw_fd()), File::from_raw_fd(fds.1.into_raw_fd())) }
+    unsafe {
+        (
+            File::from_raw_fd(fds.0.into_raw_fd()),
+            File::from_raw_fd(fds.1.into_raw_fd()),
+        )
+    }
 }
 
 /// Helper function that constructs a `File` from a `ParcelFileDescriptor`.
@@ -334,7 +363,10 @@ fn build_pipe() -> (File, File) {
 /// This is needed because `File` is currently the way to read and write
 /// to pipes using the `Read` and `Write` traits.
 fn file_from_pfd(fd: &rsbinder::ParcelFileDescriptor) -> File {
-    fd.as_ref().try_clone().expect("failed to clone file descriptor").into()
+    fd.as_ref()
+        .try_clone()
+        .expect("failed to clone file descriptor")
+        .into()
 }
 
 #[test]
@@ -348,10 +380,14 @@ fn test_parcel_file_descriptor() {
         .expect("error calling RepeatParcelFileDescriptor");
 
     const TEST_DATA: &[u8] = b"FrazzleSnazzleFlimFlamFlibbityGumboChops";
-    file_from_pfd(&result_pfd).write_all(TEST_DATA).expect("error writing to pipe");
+    file_from_pfd(&result_pfd)
+        .write_all(TEST_DATA)
+        .expect("error writing to pipe");
 
     let mut buf = [0u8; TEST_DATA.len()];
-    read_file.read_exact(&mut buf).expect("error reading from pipe");
+    read_file
+        .read_exact(&mut buf)
+        .expect("error reading from pipe");
     assert_eq!(&buf[..], TEST_DATA);
 }
 
@@ -362,12 +398,14 @@ fn test_parcel_file_descriptor_array() {
     let (read_file, write_file) = build_pipe();
     let input = [
         rsbinder::ParcelFileDescriptor::new(read_file),
-        rsbinder::ParcelFileDescriptor::new(write_file)
+        rsbinder::ParcelFileDescriptor::new(write_file),
     ];
 
     let mut repeated = vec![];
 
-    let backend = service.getBackendType().expect("error getting backend type");
+    let backend = service
+        .getBackendType()
+        .expect("error getting backend type");
     if backend == BackendType::JAVA {
         // Java needs initial values here (can't resize arrays)
         // Other backends can't accept 'None', but we can use it in Java for convenience, rather
@@ -379,15 +417,25 @@ fn test_parcel_file_descriptor_array() {
         .ReverseParcelFileDescriptorArray(&input[..], &mut repeated)
         .expect("error calling ReverseParcelFileDescriptorArray");
 
-    file_from_pfd(&input[1]).write_all(b"First").expect("error writing to pipe");
-    file_from_pfd(repeated[1].as_ref().expect("received None for ParcelFileDescriptor"))
-        .write_all(b"Second")
+    file_from_pfd(&input[1])
+        .write_all(b"First")
         .expect("error writing to pipe");
-    file_from_pfd(&result[0]).write_all(b"Third").expect("error writing to pipe");
+    file_from_pfd(
+        repeated[1]
+            .as_ref()
+            .expect("received None for ParcelFileDescriptor"),
+    )
+    .write_all(b"Second")
+    .expect("error writing to pipe");
+    file_from_pfd(&result[0])
+        .write_all(b"Third")
+        .expect("error writing to pipe");
 
     const TEST_DATA: &[u8] = b"FirstSecondThird";
     let mut buf = [0u8; TEST_DATA.len()];
-    file_from_pfd(&input[0]).read_exact(&mut buf).expect("error reading from pipe");
+    file_from_pfd(&input[0])
+        .read_exact(&mut buf)
+        .expect("error reading from pipe");
     assert_eq!(&buf[..], TEST_DATA);
 }
 
@@ -400,7 +448,10 @@ fn test_service_specific_exception() {
         assert!(result.is_err());
 
         let status = result.unwrap_err();
-        assert_eq!(status.exception_code(), rsbinder::ExceptionCode::ServiceSpecific);
+        assert_eq!(
+            status.exception_code(),
+            rsbinder::ExceptionCode::ServiceSpecific
+        );
         assert_eq!(status.service_specific_error(), i);
     }
 }
@@ -484,7 +535,10 @@ test_nullable! {
 #[test]
 fn test_binder() {
     let service = get_test_service();
-    assert!(service.GetCallback(true).expect("error calling GetCallback").is_none());
+    assert!(service
+        .GetCallback(true)
+        .expect("error calling GetCallback")
+        .is_none());
     let callback = service
         .GetCallback(false)
         .expect("error calling GetCallback")
@@ -554,8 +608,14 @@ fn test_utf8_string() {
     ];
 
     // Java can't return a null list as a parameter
-    let backend = service.getBackendType().expect("error getting backend type");
-    let null_output: Option<Vec<Option<String>>> = if backend == BackendType::JAVA { Some(vec![]) } else { None };
+    let backend = service
+        .getBackendType()
+        .expect("error getting backend type");
+    let null_output: Option<Vec<Option<String>>> = if backend == BackendType::JAVA {
+        Some(vec![])
+    } else {
+        None
+    };
     test_reverse_null_array!(service, ReverseUtf8CppStringList, null_output);
 
     test_reverse_null_array!(service, ReverseNullableUtf8CppString, None);
@@ -594,7 +654,10 @@ fn test_parcelable() {
     let result = service.FillOutStructuredParcelable(&mut parcelable);
     assert_eq!(result, Ok(()));
 
-    assert_eq!(parcelable.shouldContainThreeFs, [DESIRED_VALUE, DESIRED_VALUE, DESIRED_VALUE]);
+    assert_eq!(
+        parcelable.shouldContainThreeFs,
+        [DESIRED_VALUE, DESIRED_VALUE, DESIRED_VALUE]
+    );
     assert_eq!(parcelable.shouldBeJerry, "Jerry");
     assert_eq!(parcelable.int32_min, i32::MIN);
     assert_eq!(parcelable.int32_max, i32::MAX);
@@ -622,7 +685,10 @@ fn test_parcelable() {
     assert_eq!(parcelable.const_exprs_9.0, 1);
     assert_eq!(parcelable.const_exprs_10.0, 1);
     assert_eq!(parcelable.addString1, "hello world!");
-    assert_eq!(parcelable.addString2, "The quick brown fox jumps over the lazy dog.");
+    assert_eq!(
+        parcelable.addString2,
+        "The quick brown fox jumps over the lazy dog."
+    );
 
     assert_eq!(
         parcelable.shouldSetBit0AndBit2,
@@ -630,24 +696,41 @@ fn test_parcelable() {
     );
 
     assert_eq!(parcelable.u, Some(Union::Union::Ns(vec![1, 2, 3])));
-    assert_eq!(parcelable.shouldBeConstS1, Some(Union::Union::S(Union::S1.to_string())))
+    assert_eq!(
+        parcelable.shouldBeConstS1,
+        Some(Union::Union::S(Union::S1.to_string()))
+    )
 }
 
 #[test]
 fn test_repeat_extendable_parcelable() {
     let service = get_test_service();
 
-    let ext = Arc::new(MyExt { a: 42, b: "EXT".into() });
-    let mut ep = ExtendableParcelable { a: 1, b: "a".into(), c: 42, ..Default::default() };
-    ep.ext.set_parcelable(Arc::clone(&ext)).expect("error setting parcelable");
+    let ext = Arc::new(MyExt {
+        a: 42,
+        b: "EXT".into(),
+    });
+    let mut ep = ExtendableParcelable {
+        a: 1,
+        b: "a".into(),
+        c: 42,
+        ..Default::default()
+    };
+    ep.ext
+        .set_parcelable(Arc::clone(&ext))
+        .expect("error setting parcelable");
 
     let mut ep2 = ExtendableParcelable::default();
-    let result: std::prelude::v1::Result<(), Status> = service.RepeatExtendableParcelable(&ep, &mut ep2);
+    let result: std::prelude::v1::Result<(), Status> =
+        service.RepeatExtendableParcelable(&ep, &mut ep2);
     assert_eq!(result, Ok(()));
     assert_eq!(ep2.a, ep.a);
     assert_eq!(ep2.b, ep.b);
 
-    let ret_ext = ep2.ext.get_parcelable::<MyExt>().expect("error getting parcelable");
+    let ret_ext = ep2
+        .ext
+        .get_parcelable::<MyExt>()
+        .expect("error getting parcelable");
     assert!(ret_ext.is_some());
 
     let ret_ext = ret_ext.unwrap();
@@ -731,10 +814,25 @@ fn test_vintf_parcelable_holder_cannot_contain_unstable_parcelable() {
 #[test]
 #[ignore]
 fn test_read_write_extension() {
-    let ext = Arc::new(MyExt { a: 42, b: "EXT".into() });
-    let ext2 = Arc::new(MyExt2 { a: 42, b: MyExt { a: 24, b: "INEXT".into() }, c: "EXT2".into() });
+    let ext = Arc::new(MyExt {
+        a: 42,
+        b: "EXT".into(),
+    });
+    let ext2 = Arc::new(MyExt2 {
+        a: 42,
+        b: MyExt {
+            a: 24,
+            b: "INEXT".into(),
+        },
+        c: "EXT2".into(),
+    });
 
-    let mut ep = ExtendableParcelable { a: 1, b: "a".into(), c: 42, ..Default::default() };
+    let mut ep = ExtendableParcelable {
+        a: 1,
+        b: "a".into(),
+        c: 42,
+        ..Default::default()
+    };
 
     ep.ext.set_parcelable(Arc::clone(&ext)).unwrap();
     ep.ext2.set_parcelable(Arc::clone(&ext2)).unwrap();
@@ -769,8 +867,14 @@ fn test_read_write_extension() {
     let actual_ext = ep2.ext.get_parcelable::<MyExt>();
     assert!(actual_ext.unwrap().is_some());
 
-    let new_ext2 =
-        Arc::new(MyExt2 { a: 79, b: MyExt { a: 42, b: "INNEWEXT".into() }, c: "NEWEXT2".into() });
+    let new_ext2 = Arc::new(MyExt2 {
+        a: 79,
+        b: MyExt {
+            a: 42,
+            b: "INNEWEXT".into(),
+        },
+        c: "NEWEXT2".into(),
+    });
     ep2.ext2.set_parcelable(Arc::clone(&new_ext2)).unwrap();
 
     check_extension_content(&ep1, &ext, &ext2);
@@ -799,7 +903,10 @@ fn test_reverse_recursive_list() {
 
     let mut head = None;
     for n in 0..10 {
-        let node = RecursiveList { value: n, next: head };
+        let node = RecursiveList {
+            value: n,
+            next: head,
+        };
         head = Some(Box::new(node));
     }
     // head = [9, 8, .., 0]
@@ -884,7 +991,10 @@ fn test_versioned_known_union_field_is_ok() {
         hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
-    assert_eq!(service.acceptUnionAndReturnString(&BazUnion::IntNum(42)), Ok(String::from("42")));
+    assert_eq!(
+        service.acceptUnionAndReturnString(&BazUnion::IntNum(42)),
+        Ok(String::from("42"))
+    );
 }
 
 // #[test]
@@ -983,7 +1093,9 @@ fn test_renamed_interface_new_as_new() {
 #[test]
 fn test_renamed_interface_old_as_new() {
     test_renamed_interface(|old_name, _| {
-        let new_name = old_name.as_binder().into_interface::<dyn INewName::INewName>();
+        let new_name = old_name
+            .as_binder()
+            .into_interface::<dyn INewName::INewName>();
         assert!(new_name.is_ok());
 
         let real_name = new_name.unwrap().RealName();
@@ -994,7 +1106,9 @@ fn test_renamed_interface_old_as_new() {
 #[test]
 fn test_renamed_interface_new_as_old() {
     test_renamed_interface(|_, new_name| {
-        let old_name = new_name.as_binder().into_interface::<dyn IOldName::IOldName>();
+        let old_name = new_name
+            .as_binder()
+            .into_interface::<dyn IOldName::IOldName>();
         assert!(old_name.is_ok());
 
         let real_name = old_name.unwrap().RealName();
@@ -1030,13 +1144,15 @@ fn test_nested_type() {
     let ret = service.flipStatus(&p);
     assert_eq!(
         ret,
-        Ok(INestedService::Result::Result { status: ParcelableWithNested::Status::Status::NOT_OK })
+        Ok(INestedService::Result::Result {
+            status: ParcelableWithNested::Status::Status::NOT_OK
+        })
     );
     let received = Arc::new(Mutex::new(None));
     // NOT_OK -> OK with nested callback interface
-    let cb = INestedService::ICallback::BnCallback::new_binder(
-        Callback { received: Arc::clone(&received) }
-    );
+    let cb = INestedService::ICallback::BnCallback::new_binder(Callback {
+        received: Arc::clone(&received),
+    });
     let ret = service.flipStatusWithCallback(ParcelableWithNested::Status::Status::NOT_OK, &cb);
     assert_eq!(ret, Ok(()));
     let received = received.lock().unwrap();
@@ -1085,7 +1201,10 @@ fn test_binder_array() {
     let mut repeated = vec![Default::default(); array.len()];
 
     let result = service.ReverseIBinderArray(&array, &mut repeated);
-    assert_eq!(repeated.into_iter().collect::<Option<Vec<_>>>().as_ref(), Some(&array));
+    assert_eq!(
+        repeated.into_iter().collect::<Option<Vec<_>>>().as_ref(),
+        Some(&array)
+    );
     array.reverse();
     assert_eq!(result, Ok(array));
 }
@@ -1125,8 +1244,10 @@ fn test_read_write_fixed_size_array() {
 
     p.boolNullableMatrix = Some([[true, false], Default::default()]);
     p.byteNullableMatrix = Some([[42, 0], Default::default()]);
-    p.stringNullableMatrix =
-        Some([[Some("hello".into()), Some("world".into())], Default::default()]);
+    p.stringNullableMatrix = Some([
+        [Some("hello".into()), Some("world".into())],
+        Default::default(),
+    ]);
 
     assert_eq!(parcel.write(&p), Ok(()));
     parcel.set_data_position(0);
@@ -1203,12 +1324,19 @@ fn test_fixed_size_array_over_binder() {
     test_repeat_fixed_size_array!(service, RepeatParcelables, [p1, p2, p3]);
 
     test_repeat_fixed_size_array!(service, Repeat2dBytes, [[1u8, 2u8, 3u8], [1u8, 2u8, 3u8]]);
-    test_repeat_fixed_size_array!(service, Repeat2dInts, [[1i32, 2i32, 3i32], [1i32, 2i32, 3i32]]);
+    test_repeat_fixed_size_array!(
+        service,
+        Repeat2dInts,
+        [[1i32, 2i32, 3i32], [1i32, 2i32, 3i32]]
+    );
 
     test_repeat_fixed_size_array_2d_binder!(
         service,
         Repeat2dBinders,
-        [[binder1.clone(), binder2.clone(), binder3.clone()], [binder1, binder2, binder3]]
+        [
+            [binder1.clone(), binder2.clone(), binder3.clone()],
+            [binder1, binder2, binder3]
+        ]
     );
 
     test_repeat_fixed_size_array!(service, Repeat2dParcelables, [[p1, p2, p3], [p1, p2, p3]]);
@@ -1228,7 +1356,12 @@ fn test_dump() {
     let args = vec!["dump".to_owned(), "ITestService".to_owned()];
     let expected = args.join("\n") + "\n";
 
-    test_service.as_binder().as_proxy().unwrap().dump(write_file, &args).unwrap();
+    test_service
+        .as_binder()
+        .as_proxy()
+        .unwrap()
+        .dump(write_file, &args)
+        .unwrap();
     let mut buf = String::new();
     read_file.read_to_string(&mut buf).unwrap();
     assert_eq!(buf, expected);
@@ -1254,22 +1387,37 @@ fn test_death_recipient() {
     }
 
     {
-        let recipient = Arc::new(MyDeathRecipient{ write_file: Mutex::new(write_file) });
-        test_service.as_binder()
-            .link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
-        test_service.as_binder()
-            .unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
+        let recipient = Arc::new(MyDeathRecipient {
+            write_file: Mutex::new(write_file),
+        });
+        test_service
+            .as_binder()
+            .link_to_death(Arc::downgrade(
+                &(recipient.clone() as Arc<dyn DeathRecipient>),
+            ))
+            .unwrap();
+        test_service
+            .as_binder()
+            .unlink_to_death(Arc::downgrade(
+                &(recipient.clone() as Arc<dyn DeathRecipient>),
+            ))
+            .unwrap();
 
-        test_service.as_binder()
-            .link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))).unwrap();
+        test_service
+            .as_binder()
+            .link_to_death(Arc::downgrade(
+                &(recipient.clone() as Arc<dyn DeathRecipient>),
+            ))
+            .unwrap();
 
         println!("Killing the service...");
         test_service.killService().unwrap();
 
         println!("Waiting for the service to die...");
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let result = test_service.as_binder()
-            .unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+        let result = test_service.as_binder().unlink_to_death(Arc::downgrade(
+            &(recipient.clone() as Arc<dyn DeathRecipient>),
+        ));
         assert_eq!(result, Err(rsbinder::StatusCode::DeadObject));
     }
 
@@ -1282,7 +1430,9 @@ fn test_death_recipient() {
 fn test_hub() {
     hub::get_service(ITestService::BpTestService::descriptor()).unwrap();
     let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
-    assert!(list.iter().any(|s| s == ITestService::BpTestService::descriptor()));
+    assert!(list
+        .iter()
+        .any(|s| s == ITestService::BpTestService::descriptor()));
 
     #[cfg(target_os = "android")]
     if get_android_sdk_version() < 31 {
@@ -1291,5 +1441,7 @@ fn test_hub() {
     }
 
     let service_debug_info_list = hub::get_service_debug_info().unwrap();
-    assert!(service_debug_info_list.iter().any(|s| s.name == ITestService::BpTestService::descriptor()));
+    assert!(service_debug_info_list
+        .iter()
+        .any(|s| s.name == ITestService::BpTestService::descriptor()));
 }

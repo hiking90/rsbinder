@@ -398,7 +398,6 @@ macro_rules! declare_binder_interface {
     }
 }
 
-
 /// Implement `Serialize` trait and friends for a parcelable
 ///
 /// This is an internal macro used by the AIDL compiler to implement
@@ -410,10 +409,7 @@ macro_rules! declare_binder_interface {
 macro_rules! impl_serialize_for_parcelable {
     ($parcelable:ident) => {
         impl $crate::Serialize for $parcelable {
-            fn serialize(
-                &self,
-                parcel: &mut $crate::Parcel,
-            ) -> $crate::Result<()> {
+            fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 <Self as $crate::SerializeOption>::serialize_option(Some(self), parcel)
             }
         }
@@ -437,7 +433,6 @@ macro_rules! impl_serialize_for_parcelable {
     };
 }
 
-
 /// Implement `Deserialize` trait and friends for a parcelable
 ///
 /// This is an internal macro used by the AIDL compiler to implement
@@ -448,17 +443,12 @@ macro_rules! impl_serialize_for_parcelable {
 macro_rules! impl_deserialize_for_parcelable {
     ($parcelable:ident) => {
         impl $crate::Deserialize for $parcelable {
-            fn deserialize(
-                parcel: &mut $crate::Parcel,
-            ) -> $crate::Result<Self> {
+            fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
                 $crate::DeserializeOption::deserialize_option(parcel)
                     .transpose()
                     .unwrap_or(Err($crate::StatusCode::UnexpectedNull.into()))
             }
-            fn deserialize_from(
-                &mut self,
-                parcel: &mut $crate::Parcel,
-            ) -> $crate::Result<()> {
+            fn deserialize_from(&mut self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 let status: i32 = parcel.read()?;
                 if status == $crate::NULL_PARCELABLE_FLAG {
                     Err($crate::StatusCode::UnexpectedNull.into())
@@ -472,9 +462,7 @@ macro_rules! impl_deserialize_for_parcelable {
         impl $crate::DeserializeArray for $parcelable {}
 
         impl $crate::DeserializeOption for $parcelable {
-            fn deserialize_option(
-                parcel: &mut $crate::Parcel,
-            ) -> $crate::Result<Option<Self>> {
+            fn deserialize_option(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Self>> {
                 let mut result = None;
                 Self::deserialize_option_from(&mut result, parcel)?;
                 Ok(result)
@@ -496,7 +484,6 @@ macro_rules! impl_deserialize_for_parcelable {
         }
     };
 }
-
 
 /// Declare an AIDL enumeration.
 ///
@@ -555,7 +542,7 @@ macro_rules! declare_binder_enum {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Interface, TransactionCode, Result, Binder, Parcel};
+    use crate::{Binder, Interface, Parcel, Result, TransactionCode};
 
     pub trait IEcho: Interface {
         fn echo(&self, echo: &str) -> Result<String>;
@@ -624,15 +611,18 @@ mod tests {
     fn test_try_from() {
         use async_trait::async_trait;
 
-        pub trait IEcho : Interface + Send {
+        pub trait IEcho: Interface + Send {
             fn echo(&self, echo: &str) -> crate::status::Result<String>;
         }
-        pub trait IEchoAsync<P> : Interface + Send {
+        pub trait IEchoAsync<P>: Interface + Send {
             #[allow(dead_code)]
-            fn echo<'a>(&'a self, echo: &'a str) -> crate::BoxFuture<'a, crate::status::Result<String>>;
+            fn echo<'a>(
+                &'a self,
+                echo: &'a str,
+            ) -> crate::BoxFuture<'a, crate::status::Result<String>>;
         }
         #[async_trait]
-        pub trait IEchoAsyncService : Interface + Send {
+        pub trait IEchoAsyncService: Interface + Send {
             async fn echo(&self, echo: &str) -> crate::status::Result<String>;
         }
         pub struct BpEcho {
@@ -644,11 +634,11 @@ mod tests {
             }
         }
         impl<P: crate::BinderAsyncPool> IEchoAsync<P> for BpEcho {
-            fn echo<'a>(&'a self, _echo: &'a str) -> crate::BoxFuture<'a, crate::status::Result<String>> {
-                P::spawn(
-                    move || {0},
-                    |_| async move { Ok("".to_string()) },
-                )
+            fn echo<'a>(
+                &'a self,
+                _echo: &'a str,
+            ) -> crate::BoxFuture<'a, crate::status::Result<String>> {
+                P::spawn(move || 0, |_| async move { Ok("".to_string()) })
             }
         }
         impl Interface for BpEcho {
@@ -666,7 +656,7 @@ mod tests {
 
             fn from_binder(binder: crate::SIBinder) -> std::option::Option<Self> {
                 if binder.descriptor() != Self::descriptor() {
-                    return None
+                    return None;
                 }
                 if binder.as_proxy().is_some() {
                     Some(Self { binder })
@@ -725,8 +715,7 @@ mod tests {
 
         pub struct BnEcho(Box<dyn BnEchoAdapter>);
 
-        impl BnEcho
-        {
+        impl BnEcho {
             /// Create a new binder service.
             pub fn new_binder<T, R>(inner: T, rt: R) -> crate::Strong<dyn IEcho>
             where
@@ -734,36 +723,49 @@ mod tests {
                 R: crate::BinderAsyncRuntime + Send + Sync + 'static,
             {
                 let bn = BnEcho(Box::new(Wrapper { inner, rt }));
-                let binder = crate::native::Binder::new_with_stability(bn, crate::Stability::default());
+                let binder =
+                    crate::native::Binder::new_with_stability(bn, crate::Stability::default());
                 crate::Strong::new(Box::new(binder))
             }
         }
 
-        impl crate::Remotable for BnEcho
-        {
-            fn descriptor() -> &'static str where Self: Sized {
+        impl crate::Remotable for BnEcho {
+            fn descriptor() -> &'static str
+            where
+                Self: Sized,
+            {
                 "my.echo"
             }
 
-            fn on_transact(&self, _code: crate::TransactionCode, _reader: &mut crate::Parcel, _reply: &mut crate::Parcel) -> crate::Result<()> {
+            fn on_transact(
+                &self,
+                _code: crate::TransactionCode,
+                _reader: &mut crate::Parcel,
+                _reply: &mut crate::Parcel,
+            ) -> crate::Result<()> {
                 todo!()
             }
 
-            fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> crate::Result<()> {
+            fn on_dump(
+                &self,
+                _writer: &mut dyn std::io::Write,
+                _args: &[String],
+            ) -> crate::Result<()> {
                 Ok(())
             }
         }
 
-        impl IEcho for crate::Binder<BnEcho>
-        {
+        impl IEcho for crate::Binder<BnEcho> {
             fn echo(&self, echo: &str) -> crate::status::Result<String> {
                 self.0.as_sync().echo(echo)
             }
         }
 
-        impl<P: crate::BinderAsyncPool> IEchoAsync<P> for crate::Binder<BnEcho>
-        {
-            fn echo<'a>(&'a self, echo: &'a str) -> crate::BoxFuture<'a, crate::status::Result<String>> {
+        impl<P: crate::BinderAsyncPool> IEchoAsync<P> for crate::Binder<BnEcho> {
+            fn echo<'a>(
+                &'a self,
+                echo: &'a str,
+            ) -> crate::BoxFuture<'a, crate::status::Result<String>> {
                 self.0.as_async().echo(echo)
             }
         }
@@ -772,27 +774,23 @@ mod tests {
             fn try_from(binder: crate::SIBinder) -> crate::Result<crate::Strong<dyn IEcho>> {
                 match <BpEcho as crate::Proxy>::from_binder(binder.clone()) {
                     Some(proxy) => Ok(crate::Strong::new(Box::new(proxy))),
-                    None => {
-                        match crate::native::Binder::<BnEcho>::try_from(binder) {
-                            Ok(native) => Ok(crate::Strong::new(Box::new(native.clone()))),
-                            Err(err) => Err(err),
-                        }
-                    }
+                    None => match crate::native::Binder::<BnEcho>::try_from(binder) {
+                        Ok(native) => Ok(crate::Strong::new(Box::new(native.clone()))),
+                        Err(err) => Err(err),
+                    },
                 }
             }
         }
 
-        impl<P: crate::BinderAsyncPool> crate::FromIBinder for dyn IEchoAsync<P>
-        {
-            fn try_from(binder: crate::SIBinder) -> crate::Result<crate::Strong<dyn IEchoAsync<P>>>
-            {
+        impl<P: crate::BinderAsyncPool> crate::FromIBinder for dyn IEchoAsync<P> {
+            fn try_from(
+                binder: crate::SIBinder,
+            ) -> crate::Result<crate::Strong<dyn IEchoAsync<P>>> {
                 match <BpEcho as crate::Proxy>::from_binder(binder.clone()) {
                     Some(proxy) => Ok(crate::Strong::new(Box::new(proxy))),
                     None => {
                         match crate::native::Binder::<BnEcho>::try_from(binder) {
-                            Ok(native) => {
-                                Ok(crate::Strong::new(Box::new(native.clone())))
-                            }
+                            Ok(native) => Ok(crate::Strong::new(Box::new(native.clone()))),
                             Err(err) => Err(err),
                         }
                         // Err(crate::StatusCode::BadType.into())
@@ -825,9 +823,8 @@ mod tests {
             }
         }
 
-        let _echo = BnEcho::new_binder(MyEcho {}, MyRuntime{});
+        let _echo = BnEcho::new_binder(MyEcho {}, MyRuntime {});
 
         // echo.into_async::<Tokio>().echo("hello");
-
     }
 }

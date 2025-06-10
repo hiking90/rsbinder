@@ -17,30 +17,22 @@
  * limitations under the License.
  */
 
-use std::ffi::{CString, CStr};
-use std::fmt::Debug;
-use std::sync::{atomic::Ordering, Arc};
-use std::cell::RefCell;
 use log::error;
 use std::backtrace::Backtrace;
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::fmt::Debug;
 use std::fs::File;
+use std::sync::{atomic::Ordering, Arc};
 
-use crate::{
-    parcel::*,
-    error::*,
-    binder::*,
-    process_state::*,
-    sys::*,
-    binder_object::*,
-};
+use crate::{binder::*, binder_object::*, error::*, parcel::*, process_state::*, sys::*};
 
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
 }
 
-const RETURN_STRINGS: [&str; 21] =
-[
+const RETURN_STRINGS: [&str; 21] = [
     "BR_ERROR",
     "BR_OK",
     "BR_TRANSACTION",
@@ -78,8 +70,7 @@ fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
-const COMMAND_STRINGS: [&str; 19] =
-[
+const COMMAND_STRINGS: [&str; 19] = [
     "BC_TRANSACTION",
     "BC_REPLY",
     "BC_ACQUIRE_RESULT",
@@ -98,7 +89,7 @@ const COMMAND_STRINGS: [&str; 19] =
     "BC_CLEAR_DEATH_NOTIFICATION",
     "BC_DEAD_BINDER_DONE",
     "BC_TRANSACTION_SG",
-    "BC_REPLY_SG"
+    "BC_REPLY_SG",
 ];
 
 fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
@@ -250,27 +241,39 @@ impl ThreadState {
         token
     }
 
-    pub(crate) fn set_calling_work_source_uid_without_propagation(&mut self, uid: binder::uid_t) -> i64 {
+    pub(crate) fn set_calling_work_source_uid_without_propagation(
+        &mut self,
+        uid: binder::uid_t,
+    ) -> i64 {
         match self.transaction {
             Some(mut state) => {
-                let propagated_bit = (state.propagate_work_source as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX;
+                let propagated_bit =
+                    (state.propagate_work_source as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX;
                 let token = propagated_bit | (state.work_source as i64);
                 state.work_source = uid;
 
                 token
             }
-            None => {
-                0
-            }
+            None => 0,
         }
     }
 
-    fn write_transaction_data(&mut self, cmd: u32, mut flags: u32, handle: u32, code: u32, data: &Parcel, status: &i32) -> Result<()> {
-        log::trace!("write_transaction_data: {} {flags:X} {handle} {code}\n{:?}", command_to_str(cmd), data);
+    fn write_transaction_data(
+        &mut self,
+        cmd: u32,
+        mut flags: u32,
+        handle: u32,
+        code: u32,
+        data: &Parcel,
+        status: &i32,
+    ) -> Result<()> {
+        log::trace!(
+            "write_transaction_data: {} {flags:X} {handle} {code}\n{:?}",
+            command_to_str(cmd),
+            data
+        );
         // ptr is initialized by zero because ptr(64) and handle(32) size is different.
-        let mut target = binder_transaction_data__bindgen_ty_1 {
-            ptr: 0,
-        };
+        let mut target = binder_transaction_data__bindgen_ty_1 { ptr: 0 };
         target.handle = handle;
 
         // let all_flags: u32 = FLAG_PRIVATE_VENDOR | FLAG_CLEAR_BUF | FLAG_ONEWAY;
@@ -292,7 +295,7 @@ impl ThreadState {
                         buffer: data.as_ptr() as _,
                         offsets: data.objects.as_ptr() as _,
                     },
-                }
+                },
             }
         } else {
             flags |= binder::transaction_flags_TF_STATUS_CODE;
@@ -310,7 +313,7 @@ impl ThreadState {
                         buffer: status as *const i32 as _,
                         offsets: 0,
                     },
-                }
+                },
             }
         };
 
@@ -328,33 +331,37 @@ pub(crate) fn set_call_restriction(call_restriction: CallRestriction) {
 }
 
 pub(crate) fn call_restriction() -> CallRestriction {
-    THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().call_restriction
-    })
+    THREAD_STATE.with(|thread_state| thread_state.borrow().call_restriction)
 }
 
 pub(crate) fn strict_mode_policy() -> i32 {
-    THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().strict_mode_policy
-    })
+    THREAD_STATE.with(|thread_state| thread_state.borrow().strict_mode_policy)
 }
 
 pub(crate) fn should_propagate_work_source() -> bool {
     THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().transaction.is_some_and(|state| state.propagate_work_source)
+        thread_state
+            .borrow()
+            .transaction
+            .is_some_and(|state| state.propagate_work_source)
     })
 }
 
 pub(crate) fn calling_work_source_uid() -> binder::uid_t {
     THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().transaction.map_or(0, |state| state.work_source)
+        thread_state
+            .borrow()
+            .transaction
+            .map_or(0, |state| state.work_source)
     })
 }
 
-
 pub(crate) fn _setup_polling() -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        thread_state.borrow_mut().out_parcel.write::<u32>(&binder::BC_ENTER_LOOPER)
+        thread_state
+            .borrow_mut()
+            .out_parcel
+            .write::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
     flush_commands()?;
     Ok(())
@@ -371,7 +378,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
         loop {
             talk_with_driver(true)?;
 
-            if thread_state.borrow().in_parcel.is_empty()  {
+            if thread_state.borrow().in_parcel.is_empty() {
                 continue;
             }
             let cmd: u32 = thread_state.borrow_mut().in_parcel.read::<i32>()? as _;
@@ -384,27 +391,37 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     log::error!("{}", Backtrace::capture());
 
                     if let UntilResponse::TransactionComplete = until {
-                        break
+                        break;
                     }
-                },
+                }
                 binder::BR_TRANSACTION_COMPLETE => {
                     if let UntilResponse::TransactionComplete = until {
-                        break
+                        break;
                     }
                 }
                 binder::BR_DEAD_REPLY => {
                     return Err(StatusCode::DeadObject);
-                },
+                }
                 binder::BR_FAILED_REPLY => {
-                    log::error!("Received FAILED_REPLY transaction reply for pid {}",
-                        thread_state.borrow().transaction.map_or(0, |state| state.calling_pid));
+                    log::error!(
+                        "Received FAILED_REPLY transaction reply for pid {}",
+                        thread_state
+                            .borrow()
+                            .transaction
+                            .map_or(0, |state| state.calling_pid)
+                    );
                     return Err(StatusCode::FailedTransaction);
-                },
+                }
                 binder::BR_FROZEN_REPLY => {
-                    log::error!("Received FROZEN_REPLY transaction reply for pid {}",
-                        thread_state.borrow().transaction.map_or(0, |state| state.calling_pid));
+                    log::error!(
+                        "Received FROZEN_REPLY transaction reply for pid {}",
+                        thread_state
+                            .borrow()
+                            .transaction
+                            .map_or(0, |state| state.calling_pid)
+                    );
                     return Err(StatusCode::FailedTransaction);
-                },
+                }
                 binder::BR_ACQUIRE_RESULT => {
                     let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
                     if let UntilResponse::AcquireResult = until {
@@ -417,50 +434,66 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     } else if cfg!(debug_assertions) {
                         panic!("Unexpected BR_ACQUIRE_RESULT");
                     }
-                },
+                }
                 binder::BR_REPLY => {
-                    let tr = thread_state.borrow_mut().in_parcel.read::<binder::binder_transaction_data>()?;
+                    let tr = thread_state
+                        .borrow_mut()
+                        .in_parcel
+                        .read::<binder::binder_transaction_data>()?;
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
-                            let reply = Parcel::from_ipc_parts(buffer as _, tr.data_size as _,
+                            let reply = Parcel::from_ipc_parts(
+                                buffer as _,
+                                tr.data_size as _,
                                 offsets as _,
-                                (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
-                                free_buffer);
+                                (tr.offsets_size as usize)
+                                    / std::mem::size_of::<binder::binder_size_t>(),
+                                free_buffer,
+                            );
                             return Ok(Some(reply));
                         } else {
                             // Safe approach: verify buffer size before reading
-                            let status: StatusCode = if tr.data_size >= std::mem::size_of::<i32>() as u64 {
-                                unsafe { (*(buffer as *const i32)).into() }
-                            } else {
-                                log::error!("Buffer too small for status code: {} < {}", tr.data_size, std::mem::size_of::<i32>());
-                                StatusCode::BadValue
-                            };
+                            let status: StatusCode =
+                                if tr.data_size >= std::mem::size_of::<i32>() as u64 {
+                                    unsafe { (*(buffer as *const i32)).into() }
+                                } else {
+                                    log::error!(
+                                        "Buffer too small for status code: {} < {}",
+                                        tr.data_size,
+                                        std::mem::size_of::<i32>()
+                                    );
+                                    StatusCode::BadValue
+                                };
                             log::trace!("binder::BR_REPLY ({})", status);
-                            free_buffer(None,
+                            free_buffer(
+                                None,
                                 buffer,
                                 tr.data_size as _,
                                 offsets,
-                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
+                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>(),
+                            )?;
 
                             if status != StatusCode::Ok {
                                 log::warn!("binder::BR_REPLY ({})", status);
-                                return Err(status)
+                                return Err(status);
                             }
                         }
                     } else {
-                        free_buffer(None,
+                        free_buffer(
+                            None,
                             buffer,
                             tr.data_size as _,
                             offsets,
-                            (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>())?;
+                            (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>(),
+                        )?;
                     }
-                },
+                }
                 _ => {
                     execute_command(cmd as _)?;
                 }
             };
-        };
+        }
         Ok(None)
     })
 }
@@ -477,15 +510,18 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_OK => {}
 
-            binder::BR_TRANSACTION_SEC_CTX |
-            binder::BR_TRANSACTION => {
+            binder::BR_TRANSACTION_SEC_CTX | binder::BR_TRANSACTION => {
                 let tr_secctx = {
                     let mut thread_state = thread_state.borrow_mut();
                     if cmd == binder::BR_TRANSACTION_SEC_CTX {
-                        thread_state.in_parcel.read::<binder::binder_transaction_data_secctx>()?
+                        thread_state
+                            .in_parcel
+                            .read::<binder::binder_transaction_data_secctx>()?
                     } else {
                         binder::binder_transaction_data_secctx {
-                            transaction_data: thread_state.in_parcel.read::<binder::binder_transaction_data>()?,
+                            transaction_data: thread_state
+                                .in_parcel
+                                .read::<binder::binder_transaction_data>()?,
                             secctx: 0,
                         }
                     }
@@ -494,9 +530,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
-                    Parcel::from_ipc_parts(tr.data.ptr.buffer as _, tr.data_size as _,
-                        tr.data.ptr.offsets as _, (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
-                        free_buffer)
+                    Parcel::from_ipc_parts(
+                        tr.data.ptr.buffer as _,
+                        tr.data_size as _,
+                        tr.data.ptr.offsets as _,
+                        (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
+                        free_buffer,
+                    )
                 };
 
                 // TODO: Skip now, because if below implmentation is mandatory.
@@ -510,7 +550,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                     thread_state.clear_calling_work_source();
                     thread_state.clear_propagate_work_source();
 
-                    thread_state.transaction = Some(TransactionState::from_transaction_data(&tr_secctx));
+                    thread_state.transaction =
+                        Some(TransactionState::from_transaction_data(&tr_secctx));
 
                     transaction_old
                 };
@@ -520,9 +561,14 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let result = {
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     if target_ptr != 0 {
-                        let strong = raw_pointer_to_strong_binder((target_ptr, tr_secctx.transaction_data.cookie));
+                        let strong = raw_pointer_to_strong_binder((
+                            target_ptr,
+                            tr_secctx.transaction_data.cookie,
+                        ));
                         if strong.attempt_increase() {
-                            let result = strong.as_transactable().expect("Transactable is None.")
+                            let result = strong
+                                .as_transactable()
+                                .expect("Transactable is None.")
                                 .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
                             strong.decrease()?;
 
@@ -532,8 +578,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                             Err(StatusCode::UnknownTransaction)
                         }
                     } else {
-                        let context = ProcessState::as_self().context_manager().expect("Transactable is None.");
-                        context.as_transactable().expect("Transactable is None.").transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
+                        let context = ProcessState::as_self()
+                            .context_manager()
+                            .expect("Transactable is None.");
+                        context
+                            .as_transactable()
+                            .expect("Transactable is None.")
+                            .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
                     }
                 };
                 let flags = tr_secctx.transaction_data.flags;
@@ -543,12 +594,21 @@ fn execute_command(cmd: i32) -> Result<()> {
                         Ok(_) => StatusCode::Ok.into(),
                         Err(err) => err.into(),
                     };
-                    thread_state.borrow_mut().write_transaction_data(binder::BC_REPLY, flags, u32::MAX, 0, &reply, &status)?;
+                    thread_state.borrow_mut().write_transaction_data(
+                        binder::BC_REPLY,
+                        flags,
+                        u32::MAX,
+                        0,
+                        &reply,
+                        &status,
+                    )?;
                     wait_for_response(UntilResponse::TransactionComplete)?;
                 } else if let Err(err) = result {
                     let mut log = format!(
                         "oneway function results for code {} on binder at {:X}",
-                        tr_secctx.transaction_data.code, unsafe { tr_secctx.transaction_data.target.ptr });
+                        tr_secctx.transaction_data.code,
+                        unsafe { tr_secctx.transaction_data.target.ptr }
+                    );
                     log += &format!(" will be dropped but finished with status {}", err);
 
                     if reply.data_size() != 0 {
@@ -635,8 +695,12 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 {
                     let mut state = thread_state.borrow_mut();
-                    state.out_parcel.write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
-                    state.out_parcel.write::<binder::binder_uintptr_t>(&handle)?;
+                    state
+                        .out_parcel
+                        .write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
+                    state
+                        .out_parcel
+                        .write::<binder::binder_uintptr_t>(&handle)?;
                 }
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
@@ -652,7 +716,6 @@ fn execute_command(cmd: i32) -> Result<()> {
         Ok(())
     })
 }
-
 
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -682,13 +745,20 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
         };
 
         if bwr.write_size == 0 && bwr.read_size == 0 {
-            return Ok(())
+            return Ok(());
         }
 
         if bwr.write_size != 0 {
-            log::trace!("Sending command to driver:\n{:?}", thread_state.borrow().out_parcel);
-            log::trace!("Size of receive buffer: {}, need_read: {}, do_receive: {}",
-                bwr.read_size, thread_state.borrow().in_parcel.is_empty(), do_receive);
+            log::trace!(
+                "Sending command to driver:\n{:?}",
+                thread_state.borrow().out_parcel
+            );
+            log::trace!(
+                "Size of receive buffer: {}, need_read: {}, do_receive: {}",
+                bwr.read_size,
+                thread_state.borrow().in_parcel.is_empty(),
+                do_receive
+            );
         }
         // unsafe {
         //     loop {
@@ -711,21 +781,29 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 Err(errno) if errno != rustix::io::Errno::INTR => {
                     log::error!("binder::write_read() error : {}", errno);
                     return Err(StatusCode::Errno(errno.raw_os_error()));
-                },
+                }
                 _ => {}
             }
         }
 
-        log::trace!("write consumed: {} of {}, read consumed: {} of {}",
-            bwr.write_consumed, bwr.write_size, bwr.read_consumed, bwr.read_size);
+        log::trace!(
+            "write consumed: {} of {}, read consumed: {} of {}",
+            bwr.write_consumed,
+            bwr.write_size,
+            bwr.read_consumed,
+            bwr.read_size
+        );
 
         {
             let mut thread_state = thread_state.borrow_mut();
 
             if bwr.write_consumed > 0 {
                 if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
-                    panic!("Driver did not consume write buffer. consumed: {} of {}",
-                        bwr.write_consumed, thread_state.out_parcel.data_size());
+                    panic!(
+                        "Driver did not consume write buffer. consumed: {} of {}",
+                        bwr.write_consumed,
+                        thread_state.out_parcel.data_size()
+                    );
                 } else {
                     thread_state.out_parcel.set_data_size(0);
                     drop(thread_state);
@@ -742,7 +820,10 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
 
-                log::trace!("Received commands from driver:\n{:?}", thread_state.in_parcel);
+                log::trace!(
+                    "Received commands from driver:\n{:?}",
+                    thread_state.in_parcel
+                );
             }
         };
 
@@ -782,8 +863,10 @@ pub(crate) fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut state = thread_state.borrow_mut();
 
-        state.out_parcel.write::<u32>(&(binder::BC_ATTEMPT_ACQUIRE))?;
-        state.out_parcel.write::<u32>(&0)?;     // xxx was thread priority.
+        state
+            .out_parcel
+            .write::<u32>(&(binder::BC_ATTEMPT_ACQUIRE))?;
+        state.out_parcel.write::<u32>(&0)?; // xxx was thread priority.
         state.out_parcel.write::<u32>(&(handle))
     })?;
     wait_for_response(UntilResponse::AcquireResult).map(|_| ())
@@ -825,7 +908,7 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()>{
+pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()> {
     log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -838,7 +921,10 @@ pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()>{
         if !(flash_if_needed()?) {
             // This code is come from IPCThreadState.cpp. Is it necessaryq?
             BINDER_DEREFS.with(|binder_derefs| {
-                binder_derefs.borrow_mut().post_weak_derefs.push(weak.clone());
+                binder_derefs
+                    .borrow_mut()
+                    .post_weak_derefs
+                    .push(weak.clone());
             });
         }
 
@@ -862,7 +948,6 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
     })
 }
 
-
 pub(crate) fn flash_if_needed() -> Result<bool> {
     THREAD_STATE.with(|thread_state| -> Result<bool> {
         {
@@ -884,9 +969,7 @@ pub(crate) fn _handle_commands() -> Result<()> {
     while {
         get_and_execute_command()?;
 
-        THREAD_STATE.with(|thread_state| -> bool {
-            !thread_state.borrow().in_parcel.is_empty()
-        })
+        THREAD_STATE.with(|thread_state| -> bool { !thread_state.borrow().in_parcel.is_empty() })
     } {
         flush_commands()?;
     }
@@ -912,7 +995,11 @@ pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     })?;
 
     if header != INTERFACE_HEADER {
-        log::error!("Expecting header {:#x} but found {:#x}.", INTERFACE_HEADER, header);
+        log::error!(
+            "Expecting header {:#x} but found {:#x}.",
+            INTERFACE_HEADER,
+            header
+        );
         return Ok(false);
     }
 
@@ -920,30 +1007,49 @@ pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     if parcel_interface.eq(descriptor) {
         Ok(true)
     } else {
-        log::error!("check_interface() expected '{}' but read '{}'", descriptor, parcel_interface);
+        log::error!(
+            "check_interface() expected '{}' but read '{}'",
+            descriptor,
+            parcel_interface
+        );
         Ok(false)
     }
 }
 
-pub(crate) fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) -> Result<Option<Parcel>> {
+pub(crate) fn transact(
+    handle: u32,
+    code: u32,
+    data: &Parcel,
+    mut flags: u32,
+) -> Result<Option<Parcel>> {
     let mut reply: Option<Parcel> = None;
 
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
     let call_restriction = THREAD_STATE.with(|thread_state| -> Result<CallRestriction> {
         let mut thread_state = thread_state.borrow_mut();
-        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data, &0)?;
+        thread_state.write_transaction_data(
+            binder::BC_TRANSACTION,
+            flags,
+            handle,
+            code,
+            data,
+            &0,
+        )?;
         Ok(thread_state.call_restriction)
     })?;
 
     if (flags & transaction_flags_TF_ONE_WAY) == 0 {
         match call_restriction {
             CallRestriction::ErrorIfNotOneway => {
-                error!("Process making non-oneway call (code: {}) but is restricted.", code)
-            },
+                error!(
+                    "Process making non-oneway call (code: {}) but is restricted.",
+                    code
+                )
+            }
             CallRestriction::FatalIfNotOneway => {
                 panic!("Process may not make non-oneway calls (code: {}).", code);
-            },
+            }
             _ => (),
         }
 
@@ -955,15 +1061,22 @@ pub(crate) fn transact(handle: u32, code: u32, data: &Parcel, mut flags: u32) ->
     Ok(reply)
 }
 
-
-fn free_buffer(parcel: Option<&Parcel>, data: binder_uintptr_t, _: usize, _ : binder_uintptr_t, _: usize) -> Result<()> {
+fn free_buffer(
+    parcel: Option<&Parcel>,
+    data: binder_uintptr_t,
+    _: usize,
+    _: binder_uintptr_t,
+    _: usize,
+) -> Result<()> {
     if let Some(parcel) = parcel {
         parcel.close_file_descriptors()
     }
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut thread_state = thread_state.borrow_mut();
-        thread_state.out_parcel.write::<u32>(&binder::BC_FREE_BUFFER)?;
+        thread_state
+            .out_parcel
+            .write::<u32>(&binder::BC_FREE_BUFFER)?;
         thread_state.out_parcel.write::<binder_uintptr_t>(&data)?;
         Ok(())
     })?;
@@ -976,7 +1089,9 @@ fn free_buffer(parcel: Option<&Parcel>, data: binder_uintptr_t, _: usize, _ : bi
 pub(crate) fn query_interface(handle: u32) -> Result<String> {
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    let interface: String = reply.expect("INTERFACE_TRANSACTION should have reply parcel").read()?;
+    let interface: String = reply
+        .expect("INTERFACE_TRANSACTION should have reply parcel")
+        .read()?;
 
     Ok(interface)
 }
@@ -989,10 +1104,15 @@ pub(crate) fn ping_binder(handle: u32) -> Result<()> {
 
 pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        log::debug!("**** THREAD {:?} (PID {}) IS JOINING THE THREAD POOL",
-            std::thread::current().id(), std::process::id());
+        log::debug!(
+            "**** THREAD {:?} (PID {}) IS JOINING THE THREAD POOL",
+            std::thread::current().id(),
+            std::process::id()
+        );
 
-        ProcessState::as_self().current_threads.fetch_add(1, Ordering::SeqCst);
+        ProcessState::as_self()
+            .current_threads
+            .fetch_add(1, Ordering::SeqCst);
 
         let looper = if is_main {
             binder::BC_ENTER_LOOPER
@@ -1018,30 +1138,43 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                 match e {
                     StatusCode::TimedOut if !is_main => {
                         result = e;
-                        break
+                        break;
                     }
-                    StatusCode::Errno(errno) if errno == (rustix::io::Errno::CONNREFUSED.raw_os_error()) => {
+                    StatusCode::Errno(errno)
+                        if errno == (rustix::io::Errno::CONNREFUSED.raw_os_error()) =>
+                    {
                         result = e;
                         break;
                     }
                     _ => {
-                        panic!("get_and_execute_command() returned unexpected error {}, aborting", e);
+                        panic!(
+                            "get_and_execute_command() returned unexpected error {}, aborting",
+                            e
+                        );
                     }
                 }
             }
         }
-        log::debug!("**** THREAD {:?} (PID {}) IS LEAVING THE THREAD POOL err={}\n",
-            std::thread::current().id(), std::process::id(), result);
+        log::debug!(
+            "**** THREAD {:?} (PID {}) IS LEAVING THE THREAD POOL err={}\n",
+            std::thread::current().id(),
+            std::process::id(),
+            result
+        );
 
         {
             let mut thread_state = thread_state.borrow_mut();
 
-            thread_state.out_parcel.write::<u32>(&binder::BC_EXIT_LOOPER)?;
+            thread_state
+                .out_parcel
+                .write::<u32>(&binder::BC_EXIT_LOOPER)?;
             thread_state.is_looper = false;
         }
 
         talk_with_driver(false)?;
-        ProcessState::as_self().current_threads.fetch_sub(1, Ordering::SeqCst);
+        ProcessState::as_self()
+            .current_threads
+            .fetch_sub(1, Ordering::SeqCst);
         Ok(())
     })
 }
@@ -1052,10 +1185,14 @@ pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
+            state
+                .out_parcel
+                .write::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
             state.out_parcel.write::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
-            state.out_parcel.write::<binder::binder_uintptr_t>(&(handle as _))?;
+            state
+                .out_parcel
+                .write::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
@@ -1068,10 +1205,14 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
+            state
+                .out_parcel
+                .write::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
             state.out_parcel.write::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
-            state.out_parcel.write::<binder::binder_uintptr_t>(&(handle as _))?;
+            state
+                .out_parcel
+                .write::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
@@ -1092,9 +1233,7 @@ impl std::default::Default for CallingContext {
             match thread_state.transaction.as_ref() {
                 Some(transaction) => {
                     let calling_sid = if transaction.calling_sid.is_null() {
-                        unsafe {
-                            Some(CStr::from_ptr(transaction.calling_sid as _).to_owned())
-                        }
+                        unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
                     } else {
                         None
                     };
@@ -1118,9 +1257,7 @@ impl std::default::Default for CallingContext {
 }
 
 pub fn is_handling_transaction() -> bool {
-    THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().transaction.is_some()
-    })
+    THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.is_some())
 }
 
 #[cfg(test)]
@@ -1134,31 +1271,52 @@ mod tests {
         assert_eq!(return_to_str(binder::BR_REPLY), "BR_REPLY");
         assert_eq!(return_to_str(binder::BR_ACQUIRE), "BR_ACQUIRE");
         assert_eq!(return_to_str(binder::BR_INCREFS), "BR_INCREFS");
-        assert_eq!(return_to_str(binder::BR_ACQUIRE_RESULT), "BR_ACQUIRE_RESULT");
+        assert_eq!(
+            return_to_str(binder::BR_ACQUIRE_RESULT),
+            "BR_ACQUIRE_RESULT"
+        );
         assert_eq!(return_to_str(binder::BR_DEAD_BINDER), "BR_DEAD_BINDER");
-        assert_eq!(return_to_str(binder::BR_CLEAR_DEATH_NOTIFICATION_DONE), "BR_CLEAR_DEATH_NOTIFICATION_DONE");
+        assert_eq!(
+            return_to_str(binder::BR_CLEAR_DEATH_NOTIFICATION_DONE),
+            "BR_CLEAR_DEATH_NOTIFICATION_DONE"
+        );
         assert_eq!(return_to_str(binder::BR_FAILED_REPLY), "BR_FAILED_REPLY");
         assert_eq!(return_to_str(binder::BR_DEAD_REPLY), "BR_DEAD_REPLY");
         assert_eq!(return_to_str(binder::BR_FINISHED), "BR_FINISHED");
         assert_eq!(return_to_str(binder::BR_SPAWN_LOOPER), "BR_SPAWN_LOOPER");
-        assert_eq!(return_to_str(binder::BR_ATTEMPT_ACQUIRE), "BR_ATTEMPT_ACQUIRE");
+        assert_eq!(
+            return_to_str(binder::BR_ATTEMPT_ACQUIRE),
+            "BR_ATTEMPT_ACQUIRE"
+        );
         assert_eq!(return_to_str(binder::BR_NOOP), "BR_NOOP");
         assert_eq!(return_to_str(binder::BR_SPAWN_LOOPER), "BR_SPAWN_LOOPER");
         assert_eq!(return_to_str(binder::BR_ERROR), "BR_ERROR");
         assert_eq!(return_to_str(binder::BR_DEAD_REPLY), "BR_DEAD_REPLY");
         assert_eq!(return_to_str(binder::BR_FAILED_REPLY), "BR_FAILED_REPLY");
         assert_eq!(return_to_str(binder::BR_FROZEN_REPLY), "BR_FROZEN_REPLY");
-        assert_eq!(return_to_str(binder::BR_TRANSACTION_SEC_CTX), "BR_TRANSACTION_SEC_CTX");
+        assert_eq!(
+            return_to_str(binder::BR_TRANSACTION_SEC_CTX),
+            "BR_TRANSACTION_SEC_CTX"
+        );
         assert_eq!(return_to_str(binder::BR_DECREFS), "BR_DECREFS");
-        assert_eq!(return_to_str(binder::BR_TRANSACTION_COMPLETE), "BR_TRANSACTION_COMPLETE");
-        assert_eq!(return_to_str(binder::BR_ONEWAY_SPAM_SUSPECT), "BR_ONEWAY_SPAM_SUSPECT");
+        assert_eq!(
+            return_to_str(binder::BR_TRANSACTION_COMPLETE),
+            "BR_TRANSACTION_COMPLETE"
+        );
+        assert_eq!(
+            return_to_str(binder::BR_ONEWAY_SPAM_SUSPECT),
+            "BR_ONEWAY_SPAM_SUSPECT"
+        );
     }
 
     #[test]
     fn test_command_to_str() {
         assert_eq!(command_to_str(binder::BC_TRANSACTION), "BC_TRANSACTION");
         assert_eq!(command_to_str(binder::BC_REPLY), "BC_REPLY");
-        assert_eq!(command_to_str(binder::BC_ACQUIRE_RESULT), "BC_ACQUIRE_RESULT");
+        assert_eq!(
+            command_to_str(binder::BC_ACQUIRE_RESULT),
+            "BC_ACQUIRE_RESULT"
+        );
         assert_eq!(command_to_str(binder::BC_FREE_BUFFER), "BC_FREE_BUFFER");
         assert_eq!(command_to_str(binder::BC_INCREFS), "BC_INCREFS");
         assert_eq!(command_to_str(binder::BC_ACQUIRE), "BC_ACQUIRE");
@@ -1166,14 +1324,32 @@ mod tests {
         assert_eq!(command_to_str(binder::BC_DECREFS), "BC_DECREFS");
         assert_eq!(command_to_str(binder::BC_INCREFS_DONE), "BC_INCREFS_DONE");
         assert_eq!(command_to_str(binder::BC_ACQUIRE_DONE), "BC_ACQUIRE_DONE");
-        assert_eq!(command_to_str(binder::BC_ATTEMPT_ACQUIRE), "BC_ATTEMPT_ACQUIRE");
-        assert_eq!(command_to_str(binder::BC_REGISTER_LOOPER), "BC_REGISTER_LOOPER");
+        assert_eq!(
+            command_to_str(binder::BC_ATTEMPT_ACQUIRE),
+            "BC_ATTEMPT_ACQUIRE"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_REGISTER_LOOPER),
+            "BC_REGISTER_LOOPER"
+        );
         assert_eq!(command_to_str(binder::BC_ENTER_LOOPER), "BC_ENTER_LOOPER");
         assert_eq!(command_to_str(binder::BC_EXIT_LOOPER), "BC_EXIT_LOOPER");
-        assert_eq!(command_to_str(binder::BC_REQUEST_DEATH_NOTIFICATION), "BC_REQUEST_DEATH_NOTIFICATION");
-        assert_eq!(command_to_str(binder::BC_CLEAR_DEATH_NOTIFICATION), "BC_CLEAR_DEATH_NOTIFICATION");
-        assert_eq!(command_to_str(binder::BC_DEAD_BINDER_DONE), "BC_DEAD_BINDER_DONE");
-        assert_eq!(command_to_str(binder::BC_TRANSACTION_SG), "BC_TRANSACTION_SG");
+        assert_eq!(
+            command_to_str(binder::BC_REQUEST_DEATH_NOTIFICATION),
+            "BC_REQUEST_DEATH_NOTIFICATION"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_CLEAR_DEATH_NOTIFICATION),
+            "BC_CLEAR_DEATH_NOTIFICATION"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_DEAD_BINDER_DONE),
+            "BC_DEAD_BINDER_DONE"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_TRANSACTION_SG),
+            "BC_TRANSACTION_SG"
+        );
         assert_eq!(command_to_str(binder::BC_REPLY_SG), "BC_REPLY_SG");
     }
 }

@@ -1,8 +1,8 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::error::Error;
 use similar::{ChangeTag, TextDiff};
+use std::error::Error;
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
     let document = rsbinder_aidl::parse_document(input)?;
@@ -23,7 +23,8 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_nullability() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
 package android.aidl.fixedsizearray;
 interface ITestService {
     // Test that arrays work as parameters and return types.
@@ -328,12 +329,14 @@ pub mod ITestService {
         }
     }
 }
-        "##)
+        "##,
+    )
 }
 
 #[test]
 fn test_fixed_size_array() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
 package android.aidl.fixedsizearray;
 parcelable FixedSizeArrayExample {
     // to see if NxM array works
@@ -703,12 +706,14 @@ pub mod FixedSizeArrayExample {
         }
     }
 }
-        "##)
+        "##,
+    )
 }
 
 #[test]
 fn test_array_of_interfaces_check() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
 parcelable ArrayOfInterfaces {
     interface IEmptyInterface {}
 
@@ -1030,19 +1035,22 @@ pub mod ArrayOfInterfaces {
         }
     }
 }
-        "##)
+        "##,
+    )
 }
 
 #[test]
 fn test_parcelable_vintf() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
 package android.aidl.tests.vintf;
 
 @VintfStability
 parcelable VintfExtendableParcelable {
     ParcelableHolder ext;
 }
-        "##, r#"
+        "##,
+        r#"
 pub mod VintfExtendableParcelable {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
@@ -1077,16 +1085,19 @@ pub mod VintfExtendableParcelable {
         fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
     }
 }
-        "#)?;
+        "#,
+    )?;
 
-        aidl_generator(r##"
+    aidl_generator(
+        r##"
 package android.aidl.tests.vintf;
 
 @VintfStability
 parcelable VintfParcelable {
     int a;
 }
-        "##, r#"
+        "##,
+        r#"
 pub mod VintfParcelable {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
@@ -1121,13 +1132,15 @@ pub mod VintfParcelable {
         fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
     }
 }
-        "#)?;
-        Ok(())
+        "#,
+    )?;
+    Ok(())
 }
 
 #[test]
 fn test_parcelable_const_name() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
 parcelable IServiceManager {
     const int DUMP_FLAG_PRIORITY_CRITICAL = 1 << 0;
     const int DUMP_FLAG_PRIORITY_HIGH = 1 << 1;
@@ -1175,13 +1188,15 @@ pub mod IServiceManager {
         fn descriptor() -> &'static str { "IServiceManager" }
     }
 }
-        "#)?;
+        "#,
+    )?;
     Ok(())
 }
 
 #[test]
 fn test_parcelable() -> Result<(), Box<dyn Error>> {
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
         package android.os;
 
         /**
@@ -1198,7 +1213,8 @@ fn test_parcelable() -> Result<(), Box<dyn Error>> {
              */
             int port;
         }
-        "##, r#"
+        "##,
+        r#"
 pub mod ConnectionInfo {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
@@ -1236,7 +1252,8 @@ pub mod ConnectionInfo {
         fn descriptor() -> &'static str { "android.os.ConnectionInfo" }
     }
 }
-        "#)?;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -1258,7 +1275,8 @@ const UNION: &str = r#"
 
 #[test]
 fn test_unions() -> Result<(), Box<dyn Error>> {
-    aidl_generator(&(r#"
+    aidl_generator(
+        &(r#"
         package android.aidl.tests;
 
         @Backing(type="byte")
@@ -1269,7 +1287,9 @@ fn test_unions() -> Result<(), Box<dyn Error>> {
             BAZ,
         }
 
-        "#.to_owned() + UNION),
+        "#
+        .to_owned()
+            + UNION),
         r#"
 pub mod ByteEnum {
     #![allow(non_upper_case_globals, non_snake_case)]
@@ -1392,7 +1412,8 @@ pub mod Union {
         }
     }
 }
-        "#)?;
+        "#,
+    )?;
 
     Ok(())
 }
@@ -1438,7 +1459,7 @@ const INT_ENUM: &str = r#"
 "#;
 
 #[cfg(test)]
-const LONG_ENUM: &str =r#"
+const LONG_ENUM: &str = r#"
         @Backing(type="long")
         enum LongEnum {
             FOO = 100000000000,
@@ -1460,7 +1481,8 @@ const BYTE_ENUM: &str = r#"
 
 #[test]
 fn test_enums() -> Result<(), Box<dyn Error>> {
-    aidl_generator(BYTE_ENUM,
+    aidl_generator(
+        BYTE_ENUM,
         r##"
 pub mod ByteEnum {
     #![allow(non_upper_case_globals, non_snake_case)]
@@ -1472,9 +1494,11 @@ pub mod ByteEnum {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
-    aidl_generator(r##"
+    aidl_generator(
+        r##"
         enum BackendType {
             CPP,
             JAVA,
@@ -1494,9 +1518,11 @@ pub mod BackendType {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
-    aidl_generator(CONSTANT_EXPRESSION_ENUM,
+    aidl_generator(
+        CONSTANT_EXPRESSION_ENUM,
         r##"
 pub mod ConstantExpressionEnum {
     #![allow(non_upper_case_globals, non_snake_case)]
@@ -1515,9 +1541,11 @@ pub mod ConstantExpressionEnum {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
-    aidl_generator(INT_ENUM,
+    aidl_generator(
+        INT_ENUM,
         r##"
 pub mod IntEnum {
     #![allow(non_upper_case_globals, non_snake_case)]
@@ -1530,9 +1558,11 @@ pub mod IntEnum {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
-    aidl_generator(LONG_ENUM,
+    aidl_generator(
+        LONG_ENUM,
         r##"
 pub mod LongEnum {
     #![allow(non_upper_case_globals, non_snake_case)]
@@ -1544,9 +1574,12 @@ pub mod LongEnum {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
-    aidl_generator(&(BYTE_ENUM.to_owned() + r##"
+    aidl_generator(
+        &(BYTE_ENUM.to_owned()
+            + r##"
 interface ITestService {
     ByteEnum RepeatByteEnum(ByteEnum token);
 }
@@ -1721,14 +1754,16 @@ pub mod ITestService {
         }
     }
 }
-        "##)?;
+        "##,
+    )?;
 
     Ok(())
 }
 
 #[test]
 fn test_byte_parcelable() -> Result<(), Box<dyn Error>> {
-    aidl_generator(&(r#"
+    aidl_generator(
+        &(r#"
 package android.aidl.tests;
 parcelable StructuredParcelable {
     int[] shouldContainThreeFs;
@@ -1901,7 +1936,13 @@ parcelable StructuredParcelable {
 
     IntEnum defaultWithFoo = IntEnum.FOO;
 }
-        "#.to_owned() + CONSTANT_EXPRESSION_ENUM + BYTE_ENUM + INT_ENUM + LONG_ENUM + UNION),
+        "#
+        .to_owned()
+            + CONSTANT_EXPRESSION_ENUM
+            + BYTE_ENUM
+            + INT_ENUM
+            + LONG_ENUM
+            + UNION),
         r#"
 pub mod StructuredParcelable {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
@@ -2344,6 +2385,7 @@ pub mod Union {
         }
     }
 }
-        "#)?;
+        "#,
+    )?;
     Ok(())
 }

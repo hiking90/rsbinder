@@ -1,11 +1,11 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt::{Debug, Display, Formatter};
-use crate::parcelable::*;
-use crate::parcel::*;
 use crate::error;
 use crate::error::StatusCode;
+use crate::parcel::*;
+use crate::parcelable::*;
+use std::fmt::{Debug, Display, Formatter};
 
 pub type Result<T> = std::result::Result<T, Status>;
 
@@ -23,10 +23,10 @@ pub enum ExceptionCode {
     ServiceSpecific = -8,
     Parcelable = -9,
 
-// This is special and Java specific; see Parcel.java.
+    // This is special and Java specific; see Parcel.java.
     HasReplyHeader = -128,
-// This is special, and indicates to C++ binder proxies that the
-// transaction has failed at a low level.
+    // This is special, and indicates to C++ binder proxies that the
+    // transaction has failed at a low level.
     TransactionFailed = -129,
     JustError = -256,
 }
@@ -51,7 +51,6 @@ impl Display for ExceptionCode {
     }
 }
 
-
 impl Serialize for ExceptionCode {
     fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
         parcel.write::<i32>(&(*self as i32))
@@ -64,22 +63,39 @@ impl Deserialize for ExceptionCode {
         let code = match exception {
             exception if exception == ExceptionCode::None as i32 => ExceptionCode::None,
             exception if exception == ExceptionCode::Security as i32 => ExceptionCode::Security,
-            exception if exception == ExceptionCode::BadParcelable as i32 => ExceptionCode::BadParcelable,
-            exception if exception == ExceptionCode::IllegalArgument as i32 => ExceptionCode::IllegalArgument,
-            exception if exception == ExceptionCode::NullPointer as i32 => ExceptionCode::NullPointer,
-            exception if exception == ExceptionCode::IllegalState as i32 => ExceptionCode::IllegalState,
-            exception if exception == ExceptionCode::NetworkMainThread as i32 => ExceptionCode::NetworkMainThread,
-            exception if exception == ExceptionCode::UnsupportedOperation as i32 => ExceptionCode::UnsupportedOperation,
-            exception if exception == ExceptionCode::ServiceSpecific as i32 => ExceptionCode::ServiceSpecific,
+            exception if exception == ExceptionCode::BadParcelable as i32 => {
+                ExceptionCode::BadParcelable
+            }
+            exception if exception == ExceptionCode::IllegalArgument as i32 => {
+                ExceptionCode::IllegalArgument
+            }
+            exception if exception == ExceptionCode::NullPointer as i32 => {
+                ExceptionCode::NullPointer
+            }
+            exception if exception == ExceptionCode::IllegalState as i32 => {
+                ExceptionCode::IllegalState
+            }
+            exception if exception == ExceptionCode::NetworkMainThread as i32 => {
+                ExceptionCode::NetworkMainThread
+            }
+            exception if exception == ExceptionCode::UnsupportedOperation as i32 => {
+                ExceptionCode::UnsupportedOperation
+            }
+            exception if exception == ExceptionCode::ServiceSpecific as i32 => {
+                ExceptionCode::ServiceSpecific
+            }
             exception if exception == ExceptionCode::Parcelable as i32 => ExceptionCode::Parcelable,
-            exception if exception == ExceptionCode::HasReplyHeader as i32 => ExceptionCode::HasReplyHeader,
-            exception if exception == ExceptionCode::TransactionFailed as i32 => ExceptionCode::TransactionFailed,
+            exception if exception == ExceptionCode::HasReplyHeader as i32 => {
+                ExceptionCode::HasReplyHeader
+            }
+            exception if exception == ExceptionCode::TransactionFailed as i32 => {
+                ExceptionCode::TransactionFailed
+            }
             _ => ExceptionCode::JustError,
         };
         Ok(code)
     }
 }
-
 
 pub struct Status {
     code: StatusCode,
@@ -103,7 +119,11 @@ impl Status {
     }
 
     pub fn new_service_specific_error(err: i32, message: Option<String>) -> Self {
-        Self::new(ExceptionCode::ServiceSpecific, StatusCode::ServiceSpecific(err), message)
+        Self::new(
+            ExceptionCode::ServiceSpecific,
+            StatusCode::ServiceSpecific(err),
+            message,
+        )
     }
 
     pub fn is_ok(&self) -> bool {
@@ -138,7 +158,13 @@ impl Display for Status {
         if self.exception == ExceptionCode::None {
             write!(f, "{}", self.code)
         } else {
-            write!(f, "{} / {}: {}", self.exception, self.code, self.message.as_ref().unwrap_or(&"".to_owned()))
+            write!(
+                f,
+                "{} / {}: {}",
+                self.exception,
+                self.code,
+                self.message.as_ref().unwrap_or(&"".to_owned())
+            )
         }
     }
 }
@@ -196,12 +222,12 @@ impl From<StatusCode> for Status {
 impl Serialize for Status {
     fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
         if self.exception == ExceptionCode::TransactionFailed {
-            return Err(self.code)
+            return Err(self.code);
         }
 
         parcel.write::<i32>(&(self.exception as _))?;
         if self.exception == ExceptionCode::None {
-            return Ok(())
+            return Ok(());
         }
 
         parcel.write::<String>(self.message.as_ref().unwrap_or(&"".to_owned()))?;
@@ -233,7 +259,6 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
     Ok(())
 }
 
-
 impl Deserialize for Status {
     fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
         let mut exception = parcel.read::<ExceptionCode>()?;
@@ -247,11 +272,18 @@ impl Deserialize for Status {
         } else {
             let message: String = parcel.read::<String>()?;
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
-            if remote_stack_trace_header_size < 0 || remote_stack_trace_header_size as usize > parcel.data_avail() {
-                log::error!("0x534e4554:132650049 Invalid remote_stack_trace_header_size({}).", remote_stack_trace_header_size);
+            if remote_stack_trace_header_size < 0
+                || remote_stack_trace_header_size as usize > parcel.data_avail()
+            {
+                log::error!(
+                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({}).",
+                    remote_stack_trace_header_size
+                );
                 return Err(StatusCode::Unknown);
             }
-            parcel.set_data_position(parcel.data_position() + remote_stack_trace_header_size as usize);
+            parcel.set_data_position(
+                parcel.data_position() + remote_stack_trace_header_size as usize,
+            );
 
             let code = if exception == ExceptionCode::ServiceSpecific {
                 let code = parcel.read::<i32>()?;
@@ -286,11 +318,22 @@ mod tests {
         let unknown = Status::from(StatusCode::Unknown);
         assert_eq!(format!("{}", unknown), "TransactionFailed / Unknown: ");
 
-        let service_specific = Status::new_service_specific_error(1, Some("Service specific error".to_owned()));
-        assert_eq!(format!("{}", service_specific), "ServiceSpecific / ServiceSpecific(1): Service specific error");
+        let service_specific =
+            Status::new_service_specific_error(1, Some("Service specific error".to_owned()));
+        assert_eq!(
+            format!("{}", service_specific),
+            "ServiceSpecific / ServiceSpecific(1): Service specific error"
+        );
 
-        let exception = Status::new(ExceptionCode::BadParcelable, StatusCode::Unknown, Some("Bad parcelable".to_owned()));
-        assert_eq!(format!("{}", exception), "BadParcelable / Unknown: Bad parcelable");
+        let exception = Status::new(
+            ExceptionCode::BadParcelable,
+            StatusCode::Unknown,
+            Some("Bad parcelable".to_owned()),
+        );
+        assert_eq!(
+            format!("{}", exception),
+            "BadParcelable / Unknown: Bad parcelable"
+        );
 
         Ok(())
     }
@@ -307,7 +350,11 @@ mod tests {
         assert_eq!(status, deserialized);
 
         // serialize parcelable
-        let status = Status::new(ExceptionCode::Parcelable, StatusCode::Ok, Some("Parcelable".to_owned()));
+        let status = Status::new(
+            ExceptionCode::Parcelable,
+            StatusCode::Ok,
+            Some("Parcelable".to_owned()),
+        );
         let mut parcel = Parcel::new();
         status.serialize(&mut parcel).unwrap();
 

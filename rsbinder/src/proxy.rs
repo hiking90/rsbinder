@@ -9,12 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{self, Arc, RwLock};
 
 use crate::{
-    parcel::*,
-    binder::*,
-    error::*,
-    thread_state,
-    ref_counter::RefCounter,
-    binder_object::*,
+    binder::*, binder_object::*, error::*, parcel::*, ref_counter::RefCounter, thread_state,
 };
 
 pub struct ProxyHandle {
@@ -49,7 +44,12 @@ impl ProxyHandle {
         &self.descriptor
     }
 
-    pub fn submit_transact(&self, code: TransactionCode, data: &Parcel, flags: TransactionFlags) -> Result<Option<Parcel>> {
+    pub fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>> {
         thread_state::transact(self.handle(), code, data, flags)
     }
 
@@ -64,7 +64,8 @@ impl ProxyHandle {
     }
 
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
-        self.obituary_sent.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.obituary_sent
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let recipients = self.recipients.read().unwrap();
         if !recipients.is_empty() {
@@ -129,7 +130,10 @@ impl PartialEq for ProxyHandle {
 impl IBinder for ProxyHandle {
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .obituary_sent
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(StatusCode::DeadObject);
         } else {
             let mut recipients = self.recipients.write().unwrap();
@@ -147,7 +151,10 @@ impl IBinder for ProxyHandle {
     /// The recipient will no longer be called if this object
     /// dies.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        if self.obituary_sent.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .obituary_sent
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(StatusCode::DeadObject);
         } else {
             let mut recipients = self.recipients.write().unwrap();
@@ -189,13 +196,14 @@ impl IBinder for ProxyHandle {
     fn inc_strong(&self, strong: &SIBinder) -> Result<()> {
         // In the Android implementation, it simultaneously increases the weak reference,
         // but until the necessity is confirmed, we will not support the related functionality here.
-        self.strong.inc(|| {
-            thread_state::inc_strong_handle(self.handle(), strong.clone())
-        })
+        self.strong
+            .inc(|| thread_state::inc_strong_handle(self.handle(), strong.clone()))
     }
 
     fn attempt_inc_strong(&self) -> bool {
-        self.strong.attempt_inc(false, || {
+        self.strong.attempt_inc(
+            false,
+            || {
                 if let Err(err) = thread_state::attempt_inc_strong_handle(self.handle()) {
                     log::error!("Error in attempt_inc_strong_handle() is {:?}", err);
                     false
@@ -206,30 +214,27 @@ impl IBinder for ProxyHandle {
             || {
                 thread_state::dec_strong_handle(self.handle())
                     .expect("Failed to decrease the binder strong reference count.");
-            }
+            },
         )
     }
 
     fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        self.strong.dec(|| {
-            thread_state::dec_strong_handle(self.handle())
-        })
+        self.strong
+            .dec(|| thread_state::dec_strong_handle(self.handle()))
     }
 
     fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
-        self.weak.inc(|| {
-            thread_state::inc_weak_handle(self.handle(), weak)
-        })
+        self.weak
+            .inc(|| thread_state::inc_weak_handle(self.handle(), weak))
     }
 
     fn dec_weak(&self) -> Result<()> {
-        self.weak.dec(|| {
-            thread_state::dec_weak_handle(self.handle())
-        })
+        self.weak
+            .dec(|| thread_state::dec_weak_handle(self.handle()))
     }
 }
 
-pub trait Proxy : Sized + Interface {
+pub trait Proxy: Sized + Interface {
     /// The Binder interface descriptor string.
     ///
     /// This string is a unique identifier for a Binder interface, and should be
@@ -256,7 +261,10 @@ mod tests {
 
         // Test for Debug trait
         let debug_str = format!("{:?}", handle);
-        assert_eq!(debug_str, "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }");
+        assert_eq!(
+            debug_str,
+            "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
+        );
 
         // Test for PartialEq trait
         let handle2 = ProxyHandle::new(1, "test", Stability::Local);

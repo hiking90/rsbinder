@@ -17,20 +17,15 @@
  * limitations under the License.
  */
 
+use std::any::Any;
+use std::borrow::Borrow;
+use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::{self, Arc};
-use std::any::Any;
-use std::fmt::{Debug, Formatter};
-use std::marker::PhantomData;
-use std::borrow::Borrow;
 
-use crate::{
-    error::*,
-    parcel::*,
-    proxy,
-    sys,
-};
+use crate::{error::*, parcel::*, proxy, sys};
 
 /// Binder action to perform.
 ///
@@ -52,7 +47,7 @@ pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
 pub const FLAG_PRIVATE_VENDOR: TransactionFlags = FLAG_PRIVATE_LOCAL;
 
 const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
-    ((c1 as u32)<<24) | ((c2 as u32)<<16) | ((c3 as u32)<<8) | (c4 as u32)
+    ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
 }
 
 pub const FIRST_CALL_TRANSACTION: u32 = 0x00000001;
@@ -80,7 +75,7 @@ pub const TWEET_TRANSACTION: u32 = b_pack_chars('_', 'T', 'W', 'T');
 // Improve binder self-esteem.
 pub const LIKE_TRANSACTION: u32 = b_pack_chars('_', 'L', 'I', 'K');
 
-pub const INTERFACE_HEADER: u32  = b_pack_chars('S', 'Y', 'S', 'T');
+pub const INTERFACE_HEADER: u32 = b_pack_chars('S', 'Y', 'S', 'T');
 
 /// Super-trait for Binder interfaces.
 ///
@@ -126,7 +121,6 @@ pub trait FromIBinder: Interface {
     /// implements that interface.
     fn try_from(ibinder: SIBinder) -> Result<Strong<Self>>;
 }
-
 
 /// Interface for receiving a notification when a binder object is no longer
 /// valid.
@@ -209,12 +203,19 @@ pub trait Remotable: Send + Sync {
     ///
     /// This string is a unique identifier for a Binder interface, and should be
     /// the same between all implementations of that interface.
-    fn descriptor() -> &'static str where Self: Sized;
+    fn descriptor() -> &'static str
+    where
+        Self: Sized;
 
     /// Handle and reply to a request to invoke a transaction on this object.
     ///
     /// `reply` may be [`None`] if the sender does not expect a reply.
-    fn on_transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()>;
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
@@ -223,9 +224,13 @@ pub trait Remotable: Send + Sync {
 
 /// A transactable object that can be used to process Binder commands.
 pub trait Transactable: Send + Sync {
-    fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()>;
+    fn transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()>;
 }
-
 
 /// Implemented by sync interfaces to specify what the associated async interface is.
 /// Generic to handle the fact that async interfaces are generic over a thread pool.
@@ -404,9 +409,11 @@ impl Clone for SIBinder {
 
 impl Drop for SIBinder {
     fn drop(&mut self) {
-        self.decrease().map_err(|err| {
-            log::error!("Error in SIBinder::drop() is {:?}", err);
-        }).ok();
+        self.decrease()
+            .map_err(|err| {
+                log::error!("Error in SIBinder::drop() is {:?}", err);
+            })
+            .ok();
     }
 }
 
@@ -484,7 +491,6 @@ impl PartialEq for WIBinder {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
-
 
 /// Strong reference to a binder object
 pub struct Strong<I: FromIBinder + ?Sized>(Box<I>);
@@ -611,7 +617,6 @@ mod tests {
         // let strong2 = strong.clone();
         // assert_eq!(strong2.inner.strong.load(Ordering::Relaxed), 2);
 
-
         // let weak = SIBinder::downgrade(&strong);
 
         // assert_eq!(weak.inner.strong.load(Ordering::Relaxed), 1);
@@ -638,7 +643,10 @@ mod tests {
         assert_eq!(b_pack_chars('_', 'E', 'X', 'T'), EXTENSION_TRANSACTION);
         assert_eq!(b_pack_chars('_', 'P', 'I', 'D'), DEBUG_PID_TRANSACTION);
         assert_eq!(b_pack_chars('_', 'R', 'P', 'C'), SET_RPC_CLIENT_TRANSACTION);
-        assert_eq!(b_pack_chars('_', 'S', 'R', 'D'), START_RECORDING_TRANSACTION);
+        assert_eq!(
+            b_pack_chars('_', 'S', 'R', 'D'),
+            START_RECORDING_TRANSACTION
+        );
         assert_eq!(b_pack_chars('_', 'E', 'R', 'D'), STOP_RECORDING_TRANSACTION);
         assert_eq!(b_pack_chars('_', 'T', 'W', 'T'), TWEET_TRANSACTION);
         assert_eq!(b_pack_chars('_', 'L', 'I', 'K'), LIKE_TRANSACTION);
@@ -655,6 +663,9 @@ mod tests {
         assert_eq!(Stability::try_from(0b000011).unwrap(), Stability::Vendor);
         assert_eq!(Stability::try_from(0b001100).unwrap(), Stability::System);
         assert_eq!(Stability::try_from(0b111111).unwrap(), Stability::Vintf);
-        assert_eq!(Stability::try_from(0b1111111).unwrap_err(), StatusCode::BadValue);
+        assert_eq!(
+            Stability::try_from(0b1111111).unwrap_err(),
+            StatusCode::BadValue
+        );
     }
 }

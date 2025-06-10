@@ -17,14 +17,13 @@
  * limitations under the License.
  */
 
-use crate::{
-    Deserialize, DeserializeArray, DeserializeOption, Serialize, SerializeArray,
-    SerializeOption, Parcel,
-    binder_object::flat_binder_object,
-};
 use crate::error::{Result, StatusCode};
+use crate::{
+    binder_object::flat_binder_object, Deserialize, DeserializeArray, DeserializeOption, Parcel,
+    Serialize, SerializeArray, SerializeOption,
+};
 
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 /// Rust version of the Java class android.os.ParcelFileDescriptor
 #[derive(Debug)]
@@ -139,9 +138,7 @@ mod tests {
 
     #[test]
     fn test_parcel_file_descriptor() {
-        let fd = unsafe {
-            OwnedFd::from_raw_fd(1)
-        };
+        let fd = unsafe { OwnedFd::from_raw_fd(1) };
         let pfd = ParcelFileDescriptor::new(fd);
 
         assert_eq!(pfd.as_raw_fd(), 1);

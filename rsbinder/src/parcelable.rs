@@ -17,15 +17,7 @@
  * limitations under the License.
  */
 
-use crate::{
-    sys::*,
-    error::*,
-    process_state::*,
-    binder::*,
-    parcel::Parcel,
-    binder_object::*,
-};
-
+use crate::{binder::*, binder_object::*, error::*, parcel::Parcel, process_state::*, sys::*};
 
 /// Super-trait for Binder parcelables.
 ///
@@ -49,7 +41,6 @@ pub trait Parcelable {
     /// parse the additional header.
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()>;
 }
-
 
 /// Metadata that `ParcelableHolder` needs for all parcelables.
 ///
@@ -174,7 +165,6 @@ macro_rules! impl_parcelable_ex {
     };
 }
 
-
 parcelable_primitives! {
     impl SerializeArray for i8;
     impl DeserializeArray for i8;
@@ -286,8 +276,7 @@ impl Deserialize for bool {
     }
 }
 
-impl DeserializeArray for bool {
-}
+impl DeserializeArray for bool {}
 
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
@@ -297,18 +286,15 @@ impl Serialize for bool {
     }
 }
 
-impl SerializeArray for bool {
-}
+impl SerializeArray for bool {}
 
 impl SerializeOption for str {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         match this {
-            None => {
-                parcel.write::<i32>(&-1)
-            }
+            None => parcel.write::<i32>(&-1),
 
             Some(text) => {
-                let mut utf16 = Vec::with_capacity(text.len() * 3);   // Due to surrogate pair.
+                let mut utf16 = Vec::with_capacity(text.len() * 3); // Due to surrogate pair.
                 utf16.extend(text.encode_utf16());
 
                 let len = utf16.len();
@@ -317,11 +303,9 @@ impl SerializeOption for str {
 
                 parcel.write::<i32>(&(len as i32))?;
                 let pad_size = crate::parcel::pad_size(utf16.len() * std::mem::size_of::<u16>());
-                parcel.write_aligned_data(
-                    unsafe {
-                        std::slice::from_raw_parts(utf16.as_ptr() as *const u8, pad_size)
-                    }
-                );
+                parcel.write_aligned_data(unsafe {
+                    std::slice::from_raw_parts(utf16.as_ptr() as *const u8, pad_size)
+                });
 
                 Ok(())
             }
@@ -409,11 +393,10 @@ impl DeserializeOption for String {
 
         if (0..i32::MAX).contains(&len) {
             let data = parcel.read_aligned_data((len as usize + 1) * std::mem::size_of::<u16>())?;
-            let res = String::from_utf16(
-                unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
-                }
-            ).map_err(|e| {
+            let res = String::from_utf16(unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
+            })
+            .map_err(|e| {
                 log::error!("Deserialize for Option<String16>: {}", e);
                 StatusCode::BadValue
             })?;
@@ -514,7 +497,10 @@ impl DeserializeOption for SIBinder {
             }
 
             _ => {
-                log::warn!("Unknown Binder Type ({}) was delivered.", flat.header_type());
+                log::warn!(
+                    "Unknown Binder Type ({}) was delivered.",
+                    flat.header_type()
+                );
                 Err(StatusCode::BadType)
             }
         }
@@ -681,7 +667,6 @@ pub trait SerializeArray: Serialize + Sized {
     }
 }
 
-
 /// Helper trait for types that can be deserialized as arrays.
 /// Defaults to calling Deserialize::deserialize() manually for every element,
 /// but can be overridden for custom implementations like `readByteArray`.
@@ -694,7 +679,7 @@ pub trait DeserializeArray: Deserialize {
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {
-            return Ok(None)
+            return Ok(None);
         }
         let mut res: Vec<Self> = Vec::with_capacity(len as _);
 
@@ -734,11 +719,9 @@ impl<T: SerializeArray> SerializeOption for Vec<T> {
     }
 }
 
-
 impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        DeserializeArray::deserialize_array(parcel)
-            .map(|v| v.unwrap_or_default())
+        DeserializeArray::deserialize_array(parcel).map(|v| v.unwrap_or_default())
     }
 }
 
@@ -762,7 +745,6 @@ impl<T: SerializeArray, const N: usize> SerializeOption for [T; N] {
 
 impl<T: SerializeArray, const N: usize> SerializeArray for [T; N] {}
 
-
 impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         let vec = DeserializeArray::deserialize_array(parcel)
@@ -771,23 +753,23 @@ impl<T: DeserializeArray, const N: usize> Deserialize for [T; N] {
                 log::error!("Deserialize for [T; N]: UnexpectedNull");
                 Err(StatusCode::UnexpectedNull)
             })?;
-        vec.try_into()
-            .map_err(|_| {
-                log::error!("Deserialize: Failed to convert Vec<T> to [T; N]");
-                StatusCode::BadValue
-            })
+        vec.try_into().map_err(|_| {
+            log::error!("Deserialize: Failed to convert Vec<T> to [T; N]");
+            StatusCode::BadValue
+        })
     }
 }
 
 impl<T: std::fmt::Debug + DeserializeArray, const N: usize> DeserializeOption for [T; N] {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let vec = DeserializeArray::deserialize_array(parcel)?;
-        vec.map(|v| v.try_into()
-            .map_err(|_| {
+        vec.map(|v| {
+            v.try_into().map_err(|_| {
                 log::error!("DeserializeOption: Failed to convert Vec<T> to [T; N]");
                 StatusCode::BadValue
-            }))
-            .transpose()
+            })
+        })
+        .transpose()
     }
 }
 

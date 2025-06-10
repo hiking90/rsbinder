@@ -17,29 +17,29 @@
  * limitations under the License.
  */
 
-use std::vec::Vec;
 use std::default::Default;
+use std::vec::Vec;
 
 use pretty_hex::*;
 use rustix::fd::IntoRawFd;
 
 use crate::{
+    binder,
     error::{Result, StatusCode},
+    parcelable::*,
     sys::binder::{binder_size_t, flat_binder_object},
     sys::{binder_uintptr_t, BINDER_TYPE_FD},
-    parcelable::*,
     thread_state,
-    binder,
 };
 
 const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
 #[inline]
 pub(crate) fn pad_size(len: usize) -> usize {
-    (len+3) & (!3)
+    (len + 3) & (!3)
 }
 
-pub(crate) trait CharType : Clone {
+pub(crate) trait CharType: Clone {
     type Output;
     fn as_i32(&self) -> i32;
     fn from(v: &i32) -> Self::Output;
@@ -124,7 +124,6 @@ impl<T: Clone + Default> ParcelData<T> {
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
             _ => panic!("&[u8] can't support set_len()."),
         }
-
     }
 
     fn resize(&mut self, len: usize) {
@@ -156,7 +155,8 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 }
 
-pub type FnFreeBuffer = fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
+pub type FnFreeBuffer =
+    fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
@@ -193,9 +193,19 @@ impl Parcel {
         }
     }
 
-    pub fn from_ipc_parts(data: *mut u8, length: usize,
-            objects: *mut binder_size_t, object_count: usize,
-            free_buffer: fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>) -> Self {
+    pub fn from_ipc_parts(
+        data: *mut u8,
+        length: usize,
+        objects: *mut binder_size_t,
+        object_count: usize,
+        free_buffer: fn(
+            Option<&Parcel>,
+            binder_uintptr_t,
+            usize,
+            binder_uintptr_t,
+            usize,
+        ) -> Result<()>,
+    ) -> Self {
         Parcel {
             data: ParcelData::from_raw_parts_mut(data, length),
             objects: ParcelData::from_raw_parts_mut(objects, object_count),
@@ -220,7 +230,6 @@ impl Parcel {
             free_buffer: None,
         }
     }
-
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
@@ -296,9 +305,12 @@ impl Parcel {
 
         if aligned <= self.data_avail() {
             self.pos = pos + aligned;
-            Ok(&self.data.as_slice()[pos .. pos + len])
+            Ok(&self.data.as_slice()[pos..pos + len])
         } else {
-            log::error!("Not enough data to read aligned data.: {aligned} <= {}", self.data_avail());
+            log::error!(
+                "Not enough data to read aligned data.: {aligned} <= {}",
+                self.data_avail()
+            );
             Err(StatusCode::NotEnoughData)
         }
     }
@@ -344,7 +356,6 @@ impl Parcel {
         Err(StatusCode::BadType)
     }
 
-
     /// Safely read a sized parcelable.
     ///
     /// Read the size of a parcelable, compute the end position
@@ -357,7 +368,7 @@ impl Parcel {
     ///
     pub fn sized_read<F>(&mut self, f: F) -> Result<()>
     where
-        for<'b> F: FnOnce(&mut Parcel) -> Result<()>
+        for<'b> F: FnOnce(&mut Parcel) -> Result<()>,
     {
         let start = self.data_position();
         let parcelable_size: i32 = self.read()?;
@@ -366,11 +377,10 @@ impl Parcel {
             return Err(StatusCode::BadValue);
         }
 
-        let end = start.checked_add(parcelable_size as _)
-            .ok_or_else(|| {
-                log::error!("Parcel: check_add error: {}", parcelable_size);
-                StatusCode::BadValue
-            })?;
+        let end = start.checked_add(parcelable_size as _).ok_or_else(|| {
+            log::error!("Parcel: check_add error: {}", parcelable_size);
+            StatusCode::BadValue
+        })?;
         if end > self.data_size() {
             log::error!("Parcel: not enough data: {} > {}", end, self.data_size());
             return Err(StatusCode::NotEnoughData);
@@ -399,14 +409,20 @@ impl Parcel {
         let padded = pad_size(size);
 
         if padded > self.data_avail() {
-            log::error!("Parcel: not enough data to read array: {} > {}", padded, self.data_avail());
+            log::error!(
+                "Parcel: not enough data to read array: {} > {}",
+                padded,
+                self.data_avail()
+            );
             return Err(StatusCode::NotEnoughData);
         }
 
         let pos = self.pos;
 
         // Safer approach: bounds-checked access using slice
-        let data_slice = self.data.as_slice()
+        let data_slice = self
+            .data
+            .as_slice()
             .get(pos..pos + size)
             .ok_or(StatusCode::NotEnoughData)?;
 
@@ -416,7 +432,7 @@ impl Parcel {
             std::ptr::copy_nonoverlapping(
                 data_slice.as_ptr(),
                 result.as_mut_ptr() as *mut u8,
-                size
+                size,
             );
             result.set_len(len as usize);
         }
@@ -426,7 +442,9 @@ impl Parcel {
         Ok(Some(result))
     }
 
-    pub(crate) fn read_array_char<D: CharType>(&mut self) -> Result<Option<Vec<<D as CharType>::Output>>> {
+    pub(crate) fn read_array_char<D: CharType>(
+        &mut self,
+    ) -> Result<Option<Vec<<D as CharType>::Output>>> {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {}", len);
@@ -440,15 +458,17 @@ impl Parcel {
         let padded = pad_size(size);
 
         if padded > self.data_avail() {
-            log::error!("Parcel: not enough data to read array char: {} > {}", padded, self.data_avail());
+            log::error!(
+                "Parcel: not enough data to read array char: {} > {}",
+                padded,
+                self.data_avail()
+            );
             return Err(StatusCode::NotEnoughData);
         }
 
         let mut result = Vec::with_capacity(len as usize);
         let pos = self.pos;
-        let (_, ints, _) = unsafe {
-            self.data.as_slice()[pos .. pos + size].align_to::<i32>()
-        };
+        let (_, ints, _) = unsafe { self.data.as_slice()[pos..pos + size].align_to::<i32>() };
         for i in ints {
             result.push(D::from(i));
         }
@@ -476,7 +496,6 @@ impl Parcel {
 
         Ok(())
     }
-
 
     /// Read a vector size from the parcel and either create a correctly sized
     /// vector for that amount of data or set the output parameter to None if
@@ -519,7 +538,7 @@ impl Parcel {
         self.write::<i32>(&(len as _))?;
 
         if len == 0 {
-            return Ok(())
+            return Ok(());
         }
 
         let size = std::mem::size_of_val(parcelable);
@@ -531,7 +550,8 @@ impl Parcel {
             std::ptr::copy_nonoverlapping::<u8>(
                 parcelable.as_ptr() as _,
                 self.data.as_mut_ptr().add(pos) as _,
-                size);
+                size,
+            );
             if self.data.len() < pos + padded {
                 self.data.set_len(pos + padded);
             }
@@ -572,9 +592,8 @@ impl Parcel {
 
     pub(crate) fn write_aligned<T>(&mut self, val: &T) {
         let unaligned = std::mem::size_of::<T>();
-        let val_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(val as *const T as *const u8, unaligned)
-        };
+        let val_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
 
         self.write_aligned_data(val_bytes);
     }
@@ -589,7 +608,8 @@ impl Parcel {
             std::ptr::copy_nonoverlapping::<u8>(
                 data.as_ptr() as _,
                 self.data.as_mut_ptr().add(pos) as _,
-                unaligned);
+                unaligned,
+            );
             if pos + aligned > self.data.len() {
                 self.data.set_len(pos + aligned);
             }
@@ -625,7 +645,6 @@ impl Parcel {
         Ok(())
     }
 
-
     /// Perform a series of writes to the parcel, prepended with the length
     /// (in bytes) of the written data.
     ///
@@ -655,7 +674,7 @@ impl Parcel {
     /// ```
     pub fn sized_write<F>(&mut self, f: F) -> Result<()>
     where
-        for<'b> F: FnOnce(&mut Parcel) -> Result<()>
+        for<'b> F: FnOnce(&mut Parcel) -> Result<()>,
     {
         let start = self.data_position();
         self.write(&0i32)?;
@@ -670,24 +689,28 @@ impl Parcel {
         Ok(())
     }
 
-
     pub(crate) fn append_all_from(&mut self, other: &mut Parcel) -> Result<()> {
         self.append_from(other, 0, other.data_size())
     }
 
-    pub(crate) fn append_from(&mut self, other: &mut Parcel, offset: usize, size: usize) -> Result<()> {
+    pub(crate) fn append_from(
+        &mut self,
+        other: &mut Parcel,
+        offset: usize,
+        size: usize,
+    ) -> Result<()> {
         if size == 0 {
-            return Ok(())
+            return Ok(());
         }
         if size > i32::MAX as usize {
             log::error!("Parcel::append_from: the size is too large: {}", size);
-            return Err(StatusCode::BadValue)
+            return Err(StatusCode::BadValue);
         }
         let other_len = other.data_size();
         if offset > other_len || size > other_len || (offset + size) > other_len {
             log::error!("Parcel::append_from: The given offset({}) and size({}) exceed the data range of the parcel.",
                 offset, size);
-            return Err(StatusCode::BadValue)
+            return Err(StatusCode::BadValue);
         }
 
         let start_pos = self.pos;
@@ -712,9 +735,10 @@ impl Parcel {
         self.data.reserve(self.pos + size);
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
-                other.data.as_slice()[offset..offset+size].as_ptr() as _,
+                other.data.as_slice()[offset..offset + size].as_ptr() as _,
                 self.data.as_mut_ptr().add(self.pos) as _,
-                size);
+                size,
+            );
             if self.pos + size > self.data.len() {
                 self.data.set_len(self.pos + size);
             }
@@ -733,8 +757,10 @@ impl Parcel {
                 let flat: &mut flat_binder_object = (self.data.as_mut_ptr(), off).into();
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
-//                    flat.set_handle(nix::fcntl::fcntl(flat.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))? as _);
-                    flat.set_handle(rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0)?.into_raw_fd() as _);
+                    //                    flat.set_handle(nix::fcntl::fcntl(flat.handle() as _, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))? as _);
+                    flat.set_handle(
+                        rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0)?.into_raw_fd() as _,
+                    );
                     flat.set_cookie(1);
                 }
             }
@@ -745,12 +771,14 @@ impl Parcel {
 
     fn release_objects(&self) {
         if self.objects.len() == 0 {
-            return
+            return;
         }
 
         for pos in self.objects.as_slice() {
             let obj: &flat_binder_object = (self.data.as_ptr(), *pos as usize).into();
-            obj.release().map_err(|e| log::error!("Parcel: unable to release object: {:?}", e)).ok();
+            obj.release()
+                .map_err(|e| log::error!("Parcel: unable to release object: {:?}", e))
+                .ok();
         }
     }
 }
@@ -759,11 +787,14 @@ impl Drop for Parcel {
     fn drop(&mut self) {
         match self.free_buffer {
             Some(free_buffer) => {
-                free_buffer(Some(self),
+                free_buffer(
+                    Some(self),
                     self.data.as_ptr() as _,
                     self.data.len(),
                     self.objects.as_ptr() as _,
-                    self.objects.len()).unwrap();
+                    self.objects.len(),
+                )
+                .unwrap();
             }
             None => {
                 self.release_objects();
@@ -782,12 +813,16 @@ impl std::fmt::Debug for Parcel {
                     self.objects.len() * std::mem::size_of::<binder_size_t>(),
                 )
             };
-            writeln!(f, "Object count {}\n{}", self.objects.len(), pretty_hex(&bytes))?;
+            writeln!(
+                f,
+                "Object count {}\n{}",
+                self.objects.len(),
+                pretty_hex(&bytes)
+            )?;
         }
         write!(f, "{}", pretty_hex(&self.data.as_slice()))
     }
 }
-
 
 impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
     type Error = StatusCode;
@@ -804,12 +839,12 @@ mod tests {
 
     #[test]
     fn test_primitives() -> Result<()> {
-        let v_i32:i32 = 1234;
-        let v_f32:f32 = 5678.0;
-        let v_u32:u32 = 9012;
-        let v_i64:i64 = 3456;
-        let v_u64:u64 = 7890;
-        let v_f64:f64 = 9876.0;
+        let v_i32: i32 = 1234;
+        let v_f32: f32 = 5678.0;
+        let v_u32: u32 = 9012;
+        let v_i64: i64 = 3456;
+        let v_u64: u64 = 7890;
+        let v_f64: f64 = 9876.0;
 
         let v_str = "Hello World".to_owned();
 
