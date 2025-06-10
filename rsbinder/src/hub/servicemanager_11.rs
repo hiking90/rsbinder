@@ -3,9 +3,6 @@
 
 include!(concat!(env!("OUT_DIR"), "/service_manager_11.rs"));
 
-use std::sync::Arc;
-use std::sync::OnceLock;
-
 use crate::*;
 pub use android::os::IServiceManager::{
     IServiceManager, BpServiceManager, BnServiceManager,
@@ -21,24 +18,10 @@ pub use android::os::IServiceCallback::{
     IServiceCallback, BnServiceCallback,
 };
 
-static GLOBAL_SM: OnceLock<Arc<BpServiceManager>> = OnceLock::new();
-
-/// Retrieve the default service manager.
-pub fn default() -> Arc<BpServiceManager> {
-    GLOBAL_SM.get_or_init(|| {
-        let process = ProcessState::as_self();
-        let context = process.context_object()
-            .expect("Failed to get context_object during ServiceManager initialization");
-        let service_manager = BpServiceManager::from_binder(context)
-            .expect("Failed to create BpServiceManager from binder during ServiceManager initialization");
-        Arc::new(service_manager)
-    }).clone()
-}
-
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
-pub fn get_service(name: &str) -> Option<SIBinder> {
-    match default().getService(name) {
+pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
+    match sm.getService(name) {
         Ok(result) => result,
         Err(err) => {
             log::error!("Failed to get service {}: {:?}", name, err);
@@ -50,8 +33,8 @@ pub fn get_service(name: &str) -> Option<SIBinder> {
 /// Retrieve an existing service called @a name from the service
 /// manager. Non-blocking. Returns null if the service does not
 /// exist.
-pub fn check_service(name: &str) -> Option<SIBinder> {
-    match default().checkService(name) {
+pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
+    match sm.checkService(name) {
         Ok(result) => result,
         Err(err) => {
             log::error!("Failed to check service {}: {}", name, err);
@@ -61,8 +44,8 @@ pub fn check_service(name: &str) -> Option<SIBinder> {
 }
 
 /// Return a list of all currently running services.
-pub fn list_services(dump_priority: i32) -> Vec<String> {
-    match default().listServices(dump_priority) {
+pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
+    match sm.listServices(dump_priority) {
         Ok(result) => result,
         Err(err) => {
             log::error!("Failed to list services: {}", err);
@@ -71,27 +54,27 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
     }
 }
 
-pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
-    default().addService(identifier, &binder, false, DUMP_FLAG_PRIORITY_DEFAULT)
+pub fn add_service(sm: &BpServiceManager, identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
+    sm.addService(identifier, &binder, false, DUMP_FLAG_PRIORITY_DEFAULT)
 }
 
 /// Request a callback when a service is registered.
-pub fn register_for_notifications(name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
-    default().registerForNotifications(name, callback)
+pub fn register_for_notifications(sm: &BpServiceManager, name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
+    sm.registerForNotifications(name, callback)
         .map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
-pub fn unregister_for_notifications(name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
-    default().unregisterForNotifications(name, callback)
+pub fn unregister_for_notifications(sm: &BpServiceManager, name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
+    sm.unregisterForNotifications(name, callback)
         .map_err(|e| e.into())
 }
 
 /// Returns whether a given interface is declared on the device, even if it
 /// is not started yet. For instance, this could be a service declared in the VINTF
 /// manifest.
-pub fn is_declared(name: &str) -> bool {
-    match default().isDeclared(name) {
+pub fn is_declared(sm: &BpServiceManager, name: &str) -> bool {
+    match sm.isDeclared(name) {
         Ok(result) => result,
         Err(err) => {
             log::error!("Failed to is_declared({}): {}", name, err);
@@ -100,8 +83,8 @@ pub fn is_declared(name: &str) -> bool {
     }
 }
 
-pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
-    match default().getService(name) {
+pub fn get_interface<T: FromIBinder + ?Sized>(sm: &BpServiceManager, name: &str) -> Result<Strong<T>> {
+    match sm.getService(name) {
         Ok(Some(service)) => {
             FromIBinder::try_from(service)
         }
