@@ -47,25 +47,39 @@ pub use android_13::{
     ServiceDebugInfo
 };
 
-const ANDROID_16_SDK_VERSION: u32 = 36;
-const ANDROID_14_SDK_VERSION: u32 = 34;
-const ANDROID_13_SDK_VERSION: u32 = 33;
-const ANDROID_12_SDK_VERSION: u32 = 31;
-const ANDROID_11_SDK_VERSION: u32 = 30;
+/// Android SDK version constants
+#[cfg(target_os = "android")]
+pub mod sdk_versions {
+    /// Android 16 (API level 36)
+    pub const ANDROID_16: u32 = 36;
+    /// Android 14 (API level 34)
+    pub const ANDROID_14: u32 = 34;
+    /// Android 13 (API level 33)
+    pub const ANDROID_13: u32 = 33;
+    /// Android 12 (API level 31)
+    pub const ANDROID_12: u32 = 31;
+    /// Android 11 (API level 30)
+    pub const ANDROID_11: u32 = 30;
+
+    /// Minimum supported Android SDK version
+    pub const MIN_SUPPORTED: u32 = ANDROID_11;
+    /// Maximum supported Android SDK version
+    pub const MAX_SUPPORTED: u32 = ANDROID_16;
+}
 
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     #[cfg(target_os = "android")]
     {
         let sdk_version = crate::get_android_sdk_version();
-        if sdk_version >= ANDROID_16_SDK_VERSION {
+        if sdk_version >= sdk_versions::ANDROID_16 {
             android_16::get_interface(name)
-        } else if sdk_version >= ANDROID_14_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_14 {
             android_14::get_interface(name)
-        } else if sdk_version >= ANDROID_13_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_13 {
             android_13::get_interface(name)
-        } else if sdk_version >= ANDROID_12_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_12 {
             android_12::get_interface(name)
-        } else if sdk_version >= ANDROID_11_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_11 {
             android_11::get_interface(name)
         } else {
             log::error!("get_interface: Unsupported Android SDK version: {}", sdk_version);
@@ -83,15 +97,15 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
     #[cfg(target_os = "android")]
     {
         let sdk_version = crate::get_android_sdk_version();
-        if sdk_version >= ANDROID_16_SDK_VERSION {
+        if sdk_version >= sdk_versions::ANDROID_16 {
             android_16::list_services(dump_priority)
-        } else if sdk_version >= ANDROID_14_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_14 {
             android_14::list_services(dump_priority)
-        } else if sdk_version >= ANDROID_13_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_13 {
             android_13::list_services(dump_priority)
-        } else if sdk_version >= ANDROID_12_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_12 {
             android_12::list_services(dump_priority)
-        } else if sdk_version >= ANDROID_11_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_11 {
             android_11::list_services(dump_priority)
         } else {
             log::error!("list_services: Unsupported Android SDK version: {}", sdk_version);
@@ -112,12 +126,12 @@ pub fn register_for_notifications(
     #[cfg(target_os = "android")]
     {
         let sdk_version = crate::get_android_sdk_version();
-        if sdk_version >= ANDROID_16_SDK_VERSION {
+        if sdk_version >= sdk_versions::ANDROID_16 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_16::IServiceCallback>)
             };
             android_16::register_for_notifications(name, callback)
-        } else if sdk_version >= ANDROID_14_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_14 {
             // SAFETY: This transmutation is safe because both android_13::IServiceCallback and android_16::IServiceCallback
             // are generated from the same AIDL interface definition and have identical memory layouts,
             // vtable structures, and ABI compatibility. The only difference is the module namespace.
@@ -126,14 +140,14 @@ pub fn register_for_notifications(
                 &*(callback as *const _ as *const crate::Strong<dyn android_14::IServiceCallback>)
             };
             android_14::register_for_notifications(name, callback)
-        } else if sdk_version >= ANDROID_13_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_13 {
             android_13::register_for_notifications(name, callback)
-        } else if sdk_version >= ANDROID_12_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_12 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_12::IServiceCallback>)
             };
             android_12::register_for_notifications(name, callback)
-        } else if sdk_version >= ANDROID_11_SDK_VERSION {
+        } else if sdk_version >= sdk_versions::ANDROID_11 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_11::IServiceCallback>)
             };
@@ -156,7 +170,7 @@ pub fn unregister_for_notifications(
 ) -> Result<()> {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             // SAFETY: This transmutation is safe because both android_13::IServiceCallback and android_16::IServiceCallback
             // are generated from the same AIDL interface definition and have identical memory layouts,
             // vtable structures, and ABI compatibility. The only difference is the module namespace.
@@ -165,19 +179,19 @@ pub fn unregister_for_notifications(
                 &*(callback as *const _ as *const crate::Strong<dyn android_16::IServiceCallback>)
             };
             android_16::unregister_for_notifications(name, callback)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_14::IServiceCallback>)
             };
             android_14::unregister_for_notifications(name, callback)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::unregister_for_notifications(name, callback)
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_12::IServiceCallback>)
             };
             android_12::unregister_for_notifications(name, callback)
-        } else if crate::get_android_sdk_version() >= ANDROID_11_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_11 {
             let callback = unsafe {
                 &*(callback as *const _ as *const crate::Strong<dyn android_11::IServiceCallback>)
             };
@@ -199,15 +213,15 @@ pub fn add_service(
 ) -> std::result::Result<(), Status> {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             android_16::add_service(identifier, binder)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             android_14::add_service(identifier, binder)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::add_service(identifier, binder)
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             android_12::add_service(identifier, binder)
-        } else if crate::get_android_sdk_version() >= ANDROID_11_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_11 {
             android_11::add_service(identifier, binder)
         } else {
             log::error!("add_service: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
@@ -226,15 +240,15 @@ pub fn get_service(
 ) -> Option<SIBinder> {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             android_16::get_service(name).and_then(|s| s.service)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             android_14::get_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::get_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             android_12::get_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_11_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_11 {
             android_11::get_service(name)
         } else {
             log::error!("get_service: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
@@ -253,15 +267,15 @@ pub fn check_service(
 ) -> Option<SIBinder> {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             android_16::check_service(name).and_then(|s| s.service)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             android_14::check_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::check_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             android_12::check_service(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_11_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_11 {
             android_11::check_service(name)
         } else {
             log::error!("check_service: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
@@ -278,15 +292,15 @@ pub fn check_service(
 pub fn is_declared(name: &str) -> bool {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             android_16::is_declared(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             android_14::is_declared(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::is_declared(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             android_12::is_declared(name)
-        } else if crate::get_android_sdk_version() >= ANDROID_11_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_11 {
             android_11::is_declared(name)
         } else {
             log::error!("is_declared: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
@@ -303,7 +317,7 @@ pub fn is_declared(name: &str) -> bool {
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
     #[cfg(target_os = "android")]
     {
-        if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
+        if crate::get_android_sdk_version() >= sdk_versions::ANDROID_16 {
             // SAFETY: Converting android_16::ServiceDebugInfo to android_13::ServiceDebugInfo is safe because:
             // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
             // 2. Both have the same memory layout: name (String) + debugPid (i32)
@@ -316,15 +330,15 @@ pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
                 std::mem::transmute(a16_result)
             };
             Ok(a13_result)
-        } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_14 {
             let a14_result = android_14::get_service_debug_info()?;
             let a13_result: Vec<ServiceDebugInfo> = unsafe {
                 std::mem::transmute(a14_result)
             };
             Ok(a13_result)
-        } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_13 {
             android_13::get_service_debug_info()
-        } else if crate::get_android_sdk_version() >= ANDROID_12_SDK_VERSION {
+        } else if crate::get_android_sdk_version() >= sdk_versions::ANDROID_12 {
             let a12_result = android_12::get_service_debug_info()?;
             let a13_result: Vec<ServiceDebugInfo> = unsafe {
                 std::mem::transmute(a12_result)
