@@ -227,7 +227,7 @@ pub fn get_service(
     #[cfg(target_os = "android")]
     {
         if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
-            android_16::get_service(name).map(|s| s.service).flatten()
+            android_16::get_service(name).and_then(|s| s.service)
         } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
             android_14::get_service(name)
         } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
@@ -254,7 +254,7 @@ pub fn check_service(
     #[cfg(target_os = "android")]
     {
         if crate::get_android_sdk_version() >= ANDROID_16_SDK_VERSION {
-            android_16::check_service(name).map(|s| s.service).flatten()
+            android_16::check_service(name).and_then(|s| s.service)
         } else if crate::get_android_sdk_version() >= ANDROID_14_SDK_VERSION {
             android_14::check_service(name)
         } else if crate::get_android_sdk_version() >= ANDROID_13_SDK_VERSION {
@@ -332,7 +332,7 @@ pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
             Ok(a13_result)
         } else {
             log::error!("get_service_debug_info: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
-            Err(StatusCode::UnknownTransaction.into())
+            Err(StatusCode::UnknownTransaction)
         }
     }
 

@@ -385,7 +385,7 @@ impl Parcel {
         Ok(())
     }
 
-    pub(crate) fn read_array<D: Deserialize + ?Sized>(&mut self) -> Result<Option<Vec<D>>> {
+    pub(crate) fn read_array<D: Deserialize>(&mut self) -> Result<Option<Vec<D>>> {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {}", len);

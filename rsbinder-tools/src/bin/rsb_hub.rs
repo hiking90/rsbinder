@@ -5,7 +5,6 @@
 use std::{collections::HashMap, sync::{mpsc, Arc, Mutex}};
 use hub::android_13::{IServiceManager, BnServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use env_logger::Env;
-use clap;
 use rsbinder::*;
 
 struct Service {
@@ -95,8 +94,7 @@ impl Inner {
 
     fn handle_service_client_callback(&mut self, known_clients: usize, service_name: &str, is_called_on_interval: bool) -> Result<bool> {
         let service = if let Some(service) = self.name_to_service.get(service_name) {
-            if self.name_to_client_callbacks.get(service_name)
-                .map_or(true, |callbacks| callbacks.is_empty()) {
+            if self.name_to_client_callbacks.get(service_name).is_none_or(|callbacks| callbacks.is_empty()) {
                 return Ok(true);
             }
             service
@@ -123,28 +121,26 @@ impl Inner {
                     "service is guaranteed to be in use");
             }
 
-            self.name_to_service.get_mut(service_name).map(|service| {
+            if let Some(service) = self.name_to_service.get_mut(service_name) {
                 // guarantee is temporary
                 service.has_clients = true;
                 has_clients = true;
-            });
+            }
         }
 
         if has_kernel_reported_clients && !has_clients {
             self.send_client_callback_notification(service_name, true,
                 "we now have a record of a client");
-            self.name_to_service.get(service_name).map(|service| {
+            if let Some(service) = self.name_to_service.get(service_name) {
                 has_clients = service.has_clients;
-            });
+            }
         }
 
-        if is_called_on_interval {
-            if !has_kernel_reported_clients && has_clients{
-                self.send_client_callback_notification(service_name, false,
-                    "we now have no record of a client");
-                self.name_to_service.get(service_name).map(|service| {
-                    has_clients = service.has_clients;
-                });
+        if is_called_on_interval && !has_kernel_reported_clients && has_clients {
+            self.send_client_callback_notification(service_name, false,
+                "we now have no record of a client");
+            if let Some(service) = self.name_to_service.get(service_name) {
+                has_clients = service.has_clients;
             }
         }
 
@@ -163,9 +159,9 @@ impl Inner {
         service.guarentee_client = true;
         self.handle_service_client_callback(2 /* sm + transaction */, name, false)?;
 
-        self.name_to_service.get_mut(name).map(|service| {
+        if let Some(service) = self.name_to_service.get_mut(name) {
             service.guarentee_client = true;
-        });
+        }
 
         Ok(Some(out))
     }
@@ -276,9 +272,9 @@ impl IServiceManager for ServiceManager {
 
         let mut prev_clients = false;
         {
-            inner.name_to_service.get(name).map(|service| {
+            if let Some(service) = inner.name_to_service.get(name) {
                 prev_clients = service.has_clients;
-            });
+            }
         }
 
         inner.add_service(name, Service {
@@ -288,19 +284,19 @@ impl IServiceManager for ServiceManager {
             has_clients: prev_clients,
             guarentee_client: false,
             _debug_pid: 0,
-            context: rsbinder::thread_state::CallingContext::new(),
+            context: rsbinder::thread_state::CallingContext::default(),
         })?;
 
         if inner.name_to_registration_callbacks.contains_key(name) {
-            inner.name_to_service.get_mut(name).map(|service| {
+            if let Some(service) = inner.name_to_service.get_mut(name) {
                 service.guarentee_client = true;
-            });
+            }
 
             inner.handle_service_client_callback(2, name, false)?;
 
-            inner.name_to_service.get_mut(name).map(|service| {
+            if let Some(service) = inner.name_to_service.get_mut(name) {
                 service.guarentee_client = true;
-            });
+            }
 
             let callbacks = inner.name_to_registration_callbacks.get(name)
                 .expect("name_to_registration_callbacks must have key");
@@ -341,15 +337,15 @@ impl IServiceManager for ServiceManager {
 
         inner.name_to_registration_callbacks
             .entry(name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(arg_callback.clone());
 
-        inner.name_to_service.get(name).map(|service| {
+        if let Some(service) = inner.name_to_service.get(name) {
             arg_callback.onRegistration(name, &service.binder)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to notify client callback: {:?}", e);
                 });
-        });
+        }
 
         Ok(())
     }
@@ -397,7 +393,7 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         };
 
-        if service.context.pid != rsbinder::thread_state::CallingContext::new().pid {
+        if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
             let msg = format!("{:?} Only a server can register for client callbacks (for {})",
                 service.context, name);
             log::warn!("{}", &msg);
@@ -421,7 +417,7 @@ impl IServiceManager for ServiceManager {
 
         inner.name_to_client_callbacks
             .entry(name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(arg_callback.clone());
 
         inner.handle_service_client_callback(2 /* sm + transaction */,
@@ -431,7 +427,7 @@ impl IServiceManager for ServiceManager {
     }
 
     fn tryUnregisterService(&self, name: &str, arg_service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
-        let context = rsbinder::thread_state::CallingContext::new();
+        let context = rsbinder::thread_state::CallingContext::default();
 
         let mut inner = self.inner.lock().unwrap();
         let service = if let Some(service) = inner.name_to_service.get(name) {
@@ -443,7 +439,7 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         };
 
-        if service.context.pid != rsbinder::thread_state::CallingContext::new().pid {
+        if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
             let msg = format!("{:?} Only a server can register for client callbacks (for {})",
                 service.context, name);
             log::warn!("{}", &msg);
@@ -469,9 +465,9 @@ impl IServiceManager for ServiceManager {
             let msg = format!("{:?} Tried to unregister {}, but there are clients.",
                 context, name);
             log::warn!("{}", &msg);
-            inner.name_to_service.get_mut(name).map(|service| {
+            if let Some(service) = inner.name_to_service.get_mut(name) {
                 service.guarentee_client = true;
-            });
+            }
             return Err((ExceptionCode::IllegalState, msg.as_str()).into());
         }
 

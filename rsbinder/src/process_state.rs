@@ -85,7 +85,7 @@ impl ProcessState {
 
         let driver = open_driver(&driver_name, max_threads)?;
 
-        let vm_size = ((1024 * 1024) - rustix::param::page_size() * 2) as usize;
+        let vm_size = (1024 * 1024) - rustix::param::page_size() * 2;
         // let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
 
         let mmap = unsafe {
@@ -278,9 +278,8 @@ impl ProcessState {
         };
 
         binder::get_node_info_for_ref(&self.driver, &mut info)
-            .map_err(|e| {
+            .inspect_err(|&e| {
                 log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {:?}", e);
-                e
             })?;
         Ok(info.strong_count as usize)
     }
@@ -322,7 +321,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mmap = self.mmap.write().unwrap();
+        let mmap = self.mmap.read().unwrap();
         unsafe {
             rustix::mm::munmap(mmap.ptr, mmap.size)
                 .expect("Failed to unmap memory");

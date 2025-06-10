@@ -414,7 +414,7 @@ impl DeserializeOption for String {
                     std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
                 }
             ).map_err(|e| {
-                log::error!("Deserialize for Option<String16>: {}", e.to_string());
+                log::error!("Deserialize for Option<String16>: {}", e);
                 StatusCode::BadValue
             })?;
 
@@ -440,7 +440,7 @@ impl DeserializeArray for String {}
 
 impl Deserialize for flat_binder_object {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        parcel.read_object(false).map(|obj| *obj)
+        parcel.read_object(false).copied()
     }
 }
 

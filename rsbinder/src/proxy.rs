@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(handle.descriptor(), "test");
 
         assert!(handle.as_transactable().is_none());
-        assert_eq!(handle.is_remote(), true);
+        assert!(handle.is_remote());
 
         // Test for Debug trait
         let debug_str = format!("{:?}", handle);

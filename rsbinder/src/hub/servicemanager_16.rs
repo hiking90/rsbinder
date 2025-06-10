@@ -121,7 +121,7 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     match get_service(name) {
         Some(service) => {
             match service.service {
-                Some(service) => FromIBinder::try_from(service).map_err(|e| e.into()),
+                Some(service) => FromIBinder::try_from(service),
                 None => {
                     log::error!("Service {} is not a valid IBinder", name);
                     Err(StatusCode::NameNotFound)

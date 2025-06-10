@@ -153,9 +153,8 @@ impl Builder {
     }
 
     fn traverse_source(dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
-        let entries = fs::read_dir(dir).map_err(|err| {
+        let entries = fs::read_dir(dir).inspect_err(|_| {
             eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
-            err
         }).unwrap();
         let mut package_list = Vec::new();
 

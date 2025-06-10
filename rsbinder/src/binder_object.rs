@@ -204,13 +204,13 @@ impl From<&SIBinder> for flat_binder_object {
 
 impl From<(*const u8, usize)> for &flat_binder_object {
     fn from(pointer: (*const u8, usize)) -> Self {
-        unsafe { std::mem::transmute::<*const u8, &flat_binder_object>(&*(pointer.0.add(pointer.1))) }
+        unsafe { &*(pointer.0.add(pointer.1).cast::<flat_binder_object>()) }
     }
 }
 
 impl From<(*mut u8, usize)> for &mut flat_binder_object {
     fn from(pointer: (*mut u8, usize)) -> Self {
-        unsafe { std::mem::transmute::<*const u8, &mut flat_binder_object>(&*(pointer.0.add(pointer.1))) }
+        unsafe { &mut *(pointer.0.add(pointer.1).cast::<flat_binder_object>()) }
     }
 }
 

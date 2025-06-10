@@ -5,7 +5,6 @@ use std::path::Path;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use std::process::Command;
-use clap;
 
 use rsbinder::*;
 use anstyle::*;

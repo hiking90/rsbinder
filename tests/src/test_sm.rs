@@ -44,10 +44,10 @@ fn test_add_service() -> rsbinder::Result<()> {
     assert_eq!(hub::add_service("foo", service.as_binder()), Ok(()));
 
     // The maximum length of service name is 127.
-    let s = std::iter::repeat('a').take(127).collect::<String>();
+    let s = "a".repeat(127);
     assert!(hub::add_service(&s, service.as_binder()).is_ok());
 
-    let s = std::iter::repeat('a').take(128).collect::<String>();
+    let s = "a".repeat(128);
     assert!(hub::add_service(&s, service.as_binder()).is_err());
 
     // Weird characters are not allowed.

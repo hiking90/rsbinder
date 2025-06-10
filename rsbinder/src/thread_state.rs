@@ -66,7 +66,7 @@ const RETURN_STRINGS: [&str; 21] =
 
 fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     if cmd == binder::BR_TRANSACTION_SEC_CTX {
-        return "BR_TRANSACTION_SEC_CTX";
+        "BR_TRANSACTION_SEC_CTX"
     } else {
         let idx: usize = (cmd & binder::_IOC_NRMASK) as _;
 
@@ -341,7 +341,7 @@ pub(crate) fn strict_mode_policy() -> i32 {
 
 pub(crate) fn should_propagate_work_source() -> bool {
     THREAD_STATE.with(|thread_state| {
-        thread_state.borrow().transaction.map_or(false, |state| state.propagate_work_source)
+        thread_state.borrow().transaction.is_some_and(|state| state.propagate_work_source)
     })
 }
 
@@ -1085,13 +1085,13 @@ pub struct CallingContext {
     pub sid: Option<CString>,
 }
 
-impl CallingContext {
-    pub fn new() -> CallingContext {
+impl std::default::Default for CallingContext {
+    fn default() -> CallingContext {
         THREAD_STATE.with(|thread_state| -> CallingContext {
             let thread_state = thread_state.borrow();
             match thread_state.transaction.as_ref() {
                 Some(transaction) => {
-                    let calling_sid = if transaction.calling_sid != std::ptr::null() {
+                    let calling_sid = if transaction.calling_sid.is_null() {
                         unsafe {
                             Some(CStr::from_ptr(transaction.calling_sid as _).to_owned())
                         }

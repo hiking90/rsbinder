@@ -115,7 +115,7 @@ impl DeserializeOption for ParcelFileDescriptor {
 
         let obj = parcel.read_object(true)?;
 
-        let fd = rustix::io::fcntl_dupfd_cloexec(&obj.borrowed_fd(), 0)?;
+        let fd = rustix::io::fcntl_dupfd_cloexec(obj.borrowed_fd(), 0)?;
 
         Ok(Some(ParcelFileDescriptor::new(fd)))
     }

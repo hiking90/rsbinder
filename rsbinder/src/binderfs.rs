@@ -12,9 +12,8 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
     let fd = File::options()
         .read(true)
         .open(driver)
-        .map_err(|e| {
-            log::error!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e.to_string());
-            e
+        .inspect_err(|e| {
+            log::error!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e);
         })?;
 
     let mut device = binder::binderfs_device {
@@ -29,16 +28,14 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
 
     #[cfg(not(test))]
     binder::binder_ctl_add(fd, &mut device)
-        .map_err(|e| {
-            log::error!("Binder ioctl to add binder failed: {}", e.to_string());
-            e
+        .inspect_err(|e| {
+            log::error!("Binder ioctl to add binder failed: {}", e);
         })?;
 
     #[cfg(test)]
     tests::binder_ctl_add(fd, &mut device)
-        .map_err(|e| {
-            log::error!("Binder ioctl to add binder failed: {}", e.to_string());
-            e
+        .inspect_err(|e| {
+            log::error!("Binder ioctl to add binder failed: {}", e);
         })?;
 
     Ok((device.major, device.minor))

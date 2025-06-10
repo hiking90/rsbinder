@@ -105,7 +105,7 @@ pub fn is_declared(name: &str) -> bool {
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     match default().getService(name) {
         Ok(Some(service)) => {
-            FromIBinder::try_from(service).map_err(|e| e.into())
+            FromIBinder::try_from(service)
         }
         Ok(None) => {
             log::error!("Service {} not found", name);
