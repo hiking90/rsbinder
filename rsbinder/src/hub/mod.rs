@@ -83,6 +83,7 @@ pub fn default() -> Arc<ServiceManager> {
         let process = ProcessState::as_self();
         let context = process.context_object()
             .expect("Failed to get context_object during ServiceManager initialization");
+        #[cfg(target_os = "android")]
         let sdk_version = crate::get_android_sdk_version();
 
         const ERROR_MSG: &str = "Failed to create BpServiceManager from binder during ServiceManager initialization";
