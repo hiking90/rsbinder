@@ -126,7 +126,7 @@ impl Inner {
             if self
                 .name_to_client_callbacks
                 .get(service_name)
-                .is_none_or(|callbacks| callbacks.is_empty())
+                .map_or(true, |callbacks| callbacks.is_empty())
             {
                 return Ok(true);
             }
