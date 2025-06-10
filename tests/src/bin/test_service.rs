@@ -6,7 +6,7 @@
 use env_logger::Env;
 
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Mutex};
 
 pub use rsbinder::*;
 
@@ -16,18 +16,14 @@ pub use android::aidl::fixedsizearray::FixedSizeArrayExample::{
     IRepeatFixedSizeArray, IntParcelable::IntParcelable,
 };
 
-pub use android::aidl::tests::nested::{
-    INestedService, ParcelableWithNested,
-};
-pub use android::aidl::tests::ITestService::{
-    self, BnTestService, BpTestService, Empty::Empty,
-};
+pub use android::aidl::tests::nested::{INestedService, ParcelableWithNested};
+pub use android::aidl::tests::ITestService::{self, BnTestService, BpTestService, Empty::Empty};
 pub use android::aidl::tests::{
     extension::ExtendableParcelable::ExtendableParcelable, extension::MyExt::MyExt,
     BackendType::BackendType, ByteEnum::ByteEnum, CircularParcelable::CircularParcelable,
-    ConstantExpressionEnum::ConstantExpressionEnum, ICircular,
-    INamedCallback, INewName, IOldName, IntEnum::IntEnum, LongEnum::LongEnum,
-    RecursiveList::RecursiveList, StructuredParcelable, Union,
+    ConstantExpressionEnum::ConstantExpressionEnum, ICircular, INamedCallback, INewName, IOldName,
+    IntEnum::IntEnum, LongEnum::LongEnum, RecursiveList::RecursiveList, StructuredParcelable,
+    Union,
 };
 pub use android::aidl::versioned::tests::{
     BazUnion::BazUnion, Foo::Foo, IFooInterface, IFooInterface::BnFooInterface,
@@ -81,7 +77,6 @@ impl ICircular::ICircular for Circular {
         Ok(None)
     }
 }
-
 
 #[derive(Default)]
 struct TestService {
@@ -178,7 +173,8 @@ impl ITestService::ITestService for TestService {
     fn GetOtherTestService(
         &self,
         name: &str,
-    ) -> std::result::Result<rsbinder::Strong<dyn INamedCallback::INamedCallback>, rsbinder::Status> {
+    ) -> std::result::Result<rsbinder::Strong<dyn INamedCallback::INamedCallback>, rsbinder::Status>
+    {
         let mut service_map = self.service_map.lock().unwrap();
         let other_service = service_map.entry(name.into()).or_insert_with(|| {
             let named_callback = NamedCallback(name.into());
@@ -213,8 +209,14 @@ impl ITestService::ITestService for TestService {
     fn GetInterfaceArray(
         &self,
         names: &[String],
-    ) -> std::result::Result<Vec<rsbinder::Strong<dyn INamedCallback::INamedCallback>>, rsbinder::Status> {
-        names.iter().map(|name| self.GetOtherTestService(name)).collect()
+    ) -> std::result::Result<
+        Vec<rsbinder::Strong<dyn INamedCallback::INamedCallback>>,
+        rsbinder::Status,
+    > {
+        names
+            .iter()
+            .map(|name| self.GetOtherTestService(name))
+            .collect()
     }
 
     fn VerifyNamesWithInterfaceArray(
@@ -237,8 +239,10 @@ impl ITestService::ITestService for TestService {
     fn GetNullableInterfaceArray(
         &self,
         names: Option<&[Option<String>]>,
-    ) -> std::result::Result<Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>, Status>
-    {
+    ) -> std::result::Result<
+        Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>,
+        Status,
+    > {
         if let Some(names) = names {
             let mut services = vec![];
             for name in names {
@@ -278,8 +282,10 @@ impl ITestService::ITestService for TestService {
     fn GetInterfaceList(
         &self,
         names: Option<&[Option<String>]>,
-    ) -> std::result::Result<Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>, Status>
-    {
+    ) -> std::result::Result<
+        Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>,
+        Status,
+    > {
         self.GetNullableInterfaceArray(names)
     }
 
@@ -318,15 +324,24 @@ impl ITestService::ITestService for TestService {
     impl_repeat_nullable! {RepeatNullableLongEnumArray, LongEnum}
     impl_repeat_nullable! {RepeatNullableStringList, Option<String>}
 
-    fn RepeatNullableString(&self, input: Option<&str>) -> std::result::Result<Option<String>, rsbinder::Status> {
+    fn RepeatNullableString(
+        &self,
+        input: Option<&str>,
+    ) -> std::result::Result<Option<String>, rsbinder::Status> {
         Ok(input.map(String::from))
     }
 
-    fn RepeatNullableUtf8CppString(&self, input: Option<&str>) -> std::result::Result<Option<String>, rsbinder::Status> {
+    fn RepeatNullableUtf8CppString(
+        &self,
+        input: Option<&str>,
+    ) -> std::result::Result<Option<String>, rsbinder::Status> {
         Ok(input.map(String::from))
     }
 
-    fn RepeatNullableParcelable(&self, input: Option<&Empty>) -> std::result::Result<Option<Empty>, rsbinder::Status> {
+    fn RepeatNullableParcelable(
+        &self,
+        input: Option<&Empty>,
+    ) -> std::result::Result<Option<Empty>, rsbinder::Status> {
         Ok(input.cloned())
     }
 
@@ -337,7 +352,10 @@ impl ITestService::ITestService for TestService {
         Ok(())
     }
 
-    fn TakesANullableIBinder(&self, _: Option<&SIBinder>) -> std::result::Result<(), rsbinder::Status> {
+    fn TakesANullableIBinder(
+        &self,
+        _: Option<&SIBinder>,
+    ) -> std::result::Result<(), rsbinder::Status> {
         Ok(())
     }
 
@@ -345,7 +363,10 @@ impl ITestService::ITestService for TestService {
         Ok(())
     }
 
-    fn TakesANullableIBinderList(&self, _: Option<&[Option<SIBinder>]>) -> std::result::Result<(), rsbinder::Status> {
+    fn TakesANullableIBinderList(
+        &self,
+        _: Option<&[Option<SIBinder>]>,
+    ) -> std::result::Result<(), rsbinder::Status> {
         Ok(())
     }
 
@@ -375,7 +396,10 @@ impl ITestService::ITestService for TestService {
     fn GetCallback(
         &self,
         return_null: bool,
-    ) -> std::result::Result<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>, rsbinder::Status> {
+    ) -> std::result::Result<
+        Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>,
+        rsbinder::Status,
+    > {
         if return_null {
             Ok(None)
         } else {
@@ -432,11 +456,17 @@ impl ITestService::ITestService for TestService {
         Ok(())
     }
 
-    fn ReverseList(&self, list: &RecursiveList) -> std::result::Result<RecursiveList, rsbinder::Status> {
+    fn ReverseList(
+        &self,
+        list: &RecursiveList,
+    ) -> std::result::Result<RecursiveList, rsbinder::Status> {
         let mut reversed: Option<RecursiveList> = None;
         let mut cur: Option<&RecursiveList> = Some(list);
         while let Some(node) = cur {
-            reversed = Some(RecursiveList { value: node.value, next: reversed.map(Box::new) });
+            reversed = Some(RecursiveList {
+                value: node.value,
+                next: reversed.map(Box::new),
+            });
             cur = node.next.as_ref().map(|n| n.as_ref());
         }
         // `list` is always not empty, so is `reversed`.
@@ -462,15 +492,22 @@ impl ITestService::ITestService for TestService {
         Ok(Some(input.iter().rev().cloned().collect()))
     }
 
-    fn GetOldNameInterface(&self) -> std::result::Result<rsbinder::Strong<dyn IOldName::IOldName>, rsbinder::Status> {
+    fn GetOldNameInterface(
+        &self,
+    ) -> std::result::Result<rsbinder::Strong<dyn IOldName::IOldName>, rsbinder::Status> {
         Ok(IOldName::BnOldName::new_binder(OldName))
     }
 
-    fn GetNewNameInterface(&self) -> std::result::Result<rsbinder::Strong<dyn INewName::INewName>, rsbinder::Status> {
+    fn GetNewNameInterface(
+        &self,
+    ) -> std::result::Result<rsbinder::Strong<dyn INewName::INewName>, rsbinder::Status> {
         Ok(INewName::BnNewName::new_binder(NewName))
     }
 
-    fn GetUnionTags(&self, input: &[Union::Union]) -> std::result::Result<Vec<Union::Tag>, rsbinder::Status> {
+    fn GetUnionTags(
+        &self,
+        input: &[Union::Union],
+    ) -> std::result::Result<Vec<Union::Tag>, rsbinder::Status> {
         Ok(input
             .iter()
             .map(|u| match u {
@@ -504,7 +541,6 @@ impl ITestService::ITestService for TestService {
         std::process::exit(0);
     }
 }
-
 
 struct FooInterface;
 
@@ -551,7 +587,9 @@ impl INestedService::INestedService for NestedService {
                 status: ParcelableWithNested::Status::Status::NOT_OK,
             })
         } else {
-            Ok(INestedService::Result::Result { status: ParcelableWithNested::Status::Status::OK })
+            Ok(INestedService::Result::Result {
+                status: ParcelableWithNested::Status::Status::OK,
+            })
         }
     }
     fn flipStatusWithCallback(
@@ -572,11 +610,19 @@ struct FixedSizeArrayService;
 impl Interface for FixedSizeArrayService {}
 
 impl IRepeatFixedSizeArray::IRepeatFixedSizeArray for FixedSizeArrayService {
-    fn RepeatBytes(&self, input: &[u8; 3], repeated: &mut [u8; 3]) -> std::result::Result<[u8; 3], Status> {
+    fn RepeatBytes(
+        &self,
+        input: &[u8; 3],
+        repeated: &mut [u8; 3],
+    ) -> std::result::Result<[u8; 3], Status> {
         *repeated = *input;
         Ok(*input)
     }
-    fn RepeatInts(&self, input: &[i32; 3], repeated: &mut [i32; 3]) -> std::result::Result<[i32; 3], Status> {
+    fn RepeatInts(
+        &self,
+        input: &[i32; 3],
+        repeated: &mut [i32; 3],
+    ) -> std::result::Result<[i32; 3], Status> {
         *repeated = *input;
         Ok(*input)
     }
@@ -630,14 +676,11 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArray for FixedSizeArrayService {
     }
 }
 
-struct MyDeathRecipient {
-}
+struct MyDeathRecipient {}
 
 impl DeathRecipient for MyDeathRecipient {
-    fn binder_died(&self, _who: &WIBinder) {
-    }
+    fn binder_died(&self, _who: &WIBinder) {}
 }
-
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
@@ -653,14 +696,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     log::warn!("Intentional error output for testing purposes.");
     log::warn!("This message indicates an expected failure case.");
-    let recipient = Arc::new(MyDeathRecipient{});
-    let result = service.as_binder().link_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+    let recipient = Arc::new(MyDeathRecipient {});
+    let result = service.as_binder().link_to_death(Arc::downgrade(
+        &(recipient.clone() as Arc<dyn DeathRecipient>),
+    ));
     assert!(result.is_err());
 
-    let result = service.as_binder().unlink_to_death(Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>)));
+    let result = service.as_binder().unlink_to_death(Arc::downgrade(
+        &(recipient.clone() as Arc<dyn DeathRecipient>),
+    ));
     assert!(result.is_err());
 
-    service.as_binder().ping_binder().expect("Could not ping binder");
+    service
+        .as_binder()
+        .ping_binder()
+        .expect("Could not ping binder");
     assert_eq!(service.as_binder().is_remote(), false);
 
     let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
@@ -670,18 +720,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let nested_service_name =
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor();
-    let nested_service =
-        INestedService::BnNestedService::new_binder(NestedService);
+    let nested_service = INestedService::BnNestedService::new_binder(NestedService);
     hub::add_service(nested_service_name, nested_service.as_binder())
         .expect("Could not register service");
 
     let fixed_size_array_service_name =
         <IRepeatFixedSizeArray::BpRepeatFixedSizeArray as IRepeatFixedSizeArray::IRepeatFixedSizeArray>::descriptor();
-    let fixed_size_array_service = IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_binder(
-        FixedSizeArrayService
-    );
-    hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
-        .expect("Could not register service");
+    let fixed_size_array_service =
+        IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_binder(FixedSizeArrayService);
+    hub::add_service(
+        fixed_size_array_service_name,
+        fixed_size_array_service.as_binder(),
+    )
+    .expect("Could not register service");
 
     Ok(ProcessState::join_thread_pool()?)
 }

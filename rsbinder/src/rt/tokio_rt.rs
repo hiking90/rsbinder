@@ -31,7 +31,7 @@
 //!
 //! [`Tokio`]: crate::Tokio
 
-use crate::{hub, BinderAsyncRuntime, BinderAsyncPool, BoxFuture, FromIBinder, StatusCode, Strong};
+use crate::{hub, BinderAsyncPool, BinderAsyncRuntime, BoxFuture, FromIBinder, StatusCode, Strong};
 use std::future::Future;
 
 /// Retrieve an existing service for a particular interface, sleeping for a few

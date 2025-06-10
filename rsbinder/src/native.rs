@@ -17,21 +17,15 @@
  * limitations under the License.
  */
 
-use std::sync::{Arc, Weak};
-use std::ops::{Deref, DerefMut};
 use std::any::Any;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::os::fd::FromRawFd;
 use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
+use std::os::fd::FromRawFd;
+use std::sync::{Arc, Weak};
 
-use crate::{
-    binder::*,
-    parcel::*,
-    error::*,
-    thread_state,
-    ref_counter::RefCounter,
-};
+use crate::{binder::*, error::*, parcel::*, ref_counter::RefCounter, thread_state};
 
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
@@ -42,11 +36,14 @@ struct Inner<T: Remotable + Send + Sync> {
 
 impl<T: Remotable> Inner<T> {
     // The following functions can be redefined depending on the service.
-    fn on_transact(&self, code: TransactionCode, _reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        _reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
         match code {
-            INTERFACE_TRANSACTION => {
-                reply.write(T::descriptor())
-            }
+            INTERFACE_TRANSACTION => reply.write(T::descriptor()),
             DUMP_TRANSACTION => {
                 let obj = _reader.read_object(true)?;
                 if obj.header_type() != crate::sys::BINDER_TYPE_FD {
@@ -61,9 +58,7 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
-                let mut file = unsafe {
-                    ManuallyDrop::new(File::from_raw_fd(fd as _))
-                };
+                let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd as _)) };
 
                 self.remotable.on_dump(file.deref_mut(), argv.as_slice())
             }
@@ -80,7 +75,7 @@ impl<T: Remotable> Inner<T> {
     }
 }
 
-impl<T: 'static +  Remotable> IBinder for Inner<T> {
+impl<T: 'static + Remotable> IBinder for Inner<T> {
     fn link_to_death(&self, _recipient: Weak<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support link_to_death.");
         Err(StatusCode::InvalidOperation)
@@ -121,11 +116,11 @@ impl<T: 'static +  Remotable> IBinder for Inner<T> {
     }
 
     fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
-        self.strong.inc(|| { Ok(()) })
+        self.strong.inc(|| Ok(()))
     }
 
     fn attempt_inc_strong(&self) -> bool {
-        self.strong.attempt_inc(true, || { true }, || {})
+        self.strong.attempt_inc(true, || true, || {})
     }
 
     fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
@@ -138,16 +133,21 @@ impl<T: 'static +  Remotable> IBinder for Inner<T> {
     }
 
     fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
-        self.weak.inc(|| { Ok(()) })
+        self.weak.inc(|| Ok(()))
     }
 
     fn dec_weak(&self) -> Result<()> {
-        self.weak.dec(|| { Ok(()) })
+        self.weak.dec(|| Ok(()))
     }
 }
 
 impl<T: Remotable> Transactable for Inner<T> {
-    fn transact(&self, code: TransactionCode, reader: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+    fn transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
         reader.set_data_position(0);
         match code {
             PING_TRANSACTION => {
@@ -176,8 +176,9 @@ impl<T: Remotable> Transactable for Inner<T> {
             }
 
             _ => {
-                if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code) &&
-                    !(thread_state::check_interface(reader, T::descriptor())?) {
+                if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code)
+                    && !(thread_state::check_interface(reader, T::descriptor())?)
+                {
                     reply.write(&StatusCode::BadType)?;
                     return Ok(());
                 }
@@ -196,7 +197,6 @@ impl<T: Remotable> Transactable for Inner<T> {
         }
     }
 }
-
 
 /// A Binder object that can be used to manage the binder service.
 pub struct Binder<T: 'static + Remotable + Send + Sync> {
@@ -225,7 +225,11 @@ impl<T: 'static + Remotable> Binder<T> {
 impl<T: 'static + Remotable> Interface for Binder<T> {
     fn as_binder(&self) -> SIBinder {
         SIBinder::new(self.inner.clone()).unwrap_or_else(|e| {
-            panic!("Failed to create SIBinder for {}. StatusCode({:?})", T::descriptor(), e)
+            panic!(
+                "Failed to create SIBinder for {}. StatusCode({:?})",
+                T::descriptor(),
+                e
+            )
         })
     }
 }
@@ -254,7 +258,11 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 
     fn try_from(ibinder: SIBinder) -> Result<Self> {
         if B::descriptor() != ibinder.descriptor() {
-            log::error!("Binder type mismatch: expected {}, got {}", B::descriptor(), ibinder.descriptor());
+            log::error!(
+                "Binder type mismatch: expected {}, got {}",
+                B::descriptor(),
+                ibinder.descriptor()
+            );
             return Err(StatusCode::BadType);
         }
 
@@ -263,14 +271,17 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             let inner_raw = ibinder.into_raw() as *const Inner<B>;
             let inner = unsafe { Arc::from_raw(inner_raw) };
 
-            Ok(Self { inner, })
+            Ok(Self { inner })
         } else {
-            log::error!("Downcast failed: expected {}, got {}", B::descriptor(), ibinder.descriptor());
+            log::error!(
+                "Downcast failed: expected {}, got {}",
+                B::descriptor(),
+                ibinder.descriptor()
+            );
             Err(StatusCode::BadValue)
         }
     }
 }
-
 
 /// Determine whether the current thread is currently executing an incoming
 /// transaction.

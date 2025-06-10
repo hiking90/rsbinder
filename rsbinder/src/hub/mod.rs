@@ -39,14 +39,9 @@ pub mod android_16 {
 use crate::*;
 
 pub use android_13::{
-    DUMP_FLAG_PRIORITY_ALL,
-    DUMP_FLAG_PRIORITY_CRITICAL,
-    DUMP_FLAG_PRIORITY_DEFAULT,
-    DUMP_FLAG_PRIORITY_HIGH,
+    BnServiceCallback, IServiceCallback, ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL,
+    DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH,
     DUMP_FLAG_PRIORITY_NORMAL,
-    IServiceCallback,
-    BnServiceCallback,
-    ServiceDebugInfo
 };
 
 /// Android SDK version constants
@@ -135,8 +130,7 @@ impl ServiceManager {
             ServiceManager::Android14(sm) => android_14::get_service(sm, name),
             #[cfg(target_os = "android")]
             ServiceManager::Android16(sm) => {
-                android_16::get_service(sm, name)
-                    .and_then(|s| s.service)
+                android_16::get_service(sm, name).and_then(|s| s.service)
             }
         }
     }
@@ -166,8 +160,7 @@ impl ServiceManager {
             ServiceManager::Android14(sm) => android_14::check_service(sm, name),
             #[cfg(target_os = "android")]
             ServiceManager::Android16(sm) => {
-                android_16::check_service(sm, name)
-                    .and_then(|s| s.service)
+                android_16::check_service(sm, name).and_then(|s| s.service)
             }
         }
     }
@@ -222,7 +215,10 @@ impl ServiceManager {
         match self {
             #[cfg(target_os = "android")]
             ServiceManager::Android11(_) => {
-                log::error!("get_service_debug_info: Unsupported Android SDK version: {}", crate::get_android_sdk_version());
+                log::error!(
+                    "get_service_debug_info: Unsupported Android SDK version: {}",
+                    crate::get_android_sdk_version()
+                );
                 Err(StatusCode::UnknownTransaction)
             }
             #[cfg(target_os = "android")]
@@ -232,9 +228,7 @@ impl ServiceManager {
                 // 2. Both have the same memory layout: name (String) + debugPid (i32)
                 // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
                 let a12_result = android_12::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe {
-                    std::mem::transmute(a12_result)
-                };
+                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a12_result) };
                 Ok(a13_result)
             }
             ServiceManager::Android13(sm) => android_13::get_service_debug_info(sm),
@@ -245,9 +239,7 @@ impl ServiceManager {
                 // 2. Both have the same memory layout: name (String) + debugPid (i32)
                 // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
                 let a14_result = android_14::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe {
-                    std::mem::transmute(a14_result)
-                };
+                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a14_result) };
                 Ok(a13_result)
             }
             #[cfg(target_os = "android")]
@@ -257,9 +249,7 @@ impl ServiceManager {
                 // 2. Both have the same memory layout: name (String) + debugPid (i32)
                 // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
                 let a16_result = android_16::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe {
-                    std::mem::transmute(a16_result)
-                };
+                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a16_result) };
                 Ok(a13_result)
             }
         }
@@ -275,35 +265,41 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_11::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_11::IServiceCallback>)
                 };
                 android_11::register_for_notifications(sm, name, callback)
-            },
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android12(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_12::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_12::IServiceCallback>)
                 };
                 android_12::register_for_notifications(sm, name, callback)
-            },
-            ServiceManager::Android13(sm) => android_13::register_for_notifications(sm, name, callback),
+            }
+            ServiceManager::Android13(sm) => {
+                android_13::register_for_notifications(sm, name, callback)
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android14(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_14::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_14::IServiceCallback>)
                 };
                 android_14::register_for_notifications(sm, name, callback)
-            },
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android16(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_16::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_16::IServiceCallback>)
                 };
                 android_16::register_for_notifications(sm, name, callback)
-            },
+            }
         }
     }
 
@@ -317,43 +313,47 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_11::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_11::IServiceCallback>)
                 };
                 android_11::unregister_for_notifications(sm, name, callback)
-            },
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android12(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_12::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_12::IServiceCallback>)
                 };
                 android_12::unregister_for_notifications(sm, name, callback)
-            },
-            ServiceManager::Android13(sm) => android_13::unregister_for_notifications(sm, name, callback),
+            }
+            ServiceManager::Android13(sm) => {
+                android_13::unregister_for_notifications(sm, name, callback)
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android14(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_14::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_14::IServiceCallback>)
                 };
                 android_14::unregister_for_notifications(sm, name, callback)
-            },
+            }
             #[cfg(target_os = "android")]
             ServiceManager::Android16(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
                 let callback = unsafe {
-                    &*(callback as *const _ as *const crate::Strong<dyn android_16::IServiceCallback>)
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_16::IServiceCallback>)
                 };
                 android_16::unregister_for_notifications(sm, name, callback)
-            },
+            }
         }
     }
 }
 
 #[inline]
-pub fn get_interface<T: FromIBinder + ?Sized>(
-    name: &str,
-) -> Result<Strong<T>> {
+pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     default().get_interface(name)
 }
 
@@ -379,24 +379,17 @@ pub fn unregister_for_notifications(
 }
 
 #[inline]
-pub fn add_service(
-    identifier: &str,
-    binder: SIBinder,
-) -> std::result::Result<(), Status> {
+pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
     default().add_service(identifier, binder)
 }
 
 #[inline]
-pub fn get_service(
-    name: &str,
-) -> Option<SIBinder> {
+pub fn get_service(name: &str) -> Option<SIBinder> {
     default().get_service(name)
 }
 
 #[inline]
-pub fn check_service(
-    name: &str,
-) -> Option<SIBinder> {
+pub fn check_service(name: &str) -> Option<SIBinder> {
     default().check_service(name)
 }
 

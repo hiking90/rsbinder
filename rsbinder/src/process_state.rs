@@ -1,21 +1,15 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, OnceLock};
-use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::os::raw::c_void;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 
-use crate::{
-    error::*,
-    binder::*,
-    sys::binder,
-    proxy::*,
-    thread_state,
-};
+use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
 #[derive(Debug, Clone, Copy)]
 pub enum CallRestriction {
@@ -62,7 +56,9 @@ impl ProcessState {
     /// If ProcessState is not initialized, it will panic.
     /// If you want to initialize ProcessState, use init() or init_default().
     pub fn as_self() -> &'static ProcessState {
-        Self::instance().get().expect("ProcessState is not initialized!")
+        Self::instance()
+            .get()
+            .expect("ProcessState is not initialized!")
     }
 
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
@@ -74,7 +70,10 @@ impl ProcessState {
         *self.call_restriction.read().unwrap()
     }
 
-    fn inner_init(driver_name: &str, max_threads: u32) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
+    fn inner_init(
+        driver_name: &str,
+        max_threads: u32,
+    ) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
         let max_threads = if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
             max_threads
         } else {
@@ -96,11 +95,14 @@ impl ProcessState {
             //     &driver,
             //     0)?;
 
-            let vm_start = rustix::mm::mmap(std::ptr::null_mut(),
+            let vm_start = rustix::mm::mmap(
+                std::ptr::null_mut(),
                 vm_size,
                 rustix::mm::ProtFlags::READ,
                 rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
-                &driver, 0)?;
+                &driver,
+                0,
+            )?;
 
             (vm_start, vm_size)
         };
@@ -109,7 +111,10 @@ impl ProcessState {
             max_threads,
             driver_name,
             driver: driver.into(),
-            mmap: RwLock::new(MemoryMap { ptr: mmap.0, size: mmap.1 }),
+            mmap: RwLock::new(MemoryMap {
+                ptr: mmap.0,
+                size: mmap.1,
+            }),
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             disable_background_scheduling: AtomicBool::new(false),
@@ -127,12 +132,10 @@ impl ProcessState {
     pub fn init(driver_name: &str, max_threads: u32) -> &'static ProcessState {
         // TODO: panic! is not good. It should return Result.
         // But, get_or_try_init is not stable yet.
-        Self::instance().get_or_init(|| {
-            match Self::inner_init(driver_name, max_threads) {
-                Ok(instance) => instance,
-                Err(e) => {
-                    panic!("Error in init(): {}", e);
-                }
+        Self::instance().get_or_init(|| match Self::inner_init(driver_name, max_threads) {
+            Ok(instance) => instance,
+            Err(e) => {
+                panic!("Error in init(): {}", e);
             }
         })
     }
@@ -145,17 +148,24 @@ impl ProcessState {
     }
 
     /// Get binder service manager.
-    pub fn become_context_manager(&self, binder: SIBinder) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub fn become_context_manager(
+        &self,
+        binder: SIBinder,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut context_manager = self.context_manager.write().unwrap();
 
         if context_manager.is_none() {
-            let obj = binder::flat_binder_object::new_binder_with_flags(binder::FLAT_BINDER_FLAG_ACCEPTS_FDS);
+            let obj = binder::flat_binder_object::new_binder_with_flags(
+                binder::FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            );
 
             if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
                 //     android_errorWriteLog(0x534e4554, "121035042");
                 // let unused: i32 = 0;
                 if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
-                    return Err(format!("Binder ioctl to become context manager failed: {}", e).into());
+                    return Err(
+                        format!("Binder ioctl to become context manager failed: {}", e).into(),
+                    );
                 }
             }
             *context_manager = Some(binder);
@@ -179,15 +189,19 @@ impl ProcessState {
         self.strong_proxy_for_handle_stability(handle, Default::default())
     }
 
-    pub(crate) fn strong_proxy_for_handle_stability(&self, handle: u32, stability: Stability) -> Result<SIBinder> {
+    pub(crate) fn strong_proxy_for_handle_stability(
+        &self,
+        handle: u32,
+        stability: Stability,
+    ) -> Result<SIBinder> {
         // Double-Checked Locking Pattern is used.
         if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
-            return weak.upgrade()
+            return weak.upgrade();
         }
 
         let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
         if let Some(weak) = handle_to_proxy.get(&handle) {
-            return weak.upgrade()
+            return weak.upgrade();
         }
 
         if handle == 0 {
@@ -219,7 +233,8 @@ impl ProcessState {
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {
-        self.disable_background_scheduling.store(disable, Ordering::Relaxed);
+        self.disable_background_scheduling
+            .store(disable, Ordering::Relaxed);
     }
 
     pub fn background_scheduling_disabled(&self) -> bool {
@@ -232,7 +247,11 @@ impl ProcessState {
 
     pub fn start_thread_pool() {
         let this = Self::as_self();
-        if this.thread_pool_started.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if this
+            .thread_pool_started
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             if this.max_threads == 0 {
                 log::warn!("Extra binder thread started, but 0 threads requested.\nDo not use *start_thread_pool when zero threads are requested.");
             }
@@ -243,7 +262,9 @@ impl ProcessState {
     fn make_binder_thread_name(&self) -> String {
         let seq = self.thread_pool_seq.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let driver_name = self.driver_name.file_name()
+        let driver_name = self
+            .driver_name
+            .file_name()
             .and_then(|name| name.to_str())
             .map(|name| name.to_owned())
             .unwrap_or("BINDER".to_owned());
@@ -254,9 +275,9 @@ impl ProcessState {
         if self.thread_pool_started.load(Ordering::Relaxed) {
             let name = self.make_binder_thread_name();
             log::info!("Spawning new pooled thread, name={}", name);
-            let _ = thread::Builder::new().name(name).spawn(move || {
-                thread_state::join_thread_pool(is_main)
-            });
+            let _ = thread::Builder::new()
+                .name(name)
+                .spawn(move || thread_state::join_thread_pool(is_main));
 
             self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
         }
@@ -277,10 +298,9 @@ impl ProcessState {
             reserved3: 0,
         };
 
-        binder::get_node_info_for_ref(&self.driver, &mut info)
-            .inspect_err(|&e| {
-                log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {:?}", e);
-            })?;
+        binder::get_node_info_for_ref(&self.driver, &mut info).inspect_err(|&e| {
+            log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {:?}", e);
+        })?;
         Ok(info.strong_count as usize)
     }
 
@@ -289,22 +309,31 @@ impl ProcessState {
     }
 }
 
-fn open_driver(driver: &Path, max_threads: u32) -> std::result::Result<File, Box<dyn std::error::Error>> {
+fn open_driver(
+    driver: &Path,
+    max_threads: u32,
+) -> std::result::Result<File, Box<dyn std::error::Error>> {
     let fd = File::options()
         .read(true)
         .write(true)
         .open(driver)
         .map_err(|e| format!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e))?;
 
-    let mut vers = binder::binder_version { protocol_version: 0 };
+    let mut vers = binder::binder_version {
+        protocol_version: 0,
+    };
 
     binder::version(&fd, &mut vers)
         .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
     log::info!("Binder driver protocol version: {}", vers.protocol_version);
 
     if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
-        return Err(format!("Binder driver protocol({}) does not match user space protocol({})!",
-            vers.protocol_version, binder::BINDER_CURRENT_PROTOCOL_VERSION).into());
+        return Err(format!(
+            "Binder driver protocol({}) does not match user space protocol({})!",
+            vers.protocol_version,
+            binder::BINDER_CURRENT_PROTOCOL_VERSION
+        )
+        .into());
     }
 
     binder::set_max_threads(&fd, max_threads)
@@ -323,8 +352,7 @@ impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
         let mmap = self.mmap.read().unwrap();
         unsafe {
-            rustix::mm::munmap(mmap.ptr, mmap.size)
-                .expect("Failed to unmap memory");
+            rustix::mm::munmap(mmap.ptr, mmap.size).expect("Failed to unmap memory");
         }
     }
 }
@@ -337,7 +365,10 @@ mod tests {
     fn test_process_state() {
         let process = ProcessState::init_default();
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
-        assert_eq!(process.driver_name, PathBuf::from(crate::DEFAULT_BINDER_PATH));
+        assert_eq!(
+            process.driver_name,
+            PathBuf::from(crate::DEFAULT_BINDER_PATH)
+        );
     }
 
     #[test]
@@ -363,6 +394,11 @@ mod tests {
     fn test_process_state_start_thread_pool() {
         test_process_state();
         ProcessState::start_thread_pool();
-        assert_eq!(ProcessState::as_self().kernel_started_threads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ProcessState::as_self()
+                .kernel_started_threads
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 }

@@ -18,7 +18,7 @@
  */
 
 use crate::binder::Stability;
-use crate::error::{StatusCode, Result};
+use crate::error::{Result, StatusCode};
 use crate::{
     Deserialize, Parcel, Parcelable, ParcelableMetadata, Serialize, NON_NULL_PARCELABLE_FLAG,
     NULL_PARCELABLE_FLAG,
@@ -94,7 +94,8 @@ impl ParcelableHolder {
             log::error!(
                 "ParcelableHolder::set_parcelable: parcelable stability mismatch: {:?} > {:?}",
                 self.stability,
-                p.stability());
+                p.stability()
+            );
             return Err(StatusCode::BadValue);
         }
 
@@ -150,7 +151,7 @@ impl ParcelableHolder {
                 }
             }
             ParcelableHolderData::Parcel(ref mut parcel) => {
-                    // Safety: 0 should always be a valid position.
+                // Safety: 0 should always be a valid position.
                 parcel.set_data_position(0);
 
                 let name: String = parcel.read()?;
@@ -216,12 +217,12 @@ impl Parcelable for ParcelableHolder {
                 parcelable.write_to_parcel(parcel)?;
 
                 let end = parcel.data_position();
-                    // Safety: we got the position from `data_position`.
+                // Safety: we got the position from `data_position`.
                 parcel.set_data_position(length_start);
 
                 assert!(end >= data_start);
                 parcel.write(&((end - data_start) as i32))?;
-                    // Safety: we got the position from `data_position`.
+                // Safety: we got the position from `data_position`.
                 parcel.set_data_position(end);
 
                 Ok(())
@@ -236,8 +237,11 @@ impl Parcelable for ParcelableHolder {
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
         let wire_stability: i32 = parcel.read()?;
         if self.stability as i32 != wire_stability {
-            log::error!("ParcelableHolder::read_from_parcel: parcelable stability mismatch: {:?} != {:?}",
-                self.stability, wire_stability);
+            log::error!(
+                "ParcelableHolder::read_from_parcel: parcelable stability mismatch: {:?} != {:?}",
+                self.stability,
+                wire_stability
+            );
 
             return Err(StatusCode::BadValue);
         }
@@ -264,10 +268,10 @@ impl Parcelable for ParcelableHolder {
         new_parcel.append_from(parcel, data_start, data_size as usize)?;
         *self.data.get_mut().unwrap() = ParcelableHolderData::Parcel(new_parcel);
 
-            // Safety: `append_from` checks if `data_size` overflows
-            // `parcel` and returns `BAD_VALUE` if that happens. We also
-            // explicitly check for negative and zero `data_size` above,
-            // so `data_end` is guaranteed to be greater than `data_start`.
+        // Safety: `append_from` checks if `data_size` overflows
+        // `parcel` and returns `BAD_VALUE` if that happens. We also
+        // explicitly check for negative and zero `data_size` above,
+        // so `data_end` is guaranteed to be greater than `data_start`.
         parcel.set_data_position(data_end);
 
         Ok(())

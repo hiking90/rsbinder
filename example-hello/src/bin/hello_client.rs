@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
 use env_logger::Env;
-use rsbinder::*;
-use hub::{IServiceCallback, BnServiceCallback};
 use example_hello::*;
+use hub::{BnServiceCallback, IServiceCallback};
+use rsbinder::*;
+use std::sync::Arc;
 
-struct MyServiceCallback {
-}
+struct MyServiceCallback {}
 
 impl Interface for MyServiceCallback {}
 
@@ -20,8 +19,7 @@ impl IServiceCallback for MyServiceCallback {
     }
 }
 
-struct MyDeathRecipient {
-}
+struct MyDeathRecipient {}
 
 impl DeathRecipient for MyDeathRecipient {
     fn binder_died(&self, _who: &WIBinder) {
@@ -41,15 +39,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("{}", name);
     }
 
-    let service_callback = BnServiceCallback::new_binder(MyServiceCallback{});
+    let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
     hub::register_for_notifications(SERVICE_NAME, &service_callback)?;
 
     // Create a Hello proxy from binder service manager.
-    let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
-        .unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
+    let hello: rsbinder::Strong<dyn IHello> =
+        hub::get_interface(SERVICE_NAME).unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
 
-    let recipient = Arc::new(MyDeathRecipient{});
-    hello.as_binder().link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
+    let recipient = Arc::new(MyDeathRecipient {});
+    hello
+        .as_binder()
+        .link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
 
     // Call echo method of Hello proxy.
     let echo = hello.echo("Hello World!")?;

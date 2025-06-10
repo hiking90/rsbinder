@@ -5,18 +5,12 @@ include!(concat!(env!("OUT_DIR"), "/service_manager_14.rs"));
 
 use crate::*;
 pub use android::os::IServiceManager::{
-    IServiceManager, BpServiceManager, BnServiceManager,
-    DUMP_FLAG_PRIORITY_CRITICAL,
-    DUMP_FLAG_PRIORITY_HIGH,
-    DUMP_FLAG_PRIORITY_NORMAL,
-    DUMP_FLAG_PRIORITY_DEFAULT,
-    DUMP_FLAG_PRIORITY_ALL,
-    DUMP_FLAG_PROTO,
+    BnServiceManager, BpServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_ALL,
+    DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH,
+    DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
 };
 
-pub use android::os::IServiceCallback::{
-    IServiceCallback, BnServiceCallback,
-};
+pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
@@ -56,18 +50,30 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
     }
 }
 
-pub fn add_service(sm: &BpServiceManager, identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
+pub fn add_service(
+    sm: &BpServiceManager,
+    identifier: &str,
+    binder: SIBinder,
+) -> std::result::Result<(), Status> {
     sm.addService(identifier, &binder, false, DUMP_FLAG_PRIORITY_DEFAULT)
 }
 
 /// Request a callback when a service is registered.
-pub fn register_for_notifications(sm: &BpServiceManager, name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
+pub fn register_for_notifications(
+    sm: &BpServiceManager,
+    name: &str,
+    callback: &crate::Strong<dyn IServiceCallback>,
+) -> Result<()> {
     sm.registerForNotifications(name, callback)
         .map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
-pub fn unregister_for_notifications(sm: &BpServiceManager, name: &str, callback: &crate::Strong<dyn IServiceCallback>) -> Result<()> {
+pub fn unregister_for_notifications(
+    sm: &BpServiceManager,
+    name: &str,
+    callback: &crate::Strong<dyn IServiceCallback>,
+) -> Result<()> {
     sm.unregisterForNotifications(name, callback)
         .map_err(|e| e.into())
 }
@@ -85,11 +91,12 @@ pub fn is_declared(sm: &BpServiceManager, name: &str) -> bool {
     }
 }
 
-pub fn get_interface<T: FromIBinder + ?Sized>(sm: &BpServiceManager, name: &str) -> Result<Strong<T>> {
+pub fn get_interface<T: FromIBinder + ?Sized>(
+    sm: &BpServiceManager,
+    name: &str,
+) -> Result<Strong<T>> {
     match sm.getService(name) {
-        Ok(Some(service)) => {
-            FromIBinder::try_from(service)
-        }
+        Ok(Some(service)) => FromIBinder::try_from(service),
         Ok(None) => {
             log::error!("Service {} not found", name);
             Err(StatusCode::NameNotFound)
@@ -101,7 +108,8 @@ pub fn get_interface<T: FromIBinder + ?Sized>(sm: &BpServiceManager, name: &str)
     }
 }
 
-pub fn get_service_debug_info(sm: &BpServiceManager) -> Result<Vec<android::os::ServiceDebugInfo::ServiceDebugInfo>> {
-    sm.getServiceDebugInfo()
-        .map_err(|e| e.into())
+pub fn get_service_debug_info(
+    sm: &BpServiceManager,
+) -> Result<Vec<android::os::ServiceDebugInfo::ServiceDebugInfo>> {
+    sm.getServiceDebugInfo().map_err(|e| e.into())
 }

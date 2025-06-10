@@ -6,13 +6,11 @@ pub use rsbinder::*;
 
 include!(concat!(env!("OUT_DIR"), "/test_aidl.rs"));
 
-pub(crate) use android::aidl::tests::sm::IFoo::{IFoo, BnFoo, BpFoo};
+pub(crate) use android::aidl::tests::sm::IFoo::{BnFoo, BpFoo, IFoo};
 
-pub(crate) struct IFooService {
-}
+pub(crate) struct IFooService {}
 
-impl rsbinder::Interface for IFooService {
-}
+impl rsbinder::Interface for IFooService {}
 
 impl IFoo for IFooService {
     // Implement the echo method.
@@ -38,7 +36,7 @@ fn setup() {
 fn test_add_service() -> rsbinder::Result<()> {
     setup();
 
-    let service = BnFoo::new_binder(IFooService{});
+    let service = BnFoo::new_binder(IFooService {});
     assert!(hub::add_service("", service.as_binder()).is_err());
 
     assert_eq!(hub::add_service("foo", service.as_binder()), Ok(()));
@@ -92,13 +90,17 @@ fn test_notifications() -> rsbinder::Result<()> {
     struct MyServiceCallback {}
     impl rsbinder::Interface for MyServiceCallback {}
     impl hub::IServiceCallback for MyServiceCallback {
-        fn onRegistration(&self, name: &str, service: &rsbinder::SIBinder) -> rsbinder::status::Result<()> {
+        fn onRegistration(
+            &self,
+            name: &str,
+            service: &rsbinder::SIBinder,
+        ) -> rsbinder::status::Result<()> {
             println!("onRegistration: {} {:?}", name, service);
             Ok(())
         }
     }
 
-    let callback = hub::BnServiceCallback::new_binder(MyServiceCallback{});
+    let callback = hub::BnServiceCallback::new_binder(MyServiceCallback {});
 
     hub::register_for_notifications("mytest_service", &callback)?;
     hub::unregister_for_notifications("mytest_service", &callback)?;

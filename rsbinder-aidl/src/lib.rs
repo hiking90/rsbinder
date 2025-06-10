@@ -5,18 +5,18 @@
 extern crate lazy_static;
 
 use std::error::Error;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
-mod parser;
-mod generator;
 mod const_expr;
+mod generator;
+mod parser;
 mod type_generator;
-pub use parser::parse_document;
 pub use generator::Generator;
+pub use parser::parse_document;
 
 #[derive(Default, Hash, Eq, PartialEq, Debug, Clone)]
-pub struct Namespace{
+pub struct Namespace {
     ns: Vec<String>,
 }
 
@@ -149,13 +149,18 @@ impl Builder {
         let unparsed_file = fs::read_to_string(filename)?;
         let document = parser::parse_document(&unparsed_file)?;
 
-        Ok((filename.file_stem().unwrap().to_str().unwrap().to_string(), document))
+        Ok((
+            filename.file_stem().unwrap().to_str().unwrap().to_string(),
+            document,
+        ))
     }
 
     fn traverse_source(dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
-        let entries = fs::read_dir(dir).inspect_err(|_| {
-            eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
-        }).unwrap();
+        let entries = fs::read_dir(dir)
+            .inspect_err(|_| {
+                eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
+            })
+            .unwrap();
         let mut package_list = Vec::new();
 
         for entry in entries {
@@ -172,10 +177,13 @@ impl Builder {
         Ok(package_list)
     }
 
-    fn generate_all(&self, mut package_list: Vec<(String, String, String)>) -> Result<String, Box<dyn Error>> {
+    fn generate_all(
+        &self,
+        mut package_list: Vec<(String, String, String)>,
+    ) -> Result<String, Box<dyn Error>> {
         let mut content = String::new();
         let mut namespace = String::new();
-        let mut mod_count:usize = 0;
+        let mut mod_count: usize = 0;
 
         content += "#[allow(clippy::identity_op)]\n";
         content += "#[allow(clippy::derivable_impls)]\n";
@@ -212,7 +220,6 @@ impl Builder {
                     content += &format!("pub mod {} {{\n", r#mod);
                     mod_count += 1;
                 }
-
             }
 
             content += &add_indent(mod_count, &package.1);
@@ -271,6 +278,9 @@ mod tests {
         let target = Namespace::new("android.aidl.test.IServiceCallback", Namespace::AIDL);
         let curr = Namespace::new("android.os.IServiceManager", Namespace::AIDL);
 
-        assert_eq!(curr.relative_mod(&target), "super::super::aidl::test::IServiceCallback");
+        assert_eq!(
+            curr.relative_mod(&target),
+            "super::super::aidl::test::IServiceCallback"
+        );
     }
 }

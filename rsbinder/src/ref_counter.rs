@@ -12,22 +12,31 @@ pub(crate) struct RefCounter {
 }
 
 impl RefCounter {
-    pub fn inc(&self, f: impl FnOnce() -> Result<()>) -> Result<()>
-    {
+    pub fn inc(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
         let c = self.count.fetch_add(1, Ordering::Relaxed);
         if c == INITIAL_STRONG_VALUE {
-            self.count.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
+            self.count
+                .fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
             f()?;
         }
         Ok(())
     }
 
-    pub fn attempt_inc(&self, is_strong: bool, inc_func: impl FnOnce() -> bool, dec_func: impl FnOnce()) -> bool {
+    pub fn attempt_inc(
+        &self,
+        is_strong: bool,
+        inc_func: impl FnOnce() -> bool,
+        dec_func: impl FnOnce(),
+    ) -> bool {
         let mut curr_count = self.count.load(Ordering::Relaxed);
         debug_assert!(curr_count >= 0, "attempt_increase called after underflow");
         while curr_count > 0 && curr_count != INITIAL_STRONG_VALUE {
-            match self.count.compare_exchange_weak(curr_count, curr_count + 1,
-                Ordering::Relaxed, Ordering::Relaxed) {
+            match self.count.compare_exchange_weak(
+                curr_count,
+                curr_count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(count) => curr_count = count,
             }
@@ -39,8 +48,12 @@ impl RefCounter {
                     return false;
                 }
                 while curr_count > 0 {
-                    match self.count.compare_exchange_weak(curr_count, curr_count.wrapping_add(1),
-                        Ordering::Relaxed, Ordering::Relaxed) {
+                    match self.count.compare_exchange_weak(
+                        curr_count,
+                        curr_count.wrapping_add(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
                         Ok(_) => break,
                         Err(count) => curr_count = count,
                     }
@@ -60,7 +73,8 @@ impl RefCounter {
             }
         }
         if curr_count == INITIAL_STRONG_VALUE {
-            self.count.fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
+            self.count
+                .fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
         }
 
         true
@@ -68,8 +82,17 @@ impl RefCounter {
 
     pub fn dec(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
         let c = self.count.fetch_sub(1, Ordering::Relaxed);
-        if c == 1 && self.count.compare_exchange(0, INITIAL_STRONG_VALUE,
-            Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if c == 1
+            && self
+                .count
+                .compare_exchange(
+                    0,
+                    INITIAL_STRONG_VALUE,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             f()?;
         }
         Ok(())
@@ -97,15 +120,11 @@ mod tests {
         let counter = RefCounter::default();
         assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
 
-        let result = counter.inc(|| {
-            Ok(())
-        });
+        let result = counter.inc(|| Ok(()));
         assert!(result.is_ok());
         assert_eq!(counter.count.load(Ordering::Relaxed), 1);
 
-        let result = counter.dec(|| {
-            Ok(())
-        });
+        let result = counter.dec(|| Ok(()));
         assert!(result.is_ok());
         assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
     }
@@ -115,28 +134,19 @@ mod tests {
         let counter = RefCounter::default();
         assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
 
-        let result = counter.attempt_inc(false, || {
-            false
-        }, || {});
+        let result = counter.attempt_inc(false, || false, || {});
         assert!(!result);
         assert_eq!(counter.count.load(Ordering::Relaxed), INITIAL_STRONG_VALUE);
 
-        let result = counter.attempt_inc(true, || {
-            true
-        }, || {});
+        let result = counter.attempt_inc(true, || true, || {});
         assert!(result);
         assert_eq!(counter.count.load(Ordering::Relaxed), 1);
 
-
-        let result = counter.attempt_inc(true, || {
-            true
-        }, || {});
+        let result = counter.attempt_inc(true, || true, || {});
         assert!(result);
         assert_eq!(counter.count.load(Ordering::Relaxed), 2);
 
-        let result = counter.attempt_inc(false, || {
-            false
-        }, || {});
+        let result = counter.attempt_inc(false, || false, || {});
         assert!(result);
         assert_eq!(counter.count.load(Ordering::Relaxed), 3);
     }
