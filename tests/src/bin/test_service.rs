@@ -711,7 +711,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .as_binder()
         .ping_binder()
         .expect("Could not ping binder");
-    assert_eq!(service.as_binder().is_remote(), false);
+    assert!(!service.as_binder().is_remote());
 
     let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
     let versioned_service = BnFooInterface::new_binder(FooInterface);
