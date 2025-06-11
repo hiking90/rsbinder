@@ -185,8 +185,7 @@ impl Builder {
         let mut namespace = String::new();
         let mut mod_count: usize = 0;
 
-        content += "#[allow(clippy::identity_op)]\n";
-        content += "#[allow(clippy::derivable_impls)]\n";
+        content += "#[allow(clippy::all)]\n";
         content += "#[allow(unused_imports)]\n\n";
 
         package_list.sort();
