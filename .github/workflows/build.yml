@@ -11,15 +11,29 @@ env:
   rust_min: '1.77'
 
 jobs:
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Run audit
+        uses: actions-rust-lang/audit@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_min }}
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.rust_min }}
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -58,16 +72,22 @@ jobs:
         ndk-version: r26c
         add-to-path: false
         local-cache: true
-    - name: Install Rust ${{ env.rust_min }}
+    - name: Install Rust stable for cargo-ndk
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: ${{ matrix.target }} # Keep targets for stable as well, in case cargo-ndk needs it
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk --version "^3.0"
+    - name: Install Rust ${{ env.rust_min }} for build
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: ${{ env.rust_min }}
         targets: ${{ matrix.target }}
+        override: true # Ensure this toolchain overrides the previous one for subsequent steps
     - uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ matrix.target }}
-    - name: Install cargo-ndk
-      run: cargo install cargo-ndk --version "^3.0"
+        key: ${{ matrix.target }}-${{ env.rust_min }} # Add rust_min to cache key as it's specific now
     - name: Build for Android (${{ matrix.target }})
       run: cargo ndk -t ${{ matrix.target }} build --release
 
