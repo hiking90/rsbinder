@@ -21,14 +21,14 @@ The **rsbinder** library unlocks a significant opportunity for Android developer
 By integrating **rsbinder** into your project, you gain the ability to harness Binder IPC directly within the Android NDK environment using pure Rust.
 
 ## Current Development Status
-**rsbinder** is still in its early development stages and is not yet ready for product development.
+**rsbinder** is still in its early development stages and is not yet ready for production use.
 
 ## Overview
 **rsbinder** offers the following features:
 
 * **crate rsbinder**: A library crate for implementing binder service/client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]**: A tool for generating Rust code for rsbinder from aidl.
-* **[crate rsbinder-tools][rsbinder-tools-readme]**: Provide CLI tools including a Binder Service Manager for Linux.
+* **[crate rsbinder-tools][rsbinder-tools-readme]**: Provides CLI tools, including a Binder Service Manager for Linux.
 * **[crate tests][tests-readme]**: Port Android’s binder test cases to provide various client/server testing features.
 * **[crate example-hello][example-hello-readme]**: An example of service/client written using rsbinder.
 
@@ -40,7 +40,7 @@ By integrating **rsbinder** into your project, you gain the ability to harness B
 ## Prerequisites to build and test
 
 ### Enable binder for Linux
-* The Linux kernel must be built with support for binderfs. Please check the following kernel configs.
+* The Linux kernel must be built with support for binderfs. Please ensure the following kernel configs are enabled:
 ```
 CONFIG_ANDROID=y
 CONFIG_ANDROID_BINDER_IPC=y
@@ -60,12 +60,12 @@ $ cargo build
 ```
 
 #### Run rsbinder tools
-* Run **[rsb_device]** command to create a binder device file.
+* Run the **[rsb_device]** command to create a binder device file.
 ```
 $ sudo target/debug/rsb_device binder
 ```
 [rsb_device]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
-* Run **[rsb_hub]**. It is a binder service manager.
+* Run **[rsb_hub]**, which is a binder service manager.
 ```
 $ cargo run --bin rsb_hub
 ```
@@ -99,7 +99,7 @@ Complete API parity between rsbinder and Android Binder isn't available due to f
 - [x] Support Tokio async.
 - [x] Remove all todo!() and unimplemented!() macros.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] (In Progress) Performed compatibility testing with Binder on Android.
+- [ ] (In Progress) Perform compatibility testing with Binder on Android.
 - [ ] Enhance error detection in AIDL code generator
 - [ ] Support AIDL version and hash.
 
