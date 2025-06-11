@@ -38,6 +38,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   linux-build:
     name: Linux Build
@@ -63,7 +65,7 @@ jobs:
     needs: test
     strategy:
       matrix:
-        target: [x86_64-linux-android, aarch64-linux-android, armv7-linux-androideabi]
+        target: [x86_64-linux-android, aarch64-linux-android]
     steps:
     - uses: actions/checkout@v4
     - uses: nttld/setup-ndk@v1
