@@ -1232,7 +1232,7 @@ impl std::default::Default for CallingContext {
             let thread_state = thread_state.borrow();
             match thread_state.transaction.as_ref() {
                 Some(transaction) => {
-                    let calling_sid = if transaction.calling_sid.is_null() {
+                    let calling_sid = if !transaction.calling_sid.is_null() {
                         unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
                     } else {
                         None

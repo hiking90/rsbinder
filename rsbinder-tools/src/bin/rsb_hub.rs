@@ -123,6 +123,8 @@ impl Inner {
         is_called_on_interval: bool,
     ) -> Result<bool> {
         let service = if let Some(service) = self.name_to_service.get(service_name) {
+            // Clippy recommands to use 'is_none_or' here, but 'is_none_or' is not supported by 1.77.
+            #[allow(clippy::unnecessary_map_or)]
             if self
                 .name_to_client_callbacks
                 .get(service_name)

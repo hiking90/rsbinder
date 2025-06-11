@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::missing_const_for_fn)]
+// #![allow(clippy::missing_const_for_fn)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,6 +21,7 @@ use crate::Namespace;
 
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
+    #[allow(clippy::missing_const_for_thread_local)]
     static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
 }
