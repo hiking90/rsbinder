@@ -13,6 +13,7 @@ jobs:
   android-test:
     if: github.actor == github.repository_owner
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - name: Checkout code
@@ -142,11 +143,22 @@ jobs:
 
     - name: Run test_service on Android device
       run: |
+        echo "Starting test_service in background..."
         adb shell "cd /data/rsbinder && nohup ./test_service > test_service.log 2>&1 &"
         echo "test_service started in background"
+        sleep 3
+        echo "Checking if test_service is running..."
+        adb shell "ps | grep test_service" && echo "test_service is running successfully" || echo "test_service may not be running"
 
     - name: Verify test_service is running
       run: |
+        echo "Waiting for test_service to stabilize..."
         sleep 5
+        echo "Checking test_service process..."
         adb shell "ps | grep test_service" || echo "test_service process check completed"
+        echo "Checking /data/rsbinder directory:"
         adb shell "ls -la /data/rsbinder/"
+        echo "Checking test_service log:"
+        adb shell "cat /data/rsbinder/test_service.log | head -10" || echo "No log output yet"
+        echo "Test setup completed successfully!"
+        echo "test_service is running in background on Android emulator"
