@@ -21,7 +21,6 @@ rust-version = "1.77"
 keywords = ["android", "binder", "aidl", "linux"]
 
 [workspace.dependencies]
-lazy_static = "1.4"
 rsbinder = { version = "0.3.0", path = "rsbinder" }
 log = "0.4"
 env_logger = "0.11"

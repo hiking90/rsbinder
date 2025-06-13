@@ -42,11 +42,11 @@ pub mod ITestService {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>>;
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>>;
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()>;
-        fn getDefaultImpl() -> ITestServiceDefaultRef where Self: Sized {
-            DEFAULT_IMPL.lock().unwrap().clone()
+        fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
+            DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: ITestServiceDefaultRef) -> ITestServiceDefaultRef where Self: Sized {
-            std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+            DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
     pub trait ITestServiceAsync<P>: rsbinder::Interface + Send {
@@ -125,11 +125,8 @@ pub mod ITestService {
         pub(crate) const r#RepeatNullableIntArray: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;
         pub(crate) const r#FillOutStructuredParcelable: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 2;
     }
-    pub type ITestServiceDefaultRef = Option<std::sync::Arc<dyn ITestServiceDefault>>;
-    use lazy_static::lazy_static;
-    lazy_static! {
-        static ref DEFAULT_IMPL: std::sync::Mutex<ITestServiceDefaultRef> = std::sync::Mutex::new(None);
-    }
+    pub type ITestServiceDefaultRef = std::sync::Arc<dyn ITestServiceDefault>;
+    static DEFAULT_IMPL: std::sync::OnceLock<ITestServiceDefaultRef> = std::sync::OnceLock::new();
     rsbinder::declare_binder_interface! {
         ITestService["android.aidl.fixedsizearray.ITestService"] {
             native: {
@@ -412,11 +409,11 @@ pub mod FixedSizeArrayExample {
         pub trait IRepeatFixedSizeArray: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>;
-            fn getDefaultImpl() -> IRepeatFixedSizeArrayDefaultRef where Self: Sized {
-                DEFAULT_IMPL.lock().unwrap().clone()
+            fn getDefaultImpl() -> Option<IRepeatFixedSizeArrayDefaultRef> where Self: Sized {
+                DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IRepeatFixedSizeArrayDefaultRef) -> IRepeatFixedSizeArrayDefaultRef where Self: Sized {
-                std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+                DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
         pub trait IRepeatFixedSizeArrayAsync<P>: rsbinder::Interface + Send {
@@ -477,11 +474,8 @@ pub mod FixedSizeArrayExample {
         pub(crate) mod transactions {
             pub(crate) const r#Repeat2dParcelables: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
         }
-        pub type IRepeatFixedSizeArrayDefaultRef = Option<std::sync::Arc<dyn IRepeatFixedSizeArrayDefault>>;
-        use lazy_static::lazy_static;
-        lazy_static! {
-            static ref DEFAULT_IMPL: std::sync::Mutex<IRepeatFixedSizeArrayDefaultRef> = std::sync::Mutex::new(None);
-        }
+        pub type IRepeatFixedSizeArrayDefaultRef = std::sync::Arc<dyn IRepeatFixedSizeArrayDefault>;
+        static DEFAULT_IMPL: std::sync::OnceLock<IRepeatFixedSizeArrayDefaultRef> = std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IRepeatFixedSizeArray["android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray"] {
                 native: {
@@ -615,11 +609,11 @@ pub mod FixedSizeArrayExample {
         #![allow(non_upper_case_globals, non_snake_case, dead_code)]
         pub trait IEmptyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface" }
-            fn getDefaultImpl() -> IEmptyInterfaceDefaultRef where Self: Sized {
-                DEFAULT_IMPL.lock().unwrap().clone()
+            fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {
+                DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IEmptyInterfaceDefaultRef) -> IEmptyInterfaceDefaultRef where Self: Sized {
-                std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+                DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
         pub trait IEmptyInterfaceAsync<P>: rsbinder::Interface + Send {
@@ -671,11 +665,8 @@ pub mod FixedSizeArrayExample {
         }
         pub(crate) mod transactions {
         }
-        pub type IEmptyInterfaceDefaultRef = Option<std::sync::Arc<dyn IEmptyInterfaceDefault>>;
-        use lazy_static::lazy_static;
-        lazy_static! {
-            static ref DEFAULT_IMPL: std::sync::Mutex<IEmptyInterfaceDefaultRef> = std::sync::Mutex::new(None);
-        }
+        pub type IEmptyInterfaceDefaultRef = std::sync::Arc<dyn IEmptyInterfaceDefault>;
+        static DEFAULT_IMPL: std::sync::OnceLock<IEmptyInterfaceDefaultRef> = std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IEmptyInterface["android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface"] {
                 native: {
@@ -761,11 +752,11 @@ pub mod ArrayOfInterfaces {
         #![allow(non_upper_case_globals, non_snake_case, dead_code)]
         pub trait IEmptyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
-            fn getDefaultImpl() -> IEmptyInterfaceDefaultRef where Self: Sized {
-                DEFAULT_IMPL.lock().unwrap().clone()
+            fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {
+                DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IEmptyInterfaceDefaultRef) -> IEmptyInterfaceDefaultRef where Self: Sized {
-                std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+                DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
         pub trait IEmptyInterfaceAsync<P>: rsbinder::Interface + Send {
@@ -817,11 +808,8 @@ pub mod ArrayOfInterfaces {
         }
         pub(crate) mod transactions {
         }
-        pub type IEmptyInterfaceDefaultRef = Option<std::sync::Arc<dyn IEmptyInterfaceDefault>>;
-        use lazy_static::lazy_static;
-        lazy_static! {
-            static ref DEFAULT_IMPL: std::sync::Mutex<IEmptyInterfaceDefaultRef> = std::sync::Mutex::new(None);
-        }
+        pub type IEmptyInterfaceDefaultRef = std::sync::Arc<dyn IEmptyInterfaceDefault>;
+        static DEFAULT_IMPL: std::sync::OnceLock<IEmptyInterfaceDefaultRef> = std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IEmptyInterface["ArrayOfInterfaces.IEmptyInterface"] {
                 native: {
@@ -856,11 +844,11 @@ pub mod ArrayOfInterfaces {
         pub trait IMyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>>;
-            fn getDefaultImpl() -> IMyInterfaceDefaultRef where Self: Sized {
-                DEFAULT_IMPL.lock().unwrap().clone()
+            fn getDefaultImpl() -> Option<IMyInterfaceDefaultRef> where Self: Sized {
+                DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IMyInterfaceDefaultRef) -> IMyInterfaceDefaultRef where Self: Sized {
-                std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+                DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
         pub trait IMyInterfaceAsync<P>: rsbinder::Interface + Send {
@@ -921,11 +909,8 @@ pub mod ArrayOfInterfaces {
         pub(crate) mod transactions {
             pub(crate) const r#methodWithInterfaces: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
         }
-        pub type IMyInterfaceDefaultRef = Option<std::sync::Arc<dyn IMyInterfaceDefault>>;
-        use lazy_static::lazy_static;
-        lazy_static! {
-            static ref DEFAULT_IMPL: std::sync::Mutex<IMyInterfaceDefaultRef> = std::sync::Mutex::new(None);
-        }
+        pub type IMyInterfaceDefaultRef = std::sync::Arc<dyn IMyInterfaceDefault>;
+        static DEFAULT_IMPL: std::sync::OnceLock<IMyInterfaceDefaultRef> = std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IMyInterface["ArrayOfInterfaces.IMyInterface"] {
                 native: {
@@ -1600,11 +1585,11 @@ pub mod ITestService {
     pub trait ITestService: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "ITestService" }
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum>;
-        fn getDefaultImpl() -> ITestServiceDefaultRef where Self: Sized {
-            DEFAULT_IMPL.lock().unwrap().clone()
+        fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
+            DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: ITestServiceDefaultRef) -> ITestServiceDefaultRef where Self: Sized {
-            std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+            DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
     pub trait ITestServiceAsync<P>: rsbinder::Interface + Send {
@@ -1665,11 +1650,8 @@ pub mod ITestService {
     pub(crate) mod transactions {
         pub(crate) const r#RepeatByteEnum: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
     }
-    pub type ITestServiceDefaultRef = Option<std::sync::Arc<dyn ITestServiceDefault>>;
-    use lazy_static::lazy_static;
-    lazy_static! {
-        static ref DEFAULT_IMPL: std::sync::Mutex<ITestServiceDefaultRef> = std::sync::Mutex::new(None);
-    }
+    pub type ITestServiceDefaultRef = std::sync::Arc<dyn ITestServiceDefault>;
+    static DEFAULT_IMPL: std::sync::OnceLock<ITestServiceDefaultRef> = std::sync::OnceLock::new();
     rsbinder::declare_binder_interface! {
         ITestService["ITestService"] {
             native: {
