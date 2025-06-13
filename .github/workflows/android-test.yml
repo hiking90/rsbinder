@@ -31,8 +31,14 @@ jobs:
 
     - name: Install system images and emulator
       run: |
-        yes | sdkmanager "system-images;android-34;google_apis;x86_64"
-        yes | sdkmanager "emulator"
+        echo "Installing system images..."
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "system-images;android-34;google_apis;x86_64"
+        echo "Installing emulator..."
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "emulator"
+        echo "Installing platform-tools..."
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "platform-tools"
+        echo "Verifying installations..."
+        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list_installed | grep -E "(system-images|emulator|platform-tools)"
 
     - name: Install Android NDK
       run: |
@@ -59,25 +65,35 @@ jobs:
         echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
         echo "ANDROID_HOME: $ANDROID_HOME"
         echo "HOME: $HOME"
-        echo "export PATH=\$PATH:\$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
         echo "PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
         ls -la $ANDROID_SDK_ROOT/
+        echo "Setting up Android directories..."
+        mkdir -p $HOME/.android
+        chmod 755 $HOME/.android
+        export ANDROID_AVD_HOME=$HOME/.android/avd
+        echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
     - name: Create AVD
       run: |
         echo "Creating AVD..."
         mkdir -p $HOME/.android/avd
+        echo "Checking installed packages..."
+        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list_installed
         echo "Checking available system images..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list | grep "system-images" | head -10
-        echo "Checking available devices..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager list device | head -20
-        echo "Creating AVD with verbose output..."
-        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64" --device "pixel_6" --verbose || echo "AVD creation failed, trying without device profile..."
-        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64" --verbose || echo "AVD creation failed again"
-        echo "Checking AVD creation..."
+        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list | grep "system-images;android-34" | head -5
+        echo "Creating AVD with basic configuration..."
+        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64" --abi google_apis/x86_64 --path $HOME/.android/avd/test.avd || {
+          echo "First attempt failed, trying alternative method..."
+          echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64"
+        }
+        echo "Checking AVD creation result..."
         $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager list avd
-        echo "Checking AVD directory..."
-        ls -la $HOME/.android/avd/ || echo "AVD directory not found"
+        echo "Checking AVD directory structure..."
+        ls -la $HOME/.android/avd/
+        if [ -d "$HOME/.android/avd/test.avd" ]; then
+          echo "AVD directory found:"
+          ls -la $HOME/.android/avd/test.avd/
+        fi
 
     - name: Start emulator in background
       run: |
