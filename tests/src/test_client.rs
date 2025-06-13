@@ -954,7 +954,7 @@ impl ITestServiceDefault for TestDefaultImpl {
 #[test]
 fn test_default_impl() {
     let service = get_test_service();
-    let di: ITestServiceDefaultRef = Some(Arc::new(TestDefaultImpl));
+    let di: ITestServiceDefaultRef = Arc::new(TestDefaultImpl);
     <BpTestService as ITestService::ITestService>::setDefaultImpl(di);
 
     let result = service.UnimplementedMethod(EXPECTED_ARG_VALUE);

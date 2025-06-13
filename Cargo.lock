@@ -859,7 +859,6 @@ dependencies = [
  "async-trait",
  "downcast-rs",
  "env_logger",
- "lazy_static",
  "log",
  "pretty-hex",
  "rsbinder-aidl",
@@ -873,7 +872,6 @@ name = "rsbinder-aidl"
 version = "0.3.3"
 dependencies = [
  "convert_case",
- "lazy_static",
  "pest",
  "pest_derive",
  "serde",
@@ -888,7 +886,6 @@ dependencies = [
  "anstyle",
  "clap",
  "env_logger",
- "lazy_static",
  "log",
  "rsbinder",
 ]
