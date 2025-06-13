@@ -8,7 +8,6 @@ license = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = { workspace = true }
 rsbinder = { workspace = true }
 tokio = { workspace = true }
 env_logger = { workspace = true }

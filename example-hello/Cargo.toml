@@ -12,7 +12,6 @@ sync = ["rsbinder/sync", "rsbinder-aidl/sync"]
 async = ["rsbinder/async", "rsbinder-aidl/async"]
 
 [dependencies]
-lazy_static = { workspace = true }
 rsbinder = { workspace = true }
 env_logger = { workspace = true }
 async-trait = { workspace = true }

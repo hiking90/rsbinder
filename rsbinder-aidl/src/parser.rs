@@ -1429,57 +1429,6 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::Path;
-
-    fn parse_str(aidl: &str) -> Result<(), Box<dyn Error>> {
-        match AIDLParser::parse(Rule::document, aidl) {
-            Ok(_res) => {
-                println!("Success");
-                Ok(())
-            }
-            Err(err) => {
-                println!("{}", err);
-                Err(Box::new(err))
-            }
-        }
-    }
-
-    // fn parse_document_test(doc: &str) -> Result<(), Box<dyn Error>> {
-    //     parse_document(doc)?;
-
-    //     Ok(())
-    // }
-
-    fn parse_dir(
-        path: &Path,
-        parser: fn(data: &str) -> Result<(), Box<dyn Error>>,
-    ) -> Result<(), Box<dyn Error>> {
-        let entries = fs::read_dir(path).unwrap();
-
-        for entry in entries {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                parse_dir(&path, parser)?;
-            }
-            if path.is_file() && path.extension().unwrap_or_default() == "aidl" {
-                let unparsed_file = fs::read_to_string(path.clone()).expect("cannot read file");
-                // println!("File: {}", path.display());
-                parser(&unparsed_file)?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_only() -> Result<(), Box<dyn Error>> {
-        parse_dir(Path::new("aidl"), parse_str)
-    }
-
-    // #[test]
-    // fn test_parse_document() -> Result<(), Box<dyn Error>> {
-    //     parse_dir(&Path::new("aidl"), parse_document_test)
-    // }
 
     #[test]
     fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {

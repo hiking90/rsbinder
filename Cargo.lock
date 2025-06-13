@@ -362,7 +362,6 @@ version = "0.3.3"
 dependencies = [
  "async-trait",
  "env_logger",
- "lazy_static",
  "rsbinder",
  "rsbinder-aidl",
 ]
@@ -1091,7 +1090,6 @@ version = "0.3.3"
 dependencies = [
  "async-trait",
  "env_logger",
- "lazy_static",
  "log",
  "rsbinder",
  "rsbinder-aidl",
