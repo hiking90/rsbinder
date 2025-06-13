@@ -161,11 +161,11 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
         {%- endfor %}
-        fn getDefaultImpl() -> {{ name }}DefaultRef where Self: Sized {
-            DEFAULT_IMPL.lock().unwrap().clone()
+        fn getDefaultImpl() -> Option<{{ name }}DefaultRef> where Self: Sized {
+            DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: {{ name }}DefaultRef) -> {{ name }}DefaultRef where Self: Sized {
-            std::mem::replace(&mut *DEFAULT_IMPL.lock().unwrap(), d)
+            DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
     {%- if enabled_async %}
@@ -244,11 +244,8 @@ pub mod {{mod}} {
         {%- set_global counter = counter + 1 %}
         {%- endfor %}
     }
-    pub type {{ name }}DefaultRef = Option<std::sync::Arc<dyn {{ name }}Default>>;
-    use lazy_static::lazy_static;
-    lazy_static! {
-        static ref DEFAULT_IMPL: std::sync::Mutex<{{ name }}DefaultRef> = std::sync::Mutex::new(None);
-    }
+    pub type {{ name }}DefaultRef = std::sync::Arc<dyn {{ name }}Default>;
+    static DEFAULT_IMPL: std::sync::OnceLock<{{ name }}DefaultRef> = std::sync::OnceLock::new();
     {{crate}}::declare_binder_interface! {
         {{ name }}["{{ namespace }}"] {
             native: {
@@ -396,8 +393,10 @@ pub mod {{mod}} {
 }
 "#;
 
-lazy_static! {
-    pub static ref TEMPLATES: Tera = {
+fn template() -> &'static tera::Tera {
+    static TEMPLATES: std::sync::OnceLock<tera::Tera> = std::sync::OnceLock::new();
+
+    TEMPLATES.get_or_init(|| {
         let mut tera = Tera::default();
         tera.add_raw_template("enum", ENUM_TEMPLATE)
             .expect("Failed to add enum template");
@@ -408,8 +407,23 @@ lazy_static! {
         tera.add_raw_template("interface", INTERFACE_TEMPLATE)
             .expect("Failed to add interface template");
         tera
-    };
+    })
 }
+
+// lazy_static! {
+//     pub static ref TEMPLATES: Tera = {
+//         let mut tera = Tera::default();
+//         tera.add_raw_template("enum", ENUM_TEMPLATE)
+//             .expect("Failed to add enum template");
+//         tera.add_raw_template("union", UNION_TEMPLATE)
+//             .expect("Failed to add union template");
+//         tera.add_raw_template("parcelable", PARCELABLE_TEMPLATE)
+//             .expect("Failed to add parcelable template");
+//         tera.add_raw_template("interface", INTERFACE_TEMPLATE)
+//             .expect("Failed to add interface template");
+//         tera
+//     };
+// }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct FnMembers {
@@ -681,7 +695,7 @@ impl Generator {
         context.insert("enabled_async", &enabled_async);
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = TEMPLATES
+        let rendered = template()
             .render("interface", &context)
             .expect("Failed to render interface template");
 
@@ -785,7 +799,7 @@ impl Generator {
         context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = TEMPLATES
+        let rendered = template()
             .render("parcelable", &context)
             .expect("Failed to render parcelable template");
 
@@ -824,7 +838,7 @@ impl Generator {
         context.insert("enum_len", &decl.enumerator_list.len());
         context.insert("members", &members);
 
-        let rendered = TEMPLATES
+        let rendered = template()
             .render("enum", &context)
             .expect("Failed to render enum template");
 
@@ -895,7 +909,7 @@ impl Generator {
         context.insert("const_members", &constant_members);
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = TEMPLATES
+        let rendered = template()
             .render("union", &context)
             .expect("Failed to render union template");
 

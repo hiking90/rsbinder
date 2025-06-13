@@ -20,7 +20,6 @@ async = []
 pest = { workspace = true }
 pest_derive = { workspace = true }
 convert_case = { workspace = true }
-lazy_static = { workspace = true }
 serde = { workspace = true }
 tera = { workspace = true }
 

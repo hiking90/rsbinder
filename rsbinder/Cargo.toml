@@ -13,10 +13,20 @@ keywords.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["tokio"]
+default = ["tokio", "android_11_plus"]
 sync = ["rsbinder-aidl/sync"]
 tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
+android_11 = []
+android_12 = []
+android_13 = []
+android_14 = []
+android_16 = []
+android_11_plus = ["android_11", "android_12", "android_13", "android_14", "android_16"]
+android_12_plus = ["android_12", "android_13", "android_14", "android_16"]
+android_13_plus = ["android_13", "android_14", "android_16"]
+android_14_plus = ["android_14", "android_16"]
+android_16_plus = ["android_16"]
 
 [dependencies]
 rustix = { workspace = true, features = ["process", "param", "mm"] }
@@ -24,7 +34,6 @@ log = { workspace = true }
 pretty_hex = { workspace = true }
 downcast-rs = { workspace = true }
 async-trait = { workspace = true, optional = true }
-lazy_static = { workspace = true }
 tokio = { workspace = true, optional = true }
 rsproperties.workspace = true
 
