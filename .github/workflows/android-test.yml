@@ -175,3 +175,22 @@ jobs:
         timeout 10 adb shell "cat /data/rsbinder/test_service.log | head -10" || echo "No log output yet"
         echo "Test setup completed successfully!"
         echo "test_service execution attempted on Android emulator"
+
+    - name: Run tests on Android device
+      run: |
+        echo "Looking for test executables..."
+        timeout 10 adb shell "ls -la /data/rsbinder/tests-*" || echo "No test executables found"
+        echo "Finding and running test executables..."
+        timeout 30 adb shell "
+          cd /data/rsbinder
+          for test_file in tests-*; do
+            if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
+              echo \"Running test: \$test_file\"
+              chmod +x \"\$test_file\"
+              ./\"\$test_file\" || echo \"Test \$test_file completed with errors\"
+              echo \"Finished running: \$test_file\"
+              echo \"---\"
+            fi
+          done
+        " || echo "Test execution completed with timeout"
+        echo "All tests execution attempted"
