@@ -54,16 +54,29 @@ jobs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
+    - name: Debug Android SDK setup
+      run: |
+        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+        echo "ANDROID_HOME: $ANDROID_HOME"
+        echo "HOME: $HOME"
+        ls -la $ANDROID_SDK_ROOT/
+        which avdmanager
+        which emulator
+
     - name: Create AVD
       run: |
         echo "Creating AVD..."
+        mkdir -p $HOME/.android/avd
         echo "no" | avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64"
+        echo "Checking AVD creation..."
+        avdmanager list avd
 
     - name: Start emulator in background
       run: |
         echo "Starting emulator..."
-        $ANDROID_SDK_ROOT/emulator/emulator -avd test -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data &
+        nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data > emulator.log 2>&1 &
         echo "Emulator started in background"
+        sleep 10
 
     - name: Wait for emulator to be ready
       run: |
