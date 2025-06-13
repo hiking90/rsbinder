@@ -87,11 +87,38 @@ $ cargo run --bin hello_client
 * Please follow the guideline of https://github.com/bbqsrc/cargo-ndk
 
 ## Compatibility Goal with Android Binder
+
 ### Mutual Communication:
 Both rsbinder and Android Binder utilize the same core protocol, enabling seamless communication between Android services and rsbinder clients, and vice versa. However, continued development is currently underway to further refine this interoperability.
 
+### Protocol Level Compatibility:
+**rsbinder** implements the same low-level Binder protocol as Android, ensuring binary compatibility at the kernel interface level. This means:
+- **Transaction Format**: Uses identical `binder_transaction_data` structures
+- **Object Types**: Supports all Android Binder object types (BINDER, HANDLE, FD)
+- **Command Protocols**: Implements the same ioctl commands (BC_*/BR_* protocol)
+- **Memory Management**: Compatible parcel serialization and shared memory handling
+
+### Android Version Support:
+**rsbinder** provides feature flags for different Android versions to handle API evolution:
+```toml
+# Enable specific Android version compatibility
+[features]
+android_11 = []      # Android 11 (API 30)
+android_12 = []      # Android 12 (API 31)
+android_13 = []      # Android 13 (API 33)
+android_14 = []      # Android 14 (API 34)
+android_16 = []      # Android 16 (API 36)
+android_11_plus = ["android_11", "android_12", "android_13", "android_14", "android_16"]
+```
+
+### AIDL Compatibility:
+The **rsbinder-aidl** compiler generates Rust code that maintains compatibility with Android's AIDL:
+- **Interface Definition**: Same `.aidl` syntax and semantics
+- **Data Types**: Support for all AIDL primitive and complex types
+- **Parcelable**: Compatible serialization with Android's Parcelable
+
 ### API Differences:
-Complete API parity between rsbinder and Android Binder isn't available due to fundamental differences in their underlying architectures. Nonetheless, both APIs share a high degree of similarity, minimizing the learning curve for developers familiar with either system.
+Complete API parity between rsbinder and Android Binder isn't available due to fundamental differences in their underlying architectures:
 
 ## Todo
 - [x] Implement Binder crate.
@@ -100,10 +127,9 @@ Complete API parity between rsbinder and Android Binder isn't available due to f
 - [x] Port Android test_service and test_client and pass the test cases.
 - [x] Support Tokio async.
 - [x] Remove all todo!() and unimplemented!() macros.
+- [x] Perform compatibility testing with Binder on Android.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] (In Progress) Perform compatibility testing with Binder on Android.
 - [ ] Enhance error detection in AIDL code generator
-- [ ] Support AIDL version and hash.
 
 ## License
 **rsbinder** is licensed under the **Apache License version 2.0**.

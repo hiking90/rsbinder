@@ -8,7 +8,7 @@ license = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rsbinder = { workspace = true }
+rsbinder = { workspace = true, features = ["android_11_plus"] }
 tokio = { workspace = true }
 env_logger = { workspace = true }
 rustix = { workspace = true, features = ["pipe"] }

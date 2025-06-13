@@ -13,7 +13,7 @@ keywords.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["tokio", "android_11_plus"]
+default = ["tokio"]
 sync = ["rsbinder-aidl/sync"]
 tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
