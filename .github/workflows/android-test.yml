@@ -25,19 +25,17 @@ jobs:
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
-      with:
-        api-level: ${{ matrix.api-level }}
 
     - name: Install system images and emulator
       run: |
         echo "Installing system images for API level ${{ matrix.api-level }}..."
-        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
         echo "Installing emulator..."
-        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "emulator"
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "emulator"
         echo "Installing platform-tools..."
-        yes | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager "platform-tools"
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "platform-tools"
         echo "Verifying installations..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list_installed | grep -E "(system-images|emulator|platform-tools)"
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list_installed | grep -E "(system-images|emulator|platform-tools)"
 
     - name: Install Android NDK
       run: |
@@ -64,7 +62,7 @@ jobs:
         echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
         echo "ANDROID_HOME: $ANDROID_HOME"
         echo "HOME: $HOME"
-        echo "PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
+        echo "PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
         ls -la $ANDROID_SDK_ROOT/
         echo "Setting up Android directories..."
         mkdir -p $HOME/.android
@@ -77,16 +75,16 @@ jobs:
         echo "Creating AVD for API level ${{ matrix.api-level }}..."
         mkdir -p $HOME/.android/avd
         echo "Checking installed packages..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list_installed
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list_installed
         echo "Checking available system images..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager --list | grep "system-images;android-${{ matrix.api-level }}" | head -5
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list | grep "system-images;android-${{ matrix.api-level }}" | head -5
         echo "Creating AVD with basic configuration..."
-        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64" --abi google_apis/x86_64 --path $HOME/.android/avd/test-api${{ matrix.api-level }}.avd || {
+        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64" --abi google_apis/x86_64 --path $HOME/.android/avd/test-api${{ matrix.api-level }}.avd || {
           echo "First attempt failed, trying alternative method..."
-          echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
+          echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
         }
         echo "Checking AVD creation result..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager list avd
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager list avd
         echo "Checking AVD directory structure..."
         ls -la $HOME/.android/avd/
         if [ -d "$HOME/.android/avd/test-api${{ matrix.api-level }}.avd" ]; then
@@ -97,7 +95,7 @@ jobs:
     - name: Start emulator in background
       run: |
         echo "Checking if AVD exists for API level ${{ matrix.api-level }}..."
-        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager list avd
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager list avd
         if [ -f "$HOME/.android/avd/test-api${{ matrix.api-level }}.avd/config.ini" ]; then
           echo "AVD config found, starting emulator..."
           nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test-api${{ matrix.api-level }} -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data > emulator.log 2>&1 &
