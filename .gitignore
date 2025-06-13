@@ -1,4 +1,4 @@
 target
 gen
-.*
+.vscode
 REMOTE_LINUX
