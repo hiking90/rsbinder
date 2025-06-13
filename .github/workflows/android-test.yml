@@ -149,6 +149,24 @@ jobs:
         source ./envsetup.sh
         ndk_build && ndk_sync
 
+    - name: Copy test executables to Android device
+      run: |
+        source ./envsetup.sh
+        read_remote_android
+        echo "Copying test executables from deps directory..."
+        deps_directory="$source_directory/deps"
+        if [ -d "$deps_directory" ]; then
+          echo "Found deps directory: $deps_directory"
+          echo "Looking for test executables..."
+          find "$deps_directory" -name "tests-*" -type f -executable | while read test_file; do
+            echo "Copying test file: $test_file"
+            adb push "$test_file" "$remote_directory/"
+          done
+          echo "Test executable copy completed"
+        else
+          echo "deps directory not found: $deps_directory"
+        fi
+
     - name: Run test_service on Android device
       run: |
         echo "Starting test_service in background..."
