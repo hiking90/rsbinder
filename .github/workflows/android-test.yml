@@ -29,6 +29,11 @@ jobs:
       with:
         api-level: 34
 
+    - name: Install system images and emulator
+      run: |
+        yes | sdkmanager "system-images;android-34;google_apis;x86_64"
+        yes | sdkmanager "emulator"
+
     - name: Install Android NDK
       run: |
         yes | sdkmanager "ndk;25.2.9519653"
@@ -49,22 +54,26 @@ jobs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
-    - name: Create and start AVD
-      uses: reactivecircus/android-emulator-runner@v2
-      with:
-        api-level: 34
-        target: google_apis
-        arch: x86_64
-        profile: Nexus 6
-        emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-        disable-animations: true
-        script: |
-          echo "AVD created and started"
+    - name: Create AVD
+      run: |
+        echo "Creating AVD..."
+        echo "no" | avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64"
+
+    - name: Start emulator in background
+      run: |
+        echo "Starting emulator..."
+        $ANDROID_SDK_ROOT/emulator/emulator -avd test -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data &
+        echo "Emulator started in background"
 
     - name: Wait for emulator to be ready
       run: |
+        echo "Waiting for device..."
         adb wait-for-device
-        adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done; input keyevent 82'
+        echo "Device detected, waiting for boot completion..."
+        timeout 300 bash -c 'while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do echo "Waiting for boot..."; sleep 5; done'
+        echo "Boot completed, unlocking screen..."
+        adb shell input keyevent 82
+        echo "Emulator is ready"
 
     - name: Create REMOTE_ANDROID file
       run: |
