@@ -54,22 +54,24 @@ jobs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
-    - name: Debug Android SDK setup
+    - name: Setup Android SDK PATH
       run: |
         echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
         echo "ANDROID_HOME: $ANDROID_HOME"
         echo "HOME: $HOME"
+        echo "export PATH=\$PATH:\$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
+        echo "PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/16.0/bin:$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/emulator" >> $GITHUB_ENV
         ls -la $ANDROID_SDK_ROOT/
-        which avdmanager
-        which emulator
 
     - name: Create AVD
       run: |
         echo "Creating AVD..."
         mkdir -p $HOME/.android/avd
-        echo "no" | avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64"
+        which avdmanager
+        which emulator
+        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager create avd --force -n test -k "system-images;android-34;google_apis;x86_64" --device "pixel"
         echo "Checking AVD creation..."
-        avdmanager list avd
+        $ANDROID_SDK_ROOT/cmdline-tools/16.0/bin/avdmanager list avd
 
     - name: Start emulator in background
       run: |
@@ -77,6 +79,8 @@ jobs:
         nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data > emulator.log 2>&1 &
         echo "Emulator started in background"
         sleep 10
+        echo "Checking emulator log..."
+        cat emulator.log | head -20 || echo "No log yet"
 
     - name: Wait for emulator to be ready
       run: |
