@@ -891,9 +891,9 @@ dependencies = [
 
 [[package]]
 name = "rsproperties"
-version = "0.1.3"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac3faaf25327e4497fa832f7bd6c816c37bb30bf8e834b16730728ec603d3fc"
+checksum = "181f8ff1dc3c40000d888a593e2819d6ee12fb46147d80f6a8a04e9faed53b7d"
 dependencies = [
  "log",
  "pretty-hex",
