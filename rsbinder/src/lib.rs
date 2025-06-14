@@ -61,9 +61,7 @@ static ANDROID_SDK_VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new(
 /// Get the Android version.
 #[cfg(target_os = "android")]
 pub fn get_android_sdk_version() -> u32 {
-    *ANDROID_SDK_VERSION.get_or_init(|| {
-        rsproperties::get_or("ro.build.version.sdk", 0)
-    })
+    *ANDROID_SDK_VERSION.get_or_init(|| rsproperties::get_or("ro.build.version.sdk", 0))
 }
 
 #[cfg(test)]
