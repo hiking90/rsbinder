@@ -11,6 +11,7 @@ pub use android::os::IServiceManager::{
 };
 
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
+pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.

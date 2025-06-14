@@ -17,7 +17,9 @@ pub mod android_12 {
     pub use super::servicemanager_12::*;
 }
 
+#[cfg(all(target_os = "android", feature = "android_13"))]
 mod servicemanager_13;
+#[cfg(all(target_os = "android", feature = "android_13"))]
 pub mod android_13 {
     pub use super::servicemanager_13::*;
 }
@@ -29,16 +31,14 @@ pub mod android_14 {
     pub use super::servicemanager_14::*;
 }
 
-#[cfg(all(target_os = "android", feature = "android_16"))]
 mod servicemanager_16;
-#[cfg(all(target_os = "android", feature = "android_16"))]
 pub mod android_16 {
     pub use super::servicemanager_16::*;
 }
 
 use crate::*;
 
-pub use android_13::{
+pub use android_16::{
     BnServiceCallback, IServiceCallback, ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL,
     DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH,
     DUMP_FLAG_PRIORITY_NORMAL,
@@ -71,10 +71,10 @@ pub enum ServiceManager {
     Android11(android_11::BpServiceManager),
     #[cfg(all(target_os = "android", feature = "android_12"))]
     Android12(android_12::BpServiceManager),
+    #[cfg(all(target_os = "android", feature = "android_13"))]
     Android13(android_13::BpServiceManager),
     #[cfg(all(target_os = "android", feature = "android_14"))]
     Android14(android_14::BpServiceManager),
-    #[cfg(all(target_os = "android", feature = "android_16"))]
     Android16(android_16::BpServiceManager),
 }
 
@@ -99,10 +99,10 @@ pub fn default() -> Arc<ServiceManager> {
             }
 
             match sdk_version {
-                #[cfg(feature = "android_16")]
                 sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
                 #[cfg(feature = "android_14")]
                 sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => create_service_manager!(Android14, android_14),
+                #[cfg(feature = "android_13")]
                 sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
                 #[cfg(feature = "android_12")]
                 sdk_versions::ANDROID_12 => create_service_manager!(Android12, android_12),
@@ -113,7 +113,7 @@ pub fn default() -> Arc<ServiceManager> {
         };
 
         #[cfg(not(target_os = "android"))]
-        let service_manager = ServiceManager::Android13(android_13::BpServiceManager::from_binder(context)
+        let service_manager = ServiceManager::Android16(android_16::BpServiceManager::from_binder(context)
             .expect(ERROR_MSG));
 
         Arc::new(service_manager)
@@ -127,10 +127,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::get_service(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => {
                 android_16::get_service(sm, name).and_then(|s| s.service)
             }
@@ -143,10 +143,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::get_interface(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::get_interface(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::get_interface(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::get_interface(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => android_16::get_interface(sm, name),
         }
     }
@@ -157,10 +157,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::check_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::check_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::check_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::check_service(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => {
                 android_16::check_service(sm, name).and_then(|s| s.service)
             }
@@ -172,10 +172,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::is_declared(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::is_declared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::is_declared(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
         }
     }
@@ -186,10 +186,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::list_services(sm, dump_priority),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::list_services(sm, dump_priority),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::list_services(sm, dump_priority),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => android_16::list_services(sm, dump_priority),
         }
     }
@@ -204,10 +204,10 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::add_service(sm, identifier, binder),
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => android_16::add_service(sm, identifier, binder),
         }
     }
@@ -223,35 +223,35 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: Converting android_12::ServiceDebugInfo to android_13::ServiceDebugInfo is safe because:
+                // SAFETY: Converting android_12::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
                 // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
                 // 2. Both have the same memory layout: name (String) + debugPid (i32)
                 // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
                 let a12_result = android_12::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a12_result) };
-                Ok(a13_result)
+                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a12_result) };
+                Ok(a16_result)
             }
-            ServiceManager::Android13(sm) => android_13::get_service_debug_info(sm),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                // SAFETY: Converting android_13::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
+                // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
+                // 2. Both have the same memory layout: name (String) + debugPid (i32)
+                // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
+                let a13_result = android_13::get_service_debug_info(sm)?;
+                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a13_result) };
+                Ok(a16_result)
+            }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: Converting android_14::ServiceDebugInfo to android_13::ServiceDebugInfo is safe because:
+                // SAFETY: Converting android_14::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
                 // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
                 // 2. Both have the same memory layout: name (String) + debugPid (i32)
                 // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
                 let a14_result = android_14::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a14_result) };
-                Ok(a13_result)
+                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a14_result) };
+                Ok(a16_result)
             }
-            #[cfg(all(target_os = "android", feature = "android_16"))]
-            ServiceManager::Android16(sm) => {
-                // SAFETY: Converting android_16::ServiceDebugInfo to android_13::ServiceDebugInfo is safe because:
-                // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
-                // 2. Both have the same memory layout: name (String) + debugPid (i32)
-                // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
-                let a16_result = android_16::get_service_debug_info(sm)?;
-                let a13_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a16_result) };
-                Ok(a13_result)
-            }
+            ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
         }
     }
 
@@ -279,7 +279,13 @@ impl ServiceManager {
                 };
                 android_12::register_for_notifications(sm, name, callback)
             }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
+                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
+                let callback = unsafe {
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_13::IServiceCallback>)
+                };
                 android_13::register_for_notifications(sm, name, callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
@@ -291,13 +297,7 @@ impl ServiceManager {
                 };
                 android_14::register_for_notifications(sm, name, callback)
             }
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_16::IServiceCallback>)
-                };
                 android_16::register_for_notifications(sm, name, callback)
             }
         }
@@ -327,7 +327,13 @@ impl ServiceManager {
                 };
                 android_12::unregister_for_notifications(sm, name, callback)
             }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
+                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
+                let callback = unsafe {
+                    &*(callback as *const _
+                        as *const crate::Strong<dyn android_13::IServiceCallback>)
+                };
                 android_13::unregister_for_notifications(sm, name, callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
@@ -339,13 +345,7 @@ impl ServiceManager {
                 };
                 android_14::unregister_for_notifications(sm, name, callback)
             }
-            #[cfg(all(target_os = "android", feature = "android_16"))]
             ServiceManager::Android16(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_16::IServiceCallback>)
-                };
                 android_16::unregister_for_notifications(sm, name, callback)
             }
         }

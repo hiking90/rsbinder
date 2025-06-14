@@ -3,7 +3,7 @@
 #![allow(non_snake_case)]
 
 use env_logger::Env;
-use hub::android_13::{BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
+use hub::android_16::{BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
 use rsbinder::*;
 use std::{
     collections::HashMap,
@@ -45,11 +45,11 @@ struct Inner {
     name_to_service: HashMap<String, Service>,
     name_to_registration_callbacks: HashMap<
         String,
-        Vec<rsbinder::Strong<dyn hub::android_13::android::os::IServiceCallback::IServiceCallback>>,
+        Vec<rsbinder::Strong<dyn hub::android_16::android::os::IServiceCallback::IServiceCallback>>,
     >,
     name_to_client_callbacks: HashMap<
         String,
-        Vec<rsbinder::Strong<dyn hub::android_13::android::os::IClientCallback::IClientCallback>>,
+        Vec<rsbinder::Strong<dyn hub::android_16::android::os::IClientCallback::IClientCallback>>,
     >,
 }
 
@@ -399,7 +399,7 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
         arg_callback: &rsbinder::Strong<
-            dyn hub::android_13::android::os::IServiceCallback::IServiceCallback,
+            dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
     ) -> rsbinder::status::Result<()> {
         if !Self::is_valid_service_name(name) {
@@ -433,7 +433,7 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
         callback: &rsbinder::Strong<
-            dyn hub::android_13::android::os::IServiceCallback::IServiceCallback,
+            dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
     ) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -467,7 +467,7 @@ impl IServiceManager for ServiceManager {
         &self,
         _arg_name: &str,
     ) -> rsbinder::status::Result<
-        Option<hub::android_13::android::os::ConnectionInfo::ConnectionInfo>,
+        Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
     > {
         log::warn!("getConnectionInfo is not implemented");
         Ok(None)
@@ -478,7 +478,7 @@ impl IServiceManager for ServiceManager {
         name: &str,
         arg_service: &rsbinder::SIBinder,
         arg_callback: &rsbinder::Strong<
-            dyn hub::android_13::android::os::IClientCallback::IClientCallback,
+            dyn hub::android_16::android::os::IClientCallback::IClientCallback,
         >,
     ) -> rsbinder::status::Result<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -594,7 +594,7 @@ impl IServiceManager for ServiceManager {
     fn getServiceDebugInfo(
         &self,
     ) -> rsbinder::status::Result<
-        Vec<hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo>,
+        Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>,
     > {
         let inner = self.inner.lock().unwrap();
 
@@ -602,7 +602,7 @@ impl IServiceManager for ServiceManager {
 
         for (name, service) in inner.name_to_service.iter() {
             out.push(
-                hub::android_13::android::os::ServiceDebugInfo::ServiceDebugInfo {
+                hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo {
                     name: name.clone(),
                     debugPid: service.context.pid,
                 },
@@ -610,6 +610,65 @@ impl IServiceManager for ServiceManager {
         }
 
         Ok(out)
+    }
+
+    fn getService2(
+        &self,
+        name: &str,
+    ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
+        match self.inner.lock().unwrap().try_get_binder(name, false)? {
+            Some(binder) => {
+                // Create ServiceWithMetadata
+                let service_with_metadata =
+                    hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
+                        service: Some(binder),
+                        isLazyService: false, // Default to false for Linux implementation
+                    };
+                Ok(
+                    hub::android_16::android::os::Service::Service::ServiceWithMetadata(
+                        service_with_metadata,
+                    ),
+                )
+            }
+            None => {
+                // Return accessor variant with None for non-existent services
+                Ok(hub::android_16::android::os::Service::Service::Accessor(
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn checkService2(
+        &self,
+        name: &str,
+    ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
+        match self.inner.lock().unwrap().try_get_binder(name, false)? {
+            Some(binder) => {
+                // Create ServiceWithMetadata
+                let service_with_metadata =
+                    hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
+                        service: Some(binder),
+                        isLazyService: false, // Default to false for Linux implementation
+                    };
+                Ok(
+                    hub::android_16::android::os::Service::Service::ServiceWithMetadata(
+                        service_with_metadata,
+                    ),
+                )
+            }
+            None => {
+                // Return accessor variant with None for non-existent services
+                Ok(hub::android_16::android::os::Service::Service::Accessor(
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::status::Result<Vec<String>> {
+        log::warn!("getUpdatableNames is not implemented for Linux target");
+        Ok(vec![])
     }
 }
 
