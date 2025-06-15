@@ -60,6 +60,10 @@ jobs:
           RUSTFLAGS: "" # remove -Dwarnings
       - name: Build release
         run: cargo build --workspace --release
+      - name: Check test builds
+        run: |
+          cargo test --workspace --no-run
+          cargo test --workspace --doc --no-run
 
   android-build:
     name: Android Build
@@ -94,4 +98,8 @@ jobs:
         key: ${{ matrix.target }}-${{ env.rust_min }} # Add rust_min to cache key as it's specific now
     - name: Build for Android (${{ matrix.target }})
       run: cargo ndk -t ${{ matrix.target }} build --release
+    - name: Check test builds for Android (${{ matrix.target }})
+      run: |
+        cargo ndk -t ${{ matrix.target }} test --no-run
+        cargo ndk -t ${{ matrix.target }} test --doc --no-run
 
