@@ -5,7 +5,6 @@
 [![crates.io](https://img.shields.io/crates/v/rsbinder.svg)](https://crates.io/crates/rsbinder)
 [![Docs.rs](https://docs.rs/rsbinder/badge.svg)](https://docs.rs/rsbinder)
 [![Rust Version](https://img.shields.io/badge/rustc-1.77+-blue.svg)](https://blog.rust-lang.org/)
-![Test Coverage](https://raw.githubusercontent.com/hiking90/rsbinder/c2d5bcb6026b9929b75a2c5fecd14ad77a95c34e/coverage.svg)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 ## Binder IPC: Available on Linux, Untapped Potential
