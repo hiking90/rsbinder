@@ -99,17 +99,7 @@ Both rsbinder and Android Binder utilize the same core protocol, enabling seamle
 - **Memory Management**: Compatible parcel serialization and shared memory handling
 
 ### Android Version Support:
-**rsbinder** provides feature flags for different Android versions to handle API evolution:
-```toml
-# Enable specific Android version compatibility
-[features]
-android_11 = []      # Android 11 (API 30)
-android_12 = []      # Android 12 (API 31)
-android_13 = []      # Android 13 (API 33)
-android_14 = []      # Android 14 (API 34)
-android_16 = []      # Android 16 (API 36)
-android_11_plus = ["android_11", "android_12", "android_13", "android_14", "android_16"]
-```
+**rsbinder** supports Android versions 11 through 16.
 
 ### AIDL Compatibility:
 The **rsbinder-aidl** compiler generates Rust code that maintains compatibility with Android's AIDL:
