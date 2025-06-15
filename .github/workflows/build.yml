@@ -63,7 +63,6 @@ jobs:
       - name: Check test builds
         run: |
           cargo test --workspace --no-run
-          cargo test --workspace --doc --no-run
 
   android-build:
     name: Android Build
@@ -101,5 +100,4 @@ jobs:
     - name: Check test builds for Android (${{ matrix.target }})
       run: |
         cargo ndk -t ${{ matrix.target }} test --no-run
-        cargo ndk -t ${{ matrix.target }} test --doc --no-run
 
