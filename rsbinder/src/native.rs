@@ -64,6 +64,8 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
+                // Use ManuallyDrop because the file descriptor is managed by the kernel
+                // and should not be automatically closed when the File goes out of scope
                 let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd as _)) };
 
                 self.remotable.on_dump(file.deref_mut(), argv.as_slice())

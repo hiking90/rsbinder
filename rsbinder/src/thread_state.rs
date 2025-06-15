@@ -1239,6 +1239,10 @@ impl std::default::Default for CallingContext {
             match thread_state.transaction.as_ref() {
                 Some(transaction) => {
                     let calling_sid = if !transaction.calling_sid.is_null() {
+                        // SAFETY: The calling_sid pointer is provided by the binder driver
+                        // and is guaranteed to be a valid null-terminated C string during
+                        // the transaction lifetime. We check for null before dereferencing.
+                        // The pointer is cast from *const u8 to *const i8 as required by CStr::from_ptr.
                         unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
                     } else {
                         None
