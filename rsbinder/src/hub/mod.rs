@@ -1,6 +1,49 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! # RSBinder Hub Module
+//!
+//! This module provides a common interface to interact with Android's Service Manager.
+//!
+//! ## Version Compatibility
+//!
+//! Android's Service Manager interface has changed across different Android versions.
+//! This hub module is designed to abstract these differences and provide a consistent API
+//! for the most common operations needed by applications.
+//!
+//! The hub only exposes common functionality that is available across all supported
+//! Android versions. For version-specific features, use the specific version modules
+//! directly (e.g., `android_16`, `android_14`, etc.).
+//!
+//! ## Usage
+//!
+//! ### Common API (Version-Agnostic)
+//!
+//! ```rust,no_run
+//! use rsbinder::hub;
+//!
+//! // Get a service by name
+//! let service = hub::get_service("example_service");
+//!
+//! // List all available services
+//! let services = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL);
+//! ```
+//!
+//! ### Version-Specific API
+//!
+//! If you need to use version-specific features:
+//!
+//! ```rust,no_run
+//! use rsbinder::hub;
+//!
+//! // For Android 16 specific functionality
+//! #[cfg(all(target_os = "android", feature = "android_16"))]
+//! {
+//!     let sm = hub::android_16::BpServiceManager::getService().unwrap();
+//!     // Use Android 16 specific methods here
+//! }
+//! ```
+
 use std::sync::{Arc, OnceLock};
 
 #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -38,6 +81,7 @@ pub mod android_16 {
 
 use crate::*;
 
+// Export Android 16 types as the default public API
 pub use android_16::{
     BnServiceCallback, IServiceCallback, ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL,
     DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH,
@@ -66,6 +110,14 @@ pub mod sdk_versions {
     pub const MAX_SUPPORTED: u32 = ANDROID_16;
 }
 
+/// ServiceManager provides a unified interface to interact with Android's Service Manager
+/// across different Android versions.
+///
+/// This enum internally dispatches calls to the appropriate version-specific implementation
+/// based on the detected Android version or the explicitly specified version.
+///
+/// For version-specific features not covered by the common API, cast to the specific
+/// version's ServiceManager implementation or use the version-specific modules directly.
 pub enum ServiceManager {
     #[cfg(all(target_os = "android", feature = "android_11"))]
     Android11(android_11::BpServiceManager),
@@ -78,6 +130,11 @@ pub enum ServiceManager {
     Android16(android_16::BpServiceManager),
 }
 
+/// Returns the global ServiceManager instance appropriate for the current Android version.
+///
+/// This function creates a singleton ServiceManager instance on first call and returns it
+/// for subsequent calls. The correct version-specific implementation is automatically
+/// selected based on the detected Android SDK version.
 pub fn default() -> Arc<ServiceManager> {
     static GLOBAL_SM: OnceLock<Arc<ServiceManager>> = OnceLock::new();
 
@@ -121,6 +178,9 @@ pub fn default() -> Arc<ServiceManager> {
 }
 
 impl ServiceManager {
+    /// Retrieves a service by name.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn get_service(&self, name: &str) -> Option<SIBinder> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -137,6 +197,9 @@ impl ServiceManager {
         }
     }
 
+    /// Retrieves a service by name and attempts to cast it to the specified interface type.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn get_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -151,6 +214,9 @@ impl ServiceManager {
         }
     }
 
+    /// Checks if a service with the given name is available.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn check_service(&self, name: &str) -> Option<SIBinder> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -166,6 +232,10 @@ impl ServiceManager {
             }
         }
     }
+
+    /// Checks if a service with the given name is declared.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn is_declared(&self, name: &str) -> bool {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -180,6 +250,9 @@ impl ServiceManager {
         }
     }
 
+    /// Returns a list of all registered services with the specified dump priority.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn list_services(&self, dump_priority: i32) -> Vec<String> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -194,6 +267,9 @@ impl ServiceManager {
         }
     }
 
+    /// Registers a service with the service manager.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn add_service(
         &self,
         identifier: &str,
@@ -211,6 +287,11 @@ impl ServiceManager {
             ServiceManager::Android16(sm) => android_16::add_service(sm, identifier, binder),
         }
     }
+
+    /// Retrieves debug information about all registered services.
+    ///
+    /// Note: This feature may not be available on all Android versions.
+    /// On Android 11, this method will return an error.
     pub fn get_service_debug_info(&self) -> Result<Vec<ServiceDebugInfo>> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -255,6 +336,9 @@ impl ServiceManager {
         }
     }
 
+    /// Registers for notifications when a service becomes available.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn register_for_notifications(
         &self,
         name: &str,
@@ -303,6 +387,9 @@ impl ServiceManager {
         }
     }
 
+    /// Unregisters from notifications for a service.
+    ///
+    /// This method is version-agnostic and works across all supported Android versions.
     pub fn unregister_for_notifications(
         &self,
         name: &str,
@@ -352,16 +439,30 @@ impl ServiceManager {
     }
 }
 
+//------------------------------------------------------------------------------
+// Convenience Functions
+//------------------------------------------------------------------------------
+// The following functions provide a simpler API by using the default ServiceManager instance
+
+/// Convenience function to get an interface from the default ServiceManager.
+///
+/// This is equivalent to `default().get_interface(name)`.
 #[inline]
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     default().get_interface(name)
 }
 
+/// Convenience function to list services from the default ServiceManager.
+///
+/// This is equivalent to `default().list_services(dump_priority)`.
 #[inline]
 pub fn list_services(dump_priority: i32) -> Vec<String> {
     default().list_services(dump_priority)
 }
 
+/// Convenience function to register for notifications from the default ServiceManager.
+///
+/// This is equivalent to `default().register_for_notifications(name, callback)`.
 #[inline]
 pub fn register_for_notifications(
     name: &str,
@@ -370,6 +471,9 @@ pub fn register_for_notifications(
     default().register_for_notifications(name, callback)
 }
 
+/// Convenience function to unregister from notifications from the default ServiceManager.
+///
+/// This is equivalent to `default().unregister_for_notifications(name, callback)`.
 #[inline]
 pub fn unregister_for_notifications(
     name: &str,
@@ -378,26 +482,42 @@ pub fn unregister_for_notifications(
     default().unregister_for_notifications(name, callback)
 }
 
+/// Convenience function to add a service to the default ServiceManager.
+///
+/// This is equivalent to `default().add_service(identifier, binder)`.
 #[inline]
 pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
     default().add_service(identifier, binder)
 }
 
+/// Convenience function to get a service from the default ServiceManager.
+///
+/// This is equivalent to `default().get_service(name)`.
 #[inline]
 pub fn get_service(name: &str) -> Option<SIBinder> {
     default().get_service(name)
 }
 
+/// Convenience function to check if a service is available from the default ServiceManager.
+///
+/// This is equivalent to `default().check_service(name)`.
 #[inline]
 pub fn check_service(name: &str) -> Option<SIBinder> {
     default().check_service(name)
 }
 
+/// Convenience function to check if a service is declared from the default ServiceManager.
+///
+/// This is equivalent to `default().is_declared(name)`.
 #[inline]
 pub fn is_declared(name: &str) -> bool {
     default().is_declared(name)
 }
 
+/// Convenience function to get debug information about all services from the default ServiceManager.
+///
+/// This is equivalent to `default().get_service_debug_info()`.
+/// Note that this feature may not be available on all Android versions.
 #[inline]
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
     default().get_service_debug_info()
