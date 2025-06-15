@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! Thread-local binder state management.
+//!
+//! This module manages the per-thread state for binder operations, including
+//! transaction context, reference counting, and communication with the binder driver.
+//! Each thread participating in binder IPC maintains its own state through this module.
+
 use log::error;
 use std::backtrace::Backtrace;
 use std::cell::RefCell;

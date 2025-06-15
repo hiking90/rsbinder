@@ -17,14 +17,26 @@
  * limitations under the License.
  */
 
+//! Async support for binder operations.
+//!
+//! This module provides traits and utilities for running binder transactions
+//! asynchronously, allowing integration with async runtimes like Tokio.
+//! It enables non-blocking binder operations in async contexts.
+
 use std::future::Future;
 use std::pin::Pin;
 
-/// A type alias for a pinned, boxed future that lets you write shorter code without littering it
-/// with Pin and Send bounds.
+/// Type alias for a pinned, boxed future.
+///
+/// This shorthand type helps write cleaner async code without littering it
+/// with `Pin` and `Send` bounds, commonly used in binder async operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A thread pool for running binder transactions.
+/// Trait for async thread pools that can execute binder transactions.
+///
+/// `BinderAsyncPool` provides an abstraction over different async runtime
+/// implementations (like Tokio) for spawning binder operations on background
+/// threads while maintaining async compatibility.
 pub trait BinderAsyncPool {
     /// This function should conceptually behave like this:
     ///

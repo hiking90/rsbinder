@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! Generic container for parcelable objects.
+//!
+//! This module provides `ParcelableHolder`, a type-erased container that can hold
+//! any parcelable object. It's primarily used for AIDL union types and other
+//! scenarios where the specific parcelable type is not known at compile time.
+
 use crate::binder::Stability;
 use crate::error::{Result, StatusCode};
 use crate::{
@@ -42,13 +48,14 @@ enum ParcelableHolderData {
     Parcel(Parcel),
 }
 
-/// A container that can hold any arbitrary `Parcelable`.
+/// A type-erased container for any parcelable object.
 ///
-/// This type is currently used for AIDL parcelable fields.
+/// `ParcelableHolder` can store any type implementing `Parcelable`, allowing
+/// for runtime polymorphism over parcelable types. This is primarily used
+/// for AIDL union types and generic parcelable handling.
 ///
-/// `ParcelableHolder` is currently not thread-safe (neither
-/// `Send` nor `Sync`), mainly because it internally contains
-/// a `Parcel` which in turn is not thread-safe.
+/// Note: `ParcelableHolder` is currently not thread-safe (neither `Send` nor `Sync`)
+/// due to its internal `Parcel` which is not thread-safe.
 #[derive(Debug)]
 pub struct ParcelableHolder {
     // This is a `Mutex` because of `get_parcelable`

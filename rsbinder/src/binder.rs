@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! Core binder functionality and traits.
+//!
+//! This module provides the fundamental types and traits for binder IPC,
+//! including interface definitions, binder object management, and transaction
+//! handling. It forms the foundation for all binder communication.
+
 use std::any::Any;
 use std::borrow::Borrow;
 use std::fmt::{Debug, Formatter};
@@ -77,13 +83,13 @@ pub const LIKE_TRANSACTION: u32 = b_pack_chars('_', 'L', 'I', 'K');
 
 pub const INTERFACE_HEADER: u32 = b_pack_chars('S', 'Y', 'S', 'T');
 
-/// Super-trait for Binder interfaces.
+/// Base trait for all binder interfaces.
 ///
-/// This trait allows conversion of a Binder interface trait object into an
-/// IBinder object for IPC calls. All Binder remotable interface (i.e. AIDL
-/// interfaces) must implement this trait.
+/// This trait allows conversion of a binder interface trait object into an
+/// IBinder object for IPC calls. All binder remotable interfaces (i.e., AIDL
+/// interfaces) must implement this trait to participate in binder IPC.
 ///
-/// This is equivalent `IInterface` in C++.
+/// Equivalent to `IInterface` in Android's C++ binder implementation.
 pub trait Interface: Send + Sync {
     /// Convert this binder object into a generic [`SIBinder`] reference.
     fn as_binder(&self) -> SIBinder {
@@ -126,15 +132,20 @@ pub trait FromIBinder: Interface {
 /// valid.
 ///
 /// This trait corresponds to the parts of the interface of the C++ `DeathRecipient`
-/// class which are public.
+/// Callback interface for binder death notifications.
+///
+/// Implement this trait to receive notifications when a remote binder object dies.
+/// This is essential for cleanup and error handling in distributed systems.
 pub trait DeathRecipient: Send + Sync {
+    /// Called when the monitored binder object has died.
     fn binder_died(&self, who: &WIBinder);
 }
 
-/// Interface of binder local or remote objects.
+/// Core interface for binder objects, both local and remote.
 ///
-/// This trait corresponds to the parts of the interface of the C++ `IBinder`
-/// class which are public.
+/// This trait corresponds to the public interface of the C++ `IBinder` class,
+/// providing the fundamental operations available on all binder objects
+/// regardless of whether they represent local services or remote proxies.
 pub trait IBinder: Any + Send + Sync {
     /// Register the recipient for a notification if this binder
     /// goes away. If this binder object unexpectedly goes away
@@ -188,16 +199,14 @@ impl std::fmt::Debug for dyn IBinder {
     }
 }
 
-/// A local service that can be remotable via Binder.
+/// Trait for local services that can be exposed via binder IPC.
 ///
-/// An object that implement this interface made be made into a Binder service
-/// via `Binder::new(object)`.
+/// Objects implementing this trait can be wrapped in a `Binder<T>` to create
+/// a binder service that can receive and handle incoming transactions.
 ///
-/// This is a low-level interface that should normally be automatically
-/// generated from AIDL via the [`declare_binder_interface!`] macro. When using
-/// the AIDL backend, users need only implement the high-level AIDL-defined
-/// interface. The AIDL compiler then generates a container struct that wraps
-/// the user-defined service and implements `Remotable`.
+/// This is typically auto-generated from AIDL definitions and should not
+/// be implemented manually. The AIDL compiler generates the necessary
+/// transaction handling code that implements this trait.
 pub trait Remotable: Send + Sync {
     /// The Binder interface descriptor string.
     ///

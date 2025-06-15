@@ -1,19 +1,21 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! # RSBinder Hub Module
+//! # Service Hub and Manager Implementations
 //!
-//! This module provides a common interface to interact with Android's Service Manager.
+//! This module provides a unified interface to interact with Android's Service Manager
+//! across different Android API versions. It abstracts version differences and provides
+//! both common functionality and version-specific access when needed.
 //!
 //! ## Version Compatibility
 //!
-//! Android's Service Manager interface has changed across different Android versions.
-//! This hub module is designed to abstract these differences and provide a consistent API
+//! Android's Service Manager interface has evolved across different Android versions.
+//! This hub module abstracts these differences and provides a consistent API
 //! for the most common operations needed by applications.
 //!
-//! The hub only exposes common functionality that is available across all supported
-//! Android versions. For version-specific features, use the specific version modules
-//! directly (e.g., `android_16`, `android_14`, etc.).
+//! The hub exposes common functionality available across all supported Android versions.
+//! For version-specific features, use the specific version modules directly
+//! (e.g., `android_16`, `android_14`, etc.).
 //!
 //! ## Usage
 //!

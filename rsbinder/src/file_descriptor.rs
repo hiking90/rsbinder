@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! File descriptor wrapper for binder IPC.
+//!
+//! This module provides `ParcelFileDescriptor`, a wrapper around file descriptors
+//! that can be safely transmitted through binder IPC while maintaining proper
+//! ownership semantics and automatic cleanup.
+
 use crate::error::{Result, StatusCode};
 use crate::{
     binder_object::flat_binder_object, Deserialize, DeserializeArray, DeserializeOption, Parcel,
@@ -25,12 +31,16 @@ use crate::{
 
 use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
-/// Rust version of the Java class android.os.ParcelFileDescriptor
+/// File descriptor wrapper for binder IPC.
+///
+/// `ParcelFileDescriptor` is a Rust equivalent of the Java `android.os.ParcelFileDescriptor`,
+/// providing safe transmission of file descriptors through binder IPC while ensuring
+/// proper ownership and automatic cleanup.
 #[derive(Debug)]
 pub struct ParcelFileDescriptor(OwnedFd);
 
 impl ParcelFileDescriptor {
-    /// Create a new `ParcelFileDescriptor`
+    /// Create a new `ParcelFileDescriptor` from any type that can be converted to `OwnedFd`.
     pub fn new<F: Into<OwnedFd>>(fd: F) -> Self {
         Self(fd.into())
     }

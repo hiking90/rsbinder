@@ -1,38 +1,70 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Error handling and status codes for binder operations.
+//!
+//! This module defines the result types and error codes used throughout
+//! the binder library for consistent error handling across IPC operations.
+
 use std::error::Error;
 use std::fmt;
 
+/// Result type alias for binder operations.
 pub type Result<T> = std::result::Result<T, StatusCode>;
 
 const UNKNOWN_ERROR: i32 = -2147483647 - 1;
 
+/// Status codes for binder operations.
+///
+/// Represents various error conditions that can occur during binder IPC operations,
+/// including system errors, protocol errors, and application-specific errors.
 #[derive(Default, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum StatusCode {
+    /// Operation completed successfully
     #[default]
     Ok,
+    /// Unknown error occurred
     Unknown,
+    /// Out of memory
     NoMemory,
+    /// Invalid operation for current state
     InvalidOperation,
+    /// Invalid parameter value
     BadValue,
+    /// Wrong data type
     BadType,
+    /// Named resource not found
     NameNotFound,
+    /// Permission denied
     PermissionDenied,
+    /// Object not initialized
     NoInit,
+    /// Resource already exists
     AlreadyExists,
+    /// Remote object is dead
     DeadObject,
+    /// Transaction failed
     FailedTransaction,
+    /// Unknown transaction code
     UnknownTransaction,
+    /// Invalid array index
     BadIndex,
+    /// File descriptors not allowed
     FdsNotAllowed,
+    /// Unexpected null pointer
     UnexpectedNull,
+    /// Not enough data available
     NotEnoughData,
+    /// Operation would block
     WouldBlock,
+    /// Operation timed out
     TimedOut,
+    /// Bad file descriptor
     BadFd,
+    /// System errno value
     Errno(i32),
+    /// Service-specific error code
     ServiceSpecific(i32),
 }
 

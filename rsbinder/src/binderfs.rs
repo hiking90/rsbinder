@@ -1,6 +1,11 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! BinderFS filesystem utilities.
+//!
+//! This module provides functions for managing binder devices in the binderfs
+//! filesystem, including adding new binder devices dynamically.
+
 use crate::sys::binder;
 use log;
 use std::ffi::CString;
@@ -8,6 +13,9 @@ use std::fs::File;
 use std::path::Path;
 
 /// Add a new binder device to the binderfs.
+///
+/// Creates a new binder device node in the binderfs with the specified name.
+/// Returns the major and minor device numbers on success.
 pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
     let fd = File::options().read(true).open(driver).inspect_err(|e| {
         log::error!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e);

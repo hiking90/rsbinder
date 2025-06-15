@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! Data serialization and deserialization for binder IPC.
+//!
+//! This module provides the `Parcel` type for marshalling and unmarshalling data
+//! in binder transactions. Parcels handle the low-level details of data layout,
+//! alignment, and object references required for cross-process communication.
+
 use std::default::Default;
 use std::vec::Vec;
 
@@ -160,6 +166,10 @@ pub type FnFreeBuffer =
 
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
+///
+/// A `Parcel` is the fundamental data container for binder IPC, handling serialization
+/// and deserialization of primitive types, strings, objects, and file descriptors.
+/// It maintains proper alignment and object reference tracking required by the binder protocol.
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
@@ -177,10 +187,12 @@ impl Default for Parcel {
 }
 
 impl Parcel {
+    /// Create a new empty parcel with default capacity.
     pub fn new() -> Self {
         Parcel::with_capacity(256)
     }
 
+    /// Create a new parcel with the specified initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Parcel {
             data: ParcelData::with_capacity(capacity),

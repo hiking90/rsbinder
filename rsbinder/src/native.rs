@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+//! Native service implementation utilities.
+//!
+//! This module provides helper types and functions for implementing binder services
+//! on the server side, including the `Binder` wrapper for native service objects
+//! and transaction handling utilities.
+
 use std::any::Any;
 use std::convert::TryFrom;
 use std::fs::File;
@@ -198,18 +204,22 @@ impl<T: Remotable> Transactable for Inner<T> {
     }
 }
 
-/// A Binder object that can be used to manage the binder service.
+/// A Binder object that wraps a service implementation for IPC.
+///
+/// `Binder<T>` provides a wrapper around a service implementation that implements
+/// the `Remotable` trait, handling the low-level binder protocol details and
+/// dispatching incoming transactions to the appropriate service methods.
 pub struct Binder<T: 'static + Remotable + Send + Sync> {
     inner: Arc<Inner<T>>,
 }
 
 impl<T: 'static + Remotable> Binder<T> {
-    /// Create a new Binder object.
+    /// Create a new Binder object with default stability.
     pub fn new(remotable: T) -> Self {
         Self::new_with_stability(remotable, Default::default())
     }
 
-    /// Create a new Binder object with the specified stability.
+    /// Create a new Binder object with the specified stability level.
     pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
         Binder::<T> {
             inner: Arc::new(Inner {

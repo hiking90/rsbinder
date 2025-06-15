@@ -1,6 +1,12 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Client proxy for remote binder services.
+//!
+//! This module provides the client-side infrastructure for communicating with
+//! remote binder services, including proxy objects that represent remote services
+//! and handle transaction routing and lifecycle management.
+
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
@@ -12,6 +18,11 @@ use crate::{
     binder::*, binder_object::*, error::*, parcel::*, ref_counter::RefCounter, thread_state,
 };
 
+/// Handle for a proxy to a remote binder service.
+///
+/// `ProxyHandle` represents the client-side handle to a remote service,
+/// managing the connection, transaction routing, and lifecycle events
+/// such as death notifications.
 pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
@@ -24,6 +35,7 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
+    /// Create a new proxy handle for the given binder handle and descriptor.
     pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Arc<Self> {
         Arc::new(Self {
             handle,
@@ -36,14 +48,17 @@ impl ProxyHandle {
         })
     }
 
+    /// Get the underlying binder handle number.
     pub fn handle(&self) -> u32 {
         self.handle
     }
 
+    /// Get the interface descriptor for this proxy.
     pub fn descriptor(&self) -> &str {
         &self.descriptor
     }
 
+    /// Submit a transaction to the remote service.
     pub fn submit_transact(
         &self,
         code: TransactionCode,

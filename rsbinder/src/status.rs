@@ -1,33 +1,58 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Status and exception handling for binder operations.
+//!
+//! This module provides status types for handling exceptions and errors
+//! that occur during binder transactions, including both system-level
+//! errors and application-specific exceptions.
+
 use crate::error;
 use crate::error::StatusCode;
 use crate::parcel::*;
 use crate::parcelable::*;
 use std::fmt::{Debug, Display, Formatter};
 
+/// Result type for operations that can return a `Status` error.
 pub type Result<T> = std::result::Result<T, Status>;
 
+/// Exception codes for binder operations.
+///
+/// These codes represent different types of exceptions that can occur
+/// during binder transactions, corresponding to Java exception types
+/// in the Android framework.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
 pub enum ExceptionCode {
+    /// No exception occurred
     None = 0,
+    /// Security exception
     Security = -1,
+    /// Bad parcelable data
     BadParcelable = -2,
+    /// Illegal argument provided
     IllegalArgument = -3,
+    /// Null pointer exception
     NullPointer = -4,
+    /// Illegal state exception
     IllegalState = -5,
+    /// Network operation on main thread
     NetworkMainThread = -6,
+    /// Unsupported operation
     UnsupportedOperation = -7,
+    /// Service-specific exception
     ServiceSpecific = -8,
+    /// Parcelable exception
     Parcelable = -9,
 
     // This is special and Java specific; see Parcel.java.
+    /// Has reply header (Java-specific)
     HasReplyHeader = -128,
     // This is special, and indicates to C++ binder proxies that the
     // transaction has failed at a low level.
+    /// Transaction failed at low level
     TransactionFailed = -129,
+    /// Generic error
     JustError = -256,
 }
 
@@ -97,6 +122,11 @@ impl Deserialize for ExceptionCode {
     }
 }
 
+/// Status information for binder operations.
+///
+/// `Status` combines an exception code, status code, and optional message
+/// to provide comprehensive error information for binder transactions.
+/// It can represent both successful operations and various failure modes.
 pub struct Status {
     code: StatusCode,
     exception: ExceptionCode,

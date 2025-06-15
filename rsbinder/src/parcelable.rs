@@ -17,13 +17,19 @@
  * limitations under the License.
  */
 
+//! Parcelable trait and utilities for serializable types.
+//!
+//! This module defines the core traits and utilities for types that can be
+//! serialized and deserialized in binder parcels, providing the foundation
+//! for AIDL-generated types and custom parcelable implementations.
+
 use crate::{binder::*, binder_object::*, error::*, parcel::Parcel, process_state::*, sys::*};
 
-/// Super-trait for Binder parcelables.
+/// Core trait for types that can be serialized to and from parcels.
 ///
-/// This trait is equivalent `android::Parcelable` in C++,
-/// and defines a common interface that all parcelables need
-/// to implement.
+/// This trait is equivalent to `android::Parcelable` in C++, and defines
+/// the basic interface that all parcelable types must implement for binder IPC.
+/// It provides low-level serialization methods that work directly with parcel data.
 pub trait Parcelable {
     /// Internal serialization function for parcelables.
     ///
