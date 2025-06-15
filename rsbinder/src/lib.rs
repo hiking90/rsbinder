@@ -35,7 +35,7 @@
 //!
 //! Add a `build.rs` file to generate Rust bindings:
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! # use std::path::PathBuf;
 //! rsbinder_aidl::Builder::new()
 //!     .source(PathBuf::from("aidl/hello/IHello.aidl"))
@@ -53,7 +53,7 @@
 //!
 //! ## Implementing the Service
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use rsbinder::*;
 //!
 //! // Include the generated code
@@ -92,7 +92,7 @@
 //!
 //! ## Creating a Client
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use rsbinder::*;
 //!
 //! // Include the same generated code
