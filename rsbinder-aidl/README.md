@@ -5,7 +5,7 @@ This is an AIDL compiler for **rsbinder**.
 * Add the build-dependencies to Cargo.toml:
 ```
 [build-dependencies]
-rsbinder-aidl = "0.1.1"
+rsbinder-aidl = "0.4.0"
 ```
 * Create a build.rs file in the root folder of the crate.
 * Add use std::path::PathBuf; to build.rs.
