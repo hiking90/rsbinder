@@ -16,6 +16,104 @@
 //! - **ProcessState**: Process-level binder state management
 //! - **ServiceManager**: Service discovery and registration
 //!
+//! # Basic Usage
+//!
+//! This library works with AIDL (Android Interface Definition Language) files to generate
+//! type-safe Rust bindings for IPC services.
+//!
+//! ## Setting up an AIDL-based Service
+//!
+//! First, create an AIDL interface file (`aidl/hello/IHello.aidl`):
+//!
+//! ```aidl
+//! package hello;
+//!
+//! interface IHello {
+//!     String echo(in String message);
+//! }
+//! ```
+//!
+//! Add a `build.rs` file to generate Rust bindings:
+//!
+//! ```rust,no_run
+//! # use std::path::PathBuf;
+//! rsbinder_aidl::Builder::new()
+//!     .source(PathBuf::from("aidl/hello/IHello.aidl"))
+//!     .output(PathBuf::from("hello.rs"))
+//!     .generate()
+//!     .unwrap();
+//! ```
+//!
+//! In your `Cargo.toml`, add the build dependency:
+//!
+//! ```toml
+//! [build-dependencies]
+//! rsbinder-aidl = "0.4"
+//! ```
+//!
+//! ## Implementing the Service
+//!
+//! ```rust,no_run
+//! use rsbinder::*;
+//!
+//! // Include the generated code
+//! include!(concat!(env!("OUT_DIR"), "/hello.rs"));
+//! pub use crate::hello::IHello::*;
+//!
+//! // Implement the service
+//! struct HelloService;
+//!
+//! impl Interface for HelloService {}
+//!
+//! impl IHello for HelloService {
+//!     fn echo(&self, message: &str) -> rsbinder::status::Result<String> {
+//!         Ok(format!("Echo: {}", message))
+//!     }
+//! }
+//!
+//! # fn main() -> Result<()> {
+//! // Initialize the process state
+//! ProcessState::init_default();
+//!
+//! // Start the thread pool
+//! ProcessState::start_thread_pool();
+//!
+//! // Register your service
+//! let service = BnHello::new_binder(HelloService);
+//! hub::add_service("hello_service", service.as_binder())?;
+//!
+//! println!("Hello service started");
+//!
+//! // Join the thread pool to handle requests
+//! ProcessState::join_thread_pool();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Creating a Client
+//!
+//! ```rust,no_run
+//! use rsbinder::*;
+//!
+//! // Include the same generated code
+//! include!(concat!(env!("OUT_DIR"), "/hello.rs"));
+//! pub use crate::hello::IHello::*;
+//!
+//! # fn main() -> Result<()> {
+//! // Initialize the process state
+//! ProcessState::init_default();
+//!
+//! // Get service from service manager
+//! let service = hub::get_service("hello_service")?;
+//! let hello_service = BpHello::new(service)?;
+//!
+//! // Call remote method
+//! let result = hello_service.echo("Hello, World!")?;
+//! println!("Service response: {}", result);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # License
 //!
 //! Licensed under Apache License, Version 2.0.

@@ -404,7 +404,6 @@ macro_rules! declare_binder_interface {
 /// `Serialize`, `SerializeArray` and `SerializeOption` for
 /// structured parcelables. The target type must implement the
 /// `Parcelable` trait.
-/// ```
 #[macro_export]
 macro_rules! impl_serialize_for_parcelable {
     ($parcelable:ident) => {

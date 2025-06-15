@@ -272,8 +272,8 @@ where
 
 /// Interface stability promise
 ///
-/// An interface can promise to be a stable vendor interface ([`Vintf`]), or
-/// makes no stability guarantees ([`Local`]). [`Local`] is
+/// An interface can promise to be a stable vendor interface ([`Stability::Vintf`]), or
+/// makes no stability guarantees ([`Stability::Local`]). [`Stability::Local`] is
 /// currently the default stability.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stability {
