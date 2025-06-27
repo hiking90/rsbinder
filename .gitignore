@@ -2,3 +2,6 @@ target
 gen
 .vscode
 REMOTE_LINUX
+
+.idea/
+*.iml
