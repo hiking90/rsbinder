@@ -4,8 +4,10 @@
 // #[macro_use]
 // extern crate lazy_static;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
+use std::mem::take;
 use std::path::{Path, PathBuf};
 
 mod const_expr;
@@ -92,6 +94,7 @@ pub fn add_indent(step: usize, source: &str) -> String {
 
 pub struct Builder {
     sources: Vec<PathBuf>,
+    includes: Vec<PathBuf>,
     dest_dir: PathBuf,
     output: PathBuf,
     enabled_async: bool,
@@ -109,6 +112,7 @@ impl Builder {
         parser::reset();
         Self {
             sources: Vec::new(),
+            includes: Vec::new(),
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
             output: "rsbinder_generated_aidl.rs".into(),
             enabled_async: false,
@@ -116,12 +120,19 @@ impl Builder {
         }
     }
 
-    pub fn source(mut self, source: PathBuf) -> Self {
-        self.sources.push(source);
+    pub fn source(mut self, source: impl AsRef<Path>) -> Self {
+        self.sources.push(source.as_ref().into());
         self
     }
 
-    pub fn output(mut self, mut output: PathBuf) -> Self {
+    pub fn include_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.includes.push(dir.as_ref().into());
+        self
+    }
+
+    pub fn output(mut self, output: impl AsRef<Path>) -> Self {
+        let mut output = output.as_ref().to_owned();
+
         if output.extension().is_none() {
             output.set_extension("rs");
         }
@@ -153,28 +164,6 @@ impl Builder {
             filename.file_stem().unwrap().to_str().unwrap().to_string(),
             document,
         ))
-    }
-
-    fn traverse_source(dir: &Path) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
-        let entries = fs::read_dir(dir)
-            .inspect_err(|_| {
-                eprintln!("traverse_source: fs::read_dir({dir:?}) failed.");
-            })
-            .unwrap();
-        let mut package_list = Vec::new();
-
-        for entry in entries {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                package_list.append(&mut Self::traverse_source(&path)?);
-            }
-            if path.is_file() && path.extension().unwrap_or_default() == "aidl" {
-                let package = Self::parse_file(&path)?;
-                package_list.push(package);
-            }
-        }
-
-        Ok(package_list)
     }
 
     fn generate_all(
@@ -232,20 +221,81 @@ impl Builder {
         Ok(content)
     }
 
-    pub fn generate(self) -> Result<(), Box<dyn Error>> {
+    fn parse_sources(&mut self) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
+        let mut sources = take(&mut self.sources);
+        let mut seen = HashSet::new();
+        let mut includes = take(&mut self.includes).into_iter().collect::<HashSet<_>>();
         let mut document_list = Vec::new();
 
-        for source in &self.sources {
-            if source.is_file() {
-                let package = Self::parse_file(source)?;
-                document_list.push(package);
-            } else {
-                document_list.append(&mut Self::traverse_source(source)?);
-            };
+        fn strip_package(path: &Path, package: &str) -> Option<PathBuf> {
+            let mut components = path.components();
+            for package in package.split('.').rev() {
+                if components.next_back()?.as_os_str().to_str()? != package {
+                    return None;
+                }
+            }
+            Some(components.collect())
         }
 
+        while !sources.is_empty() {
+            for path in take(&mut sources) {
+                if seen.contains(&path) {
+                    continue;
+                }
+
+                if path.is_file() {
+                    let (name, doc) = Self::parse_file(&path)?;
+
+                    if let Some(dir) = doc
+                        .package
+                        .as_ref()
+                        .and_then(|p| strip_package(path.parent()?, p))
+                    {
+                        includes.insert(dir);
+                    }
+
+                    'import: for import in doc.imports.values() {
+                        let rel_path =
+                            PathBuf::from(import.replace('.', "/")).with_extension("aidl");
+                        for include_dir in &includes {
+                            let path = include_dir.join(&rel_path);
+                            if path.exists() {
+                                sources.push(path);
+                                continue 'import;
+                            }
+                        }
+
+                        return Err(
+                            format!("import {import} not found, imported from {path:?}").into()
+                        );
+                    }
+
+                    document_list.push((name, doc));
+                } else {
+                    let entries = fs::read_dir(&path).map_err(|err| {
+                        format!("parse_sources: fs::read_dir({path:?}) failed: {err}")
+                    })?;
+
+                    for entry in entries {
+                        let path = entry.unwrap().path();
+                        if path.is_dir()
+                            || (path.is_file() && path.extension().unwrap_or_default() == "aidl")
+                        {
+                            sources.push(path);
+                        }
+                    }
+                };
+
+                seen.insert(path);
+            }
+        }
+
+        Ok(document_list)
+    }
+
+    pub fn generate(mut self) -> Result<(), Box<dyn Error>> {
         let mut package_list = Vec::new();
-        for document in document_list {
+        for document in self.parse_sources()? {
             println!("Generating: {}", document.0);
             let gen = generator::Generator::new(self.enabled_async, self.is_crate);
             let package = gen.document(&document.1)?;
