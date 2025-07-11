@@ -192,6 +192,8 @@ impl From<&SIBinder> for flat_binder_object {
 impl From<(*const u8, usize)> for &flat_binder_object {
     fn from(pointer: (*const u8, usize)) -> Self {
         unsafe {
+            // Rust compiler requests 8 byte alignment, but flat_binder_object is 4 byte aligned.
+            // So, transmute must be used to convert the pointer.
             #[allow(clippy::transmute_ptr_to_ref)]
             std::mem::transmute::<*const u8, &flat_binder_object>(&*(pointer.0.add(pointer.1)))
         }
