@@ -200,7 +200,7 @@ impl From<(*const u8, usize)> for &flat_binder_object {
 
 impl From<(*mut u8, usize)> for &mut flat_binder_object {
     fn from(pointer: (*mut u8, usize)) -> Self {
-        unsafe { 
+        unsafe {
             #[allow(clippy::transmute_ptr_to_ref)]
             std::mem::transmute::<*const u8, &mut flat_binder_object>(&*(pointer.0.add(pointer.1)))
         }
