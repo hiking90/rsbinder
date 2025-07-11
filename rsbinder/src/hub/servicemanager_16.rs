@@ -23,12 +23,12 @@ pub fn get_service(
         Ok(service) => match service {
             android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
             android::os::Service::Service::Accessor(_accessor) => {
-                log::warn!("Service {} is an Accessor, not a ServiceWithMetadata", name);
+                log::warn!("Service {name} is an Accessor, not a ServiceWithMetadata");
                 None
             }
         },
         Err(err) => {
-            log::error!("Failed to get service {}: {}", name, err);
+            log::error!("Failed to get service {name}: {err}");
             None
         }
     }
@@ -45,12 +45,12 @@ pub fn check_service(
         Ok(service) => match service {
             android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
             android::os::Service::Service::Accessor(_accessor) => {
-                log::warn!("Service {} is an Accessor, not a ServiceWithMetadata", name);
+                log::warn!("Service {name} is an Accessor, not a ServiceWithMetadata");
                 None
             }
         },
         Err(err) => {
-            log::error!("Failed to check service {}: {}", name, err);
+            log::error!("Failed to check service {name}: {err}");
             None
         }
     }
@@ -61,7 +61,7 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
     match sm.listServices(dump_priority) {
         Ok(result) => result,
         Err(err) => {
-            log::error!("Failed to list services: {}", err);
+            log::error!("Failed to list services: {err}");
             Vec::new()
         }
     }
@@ -102,7 +102,7 @@ pub fn is_declared(sm: &BpServiceManager, name: &str) -> bool {
     match sm.isDeclared(name) {
         Ok(result) => result,
         Err(err) => {
-            log::error!("Failed to is_declared({}): {}", name, err);
+            log::error!("Failed to is_declared({name}): {err}");
             false
         }
     }
@@ -116,12 +116,12 @@ pub fn get_interface<T: FromIBinder + ?Sized>(
         Some(service) => match service.service {
             Some(service) => FromIBinder::try_from(service),
             None => {
-                log::error!("Service {} is not a valid IBinder", name);
+                log::error!("Service {name} is not a valid IBinder");
                 Err(StatusCode::NameNotFound)
             }
         },
         None => {
-            log::error!("Failed to get interface {}", name);
+            log::error!("Failed to get interface {name}");
             Err(StatusCode::NameNotFound)
         }
     }

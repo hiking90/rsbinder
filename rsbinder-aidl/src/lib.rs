@@ -156,7 +156,7 @@ impl Builder {
     }
 
     fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
-        println!("Parsing: {:?}", filename);
+        println!("Parsing: {filename:?}");
         let unparsed_file = fs::read_to_string(filename)?;
         let document = parser::parse_document(&unparsed_file)?;
 
@@ -205,7 +205,7 @@ impl Builder {
 
                 for r#mod in &mod_list[start..] {
                     content += &indent_space(mod_count);
-                    content += &format!("pub mod {} {{\n", r#mod);
+                    content += &format!("pub mod {mod} {{\n");
                     mod_count += 1;
                 }
             }

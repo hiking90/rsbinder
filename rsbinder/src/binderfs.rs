@@ -37,12 +37,12 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
 
     #[cfg(not(test))]
     binder::binder_ctl_add(fd, &mut device).inspect_err(|e| {
-        log::error!("Binder ioctl to add binder failed: {}", e);
+        log::error!("Binder ioctl to add binder failed: {e}");
     })?;
 
     #[cfg(test)]
     tests::binder_ctl_add(fd, &mut device).inspect_err(|e| {
-        log::error!("Binder ioctl to add binder failed: {}", e);
+        log::error!("Binder ioctl to add binder failed: {e}");
     })?;
 
     Ok((device.major, device.minor))

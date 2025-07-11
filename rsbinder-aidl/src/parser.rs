@@ -617,8 +617,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
             let parsed_value = u8::from_str_radix(value, radix)
                 .map_err(|err| {
                     eprintln!(
-                        "{:?}\nparse_intvalue() - Invalid u8 value: {}, radix: {}\n",
-                        err, arg_value, radix
+                        "{err:?}\nparse_intvalue() - Invalid u8 value: {arg_value}, radix: {radix}\n"
                     );
                     err
                 })
@@ -631,8 +630,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
                 let parsed_value = u64::from_str_radix(value, radix)
                     .map_err(|err| {
                         eprintln!(
-                            "{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n",
-                            err, arg_value, radix
+                            "{err:?}\nparse_intvalue() - Invalid u64 value: {arg_value}, radix: {radix}\n"
                         );
                         err
                     })
@@ -643,8 +641,7 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
             let parsed_value = u64::from_str_radix(value, radix)
                 .map_err(|err| {
                     eprintln!(
-                        "{:?}\nparse_intvalue() - Invalid u64 value: {}, radix: {}\n",
-                        err, arg_value, radix
+                        "{err:?}\nparse_intvalue() - Invalid u64 value: {arg_value}, radix: {radix}\n"
                     );
                     err
                 })
@@ -655,15 +652,14 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
         let parsed_value = i64::from_str_radix(value, radix)
             .map_err(|err| {
                 eprintln!(
-                    "{:?}\nparse_intvalue() - Invalid int value: {}, radix: {}\n",
-                    err, arg_value, radix
+                    "{err:?}\nparse_intvalue() - Invalid int value: {arg_value}, radix: {radix}\n"
                 );
                 err
             })
             .unwrap();
         if is_u8 {
             if parsed_value > u8::MAX.into() || parsed_value < 0 {
-                panic!("u8 is overflowed. {}", parsed_value);
+                panic!("u8 is overflowed. {parsed_value}");
             }
             ConstExpr::new(ValueType::Byte(parsed_value as i8 as _))
         } else if is_long {
@@ -1434,7 +1430,7 @@ mod tests {
     fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {
         let mut res =
             AIDLParser::parse(Rule::string_expr, r##""Hello" + " World""##).map_err(|err| {
-                println!("{}", err);
+                println!("{err}");
                 err
             })?;
 
@@ -1455,7 +1451,7 @@ mod tests {
     fn test_parse_expression() -> Result<(), Box<dyn Error>> {
         let mut res =
             AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2 | 4"##).map_err(|err| {
-                println!("{}", err);
+                println!("{err}");
                 err
             })?;
 

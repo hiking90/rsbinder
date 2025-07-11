@@ -282,7 +282,7 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
     let header_size = parcel.read::<i32>()?;
 
     if header_size < 0 || header_size as usize > header_avail {
-        log::error!("0x534e4554:132650049 Invalid header_size({}).", header_size);
+        log::error!("0x534e4554:132650049 Invalid header_size({header_size}).");
         return Err(StatusCode::Unknown);
     }
     parcel.set_data_position(header_start + (header_size as usize));
@@ -306,8 +306,7 @@ impl Deserialize for Status {
                 || remote_stack_trace_header_size as usize > parcel.data_avail()
             {
                 log::error!(
-                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({}).",
-                    remote_stack_trace_header_size
+                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size})."
                 );
                 return Err(StatusCode::Unknown);
             }
@@ -346,12 +345,12 @@ mod tests {
     #[test]
     fn test_status_display() -> Result<()> {
         let unknown = Status::from(StatusCode::Unknown);
-        assert_eq!(format!("{}", unknown), "TransactionFailed / Unknown: ");
+        assert_eq!(format!("{unknown}"), "TransactionFailed / Unknown: ");
 
         let service_specific =
             Status::new_service_specific_error(1, Some("Service specific error".to_owned()));
         assert_eq!(
-            format!("{}", service_specific),
+            format!("{service_specific}"),
             "ServiceSpecific / ServiceSpecific(1): Service specific error"
         );
 
@@ -361,7 +360,7 @@ mod tests {
             Some("Bad parcelable".to_owned()),
         );
         assert_eq!(
-            format!("{}", exception),
+            format!("{exception}"),
             "BadParcelable / Unknown: Bad parcelable"
         );
 

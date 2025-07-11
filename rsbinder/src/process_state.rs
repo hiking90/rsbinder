@@ -135,7 +135,7 @@ impl ProcessState {
         Self::instance().get_or_init(|| match Self::inner_init(driver_name, max_threads) {
             Ok(instance) => instance,
             Err(e) => {
-                panic!("Error in init(): {}", e);
+                panic!("Error in init(): {e}");
             }
         })
     }
@@ -164,7 +164,7 @@ impl ProcessState {
                 // let unused: i32 = 0;
                 if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
                     return Err(
-                        format!("Binder ioctl to become context manager failed: {}", e).into(),
+                        format!("Binder ioctl to become context manager failed: {e}").into(),
                     );
                 }
             }
@@ -268,13 +268,13 @@ impl ProcessState {
             .and_then(|name| name.to_str())
             .map(|name| name.to_owned())
             .unwrap_or("BINDER".to_owned());
-        format!("{}:{}_{:X}", driver_name, pid, seq)
+        format!("{driver_name}:{pid}_{seq:X}")
     }
 
     pub(crate) fn spawn_pooled_thread(&self, is_main: bool) {
         if self.thread_pool_started.load(Ordering::Relaxed) {
             let name = self.make_binder_thread_name();
-            log::info!("Spawning new pooled thread, name={}", name);
+            log::info!("Spawning new pooled thread, name={name}");
             let _ = thread::Builder::new()
                 .name(name)
                 .spawn(move || thread_state::join_thread_pool(is_main));
@@ -299,7 +299,7 @@ impl ProcessState {
         };
 
         binder::get_node_info_for_ref(&self.driver, &mut info).inspect_err(|&e| {
-            log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {:?}", e);
+            log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {e:?}");
         })?;
         Ok(info.strong_count as usize)
     }
@@ -324,7 +324,7 @@ fn open_driver(
     };
 
     binder::version(&fd, &mut vers)
-        .map_err(|e| format!("Binder ioctl to obtain version failed: {}", e))?;
+        .map_err(|e| format!("Binder ioctl to obtain version failed: {e}"))?;
     log::info!("Binder driver protocol version: {}", vers.protocol_version);
 
     if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
@@ -337,12 +337,12 @@ fn open_driver(
     }
 
     binder::set_max_threads(&fd, max_threads)
-        .map_err(|e| format!("Binder ioctl to set max threads failed: {}", e))?;
-    log::info!("Binder driver max threads set to {}", max_threads);
+        .map_err(|e| format!("Binder ioctl to set max threads failed: {e}"))?;
+    log::info!("Binder driver max threads set to {max_threads}");
 
     let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
     if let Err(e) = binder::enable_oneway_spam_detection(&fd, enable) {
-        log::warn!("Binder ioctl to enable oneway spam detection failed: {}", e)
+        log::warn!("Binder ioctl to enable oneway spam detection failed: {e}")
     }
 
     Ok(fd)

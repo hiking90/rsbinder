@@ -35,7 +35,7 @@ struct DeathRecipientWrapper(mpsc::Sender<rsbinder::WIBinder>);
 impl rsbinder::DeathRecipient for DeathRecipientWrapper {
     fn binder_died(&self, who: &rsbinder::WIBinder) {
         self.0.send(who.clone()).unwrap_or_else(|e| {
-            log::error!("Failed to send death notification: {:?}", e);
+            log::error!("Failed to send death notification: {e:?}");
         });
     }
 }
@@ -78,18 +78,14 @@ impl Inner {
             service
         } else {
             log::warn!(
-                "send_client_callback_notification could not find service {} when {}",
-                service_name,
-                context
+                "send_client_callback_notification could not find service {service_name} when {context}"
             );
             return;
         };
 
         if service.has_clients == has_clients {
             log::error!(
-                "send_client_callback_notification called with the same state {} when {}",
-                has_clients,
-                context
+                "send_client_callback_notification called with the same state {has_clients} when {context}"
             );
             std::process::abort()
         }
@@ -106,11 +102,11 @@ impl Inner {
             for callback in callbacks {
                 callback.onClients(&service.binder, has_clients)
                     .unwrap_or_else(|e| {
-                        log::error!("Failed to notify client callback: {:?}", e);
+                        log::error!("Failed to notify client callback: {e:?}");
                     });
             }
         }).unwrap_or_else(|| {
-            log::warn!("send_client_callback_notification could not find callbacks for service when {}", context);
+            log::warn!("send_client_callback_notification could not find callbacks for service when {context}");
         });
 
         service.has_clients = has_clients;
@@ -142,11 +138,7 @@ impl Inner {
         {
             Ok(count) => count,
             Err(e) => {
-                log::error!(
-                    "Failed to get strong ref count for {}: {:?}",
-                    service_name,
-                    e
-                );
+                log::error!("Failed to get strong ref count for {service_name}: {e:?}");
                 return Ok(true);
             }
         };
@@ -422,7 +414,7 @@ impl IServiceManager for ServiceManager {
             arg_callback
                 .onRegistration(name, &service.binder)
                 .unwrap_or_else(|e| {
-                    log::error!("Failed to notify client callback: {:?}", e);
+                    log::error!("Failed to notify client callback: {e:?}");
                 });
         }
 
@@ -486,7 +478,7 @@ impl IServiceManager for ServiceManager {
         let service = if let Some(service) = inner.name_to_service.get(name) {
             service
         } else {
-            let msg = format!("registerClientCallback could not find service {}", name);
+            let msg = format!("registerClientCallback could not find service {name}");
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         };
@@ -501,7 +493,7 @@ impl IServiceManager for ServiceManager {
         }
 
         if service.binder != *arg_service {
-            let msg = format!("registerClientCallback called with wrong service {}", name);
+            let msg = format!("registerClientCallback called with wrong service {name}");
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         }
@@ -514,7 +506,7 @@ impl IServiceManager for ServiceManager {
             arg_callback
                 .onClients(&service.binder, true)
                 .unwrap_or_else(|e| {
-                    log::error!("Failed to notify client callback: {:?}", e);
+                    log::error!("Failed to notify client callback: {e:?}");
                 });
         }
 
@@ -541,8 +533,7 @@ impl IServiceManager for ServiceManager {
             service
         } else {
             let msg = format!(
-                "{:?} Tried to unregister {}, but that service wasn't registered to begin with.",
-                context, name
+                "{context:?} Tried to unregister {name}, but that service wasn't registered to begin with."
             );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
@@ -558,16 +549,14 @@ impl IServiceManager for ServiceManager {
         }
 
         if arg_service.clone() != service.binder.clone() {
-            let msg = format!("{:?} Tried to unregister {}, but a different service is registered under this name.",
-                context, name);
+            let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         }
 
         if service.guarentee_client {
             let msg = format!(
-                "{:?} Tried to unregister {}, but there is about to be a client.",
-                context, name
+                "{context:?} Tried to unregister {name}, but there is about to be a client."
             );
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalState, msg.as_str()).into());
@@ -575,10 +564,7 @@ impl IServiceManager for ServiceManager {
 
         let res = inner.handle_service_client_callback(2, name, false);
         if res.is_err() {
-            let msg = format!(
-                "{:?} Tried to unregister {}, but there are clients.",
-                context, name
-            );
+            let msg = format!("{context:?} Tried to unregister {name}, but there are clients.");
             log::warn!("{}", &msg);
             if let Some(service) = inner.name_to_service.get_mut(name) {
                 service.guarentee_client = true;

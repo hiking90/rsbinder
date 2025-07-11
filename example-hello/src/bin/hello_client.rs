@@ -36,7 +36,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("list services:");
     // This is an example of how to use service manager.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
-        println!("{}", name);
+        println!("{name}");
     }
 
     let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});

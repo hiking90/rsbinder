@@ -95,7 +95,7 @@ fn test_notifications() -> rsbinder::Result<()> {
             name: &str,
             service: &rsbinder::SIBinder,
         ) -> rsbinder::status::Result<()> {
-            println!("onRegistration: {} {:?}", name, service);
+            println!("onRegistration: {name} {service:?}");
             Ok(())
         }
     }
