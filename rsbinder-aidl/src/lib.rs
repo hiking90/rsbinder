@@ -254,20 +254,25 @@ impl Builder {
                         includes.insert(dir);
                     }
 
-                    'import: for import in doc.imports.values() {
+                    for import in doc.imports.values() {
                         let rel_path =
                             PathBuf::from(import.replace('.', "/")).with_extension("aidl");
+                        let mut found = false;
                         for include_dir in &includes {
                             let path = include_dir.join(&rel_path);
                             if path.exists() {
                                 sources.push(path);
-                                continue 'import;
+                                found = true;
+                                break;
                             }
                         }
 
-                        return Err(
-                            format!("import {import} not found, imported from {path:?}").into()
-                        );
+                        if !found {
+                            return Err(format!(
+                                "import {import} not found, imported from {path:?}"
+                            )
+                            .into());
+                        }
                     }
 
                     document_list.push((name, doc));
