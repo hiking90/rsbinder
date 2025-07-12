@@ -330,7 +330,7 @@ impl TryFrom<i32> for Stability {
             stability if stability == System.into() => Ok(System),
             stability if stability == Vintf.into() => Ok(Vintf),
             _ => {
-                log::error!("Stability value is invalid: {:X}", stability);
+                log::error!("Stability value is invalid: {stability:X}");
                 // Err(StatusCode::BadValue)
                 Ok(Local)
             }
@@ -420,7 +420,7 @@ impl Drop for SIBinder {
     fn drop(&mut self) {
         self.decrease()
             .map_err(|err| {
-                log::error!("Error in SIBinder::drop() is {:?}", err);
+                log::error!("Error in SIBinder::drop() is {err:?}");
             })
             .ok();
     }

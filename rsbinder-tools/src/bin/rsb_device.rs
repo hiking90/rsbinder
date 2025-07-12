@@ -20,7 +20,7 @@ fn log_ok(msg: &str) {
 }
 
 fn log_err(msg: &str) {
-    log::error!("{}", msg);
+    log::error!("{msg}");
     std::process::exit(1);
 }
 
@@ -82,7 +82,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .arg(binderfs_path)
             .status()
             .map(|_| log_ok(&format!("BinderFS mounted at {}.", binderfs_path.display())))
-            .map_err(|err| log_err(&format!("Failed to mount binderfs\n{}", err)))
+            .map_err(|err| log_err(&format!("Failed to mount binderfs\n{err}")))
             .ok();
     } else {
         log_ok(&format!(
@@ -100,9 +100,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::AlreadyExists {
-                log_ok(&format!("Device {} already exists", device_name));
+                log_ok(&format!("Device {device_name} already exists"));
             } else {
-                log_err(&format!("Failed to allocate new binder device\n{}", err));
+                log_err(&format!("Failed to allocate new binder device\n{err}"));
             }
         }).ok();
 
@@ -150,10 +150,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     println!("\nSummary:");
     println!(
-        "The binder device '{}' has been successfully created \
-        and is accessible at /dev/binderfs/{} with full permissions (read/write by all users). \
-        This setup facilitates IPC mechanisms within the Linux kernel.\n",
-        device_name, device_name
+        "The binder device '{device_name}' has been successfully created \
+        and is accessible at /dev/binderfs/{device_name} with full permissions (read/write by all users). \
+        This setup facilitates IPC mechanisms within the Linux kernel.\n"
     );
 
     Ok(())

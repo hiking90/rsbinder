@@ -469,7 +469,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
             } else {
                 format!("&{}", generator.identifier)
             };
-            write_funcs.push(format!("data.write({})?;", param));
+            write_funcs.push(format!("data.write({param})?;"));
         } else if generator.is_variable_array() {
             if generator.is_nullable {
                 write_funcs.push(format!(
@@ -741,7 +741,7 @@ impl Generator {
             // Parse struct variables only.
             for decl in &decl.members {
                 if let Some(var) = decl.is_variable() {
-                    println!("Parcelable variable: {:?}", var);
+                    println!("Parcelable variable: {var:?}");
                     let generator = var.r#type.to_generator();
 
                     if var.constant {

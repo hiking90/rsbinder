@@ -306,7 +306,7 @@ impl Parcel {
 
     pub fn data_avail(&self) -> usize {
         let result = self.data.len() - self.pos;
-        assert!(result < i32::MAX as _, "data too big: {}", result);
+        assert!(result < i32::MAX as _, "data too big: {result}");
 
         result
     }
@@ -342,7 +342,7 @@ impl Parcel {
         let mut opos = self.next_object_hint;
 
         if count > 0 {
-            log::trace!("Parcel looking for obj at {}, hint={}", data_pos, opos);
+            log::trace!("Parcel looking for obj at {data_pos}, hint={opos}");
             if opos < count {
                 while opos < (count - 1) && objects[opos] < data_pos {
                     opos += 1;
@@ -364,7 +364,7 @@ impl Parcel {
                 return Ok(obj);
             }
         }
-        log::error!("Parcel: unable to find object at index {}", data_pos);
+        log::error!("Parcel: unable to find object at index {data_pos}");
         Err(StatusCode::BadType)
     }
 
@@ -385,12 +385,12 @@ impl Parcel {
         let start = self.data_position();
         let parcelable_size: i32 = self.read()?;
         if parcelable_size < 4 {
-            log::error!("Parcel: bad size for object: {}", parcelable_size);
+            log::error!("Parcel: bad size for object: {parcelable_size}");
             return Err(StatusCode::BadValue);
         }
 
         let end = start.checked_add(parcelable_size as _).ok_or_else(|| {
-            log::error!("Parcel: check_add error: {}", parcelable_size);
+            log::error!("Parcel: check_add error: {parcelable_size}");
             StatusCode::BadValue
         })?;
         if end > self.data_size() {
@@ -410,7 +410,7 @@ impl Parcel {
     pub(crate) fn read_array<D: Deserialize>(&mut self) -> Result<Option<Vec<D>>> {
         let len: i32 = self.read()?;
         if len < -1 {
-            log::error!("Parcel: bad array length: {}", len);
+            log::error!("Parcel: bad array length: {len}");
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {
@@ -459,7 +459,7 @@ impl Parcel {
     ) -> Result<Option<Vec<<D as CharType>::Output>>> {
         let len: i32 = self.read()?;
         if len < -1 {
-            log::error!("Parcel: bad array length: {}", len);
+            log::error!("Parcel: bad array length: {len}");
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {
@@ -715,13 +715,12 @@ impl Parcel {
             return Ok(());
         }
         if size > i32::MAX as usize {
-            log::error!("Parcel::append_from: the size is too large: {}", size);
+            log::error!("Parcel::append_from: the size is too large: {size}");
             return Err(StatusCode::BadValue);
         }
         let other_len = other.data_size();
         if offset > other_len || size > other_len || (offset + size) > other_len {
-            log::error!("Parcel::append_from: The given offset({}) and size({}) exceed the data range of the parcel.",
-                offset, size);
+            log::error!("Parcel::append_from: The given offset({offset}) and size({size}) exceed the data range of the parcel.");
             return Err(StatusCode::BadValue);
         }
 
@@ -789,7 +788,7 @@ impl Parcel {
         for pos in self.objects.as_slice() {
             let obj: &flat_binder_object = (self.data.as_ptr(), *pos as usize).into();
             obj.release()
-                .map_err(|e| log::error!("Parcel: unable to release object: {:?}", e))
+                .map_err(|e| log::error!("Parcel: unable to release object: {e:?}"))
                 .ok();
         }
     }
@@ -916,7 +915,7 @@ mod tests {
         parcel.write_array(&array).unwrap();
         parcel.write_array(&reverse).unwrap();
 
-        println!("{:?}", parcel);
+        println!("{parcel:?}");
 
         parcel.set_data_position(0);
 

@@ -220,7 +220,7 @@ impl IBinder for ProxyHandle {
             false,
             || {
                 if let Err(err) = thread_state::attempt_inc_strong_handle(self.handle()) {
-                    log::error!("Error in attempt_inc_strong_handle() is {:?}", err);
+                    log::error!("Error in attempt_inc_strong_handle() is {err:?}");
                     false
                 } else {
                     true
@@ -275,7 +275,7 @@ mod tests {
         assert!(handle.is_remote());
 
         // Test for Debug trait
-        let debug_str = format!("{:?}", handle);
+        let debug_str = format!("{handle:?}");
         assert_eq!(
             debug_str,
             "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"

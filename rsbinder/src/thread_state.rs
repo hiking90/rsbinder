@@ -471,7 +471,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                                     );
                                     StatusCode::BadValue
                                 };
-                            log::trace!("binder::BR_REPLY ({})", status);
+                            log::trace!("binder::BR_REPLY ({status})");
                             free_buffer(
                                 None,
                                 buffer,
@@ -481,7 +481,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                             )?;
 
                             if status != StatusCode::Ok {
-                                log::warn!("binder::BR_REPLY ({})", status);
+                                log::warn!("binder::BR_REPLY ({status})");
                                 return Err(status);
                             }
                         }
@@ -511,7 +511,7 @@ fn execute_command(cmd: i32) -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
                 let other: StatusCode = thread_state.borrow_mut().in_parcel.read::<i32>()?.into();
-                log::error!("binder::BR_ERROR ({})", other);
+                log::error!("binder::BR_ERROR ({other})");
                 return Err(other);
             }
             binder::BR_OK => {}
@@ -615,12 +615,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                         tr_secctx.transaction_data.code,
                         unsafe { tr_secctx.transaction_data.target.ptr }
                     );
-                    log += &format!(" will be dropped but finished with status {}", err);
+                    log += &format!(" will be dropped but finished with status {err}");
 
                     if reply.data_size() != 0 {
                         log += &format!(" and reply parcel size {}", reply.data_size());
                     }
-                    log::error!("{}", log);
+                    log::error!("{log}");
                 }
 
                 thread_state.borrow_mut().transaction = transaction_old;
@@ -696,7 +696,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     state.in_parcel.read::<binder::binder_uintptr_t>()?
                 };
 
-                log::trace!("BR_DEAD_BINDER: handle {:X}", handle);
+                log::trace!("BR_DEAD_BINDER: handle {handle:X}");
                 ProcessState::as_self().send_obituary_for_handle(handle as _)?;
 
                 {
@@ -714,7 +714,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 state.in_parcel.read::<binder::binder_uintptr_t>()?;
             }
             _ => {
-                log::error!("*** BAD COMMAND {} received from Binder driver\n", cmd);
+                log::error!("*** BAD COMMAND {cmd} received from Binder driver\n");
                 return Err(StatusCode::Unknown);
             }
         };
@@ -785,7 +785,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             match res {
                 Ok(_) => break,
                 Err(errno) if errno != rustix::io::Errno::INTR => {
-                    log::error!("binder::write_read() error : {}", errno);
+                    log::error!("binder::write_read() error : {errno}");
                     return Err(StatusCode::Errno(errno.raw_os_error()));
                 }
                 _ => {}
@@ -1001,11 +1001,7 @@ pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     })?;
 
     if header != INTERFACE_HEADER {
-        log::error!(
-            "Expecting header {:#x} but found {:#x}.",
-            INTERFACE_HEADER,
-            header
-        );
+        log::error!("Expecting header {INTERFACE_HEADER:#x} but found {header:#x}.");
         return Ok(false);
     }
 
@@ -1013,11 +1009,7 @@ pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     if parcel_interface.eq(descriptor) {
         Ok(true)
     } else {
-        log::error!(
-            "check_interface() expected '{}' but read '{}'",
-            descriptor,
-            parcel_interface
-        );
+        log::error!("check_interface() expected '{descriptor}' but read '{parcel_interface}'");
         Ok(false)
     }
 }
@@ -1048,13 +1040,10 @@ pub(crate) fn transact(
     if (flags & transaction_flags_TF_ONE_WAY) == 0 {
         match call_restriction {
             CallRestriction::ErrorIfNotOneway => {
-                error!(
-                    "Process making non-oneway call (code: {}) but is restricted.",
-                    code
-                )
+                error!("Process making non-oneway call (code: {code}) but is restricted.")
             }
             CallRestriction::FatalIfNotOneway => {
-                panic!("Process may not make non-oneway calls (code: {}).", code);
+                panic!("Process may not make non-oneway calls (code: {code}).");
             }
             _ => (),
         }
@@ -1153,10 +1142,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         break;
                     }
                     _ => {
-                        panic!(
-                            "get_and_execute_command() returned unexpected error {}, aborting",
-                            e
-                        );
+                        panic!("get_and_execute_command() returned unexpected error {e}, aborting");
                     }
                 }
             }

@@ -145,7 +145,7 @@ impl TypeGenerator {
         } else {
             let name: String = lookup_decl.name.ns.last().unwrap().to_owned();
             if curr_ns.ns.last().unwrap() == name.as_str() {
-                format!("Box<{}>", name) // To avoid, recursive type issue.
+                format!("Box<{name}>") // To avoid, recursive type issue.
             } else {
                 name
             }
@@ -226,7 +226,7 @@ impl TypeGenerator {
     }
 
     pub fn identifier(mut self, ident: &str) -> Self {
-        self.identifier = format!("_arg_{}", ident);
+        self.identifier = format!("_arg_{ident}");
         self
     }
 
@@ -270,7 +270,7 @@ impl TypeGenerator {
 
         let value_str = if is_struct {
             if self.is_nullable && Self::is_aidl_nullable(&array_info.value_type) {
-                format!("Option<{}>", type_name)
+                format!("Option<{type_name}>")
             } else {
                 type_name
             }
@@ -280,7 +280,7 @@ impl TypeGenerator {
                     if self.is_nullable
                         || !Self::can_be_defaulted(&array_info.value_type, is_struct)
                     {
-                        format!("Option<{}>", type_name)
+                        format!("Option<{type_name}>")
                     } else {
                         type_name
                     }
@@ -291,7 +291,7 @@ impl TypeGenerator {
 
         array_info.sizes.iter().rev().skip(1).fold(
             format!("[{}; {}]", value_str, array_info.sizes.last().unwrap()),
-            |acc, size| format!("[{}; {}]", acc, size),
+            |acc, size| format!("[{acc}; {size}]"),
         )
     }
 
@@ -301,21 +301,21 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("Option<{}>", fixed_array)
+                    format!("Option<{fixed_array}>")
                 } else {
                     fixed_array
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Option<{}>", fixed_array)
+                    format!("Option<{fixed_array}>")
                 } else {
                     fixed_array
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<{}>", fixed_array)
+                    format!("Option<{fixed_array}>")
                 } else {
                     fixed_array
                 }
@@ -333,37 +333,37 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", type_name)
+                    format!("Vec<Option<{type_name}>>")
                 } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
-                    format!("Vec<{}>", type_name)
+                    format!("Vec<{type_name}>")
                 } else {
-                    format!("Vec<Option<{}>>", type_name)
+                    format!("Vec<Option<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Vec<Option<{}>>", type_name)
+                    format!("Vec<Option<{type_name}>>")
                 } else if Self::can_be_defaulted(&sub_type.value_type, true) {
-                    format!("Vec<{}>", type_name)
+                    format!("Vec<{type_name}>")
                 } else {
-                    format!("Vec<Option<{}>>", type_name)
+                    format!("Vec<Option<{type_name}>>")
                 }
             }
             _ => {
                 if is_struct {
                     if self.is_nullable && Self::is_aidl_nullable(&sub_type.value_type) {
-                        format!("Vec<Option<{}>>", type_name)
+                        format!("Vec<Option<{type_name}>>")
                     } else {
-                        format!("Vec<{}>", type_name)
+                        format!("Vec<{type_name}>")
                     }
                 } else if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<Vec<{}>>", type_name)
+                        format!("Option<Vec<{type_name}>>")
                     } else {
-                        format!("Option<Vec<Option<{}>>>", type_name)
+                        format!("Option<Vec<Option<{type_name}>>>")
                     }
                 } else {
-                    format!("Vec<{}>", type_name)
+                    format!("Vec<{type_name}>")
                 }
             }
         }
@@ -418,23 +418,23 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("&mut Option<{}>", fixed_array)
+                    format!("&mut Option<{fixed_array}>")
                 } else {
-                    format!("&mut {}", fixed_array)
+                    format!("&mut {fixed_array}")
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("&mut Option<{}>", fixed_array)
+                    format!("&mut Option<{fixed_array}>")
                 } else {
-                    format!("&mut {}", fixed_array)
+                    format!("&mut {fixed_array}")
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<&{}>", fixed_array)
+                    format!("Option<&{fixed_array}>")
                 } else {
-                    format!("&{}", fixed_array)
+                    format!("&{fixed_array}")
                 }
             }
         }
@@ -450,36 +450,36 @@ impl TypeGenerator {
             Direction::Out => {
                 if self.is_nullable {
                     // if nullable, it means that the array can have null elements.
-                    format!("&mut Option<Vec<Option<{}>>>", type_name)
+                    format!("&mut Option<Vec<Option<{type_name}>>>")
                 } else if Self::can_be_defaulted(&sub_type.value_type, false)
                     || Self::is_primitive(&sub_type.value_type)
                 {
                     // Enum is a primitive type.
-                    format!("&mut Vec<{}>", type_name)
+                    format!("&mut Vec<{type_name}>")
                 } else {
-                    format!("&mut Vec<Option<{}>>", type_name)
+                    format!("&mut Vec<Option<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
                     if Self::can_be_defaulted(&sub_type.value_type, false) {
-                        format!("&mut Option<Vec<{}>>", type_name)
+                        format!("&mut Option<Vec<{type_name}>>")
                     } else {
-                        format!("&mut Option<Vec<Option<{}>>>", type_name)
+                        format!("&mut Option<Vec<Option<{type_name}>>>")
                     }
                 } else {
-                    format!("&mut Vec<{}>", type_name)
+                    format!("&mut Vec<{type_name}>")
                 }
             }
             _ => {
                 if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<&[{}]>", type_name)
+                        format!("Option<&[{type_name}]>")
                     } else {
-                        format!("Option<&[Option<{}>]>", type_name)
+                        format!("Option<&[Option<{type_name}>]>")
                     }
                 } else {
-                    format!("&[{}]", type_name)
+                    format!("&[{type_name}]")
                 }
             }
         }
@@ -507,9 +507,9 @@ impl TypeGenerator {
                     }
                     let name = self.type_decl(&self.value_type);
                     if self.is_nullable {
-                        format!("&mut Option<{}>", name)
+                        format!("&mut Option<{name}>")
                     } else {
-                        format!("&mut {}", name)
+                        format!("&mut {name}")
                     }
                 }
                 _ => {
@@ -518,9 +518,9 @@ impl TypeGenerator {
                     } else {
                         let name = self.type_decl(&self.value_type);
                         if self.is_nullable {
-                            format!("Option<&{}>", name)
+                            format!("Option<&{name}>")
                         } else {
-                            format!("&{}", name)
+                            format!("&{name}")
                         }
                     }
                 }
@@ -572,8 +572,8 @@ impl TypeGenerator {
 
         let (mutable, init) = match self.direction {
             Direction::Out => ("mut ", "Default::default()".to_owned()),
-            Direction::Inout => ("mut ", format!("{}.read()?", reader)),
-            _ => ("", format!("{}.read()?", reader)),
+            Direction::Inout => ("mut ", format!("{reader}.read()?")),
+            _ => ("", format!("{reader}.read()?")),
         };
 
         format!(
@@ -625,7 +625,7 @@ impl TypeGenerator {
                         .to_init(param.with_fixed_array(false).with_nullable(false))
                 };
                 if self.is_nullable {
-                    format!("Some({})", init_str)
+                    format!("Some({init_str})")
                 } else {
                     init_str
                 }

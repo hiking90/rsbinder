@@ -222,7 +222,7 @@ impl ValueType {
                 }
                 ConstExpr::new(ValueType::Array(list))
             }
-            _ => panic!("Can't apply unary operator '~' or \"!\" to {:?}", self),
+            _ => panic!("Can't apply unary operator '~' or \"!\" to {self:?}"),
         }
     }
 
@@ -249,7 +249,7 @@ impl ValueType {
 
                 ConstExpr::new(ValueType::Array(list))
             }
-            _ => panic!("Can't apply unary operator '-' to {:?}", self),
+            _ => panic!("Can't apply unary operator '-' to {self:?}"),
         }
     }
 
@@ -318,7 +318,7 @@ impl ValueType {
             ValueType::Int64(v) => *v as _,
             ValueType::Float(v) | ValueType::Double(v) => *v as _,
             ValueType::Array(_) => {
-                panic!("to_i64() for List is not supported. {:?}", self);
+                panic!("to_i64() for List is not supported. {self:?}");
             }
             ValueType::Name(_) => {
                 panic!("to_i64() for Name is not supported.");
@@ -368,7 +368,7 @@ impl ValueType {
                     let some_str = if let ValueType::Array(_) = v.value {
                         init_str
                     } else if param.is_nullable {
-                        format!("Some({})", init_str)
+                        format!("Some({init_str})")
                     } else {
                         init_str
                     };
@@ -381,7 +381,7 @@ impl ValueType {
                 res
             }
             ValueType::Holder => {
-                println!("Init Holder: {:?}", param);
+                println!("Init Holder: {param:?}");
                 if param.is_vintf {
                     format!(
                         "{}::ParcelableHolder::new({}::Stability::Vintf)",
@@ -718,7 +718,7 @@ impl ConstExpr {
                     if let Some(ch) = char::from_u32(ch) {
                         Self::new(ValueType::Char(ch as _))
                     } else {
-                        panic!("0x{:x} is invalid unicode.", ch)
+                        panic!("0x{ch:x} is invalid unicode.")
                     }
                 }
                 ValueType::Array(_) => {

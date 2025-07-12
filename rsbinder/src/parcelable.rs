@@ -403,7 +403,7 @@ impl DeserializeOption for String {
                 std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
             })
             .map_err(|e| {
-                log::error!("Deserialize for Option<String16>: {}", e);
+                log::error!("Deserialize for Option<String16>: {e}");
                 StatusCode::BadValue
             })?;
 
@@ -681,7 +681,7 @@ pub trait DeserializeArray: Deserialize {
     fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
         let len: i32 = parcel.read()?;
         if len < -1 {
-            log::error!("Negative array size given in parcel: {}", len);
+            log::error!("Negative array size given in parcel: {len}");
             return Err(StatusCode::BadValue);
         }
         if len <= 0 {

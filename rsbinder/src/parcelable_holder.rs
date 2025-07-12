@@ -141,17 +141,13 @@ impl ParcelableHolder {
             } => {
                 if name != parcelable_desc {
                     log::error!(
-                        "ParcelableHolder::get_parcelable: parcelable descriptor mismatch: {:?} != {:?}",
-                        name,
-                        parcelable_desc);
+                        "ParcelableHolder::get_parcelable: parcelable descriptor mismatch: {name:?} != {parcelable_desc:?}");
                     return Err(StatusCode::BadValue);
                 }
 
                 match Arc::clone(parcelable).downcast_arc::<T>() {
                     Err(_) => {
-                        log::error!("ParcelableHolder::get_parcelable: parcelable type mismatch: {:?} != {:?}",
-                            parcelable,
-                            parcelable_desc);
+                        log::error!("ParcelableHolder::get_parcelable: parcelable type mismatch: {parcelable:?} != {parcelable_desc:?}");
                         Err(StatusCode::BadValue)
                     }
                     Ok(x) => Ok(Some(x)),

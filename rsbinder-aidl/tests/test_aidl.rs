@@ -15,7 +15,7 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
             ChangeTag::Insert => "+ ",
             ChangeTag::Equal => "  ",
         };
-        print!("{}{}", sign, change);
+        print!("{sign}{change}");
     }
     assert_eq!(res.1.trim(), expect.trim());
     Ok(())
