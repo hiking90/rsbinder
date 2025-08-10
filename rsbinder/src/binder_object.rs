@@ -59,7 +59,7 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.handle }
     }
 
-    pub(crate) fn borrowed_fd(&self) -> BorrowedFd {
+    pub(crate) fn borrowed_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(self.handle() as _) }
     }
 
