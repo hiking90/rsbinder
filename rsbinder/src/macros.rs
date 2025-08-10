@@ -563,6 +563,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     impl IEcho for Binder<BnEcho> {
         #[cfg(feature = "async")]
         fn echo(&self, echo: &str) -> Result<String> {
@@ -610,6 +611,7 @@ mod tests {
     fn test_try_from() {
         use async_trait::async_trait;
 
+        #[allow(dead_code)]
         pub trait IEcho: Interface + Send {
             fn echo(&self, echo: &str) -> crate::status::Result<String>;
         }
@@ -620,6 +622,8 @@ mod tests {
                 echo: &'a str,
             ) -> crate::BoxFuture<'a, crate::status::Result<String>>;
         }
+
+        #[allow(dead_code)]
         #[async_trait]
         pub trait IEchoAsyncService: Interface + Send {
             async fn echo(&self, echo: &str) -> crate::status::Result<String>;
@@ -665,11 +669,13 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         pub trait BnEchoAdapter: Send + Sync {
             fn as_sync(&self) -> &dyn IEcho;
             fn as_async(&self) -> &dyn IEchoAsyncService;
         }
 
+        #[allow(dead_code)]
         struct Wrapper<T, R> {
             inner: T,
             rt: R,
@@ -712,6 +718,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         pub struct BnEcho(Box<dyn BnEchoAdapter>);
 
         impl BnEcho {
