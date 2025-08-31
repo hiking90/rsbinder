@@ -166,6 +166,7 @@ impl TypeGenerator {
                 let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL);
                 matches!(lookup_decl.decl, Declaration::Enum(_))
             }
+            ValueType::Reference { .. } => true,
             _ => value_type.is_primitive(),
         }
     }
@@ -619,10 +620,26 @@ impl TypeGenerator {
                                 .with_nullable(is_nullable),
                         )
                 } else {
-                    expr.calculate()
-                        .convert_to(&self.value_type)
-                        .value
-                        .to_init(param.with_fixed_array(false).with_nullable(false))
+                    let calculated = expr.calculate();
+                    // Check if we have an enum reference and target is a primitive type
+                    if let ValueType::Reference { value, .. } = &calculated.value {
+                        if matches!(&self.value_type, ValueType::UserDefined(_)) {
+                            // Target is an enum type, preserve enum reference
+                            calculated
+                                .value
+                                .to_init(param.with_fixed_array(false).with_nullable(false))
+                        } else {
+                            // Target is a primitive type (e.g., int), use numeric value
+                            ValueType::Int64(*value)
+                                .to_init(param.with_fixed_array(false).with_nullable(false))
+                        }
+                    } else {
+                        // Normal processing for non-enum references
+                        calculated
+                            .convert_to(&self.value_type)
+                            .value
+                            .to_init(param.with_fixed_array(false).with_nullable(false))
+                    }
                 };
                 if self.is_nullable {
                     format!("Some({init_str})")

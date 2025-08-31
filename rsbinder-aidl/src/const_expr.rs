@@ -26,6 +26,11 @@ macro_rules! arithmetic_bit_op {
                 // ValueType::Float(_) | ValueType::Double => {
                 //     ConstExpr::new_with_int($lhs.to_i64() $op $rhs.to_i64(), $promoted)
                 // }
+                ValueType::Reference { .. } => {
+                    // Reference types use their numeric values for bitwise operations
+                    let value = ($lhs.to_i64() $op $rhs.to_i64());
+                    ConstExpr::new(ValueType::Int64(value as _))
+                }
                 _ => panic!("Can't apply operator {:?} - '{}' for non integer type: {} {:?} - {}",
                     $lhs, $lhs.raw_expr(), $desc, $rhs, $rhs.raw_expr()),
             }
@@ -63,6 +68,10 @@ macro_rules! arithmetic_basic_op {
                 }
                 ValueType::Bool(_) => {
                     ConstExpr::new(ValueType::Bool((lhs.to_i64() $op rhs.to_i64()) != 0))
+                }
+                ValueType::Reference { .. } => {
+                    // Reference types use their numeric values for arithmetic operations
+                    ConstExpr::new(ValueType::Int64((lhs.to_i64() $op rhs.to_i64()) as _))
                 }
                 _ => {
                     panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, as_str);
@@ -146,6 +155,11 @@ pub enum ValueType {
     FileDescriptor,
     Holder,
     UserDefined(String),
+    Reference {
+        enum_name: String,
+        member_name: String,
+        value: i64,
+    },
 }
 
 impl ValueType {
@@ -176,6 +190,7 @@ impl ValueType {
                 | ValueType::Char(_)
                 | ValueType::Float(_)
                 | ValueType::Double(_)
+                | ValueType::Reference { .. }
         )
     }
 
@@ -199,6 +214,7 @@ impl ValueType {
             ValueType::FileDescriptor => 15,
             ValueType::Holder => 16,
             ValueType::UserDefined(_) => 17,
+            ValueType::Reference { .. } => 18,
         }
     }
 
@@ -372,6 +388,7 @@ impl ValueType {
                     }
                 }
             }
+            ValueType::Reference { value, .. } => *value,
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate();
                 expr.to_i64()
@@ -405,6 +422,20 @@ impl ValueType {
             ValueType::Double(_) => format!("{}f64", self.to_value_string()),
             ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
             ValueType::Name(_) => self.to_value_string(),
+            ValueType::Reference {
+                enum_name,
+                member_name,
+                value,
+            } => {
+                if param.is_const {
+                    // For constants, always use numeric values
+                    format!("{}", value)
+                } else {
+                    // For default values, format depends on whether target expects enum or numeric type
+                    // This will be handled in the init_value method based on target type
+                    format!("super::{}::{}::{}", enum_name, enum_name, member_name)
+                }
+            }
             ValueType::Array(v) => {
                 let mut res = if param.is_fixed_array {
                     "[".to_owned()
@@ -473,6 +504,13 @@ impl ValueType {
                 res
             }
             ValueType::Name(v) => v.to_string(),
+            ValueType::Reference {
+                enum_name,
+                member_name,
+                ..
+            } => {
+                format!("{}.{}", enum_name, member_name)
+            }
             ValueType::Expr { lhs, operator, rhs } => {
                 format!(
                     "{} {} {}",
@@ -548,6 +586,7 @@ impl ValueType {
                     ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(value as _)),
                     ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(value as _)),
                     ValueType::Byte(_) => ConstExpr::new(ValueType::Byte(value as _)),
+                    ValueType::Reference { .. } => ConstExpr::new(ValueType::Int64(value as _)),
                     _ => panic!(
                         "Can't apply operator '{}' for non integer type: {}",
                         operator,
@@ -608,6 +647,7 @@ impl ValueType {
                     }
                 }
             }
+            ValueType::Reference { .. } => ConstExpr::new(self.clone()),
             _ => ConstExpr::new(self.clone()),
         }
     }
@@ -795,6 +835,10 @@ impl ConstExpr {
                     unreachable!();
                 }
                 ValueType::UserDefined(_) => self.clone(),
+                ValueType::Reference { .. } => {
+                    // Reference types preserve their original form
+                    self.clone()
+                }
                 _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),
             }
         }

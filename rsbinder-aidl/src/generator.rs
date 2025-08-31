@@ -845,24 +845,28 @@ impl Generator {
                     _ => calculated.to_i64(),
                 };
 
-                // Register the member using universal symbol table
+                // Register the member using universal symbol table with enum reference preservation
                 parser::register_symbol(
                     member_name,
-                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Int64(
-                        computed_val,
-                    )),
+                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
+                        enum_name: decl.name.clone(),
+                        member_name: member_name.to_string(),
+                        value: computed_val,
+                    }),
                     parser::SymbolType::EnumMember,
                     Some(&decl.name),
                 );
 
                 enum_val = computed_val;
             } else {
-                // Register with current auto-increment value using universal symbol table
+                // Register with current auto-increment value using universal symbol table with enum reference preservation
                 parser::register_symbol(
                     member_name,
-                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Int64(
-                        enum_val,
-                    )),
+                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
+                        enum_name: decl.name.clone(),
+                        member_name: member_name.to_string(),
+                        value: enum_val,
+                    }),
                     parser::SymbolType::EnumMember,
                     Some(&decl.name),
                 );
