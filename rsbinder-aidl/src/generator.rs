@@ -657,6 +657,19 @@ impl Generator {
         let mut fn_members = Vec::new();
 
         if !is_empty {
+            // First pass: register all interface constants for resolution
+            for constant in decl.constant_list.iter() {
+                if let Some(const_expr) = &constant.const_expr {
+                    parser::register_symbol(
+                        &constant.identifier,
+                        const_expr.clone(),
+                        parser::SymbolType::InterfaceConstant,
+                        Some(&decl.name),
+                    );
+                }
+            }
+
+            // Second pass: process constants with resolved values
             for constant in decl.constant_list.iter() {
                 let generator = constant.r#type.to_generator();
                 const_members.push((
@@ -816,6 +829,54 @@ impl Generator {
 
         let mut members = Vec::new();
         let mut enum_val: i64 = 0;
+
+        // First pass: register all enum members with their names for resolution
+        for enumerator in &decl.enumerator_list {
+            let member_name = &enumerator.identifier;
+
+            if let Some(const_expr) = &enumerator.const_expr {
+                // Try to compute the value, but handle cases where it might reference other enum members
+                let calculated = const_expr.calculate();
+                let computed_val = match calculated.value {
+                    crate::const_expr::ValueType::Name(_) => {
+                        // This is an unresolved reference, use current enum_val as fallback
+                        enum_val
+                    }
+                    _ => calculated.to_i64(),
+                };
+
+                // Register the member using universal symbol table with enum reference preservation
+                parser::register_symbol(
+                    member_name,
+                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
+                        enum_name: decl.name.clone(),
+                        member_name: member_name.to_string(),
+                        value: computed_val,
+                    }),
+                    parser::SymbolType::EnumMember,
+                    Some(&decl.name),
+                );
+
+                enum_val = computed_val;
+            } else {
+                // Register with current auto-increment value using universal symbol table with enum reference preservation
+                parser::register_symbol(
+                    member_name,
+                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
+                        enum_name: decl.name.clone(),
+                        member_name: member_name.to_string(),
+                        value: enum_val,
+                    }),
+                    parser::SymbolType::EnumMember,
+                    Some(&decl.name),
+                );
+            }
+
+            enum_val += 1;
+        }
+
+        // Second pass: resolve all values now that all members are registered
+        enum_val = 0;
         for enumerator in &decl.enumerator_list {
             if let Some(const_expr) = &enumerator.const_expr {
                 enum_val = const_expr.calculate().to_i64();

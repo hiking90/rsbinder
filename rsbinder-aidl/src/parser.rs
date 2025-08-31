@@ -19,11 +19,32 @@ use crate::const_expr::{ConstExpr, ValueType};
 use crate::type_generator;
 use crate::Namespace;
 
+#[derive(Debug, Clone)]
+pub enum SymbolType {
+    EnumMember,
+    InterfaceConstant,
+    // Future expansion: ParcelableDefault, Variable, etc.
+}
+
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    #[allow(dead_code)]
+    pub name: String,
+    pub value: crate::const_expr::ConstExpr,
+    #[allow(dead_code)]
+    pub symbol_type: SymbolType,
+    #[allow(dead_code)]
+    pub namespace: Option<String>,
+}
+
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
+
+    // Universal Symbol Table - supports all types of named constants
+    static SYMBOL_TABLE: RefCell<HashMap<String, Symbol>> = RefCell::new(HashMap::new());
 }
 
 pub struct NamespaceGuard();
@@ -212,10 +233,93 @@ fn lookup_name_members(members: &Vec<Declaration>, lookup_decl: &LookupDecl) -> 
     None
 }
 
-// Normally, this function is used to generate Rust source code.
+// Universal symbol registration - supports all types of named constants
+pub fn register_symbol(
+    name: &str,
+    value: ConstExpr,
+    symbol_type: SymbolType,
+    namespace: Option<&str>,
+) {
+    let symbol = Symbol {
+        name: name.to_string(),
+        value,
+        symbol_type,
+        namespace: namespace.map(|s| s.to_string()),
+    };
+
+    SYMBOL_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+
+        // Register with simple name
+        table.insert(name.to_string(), symbol.clone());
+
+        // Also register with qualified name if namespace is provided
+        if let Some(ns) = namespace {
+            let qualified_name = format!("{}.{}", ns, name);
+            table.insert(qualified_name, symbol);
+        }
+    });
+}
+
+// Note: register_enum_member removed as it's not used
+// Use register_symbol directly with SymbolType::EnumMember
+
+// Enhanced name resolution with universal symbol table
 pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
-    let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
-    lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
+    // First, try to resolve from universal symbol table
+    let symbol_result =
+        SYMBOL_TABLE.with(|table| table.borrow().get(name).map(|symbol| symbol.value.clone()));
+
+    if symbol_result.is_some() {
+        return symbol_result;
+    }
+
+    // Try alternative name formats for cross-references
+    let alternative_formats = generate_name_variants(name);
+    for variant in alternative_formats {
+        let variant_result = SYMBOL_TABLE.with(|table| {
+            table
+                .borrow()
+                .get(&variant)
+                .map(|symbol| symbol.value.clone())
+        });
+        if variant_result.is_some() {
+            return variant_result;
+        }
+    }
+
+    // Fallback to original resolution
+    let lookup_result = std::panic::catch_unwind(|| {
+        let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
+        lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
+    });
+
+    lookup_result.unwrap_or_default()
+}
+
+// Generate possible name variants for flexible resolution
+fn generate_name_variants(name: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+
+    // Handle dot notation: "EnumName.VALUE" -> ["EnumName.VALUE", "VALUE"]
+    if name.contains('.') {
+        variants.push(name.to_string());
+        if let Some(last_part) = name.split('.').next_back() {
+            variants.push(last_part.to_string());
+        }
+    } else {
+        // For simple names, try with current namespace context
+        let current_ns = std::panic::catch_unwind(current_namespace)
+            .map(|ns| ns.to_string(crate::Namespace::AIDL))
+            .unwrap_or_default();
+
+        if !current_ns.is_empty() {
+            variants.push(format!("{}.{}", current_ns, name));
+        }
+        variants.push(name.to_string());
+    }
+
+    variants
 }
 
 #[derive(Debug)]
@@ -1419,6 +1523,9 @@ pub fn reset() {
     });
     DOCUMENT.with(|doc| {
         *doc.borrow_mut() = Document::new();
+    });
+    SYMBOL_TABLE.with(|table| {
+        table.borrow_mut().clear();
     });
 }
 
