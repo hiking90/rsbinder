@@ -24,10 +24,10 @@ fn test_circular_reference_warning() -> Result<(), Box<dyn Error>> {
             C = A,
         }
     "##;
-    
+
     // Capture stderr to check for warnings
     let result = test_aidl_generation(input);
-    
+
     match result {
         Ok(_output) => {
             // Success is acceptable - it means we handled the circular reference gracefully
@@ -72,14 +72,14 @@ fn test_deep_nesting_stability() -> Result<(), Box<dyn Error>> {
             VAL = Level4.VAL | Level3.VAL,
         }
     "##;
-    
+
     let result = test_aidl_generation(input)?;
-    
+
     // Should work without crashes
     assert!(result.contains("pub mod BaseEnum"));
     assert!(result.contains("pub mod Level5"));
     println!("Deep nesting test passed successfully");
-    
+
     Ok(())
 }
 
@@ -95,9 +95,9 @@ fn test_unresolvable_reference_graceful() -> Result<(), Box<dyn Error>> {
             C = A + B, // This should still work
         }
     "##;
-    
+
     let result = test_aidl_generation(input);
-    
+
     match result {
         Ok(output) => {
             // Should generate something reasonable
@@ -109,7 +109,7 @@ fn test_unresolvable_reference_graceful() -> Result<(), Box<dyn Error>> {
             println!("Unresolvable reference caused error (no crash): {}", e);
         }
     }
-    
+
     Ok(())
 }
 
@@ -129,9 +129,9 @@ fn test_mixed_resolvable_unresolvable() -> Result<(), Box<dyn Error>> {
             COMPUTED = WORKS + 5,     // Should work based on resolved value
         }
     "##;
-    
+
     let result = test_aidl_generation(input);
-    
+
     match result {
         Ok(output) => {
             assert!(output.contains("pub mod GoodEnum"));
@@ -142,7 +142,7 @@ fn test_mixed_resolvable_unresolvable() -> Result<(), Box<dyn Error>> {
             println!("Mixed test caused error (acceptable): {}", e);
         }
     }
-    
+
     Ok(())
 }
 
@@ -176,20 +176,24 @@ fn test_large_enum_performance() -> Result<(), Box<dyn Error>> {
             V20 = V19 + 1,
         }
     "##;
-    
+
     use std::time::Instant;
     let start = Instant::now();
-    
+
     let result = test_aidl_generation(input)?;
-    
+
     let duration = start.elapsed();
-    
+
     // Should complete in reasonable time (less than 1 second)
-    assert!(duration.as_secs() < 1, "Large enum took too long: {:?}", duration);
+    assert!(
+        duration.as_secs() < 1,
+        "Large enum took too long: {:?}",
+        duration
+    );
     assert!(result.contains("pub mod LargeEnum"));
-    
+
     println!("Large enum test passed in {:?}", duration);
-    
+
     Ok(())
 }
 
@@ -214,18 +218,18 @@ fn test_android_keymint_style_simplified() -> Result<(), Box<dyn Error>> {
             COMPUTED = KEY_SIZE + 1,
         }
     "##;
-    
+
     let result = test_aidl_generation(input)?;
-    
+
     // Should work without panicking
     assert!(result.contains("pub mod TagType"));
     assert!(result.contains("pub mod Tag"));
-    
+
     // Verify some basic values are calculated
     assert!(result.contains("r#INVALID = 0"));
     assert!(result.contains("r#UINT = 805306368")); // 0x30000000
-    
+
     println!("Android KeyMint style test passed successfully");
-    
+
     Ok(())
 }
