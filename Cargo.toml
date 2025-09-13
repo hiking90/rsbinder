@@ -33,10 +33,13 @@ pest = "2.7.*"
 pest_derive = "2.7.*"
 convert_case = "0.8"
 serde = { version = "1.0", features = ["derive"] }
-tera = "1.19"
+tera = "1.20.*"
 similar = "2.4"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "2.0"
 rustix = "1.0.*"
-clap = "4.5.43"
+clap = "4.5"
 rsproperties = "0.2.1"
+
+[patch.crates-io]
+chrono = { git = "https://github.com/chronotope/chrono", tag = "v0.4.41" }
