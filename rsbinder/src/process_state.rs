@@ -214,7 +214,7 @@ impl ProcessState {
         }
 
         // some binder objects do not have interface string
-        let interface: String = thread_state::query_interface(handle).unwrap_or(String::new());
+        let interface: String = thread_state::query_interface(handle).unwrap_or_default();
 
         let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, &interface, stability);
         let weak = WIBinder::new(proxy)?;
