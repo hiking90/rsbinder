@@ -15,7 +15,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{self, Arc, RwLock};
 
 use crate::{
-    binder::*, binder_object::*, error::*, parcel::*, ref_counter::RefCounter, thread_state,
+    binder::*, binder_object::*, error::*, parcel::*, process_state::ProcessState,
+    ref_counter::RefCounter, thread_state,
 };
 
 /// Handle for a proxy to a remote binder service.
@@ -36,10 +37,11 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Create a new proxy handle for the given binder handle and descriptor.
-    pub fn new(handle: u32, descriptor: &str, stability: Stability) -> Arc<Self> {
+    /// Takes ownership of the descriptor String to avoid unnecessary allocation.
+    pub fn new(handle: u32, descriptor: String, stability: Stability) -> Arc<Self> {
         Arc::new(Self {
             handle,
-            descriptor: descriptor.to_owned(),
+            descriptor,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
@@ -234,8 +236,25 @@ impl IBinder for ProxyHandle {
     }
 
     fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        self.strong
-            .dec(|| thread_state::dec_strong_handle(self.handle()))
+        let handle = self.handle;
+        self.strong.dec(|| {
+            thread_state::dec_strong_handle(handle)?;
+
+            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
+            // This means no active references exist (except WIBinder's Arc in cache)
+            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
+            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
+
+            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
+                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
+            {
+                // Both counters are reset - safe to remove from cache
+                // This prevents stale proxies when handles are reused (Issue #47)
+                ProcessState::as_self().expunge_handle(handle);
+            }
+
+            Ok(())
+        })
     }
 
     fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
@@ -244,8 +263,25 @@ impl IBinder for ProxyHandle {
     }
 
     fn dec_weak(&self) -> Result<()> {
-        self.weak
-            .dec(|| thread_state::dec_weak_handle(self.handle()))
+        let handle = self.handle;
+        self.weak.dec(|| {
+            thread_state::dec_weak_handle(handle)?;
+
+            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
+            // This means no active references exist (except WIBinder's Arc in cache)
+            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
+            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
+
+            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
+                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
+            {
+                // Both counters are reset - safe to remove from cache
+                // This prevents stale proxies when handles are reused (Issue #47)
+                ProcessState::as_self().expunge_handle(handle);
+            }
+
+            Ok(())
+        })
     }
 }
 
@@ -267,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_proxy_handle() {
-        let handle = ProxyHandle::new(1, "test", Stability::Local);
+        let handle = ProxyHandle::new(1, "test".to_string(), Stability::Local);
         assert_eq!(handle.handle(), 1);
         assert_eq!(handle.descriptor(), "test");
 
@@ -282,7 +318,7 @@ mod tests {
         );
 
         // Test for PartialEq trait
-        let handle2 = ProxyHandle::new(1, "test", Stability::Local);
+        let handle2 = ProxyHandle::new(1, "test".to_string(), Stability::Local);
         assert_eq!(handle, handle2);
     }
 }

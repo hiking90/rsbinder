@@ -190,21 +190,21 @@ jobs:
         echo "Test setup completed successfully on Android API level ${{ matrix.api-level }}!"
         echo "test_service execution attempted on Android emulator"
 
-    - name: Run tests on Android device
+    - name: Run tests on Android device (20 iterations)
       run: |
         echo "Looking for test executables on API level ${{ matrix.api-level }}..."
         timeout 10 adb shell "ls -la /data/rsbinder/tests-*" || echo "No test executables found"
-        echo "Finding and running test executables..."
+        echo "Finding and running test executables (20 iterations)..."
         timeout 30 adb shell "
           cd /data/rsbinder
-          for test_file in tests-*; do
-            if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
-              echo \"Running test: \$test_file\"
-              chmod +x \"\$test_file\"
-              ./\"\$test_file\" || echo \"Test \$test_file completed with errors\"
-              echo \"Finished running: \$test_file\"
-              echo \"---\"
-            fi
+          for iteration in \$(seq 1 20); do
+            echo \"=== Iteration \$iteration/20 ===\"
+            for test_file in tests-*; do
+              if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
+                chmod +x \"\$test_file\"
+                ./\"\$test_file\" || echo \"Test \$test_file failed\"
+              fi
+            done
           done
         " || echo "Test execution completed with timeout"
-        echo "All tests execution attempted on Android API level ${{ matrix.api-level }}"
+        echo "All 20 test iterations attempted on Android API level ${{ matrix.api-level }}"

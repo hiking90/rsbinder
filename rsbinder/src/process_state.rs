@@ -216,7 +216,7 @@ impl ProcessState {
         // some binder objects do not have interface string
         let interface: String = thread_state::query_interface(handle).unwrap_or_default();
 
-        let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, &interface, stability);
+        let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, interface, stability);
         let weak = WIBinder::new(proxy)?;
 
         handle_to_proxy.insert(handle, weak.clone());
@@ -231,6 +231,19 @@ impl ProcessState {
         }
         handle_to_proxy.remove(&handle);
         Ok(())
+    }
+
+    /// Remove a proxy handle from the cache.
+    ///
+    /// This is called by ProxyHandle's Drop implementation to ensure that
+    /// when a proxy is destroyed, it is removed from the cache. This prevents
+    /// stale proxies from being returned when a handle is reused by the kernel.
+    ///
+    /// This is equivalent to Android's ProcessState::expungeHandle().
+    pub(crate) fn expunge_handle(&self, handle: u32) {
+        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+        handle_to_proxy.remove(&handle);
+        log::trace!("expunge_handle: removed handle {}", handle);
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {

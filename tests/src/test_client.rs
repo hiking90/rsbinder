@@ -1445,3 +1445,91 @@ fn test_hub() {
         .iter()
         .any(|s| s.name == ITestService::BpTestService::descriptor()));
 }
+
+/// Test for issue #47: cached interface string bug
+///
+/// This test demonstrates the problem where handle_to_proxy cache
+/// returns a stale proxy with an incorrect descriptor when handles
+/// are reused for different services.
+///
+/// Bug scenario from issue #47:
+/// ```
+/// let service_manager = rsbinder::hub::default();
+/// let all_services = service_manager.list_services(0xf);
+/// for service_name in &all_services {
+///     let service = service_manager.get_service(service_name).unwrap();
+///     println!("{} interface: {}", service_name, service.descriptor());
+///     service.dec_weak().unwrap();
+/// }
+/// ```
+/// The output shows all services have the same (first) descriptor.
+#[test]
+fn test_issue_47_cached_interface_string() {
+    init_test();
+
+    // Get list of all available services
+    let all_services = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
+
+    if all_services.len() < 2 {
+        println!(
+            "Skipping test: need at least 2 services, found {}",
+            all_services.len()
+        );
+        return;
+    }
+
+    println!("\nTesting issue #47 with {} services", all_services.len());
+
+    // Track services and their expected descriptors
+    let mut service_descriptors = Vec::new();
+
+    // First pass: get services and record their descriptors
+    println!("\n=== First Pass: Recording service descriptors ===");
+    for service_name in all_services.iter().take(10) {
+        if let Some(service) = hub::get_service(service_name) {
+            let descriptor = service.descriptor().to_string();
+
+            println!("Service '{}' -> descriptor: '{}'", service_name, descriptor);
+
+            service_descriptors.push((service_name.clone(), descriptor));
+
+            // Release the service (this is important to potentially trigger handle reuse)
+            let _ = service.dec_weak();
+        }
+    }
+
+    // Second pass: retrieve services again and verify descriptors match
+    println!("\n=== Second Pass: Verifying descriptors ===");
+    let mut bug_detected = false;
+
+    for (service_name, expected_descriptor) in &service_descriptors {
+        if let Some(service) = hub::get_service(service_name) {
+            let actual_descriptor = service.descriptor();
+
+            println!(
+                "Service '{}' -> descriptor: '{}' (expected: '{}')",
+                service_name, actual_descriptor, expected_descriptor
+            );
+
+            // Check if descriptors match
+            if actual_descriptor != expected_descriptor {
+                println!("\n!!! BUG #47 DETECTED !!!");
+                println!("Service '{}' has wrong descriptor!", service_name);
+                println!("  Expected: '{}'", expected_descriptor);
+                println!("  Got:      '{}'", actual_descriptor);
+                bug_detected = true;
+            }
+
+            let _ = service.dec_weak();
+        }
+    }
+
+    // This assertion will FAIL if bug #47 exists
+    assert!(
+        !bug_detected,
+        "BUG #47 DETECTED: Some services returned incorrect descriptors. \
+         This indicates the proxy cache is returning stale proxies with wrong interface strings."
+    );
+
+    println!("\n=== Test passed: All services have correct descriptors ===\n");
+}

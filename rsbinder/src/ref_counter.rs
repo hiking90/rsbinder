@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::*;
 
-const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
+pub(crate) const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
 
 pub(crate) struct RefCounter {
     pub(crate) count: AtomicI32,

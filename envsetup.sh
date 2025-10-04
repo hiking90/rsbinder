@@ -27,6 +27,9 @@ function ndk_build() {
 function ndk_sync() {
     read_remote_android
 
+    echo "Syncing binaries from $source_directory to $remote_directory..."
+
+    # Sync main executables from debug directory
     if [[ "$OSTYPE" == "darwin"* ]]; then
         # macOS
         find_command="find \"$source_directory\" -maxdepth 1 -type f -perm +111"
@@ -36,8 +39,31 @@ function ndk_sync() {
     fi
 
     eval $find_command | while read file; do
+        echo "  Pushing $(basename "$file")..."
         adb push "$file" "$remote_directory/"
     done
+
+    # Sync test binaries from deps directory
+    local deps_directory="$source_directory/deps"
+    if [ -d "$deps_directory" ]; then
+        echo "Syncing test binaries from deps directory..."
+
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS - find test executables (exclude .d files and libraries)
+            find "$deps_directory" -type f -perm +111 ! -name "*.d" ! -name "*.so" ! -name "*.dylib" | while read file; do
+                echo "  Pushing $(basename "$file")..."
+                adb push "$file" "$remote_directory/"
+            done
+        else
+            # Linux
+            find "$deps_directory" -type f -executable ! -name "*.d" ! -name "*.so" | while read file; do
+                echo "  Pushing $(basename "$file")..."
+                adb push "$file" "$remote_directory/"
+            done
+        fi
+    fi
+
+    echo "Sync complete!"
 }
 
 function read_remote_android() {
