@@ -62,12 +62,18 @@ impl ProcessState {
     }
 
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
-        let mut self_call_restriction = self.call_restriction.write().unwrap();
+        let mut self_call_restriction = self
+            .call_restriction
+            .write()
+            .expect("Call restriction lock poisoned");
         *self_call_restriction = call_restriction;
     }
 
     pub(crate) fn call_restriction(&self) -> CallRestriction {
-        *self.call_restriction.read().unwrap()
+        *self
+            .call_restriction
+            .read()
+            .expect("Call restriction lock poisoned")
     }
 
     fn inner_init(
@@ -152,7 +158,10 @@ impl ProcessState {
         &self,
         binder: SIBinder,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let mut context_manager = self.context_manager.write().unwrap();
+        let mut context_manager = self
+            .context_manager
+            .write()
+            .expect("Context manager lock poisoned");
 
         if context_manager.is_none() {
             let obj = binder::flat_binder_object::new_binder_with_flags(
@@ -175,7 +184,10 @@ impl ProcessState {
     }
 
     pub(crate) fn context_manager(&self) -> Option<SIBinder> {
-        self.context_manager.read().unwrap().clone()
+        self.context_manager
+            .read()
+            .expect("Context manager lock poisoned")
+            .clone()
     }
 
     /// Get binder service manager.
@@ -195,11 +207,19 @@ impl ProcessState {
         stability: Stability,
     ) -> Result<SIBinder> {
         // Double-Checked Locking Pattern is used.
-        if let Some(weak) = self.handle_to_proxy.read().unwrap().get(&handle) {
+        if let Some(weak) = self
+            .handle_to_proxy
+            .read()
+            .expect("Handle to proxy lock poisoned")
+            .get(&handle)
+        {
             return weak.upgrade();
         }
 
-        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+        let mut handle_to_proxy = self
+            .handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned");
         if let Some(weak) = handle_to_proxy.get(&handle) {
             return weak.upgrade();
         }
@@ -225,11 +245,39 @@ impl ProcessState {
     }
 
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
-        if let Some(weak) = handle_to_proxy.get(&handle) {
-            weak.upgrade()?.as_proxy().unwrap().send_obituary(weak)?;
+        // Extract the weak reference atomically by removing it from the map.
+        // This ensures only one thread can retrieve and process this handle's obituary.
+        let weak = {
+            let mut handle_to_proxy = self
+                .handle_to_proxy
+                .write()
+                .expect("Handle to proxy lock poisoned");
+            handle_to_proxy.remove(&handle)
+        };
+        // Write lock is released here
+
+        // Send obituary notification outside the lock to avoid potential deadlock.
+        // If the handle wasn't in the map, this is a no-op.
+        if let Some(weak) = weak {
+            match weak.upgrade() {
+                Ok(strong) => {
+                    if let Some(proxy) = strong.as_proxy() {
+                        // Send obituary - this is best-effort notification
+                        proxy.send_obituary(&weak)?;
+                    } else {
+                        log::debug!("Handle {} is not a proxy during obituary", handle);
+                    }
+                }
+                Err(_) => {
+                    // Weak reference upgrade failed - object already destroyed
+                    // This is expected in many cases and not an error
+                    log::trace!("Object for handle {} already destroyed", handle);
+                }
+            }
+        } else {
+            log::trace!("Handle {} was not in cache during obituary", handle);
         }
-        handle_to_proxy.remove(&handle);
+
         Ok(())
     }
 
@@ -241,7 +289,10 @@ impl ProcessState {
     ///
     /// This is equivalent to Android's ProcessState::expungeHandle().
     pub(crate) fn expunge_handle(&self, handle: u32) {
-        let mut handle_to_proxy = self.handle_to_proxy.write().unwrap();
+        let mut handle_to_proxy = self
+            .handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned");
         handle_to_proxy.remove(&handle);
         log::trace!("expunge_handle: removed handle {}", handle);
     }
@@ -364,7 +415,7 @@ fn open_driver(
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mmap = self.mmap.read().unwrap();
+        let mmap = self.mmap.read().expect("Mmap lock poisoned");
         unsafe {
             rustix::mm::munmap(mmap.ptr, mmap.size).expect("Failed to unmap memory");
         }

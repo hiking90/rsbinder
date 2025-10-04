@@ -798,6 +798,9 @@ impl Drop for Parcel {
     fn drop(&mut self) {
         match self.free_buffer {
             Some(free_buffer) => {
+                // Free buffer must succeed - if it fails, we have a critical system issue
+                // that will lead to resource leaks. Better to abort than continue in
+                // an inconsistent state.
                 free_buffer(
                     Some(self),
                     self.data.as_ptr() as _,
@@ -805,7 +808,7 @@ impl Drop for Parcel {
                     self.objects.as_ptr() as _,
                     self.objects.len(),
                 )
-                .unwrap();
+                .expect("Failed to free parcel buffer: critical system resource leak");
             }
             None => {
                 self.release_objects();

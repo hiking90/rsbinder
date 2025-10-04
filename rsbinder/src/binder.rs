@@ -412,7 +412,8 @@ impl Debug for SIBinder {
 
 impl Clone for SIBinder {
     fn clone(&self) -> Self {
-        Self::new_with_inner(Arc::clone(&self.inner)).unwrap()
+        Self::new_with_inner(Arc::clone(&self.inner))
+            .expect("Failed to clone SIBinder: inc_strong should not fail on existing reference")
     }
 }
 
@@ -522,7 +523,8 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     {
         // By implementing the ToAsyncInterface trait, it is guaranteed that the binder
         // object is also valid for the target type.
-        FromIBinder::try_from(self.0.as_binder()).unwrap()
+        FromIBinder::try_from(self.0.as_binder())
+            .expect("ToAsyncInterface guarantees binder compatibility")
     }
 
     /// Convert this asynchronous binder handle into a synchronous one.
@@ -532,7 +534,8 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     {
         // By implementing the ToSyncInterface trait, it is guaranteed that the binder
         // object is also valid for the target type.
-        FromIBinder::try_from(self.0.as_binder()).unwrap()
+        FromIBinder::try_from(self.0.as_binder())
+            .expect("ToSyncInterface guarantees binder compatibility")
     }
 }
 
@@ -541,7 +544,8 @@ impl<I: FromIBinder + ?Sized> Clone for Strong<I> {
         // Since we hold a strong reference, we should always be able to create
         // a new strong reference to the same interface type, so try_from()
         // should never fail here.
-        FromIBinder::try_from(self.0.as_binder()).unwrap()
+        FromIBinder::try_from(self.0.as_binder())
+            .expect("Failed to clone Strong<I>: existing strong reference guarantees valid binder")
     }
 }
 

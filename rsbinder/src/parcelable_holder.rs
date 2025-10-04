@@ -88,7 +88,10 @@ impl ParcelableHolder {
     /// Note that this method does not reset the stability,
     /// only the contents.
     pub fn reset(&mut self) {
-        *self.data.get_mut().unwrap() = ParcelableHolderData::Empty;
+        *self
+            .data
+            .get_mut()
+            .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Empty;
         // We could also clear stability here, but C++ doesn't
     }
 
@@ -106,7 +109,10 @@ impl ParcelableHolder {
             return Err(StatusCode::BadValue);
         }
 
-        *self.data.get_mut().unwrap() = ParcelableHolderData::Parcelable {
+        *self
+            .data
+            .get_mut()
+            .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Parcelable {
             parcelable: p,
             name: T::descriptor().into(),
         };
@@ -132,7 +138,7 @@ impl ParcelableHolder {
         T: Any + Parcelable + ParcelableMetadata + Default + std::fmt::Debug + Send + Sync,
     {
         let parcelable_desc = T::descriptor();
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().expect("Parcelable holder lock poisoned");
         match *data {
             ParcelableHolderData::Empty => Ok(None),
             ParcelableHolderData::Parcelable {
@@ -205,7 +211,7 @@ impl Parcelable for ParcelableHolder {
     fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
         parcel.write(&(self.stability as i32))?;
 
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().expect("Parcelable holder lock poisoned");
         match *data {
             ParcelableHolderData::Empty => parcel.write(&0i32),
             ParcelableHolderData::Parcelable {
@@ -256,7 +262,10 @@ impl Parcelable for ParcelableHolder {
             return Err(StatusCode::BadValue);
         }
         if data_size == 0 {
-            *self.data.get_mut().unwrap() = ParcelableHolderData::Empty;
+            *self
+                .data
+                .get_mut()
+                .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Empty;
             return Ok(());
         }
 
@@ -269,7 +278,10 @@ impl Parcelable for ParcelableHolder {
 
         let mut new_parcel = Parcel::new();
         new_parcel.append_from(parcel, data_start, data_size as usize)?;
-        *self.data.get_mut().unwrap() = ParcelableHolderData::Parcel(new_parcel);
+        *self
+            .data
+            .get_mut()
+            .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Parcel(new_parcel);
 
         // Safety: `append_from` checks if `data_size` overflows
         // `parcel` and returns `BAD_VALUE` if that happens. We also

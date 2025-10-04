@@ -84,7 +84,7 @@ impl ProxyHandle {
         self.obituary_sent
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        let recipients = self.recipients.read().unwrap();
+        let recipients = self.recipients.read().expect("Recipients lock poisoned");
         if !recipients.is_empty() {
             thread_state::clear_death_notification(self.handle())?;
             thread_state::flush_commands()?;
@@ -104,7 +104,7 @@ impl ProxyHandle {
         drop(recipients); // Release the read lock before acquiring the write lock
 
         if !recipients_to_remove.is_empty() {
-            let mut recipients = self.recipients.write().unwrap();
+            let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
             for recipient in recipients_to_remove {
                 recipients.retain(|r| !sync::Weak::ptr_eq(r, &recipient));
             }
@@ -153,7 +153,7 @@ impl IBinder for ProxyHandle {
         {
             return Err(StatusCode::DeadObject);
         } else {
-            let mut recipients = self.recipients.write().unwrap();
+            let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
             if recipients.is_empty() {
                 thread_state::request_death_notification(self.handle())?;
                 thread_state::flush_commands()?;
@@ -174,7 +174,7 @@ impl IBinder for ProxyHandle {
         {
             return Err(StatusCode::DeadObject);
         } else {
-            let mut recipients = self.recipients.write().unwrap();
+            let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
 
             recipients.retain(|r| !sync::Weak::ptr_eq(r, &recipient));
             if recipients.is_empty() {
