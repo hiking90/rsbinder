@@ -281,11 +281,30 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
 
     let header_size = parcel.read::<i32>()?;
 
-    if header_size < 0 || header_size as usize > header_avail {
-        log::error!("0x534e4554:132650049 Invalid header_size({header_size}).");
-        return Err(StatusCode::Unknown);
+    // Check for negative values first
+    if header_size < 0 {
+        log::error!("0x534e4554:132650049 Negative header_size({header_size}).");
+        return Err(StatusCode::BadValue);
     }
-    parcel.set_data_position(header_start + (header_size as usize));
+
+    // Safe conversion after negativity check
+    let header_size_usize = header_size as usize;
+
+    // Check against available data
+    if header_size_usize > header_avail {
+        log::error!(
+            "0x534e4554:132650049 Invalid header_size({header_size}) exceeds available({header_avail})."
+        );
+        return Err(StatusCode::BadValue);
+    }
+
+    // Prevent integer overflow in position calculation
+    let new_position = header_start.checked_add(header_size_usize).ok_or_else(|| {
+        log::error!("0x534e4554:132650049 Position overflow with header_size({header_size})");
+        StatusCode::BadValue
+    })?;
+
+    parcel.set_data_position(new_position);
     Ok(())
 }
 
@@ -302,17 +321,37 @@ impl Deserialize for Status {
         } else {
             let message: String = parcel.read::<String>()?;
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
-            if remote_stack_trace_header_size < 0
-                || remote_stack_trace_header_size as usize > parcel.data_avail()
-            {
+
+            // Check for negative values first
+            if remote_stack_trace_header_size < 0 {
                 log::error!(
-                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size})."
+                    "0x534e4554:132650049 Negative remote_stack_trace_header_size({remote_stack_trace_header_size})."
                 );
-                return Err(StatusCode::Unknown);
+                return Err(StatusCode::BadValue);
             }
-            parcel.set_data_position(
-                parcel.data_position() + remote_stack_trace_header_size as usize,
-            );
+
+            // Safe conversion after negativity check
+            let trace_size_usize = remote_stack_trace_header_size as usize;
+
+            // Check against available data
+            if trace_size_usize > parcel.data_avail() {
+                log::error!(
+                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size}) exceeds available({}).",
+                    parcel.data_avail()
+                );
+                return Err(StatusCode::BadValue);
+            }
+
+            // Prevent integer overflow in position calculation
+            let current_pos = parcel.data_position();
+            let new_position = current_pos.checked_add(trace_size_usize).ok_or_else(|| {
+                log::error!(
+                    "0x534e4554:132650049 Position overflow with remote_stack_trace_header_size({remote_stack_trace_header_size})"
+                );
+                StatusCode::BadValue
+            })?;
+
+            parcel.set_data_position(new_position);
 
             let code = if exception == ExceptionCode::ServiceSpecific {
                 let code = parcel.read::<i32>()?;

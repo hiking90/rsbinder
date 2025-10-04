@@ -93,7 +93,18 @@ pub const INTERFACE_HEADER: u32 = b_pack_chars('S', 'Y', 'S', 'T');
 pub trait Interface: Send + Sync {
     /// Convert this binder object into a generic [`SIBinder`] reference.
     fn as_binder(&self) -> SIBinder {
-        panic!("This object was not a Binder object and cannot be converted into an SIBinder.")
+        log::error!(
+            "as_binder() called on non-Binder object of type {}. \
+             This is a programmer error - only Binder objects should implement Interface.",
+            std::any::type_name::<Self>()
+        );
+        // This should never happen in correct code, but we want a clear error
+        // rather than undefined behavior
+        unreachable!(
+            "as_binder() must be overridden by types that can be converted to SIBinder. \
+             Type: {}",
+            std::any::type_name::<Self>()
+        )
     }
 
     /// Dump transaction handler for this Binder object.
