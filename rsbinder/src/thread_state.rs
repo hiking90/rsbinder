@@ -800,10 +800,11 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             bwr.read_size
         );
 
-        {
+        // Process write and read results in a single borrow_mut scope
+        let should_process_derefs = {
             let mut thread_state = thread_state.borrow_mut();
 
-            if bwr.write_consumed > 0 {
+            let should_process = if bwr.write_consumed > 0 {
                 if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
                     panic!(
                         "Driver did not consume write buffer. consumed: {} of {}",
@@ -812,16 +813,12 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     );
                 } else {
                     thread_state.out_parcel.set_data_size(0);
-                    drop(thread_state);
-
-                    BINDER_DEREFS.with(|binder_derefs| {
-                        binder_derefs.borrow_mut().process_post_write_derefs()
-                    });
+                    true
                 }
-            }
-        }
-        {
-            let mut thread_state = thread_state.borrow_mut();
+            } else {
+                false
+            };
+
             if bwr.read_consumed > 0 {
                 thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
                 thread_state.in_parcel.set_data_position(0);
@@ -831,7 +828,14 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     thread_state.in_parcel
                 );
             }
-        };
+
+            should_process
+        }; // thread_state is dropped here
+
+        if should_process_derefs {
+            BINDER_DEREFS
+                .with(|binder_derefs| binder_derefs.borrow_mut().process_post_write_derefs());
+        }
 
         Ok(())
     })
