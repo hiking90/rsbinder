@@ -309,6 +309,11 @@ impl SerializeOption for str {
 
                 parcel.write::<i32>(&(len as i32))?;
                 let pad_size = crate::parcel::pad_size(utf16.len() * std::mem::size_of::<u16>());
+                // SAFETY: We're creating a byte view of the UTF-16 encoded string.
+                // - utf16 is a valid Vec<u16> with proper alignment
+                // - pad_size was calculated with pad_size() to include padding
+                // - The resulting byte slice will not outlive the utf16 vector
+                // - u16 data can safely be viewed as bytes
                 parcel.write_aligned_data(unsafe {
                     std::slice::from_raw_parts(utf16.as_ptr() as *const u8, pad_size)
                 });

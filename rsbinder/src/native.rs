@@ -64,8 +64,12 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
-                // Use ManuallyDrop because the file descriptor is managed by the kernel
-                // and should not be automatically closed when the File goes out of scope
+                // SAFETY:
+                // 1. The fd comes from a valid flat_binder_object validated by read_object()
+                // 2. We use ManuallyDrop because the kernel owns this fd - it will be closed
+                //    by the binder driver when the transaction completes
+                // 3. The fd is only valid for the duration of this transaction
+                // 4. We only use it for writing (dump output), never transfer ownership
                 let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd as _)) };
 
                 self.remotable.on_dump(file.deref_mut(), argv.as_slice())
@@ -278,7 +282,9 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             return Err(StatusCode::BadType);
         }
 
-        // Safety: Check if ibinder has the same type as Inner<B>. And then, covert it to Arc<Inner<B>>.
+        // SAFETY: We just verified through downcast_ref that this IBinder
+        // is actually an Inner<B>, so the cast is safe. The into_raw()
+        // gives us the underlying Arc pointer which we reconstruct here.
         if ibinder.as_any().downcast_ref::<Inner<B>>().is_some() {
             let inner_raw = ibinder.into_raw() as *const Inner<B>;
             let inner = unsafe { Arc::from_raw(inner_raw) };

@@ -135,7 +135,23 @@ impl flat_binder_object {
     }
 }
 
+/// Splits a fat pointer (trait object) into its data and vtable components.
+///
+/// # Safety
+/// This function uses transmute to convert a fat pointer into two u64 values.
+/// This is safe because:
+/// 1. Fat pointers are always two usizes (data pointer + vtable pointer)
+/// 2. On 64-bit systems, usize == u64
+/// 3. We only use this for binder IPC serialization where we need both components
+///
+/// # Panics
+/// Will panic on 32-bit systems where usize != u64
 fn split_fat_pointer(ptr: *const dyn IBinder) -> (u64, u64) {
+    debug_assert_eq!(
+        std::mem::size_of::<*const dyn IBinder>(),
+        std::mem::size_of::<(u64, u64)>(),
+        "Fat pointer size mismatch - system not 64-bit?"
+    );
     unsafe { std::mem::transmute(ptr) }
 }
 

@@ -459,7 +459,11 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                             );
                             return Ok(Some(reply));
                         } else {
-                            // Safe approach: verify buffer size before reading
+                            // SAFETY: Reading status code from binder transaction reply
+                            // - We verify tr.data_size >= size_of::<i32>() before reading
+                            // - buffer points to valid memory owned by binder driver
+                            // - The data remains valid for the transaction lifetime
+                            // - We convert to StatusCode immediately after reading
                             let status: StatusCode =
                                 if tr.data_size >= std::mem::size_of::<i32>() as u64 {
                                     unsafe { (*(buffer as *const i32)).into() }

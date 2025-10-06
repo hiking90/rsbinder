@@ -438,6 +438,11 @@ impl Parcel {
             .get(pos..pos + size)
             .ok_or(StatusCode::NotEnoughData)?;
 
+        // SAFETY: We have verified bounds through data_slice.get()
+        // - data_slice is a valid slice of exactly `size` bytes
+        // - result has capacity for `len` elements
+        // - copy_nonoverlapping copies exactly `size` bytes
+        // - setting length to `len` is valid as we just initialized those elements
         let mut result = Vec::with_capacity(len as usize);
         unsafe {
             // Copy from bounds-checked slice
