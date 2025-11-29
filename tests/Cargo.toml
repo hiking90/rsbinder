@@ -16,4 +16,4 @@ async-trait = { workspace = true }
 log.workspace = true
 
 [build-dependencies]
-rsbinder-aidl = { workspace = true }
+rsbinder-aidl = { workspace = true, features = ["async"] }

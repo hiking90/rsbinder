@@ -14,7 +14,6 @@ keywords.workspace = true
 
 [features]
 default = ["tokio"]
-sync = ["rsbinder-aidl/sync"]
 tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
 android_11 = []
@@ -38,7 +37,7 @@ tokio = { workspace = true, optional = true }
 rsproperties.workspace = true
 
 [build-dependencies]
-rsbinder-aidl = { workspace = true }
+rsbinder-aidl = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
 env_logger = { workspace = true }

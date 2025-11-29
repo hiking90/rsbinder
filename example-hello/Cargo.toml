@@ -6,10 +6,6 @@ edition = { workspace = true }
 license = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-# [features]
-# default = ["async"]
-# sync = ["rsbinder/sync", "rsbinder-aidl/sync"]
-# async = ["rsbinder/async", "rsbinder-aidl/async"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_11_plus"] }
@@ -17,4 +13,4 @@ env_logger = { workspace = true }
 async-trait = { workspace = true }
 
 [build-dependencies]
-rsbinder-aidl = { workspace = true }
+rsbinder-aidl = { workspace = true, features = ["async"] }
