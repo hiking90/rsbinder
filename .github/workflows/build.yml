@@ -10,7 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  rust_min: '1.77'
+  rust_min: '1.85'
 
 jobs:
   security_audit:
