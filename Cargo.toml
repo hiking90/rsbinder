@@ -41,6 +41,7 @@ rustix = "1.0.*"
 clap = "4.5"
 rsproperties = "0.2.2"
 ignore = "=0.4.23"
+globset = "=0.4.16"
 
 [patch.crates-io]
 chrono = { git = "https://github.com/chronotope/chrono", tag = "v0.4.41" }
