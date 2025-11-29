@@ -659,15 +659,39 @@ impl IServiceManager for ServiceManager {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let _ = clap::Command::new("rsb_hub")
+    let matches = clap::Command::new("rsb_hub")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about("A service manager for Binder IPC on Linux. Facilitates service registration, discovery, and management.")
+        .arg(
+            clap::Arg::new("device")
+                .short('d')
+                .long("device")
+                .value_name("NAME")
+                .help("Name of the binder device to use (e.g., 'binder', 'mybinder')")
+                .default_value("binder"),
+        )
+        .after_help(
+            "Examples:\n    \
+            Run with the default binder device:\n    \
+            $ rsb_hub\n\n    \
+            Run with a custom binder device:\n    \
+            $ rsb_hub --device mybinder\n    \
+            $ rsb_hub -d mybinder\n\n    \
+            Note: The binder device must be created first using rsb_device.",
+        )
         .get_matches();
 
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    ProcessState::init(DEFAULT_BINDER_PATH, 0);
+    let device_name = matches
+        .get_one::<String>("device")
+        .expect("device has a default value");
+    let binder_path = format!("{}/{}", DEFAULT_BINDERFS_PATH, device_name);
+
+    log::info!("Starting rsb_hub with binder device: {}", binder_path);
+
+    ProcessState::init(&binder_path, 0);
 
     // Create a binder service.
     let service = BnServiceManager::new_binder(ServiceManager::new());
