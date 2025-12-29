@@ -230,7 +230,7 @@ impl ThreadState {
     }
 
     fn clear_propagate_work_source(&mut self) {
-        if let Some(mut state) = self.transaction {
+        if let Some(ref mut state) = self.transaction {
             state.propagate_work_source = false;
         }
     }
@@ -241,7 +241,7 @@ impl ThreadState {
 
     fn set_calling_work_source_uid(&mut self, uid: binder::uid_t) -> i64 {
         let token = self.set_calling_work_source_uid_without_propagation(uid);
-        if let Some(mut state) = self.transaction {
+        if let Some(ref mut state) = self.transaction {
             state.propagate_work_source = true;
         }
         token
@@ -252,7 +252,7 @@ impl ThreadState {
         uid: binder::uid_t,
     ) -> i64 {
         match self.transaction {
-            Some(mut state) => {
+            Some(ref mut state) => {
                 let propagated_bit =
                     (state.propagate_work_source as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX;
                 let token = propagated_bit | (state.work_source as i64);

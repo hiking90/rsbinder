@@ -48,7 +48,7 @@
 //!
 //! ```toml
 //! [build-dependencies]
-//! rsbinder-aidl = "0.4"
+//! rsbinder-aidl = "*"  # Check crates.io for the latest version
 //! ```
 //!
 //! ## Implementing the Service
