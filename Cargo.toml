@@ -31,7 +31,7 @@ async-trait = "0.1"
 rsbinder-aidl = { version = "0.5.0", path = "rsbinder-aidl" }
 pest = "2.8"
 pest_derive = "2.8"
-convert_case = "0.10"
+convert_case = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 tera = "1.20.*"
 similar = "2.4"
