@@ -115,7 +115,7 @@ impl Builder {
             includes: Vec::new(),
             dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
             output: "rsbinder_generated_aidl.rs".into(),
-            enabled_async: false,
+            enabled_async: cfg!(feature = "async"),
             is_crate: false,
         }
     }

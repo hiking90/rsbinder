@@ -528,3 +528,51 @@ pub mod CombinedFlags {
     )?;
     Ok(())
 }
+
+// Issue: https://github.com/hiking90/rsbinder/issues/68
+// Cross-package enum default values should resolve to correct module paths
+#[test]
+fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
+    let gen = rsbinder_aidl::Generator::new(false, false);
+
+    // 1. Parse and generate enum in a different package
+    //    (registers in DECLARATION_MAP + SYMBOL_TABLE)
+    let enum_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test.sub;
+
+        @VintfStability
+        @Backing(type="int")
+        enum SubEnum {
+            UNKNOWN = 0,
+        }
+    "#,
+    )?;
+    let _ = gen.document(&enum_doc)?;
+
+    // 2. Parse parcelable that imports the cross-package enum
+    let parcelable_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test;
+
+        import test.sub.SubEnum;
+
+        @VintfStability
+        parcelable CrossPackageParcelable {
+            SubEnum enumField = SubEnum.UNKNOWN;
+        }
+    "#,
+    )?;
+
+    // 3. Generate code and verify the path
+    let res = gen.document(&parcelable_doc)?;
+    let output = &res.1;
+
+    assert!(
+        output.contains("super::sub::SubEnum::SubEnum::UNKNOWN"),
+        "Expected cross-package path 'super::sub::SubEnum::SubEnum::UNKNOWN', got:\n{}",
+        output
+    );
+
+    Ok(())
+}

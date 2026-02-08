@@ -79,51 +79,6 @@ pub mod ArrayOfInterfaces {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IEmptyInterfaceAsync<P>: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
-        }
-        #[::async_trait::async_trait]
-        pub trait IEmptyInterfaceAsyncService: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
-        }
-        impl BnEmptyInterface
-        {
-            pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn IEmptyInterface>
-            where
-                T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                struct Wrapper<T, R> {
-                    _inner: T,
-                    _rt: R,
-                }
-                impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                    fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                    fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-                }
-                impl<T, R> BnEmptyInterfaceAdapter for Wrapper<T, R>
-                where
-                    T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn as_sync(&self) -> &dyn IEmptyInterface {
-                        self
-                    }
-                    fn as_async(&self) -> &dyn IEmptyInterfaceAsyncService {
-                        &self._inner
-                    }
-                }
-                impl<T, R> IEmptyInterface for Wrapper<T, R>
-                where
-                    T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                }
-                let wrapped = Wrapper { _inner: inner, _rt: rt };
-                let binder = rsbinder::native::Binder::new_with_stability(BnEmptyInterface(Box::new(wrapped)), rsbinder::Stability::default());
-                rsbinder::Strong::new(Box::new(binder))
-            }
-        }
         pub trait IEmptyInterfaceDefault: Send + Sync {
         }
         pub(crate) mod transactions {
@@ -134,21 +89,13 @@ pub mod ArrayOfInterfaces {
             IEmptyInterface["ArrayOfInterfaces.IEmptyInterface"] {
                 native: {
                     BnEmptyInterface(on_transact),
-                    adapter: BnEmptyInterfaceAdapter,
-                    r#async: IEmptyInterfaceAsyncService,
                 },
                 proxy: BpEmptyInterface,
-                r#async: IEmptyInterfaceAsync,
             }
         }
         impl BpEmptyInterface {
         }
         impl IEmptyInterface for BpEmptyInterface {
-        }
-        impl<P: rsbinder::BinderAsyncPool> IEmptyInterfaceAsync<P> for BpEmptyInterface {
-        }
-        impl<P: rsbinder::BinderAsyncPool> IEmptyInterfaceAsync<P> for rsbinder::Binder<BnEmptyInterface>
-        {
         }
         impl IEmptyInterface for rsbinder::Binder<BnEmptyInterface> {
         }
@@ -171,56 +118,6 @@ pub mod ArrayOfInterfaces {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IMyInterfaceAsync<P>: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
-            fn r#methodWithInterfaces<'a>(&'a self, _arg_iface: &'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &'a [rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &'a mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &'a mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&'a [Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<Option<String>>>>>;
-        }
-        #[::async_trait::async_trait]
-        pub trait IMyInterfaceAsyncService: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
-            async fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>>;
-        }
-        impl BnMyInterface
-        {
-            pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn IMyInterface>
-            where
-                T: IMyInterfaceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                struct Wrapper<T, R> {
-                    _inner: T,
-                    _rt: R,
-                }
-                impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                    fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                    fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-                }
-                impl<T, R> BnMyInterfaceAdapter for Wrapper<T, R>
-                where
-                    T: IMyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn as_sync(&self) -> &dyn IMyInterface {
-                        self
-                    }
-                    fn as_async(&self) -> &dyn IMyInterfaceAsyncService {
-                        &self._inner
-                    }
-                }
-                impl<T, R> IMyInterface for Wrapper<T, R>
-                where
-                    T: IMyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
-                        self._rt.block_on(self._inner.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout))
-                    }
-                }
-                let wrapped = Wrapper { _inner: inner, _rt: rt };
-                let binder = rsbinder::native::Binder::new_with_stability(BnMyInterface(Box::new(wrapped)), rsbinder::Stability::default());
-                rsbinder::Strong::new(Box::new(binder))
-            }
-        }
         pub trait IMyInterfaceDefault: Send + Sync {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
                 Err(rsbinder::StatusCode::UnknownTransaction.into())
@@ -235,11 +132,8 @@ pub mod ArrayOfInterfaces {
             IMyInterface["ArrayOfInterfaces.IMyInterface"] {
                 native: {
                     BnMyInterface(on_transact),
-                    adapter: BnMyInterfaceAdapter,
-                    r#async: IMyInterfaceAsyncService,
                 },
                 proxy: BpMyInterface,
-                r#async: IMyInterfaceAsync,
             }
         }
         impl BpMyInterface {
@@ -279,30 +173,9 @@ pub mod ArrayOfInterfaces {
                 self.read_response_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout, _aidl_reply)
             }
         }
-        impl<P: rsbinder::BinderAsyncPool> IMyInterfaceAsync<P> for BpMyInterface {
-            fn r#methodWithInterfaces<'a>(&'a self, _arg_iface: &'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &'a [rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &'a mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &'a mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&'a [Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<Option<String>>>>> {
-                let _aidl_data = match self.build_parcel_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout) {
-                    Ok(_aidl_data) => _aidl_data,
-                    Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-                };
-                let binder = self.binder.clone();
-                P::spawn(
-                    move || binder.as_proxy().unwrap().submit_transact(transactions::r#methodWithInterfaces, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                    move |_aidl_reply| async move {
-                        self.read_response_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout, _aidl_reply)
-                    }
-                )
-            }
-        }
-        impl<P: rsbinder::BinderAsyncPool> IMyInterfaceAsync<P> for rsbinder::Binder<BnMyInterface>
-        {
-            fn r#methodWithInterfaces<'a>(&'a self, _arg_iface: &'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&'a rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &'a [rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &'a mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &'a mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&'a [Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &'a mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<Option<String>>>>> {
-                self.0.as_async().r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
-            }
-        }
         impl IMyInterface for rsbinder::Binder<BnMyInterface> {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
-                self.0.as_sync().r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
+                self.0.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
             }
         }
         fn on_transact(
