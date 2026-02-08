@@ -372,56 +372,6 @@ pub mod ITestService {
             DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
-    pub trait ITestServiceAsync<P>: rsbinder::Interface + Send {
-        fn descriptor() -> &'static str where Self: Sized { "ITestService" }
-        fn r#RepeatByteEnum<'a>(&'a self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<super::ByteEnum::ByteEnum>>;
-    }
-    #[::async_trait::async_trait]
-    pub trait ITestServiceAsyncService: rsbinder::Interface + Send {
-        fn descriptor() -> &'static str where Self: Sized { "ITestService" }
-        async fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum>;
-    }
-    impl BnTestService
-    {
-        pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn ITestService>
-        where
-            T: ITestServiceAsyncService + Sync + Send + 'static,
-            R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-        {
-            struct Wrapper<T, R> {
-                _inner: T,
-                _rt: R,
-            }
-            impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-            }
-            impl<T, R> BnTestServiceAdapter for Wrapper<T, R>
-            where
-                T: ITestServiceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                fn as_sync(&self) -> &dyn ITestService {
-                    self
-                }
-                fn as_async(&self) -> &dyn ITestServiceAsyncService {
-                    &self._inner
-                }
-            }
-            impl<T, R> ITestService for Wrapper<T, R>
-            where
-                T: ITestServiceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
-                    self._rt.block_on(self._inner.r#RepeatByteEnum(_arg_token))
-                }
-            }
-            let wrapped = Wrapper { _inner: inner, _rt: rt };
-            let binder = rsbinder::native::Binder::new_with_stability(BnTestService(Box::new(wrapped)), rsbinder::Stability::default());
-            rsbinder::Strong::new(Box::new(binder))
-        }
-    }
     pub trait ITestServiceDefault: Send + Sync {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
@@ -436,11 +386,8 @@ pub mod ITestService {
         ITestService["ITestService"] {
             native: {
                 BnTestService(on_transact),
-                adapter: BnTestServiceAdapter,
-                r#async: ITestServiceAsyncService,
             },
             proxy: BpTestService,
-            r#async: ITestServiceAsync,
         }
     }
     impl BpTestService {
@@ -469,30 +416,9 @@ pub mod ITestService {
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }
-    impl<P: rsbinder::BinderAsyncPool> ITestServiceAsync<P> for BpTestService {
-        fn r#RepeatByteEnum<'a>(&'a self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<super::ByteEnum::ByteEnum>> {
-            let _aidl_data = match self.build_parcel_RepeatByteEnum(_arg_token) {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-            };
-            let binder = self.binder.clone();
-            P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                move |_aidl_reply| async move {
-                    self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
-                }
-            )
-        }
-    }
-    impl<P: rsbinder::BinderAsyncPool> ITestServiceAsync<P> for rsbinder::Binder<BnTestService>
-    {
-        fn r#RepeatByteEnum<'a>(&'a self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<super::ByteEnum::ByteEnum>> {
-            self.0.as_async().r#RepeatByteEnum(_arg_token)
-        }
-    }
     impl ITestService for rsbinder::Binder<BnTestService> {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
-            self.0.as_sync().r#RepeatByteEnum(_arg_token)
+            self.0.r#RepeatByteEnum(_arg_token)
         }
     }
     fn on_transact(
@@ -517,6 +443,322 @@ pub mod ITestService {
     }
 }
         "##,
+    )?;
+
+    Ok(())
+}
+
+// Tests for GitHub issue #67: Panic when generating for nested types in unions
+// https://github.com/hiking90/rsbinder/issues/67
+
+#[test]
+fn test_union_with_nested_enum() -> Result<(), Box<dyn Error>> {
+    // Exact reproduction case from issue #67
+    aidl_generator(
+        r#"
+        package test;
+        @VintfStability
+        union NestedUnion {
+            @VintfStability
+            @Backing(type="int")
+            enum Inner {
+                VALUE = 0,
+            }
+            NestedUnion.Inner innerField;
+        }
+        "#,
+        r#"
+pub mod NestedUnion {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub enum r#NestedUnion {
+        r#InnerField(Inner::Inner),
+    }
+    impl Default for r#NestedUnion {
+        fn default() -> Self {
+            Self::InnerField(Inner::Inner::VALUE)
+        }
+    }
+    impl rsbinder::Parcelable for r#NestedUnion {
+        fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            match self {
+                Self::r#InnerField(v) => {
+                    parcel.write(&0i32)?;
+                    parcel.write(v)
+                }
+            }
+        }
+        fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            let tag: i32 = parcel.read()?;
+            match tag {
+                0 => {
+                    let value: Inner::Inner = parcel.read()?;
+                    *self = Self::r#InnerField(value);
+                    Ok(())
+                }
+                _ => Err(rsbinder::StatusCode::BadValue),
+            }
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(r#NestedUnion);
+    rsbinder::impl_deserialize_for_parcelable!(r#NestedUnion);
+    impl rsbinder::ParcelableMetadata for r#NestedUnion {
+        fn descriptor() -> &'static str { "test.NestedUnion" }
+        fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
+    }
+    rsbinder::declare_binder_enum! {
+        Tag : [i32; 1] {
+            r#innerField = 0,
+        }
+    }
+    pub mod Inner {
+        #![allow(non_upper_case_globals, non_snake_case)]
+        rsbinder::declare_binder_enum! {
+            r#Inner : [i32; 1] {
+                r#VALUE = 0,
+            }
+        }
+    }
+}
+        "#,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_union_with_nested_parcelable() -> Result<(), Box<dyn Error>> {
+    aidl_generator(
+        r#"
+        package test;
+        union OuterUnion {
+            parcelable InnerData {
+                int value;
+                @utf8InCpp String name;
+            }
+            int simpleField;
+            OuterUnion.InnerData dataField;
+        }
+        "#,
+        r#"
+pub mod OuterUnion {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub enum r#OuterUnion {
+        r#SimpleField(i32),
+        r#DataField(InnerData::InnerData),
+    }
+    impl Default for r#OuterUnion {
+        fn default() -> Self {
+            Self::SimpleField(Default::default())
+        }
+    }
+    impl rsbinder::Parcelable for r#OuterUnion {
+        fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            match self {
+                Self::r#SimpleField(v) => {
+                    parcel.write(&0i32)?;
+                    parcel.write(v)
+                }
+                Self::r#DataField(v) => {
+                    parcel.write(&1i32)?;
+                    parcel.write(v)
+                }
+            }
+        }
+        fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            let tag: i32 = parcel.read()?;
+            match tag {
+                0 => {
+                    let value: i32 = parcel.read()?;
+                    *self = Self::r#SimpleField(value);
+                    Ok(())
+                }
+                1 => {
+                    let value: InnerData::InnerData = parcel.read()?;
+                    *self = Self::r#DataField(value);
+                    Ok(())
+                }
+                _ => Err(rsbinder::StatusCode::BadValue),
+            }
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(r#OuterUnion);
+    rsbinder::impl_deserialize_for_parcelable!(r#OuterUnion);
+    impl rsbinder::ParcelableMetadata for r#OuterUnion {
+        fn descriptor() -> &'static str { "test.OuterUnion" }
+    }
+    rsbinder::declare_binder_enum! {
+        Tag : [i32; 2] {
+            r#simpleField = 0,
+            r#dataField = 1,
+        }
+    }
+    pub mod InnerData {
+        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #[derive(Debug)]
+        pub struct InnerData {
+            pub r#value: i32,
+            pub r#name: String,
+        }
+        impl Default for InnerData {
+            fn default() -> Self {
+                Self {
+                    r#value: Default::default(),
+                    r#name: Default::default(),
+                }
+            }
+        }
+        impl rsbinder::Parcelable for InnerData {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.sized_write(|_sub_parcel| {
+                    _sub_parcel.write(&self.r#value)?;
+                    _sub_parcel.write(&self.r#name)?;
+                    Ok(())
+                })
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.sized_read(|_sub_parcel| {
+                    self.r#value = _sub_parcel.read()?;
+                    self.r#name = _sub_parcel.read()?;
+                    Ok(())
+                })
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(InnerData);
+        rsbinder::impl_deserialize_for_parcelable!(InnerData);
+        impl rsbinder::ParcelableMetadata for InnerData {
+            fn descriptor() -> &'static str { "test.OuterUnion.InnerData" }
+        }
+    }
+}
+        "#,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_union_with_multiple_nested_types() -> Result<(), Box<dyn Error>> {
+    aidl_generator(
+        r#"
+        package test;
+        @VintfStability
+        union MultiNestedUnion {
+            @VintfStability
+            @Backing(type="int")
+            enum Status {
+                OK = 0,
+                ERROR = 1,
+            }
+            @VintfStability
+            parcelable Metadata {
+                int id;
+            }
+            int rawValue;
+            MultiNestedUnion.Status statusField;
+        }
+        "#,
+        r#"
+pub mod MultiNestedUnion {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub enum r#MultiNestedUnion {
+        r#RawValue(i32),
+        r#StatusField(Status::Status),
+    }
+    impl Default for r#MultiNestedUnion {
+        fn default() -> Self {
+            Self::RawValue(Default::default())
+        }
+    }
+    impl rsbinder::Parcelable for r#MultiNestedUnion {
+        fn write_to_parcel(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            match self {
+                Self::r#RawValue(v) => {
+                    parcel.write(&0i32)?;
+                    parcel.write(v)
+                }
+                Self::r#StatusField(v) => {
+                    parcel.write(&1i32)?;
+                    parcel.write(v)
+                }
+            }
+        }
+        fn read_from_parcel(&mut self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            let tag: i32 = parcel.read()?;
+            match tag {
+                0 => {
+                    let value: i32 = parcel.read()?;
+                    *self = Self::r#RawValue(value);
+                    Ok(())
+                }
+                1 => {
+                    let value: Status::Status = parcel.read()?;
+                    *self = Self::r#StatusField(value);
+                    Ok(())
+                }
+                _ => Err(rsbinder::StatusCode::BadValue),
+            }
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(r#MultiNestedUnion);
+    rsbinder::impl_deserialize_for_parcelable!(r#MultiNestedUnion);
+    impl rsbinder::ParcelableMetadata for r#MultiNestedUnion {
+        fn descriptor() -> &'static str { "test.MultiNestedUnion" }
+        fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
+    }
+    rsbinder::declare_binder_enum! {
+        Tag : [i32; 2] {
+            r#rawValue = 0,
+            r#statusField = 1,
+        }
+    }
+    pub mod Status {
+        #![allow(non_upper_case_globals, non_snake_case)]
+        rsbinder::declare_binder_enum! {
+            r#Status : [i32; 2] {
+                r#OK = 0,
+                r#ERROR = 1,
+            }
+        }
+    }
+    pub mod Metadata {
+        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #[derive(Debug)]
+        pub struct Metadata {
+            pub r#id: i32,
+        }
+        impl Default for Metadata {
+            fn default() -> Self {
+                Self {
+                    r#id: Default::default(),
+                }
+            }
+        }
+        impl rsbinder::Parcelable for Metadata {
+            fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.sized_write(|_sub_parcel| {
+                    _sub_parcel.write(&self.r#id)?;
+                    Ok(())
+                })
+            }
+            fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+                _parcel.sized_read(|_sub_parcel| {
+                    self.r#id = _sub_parcel.read()?;
+                    Ok(())
+                })
+            }
+        }
+        rsbinder::impl_serialize_for_parcelable!(Metadata);
+        rsbinder::impl_deserialize_for_parcelable!(Metadata);
+        impl rsbinder::ParcelableMetadata for Metadata {
+            fn descriptor() -> &'static str { "test.MultiNestedUnion.Metadata" }
+            fn stability(&self) -> rsbinder::Stability { rsbinder::Stability::Vintf }
+        }
+    }
+}
+        "#,
     )?;
 
     Ok(())

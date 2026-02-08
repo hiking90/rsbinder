@@ -91,6 +91,9 @@ pub mod {{mod}} {
     {%- endfor %}
         }
     }
+    {%- if nested|length>0 %}
+    {{nested}}
+    {%- endif %}
 }
 "#;
 
@@ -924,6 +927,7 @@ impl Generator {
 
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
+        let mut declarations = Vec::new();
 
         for member in &decl.members {
             if let parser::Declaration::Variable(var) = member {
@@ -946,10 +950,11 @@ impl Generator {
                     ));
                 }
             } else {
-                unreachable!();
+                declarations.push(member.clone());
             }
         }
 
+        let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
@@ -968,6 +973,7 @@ impl Generator {
         context.insert("namespace", &namespace);
         context.insert("members", &members);
         context.insert("const_members", &constant_members);
+        context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);
 
         let rendered = template()
