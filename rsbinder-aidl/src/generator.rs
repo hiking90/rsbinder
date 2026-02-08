@@ -690,7 +690,7 @@ impl Generator {
             }
         }
 
-        let enabled_async = self.enabled_async || cfg!(feature = "async");
+        let enabled_async = self.enabled_async;
 
         let nested = &self.declarations(&decl.members, indent + 1)?;
 

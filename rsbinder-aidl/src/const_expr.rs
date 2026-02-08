@@ -431,9 +431,16 @@ impl ValueType {
                     // For constants, always use numeric values
                     format!("{}", value)
                 } else {
-                    // For default values, format depends on whether target expects enum or numeric type
-                    // This will be handled in the init_value method based on target type
-                    format!("super::{}::{}::{}", enum_name, enum_name, member_name)
+                    // Use proper namespace resolution for cross-package enum references
+                    let lookup_decl =
+                        parser::lookup_decl_from_name(enum_name, crate::Namespace::AIDL);
+                    let curr_ns = parser::current_namespace();
+                    let ns = curr_ns.relative_mod(&lookup_decl.ns);
+                    if !ns.is_empty() {
+                        format!("{}::{}::{}", ns, enum_name, member_name)
+                    } else {
+                        format!("{}::{}", enum_name, member_name)
+                    }
                 }
             }
             ValueType::Array(v) => {

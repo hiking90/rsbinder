@@ -49,66 +49,6 @@ pub mod ITestService {
             DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
-    pub trait ITestServiceAsync<P>: rsbinder::Interface + Send {
-        fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
-        fn r#ReverseBoolean<'a>(&'a self, _arg_input: &'a [bool], _arg_repeated: &'a mut Vec<bool>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Vec<bool>>>;
-        fn r#RepeatNullableIntArray<'a>(&'a self, _arg_input: Option<&'a [i32]>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<i32>>>>;
-        fn r#FillOutStructuredParcelable<'a>(&'a self, _arg_parcel: &'a mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<()>>;
-    }
-    #[::async_trait::async_trait]
-    pub trait ITestServiceAsyncService: rsbinder::Interface + Send {
-        fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
-        async fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>>;
-        async fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>>;
-        async fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()>;
-    }
-    impl BnTestService
-    {
-        pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn ITestService>
-        where
-            T: ITestServiceAsyncService + Sync + Send + 'static,
-            R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-        {
-            struct Wrapper<T, R> {
-                _inner: T,
-                _rt: R,
-            }
-            impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-            }
-            impl<T, R> BnTestServiceAdapter for Wrapper<T, R>
-            where
-                T: ITestServiceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                fn as_sync(&self) -> &dyn ITestService {
-                    self
-                }
-                fn as_async(&self) -> &dyn ITestServiceAsyncService {
-                    &self._inner
-                }
-            }
-            impl<T, R> ITestService for Wrapper<T, R>
-            where
-                T: ITestServiceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
-                    self._rt.block_on(self._inner.r#ReverseBoolean(_arg_input, _arg_repeated))
-                }
-                fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
-                    self._rt.block_on(self._inner.r#RepeatNullableIntArray(_arg_input))
-                }
-                fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
-                    self._rt.block_on(self._inner.r#FillOutStructuredParcelable(_arg_parcel))
-                }
-            }
-            let wrapped = Wrapper { _inner: inner, _rt: rt };
-            let binder = rsbinder::native::Binder::new_with_stability(BnTestService(Box::new(wrapped)), rsbinder::Stability::default());
-            rsbinder::Strong::new(Box::new(binder))
-        }
-    }
     pub trait ITestServiceDefault: Send + Sync {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
@@ -131,11 +71,8 @@ pub mod ITestService {
         ITestService["android.aidl.fixedsizearray.ITestService"] {
             native: {
                 BnTestService(on_transact),
-                adapter: BnTestServiceAdapter,
-                r#async: ITestServiceAsyncService,
             },
             proxy: BpTestService,
-            r#async: ITestServiceAsync,
         }
     }
     impl BpTestService {
@@ -210,68 +147,15 @@ pub mod ITestService {
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
         }
     }
-    impl<P: rsbinder::BinderAsyncPool> ITestServiceAsync<P> for BpTestService {
-        fn r#ReverseBoolean<'a>(&'a self, _arg_input: &'a [bool], _arg_repeated: &'a mut Vec<bool>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Vec<bool>>> {
-            let _aidl_data = match self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated) {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-            };
-            let binder = self.binder.clone();
-            P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                move |_aidl_reply| async move {
-                    self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
-                }
-            )
-        }
-        fn r#RepeatNullableIntArray<'a>(&'a self, _arg_input: Option<&'a [i32]>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<i32>>>> {
-            let _aidl_data = match self.build_parcel_RepeatNullableIntArray(_arg_input) {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-            };
-            let binder = self.binder.clone();
-            P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                move |_aidl_reply| async move {
-                    self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
-                }
-            )
-        }
-        fn r#FillOutStructuredParcelable<'a>(&'a self, _arg_parcel: &'a mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<()>> {
-            let _aidl_data = match self.build_parcel_FillOutStructuredParcelable(_arg_parcel) {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-            };
-            let binder = self.binder.clone();
-            P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                move |_aidl_reply| async move {
-                    self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
-                }
-            )
-        }
-    }
-    impl<P: rsbinder::BinderAsyncPool> ITestServiceAsync<P> for rsbinder::Binder<BnTestService>
-    {
-        fn r#ReverseBoolean<'a>(&'a self, _arg_input: &'a [bool], _arg_repeated: &'a mut Vec<bool>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Vec<bool>>> {
-            self.0.as_async().r#ReverseBoolean(_arg_input, _arg_repeated)
-        }
-        fn r#RepeatNullableIntArray<'a>(&'a self, _arg_input: Option<&'a [i32]>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<Option<Vec<i32>>>> {
-            self.0.as_async().r#RepeatNullableIntArray(_arg_input)
-        }
-        fn r#FillOutStructuredParcelable<'a>(&'a self, _arg_parcel: &'a mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<()>> {
-            self.0.as_async().r#FillOutStructuredParcelable(_arg_parcel)
-        }
-    }
     impl ITestService for rsbinder::Binder<BnTestService> {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
-            self.0.as_sync().r#ReverseBoolean(_arg_input, _arg_repeated)
+            self.0.r#ReverseBoolean(_arg_input, _arg_repeated)
         }
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
-            self.0.as_sync().r#RepeatNullableIntArray(_arg_input)
+            self.0.r#RepeatNullableIntArray(_arg_input)
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
-            self.0.as_sync().r#FillOutStructuredParcelable(_arg_parcel)
+            self.0.r#FillOutStructuredParcelable(_arg_parcel)
         }
     }
     fn on_transact(
@@ -416,56 +300,6 @@ pub mod FixedSizeArrayExample {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IRepeatFixedSizeArrayAsync<P>: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
-            fn r#Repeat2dParcelables<'a>(&'a self, _arg_input: &'a [[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &'a mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>>;
-        }
-        #[::async_trait::async_trait]
-        pub trait IRepeatFixedSizeArrayAsyncService: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
-            async fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>;
-        }
-        impl BnRepeatFixedSizeArray
-        {
-            pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn IRepeatFixedSizeArray>
-            where
-                T: IRepeatFixedSizeArrayAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                struct Wrapper<T, R> {
-                    _inner: T,
-                    _rt: R,
-                }
-                impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                    fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                    fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-                }
-                impl<T, R> BnRepeatFixedSizeArrayAdapter for Wrapper<T, R>
-                where
-                    T: IRepeatFixedSizeArrayAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn as_sync(&self) -> &dyn IRepeatFixedSizeArray {
-                        self
-                    }
-                    fn as_async(&self) -> &dyn IRepeatFixedSizeArrayAsyncService {
-                        &self._inner
-                    }
-                }
-                impl<T, R> IRepeatFixedSizeArray for Wrapper<T, R>
-                where
-                    T: IRepeatFixedSizeArrayAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
-                        self._rt.block_on(self._inner.r#Repeat2dParcelables(_arg_input, _arg_repeated))
-                    }
-                }
-                let wrapped = Wrapper { _inner: inner, _rt: rt };
-                let binder = rsbinder::native::Binder::new_with_stability(BnRepeatFixedSizeArray(Box::new(wrapped)), rsbinder::Stability::default());
-                rsbinder::Strong::new(Box::new(binder))
-            }
-        }
         pub trait IRepeatFixedSizeArrayDefault: Send + Sync {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 Err(rsbinder::StatusCode::UnknownTransaction.into())
@@ -480,11 +314,8 @@ pub mod FixedSizeArrayExample {
             IRepeatFixedSizeArray["android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray"] {
                 native: {
                     BnRepeatFixedSizeArray(on_transact),
-                    adapter: BnRepeatFixedSizeArrayAdapter,
-                    r#async: IRepeatFixedSizeArrayAsyncService,
                 },
                 proxy: BpRepeatFixedSizeArray,
-                r#async: IRepeatFixedSizeArrayAsync,
             }
         }
         impl BpRepeatFixedSizeArray {
@@ -514,30 +345,9 @@ pub mod FixedSizeArrayExample {
                 self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
             }
         }
-        impl<P: rsbinder::BinderAsyncPool> IRepeatFixedSizeArrayAsync<P> for BpRepeatFixedSizeArray {
-            fn r#Repeat2dParcelables<'a>(&'a self, _arg_input: &'a [[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &'a mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>> {
-                let _aidl_data = match self.build_parcel_Repeat2dParcelables(_arg_input, _arg_repeated) {
-                    Ok(_aidl_data) => _aidl_data,
-                    Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
-                };
-                let binder = self.binder.clone();
-                P::spawn(
-                    move || binder.as_proxy().unwrap().submit_transact(transactions::r#Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL),
-                    move |_aidl_reply| async move {
-                        self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
-                    }
-                )
-            }
-        }
-        impl<P: rsbinder::BinderAsyncPool> IRepeatFixedSizeArrayAsync<P> for rsbinder::Binder<BnRepeatFixedSizeArray>
-        {
-            fn r#Repeat2dParcelables<'a>(&'a self, _arg_input: &'a [[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &'a mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BoxFuture<'a, rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>> {
-                self.0.as_async().r#Repeat2dParcelables(_arg_input, _arg_repeated)
-            }
-        }
         impl IRepeatFixedSizeArray for rsbinder::Binder<BnRepeatFixedSizeArray> {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
-                self.0.as_sync().r#Repeat2dParcelables(_arg_input, _arg_repeated)
+                self.0.r#Repeat2dParcelables(_arg_input, _arg_repeated)
             }
         }
         fn on_transact(
@@ -616,51 +426,6 @@ pub mod FixedSizeArrayExample {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IEmptyInterfaceAsync<P>: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface" }
-        }
-        #[::async_trait::async_trait]
-        pub trait IEmptyInterfaceAsyncService: rsbinder::Interface + Send {
-            fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface" }
-        }
-        impl BnEmptyInterface
-        {
-            pub fn new_async_binder<T, R>(inner: T, rt: R) -> rsbinder::Strong<dyn IEmptyInterface>
-            where
-                T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                struct Wrapper<T, R> {
-                    _inner: T,
-                    _rt: R,
-                }
-                impl<T, R> rsbinder::Interface for Wrapper<T, R> where T: rsbinder::Interface, R: Send + Sync {
-                    fn as_binder(&self) -> rsbinder::SIBinder { self._inner.as_binder() }
-                    fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> { self._inner.dump(_writer, _args) }
-                }
-                impl<T, R> BnEmptyInterfaceAdapter for Wrapper<T, R>
-                where
-                    T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                    fn as_sync(&self) -> &dyn IEmptyInterface {
-                        self
-                    }
-                    fn as_async(&self) -> &dyn IEmptyInterfaceAsyncService {
-                        &self._inner
-                    }
-                }
-                impl<T, R> IEmptyInterface for Wrapper<T, R>
-                where
-                    T: IEmptyInterfaceAsyncService + Sync + Send + 'static,
-                    R: rsbinder::BinderAsyncRuntime + Send + Sync + 'static,
-                {
-                }
-                let wrapped = Wrapper { _inner: inner, _rt: rt };
-                let binder = rsbinder::native::Binder::new_with_stability(BnEmptyInterface(Box::new(wrapped)), rsbinder::Stability::default());
-                rsbinder::Strong::new(Box::new(binder))
-            }
-        }
         pub trait IEmptyInterfaceDefault: Send + Sync {
         }
         pub(crate) mod transactions {
@@ -671,21 +436,13 @@ pub mod FixedSizeArrayExample {
             IEmptyInterface["android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface"] {
                 native: {
                     BnEmptyInterface(on_transact),
-                    adapter: BnEmptyInterfaceAdapter,
-                    r#async: IEmptyInterfaceAsyncService,
                 },
                 proxy: BpEmptyInterface,
-                r#async: IEmptyInterfaceAsync,
             }
         }
         impl BpEmptyInterface {
         }
         impl IEmptyInterface for BpEmptyInterface {
-        }
-        impl<P: rsbinder::BinderAsyncPool> IEmptyInterfaceAsync<P> for BpEmptyInterface {
-        }
-        impl<P: rsbinder::BinderAsyncPool> IEmptyInterfaceAsync<P> for rsbinder::Binder<BnEmptyInterface>
-        {
         }
         impl IEmptyInterface for rsbinder::Binder<BnEmptyInterface> {
         }
