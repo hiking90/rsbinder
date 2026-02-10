@@ -587,6 +587,29 @@ impl Generator {
         context
     }
 
+    /// Pre-register all enum member symbols from a document into the symbol table.
+    /// This ensures enum symbols are available before any code generation begins,
+    /// preventing incorrect resolution when multiple enums share the same member names.
+    pub fn pre_register_enums(document: &parser::Document) {
+        parser::set_current_document(document);
+        Self::pre_register_enum_decls(&document.decls);
+    }
+
+    fn pre_register_enum_decls(decls: &[parser::Declaration]) {
+        for decl in decls {
+            match decl {
+                parser::Declaration::Enum(enum_decl) => {
+                    let _ns = parser::NamespaceGuard::new(&enum_decl.namespace);
+                    Self::register_enum_members(enum_decl);
+                }
+                parser::Declaration::Parcelable(d) => Self::pre_register_enum_decls(&d.members),
+                parser::Declaration::Interface(d) => Self::pre_register_enum_decls(&d.members),
+                parser::Declaration::Union(d) => Self::pre_register_enum_decls(&d.members),
+                _ => {}
+            }
+        }
+    }
+
     pub fn document(
         &self,
         document: &parser::Document,
@@ -822,18 +845,14 @@ impl Generator {
         Ok(add_indent(indent, rendered.trim()))
     }
 
-    fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    fn register_enum_members(decl: &parser::EnumDecl) {
         if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
         {
-            return Ok(String::new());
+            return;
         }
 
-        let generator = &parser::get_backing_type(&decl.annotation_list);
-
-        let mut members = Vec::new();
         let mut enum_val: i64 = 0;
 
-        // First pass: register all enum members with their names for resolution
         for enumerator in &decl.enumerator_list {
             let member_name = &enumerator.identifier;
 
@@ -848,7 +867,6 @@ impl Generator {
                     _ => calculated.to_i64(),
                 };
 
-                // Register the member using universal symbol table with enum reference preservation
                 parser::register_symbol(
                     member_name,
                     crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
@@ -862,7 +880,6 @@ impl Generator {
 
                 enum_val = computed_val;
             } else {
-                // Register with current auto-increment value using universal symbol table with enum reference preservation
                 parser::register_symbol(
                     member_name,
                     crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
@@ -877,9 +894,23 @@ impl Generator {
 
             enum_val += 1;
         }
+    }
+
+    fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
+        {
+            return Ok(String::new());
+        }
+
+        let generator = &parser::get_backing_type(&decl.annotation_list);
+
+        let mut members = Vec::new();
+
+        // First pass: register all enum members with their names for resolution
+        Self::register_enum_members(decl);
 
         // Second pass: resolve all values now that all members are registered
-        enum_val = 0;
+        let mut enum_val: i64 = 0;
         for enumerator in &decl.enumerator_list {
             if let Some(const_expr) = &enumerator.const_expr {
                 enum_val = const_expr.calculate().to_i64();
