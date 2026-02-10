@@ -266,12 +266,26 @@ pub fn register_symbol(
 
 // Enhanced name resolution with universal symbol table
 pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
-    // First, try to resolve from universal symbol table
+    // First, try to resolve from universal symbol table (exact match)
     let symbol_result =
         SYMBOL_TABLE.with(|table| table.borrow().get(name).map(|symbol| symbol.value.clone()));
 
     if symbol_result.is_some() {
         return symbol_result;
+    }
+
+    // For dotted names, try namespace-aware declaration lookup before variant stripping.
+    // This ensures that qualified names like "ParcelableWithNested.Status.OK"
+    // are resolved with full namespace context rather than being stripped to
+    // shorter variants that may lose parent type information.
+    if name.contains('.') {
+        let lookup_result = std::panic::catch_unwind(|| {
+            let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
+            lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
+        });
+        if let Ok(Some(expr)) = lookup_result {
+            return Some(expr);
+        }
     }
 
     // Try alternative name formats for cross-references
@@ -301,11 +315,12 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
 fn generate_name_variants(name: &str) -> Vec<String> {
     let mut variants = Vec::new();
 
-    // Handle dot notation: "EnumName.VALUE" -> ["EnumName.VALUE", "VALUE"]
+    // Handle dot notation: "A.B.C" -> ["A.B.C", "B.C", "C"]
+    // Try progressively shorter prefixes to find the best qualified match
     if name.contains('.') {
-        variants.push(name.to_string());
-        if let Some(last_part) = name.split('.').next_back() {
-            variants.push(last_part.to_string());
+        let parts: Vec<&str> = name.split('.').collect();
+        for i in 0..parts.len() {
+            variants.push(parts[i..].join("."));
         }
     } else {
         // For simple names, try with current namespace context
