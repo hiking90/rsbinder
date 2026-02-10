@@ -529,6 +529,135 @@ pub mod CombinedFlags {
     Ok(())
 }
 
+// Issue: https://github.com/hiking90/rsbinder/issues/71
+// When multiple enums share the same constant name (e.g., UNKNOWN) and a parcelable
+// uses them as default values, the generator must resolve to the correct enum type.
+// The fix pre-registers all enum symbols before code generation begins.
+#[test]
+fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
+    let gen = rsbinder_aidl::Generator::new(false, false);
+
+    // Parse all documents first (simulating separate AIDL files)
+    let fold_state_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test.bug;
+
+        @VintfStability
+        @Backing(type="int")
+        enum FoldState {
+            UNKNOWN,
+            HALF_OPENED,
+            FULLY_OPENED,
+            FULLY_CLOSED,
+        }
+    "#,
+    )?;
+
+    let operation_reason_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test.bug;
+
+        @VintfStability
+        @Backing(type="byte")
+        enum OperationReason {
+            UNKNOWN,
+            BIOMETRIC_PROMPT,
+            KEYGUARD,
+        }
+    "#,
+    )?;
+
+    let wake_reason_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test.bug;
+
+        @VintfStability
+        @Backing(type="int")
+        enum WakeReason {
+            UNKNOWN,
+            POWER_BUTTON,
+            GESTURE,
+        }
+    "#,
+    )?;
+
+    let operation_context_doc = rsbinder_aidl::parse_document(
+        r#"
+        package test.bug;
+
+        import test.bug.FoldState;
+        import test.bug.OperationReason;
+        import test.bug.WakeReason;
+
+        @VintfStability
+        parcelable OperationContext {
+            OperationReason reason = OperationReason.UNKNOWN;
+            WakeReason wakeReason = WakeReason.UNKNOWN;
+            FoldState foldState = FoldState.UNKNOWN;
+        }
+    "#,
+    )?;
+
+    // 1st pass: pre-register all enum symbols (the fix for issue #71)
+    let documents = vec![
+        &fold_state_doc,
+        &operation_context_doc, // parcelable processed before some enums
+        &operation_reason_doc,
+        &wake_reason_doc,
+    ];
+    for doc in &documents {
+        rsbinder_aidl::Generator::pre_register_enums(doc);
+    }
+
+    // 2nd pass: generate code for the parcelable
+    // First generate enum documents so DECLARATION_MAP is populated
+    let _ = gen.document(&fold_state_doc)?;
+    let _ = gen.document(&operation_reason_doc)?;
+    let _ = gen.document(&wake_reason_doc)?;
+    let res = gen.document(&operation_context_doc)?;
+    let output = &res.1;
+
+    // Each field must reference its own enum type, not FoldState
+    assert!(
+        output.contains("OperationReason::OperationReason::UNKNOWN"),
+        "Expected OperationReason::OperationReason::UNKNOWN, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("WakeReason::WakeReason::UNKNOWN"),
+        "Expected WakeReason::WakeReason::UNKNOWN, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("FoldState::FoldState::UNKNOWN"),
+        "Expected FoldState::FoldState::UNKNOWN, got:\n{}",
+        output
+    );
+
+    // Ensure FoldState is NOT used for non-FoldState fields
+    let reason_line = output
+        .lines()
+        .find(|l| l.contains("r#reason:") || l.contains("r#reason ="))
+        .unwrap_or("");
+    assert!(
+        !reason_line.contains("FoldState"),
+        "reason field should not reference FoldState, got: {}",
+        reason_line
+    );
+
+    let wake_line = output
+        .lines()
+        .find(|l| l.contains("r#wakeReason:") || l.contains("r#wakeReason ="))
+        .unwrap_or("");
+    assert!(
+        !wake_line.contains("FoldState"),
+        "wakeReason field should not reference FoldState, got: {}",
+        wake_line
+    );
+
+    Ok(())
+}
+
 // Issue: https://github.com/hiking90/rsbinder/issues/68
 // Cross-package enum default values should resolve to correct module paths
 #[test]

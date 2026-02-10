@@ -299,16 +299,25 @@ impl Builder {
     }
 
     pub fn generate(mut self) -> Result<(), Box<dyn Error>> {
+        let documents = self.parse_sources()?;
+
+        // 1st pass: pre-register all enum symbols across all documents
+        // so that parcelable default values can resolve enum references
+        // regardless of file processing order.
+        for document in &documents {
+            generator::Generator::pre_register_enums(&document.1);
+        }
+
+        // 2nd pass: generate code
         let mut package_list = Vec::new();
-        for document in self.parse_sources()? {
+        for document in &documents {
             println!("Generating: {}", document.0);
             let gen = generator::Generator::new(self.enabled_async, self.is_crate);
             let package = gen.document(&document.1)?;
-            package_list.push((package.0, package.1, document.0));
+            package_list.push((package.0, package.1, document.0.clone()));
         }
 
         let content = self.generate_all(package_list)?;
-        // let content = add_namespace(DEFAULT_NAMESPACE, &content);
 
         fs::write(self.dest_dir.join(&self.output), content)?;
 
