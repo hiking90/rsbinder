@@ -101,6 +101,8 @@ pub mod sdk_versions {
     pub const ANDROID_14: u32 = 34;
     /// Android 13 (API level 33)
     pub const ANDROID_13: u32 = 33;
+    /// Android 12L (API level 32)
+    pub const ANDROID_12L: u32 = 32;
     /// Android 12 (API level 31)
     pub const ANDROID_12: u32 = 31;
     /// Android 11 (API level 30)
@@ -164,7 +166,7 @@ pub fn default() -> Arc<ServiceManager> {
                 #[cfg(feature = "android_13")]
                 sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
                 #[cfg(feature = "android_12")]
-                sdk_versions::ANDROID_12 => create_service_manager!(Android12, android_12),
+                sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
                 #[cfg(feature = "android_11")]
                 sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
                 _ => panic!("default: Unsupported Android SDK version: {}", sdk_version),
