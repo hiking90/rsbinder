@@ -1,0 +1,19 @@
+[book]
+authors = ["Jeff Kim"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Rsbinder Development Guide"
+
+[build]
+build-dir = "build"
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output]
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

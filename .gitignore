@@ -5,3 +5,5 @@ REMOTE_LINUX
 
 .idea/
 *.iml
+
+book/build/
