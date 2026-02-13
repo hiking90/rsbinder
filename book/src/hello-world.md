@@ -2,16 +2,15 @@
 This tutorial will guide you through creating a simple Binder service that echoes a string back to the client, and a client program that uses the service.
 
 ## Create a new Rust project
-Create a new Rust project using Cargo:
-```
+Create a library project for the common library used by both the client and service:
+```bash
 $ cargo new --lib hello
 ```
-Create a library project for the common library used by both the client and service:
 
 ## Modify Cargo.toml
 In the hello project's Cargo.toml, add the following dependencies:
 
-```
+```toml
 [package]
 name = "hello"
 version = "0.1.0"
@@ -19,16 +18,14 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.4.0"
-lazy_static = "1"
+rsbinder = "0.5"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.4.0"
-
+rsbinder-aidl = "0.5"
 ```
-Add rsbinder, lazy_static, and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
+Add rsbinder and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
 
 ## Create an AIDL File
 Create an aidl folder in the project's top directory to manage AIDL files:
@@ -39,7 +36,7 @@ $ touch aidl/hello/IHello.aidl
 The reason for creating an additional **hello** folder is to create a namespace for the **hello** package.
 
 Create the `aidl/hello/IHello.aidl` file with the following contents:
-```
+```aidl
 package hello;
 
 // Defining the IHello Interface
@@ -52,7 +49,7 @@ interface IHello {
 For more information on AIDL syntax, refer to the [Android AIDL documentation](https://source.android.com/docs/core/architecture/aidl).
 
 ## Create the build.rs
-Create a `build.rs` file in the project root to compile the AIDL file and generate Rust code:
+Create a `build.rs` file in the **project root** (next to `Cargo.toml`) to compile the AIDL file and generate Rust code:
 ```rust
 use std::path::PathBuf;
 
@@ -66,11 +63,13 @@ fn main() {
 ```
 This uses **rsbinder-aidl** to specify the AIDL source file (`IHello.aidl`) and the generated Rust file name (`hello.rs`), and then generates the code during the build process.
 
+> **Important**: The `build.rs` file must be placed in the project root directory, **not** inside `src/`. If placed in the wrong location, you will get a compile error: `environment variable OUT_DIR not defined at compile time`. Cargo only recognizes `build.rs` at the project root.
+
 ## Create a common library for Client and Service
 For the Client and Service, create a library that includes the Rust code generated from AIDL.
 
 Create src/lib.rs and add the following content.
-```
+```rust
 // Include the code hello.rs generated from AIDL.
 include!(concat!(env!("OUT_DIR"), "/hello.rs"));
 
@@ -82,14 +81,16 @@ pub const SERVICE_NAME: &str = "my.hello";
 ```
 
 ## Create a service
+Create the `src/bin/` directory and add the service file. Cargo automatically recognizes `.rs` files under `src/bin/` as binary targets, so no `[[bin]]` section is needed in `Cargo.toml`.
+
 Let's configure the src/bin/hello_service.rs file as follows.
-```
+```rust
 use env_logger::Env;
 use rsbinder::*;
 
 use hello::*;
 
-// Define the name of the service to be registered in the HUB(service manager).
+// Define a struct that implements the IHello interface.
 struct IHelloService;
 
 // Implement the IHello interface for the IHelloService.
@@ -137,7 +138,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 ## Create a client
 Create the src/bin/hello_client.rs file and configure it as follows.
-```
+```rust
+#![allow(non_snake_case)]
+
 use env_logger::Env;
 use rsbinder::*;
 use hello::*;
@@ -172,7 +175,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("list services:");
     // This is an example of how to use service manager.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
-        println!("{}", name);
+        println!("{name}");
     }
 
     let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
@@ -261,23 +264,80 @@ The client demonstrates several advanced features:
 
 If you encounter issues:
 
-1. **"Can't find my.hello"** - Ensure the service is running and registered
-2. **Permission errors** - Check that binder device has correct permissions (0666)
-3. **Service manager not found** - Verify `rsb_hub` is running
-4. **Build errors** - Ensure all dependencies are correctly specified in Cargo.toml
+1. **"ProcessState is not initialized!"** - `ProcessState::init_default()` (or `ProcessState::init()`) must be called in `main()` before using any other rsbinder APIs
+2. **"environment variable OUT_DIR not defined"** - `build.rs` must be placed in the project root directory (next to `Cargo.toml`), not inside `src/`
+3. **"Can't find my.hello"** - Ensure the service is running and registered
+4. **Permission errors** - Check that binder device has correct permissions (0666)
+5. **Service manager not found** - Verify `rsb_hub` is running
+6. **Build errors** - Ensure all dependencies are correctly specified in Cargo.toml
 
 ## Next Steps
 
 Congratulations! You've successfully created your first Binder service and client. Here are some next steps to explore:
 
-### Explore Advanced Features
-- **Async Services**: Use async/await with tokio runtime
-- **Complex Data Types**: Define custom Parcelable structs
+### Caller Identity and Access Control
+
+Inside a service method, you can identify the calling process using `CallingContext`:
+
+```rust
+use rsbinder::thread_state::CallingContext;
+
+fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    let caller = CallingContext::default();
+    let caller_uid = caller.uid;
+    let caller_pid = caller.pid;
+    let caller_sid = caller.sid;  // Optional SELinux context
+
+    // Enforce your own access control policy
+    if caller_uid != expected_uid {
+        return Err(rsbinder::Status::from(rsbinder::StatusCode::PermissionDenied));
+    }
+
+    Ok(echo.to_owned())
+}
+```
+
+This is especially useful since **rsbinder** does not enforce any access control policy by itself — it is up to each service to validate callers.
+
+### Error Handling
+
+Services can return service-specific errors to clients using `Status::new_service_specific_error`:
+
+```rust
+fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    if echo.is_empty() {
+        return Err(rsbinder::Status::new_service_specific_error(-1, None));
+    }
+    Ok(echo.to_owned())
+}
+```
+
+On the client side, these errors can be inspected through the `Status` type to distinguish between transport errors and application-level errors.
+
+### AIDL Annotations
+
+Generated types from AIDL do not derive `Clone` by default, because some AIDL types contain non-cloneable fields such as `ParcelFileDescriptor` (which wraps `OwnedFd`) or `ParcelableHolder` (which contains a `Mutex`).
+
+You can opt-in to `Clone` (and other traits) for specific types using the `@RustDerive` annotation in your AIDL file:
+
+```aidl
+@RustDerive(Clone=true, PartialEq=true)
+parcelable MyData {
+    int id;
+    String name;
+}
+```
+
+`@RustDerive` is supported for **parcelable** and **union** types. This follows the same convention as [Android's AIDL Rust backend](https://source.android.com/docs/core/architecture/aidl/aidl-annotations). The annotation will only compile successfully if all fields in the type actually implement the requested traits.
+
+### Explore More Features
+- **Async Services**: Use async/await with tokio runtime (the `tokio` feature is enabled by default). See `tests/src/bin/test_service_async.rs` in the repository for an async service example.
+- **Complex Data Types**: Define custom Parcelable structs in AIDL
 - **Service Callbacks**: Implement bidirectional communication
-- **Error Handling**: Learn about Status codes and error propagation
+- **API Reference**: See the full API documentation at [docs.rs/rsbinder](https://docs.rs/rsbinder)
 
 ### Run the Test Suite
-The **rsbinder** project includes a comprehensive test suite with 96 test cases (90 currently passing) ported from Android:
+The **rsbinder** project includes a comprehensive test suite ported from Android:
 
 ```bash
 # Terminal 1: Start service manager
@@ -287,11 +347,11 @@ $ cargo run --bin rsb_hub
 $ cargo run --bin test_service
 
 # Terminal 3: Run tests
-$ cargo test test_client::
+$ cargo test -p tests test_client::
 ```
 
 ### Study Real Examples
 Check out the **rsbinder** repository for more complex examples:
-- **example-hello**: The complete example from this tutorial
+- **example-hello**: The complete example from this tutorial (note: the package name is `example-hello`, so import paths use `example_hello::*` instead of `hello::*`)
 - **tests**: Comprehensive test cases showing various IPC scenarios
 - **rsbinder-tools**: Real-world service manager implementation

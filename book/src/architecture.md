@@ -21,6 +21,13 @@ flowchart BT
     C<-->|Communication|S;
 ```
 
+### How It Works
+
+1. You define your service interface in an **AIDL** file
+2. The **rsbinder-aidl** compiler generates Rust code (traits, proxies, and stubs)
+3. Your **Service** implements the generated trait and registers itself with the **HUB** (service manager)
+4. A **Client** queries the HUB to discover the service, then communicates with it through the generated proxy
+
 ### Description of each component of the diagram
 - **AIDL (Android Interface Definition Language)**
     - The Android Interface Definition Language (AIDL) is a tool that lets users abstract away IPC. Given an interface (specified in a .aidl file), the **rsbinder-aidl** compiler constructs Rust bindings so that this interface can be used across processes, regardless of the runtime or bitness.

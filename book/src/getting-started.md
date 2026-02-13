@@ -6,7 +6,7 @@ Welcome to **rsbinder**! This guide will help you get started with Binder IPC de
 
 If you are new to Binder IPC, we recommend following this learning path:
 
-1. **[Architecture](./architecture.md)** - Start here to understand Binder IPC fundamentals
+1. **[Overview](./overview.md)** and **[Architecture](./architecture.md)** - Start here to understand Binder IPC fundamentals
    - Learn about the core concepts and components
    - Understand the relationship between services and clients
    - See how AIDL generates Rust code
@@ -25,15 +25,23 @@ If you are new to Binder IPC, we recommend following this learning path:
    - **[Linux Setup](./enable-binder-for-linux.md)** - For Linux development
    - **[Android Development](./android.md)** - For Android integration
 
+## Platform Requirements
+
+**rsbinder** requires a Linux kernel with Binder IPC support. It runs on:
+- **Linux**: Requires kernel 4.17+ with binderfs enabled (disabled by default in most distributions)
+- **Android**: Binder is available natively; no kernel modification needed
+
+> **Note**: macOS and Windows are **not supported** as runtime environments. You can use macOS for cross-compiling to Android targets, but running Binder services requires Linux.
+
 ## Quick Start Checklist
 
 Before diving into development, ensure you have:
 
-- [ ] Rust 1.77+ installed
-- [ ] Linux kernel with binder support enabled
-- [ ] Created binder device using `rsb_device`
-- [ ] Service manager (`rsb_hub`) running
-- [ ] Basic understanding of AIDL syntax
+- [ ] Rust 1.85+ installed
+- [ ] Linux kernel with binder support enabled (or an Android device/emulator)
+- [ ] Created binder device using `rsb_device` (Linux only)
+- [ ] Service manager (`rsb_hub`) running (Linux only)
+- [ ] Basic understanding of AIDL syntax (covered in the [Hello World](./hello-world.md) tutorial)
 
 ## Key Concepts to Understand
 
@@ -52,4 +60,4 @@ Before diving into development, ensure you have:
 4. Register the service with the service manager
 5. Create clients that discover and use your service
 
-Ready to start? Head to the [Architecture](./architecture.md) section to learn the fundamentals!
+Ready to start? Head to the [Overview](./overview.md) section to learn the fundamentals!

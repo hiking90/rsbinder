@@ -58,7 +58,7 @@ $ ls -la /dev/binderfs/binder
 
 # Test with a simple example
 $ git clone https://github.com/hiking90/rsbinder.git
-$ cd rsbinder/example-hello
+$ cd rsbinder
 
 # Start service manager in one terminal
 $ rsb_hub

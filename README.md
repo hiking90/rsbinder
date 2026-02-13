@@ -22,6 +22,15 @@ The **rsbinder** library unlocks a significant opportunity for Android developer
 
 By integrating **rsbinder** into your project, you gain the ability to harness Binder IPC directly within the Android NDK environment using pure Rust.
 
+## Documentation
+For a comprehensive guide on using rsbinder, including architecture overview, installation, and tutorials, check out the **[Rsbinder Development Guide](https://hiking90.github.io/rsbinder/)**.
+
+The book source is available in the [`book/`](book/) directory and can be built locally using [mdBook](https://github.com/rust-lang/mdBook):
+```
+$ cd book
+$ mdbook serve
+```
+
 ## Current Development Status
 **rsbinder** is still in its early development stages and is not yet ready for production use.
 

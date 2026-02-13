@@ -45,9 +45,9 @@ The Android NDK (Native Development Kit) is required for building native Rust co
 #### Method 2: Command Line Installation
 ```bash
 # Install specific NDK version
-$ sdkmanager "ndk;26.1.10909125"  # Latest stable version
-# or
-$ sdkmanager "ndk;25.2.9519653"   # Alternative stable version
+$ sdkmanager "ndk;26.1.10909125"
+# Check for the latest available version:
+$ sdkmanager --list | grep ndk
 ```
 
 #### Method 3: Direct Download
@@ -62,8 +62,8 @@ Set up environment variables in your shell profile (`.bashrc`, `.zshrc`, etc.):
 export ANDROID_HOME=$HOME/Android/Sdk  # Linux
 # export ANDROID_HOME=$HOME/Library/Android/sdk  # macOS
 
-# Android NDK
-export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125
+# Android NDK (replace with your installed version)
+export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/<your-ndk-version>
 export NDK_HOME=$ANDROID_NDK_ROOT
 
 # Add tools to PATH
@@ -124,7 +124,7 @@ $ ndk_prepare
 
 **`ndk_build`**: Builds the project for Android
 - Reads configuration from `REMOTE_ANDROID` file
-- Builds both release binaries and test executables
+- Builds both debug binaries and test executables
 - Uses `cargo ndk` with the specified target architecture
 
 ```bash
@@ -139,6 +139,8 @@ $ ndk_build
 ```bash
 $ ndk_sync
 ```
+
+The `envsetup.sh` script also provides functions for remote Linux testing (`remote_sync`, `remote_shell`, `remote_test`) and publishing (`publish`, `publish_dry_run`). These are intended for project maintainers and advanced development workflows.
 
 ### Configuration File: REMOTE_ANDROID
 
