@@ -55,9 +55,9 @@ flowchart BT
     - Full type safety with compile-time interface validation.
 
 - **HUB (Service Manager)**
-    - **rsbinder** provides **rsb_hub**, a service manager for Linux environments.
+    - In **rsbinder**, the service manager is referred to as **HUB**. The `hub` module in the rsbinder API provides a unified interface (`hub::add_service()`, `hub::get_interface()`, etc.) that works on both platforms.
+    - **On Linux**: **rsbinder** provides **rsb_hub**, a standalone service manager that you run as a separate process. You must start `rsb_hub` before registering or discovering services.
+    - **On Android**: The system already provides its own service manager (`servicemanager`). **rsbinder** connects to it automatically — no need to run `rsb_hub`.
     - Handles service registration, discovery, and lifecycle management.
     - Provides APIs for listing services, checking service status, and notifications.
-    - On Android, integrates with the existing Android service manager seamlessly.
-    - Supports priority-based service access and security policies.
 
