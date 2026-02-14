@@ -32,9 +32,8 @@ use std::os::fd::FromRawFd;
 use std::sync::{Arc, RwLock, Weak};
 
 use crate::{
-    binder::*, error::*, parcel::*,
-    parcelable::SerializeOption,
-    ref_counter::RefCounter, thread_state,
+    binder::*, error::*, parcel::*, parcelable::SerializeOption, ref_counter::RefCounter,
+    thread_state,
 };
 
 struct Inner<T: Remotable + Send + Sync> {
@@ -94,7 +93,11 @@ impl<T: Remotable> Inner<T> {
 
 impl<T: 'static + Remotable> IBinder for Inner<T> {
     fn get_extension(&self) -> Result<Option<SIBinder>> {
-        Ok(self.extension.read().expect("Extension lock poisoned").clone())
+        Ok(self
+            .extension
+            .read()
+            .expect("Extension lock poisoned")
+            .clone())
     }
 
     fn set_extension(&self, extension: &SIBinder) -> Result<()> {

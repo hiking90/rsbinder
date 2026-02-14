@@ -24,9 +24,9 @@ use android::aidl::tests::unstable::{
 use android::aidl::tests::vintf::{
     VintfExtendableParcelable::VintfExtendableParcelable, VintfParcelable::VintfParcelable,
 };
+use android::aidl::tests::INamedCallback;
 use android::aidl::tests::INewName::{self, BpNewName};
 use android::aidl::tests::IOldName::{self, BpOldName};
-use android::aidl::tests::INamedCallback;
 use android::aidl::tests::ITestService::{
     self, BpTestService, Empty::Empty, ITestServiceDefault, ITestServiceDefaultRef,
 };
@@ -1560,7 +1560,10 @@ fn test_binder_extension_local_set_get() {
     assert!(got.is_ok());
     let got = got.unwrap();
     assert!(got.is_some(), "Extension should be set");
-    assert_eq!(got.unwrap().descriptor(), "android.aidl.tests.INamedCallback");
+    assert_eq!(
+        got.unwrap().descriptor(),
+        "android.aidl.tests.INamedCallback"
+    );
 }
 
 // Test 2: Local binder without extension returns None
@@ -1571,7 +1574,10 @@ fn test_binder_extension_local_default_none() {
 
     let ext = binder.get_extension();
     assert!(ext.is_ok());
-    assert!(ext.unwrap().is_none(), "Extension should be None by default");
+    assert!(
+        ext.unwrap().is_none(),
+        "Extension should be None by default"
+    );
 }
 
 // Test 3: Remote get_extension with extension set (EXTENSION_TRANSACTION round-trip)
@@ -1588,7 +1594,10 @@ fn test_binder_extension_get_from_remote() {
 
     // Verify the extension is a valid remote binder
     let ext_binder = ext.unwrap();
-    assert!(ext_binder.is_remote(), "Extension should be a remote binder");
+    assert!(
+        ext_binder.is_remote(),
+        "Extension should be a remote binder"
+    );
     assert_eq!(ext_binder.descriptor(), "android.aidl.tests.INamedCallback");
 }
 
@@ -1603,7 +1612,10 @@ fn test_binder_extension_none_from_remote() {
 
     let ext = service.as_binder().get_extension();
     assert!(ext.is_ok());
-    assert!(ext.unwrap().is_none(), "Extension should be None for service without extension");
+    assert!(
+        ext.unwrap().is_none(),
+        "Extension should be None for service without extension"
+    );
 }
 
 // Test 5: Proxy cache hit (extension exists)
@@ -1649,8 +1661,9 @@ fn test_binder_extension_use_as_interface() {
     let ext = service.as_binder().get_extension().unwrap().unwrap();
 
     // Cast extension to INamedCallback and call GetName()
-    let named_callback: rsbinder::Strong<dyn INamedCallback::INamedCallback> =
-        ext.into_interface().expect("Extension should be castable to INamedCallback");
+    let named_callback: rsbinder::Strong<dyn INamedCallback::INamedCallback> = ext
+        .into_interface()
+        .expect("Extension should be castable to INamedCallback");
     let name = named_callback.GetName().expect("GetName should succeed");
     assert_eq!(name, "binder_ext");
 }

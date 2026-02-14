@@ -15,8 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{self, Arc, RwLock};
 
 use crate::{
-    binder::*, binder_object::*, error::*, parcel::*,
-    parcelable::DeserializeOption,
+    binder::*, binder_object::*, error::*, parcel::*, parcelable::DeserializeOption,
     process_state::ProcessState, ref_counter::RefCounter, thread_state,
 };
 
@@ -168,12 +167,10 @@ impl IBinder for ProxyHandle {
         // 2. Remote query (EXTENSION_TRANSACTION)
         let data = Parcel::new();
         let ext: Option<SIBinder> = match self.submit_transact(EXTENSION_TRANSACTION, &data, 0) {
-            Ok(Some(mut reply)) => {
-                match DeserializeOption::deserialize_option(&mut reply) {
-                    Ok(ext) => ext,
-                    Err(_) => return Ok(None),
-                }
-            }
+            Ok(Some(mut reply)) => match DeserializeOption::deserialize_option(&mut reply) {
+                Ok(ext) => ext,
+                Err(_) => return Ok(None),
+            },
             _ => return Ok(None),
         };
 
