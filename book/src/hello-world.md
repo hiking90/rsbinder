@@ -331,9 +331,16 @@ parcelable MyData {
 `@RustDerive` is supported for **parcelable** and **union** types. This follows the same convention as [Android's AIDL Rust backend](https://source.android.com/docs/core/architecture/aidl/aidl-annotations). The annotation will only compile successfully if all fields in the type actually implement the requested traits.
 
 ### Explore More Features
-- **Async Services**: Use async/await with tokio runtime (the `tokio` feature is enabled by default). See `tests/src/bin/test_service_async.rs` in the repository for an async service example.
-- **Complex Data Types**: Define custom Parcelable structs in AIDL
-- **Service Callbacks**: Implement bidirectional communication
+- **[AIDL Data Types](./aidl-data-types.md)**: Learn how AIDL types map to Rust, including primitives, arrays, strings, and nullable types
+- **[Parcelable](./aidl-parcelable.md)**: Define custom data structures that can be sent across Binder IPC
+- **[Enum and Union](./aidl-enum-union.md)**: Use enum and union types in your AIDL interfaces
+- **[Annotations](./aidl-annotations.md)**: Control code generation with `@RustDerive`, `@Backing`, `@nullable`, and more
+- **[Service Patterns](./service-patterns.md)**: Advanced service patterns including `dump()`, default implementations, and multi-service processes
+- **[Async Service](./async-service.md)**: Use async/await with tokio runtime for non-blocking services
+- **[Callbacks and Interfaces](./callbacks-and-interfaces.md)**: Implement bidirectional communication and death recipients
+- **[ParcelFileDescriptor](./parcel-file-descriptor.md)**: Pass file descriptors across process boundaries
+- **[Error Handling](./error-handling.md)**: Service-specific errors, status codes, and exception handling
+- **[Service Manager (HUB)](./service-manager.md)**: Registration, lookup, notifications, and debug info
 - **API Reference**: See the full API documentation at [docs.rs/rsbinder](https://docs.rs/rsbinder)
 
 ### Run the Test Suite

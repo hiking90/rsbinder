@@ -21,7 +21,21 @@ If you are new to Binder IPC, we recommend following this learning path:
    - Learn AIDL basics
    - Understand service registration and client communication
 
-4. **Platform-specific Setup** - Choose your target platform:
+4. **AIDL Guide** - Dive deeper into AIDL language features:
+   - **[Data Types](./aidl-data-types.md)** - How AIDL types map to Rust types
+   - **[Parcelable](./aidl-parcelable.md)** - Custom data structures for IPC
+   - **[Enum and Union](./aidl-enum-union.md)** - Enum and union type support
+   - **[Annotations](./aidl-annotations.md)** - Code generation annotations
+
+5. **Service Development** - Build production-quality services:
+   - **[Service Patterns](./service-patterns.md)** - Advanced service patterns and best practices
+   - **[Async Service](./async-service.md)** - Non-blocking services with tokio
+   - **[Callbacks and Interfaces](./callbacks-and-interfaces.md)** - Bidirectional communication
+   - **[ParcelFileDescriptor](./parcel-file-descriptor.md)** - File descriptor passing
+   - **[Error Handling](./error-handling.md)** - Error types and handling strategies
+   - **[Service Manager (HUB)](./service-manager.md)** - Service registration and discovery
+
+6. **Platform-specific Setup** - Choose your target platform:
    - **[Linux Setup](./enable-binder-for-linux.md)** - For Linux development
    - **[Android Development](./android.md)** - For Android integration
 
