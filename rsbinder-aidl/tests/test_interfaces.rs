@@ -216,3 +216,104 @@ pub mod ArrayOfInterfaces {
         "##,
     )
 }
+
+/// Helper to verify that generated code contains a specific string fragment
+fn aidl_generator_contains(input: &str, expected_fragment: &str) -> Result<(), Box<dyn Error>> {
+    let document = rsbinder_aidl::parse_document(input)?;
+    let gen = rsbinder_aidl::Generator::new(false, false);
+    let res = gen.document(&document)?;
+    assert!(
+        res.1.contains(expected_fragment),
+        "Generated code does not contain expected fragment.\nExpected fragment:\n{}\n\nGenerated code:\n{}",
+        expected_fragment, res.1
+    );
+    Ok(())
+}
+
+/// Helper to verify that AIDL parsing + code generation returns an error
+fn aidl_generator_should_fail(input: &str, expected_error_substring: &str) {
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let document = rsbinder_aidl::parse_document(input)?;
+        let gen = rsbinder_aidl::Generator::new(false, false);
+        gen.document(&document)?;
+        Ok(())
+    })();
+    assert!(result.is_err(), "Expected error but got success");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains(expected_error_substring),
+        "Error message '{}' does not contain '{}'",
+        err_msg, expected_error_substring
+    );
+}
+
+#[test]
+fn test_explicit_transaction_codes() -> Result<(), Box<dyn Error>> {
+    let input = r#"
+interface IExplicit {
+    void method1() = 10;
+    void method2() = 20;
+}
+    "#;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 10;")?;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 20;")?;
+    Ok(())
+}
+
+#[test]
+fn test_explicit_transaction_code_zero() -> Result<(), Box<dyn Error>> {
+    let input = r#"
+interface IZero {
+    void method1() = 0;
+    void method2() = 1;
+}
+    "#;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;")?;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;")?;
+    Ok(())
+}
+
+#[test]
+fn test_mixed_transaction_codes_error() {
+    aidl_generator_should_fail(
+        r#"
+interface IMixed {
+    void method1() = 10;
+    void method2();
+}
+        "#,
+        "either all methods must have explicitly assigned transaction IDs",
+    );
+}
+
+#[test]
+fn test_implicit_transaction_codes_unchanged() -> Result<(), Box<dyn Error>> {
+    let input = r#"
+interface IImplicit {
+    void method1();
+    void method2();
+}
+    "#;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;")?;
+    aidl_generator_contains(input,
+        "pub(crate) const r#method2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;")?;
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_transaction_codes_error() {
+    aidl_generator_should_fail(
+        r#"
+interface IDuplicate {
+    void method1() = 10;
+    void method2() = 10;
+}
+        "#,
+        "have the same transaction code",
+    );
+}

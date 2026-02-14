@@ -477,7 +477,7 @@ pub struct MethodDecl {
     pub r#type: Type,
     pub identifier: String,
     pub arg_list: Vec<Arg>,
-    pub intvalue: i64,
+    pub intvalue: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1175,7 +1175,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
             }
             Rule::INTVALUE => {
                 let expr = parse_intvalue(pair.as_str()).calculate();
-                decl.intvalue = match expr.value {
+                decl.intvalue = Some(match expr.value {
                     ValueType::Byte(v) => v as _,
                     ValueType::Int32(v) => v as _,
                     ValueType::Int64(v) => v,
@@ -1184,7 +1184,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
                         pair,
                         pair.as_str()
                     ),
-                };
+                });
             }
             _ => unreachable!(
                 "Unexpected rule in parse_method_decl(): {}, \"{}\"",

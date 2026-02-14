@@ -243,8 +243,12 @@ pub mod {{mod}} {
     pub(crate) mod transactions {
         {%- set counter = 0 %}
         {%- for member in fn_members %}
+        {%- if member.has_explicit_code %}
+        pub(crate) const r#{{ member.identifier }}: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + {{ member.transaction_code }};
+        {%- else %}
         pub(crate) const r#{{ member.identifier }}: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + {{ counter }};
         {%- set_global counter = counter + 1 %}
+        {%- endif %}
         {%- endfor %}
     }
     pub type {{ name }}DefaultRef = std::sync::Arc<dyn {{ name }}Default>;
@@ -442,6 +446,8 @@ struct FnMembers {
     transaction_has_return: bool,
     oneway: bool,
     read_onto_params: Vec<String>,
+    transaction_code: u32,
+    has_explicit_code: bool,
 }
 
 fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
@@ -555,6 +561,8 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
         transaction_has_return,
         oneway: method.oneway,
         read_onto_params,
+        transaction_code: method.intvalue.unwrap_or(0) as u32,
+        has_explicit_code: method.intvalue.is_some(),
     })
 }
 
@@ -706,6 +714,50 @@ impl Generator {
                         InitParam::builder().with_const(true),
                     ),
                 ));
+            }
+
+            // === Transaction code validation (before fn_members loop) ===
+            {
+                let explicit_count = decl.method_list.iter()
+                    .filter(|m| m.intvalue.is_some())
+                    .count();
+
+                // AOSP rule: all-or-nothing
+                if explicit_count > 0 && explicit_count < decl.method_list.len() {
+                    return Err(format!(
+                        "Interface {}: either all methods must have explicitly assigned \
+                         transaction IDs or none of them should",
+                        decl.name
+                    ).into());
+                }
+
+                if explicit_count > 0 {
+                    // Detect duplicate transaction codes
+                    let mut seen = std::collections::HashMap::new();
+                    for method in decl.method_list.iter() {
+                        if let Some(code) = method.intvalue {
+                            if code < 0 {
+                                return Err(format!(
+                                    "Interface {}: method '{}' has negative transaction code {}",
+                                    decl.name, method.identifier, code
+                                ).into());
+                            }
+                            if code > u32::MAX as i64 {
+                                return Err(format!(
+                                    "Interface {}: method '{}' has transaction code {} exceeding u32 range",
+                                    decl.name, method.identifier, code
+                                ).into());
+                            }
+                            if let Some(prev_name) = seen.insert(code, &method.identifier) {
+                                return Err(format!(
+                                    "Interface {}: methods '{}' and '{}' have the same \
+                                     transaction code {}",
+                                    decl.name, prev_name, method.identifier, code
+                                ).into());
+                            }
+                        }
+                    }
+                }
             }
 
             for method in decl.method_list.iter() {
