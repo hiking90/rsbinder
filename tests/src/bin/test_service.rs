@@ -692,6 +692,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let service_name = <BpTestService as ITestService::ITestService>::descriptor();
     let service = BnTestService::new_binder(TestService::default());
+
+    // Set a NamedCallback as binder extension for testing get_extension/set_extension
+    let ext_service = INamedCallback::BnNamedCallback::new_binder(NamedCallback("binder_ext".into()));
+    service.as_binder().set_extension(&ext_service.as_binder()).expect("Could not set extension");
+
     hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
     log::warn!("Intentional error output for testing purposes.");

@@ -15,9 +15,18 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{self, Arc, RwLock};
 
 use crate::{
-    binder::*, binder_object::*, error::*, parcel::*, process_state::ProcessState,
-    ref_counter::RefCounter, thread_state,
+    binder::*, binder_object::*, error::*, parcel::*,
+    parcelable::DeserializeOption,
+    process_state::ProcessState, ref_counter::RefCounter, thread_state,
 };
+
+/// Cache state for the extension binder object on the proxy side.
+enum ExtensionCache {
+    /// Remote query has not been performed yet.
+    NotQueried,
+    /// Remote query completed; stores the result (Some or None).
+    Queried(Option<SIBinder>),
+}
 
 /// Handle for a proxy to a remote binder service.
 ///
@@ -33,6 +42,7 @@ pub struct ProxyHandle {
 
     strong: RefCounter,
     weak: RefCounter,
+    extension: RwLock<ExtensionCache>,
 }
 
 impl ProxyHandle {
@@ -47,6 +57,7 @@ impl ProxyHandle {
             recipients: RwLock::new(Vec::new()),
             strong: Default::default(),
             weak: Default::default(),
+            extension: RwLock::new(ExtensionCache::NotQueried),
         })
     }
 
@@ -145,6 +156,39 @@ impl PartialEq for ProxyHandle {
 }
 
 impl IBinder for ProxyHandle {
+    fn get_extension(&self) -> Result<Option<SIBinder>> {
+        // 1. Check cache (read lock)
+        {
+            let cached = self.extension.read().expect("Extension lock poisoned");
+            if let ExtensionCache::Queried(ref ext) = *cached {
+                return Ok(ext.clone());
+            }
+        }
+
+        // 2. Remote query (EXTENSION_TRANSACTION)
+        let data = Parcel::new();
+        let ext: Option<SIBinder> = match self.submit_transact(EXTENSION_TRANSACTION, &data, 0) {
+            Ok(Some(mut reply)) => {
+                match DeserializeOption::deserialize_option(&mut reply) {
+                    Ok(ext) => ext,
+                    Err(_) => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        // 3. Cache on success only (write lock)
+        let mut cache = self.extension.write().expect("Extension lock poisoned");
+        *cache = ExtensionCache::Queried(ext.clone());
+        Ok(ext)
+    }
+
+    fn set_extension(&self, extension: &SIBinder) -> Result<()> {
+        let mut ext = self.extension.write().expect("Extension lock poisoned");
+        *ext = ExtensionCache::Queried(Some(extension.clone()));
+        Ok(())
+    }
+
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         if self

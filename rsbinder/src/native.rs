@@ -29,15 +29,20 @@ use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::FromRawFd;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
-use crate::{binder::*, error::*, parcel::*, ref_counter::RefCounter, thread_state};
+use crate::{
+    binder::*, error::*, parcel::*,
+    parcelable::SerializeOption,
+    ref_counter::RefCounter, thread_state,
+};
 
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
     _stability: Stability,
     strong: RefCounter,
     weak: RefCounter,
+    extension: RwLock<Option<SIBinder>>,
 }
 
 impl<T: Remotable> Inner<T> {
@@ -88,6 +93,16 @@ impl<T: Remotable> Inner<T> {
 }
 
 impl<T: 'static + Remotable> IBinder for Inner<T> {
+    fn get_extension(&self) -> Result<Option<SIBinder>> {
+        Ok(self.extension.read().expect("Extension lock poisoned").clone())
+    }
+
+    fn set_extension(&self, extension: &SIBinder) -> Result<()> {
+        let mut ext = self.extension.write().expect("Extension lock poisoned");
+        *ext = Some(extension.clone());
+        Ok(())
+    }
+
     fn link_to_death(&self, _recipient: Weak<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support link_to_death.");
         Err(StatusCode::InvalidOperation)
@@ -167,10 +182,9 @@ impl<T: Remotable> Transactable for Inner<T> {
                 Ok(())
             }
             EXTENSION_TRANSACTION => {
-                log::error!("EXTENSION_TRANSACTION is not supported.");
-                Err(StatusCode::InvalidOperation)
-                // CHECK(reply != nullptr);
-                // err = reply->writeStrongBinder(getExtension());
+                let ext = self.extension.read().expect("Extension lock poisoned");
+                SerializeOption::serialize_option(ext.as_ref(), reply)?;
+                Ok(())
             }
 
             STOP_RECORDING_TRANSACTION => {
@@ -233,8 +247,21 @@ impl<T: 'static + Remotable> Binder<T> {
                 _stability: stability,
                 strong: Default::default(),
                 weak: Default::default(),
+                extension: RwLock::new(None),
             }),
         }
+    }
+}
+
+impl<T: 'static + Remotable> Binder<T> {
+    /// Set the extension binder object.
+    pub fn set_extension(&self, extension: &SIBinder) -> Result<()> {
+        self.inner.set_extension(extension)
+    }
+
+    /// Return the extension binder object, if set.
+    pub fn get_extension(&self) -> Result<Option<SIBinder>> {
+        self.inner.get_extension()
     }
 }
 
