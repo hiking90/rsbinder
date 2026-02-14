@@ -190,6 +190,16 @@ pub trait IBinder: Any + Send + Sync {
     /// Retrieve if this object is remote.
     fn is_remote(&self) -> bool;
 
+    /// Return the extension binder object, if set. Returns None if no extension is set.
+    fn get_extension(&self) -> Result<Option<SIBinder>> {
+        Ok(None)
+    }
+
+    /// Set the extension binder object.
+    fn set_extension(&self, _extension: &SIBinder) -> Result<()> {
+        Err(StatusCode::InvalidOperation)
+    }
+
     fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
     fn attempt_inc_strong(&self) -> bool;
     fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()>;
