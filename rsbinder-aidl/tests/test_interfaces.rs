@@ -243,7 +243,8 @@ fn aidl_generator_should_fail(input: &str, expected_error_substring: &str) {
     assert!(
         err_msg.contains(expected_error_substring),
         "Error message '{}' does not contain '{}'",
-        err_msg, expected_error_substring
+        err_msg,
+        expected_error_substring
     );
 }
 

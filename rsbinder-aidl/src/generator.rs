@@ -718,7 +718,9 @@ impl Generator {
 
             // === Transaction code validation (before fn_members loop) ===
             {
-                let explicit_count = decl.method_list.iter()
+                let explicit_count = decl
+                    .method_list
+                    .iter()
                     .filter(|m| m.intvalue.is_some())
                     .count();
 
@@ -728,7 +730,8 @@ impl Generator {
                         "Interface {}: either all methods must have explicitly assigned \
                          transaction IDs or none of them should",
                         decl.name
-                    ).into());
+                    )
+                    .into());
                 }
 
                 if explicit_count > 0 {
@@ -740,7 +743,8 @@ impl Generator {
                                 return Err(format!(
                                     "Interface {}: method '{}' has negative transaction code {}",
                                     decl.name, method.identifier, code
-                                ).into());
+                                )
+                                .into());
                             }
                             if code > u32::MAX as i64 {
                                 return Err(format!(
@@ -753,7 +757,8 @@ impl Generator {
                                     "Interface {}: methods '{}' and '{}' have the same \
                                      transaction code {}",
                                     decl.name, prev_name, method.identifier, code
-                                ).into());
+                                )
+                                .into());
                             }
                         }
                     }
