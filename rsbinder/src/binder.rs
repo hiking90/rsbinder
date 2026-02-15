@@ -713,7 +713,6 @@ mod tests {
         assert_eq!(b_pack_chars('_', 'T', 'W', 'T'), TWEET_TRANSACTION);
         assert_eq!(b_pack_chars('_', 'L', 'I', 'K'), LIKE_TRANSACTION);
     }
-
 }
 
 #[cfg(test)]
@@ -732,7 +731,12 @@ mod stability_tests {
     // === TryFrom round-trip tests ===
     #[test]
     fn test_stability_roundtrip() {
-        for s in [Stability::Local, Stability::Vendor, Stability::System, Stability::Vintf] {
+        for s in [
+            Stability::Local,
+            Stability::Vendor,
+            Stability::System,
+            Stability::Vintf,
+        ] {
             let wire: i32 = s.into();
             assert_eq!(Stability::try_from(wire).unwrap(), s);
         }
@@ -744,15 +748,30 @@ mod stability_tests {
         // Category{version=1, reserved=[0,0], level} → repr = (level << 24) | version
         let category = |level: i32, version: i32| -> i32 { (level << 24) | version };
 
-        assert_eq!(Stability::try_from(category(0b000011, 1)).unwrap(), Stability::Vendor);
-        assert_eq!(Stability::try_from(category(0b001100, 1)).unwrap(), Stability::System);
-        assert_eq!(Stability::try_from(category(0b111111, 1)).unwrap(), Stability::Vintf);
+        assert_eq!(
+            Stability::try_from(category(0b000011, 1)).unwrap(),
+            Stability::Vendor
+        );
+        assert_eq!(
+            Stability::try_from(category(0b001100, 1)).unwrap(),
+            Stability::System
+        );
+        assert_eq!(
+            Stability::try_from(category(0b111111, 1)).unwrap(),
+            Stability::Vintf
+        );
 
         // Different version values should also work
-        assert_eq!(Stability::try_from(category(0b001100, 12)).unwrap(), Stability::System);
+        assert_eq!(
+            Stability::try_from(category(0b001100, 12)).unwrap(),
+            Stability::System
+        );
 
         // rsbinder's own Android 12 format: level | 0x0c000000
-        assert_eq!(Stability::try_from(0b001100 | 0x0c000000_i32).unwrap(), Stability::System);
+        assert_eq!(
+            Stability::try_from(0b001100 | 0x0c000000_i32).unwrap(),
+            Stability::System
+        );
     }
 
     #[test]
