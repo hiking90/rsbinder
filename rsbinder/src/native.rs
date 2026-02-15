@@ -38,7 +38,7 @@ use crate::{
 
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
-    _stability: Stability,
+    stability: Stability,
     strong: RefCounter,
     weak: RefCounter,
     extension: RwLock<Option<SIBinder>>,
@@ -124,10 +124,9 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         Ok(())
     }
 
-    // /// Retrieve the stability of this object.
-    // fn stability(&self) -> Stability {
-    //     self.stability
-    // }
+    fn stability(&self) -> Stability {
+        self.stability
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -247,7 +246,7 @@ impl<T: 'static + Remotable> Binder<T> {
         Binder::<T> {
             inner: Arc::new(Inner {
                 remotable,
-                _stability: stability,
+                stability,
                 strong: Default::default(),
                 weak: Default::default(),
                 extension: RwLock::new(None),
