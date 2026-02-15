@@ -100,11 +100,11 @@ impl ParcelableHolder {
     where
         T: Any + Parcelable + ParcelableMetadata + std::fmt::Debug + Send + Sync,
     {
-        if self.stability > p.stability() {
+        if !p.stability().includes(self.stability) {
             log::error!(
-                "ParcelableHolder::set_parcelable: parcelable stability mismatch: {:?} > {:?}",
-                self.stability,
-                p.stability()
+                "ParcelableHolder::set_parcelable: parcelable stability {:?} does not include holder stability {:?}",
+                p.stability(),
+                self.stability
             );
             return Err(StatusCode::BadValue);
         }

@@ -190,6 +190,11 @@ pub trait IBinder: Any + Send + Sync {
     /// Retrieve if this object is remote.
     fn is_remote(&self) -> bool;
 
+    /// Retrieve the stability level of this binder object.
+    fn stability(&self) -> Stability {
+        Stability::default()
+    }
+
     /// Return the extension binder object, if set. Returns None if no extension is set.
     fn get_extension(&self) -> Result<Option<SIBinder>> {
         Ok(None)
@@ -294,9 +299,9 @@ where
 /// Interface stability promise
 ///
 /// An interface can promise to be a stable vendor interface ([`Stability::Vintf`]), or
-/// makes no stability guarantees ([`Stability::Local`]). [`Stability::Local`] is
-/// currently the default stability.
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// makes no stability guarantees ([`Stability::Local`]). [`Stability::System`] is
+/// the default stability, matching Android's `getLocalLevel()` for non-VNDK builds.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Stability {
     /// Default stability, visible to other modules in the same compilation
     /// context (e.g. modules on system.img)
@@ -307,6 +312,18 @@ pub enum Stability {
 
     /// A Vendor Interface Object, which promises to be stable
     Vintf,
+}
+
+impl Stability {
+    /// Android bitmask-compatible verification.
+    ///
+    /// Checks whether `self` (provider) includes the `required` stability level.
+    /// e.g., Vintf includes all levels. System and Vendor are independent domains.
+    pub fn includes(&self, required: Stability) -> bool {
+        let provided: i32 = (*self).into();
+        let required: i32 = required.into();
+        (provided & required) == required
+    }
 }
 
 // Android 12 version uses "Category" as the stability format for passed on the wire lines,
@@ -345,15 +362,25 @@ impl TryFrom<i32> for Stability {
     type Error = StatusCode;
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
-        match stability {
-            stability if stability == Local.into() => Ok(Local),
-            stability if stability == Vendor.into() => Ok(Vendor),
-            stability if stability == System.into() => Ok(System),
-            stability if stability == Vintf.into() => Ok(Vintf),
+
+        // Try matching as raw Level value first (Android 11, 13+)
+        let level = if stability <= 0xFF {
+            stability
+        } else {
+            // Try extracting level from Category repr format (Android 12).
+            // Category struct on little-endian: { version: u8, reserved: [u8; 2], level: u8 }
+            // repr() = (level << 24) | version
+            (stability >> 24) & 0xFF
+        };
+
+        match level {
+            0 => Ok(Local),
+            0b000011 => Ok(Vendor),
+            0b001100 => Ok(System),
+            0b111111 => Ok(Vintf),
             _ => {
-                log::error!("Stability value is invalid: {stability:X}");
-                // Err(StatusCode::BadValue)
-                Ok(Local)
+                log::error!("Stability value is invalid: {stability:#X}");
+                Err(StatusCode::BadValue)
             }
         }
     }
@@ -391,9 +418,10 @@ impl SIBinder {
         WIBinder::new_with_inner(Arc::clone(&this.inner))
     }
 
-    // pub fn stability(&self) -> Stability {
-    //     self.inner.data.stability()
-    // }
+    /// Retrieve the stability level of the underlying binder object.
+    pub fn stability(&self) -> Stability {
+        self.inner.stability()
+    }
 
     pub(crate) fn increase(&self) -> Result<()> {
         self.inner.inc_strong(self)
@@ -686,20 +714,73 @@ mod tests {
         assert_eq!(b_pack_chars('_', 'L', 'I', 'K'), LIKE_TRANSACTION);
     }
 
+}
+
+#[cfg(test)]
+mod stability_tests {
+    use super::*;
+
+    // === Wire value tests ===
     #[test]
-    fn test_stability() {
+    fn test_stability_wire_values() {
         assert_eq!(Into::<i32>::into(Stability::Local), 0);
         assert_eq!(Into::<i32>::into(Stability::Vendor), 0b000011);
         assert_eq!(Into::<i32>::into(Stability::System), 0b001100);
         assert_eq!(Into::<i32>::into(Stability::Vintf), 0b111111);
+    }
 
-        assert_eq!(Stability::try_from(0).unwrap(), Stability::Local);
-        assert_eq!(Stability::try_from(0b000011).unwrap(), Stability::Vendor);
-        assert_eq!(Stability::try_from(0b001100).unwrap(), Stability::System);
-        assert_eq!(Stability::try_from(0b111111).unwrap(), Stability::Vintf);
-        assert_eq!(
-            Stability::try_from(0b1111111).unwrap_err(),
-            StatusCode::BadValue
-        );
+    // === TryFrom round-trip tests ===
+    #[test]
+    fn test_stability_roundtrip() {
+        for s in [Stability::Local, Stability::Vendor, Stability::System, Stability::Vintf] {
+            let wire: i32 = s.into();
+            assert_eq!(Stability::try_from(wire).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn test_stability_category_format() {
+        // Android 12 Category repr: level in byte 3 (big end on little-endian)
+        // Category{version=1, reserved=[0,0], level} → repr = (level << 24) | version
+        let category = |level: i32, version: i32| -> i32 { (level << 24) | version };
+
+        assert_eq!(Stability::try_from(category(0b000011, 1)).unwrap(), Stability::Vendor);
+        assert_eq!(Stability::try_from(category(0b001100, 1)).unwrap(), Stability::System);
+        assert_eq!(Stability::try_from(category(0b111111, 1)).unwrap(), Stability::Vintf);
+
+        // Different version values should also work
+        assert_eq!(Stability::try_from(category(0b001100, 12)).unwrap(), Stability::System);
+
+        // rsbinder's own Android 12 format: level | 0x0c000000
+        assert_eq!(Stability::try_from(0b001100 | 0x0c000000_i32).unwrap(), Stability::System);
+    }
+
+    #[test]
+    fn test_stability_invalid_value() {
+        assert_eq!(Stability::try_from(0x7F).unwrap_err(), StatusCode::BadValue);
+        assert_eq!(Stability::try_from(0x01).unwrap_err(), StatusCode::BadValue);
+    }
+
+    // === Bitmask verification tests ===
+    #[test]
+    fn test_stability_includes() {
+        // Local is included by all stability levels
+        assert!(Stability::Local.includes(Stability::Local));
+        assert!(Stability::Vendor.includes(Stability::Local));
+        assert!(Stability::System.includes(Stability::Local));
+        assert!(Stability::Vintf.includes(Stability::Local));
+
+        // Vendor and System are independent domains
+        assert!(!Stability::Vendor.includes(Stability::System));
+        assert!(!Stability::System.includes(Stability::Vendor));
+
+        // Vintf includes all levels
+        assert!(Stability::Vintf.includes(Stability::Vendor));
+        assert!(Stability::Vintf.includes(Stability::System));
+        assert!(Stability::Vintf.includes(Stability::Vintf));
+
+        // Self-inclusion
+        assert!(Stability::Vendor.includes(Stability::Vendor));
+        assert!(Stability::System.includes(Stability::System));
     }
 }

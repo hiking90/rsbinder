@@ -231,9 +231,9 @@ impl IBinder for ProxyHandle {
         thread_state::ping_binder(self.handle())
     }
 
-    // fn stability(&self) -> Stability {
-    //     self.stability
-    // }
+    fn stability(&self) -> Stability {
+        self.stability
+    }
 
     fn as_any(&self) -> &dyn Any {
         self

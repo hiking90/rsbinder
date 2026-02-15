@@ -60,7 +60,7 @@ pub trait ParcelableMetadata {
 
     /// The Binder parcelable stability.
     fn stability(&self) -> Stability {
-        Stability::Local
+        Stability::default()
     }
 }
 
@@ -456,7 +456,7 @@ impl SerializeOption for SIBinder {
         match this {
             Some(binder) => {
                 parcel.write::<flat_binder_object>(&binder.into())?;
-                parcel.write::<i32>(&Stability::System.into())?;
+                parcel.write::<i32>(&binder.stability().into())?;
                 Ok(())
             }
 
