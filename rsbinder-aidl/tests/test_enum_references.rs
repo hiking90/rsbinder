@@ -11,7 +11,8 @@ use similar::{ChangeTag, TextDiff};
 use std::error::Error;
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
     let diff = TextDiff::from_lines(res.1.trim(), expect.trim());
@@ -119,7 +120,8 @@ fn test_keymint_style_enum_reference_panics() -> Result<(), Box<dyn Error>> {
         }
     "##;
 
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
 
     // This should now work correctly without panicking
@@ -288,7 +290,8 @@ fn test_enum_reference_in_interface_constants() -> Result<(), Box<dyn Error>> {
         }
         "##;
 
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
 
@@ -538,7 +541,8 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
 
     // Parse all documents first (simulating separate AIDL files)
-    let fold_state_doc = rsbinder_aidl::parse_document(
+    let fold_state_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "FoldState.aidl",
         r#"
         package test.bug;
 
@@ -551,9 +555,10 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
             FULLY_CLOSED,
         }
     "#,
-    )?;
+    ))?;
 
-    let operation_reason_doc = rsbinder_aidl::parse_document(
+    let operation_reason_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "OperationReason.aidl",
         r#"
         package test.bug;
 
@@ -565,9 +570,10 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
             KEYGUARD,
         }
     "#,
-    )?;
+    ))?;
 
-    let wake_reason_doc = rsbinder_aidl::parse_document(
+    let wake_reason_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "WakeReason.aidl",
         r#"
         package test.bug;
 
@@ -579,9 +585,10 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
             GESTURE,
         }
     "#,
-    )?;
+    ))?;
 
-    let operation_context_doc = rsbinder_aidl::parse_document(
+    let operation_context_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "OperationContext.aidl",
         r#"
         package test.bug;
 
@@ -596,7 +603,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
             FoldState foldState = FoldState.UNKNOWN;
         }
     "#,
-    )?;
+    ))?;
 
     // 1st pass: pre-register all enum symbols (the fix for issue #71)
     let documents = vec![
@@ -666,7 +673,8 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
 
     // 1. Parse and generate enum in a different package
     //    (registers in DECLARATION_MAP + SYMBOL_TABLE)
-    let enum_doc = rsbinder_aidl::parse_document(
+    let enum_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "SubEnum.aidl",
         r#"
         package test.sub;
 
@@ -676,11 +684,12 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
             UNKNOWN = 0,
         }
     "#,
-    )?;
+    ))?;
     let _ = gen.document(&enum_doc)?;
 
     // 2. Parse parcelable that imports the cross-package enum
-    let parcelable_doc = rsbinder_aidl::parse_document(
+    let parcelable_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "CrossPackageParcelable.aidl",
         r#"
         package test;
 
@@ -691,7 +700,7 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
             SubEnum enumField = SubEnum.UNKNOWN;
         }
     "#,
-    )?;
+    ))?;
 
     // 3. Generate code and verify the path
     let res = gen.document(&parcelable_doc)?;

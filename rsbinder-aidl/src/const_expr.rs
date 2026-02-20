@@ -1,6 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::error::ConstExprError;
 use crate::parser;
 
 macro_rules! arithmetic_bit_op {
@@ -8,31 +9,29 @@ macro_rules! arithmetic_bit_op {
         {
             match $promoted {
                 ValueType::Bool(_) => {
-                    let value = ($lhs.to_i64() $op $rhs.to_i64()) != 0;
-                    ConstExpr::new(ValueType::Bool(value))
+                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?) != 0;
+                    Ok(ConstExpr::new(ValueType::Bool(value)))
                 }
                 ValueType::Byte(_) => {
-                    let value = ($lhs.to_i64() $op $rhs.to_i64());
-                    ConstExpr::new(ValueType::Byte(value as _))
+                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
+                    Ok(ConstExpr::new(ValueType::Byte(value as _)))
                 }
                 ValueType::Int32(_) => {
-                    let value = ($lhs.to_i64() $op $rhs.to_i64());
-                    ConstExpr::new(ValueType::Int32(value as _))
+                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
+                    Ok(ConstExpr::new(ValueType::Int32(value as _)))
                 }
                 ValueType::Int64(_) => {
-                    let value = ($lhs.to_i64() $op $rhs.to_i64());
-                    ConstExpr::new(ValueType::Int64(value as _))
+                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
+                    Ok(ConstExpr::new(ValueType::Int64(value as _)))
                 }
-                // ValueType::Float(_) | ValueType::Double => {
-                //     ConstExpr::new_with_int($lhs.to_i64() $op $rhs.to_i64(), $promoted)
-                // }
                 ValueType::Reference { .. } => {
-                    // Reference types use their numeric values for bitwise operations
-                    let value = ($lhs.to_i64() $op $rhs.to_i64());
-                    ConstExpr::new(ValueType::Int64(value as _))
+                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
+                    Ok(ConstExpr::new(ValueType::Int64(value as _)))
                 }
-                _ => panic!("Can't apply operator {:?} - '{}' for non integer type: {} {:?} - {}",
-                    $lhs, $lhs.raw_expr(), $desc, $rhs, $rhs.raw_expr()),
+                _ => Err(ConstExprError::new(format!(
+                    "can't apply bitwise operator '{}' to non-integer type: {} {:?}",
+                    $desc, $lhs.raw_expr(), $rhs
+                ))),
             }
         }
     }
@@ -41,40 +40,41 @@ macro_rules! arithmetic_bit_op {
 macro_rules! arithmetic_basic_op {
     ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
-            let lhs = $lhs.convert_to($promoted);
-            let rhs = $rhs.convert_to($promoted);
-            let as_str = &format!("{} {} {}", lhs.raw_expr(), $desc, rhs.raw_expr());
+            let lhs = $lhs.convert_to($promoted)?;
+            let rhs = $rhs.convert_to($promoted)?;
 
             match $promoted {
-                ValueType::Void => ConstExpr::default(),
+                ValueType::Void => Ok(ConstExpr::default()),
                 ValueType::String(_) | ValueType::Char(_) => {
                     let value = format!("{}{}", lhs.to_value_string(), rhs.to_value_string());
-                    ConstExpr::new(ValueType::String(value))
+                    Ok(ConstExpr::new(ValueType::String(value)))
                 }
                 ValueType::Byte(_) => {
-                    ConstExpr::new(ValueType::Byte((lhs.to_i64() $op rhs.to_i64()) as u8 as _))
+                    Ok(ConstExpr::new(ValueType::Byte((lhs.to_i64()? $op rhs.to_i64()?) as u8 as _)))
                 }
                 ValueType::Int32(_) => {
-                    ConstExpr::new(ValueType::Int32((lhs.to_i64() $op rhs.to_i64()) as i32 as _))
+                    Ok(ConstExpr::new(ValueType::Int32((lhs.to_i64()? $op rhs.to_i64()?) as i32 as _)))
                 }
                 ValueType::Int64(_) => {
-                    ConstExpr::new(ValueType::Int64((lhs.to_i64() $op rhs.to_i64()) as _))
+                    Ok(ConstExpr::new(ValueType::Int64((lhs.to_i64()? $op rhs.to_i64()?) as _)))
                 }
                 ValueType::Float(_) => {
-                    ConstExpr::new(ValueType::Float((lhs.to_f64() $op rhs.to_f64()) as f32 as _))
+                    Ok(ConstExpr::new(ValueType::Float((lhs.to_f64()? $op rhs.to_f64()?) as f32 as _)))
                 }
                 ValueType::Double(_) => {
-                    ConstExpr::new(ValueType::Double((lhs.to_f64() $op rhs.to_f64()) as _))
+                    Ok(ConstExpr::new(ValueType::Double((lhs.to_f64()? $op rhs.to_f64()?) as _)))
                 }
                 ValueType::Bool(_) => {
-                    ConstExpr::new(ValueType::Bool((lhs.to_i64() $op rhs.to_i64()) != 0))
+                    Ok(ConstExpr::new(ValueType::Bool((lhs.to_i64()? $op rhs.to_i64()?) != 0)))
                 }
                 ValueType::Reference { .. } => {
-                    // Reference types use their numeric values for arithmetic operations
-                    ConstExpr::new(ValueType::Int64((lhs.to_i64() $op rhs.to_i64()) as _))
+                    Ok(ConstExpr::new(ValueType::Int64((lhs.to_i64()? $op rhs.to_i64()?) as _)))
                 }
                 _ => {
-                    panic!("Can't apply operator '{}' to non integer or float type: {}", $desc, as_str);
+                    Err(ConstExprError::new(format!(
+                        "can't apply operator '{}' to non-integer or float type: {} {} {}",
+                        $desc, lhs.raw_expr(), $desc, rhs.raw_expr()
+                    )))
                 }
             }
         }
@@ -218,182 +218,172 @@ impl ValueType {
         }
     }
 
-    fn unary_not(&self) -> ConstExpr {
+    fn unary_not(&self) -> Result<ConstExpr, ConstExprError> {
         match self {
             ValueType::Void | ValueType::String(_) | ValueType::Char(_) => {
-                ConstExpr::new(self.clone())
+                Ok(ConstExpr::new(self.clone()))
             }
-            ValueType::Byte(v) => ConstExpr::new(ValueType::Byte(!*v)),
-            ValueType::Int32(v) => ConstExpr::new(ValueType::Int32(!*v)),
-            ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(!*v)),
-            ValueType::Bool(v) => ConstExpr::new(ValueType::Bool(!*v)),
+            ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(!*v))),
+            ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(!*v))),
+            ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(!*v))),
+            ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Bool(!*v))),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate();
+                let expr = self.calculate()?;
                 expr.value.unary_not()
             }
             ValueType::Array(v) => {
                 let mut list = Vec::new();
                 for expr in v {
-                    list.push(expr.value.unary_not())
+                    list.push(expr.value.unary_not()?)
                 }
-                ConstExpr::new(ValueType::Array(list))
+                Ok(ConstExpr::new(ValueType::Array(list)))
             }
-            _ => panic!("Can't apply unary operator '~' or \"!\" to {self:?}"),
+            _ => Err(ConstExprError::new(format!(
+                "can't apply unary operator '~' or '!' to {self:?}"
+            ))),
         }
     }
 
-    fn unary_minus(&self) -> ConstExpr {
+    fn unary_minus(&self) -> Result<ConstExpr, ConstExprError> {
         match self {
             ValueType::Void | ValueType::String(_) | ValueType::Bool(_) | ValueType::Char(_) => {
-                ConstExpr::new(self.clone())
+                Ok(ConstExpr::new(self.clone()))
             }
-            ValueType::Byte(v) => ConstExpr::new(ValueType::Byte((*v).wrapping_neg() as _)),
-            ValueType::Int32(v) => ConstExpr::new(ValueType::Int32((*v).wrapping_neg() as _)),
-            ValueType::Int64(v) => ConstExpr::new(ValueType::Int64(v.wrapping_neg())),
-            ValueType::Float(v) => ConstExpr::new(ValueType::Float(-(*v as f32) as _)),
-            ValueType::Double(v) => ConstExpr::new(ValueType::Double(-*v)),
+            ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte((*v).wrapping_neg() as _))),
+            ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32((*v).wrapping_neg() as _))),
+            ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(v.wrapping_neg()))),
+            ValueType::Float(v) => Ok(ConstExpr::new(ValueType::Float(-(*v as f32) as _))),
+            ValueType::Double(v) => Ok(ConstExpr::new(ValueType::Double(-*v))),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate();
+                let expr = self.calculate()?;
                 expr.value.unary_minus()
             }
 
             ValueType::Array(v) => {
                 let mut list = Vec::new();
                 for expr in v {
-                    list.push(expr.value.unary_minus())
+                    list.push(expr.value.unary_minus()?)
                 }
 
-                ConstExpr::new(ValueType::Array(list))
+                Ok(ConstExpr::new(ValueType::Array(list)))
             }
-            _ => panic!("Can't apply unary operator '-' to {self:?}"),
+            _ => Err(ConstExprError::new(format!(
+                "can't apply unary operator '-' to {self:?}"
+            ))),
         }
     }
 
-    pub fn to_bool(&self) -> bool {
+    pub fn to_bool(&self) -> Result<bool, ConstExprError> {
         match self {
-            ValueType::Void => false,
-            ValueType::String(_) => unimplemented!(),
-            ValueType::Bool(v) => *v,
-            ValueType::Char(_) => true,
-            ValueType::Byte(v) => *v != 0,
-            ValueType::Int32(v) => *v != 0,
-            ValueType::Int64(v) => *v != 0,
-            ValueType::Float(v) | ValueType::Double(v) => *v != 0.,
-            ValueType::Array(_) => {
-                panic!("to_bool() for List is not supported.");
+            ValueType::Void => Ok(false),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_bool() for String is not supported"))
             }
+            ValueType::Bool(v) => Ok(*v),
+            ValueType::Char(_) => Ok(true),
+            ValueType::Byte(v) => Ok(*v != 0),
+            ValueType::Int32(v) => Ok(*v != 0),
+            ValueType::Int64(v) => Ok(*v != 0),
+            ValueType::Float(v) | ValueType::Double(v) => Ok(*v != 0.),
+            ValueType::Array(_) => Err(ConstExprError::new("to_bool() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
                     Some(expr) => {
-                        let calculated = expr.calculate();
-                        // Check if calculation still resulted in a Name (unresolved)
+                        let calculated = expr.calculate()?;
                         if let ValueType::Name(_) = calculated.value {
-                            // Still unresolved, return false to avoid infinite recursion
-                            false
+                            Ok(false)
                         } else {
                             calculated.to_bool()
                         }
                     }
-                    None => {
-                        // For unresolved names in boolean context, return false
-                        false
-                    }
+                    None => Ok(false),
                 }
             }
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate();
+                let expr = self.calculate()?;
                 expr.to_bool()
             }
-            _ => unimplemented!(),
+            _ => Err(ConstExprError::new(format!(
+                "to_bool() not supported for {self:?}"
+            ))),
         }
     }
 
-    pub fn to_f64(&self) -> f64 {
+    pub fn to_f64(&self) -> Result<f64, ConstExprError> {
         match self {
-            ValueType::Void => 0.,
-            ValueType::String(_) => unimplemented!(),
-            ValueType::Bool(v) => {
-                if *v {
-                    1.0
-                } else {
-                    0.0
-                }
+            ValueType::Void => Ok(0.),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_f64() for String is not supported"))
             }
-            ValueType::Char(v) => *v as i64 as _,
-            ValueType::Byte(v) => *v as _,
-            ValueType::Int32(v) => *v as _,
-            ValueType::Int64(v) => *v as _,
-            ValueType::Float(v) | ValueType::Double(v) => *v as _,
-            ValueType::Array(_) => {
-                panic!("to_f64() for List is not supported.");
-            }
+            ValueType::Bool(v) => Ok(if *v { 1.0 } else { 0.0 }),
+            ValueType::Char(v) => Ok(*v as i64 as _),
+            ValueType::Byte(v) => Ok(*v as _),
+            ValueType::Int32(v) => Ok(*v as _),
+            ValueType::Int64(v) => Ok(*v as _),
+            ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
+            ValueType::Array(_) => Err(ConstExprError::new("to_f64() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
                     Some(expr) => {
-                        let calculated = expr.calculate();
-                        // Check if calculation still resulted in a Name (unresolved)
+                        let calculated = expr.calculate()?;
                         if let ValueType::Name(_) = calculated.value {
-                            // Still unresolved, return 0.0 to avoid infinite recursion
-                            0.0
+                            Ok(0.0)
                         } else {
                             calculated.to_f64()
                         }
                     }
-                    None => {
-                        // For unresolved names in float context, return 0.0
-                        0.0
-                    }
+                    None => Ok(0.0),
                 }
             }
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate();
+                let expr = self.calculate()?;
                 expr.to_f64()
             }
-            _ => unimplemented!(),
+            _ => Err(ConstExprError::new(format!(
+                "to_f64() not supported for {self:?}"
+            ))),
         }
     }
 
-    pub fn to_i64(&self) -> i64 {
+    pub fn to_i64(&self) -> Result<i64, ConstExprError> {
         match self {
-            ValueType::Void => 0,
-            ValueType::String(_) => unimplemented!(),
-            ValueType::Bool(v) => *v as _,
-            ValueType::Char(v) => *v as _,
-            ValueType::Byte(v) => *v as _,
-            ValueType::Int32(v) => *v as _,
-            ValueType::Int64(v) => *v as _,
-            ValueType::Float(v) | ValueType::Double(v) => *v as _,
-            ValueType::Array(_) => {
-                panic!("to_i64() for List is not supported. {self:?}");
+            ValueType::Void => Ok(0),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_i64() for String is not supported"))
             }
+            ValueType::Bool(v) => Ok(*v as _),
+            ValueType::Char(v) => Ok(*v as _),
+            ValueType::Byte(v) => Ok(*v as _),
+            ValueType::Int32(v) => Ok(*v as _),
+            ValueType::Int64(v) => Ok(*v as _),
+            ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
+            ValueType::Array(_) => Err(ConstExprError::new(format!(
+                "to_i64() for Array is not supported: {self:?}"
+            ))),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
                     Some(expr) => {
-                        let calculated = expr.calculate();
-                        // Check if calculation still resulted in a Name (unresolved)
+                        let calculated = expr.calculate()?;
                         if let ValueType::Name(_) = calculated.value {
-                            // Still unresolved, return 0 to avoid infinite recursion
-                            0
+                            Ok(0)
                         } else {
                             calculated.to_i64()
                         }
                     }
-                    None => {
-                        // For unresolved names in numeric context, return 0
-                        // This handles cross-enum references that may not be fully resolved yet
-                        0
-                    }
+                    None => Ok(0),
                 }
             }
-            ValueType::Reference { value, .. } => *value,
+            ValueType::Reference { value, .. } => Ok(*value),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                let expr = self.calculate();
+                let expr = self.calculate()?;
                 expr.to_i64()
             }
-            _ => unimplemented!(),
+            _ => Err(ConstExprError::new(format!(
+                "to_i64() not supported for {self:?}"
+            ))),
         }
     }
 
@@ -404,7 +394,7 @@ impl ValueType {
             '\"' => String::from("\\\""),
             '\n' => String::from("\\n"),
             '\t' => String::from("\\t"),
-            // ... 다른 특수 문자들을 필요에 따라 추가 ...
+            // ... add other special characters as needed ...
             _ => ch.to_string(),
         }
     }
@@ -432,14 +422,19 @@ impl ValueType {
                     format!("{}", value)
                 } else {
                     // Use proper namespace resolution for cross-package enum references
-                    let lookup_decl =
-                        parser::lookup_decl_from_name(enum_name, crate::Namespace::AIDL);
-                    let curr_ns = parser::current_namespace();
-                    let ns = curr_ns.relative_mod(&lookup_decl.ns);
-                    if !ns.is_empty() {
-                        format!("{}::{}::{}", ns, enum_name, member_name)
-                    } else {
-                        format!("{}::{}", enum_name, member_name)
+                    match parser::lookup_decl_from_name(enum_name, crate::Namespace::AIDL) {
+                        Some(lookup_decl) => {
+                            let curr_ns = parser::current_namespace();
+                            let ns = curr_ns.relative_mod(&lookup_decl.ns);
+                            if !ns.is_empty() {
+                                format!("{}::{}::{}", ns, enum_name, member_name)
+                            } else {
+                                format!("{}::{}", enum_name, member_name)
+                            }
+                        }
+                        None => {
+                            format!("{}::{}", enum_name, member_name)
+                        }
                     }
                 }
             }
@@ -533,9 +528,13 @@ impl ValueType {
         }
     }
 
-    fn calc_expr(lhs: &ConstExpr, operator: &str, rhs: &ConstExpr) -> ConstExpr {
-        let lhs = lhs.calculate();
-        let rhs = rhs.calculate();
+    fn calc_expr(
+        lhs: &ConstExpr,
+        operator: &str,
+        rhs: &ConstExpr,
+    ) -> Result<ConstExpr, ConstExprError> {
+        let lhs = lhs.calculate()?;
+        let rhs = rhs.calculate()?;
 
         let promoted = type_conversion(
             integral_promotion(lhs.value.clone()),
@@ -543,8 +542,12 @@ impl ValueType {
         );
 
         match operator {
-            "||" => ConstExpr::new(ValueType::Bool(lhs.to_bool() || rhs.to_bool())),
-            "&&" => ConstExpr::new(ValueType::Bool(lhs.to_bool() && rhs.to_bool())),
+            "||" => Ok(ConstExpr::new(ValueType::Bool(
+                lhs.to_bool()? || rhs.to_bool()?,
+            ))),
+            "&&" => Ok(ConstExpr::new(ValueType::Bool(
+                lhs.to_bool()? && rhs.to_bool()?,
+            ))),
             "|" => {
                 arithmetic_bit_op!(lhs, |, rhs, "|", promoted)
             }
@@ -555,8 +558,8 @@ impl ValueType {
                 arithmetic_bit_op!(lhs, &, rhs, "&", promoted)
             }
             "==" | "!=" | "<=" | ">=" | "<" | ">" => {
-                let lhs = lhs.convert_to(&promoted);
-                let rhs = rhs.convert_to(&promoted);
+                let lhs = lhs.convert_to(&promoted)?;
+                let rhs = rhs.convert_to(&promoted)?;
 
                 let value = match operator {
                     "==" => lhs == rhs,
@@ -568,14 +571,14 @@ impl ValueType {
                     _ => unreachable!(),
                 };
 
-                ConstExpr::new(ValueType::Bool(value))
+                Ok(ConstExpr::new(ValueType::Bool(value)))
             }
 
             "<<" | ">>" => {
                 let mut is_shl = operator == "<<";
 
-                let lhs_value = lhs.to_i64();
-                let rhs_value = rhs.to_i64();
+                let lhs_value = lhs.to_i64()?;
+                let rhs_value = rhs.to_i64()?;
                 let rhs_value: u32 = if rhs_value < 0 {
                     is_shl = !is_shl;
                     rhs_value.wrapping_neg() as _
@@ -590,15 +593,15 @@ impl ValueType {
                 };
 
                 match promoted {
-                    ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(value as _)),
-                    ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(value as _)),
-                    ValueType::Byte(_) => ConstExpr::new(ValueType::Byte(value as _)),
-                    ValueType::Reference { .. } => ConstExpr::new(ValueType::Int64(value as _)),
-                    _ => panic!(
-                        "Can't apply operator '{}' for non integer type: {}",
+                    ValueType::Int32(_) => Ok(ConstExpr::new(ValueType::Int32(value as _))),
+                    ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(value as _))),
+                    ValueType::Byte(_) => Ok(ConstExpr::new(ValueType::Byte(value as _))),
+                    ValueType::Reference { .. } => Ok(ConstExpr::new(ValueType::Int64(value as _))),
+                    _ => Err(ConstExprError::new(format!(
+                        "can't apply shift operator '{}' to non-integer type: {}",
                         operator,
                         lhs.raw_expr()
-                    ),
+                    ))),
                 }
             }
             "+" => arithmetic_basic_op!(lhs, +, rhs, "+", &promoted),
@@ -610,20 +613,23 @@ impl ValueType {
         }
     }
 
-    pub fn calculate(&self) -> ConstExpr {
+    pub fn calculate(&self) -> Result<ConstExpr, ConstExprError> {
         self.calculate_with_visited(&mut std::collections::HashSet::new())
     }
 
-    fn calculate_with_visited(&self, visited: &mut std::collections::HashSet<String>) -> ConstExpr {
+    fn calculate_with_visited(
+        &self,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<ConstExpr, ConstExprError> {
         match self {
             ValueType::Unary { operator, expr } => {
-                let expr = expr.value.calculate_with_visited(visited);
+                let expr = expr.value.calculate_with_visited(visited)?;
                 if operator == "-" {
                     expr.value.unary_minus()
                 } else if operator == "~" || operator == "!" {
                     expr.value.unary_not()
                 } else {
-                    expr
+                    Ok(expr)
                 }
             }
             ValueType::Expr { lhs, operator, rhs } => ValueType::calc_expr(lhs, operator, rhs),
@@ -631,31 +637,25 @@ impl ValueType {
                 let mut array = Vec::new();
 
                 for value in v {
-                    array.push(value.value.calculate_with_visited(visited));
+                    array.push(value.value.calculate_with_visited(visited)?);
                 }
 
-                ConstExpr::new(ValueType::Array(array))
+                Ok(ConstExpr::new(ValueType::Array(array)))
             }
             ValueType::Name(name) => {
                 if visited.contains(name) {
-                    // Circular reference detected, return a zero value
-                    // This handles self-referential enum values
-                    ConstExpr::new(ValueType::Int32(0))
+                    Ok(ConstExpr::new(ValueType::Int32(0)))
                 } else {
                     visited.insert(name.clone());
                     let expr = parser::name_to_const_expr(name);
                     match expr {
                         Some(expr) => expr.value.calculate_with_visited(visited),
-                        None => {
-                            // Name not found, return the name as-is
-                            // This preserves the expression for potential later resolution
-                            ConstExpr::new(self.clone())
-                        }
+                        None => Ok(ConstExpr::new(self.clone())),
                     }
                 }
             }
-            ValueType::Reference { .. } => ConstExpr::new(self.clone()),
-            _ => ConstExpr::new(self.clone()),
+            ValueType::Reference { .. } => Ok(ConstExpr::new(self.clone())),
+            _ => Ok(ConstExpr::new(self.clone())),
         }
     }
 }
@@ -677,12 +677,14 @@ impl PartialOrd for ValueType {
                 }
             }
             ValueType::String(v) | ValueType::Name(v) => v.partial_cmp(&rhs.to_value_string()),
-            ValueType::Byte(v) => v.partial_cmp(&(rhs.to_i64() as _)),
-            ValueType::Int32(v) => v.partial_cmp(&(rhs.to_i64() as _)),
-            ValueType::Int64(v) => v.partial_cmp(&(rhs.to_i64() as _)),
-            ValueType::Char(v) => (*v as i64).partial_cmp(&rhs.to_i64()),
-            ValueType::Bool(v) => v.partial_cmp(&rhs.to_bool()),
-            ValueType::Float(v) | ValueType::Double(v) => v.partial_cmp(&rhs.to_f64()),
+            ValueType::Byte(v) => rhs.to_i64().ok().and_then(|r| v.partial_cmp(&(r as _))),
+            ValueType::Int32(v) => rhs.to_i64().ok().and_then(|r| v.partial_cmp(&(r as _))),
+            ValueType::Int64(v) => rhs.to_i64().ok().and_then(|r| v.partial_cmp(&(r as _))),
+            ValueType::Char(v) => rhs.to_i64().ok().and_then(|r| (*v as i64).partial_cmp(&r)),
+            ValueType::Bool(v) => rhs.to_bool().ok().and_then(|r| v.partial_cmp(&r)),
+            ValueType::Float(v) | ValueType::Double(v) => {
+                rhs.to_f64().ok().and_then(|r| v.partial_cmp(&r))
+            }
             ValueType::Array(lhs_array) => {
                 if let ValueType::Array(rhs_array) = rhs {
                     lhs_array.partial_cmp(rhs_array)
@@ -691,9 +693,10 @@ impl PartialOrd for ValueType {
                 }
             }
             ValueType::Unary { .. } | ValueType::Expr { .. } => {
-                let lhs = self.calculate();
-                let rhs = rhs.calculate();
-                lhs.partial_cmp(&rhs)
+                match (self.calculate(), rhs.calculate()) {
+                    (Ok(lhs), Ok(rhs)) => lhs.partial_cmp(&rhs),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -786,78 +789,70 @@ impl ConstExpr {
         self.value.to_value_string()
     }
 
-    pub fn to_i64(&self) -> i64 {
+    pub fn to_i64(&self) -> Result<i64, ConstExprError> {
         self.value.to_i64()
     }
 
-    pub fn to_f64(&self) -> f64 {
+    pub fn to_f64(&self) -> Result<f64, ConstExprError> {
         self.value.to_f64()
     }
 
-    pub fn to_bool(&self) -> bool {
+    pub fn to_bool(&self) -> Result<bool, ConstExprError> {
         self.value.to_bool()
     }
 
-    pub fn convert_to(&self, value_type: &ValueType) -> ConstExpr {
+    pub fn convert_to(&self, value_type: &ValueType) -> Result<ConstExpr, ConstExprError> {
         if self.value.order() == value_type.order() {
-            self.clone()
+            Ok(self.clone())
         } else if let ValueType::Array(list) = &self.value {
             let mut res = Vec::new();
 
             for v in list {
-                res.push(v.convert_to(value_type))
+                res.push(v.convert_to(value_type)?)
             }
-            ConstExpr::new(ValueType::Array(res))
+            Ok(ConstExpr::new(ValueType::Array(res)))
         } else {
             match value_type {
-                ValueType::Void => Self::default(),
-                ValueType::String(_) => ConstExpr::new(ValueType::String(self.to_value_string())),
-                ValueType::Byte(_) => ConstExpr::new(ValueType::Byte(self.to_i64() as i8 as _)),
-                ValueType::Int32(_) => ConstExpr::new(ValueType::Int32(self.to_i64() as i32 as _)),
-                ValueType::Int64(_) => ConstExpr::new(ValueType::Int64(self.to_i64())),
-                ValueType::Float(_) => ConstExpr::new(ValueType::Float(self.to_f64() as f32 as _)),
-                ValueType::Double(_) => ConstExpr::new(ValueType::Float(self.to_f64())),
-                ValueType::Bool(_) => ConstExpr::new(ValueType::Bool(self.to_bool())),
+                ValueType::Void => Ok(Self::default()),
+                ValueType::String(_) => {
+                    Ok(ConstExpr::new(ValueType::String(self.to_value_string())))
+                }
+                ValueType::Byte(_) => {
+                    Ok(ConstExpr::new(ValueType::Byte(self.to_i64()? as i8 as _)))
+                }
+                ValueType::Int32(_) => {
+                    Ok(ConstExpr::new(ValueType::Int32(self.to_i64()? as i32 as _)))
+                }
+                ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(self.to_i64()?))),
+                ValueType::Float(_) => {
+                    Ok(ConstExpr::new(ValueType::Float(self.to_f64()? as f32 as _)))
+                }
+                ValueType::Double(_) => Ok(ConstExpr::new(ValueType::Float(self.to_f64()?))),
+                ValueType::Bool(_) => Ok(ConstExpr::new(ValueType::Bool(self.to_bool()?))),
                 ValueType::Char(_) => {
-                    let ch = self.to_i64() as u32;
+                    let ch = self.to_i64()? as u32;
                     if let Some(ch) = char::from_u32(ch) {
-                        Self::new(ValueType::Char(ch as _))
+                        Ok(Self::new(ValueType::Char(ch as _)))
                     } else {
-                        panic!("0x{ch:x} is invalid unicode.")
+                        Err(ConstExprError::new(format!("0x{ch:x} is invalid unicode")))
                     }
                 }
-                ValueType::Array(_) => {
-                    unimplemented!();
-                    // let mut res = Vec::new();
-                    // for v in &v {
-                    //     res.push(v.convert_to(value_type));
-                    // }
-
-                    // Self::new_with_array(res)
-                }
-                ValueType::Name(_) => {
-                    unreachable!();
-                }
-                ValueType::Expr { .. } | ValueType::Unary { .. } => {
-                    unreachable!();
-                }
-                ValueType::UserDefined(_) => self.clone(),
-                ValueType::Reference { .. } => {
-                    // Reference types preserve their original form
-                    self.clone()
-                }
-                _ => unimplemented!("convert_to: {:?} -> {:?}", self, value_type),
+                ValueType::UserDefined(_) | ValueType::Reference { .. } => Ok(self.clone()),
+                _ => Err(ConstExprError::new(format!(
+                    "convert_to: unsupported conversion {:?} -> {:?}",
+                    self.value, value_type
+                ))),
             }
         }
     }
 
-    pub fn calculate(&self) -> ConstExpr {
+    pub fn calculate(&self) -> Result<ConstExpr, ConstExprError> {
         if self.is_calculated {
-            self.clone()
+            Ok(self.clone())
         } else {
-            let mut expr = self.value.calculate();
+            let mut expr = self.value.calculate()?;
             expr.is_calculated = true;
-            expr
+            Ok(expr)
         }
     }
 }
@@ -870,12 +865,15 @@ mod tests {
     fn test_expression_arithmatic() {
         let expr = ValueType::new_expr(ValueType::Int32(10), "+", ValueType::Int32(10));
 
-        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(20)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(20))
+        );
 
         let expr = ValueType::new_expr(ValueType::Byte(1), "<<", ValueType::Byte(31));
 
         assert_eq!(
-            expr.calculate(),
+            expr.calculate().unwrap(),
             ConstExpr::new(ValueType::Int32(0x80000000u32 as _))
         );
 
@@ -883,18 +881,24 @@ mod tests {
 
         let expr = ValueType::new_expr(ValueType::Byte(10), "/", ValueType::Float(2.0));
 
-        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Float(5.0)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Float(5.0))
+        );
 
         let expr = ValueType::new_expr(ValueType::Float(10.0), "%", ValueType::Float(2.0));
 
         assert_eq!(
-            expr.calculate(),
+            expr.calculate().unwrap(),
             ConstExpr::new(ValueType::Float(10.0 % 2.0))
         );
 
         let expr = ValueType::new_expr(ValueType::Int32(10), "%", ValueType::Bool(true));
 
-        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(0)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(0))
+        );
     }
 
     // #[test]
@@ -958,4 +962,28 @@ mod tests {
 
     //     assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(15)));
     // }
+
+    // 4.3g: Array.to_bool() returns Err (not panic)
+    #[test]
+    fn test_array_to_bool_returns_error() {
+        let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
+        let result = arr.to_bool();
+        assert!(result.is_err());
+    }
+
+    // 4.3h: Array.to_i64() returns Err (not panic)
+    #[test]
+    fn test_array_to_i64_returns_error() {
+        let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
+        let result = arr.to_i64();
+        assert!(result.is_err());
+    }
+
+    // 4.3i: Array.to_f64() returns Err (not panic)
+    #[test]
+    fn test_array_to_f64_returns_error() {
+        let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
+        let result = arr.to_f64();
+        assert!(result.is_err());
+    }
 }

@@ -6,7 +6,8 @@
 use std::error::Error;
 
 fn test_aidl_generation(input: &str) -> Result<String, Box<dyn Error>> {
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
     Ok(res.1)

@@ -128,7 +128,7 @@ Complete API parity between rsbinder and Android Binder isn't available due to f
 - [x] Remove all todo!() and unimplemented!() macros.
 - [x] Perform compatibility testing with Binder on Android.
 - [ ] (In Progress) Implement Service Manager(**rsb_hub**) for Linux
-- [ ] Enhance error detection in AIDL code generator
+- [x] Enhance error detection in AIDL code generator
 
 ## License
 **rsbinder** is licensed under the **Apache License version 2.0**.

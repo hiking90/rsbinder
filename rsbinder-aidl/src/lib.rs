@@ -1,21 +1,28 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+// rsbinder-aidl is a build-time AIDL compiler; large error types on the stack
+// have no meaningful performance impact, so suppress this clippy lint crate-wide.
+#![allow(clippy::result_large_err)]
+
 // #[macro_use]
 // extern crate lazy_static;
 
+use miette::{NamedSource, SourceSpan};
 use std::collections::HashSet;
-use std::error::Error;
 use std::fs;
 use std::mem::take;
 use std::path::{Path, PathBuf};
 
 mod const_expr;
+pub mod error;
 mod generator;
 mod parser;
 mod type_generator;
+pub use error::AidlError;
 pub use generator::Generator;
 pub use parser::parse_document;
+pub use parser::SourceContext;
 
 #[derive(Default, Hash, Eq, PartialEq, Debug, Clone)]
 pub struct Namespace {
@@ -155,21 +162,30 @@ impl Builder {
         self
     }
 
-    fn parse_file(filename: &Path) -> Result<(String, parser::Document), Box<dyn Error>> {
+    fn parse_file(
+        filename: &Path,
+    ) -> Result<(String, parser::Document, parser::SourceContext), AidlError> {
         println!("Parsing: {filename:?}");
-        let unparsed_file = fs::read_to_string(filename)?;
-        let document = parser::parse_document(&unparsed_file)?;
-
-        Ok((
-            filename.file_stem().unwrap().to_str().unwrap().to_string(),
-            document,
-        ))
+        let source = fs::read_to_string(filename)?;
+        let name = filename
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid filename: {filename:?}"),
+                )
+            })?
+            .to_string();
+        let ctx = parser::SourceContext::new(filename.to_string_lossy().as_ref(), source);
+        let document = parser::parse_document(&ctx)?;
+        Ok((name, document, ctx))
     }
 
     fn generate_all(
         &self,
         mut package_list: Vec<(String, String, String)>,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, AidlError> {
         let mut content = String::new();
         let mut namespace = String::new();
         let mut mod_count: usize = 0;
@@ -221,11 +237,14 @@ impl Builder {
         Ok(content)
     }
 
-    fn parse_sources(&mut self) -> Result<Vec<(String, parser::Document)>, Box<dyn Error>> {
+    fn parse_sources(
+        &mut self,
+    ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
         let mut includes = take(&mut self.includes).into_iter().collect::<HashSet<_>>();
         let mut document_list = Vec::new();
+        let mut errors = Vec::new();
 
         fn strip_package(path: &Path, package: &str) -> Option<PathBuf> {
             let mut components = path.components();
@@ -244,41 +263,61 @@ impl Builder {
                 }
 
                 if path.is_file() {
-                    let (name, doc) = Self::parse_file(&path)?;
-
-                    if let Some(dir) = doc
-                        .package
-                        .as_ref()
-                        .and_then(|p| strip_package(path.parent()?, p))
-                    {
-                        includes.insert(dir);
-                    }
-
-                    for import in doc.imports.values() {
-                        let rel_path =
-                            PathBuf::from(import.replace('.', "/")).with_extension("aidl");
-                        let mut found = false;
-                        for include_dir in &includes {
-                            let path = include_dir.join(&rel_path);
-                            if path.exists() {
-                                sources.push(path);
-                                found = true;
-                                break;
+                    match Self::parse_file(&path) {
+                        Ok((name, doc, ctx)) => {
+                            if let Some(dir) = doc
+                                .package
+                                .as_ref()
+                                .and_then(|p| strip_package(path.parent()?, p))
+                            {
+                                includes.insert(dir);
                             }
-                        }
 
-                        if !found {
-                            return Err(format!(
-                                "import {import} not found, imported from {path:?}"
-                            )
-                            .into());
+                            for import in doc.imports.values() {
+                                let rel_path =
+                                    PathBuf::from(import.replace('.', "/")).with_extension("aidl");
+                                let mut found = false;
+                                for include_dir in &includes {
+                                    let path = include_dir.join(&rel_path);
+                                    if path.exists() {
+                                        sources.push(path);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+
+                                if !found {
+                                    // The exact byte offset of an import statement is not preserved in the AST,
+                                    // so search the source text for the import string to approximate the span.
+                                    let source_text = fs::read_to_string(&path).unwrap_or_default();
+                                    let import_offset = source_text.find(import).unwrap_or(0);
+                                    let import_len =
+                                        if import_offset > 0 { import.len() } else { 0 };
+                                    errors.push(AidlError::from(
+                                        error::ResolutionError::ImportNotFound {
+                                            import: import.clone(),
+                                            src: NamedSource::new(
+                                                path.to_string_lossy().as_ref(),
+                                                source_text,
+                                            ),
+                                            span: SourceSpan::new(import_offset.into(), import_len),
+                                        },
+                                    ));
+                                }
+                            }
+
+                            document_list.push((name, doc, ctx));
+                        }
+                        Err(e) => {
+                            errors.push(e);
                         }
                     }
-
-                    document_list.push((name, doc));
                 } else {
                     let entries = fs::read_dir(&path).map_err(|err| {
-                        format!("parse_sources: fs::read_dir({path:?}) failed: {err}")
+                        std::io::Error::new(
+                            err.kind(),
+                            format!("parse_sources: fs::read_dir({path:?}) failed: {err}"),
+                        )
                     })?;
 
                     for entry in entries {
@@ -295,10 +334,15 @@ impl Builder {
             }
         }
 
+        // If there are parse errors, report them immediately without semantic analysis (prevents cascading errors)
+        if let Some(err) = AidlError::collect(errors) {
+            return Err(err);
+        }
+
         Ok(document_list)
     }
 
-    pub fn generate(mut self) -> Result<(), Box<dyn Error>> {
+    pub fn generate(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
 
         // 1st pass: pre-register all enum symbols across all documents
@@ -308,13 +352,27 @@ impl Builder {
             generator::Generator::pre_register_enums(&document.1);
         }
 
-        // 2nd pass: generate code
+        // 2nd pass: generate code, collecting errors across files
         let mut package_list = Vec::new();
+        let mut errors = Vec::new();
         for document in &documents {
             println!("Generating: {}", document.0);
+            // Re-establish the source context so that semantic errors generated
+            // during code generation can reference the correct file name and source text.
+            let _guard = parser::SourceGuard::new(&document.2.filename, &document.2.source);
             let gen = generator::Generator::new(self.enabled_async, self.is_crate);
-            let package = gen.document(&document.1)?;
-            package_list.push((package.0, package.1, document.0.clone()));
+            match gen.document(&document.1) {
+                Ok(package) => {
+                    package_list.push((package.0, package.1, document.0.clone()));
+                }
+                Err(e) => {
+                    errors.push(e);
+                }
+            }
+        }
+
+        if let Some(err) = AidlError::collect(errors) {
+            return Err(err);
         }
 
         let content = self.generate_all(package_list)?;
