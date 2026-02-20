@@ -21,6 +21,10 @@ pest_derive = { workspace = true }
 convert_case = { workspace = true }
 serde = { workspace = true }
 tera = { workspace = true }
+miette = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 similar = { workspace = true }
+miette = { workspace = true }
+tempfile = "3.25.0"

@@ -5,7 +5,8 @@ use similar::{ChangeTag, TextDiff};
 use std::error::Error;
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
     let diff = TextDiff::from_lines(res.1.trim(), expect.trim());

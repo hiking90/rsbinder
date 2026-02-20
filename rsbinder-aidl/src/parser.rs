@@ -5,8 +5,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::error::Error;
-use std::panic;
+
+use crate::error::{pest_error_to_diagnostic, AidlError, ParseError};
 
 use convert_case::{Case, Casing};
 
@@ -45,6 +45,70 @@ thread_local! {
 
     // Universal Symbol Table - supports all types of named constants
     static SYMBOL_TABLE: RefCell<HashMap<String, Symbol>> = RefCell::new(HashMap::new());
+
+    // 현재 파싱 중인 소스의 파일명과 소스 텍스트 (에러 메시지 생성에 사용)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static CURRENT_SOURCE_NAME: RefCell<String> = RefCell::new(String::new());
+    #[allow(clippy::missing_const_for_thread_local)]
+    static CURRENT_SOURCE_TEXT: RefCell<String> = RefCell::new(String::new());
+}
+
+/// SourceGuard와 동일한 thread-local 소스 정보를 사용하여 ParseError를 생성하는 헬퍼.
+fn make_parse_error(message: impl Into<String>, start: usize, end: usize) -> AidlError {
+    let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
+    let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
+    AidlError::from(ParseError {
+        src: miette::NamedSource::new(filename, source),
+        span: miette::SourceSpan::new(start.into(), end - start),
+        message: message.into(),
+        help: None,
+    })
+}
+
+/// 파싱할 파일의 이름과 소스 텍스트를 담는 컨텍스트 구조체.
+/// `parse_document()`에 전달하여 에러 진단 메시지에 파일 정보를 포함시킨다.
+#[derive(Debug, Clone)]
+pub struct SourceContext {
+    pub filename: String,
+    pub source: String,
+}
+
+impl SourceContext {
+    pub fn new(filename: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            filename: filename.into(),
+            source: source.into(),
+        }
+    }
+}
+
+/// RAII guard: 생성 시 thread-local 소스 컨텍스트를 설정하고,
+/// drop 시 자동으로 정리한다. 에러 반환 및 panic 경로에서도 정리가 보장된다.
+pub struct SourceGuard;
+
+impl SourceGuard {
+    pub fn new(filename: &str, source: &str) -> Self {
+        CURRENT_SOURCE_NAME.with(|name| *name.borrow_mut() = filename.to_string());
+        CURRENT_SOURCE_TEXT.with(|text| *text.borrow_mut() = source.to_string());
+        SourceGuard
+    }
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        CURRENT_SOURCE_NAME.with(|name| name.borrow_mut().clear());
+        CURRENT_SOURCE_TEXT.with(|text| text.borrow_mut().clear());
+    }
+}
+
+/// 현재 설정된 소스 컨텍스트의 파일명을 반환한다.
+pub fn current_source_name() -> String {
+    CURRENT_SOURCE_NAME.with(|name| name.borrow().clone())
+}
+
+/// 현재 설정된 소스 컨텍스트의 소스 텍스트를 반환한다.
+pub fn current_source_text() -> String {
+    CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone())
 }
 
 pub struct NamespaceGuard();
@@ -68,10 +132,7 @@ impl Drop for NamespaceGuard {
 
 pub fn current_namespace() -> Namespace {
     NAMESPACE_STACK.with(|stack| {
-        stack.borrow().last().map_or_else(
-            || panic!("There is no namespace in stack."),
-            |namespace| namespace.clone(),
-        )
+        stack.borrow().last().cloned().unwrap_or_default()
     })
 }
 
@@ -106,7 +167,7 @@ pub struct LookupDecl {
     pub name: Namespace,
 }
 
-pub fn lookup_decl_from_name(name: &str, style: &str) -> LookupDecl {
+pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
     let mut namespace = Namespace::new(name, style);
 
     let mut ns_vec = Vec::new();
@@ -134,40 +195,31 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> LookupDecl {
         }
     });
 
-    // println!("namesapce: {:?}\nns_vec: {:?}\n", namespace, ns_vec);
-
     let (decl, ns) = DECLARATION_MAP.with(|hashmap| {
         for ns in &ns_vec {
             if let Some(decl) = hashmap.borrow().get(ns) {
-                // println!("Found: {:?}\n", ns);
-                return (decl.clone(), ns.clone());
+                return Some((decl.clone(), ns.clone()));
             }
         }
 
         let curr_ns = current_namespace();
         if let Some(decl) = hashmap.borrow().get(&curr_ns) {
-            // println!("Not Found: {:?}\n", curr_ns);
-            return (decl.clone(), curr_ns);
+            return Some((decl.clone(), curr_ns));
         }
 
-        panic!(
-            "Unknown namespace: {:?} for name: [{}]\n{:?}",
-            ns_vec,
-            name,
-            hashmap.borrow().keys()
-        );
-    });
+        None
+    })?;
 
     // leave max 2 items because the other items are for name space.
     if namespace.ns.len() > 2 {
         namespace.ns.drain(0..namespace.ns.len() - 2);
     }
 
-    LookupDecl {
+    Some(LookupDecl {
         decl,
         ns,
         name: namespace,
-    }
+    })
 }
 
 fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> ConstExpr {
@@ -279,12 +331,10 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     // are resolved with full namespace context rather than being stripped to
     // shorter variants that may lose parent type information.
     if name.contains('.') {
-        let lookup_result = std::panic::catch_unwind(|| {
-            let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
-            lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
-        });
-        if let Ok(Some(expr)) = lookup_result {
-            return Some(expr);
+        if let Some(lookup_decl) = lookup_decl_from_name(name, Namespace::AIDL) {
+            if let Some(expr) = lookup_name_from_decl(&lookup_decl.decl, &lookup_decl) {
+                return Some(expr);
+            }
         }
     }
 
@@ -303,12 +353,11 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     }
 
     // Fallback to original resolution
-    let lookup_result = std::panic::catch_unwind(|| {
-        let lookup_decl = lookup_decl_from_name(name, Namespace::AIDL);
-        lookup_name_from_decl(&lookup_decl.decl, &lookup_decl)
-    });
+    if let Some(lookup_decl) = lookup_decl_from_name(name, Namespace::AIDL) {
+        return lookup_name_from_decl(&lookup_decl.decl, &lookup_decl);
+    }
 
-    lookup_result.unwrap_or_default()
+    None
 }
 
 // Generate possible name variants for flexible resolution
@@ -324,9 +373,7 @@ fn generate_name_variants(name: &str) -> Vec<String> {
         }
     } else {
         // For simple names, try with current namespace context
-        let current_ns = std::panic::catch_unwind(current_namespace)
-            .map(|ns| ns.to_string(crate::Namespace::AIDL))
-            .unwrap_or_default();
+        let current_ns = current_namespace().to_string(crate::Namespace::AIDL);
 
         if !current_ns.is_empty() {
             variants.push(format!("{}.{}", current_ns, name));
@@ -387,6 +434,7 @@ pub struct InterfaceDecl {
     pub annotation_list: Vec<Annotation>,
     pub oneway: bool,
     pub name: String,
+    pub name_span: Option<(usize, usize)>,
     pub method_list: Vec<MethodDecl>,
     pub constant_list: Vec<VariableDecl>,
     pub members: Vec<Declaration>,
@@ -395,7 +443,7 @@ pub struct InterfaceDecl {
 impl InterfaceDecl {
     pub fn pre_process(&mut self) {
         for decl in &mut self.constant_list {
-            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate());
+            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
         }
     }
 }
@@ -415,7 +463,7 @@ impl ParcelableDecl {
     pub fn pre_process(&mut self) {
         for decl in &mut self.members {
             if let Declaration::Variable(decl) = decl {
-                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate());
+                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
             }
         }
     }
@@ -438,12 +486,12 @@ pub struct Arg {
 }
 
 impl Arg {
-    pub fn to_generator(&self) -> type_generator::TypeGenerator {
-        let generator = type_generator::TypeGenerator::new_with_type(&self.r#type);
+    pub fn to_generator(&self) -> Result<type_generator::TypeGenerator, crate::error::AidlError> {
+        let generator = type_generator::TypeGenerator::new_with_type(&self.r#type)?;
 
-        generator
-            .direction(&self.direction)
-            .identifier(&self.identifier)
+        Ok(generator
+            .direction(&self.direction)?
+            .identifier(&self.identifier))
     }
 
     // fn arg_identifier(&self) -> String {
@@ -476,8 +524,10 @@ pub struct MethodDecl {
     pub oneway: bool,
     pub r#type: Type,
     pub identifier: String,
+    pub identifier_span: Option<(usize, usize)>,
     pub arg_list: Vec<Arg>,
     pub intvalue: Option<i64>,
+    pub intvalue_span: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -550,6 +600,7 @@ pub struct Annotation {
     pub annotation: String,
     pub const_expr: Option<ConstExpr>,
     pub parameter_list: Vec<Parameter>,
+    pub annotation_span: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -583,23 +634,23 @@ pub enum Generic {
 // }
 
 impl Generic {
-    pub fn to_value_type(&self) -> ValueType {
+    pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
         let generator = match self {
             Generic::Type1 {
                 type_args1,
                 non_array_type: _,
                 type_args2: _,
-            } => type_generator::TypeGenerator::new_with_type(&type_args1[0]),
+            } => type_generator::TypeGenerator::new_with_type(&type_args1[0])?,
             Generic::Type2 {
                 non_array_type,
                 type_args: _,
-            } => type_generator::TypeGenerator::new(non_array_type),
+            } => type_generator::TypeGenerator::new(non_array_type)?,
             Generic::Type3 { type_args } => {
-                type_generator::TypeGenerator::new_with_type(&type_args[0])
+                type_generator::TypeGenerator::new_with_type(&type_args[0])?
             }
         };
 
-        generator.value_type
+        Ok(generator.value_type)
     }
 }
 
@@ -607,6 +658,7 @@ impl Generic {
 pub struct NonArrayType {
     pub name: String,
     pub generic: Option<Box<Generic>>,
+    pub name_span: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -622,7 +674,7 @@ pub struct Type {
 }
 
 impl Type {
-    pub fn to_generator(&self) -> type_generator::TypeGenerator {
+    pub fn to_generator(&self) -> Result<type_generator::TypeGenerator, crate::error::AidlError> {
         type_generator::TypeGenerator::new_with_type(self)
     }
 }
@@ -654,7 +706,7 @@ pub fn check_annotation_list(
                 let mut derives = Vec::new();
 
                 for param in &annotation.parameter_list {
-                    if param.const_expr.to_bool() {
+                    if param.const_expr.to_bool().unwrap_or(false) {
                         derives.push(param.identifier.to_owned())
                     }
                 }
@@ -682,7 +734,9 @@ pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) ->
     None
 }
 
-pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> type_generator::TypeGenerator {
+pub fn get_backing_type(
+    annotation_list: &Vec<Annotation>,
+) -> Result<type_generator::TypeGenerator, crate::error::AidlError> {
     // parse "@Backing(type="byte")"
     for annotation in annotation_list {
         if annotation.annotation == "@Backing" {
@@ -692,6 +746,7 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> type_generator::Ty
                         // The cstr is enclosed in quotes.
                         name: param.const_expr.to_value_string().trim_matches('"').into(),
                         generic: None,
+                        name_span: None,
                     });
                 }
             }
@@ -702,16 +757,17 @@ pub fn get_backing_type(annotation_list: &Vec<Annotation>) -> type_generator::Ty
         // The cstr is enclosed in quotes.
         name: "byte".into(),
         generic: None,
+        name_span: None,
     })
 }
 
-fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
+fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
     let operator = pairs.next().unwrap().as_str().to_owned();
-    let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap());
-    ConstExpr::new_unary(&operator, factor)
+    let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
+    Ok(ConstExpr::new_unary(&operator, factor))
 }
 
-fn parse_intvalue(arg_value: &str) -> ConstExpr {
+fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, AidlError> {
     let mut is_u8 = false;
     let mut is_long = false;
 
@@ -733,89 +789,97 @@ fn parse_intvalue(arg_value: &str) -> ConstExpr {
 
     if radix == 16 {
         if is_u8 {
-            let parsed_value = u8::from_str_radix(value, radix)
-                .map_err(|err| {
-                    eprintln!(
-                        "{err:?}\nparse_intvalue() - Invalid u8 value: {arg_value}, radix: {radix}\n"
-                    );
-                    err
-                })
-                .unwrap();
-            ConstExpr::new(ValueType::Byte(parsed_value as _))
+            let parsed_value = u8::from_str_radix(value, radix).map_err(|err| {
+                make_parse_error(
+                    format!("invalid u8 hex literal '{arg_value}': {err}"),
+                    span.0,
+                    span.1,
+                )
+            })?;
+            Ok(ConstExpr::new(ValueType::Byte(parsed_value as _)))
         } else if !is_long {
             if let Ok(parsed_value) = u32::from_str_radix(value, radix) {
-                ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
+                Ok(ConstExpr::new(ValueType::Int32(parsed_value as i32 as _)))
             } else {
-                let parsed_value = u64::from_str_radix(value, radix)
-                    .map_err(|err| {
-                        eprintln!(
-                            "{err:?}\nparse_intvalue() - Invalid u64 value: {arg_value}, radix: {radix}\n"
-                        );
-                        err
-                    })
-                    .unwrap();
-                ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
+                let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
+                    make_parse_error(
+                        format!("invalid hex literal '{arg_value}': {err}"),
+                        span.0,
+                        span.1,
+                    )
+                })?;
+                Ok(ConstExpr::new(ValueType::Int64(parsed_value as i64 as _)))
             }
         } else {
-            let parsed_value = u64::from_str_radix(value, radix)
-                .map_err(|err| {
-                    eprintln!(
-                        "{err:?}\nparse_intvalue() - Invalid u64 value: {arg_value}, radix: {radix}\n"
-                    );
-                    err
-                })
-                .unwrap();
-            ConstExpr::new(ValueType::Int64(parsed_value as i64 as _))
+            let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
+                make_parse_error(
+                    format!("invalid hex literal '{arg_value}': {err}"),
+                    span.0,
+                    span.1,
+                )
+            })?;
+            Ok(ConstExpr::new(ValueType::Int64(parsed_value as i64 as _)))
         }
     } else {
-        let parsed_value = i64::from_str_radix(value, radix)
-            .map_err(|err| {
-                eprintln!(
-                    "{err:?}\nparse_intvalue() - Invalid int value: {arg_value}, radix: {radix}\n"
-                );
-                err
-            })
-            .unwrap();
+        let parsed_value = i64::from_str_radix(value, radix).map_err(|err| {
+            make_parse_error(
+                format!("invalid integer literal '{arg_value}': {err}"),
+                span.0,
+                span.1,
+            )
+        })?;
         if is_u8 {
             if parsed_value > u8::MAX.into() || parsed_value < 0 {
-                panic!("u8 is overflowed. {parsed_value}");
+                return Err(make_parse_error(
+                    format!("u8 literal overflow: {parsed_value} is out of range (0..=255)"),
+                    span.0,
+                    span.1,
+                ));
             }
-            ConstExpr::new(ValueType::Byte(parsed_value as i8 as _))
+            Ok(ConstExpr::new(ValueType::Byte(parsed_value as i8 as _)))
         } else if is_long {
-            ConstExpr::new(ValueType::Int64(parsed_value as _))
+            Ok(ConstExpr::new(ValueType::Int64(parsed_value as _)))
         } else if parsed_value <= i8::MAX.into() && parsed_value >= i8::MIN.into() {
-            ConstExpr::new(ValueType::Byte(parsed_value as i8 as _))
+            Ok(ConstExpr::new(ValueType::Byte(parsed_value as i8 as _)))
         } else if parsed_value <= i32::MAX.into() && parsed_value >= i32::MIN.into() {
-            ConstExpr::new(ValueType::Int32(parsed_value as i32 as _))
+            Ok(ConstExpr::new(ValueType::Int32(parsed_value as i32 as _)))
         } else {
-            ConstExpr::new(ValueType::Int64(parsed_value as _))
+            Ok(ConstExpr::new(ValueType::Int64(parsed_value as _)))
         }
     }
 }
 
-fn parse_value(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
-        // Rule::const_expr => { parse_const_expr(pair.into_inner()) }
-        Rule::qualified_name => ConstExpr::new(ValueType::Name(pair.as_str().into())),
-        // Rule::C_STR => { ConstExpr::CStr(pair.as_str().into()) }
-        Rule::HEXVALUE => parse_intvalue(pair.as_str()),
+        Rule::qualified_name => Ok(ConstExpr::new(ValueType::Name(pair.as_str().into()))),
+        Rule::HEXVALUE | Rule::INTVALUE => {
+            let span = pair.as_span();
+            parse_intvalue(pair.as_str(), (span.start(), span.end()))
+        }
         Rule::FLOATVALUE => {
+            let span = pair.as_span();
             let value = pair.as_str();
             let value = if let Some(stripped) = value.strip_suffix('f') {
                 stripped
             } else {
                 value
             };
-            ConstExpr::new(ValueType::Double(value.parse::<f64>().unwrap() as _))
+            let f = value.parse::<f64>().map_err(|_| {
+                make_parse_error(
+                    format!("invalid float literal: {}", pair.as_str()),
+                    span.start(),
+                    span.end(),
+                )
+            })?;
+            Ok(ConstExpr::new(ValueType::Double(f as _)))
         }
-        Rule::INTVALUE => parse_intvalue(pair.as_str()),
-        Rule::TRUE_LITERAL => ConstExpr::new(ValueType::Bool(true)),
-        Rule::FALSE_LITERAL => ConstExpr::new(ValueType::Bool(false)),
+        Rule::TRUE_LITERAL => Ok(ConstExpr::new(ValueType::Bool(true))),
+        Rule::FALSE_LITERAL => Ok(ConstExpr::new(ValueType::Bool(false))),
         _ => unreachable!("Unexpected rule in parse_value(): {}", pair),
     }
 }
 
-fn parse_factor(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     // println!("parse_factor {:?}", pair);
     match pair.as_rule() {
         Rule::expression => parse_expression(pair.clone().into_inner()),
@@ -825,7 +889,7 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     }
 }
 
-fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
         Rule::equality
         | Rule::comparison
@@ -841,17 +905,17 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     }
 }
 
-fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
-    let mut lhs = parse_expression_term(pairs.next().unwrap());
+fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
+    let mut lhs = parse_expression_term(pairs.next().unwrap())?;
 
     while let Some(pair) = pairs.next() {
         let op = pair.as_str().to_owned();
-        let rhs = parse_expression_term(pairs.next().unwrap());
+        let rhs = parse_expression_term(pairs.next().unwrap())?;
 
         lhs = ConstExpr::new_expr(lhs, &op, rhs)
     }
 
-    lhs
+    Ok(lhs)
 }
 
 fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
@@ -865,7 +929,7 @@ fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     }
 }
 
-fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
+fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
     let mut expr: Option<ConstExpr> = None;
 
     for pair in pairs {
@@ -881,22 +945,22 @@ fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> ConstExpr {
         }
     }
 
-    expr.expect("Parsing error in String expression.")
+    Ok(expr.expect("internal: empty string_expr"))
 }
 
-fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
         Rule::constant_value_list => {
             let mut value_list = Vec::new();
             for pair in pair.into_inner() {
                 match pair.as_rule() {
                     Rule::const_expr => {
-                        value_list.push(parse_const_expr(pair.into_inner().next().unwrap()));
+                        value_list.push(parse_const_expr(pair.into_inner().next().unwrap())?);
                     }
                     _ => unreachable!("Unexpected rule in Rule::constant_value_list: {}", pair),
                 }
             }
-            ConstExpr::new(ValueType::Array(value_list))
+            Ok(ConstExpr::new(ValueType::Array(value_list)))
         }
 
         Rule::CHARVALUE => {
@@ -909,7 +973,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
                     if !has_backslash && ch == '\\' {
                         has_backslash = true;
                     } else {
-                        return ConstExpr::new(ValueType::Char(ch));
+                        return Ok(ConstExpr::new(ValueType::Char(ch)));
                     }
                 }
             }
@@ -924,7 +988,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
     }
 }
 
-fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Parameter {
+fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Result<Parameter, AidlError> {
     let mut parameter = Parameter {
         identifier: "".to_string(),
         const_expr: ConstExpr::default(),
@@ -936,84 +1000,87 @@ fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Parameter {
                 parameter.identifier = pair.as_str().into();
             }
             Rule::const_expr => {
-                parameter.const_expr = parse_const_expr(pair.into_inner().next().unwrap());
+                parameter.const_expr = parse_const_expr(pair.into_inner().next().unwrap())?;
             }
             _ => unreachable!("Unexpected rule in parse_parameter(): {}", pair),
         }
     }
 
-    parameter
+    Ok(parameter)
 }
 
-fn parse_parameter_list(pairs: pest::iterators::Pairs<Rule>) -> Vec<Parameter> {
+fn parse_parameter_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Parameter>, AidlError> {
     let mut list = Vec::new();
     for pair in pairs {
-        list.push(parse_parameter(pair.into_inner()));
+        list.push(parse_parameter(pair.into_inner())?);
     }
 
-    list
+    Ok(list)
 }
 
-fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Annotation {
+fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, AidlError> {
     let mut annotation = Annotation::default();
     for pair in pairs {
         match pair.as_rule() {
             Rule::ANNOTATION => {
+                let span = pair.as_span();
                 annotation.annotation = pair.as_str().into();
+                annotation.annotation_span = Some((span.start(), span.end()));
             }
 
             Rule::const_expr => {
-                annotation.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap()));
+                annotation.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
             }
 
             Rule::parameter_list => {
-                annotation.parameter_list = parse_parameter_list(pair.into_inner());
+                annotation.parameter_list = parse_parameter_list(pair.into_inner())?;
             }
 
             _ => unreachable!("Unexpected rule in parse_annotation(): {}", pair),
         }
     }
 
-    annotation
+    Ok(annotation)
 }
 
-fn parse_annotation_list(pairs: pest::iterators::Pairs<Rule>) -> Vec<Annotation> {
+fn parse_annotation_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Annotation>, AidlError> {
     let mut annotation_list = Vec::new();
     for pair in pairs {
-        annotation_list.push(parse_annotation(pair.into_inner()));
+        annotation_list.push(parse_annotation(pair.into_inner())?);
     }
 
-    annotation_list
+    Ok(annotation_list)
 }
 
-fn parse_type_args(pairs: pest::iterators::Pairs<Rule>) -> Vec<Type> {
+fn parse_type_args(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Type>, AidlError> {
     let mut res = Vec::new();
 
     for pair in pairs {
         match pair.as_rule() {
-            Rule::r#type => res.push(parse_type(pair.into_inner())),
+            Rule::r#type => res.push(parse_type(pair.into_inner())?),
             _ => unreachable!("Unexpected rule in parse_type_args(): {}", pair),
         }
     }
 
-    res
+    Ok(res)
 }
 
-fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> NonArrayType {
+fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayType, AidlError> {
     let mut non_array_type = NonArrayType::default();
 
     for pair in pairs {
         match pair.as_rule() {
-            // Rule::annotation_list => { non_array_type.annotation_list = parse_annotation_list(pair.into_inner()); }
             Rule::qualified_name => {
+                let span = pair.as_span();
                 non_array_type.name = pair.as_str().into();
+                non_array_type.name_span = Some((span.start(), span.end()));
             }
             Rule::generic_type1 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type1 {
-                    type_args1: parse_type_args(pairs.next().unwrap().into_inner()),
-                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner()),
-                    type_args2: parse_type_args(pairs.next().unwrap().into_inner()),
+                    type_args1: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner())?,
+                    type_args2: parse_type_args(pairs.next().unwrap().into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -1022,8 +1089,8 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> NonArrayType {
             Rule::generic_type2 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type2 {
-                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner()),
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner()),
+                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner())?,
+                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -1031,7 +1098,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> NonArrayType {
             Rule::generic_type3 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type3 {
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner()),
+                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -1042,38 +1109,37 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> NonArrayType {
         }
     }
 
-    non_array_type
+    Ok(non_array_type)
 }
 
-fn parse_array_type(pairs: pest::iterators::Pairs<Rule>) -> ArrayType {
+fn parse_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<ArrayType, AidlError> {
     let mut array_type = ArrayType::default();
 
     for pair in pairs {
         match pair.as_rule() {
-            // Rule::annotation_list => { array_type.annotation_list = parse_annotation_list(pair.into_inner()); }
             Rule::const_expr => {
-                array_type.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap()));
+                array_type.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
             }
             _ => unreachable!("Unexpected rule in parse_array_type(): {}", pair),
         }
     }
 
-    array_type
+    Ok(array_type)
 }
 
-fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Type {
+fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Result<Type, AidlError> {
     let mut r#type = Type::default();
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::annotation_list => {
-                r#type.annotation_list = parse_annotation_list(pair.into_inner());
+                r#type.annotation_list = parse_annotation_list(pair.into_inner())?;
             }
             Rule::non_array_type => {
-                r#type.non_array_type = parse_non_array_type(pair.into_inner());
+                r#type.non_array_type = parse_non_array_type(pair.into_inner())?;
             }
             Rule::array_type => {
-                r#type.array_types.push(parse_array_type(pair.into_inner()));
+                r#type.array_types.push(parse_array_type(pair.into_inner())?);
             }
             _ => {
                 unreachable!("Unexpected rule in parse_type(): {}", pair);
@@ -1081,10 +1147,10 @@ fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Type {
         }
     }
 
-    r#type
+    Ok(r#type)
 }
 
-fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> VariableDecl {
+fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> Result<VariableDecl, AidlError> {
     let mut decl = VariableDecl {
         constant,
         ..Default::default()
@@ -1093,16 +1159,16 @@ fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> V
     for pair in pairs {
         match pair.as_rule() {
             Rule::annotation_list => {
-                decl.annotation_list = parse_annotation_list(pair.into_inner());
+                decl.annotation_list = parse_annotation_list(pair.into_inner())?;
             }
             Rule::r#type => {
-                decl.r#type = parse_type(pair.into_inner());
+                decl.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
                 decl.identifier = pair.as_str().into();
             }
             Rule::const_expr => match pair.into_inner().next() {
-                Some(pair) => decl.const_expr = Some(parse_const_expr(pair)),
+                Some(pair) => decl.const_expr = Some(parse_const_expr(pair)?),
                 None => decl.const_expr = None,
             },
             _ => unreachable!(
@@ -1113,10 +1179,10 @@ fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> V
         }
     }
 
-    decl
+    Ok(decl)
 }
 
-fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Arg {
+fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Result<Arg, AidlError> {
     let mut arg = Arg::default();
 
     for pair in pairs {
@@ -1126,11 +1192,18 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Arg {
                     "in" => Direction::In,
                     "out" => Direction::Out,
                     "inout" => Direction::Inout,
-                    _ => panic!("Unsupported direction: {}", pair.as_str()),
+                    _ => {
+                        let span = pair.as_span();
+                        return Err(make_parse_error(
+                            format!("unsupported direction: {}", pair.as_str()),
+                            span.start(),
+                            span.end(),
+                        ));
+                    }
                 };
             }
             Rule::r#type => {
-                arg.r#type = parse_type(pair.into_inner());
+                arg.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
                 arg.identifier = pair.as_str().into();
@@ -1139,31 +1212,33 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Arg {
         }
     }
 
-    arg
+    Ok(arg)
 }
 
-fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
+fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, AidlError> {
     let mut decl = MethodDecl::default();
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::annotation_list => {
-                decl.annotation_list = parse_annotation_list(pair.into_inner());
+                decl.annotation_list = parse_annotation_list(pair.into_inner())?;
             }
             Rule::ONEWAY => {
                 decl.oneway = true;
             }
             Rule::r#type => {
-                decl.r#type = parse_type(pair.into_inner());
+                decl.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
+                let span = pair.as_span();
                 decl.identifier = pair.as_str().into();
+                decl.identifier_span = Some((span.start(), span.end()));
             }
             Rule::arg_list => {
                 for pair in pair.into_inner() {
                     match pair.as_rule() {
                         Rule::arg => {
-                            decl.arg_list.push(parse_arg(pair.into_inner()));
+                            decl.arg_list.push(parse_arg(pair.into_inner())?);
                         }
                         _ => unreachable!(
                             "Unexpected rule in parse_method_decl(): {}, \"{}\"",
@@ -1174,7 +1249,9 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
                 }
             }
             Rule::INTVALUE => {
-                let expr = parse_intvalue(pair.as_str()).calculate();
+                let span = pair.as_span();
+                let expr = parse_intvalue(pair.as_str(), (span.start(), span.end()))?.calculate()
+                    .map_err(|e| make_parse_error(e.message, span.start(), span.end()))?;
                 decl.intvalue = Some(match expr.value {
                     ValueType::Byte(v) => v as _,
                     ValueType::Int32(v) => v as _,
@@ -1185,6 +1262,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
                         pair.as_str()
                     ),
                 });
+                decl.intvalue_span = Some((span.start(), span.end()));
             }
             _ => unreachable!(
                 "Unexpected rule in parse_method_decl(): {}, \"{}\"",
@@ -1194,41 +1272,42 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> MethodDecl {
         }
     }
 
-    decl
+    Ok(decl)
 }
 
-fn parse_interface_members(pairs: pest::iterators::Pairs<Rule>, interface: &mut InterfaceDecl) {
+fn parse_interface_members(pairs: pest::iterators::Pairs<Rule>, interface: &mut InterfaceDecl) -> Result<(), AidlError> {
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {
                 interface
                     .method_list
-                    .push(parse_method_decl(pair.into_inner()));
+                    .push(parse_method_decl(pair.into_inner())?);
             }
 
             Rule::constant_decl => {
                 interface
                     .constant_list
-                    .push(parse_variable_decl(pair.into_inner(), true));
+                    .push(parse_variable_decl(pair.into_inner(), true)?);
             }
 
             Rule::interface_members => {
-                parse_interface_members(pair.into_inner(), interface);
+                parse_interface_members(pair.into_inner(), interface)?;
             }
 
             Rule::decl => {
-                interface.members.append(&mut parse_decl(pair.into_inner()));
+                interface.members.append(&mut parse_decl(pair.into_inner())?);
             }
 
             _ => unreachable!("Unexpected rule in parse_interface_members(): {}", pair),
         }
     }
+    Ok(())
 }
 
 fn parse_interface_decl(
     annotation_list: Vec<Annotation>,
     pairs: pest::iterators::Pairs<Rule>,
-) -> Declaration {
+) -> Result<Declaration, AidlError> {
     let mut interface = InterfaceDecl {
         annotation_list,
         ..Default::default()
@@ -1241,21 +1320,23 @@ fn parse_interface_decl(
             }
 
             Rule::qualified_name => {
+                let span = pair.as_span();
                 interface.name = pair.as_str().into();
+                interface.name_span = Some((span.start(), span.end()));
             }
 
             Rule::interface_members => {
-                parse_interface_members(pair.into_inner(), &mut interface);
+                parse_interface_members(pair.into_inner(), &mut interface)?;
             }
 
             _ => unreachable!("Unexpected rule in parse_interface_decl(): {}", pair),
         }
     }
 
-    Declaration::Interface(interface)
+    Ok(Declaration::Interface(interface))
 }
 
-fn parse_parcelable_members(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
+fn parse_parcelable_members(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, AidlError> {
     let mut res = Vec::new();
 
     for pair in pairs {
@@ -1264,20 +1345,20 @@ fn parse_parcelable_members(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declarat
                 res.push(Declaration::Variable(parse_variable_decl(
                     pair.into_inner(),
                     false,
-                )));
+                )?));
             }
             Rule::constant_decl => {
                 res.push(Declaration::Variable(parse_variable_decl(
                     pair.into_inner(),
                     true,
-                )));
+                )?));
             }
-            Rule::decl => res.append(&mut parse_decl(pair.into_inner())),
+            Rule::decl => res.append(&mut parse_decl(pair.into_inner())?),
             _ => unreachable!("Unexpected rule in parse_parcelable_members(): {}", pair),
         }
     }
 
-    res
+    Ok(res)
 }
 
 fn parse_optional_type_params(pairs: pest::iterators::Pairs<Rule>) -> Vec<String> {
@@ -1296,7 +1377,7 @@ fn parse_optional_type_params(pairs: pest::iterators::Pairs<Rule>) -> Vec<String
 fn parse_parcelable_decl(
     annotation_list: Vec<Annotation>,
     pairs: pest::iterators::Pairs<Rule>,
-) -> Declaration {
+) -> Result<Declaration, AidlError> {
     let mut parcelable = ParcelableDecl {
         annotation_list,
         ..Default::default()
@@ -1315,7 +1396,7 @@ fn parse_parcelable_decl(
             Rule::parcelable_members => {
                 parcelable
                     .members
-                    .append(&mut parse_parcelable_members(pair.into_inner()));
+                    .append(&mut parse_parcelable_members(pair.into_inner())?);
             }
 
             Rule::C_STR => {
@@ -1326,7 +1407,7 @@ fn parse_parcelable_decl(
         }
     }
 
-    Declaration::Parcelable(parcelable)
+    Ok(Declaration::Parcelable(parcelable))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1344,7 +1425,7 @@ pub struct EnumDecl {
     pub members: Vec<Declaration>,
 }
 
-fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Enumerator {
+fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, AidlError> {
     let mut res = Enumerator::default();
 
     for pair in pairs {
@@ -1353,19 +1434,19 @@ fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Enumerator {
                 res.identifier = pair.as_str().into();
             }
             Rule::const_expr => {
-                res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap()));
+                res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
             }
             _ => unreachable!("Unexpected rule in parse_enumerator(): {}", pair),
         }
     }
 
-    res
+    Ok(res)
 }
 
 fn parse_enum_decl(
     annotation_list: Vec<Annotation>,
     pairs: pest::iterators::Pairs<Rule>,
-) -> Declaration {
+) -> Result<Declaration, AidlError> {
     let mut enum_decl = EnumDecl {
         annotation_list: annotation_list.clone(),
         ..Default::default()
@@ -1378,12 +1459,12 @@ fn parse_enum_decl(
             }
             Rule::enumerator => enum_decl
                 .enumerator_list
-                .push(parse_enumerator(pair.into_inner())),
+                .push(parse_enumerator(pair.into_inner())?),
             _ => unreachable!("Unexpected rule in parse_enum_decl(): {}", pair),
         }
     }
 
-    Declaration::Enum(enum_decl)
+    Ok(Declaration::Enum(enum_decl))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1398,7 +1479,7 @@ pub struct UnionDecl {
 fn parse_union_decl(
     annotation_list: Vec<Annotation>,
     pairs: pest::iterators::Pairs<Rule>,
-) -> Declaration {
+) -> Result<Declaration, AidlError> {
     let mut union_decl = UnionDecl {
         annotation_list,
         ..Default::default()
@@ -1413,48 +1494,48 @@ fn parse_union_decl(
                 union_decl.type_params = parse_optional_type_params(pair.into_inner());
             }
             Rule::parcelable_members => {
-                union_decl.members = parse_parcelable_members(pair.into_inner());
+                union_decl.members = parse_parcelable_members(pair.into_inner())?;
             }
             _ => unreachable!("Unexpected rule in parse_union_decl(): {}", pair),
         }
     }
-    Declaration::Union(union_decl)
+    Ok(Declaration::Union(union_decl))
 }
 
-fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Vec<Declaration> {
+fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, AidlError> {
     let mut annotation_list = Vec::new();
     let mut declarations = Vec::new();
 
     for pair in pairs {
         match pair.as_rule() {
             Rule::annotation_list => {
-                annotation_list = parse_annotation_list(pair.into_inner());
+                annotation_list = parse_annotation_list(pair.into_inner())?;
             }
             Rule::interface_decl => {
                 declarations.push(parse_interface_decl(
                     annotation_list.clone(),
                     pair.into_inner(),
-                ));
+                )?);
             }
 
             Rule::parcelable_decl => {
                 declarations.push(parse_parcelable_decl(
                     annotation_list.clone(),
                     pair.into_inner(),
-                ));
+                )?);
             }
             Rule::enum_decl => {
-                declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner()));
+                declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner())?);
             }
             Rule::union_decl => {
-                declarations.push(parse_union_decl(annotation_list.clone(), pair.into_inner()));
+                declarations.push(parse_union_decl(annotation_list.clone(), pair.into_inner())?);
             }
 
             _ => unreachable!("Unexpected rule in parse_decl(): {}", pair),
         };
     }
 
-    declarations
+    Ok(declarations)
 }
 
 pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
@@ -1475,10 +1556,11 @@ pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
     }
 }
 
-pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
+pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
+    let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
     let mut document = Document::new();
 
-    match AIDLParser::parse(Rule::document, data) {
+    match AIDLParser::parse(Rule::document, &ctx.source) {
         Ok(pairs) => {
             for pair in pairs {
                 match pair.as_rule() {
@@ -1498,7 +1580,7 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
                     }
 
                     Rule::decl => {
-                        document.decls.append(&mut parse_decl(pair.into_inner()));
+                        document.decls.append(&mut parse_decl(pair.into_inner())?);
                     }
 
                     Rule::EOI => {}
@@ -1512,7 +1594,9 @@ pub fn parse_document(data: &str) -> Result<Document, Box<dyn Error>> {
             // println!("{:?}", document);
         }
         Err(err) => {
-            panic!("{}", err);
+            return Err(
+                pest_error_to_diagnostic(err, &ctx.filename, &ctx.source).into(),
+            );
         }
     }
 
@@ -1547,6 +1631,7 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {
@@ -1556,7 +1641,7 @@ mod tests {
                 err
             })?;
 
-        let expr = parse_string_expr(res.next().unwrap().into_inner());
+        let expr = parse_string_expr(res.next().unwrap().into_inner())?;
         assert_eq!(
             expr,
             ConstExpr::new_expr(
@@ -1577,7 +1662,7 @@ mod tests {
                 err
             })?;
 
-        let expr = parse_expression(res.next().unwrap().into_inner());
+        let expr = parse_expression(res.next().unwrap().into_inner())?;
         // assert_eq!(
         //     expr.clone(),
         //     // Expression::Expr {
@@ -1607,7 +1692,7 @@ mod tests {
         //     ConstExpr::default(),
         // );
 
-        assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int64(-20)));
+        assert_eq!(expr.calculate().unwrap(), ConstExpr::new(ValueType::Int64(-20)));
 
         Ok(())
     }
@@ -1625,5 +1710,30 @@ mod tests {
             }
             assert_eq!(current_namespace(), Namespace::new("2.2", Namespace::AIDL));
         }
+    }
+
+    // 1.1n: SourceGuard drop 후 thread-local 정리 검증
+    #[test]
+    fn test_source_guard_cleanup_on_drop() {
+        {
+            let _guard = SourceGuard::new("test.aidl", "source text");
+            assert_eq!(current_source_name(), "test.aidl");
+            assert_eq!(current_source_text(), "source text");
+        }
+        // After drop, thread-locals should be cleared
+        assert_eq!(current_source_name(), "");
+        assert_eq!(current_source_text(), "");
+    }
+
+    // 1.1o: SourceGuard panic 시에도 thread-local 정리 검증
+    #[test]
+    fn test_source_guard_cleanup_on_panic() {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = SourceGuard::new("panic.aidl", "panic source");
+            panic!("intentional panic to test cleanup");
+        });
+        assert!(result.is_err());
+        assert_eq!(current_source_name(), "");
+        assert_eq!(current_source_text(), "");
     }
 }

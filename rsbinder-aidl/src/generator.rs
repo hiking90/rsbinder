@@ -1,12 +1,13 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use miette::{NamedSource, SourceSpan};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
 
 use tera::Tera;
 
 use crate::const_expr::{ConstExpr, InitParam, ValueType};
+use crate::error::{AidlError, DuplicateCodeRelated, SemanticError};
 use crate::parser::Direction;
 use crate::{add_indent, parser, Namespace};
 
@@ -450,7 +451,7 @@ struct FnMembers {
     has_explicit_code: bool,
 }
 
-fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Error>> {
+fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
     let mut func_call_params = String::new();
     let mut args = "&self".to_string();
     let mut args_async = "&'a self".to_string();
@@ -461,10 +462,10 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     let mut read_onto_params = Vec::new();
     // let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
-    method.arg_list.iter().for_each(|arg| {
-        let generator = arg.to_generator();
+    for arg in &method.arg_list {
+        let generator = arg.to_generator()?;
 
-        let type_decl_for_func = generator.type_decl_for_func();
+        let type_decl_for_func = generator.type_decl_for_func()?;
 
         let arg_str = format!(", {}: {}", generator.identifier, type_decl_for_func);
 
@@ -513,7 +514,7 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
             read_onto_params.push(generator.identifier.to_owned());
         }
         transaction_params += &format!("{}, ", generator.func_call_param());
-    });
+    }
 
     let func_call_params = if func_call_params.chars().count() > 2 {
         func_call_params
@@ -539,9 +540,14 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, Box<dyn Erro
     )
     .0
     {
-        method.r#type.to_generator().nullable()
+        let nullable_span = method
+            .annotation_list
+            .iter()
+            .find(|a| a.annotation == "@nullable")
+            .and_then(|a| a.annotation_span);
+        method.r#type.to_generator()?.nullable_at(nullable_span)?
     } else {
-        method.r#type.to_generator()
+        method.r#type.to_generator()?
     };
 
     let return_type = generator.type_declaration(false);
@@ -621,7 +627,7 @@ impl Generator {
     pub fn document(
         &self,
         document: &parser::Document,
-    ) -> Result<(String, String), Box<dyn Error>> {
+    ) -> Result<(String, String), AidlError> {
         parser::set_current_document(document);
 
         let mut content = String::new();
@@ -635,7 +641,7 @@ impl Generator {
         &self,
         decls: &Vec<parser::Declaration>,
         indent: usize,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, AidlError> {
         let mut content = String::new();
 
         for decl in decls {
@@ -673,7 +679,7 @@ impl Generator {
         &self,
         arg_decl: &parser::InterfaceDecl,
         indent: usize,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, AidlError> {
         let mut decl = arg_decl.clone();
 
         let is_empty =
@@ -705,10 +711,10 @@ impl Generator {
 
             // Second pass: process constants with resolved values
             for constant in decl.constant_list.iter() {
-                let generator = constant.r#type.to_generator();
+                let generator = constant.r#type.to_generator()?;
                 const_members.push((
                     constant.const_identifier(),
-                    generator.const_type_decl(),
+                    generator.const_type_decl()?,
                     generator.init_value(
                         constant.const_expr.as_ref(),
                         InitParam::builder().with_const(true),
@@ -724,40 +730,83 @@ impl Generator {
                     .filter(|m| m.intvalue.is_some())
                     .count();
 
+                let source_name = parser::current_source_name();
+                let source_text = parser::current_source_text();
+
                 // AOSP rule: all-or-nothing
                 if explicit_count > 0 && explicit_count < decl.method_list.len() {
-                    return Err(format!(
-                        "Interface {}: either all methods must have explicitly assigned \
-                         transaction IDs or none of them should",
-                        decl.name
-                    )
+                    let (span_start, span_end) = decl.name_span.unwrap_or((0, 0));
+                    return Err(SemanticError::MixedTransactionIds {
+                        interface: decl.name.clone(),
+                        src: NamedSource::new(&source_name, source_text.clone()),
+                        span: SourceSpan::new(span_start.into(), span_end - span_start),
+                    }
                     .into());
                 }
 
                 if explicit_count > 0 {
                     // Detect duplicate transaction codes
-                    let mut seen = std::collections::HashMap::new();
+                    let mut seen: std::collections::HashMap<i64, (String, Option<(usize, usize)>)> =
+                        std::collections::HashMap::new();
                     for method in decl.method_list.iter() {
                         if let Some(code) = method.intvalue {
                             if code < 0 {
-                                return Err(format!(
-                                    "Interface {}: method '{}' has negative transaction code {}",
-                                    decl.name, method.identifier, code
-                                )
+                                let (span_start, span_end) =
+                                    method.intvalue_span.unwrap_or((0, 0));
+                                return Err(SemanticError::NegativeTransactionCode {
+                                    interface: decl.name.clone(),
+                                    method: method.identifier.clone(),
+                                    code,
+                                    src: NamedSource::new(&source_name, source_text.clone()),
+                                    span: SourceSpan::new(
+                                        span_start.into(),
+                                        span_end - span_start,
+                                    ),
+                                }
                                 .into());
                             }
                             if code > u32::MAX as i64 {
-                                return Err(format!(
-                                    "Interface {}: method '{}' has transaction code {} exceeding u32 range",
-                                    decl.name, method.identifier, code
-                                ).into());
+                                let (span_start, span_end) =
+                                    method.intvalue_span.unwrap_or((0, 0));
+                                return Err(SemanticError::TransactionCodeOverflow {
+                                    interface: decl.name.clone(),
+                                    method: method.identifier.clone(),
+                                    code,
+                                    src: NamedSource::new(&source_name, source_text.clone()),
+                                    span: SourceSpan::new(
+                                        span_start.into(),
+                                        span_end - span_start,
+                                    ),
+                                }
+                                .into());
                             }
-                            if let Some(prev_name) = seen.insert(code, &method.identifier) {
-                                return Err(format!(
-                                    "Interface {}: methods '{}' and '{}' have the same \
-                                     transaction code {}",
-                                    decl.name, prev_name, method.identifier, code
-                                )
+                            if let Some((prev_name, prev_span)) = seen.insert(
+                                code,
+                                (method.identifier.clone(), method.identifier_span),
+                            ) {
+                                let (span_start, span_end) =
+                                    prev_span.unwrap_or((0, 0));
+                                let (rel_start, rel_end) =
+                                    method.identifier_span.unwrap_or((0, 0));
+                                return Err(SemanticError::DuplicateTransactionCode {
+                                    interface: decl.name.clone(),
+                                    method1: prev_name.clone(),
+                                    method2: method.identifier.clone(),
+                                    code,
+                                    src: NamedSource::new(&source_name, source_text.clone()),
+                                    span: SourceSpan::new(
+                                        span_start.into(),
+                                        span_end - span_start,
+                                    ),
+                                    related: vec![DuplicateCodeRelated {
+                                        method: method.identifier.clone(),
+                                        src: NamedSource::new(&source_name, source_text.clone()),
+                                        span: SourceSpan::new(
+                                            rel_start.into(),
+                                            rel_end - rel_start,
+                                        ),
+                                    }],
+                                }
                                 .into());
                             }
                         }
@@ -793,7 +842,7 @@ impl Generator {
 
         let rendered = template()
             .render("interface", &context)
-            .expect("Failed to render interface template");
+            .map_err(|e| std::io::Error::other(format!("Failed to render interface template: {e}")))?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -802,7 +851,7 @@ impl Generator {
         &self,
         arg_decl: &parser::ParcelableDecl,
         indent: usize,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, AidlError> {
         let mut is_empty = false;
         let mut decl = arg_decl.clone();
 
@@ -838,12 +887,12 @@ impl Generator {
             for decl in &decl.members {
                 if let Some(var) = decl.is_variable() {
                     println!("Parcelable variable: {var:?}");
-                    let generator = var.r#type.to_generator();
+                    let generator = var.r#type.to_generator()?;
 
                     if var.constant {
                         constant_members.push((
                             var.const_identifier(),
-                            generator.const_type_decl(),
+                            generator.const_type_decl()?,
                             generator.init_value(
                                 var.const_expr.as_ref(),
                                 InitParam::builder().with_const(true),
@@ -897,7 +946,7 @@ impl Generator {
 
         let rendered = template()
             .render("parcelable", &context)
-            .expect("Failed to render parcelable template");
+            .map_err(|e| std::io::Error::other(format!("Failed to render parcelable template: {e}")))?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -915,13 +964,15 @@ impl Generator {
 
             if let Some(const_expr) = &enumerator.const_expr {
                 // Try to compute the value, but handle cases where it might reference other enum members
-                let calculated = const_expr.calculate();
-                let computed_val = match calculated.value {
-                    crate::const_expr::ValueType::Name(_) => {
-                        // This is an unresolved reference, use current enum_val as fallback
-                        enum_val
-                    }
-                    _ => calculated.to_i64(),
+                let computed_val = match const_expr.calculate() {
+                    Ok(calculated) => match calculated.value {
+                        crate::const_expr::ValueType::Name(_) => {
+                            // This is an unresolved reference, use current enum_val as fallback
+                            enum_val
+                        }
+                        _ => calculated.to_i64().unwrap_or(enum_val),
+                    },
+                    Err(_) => enum_val,
                 };
 
                 parser::register_symbol(
@@ -953,13 +1004,13 @@ impl Generator {
         }
     }
 
-    fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, Box<dyn Error>> {
+    fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, AidlError> {
         if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
         {
             return Ok(String::new());
         }
 
-        let generator = &parser::get_backing_type(&decl.annotation_list);
+        let generator = &parser::get_backing_type(&decl.annotation_list)?;
 
         let mut members = Vec::new();
 
@@ -970,7 +1021,9 @@ impl Generator {
         let mut enum_val: i64 = 0;
         for enumerator in &decl.enumerator_list {
             if let Some(const_expr) = &enumerator.const_expr {
-                enum_val = const_expr.calculate().to_i64();
+                if let Some(val) = const_expr.calculate().ok().and_then(|c| c.to_i64().ok()) {
+                    enum_val = val;
+                }
             }
             members.push((enumerator.identifier.to_owned(), enum_val));
             enum_val += 1;
@@ -984,7 +1037,7 @@ impl Generator {
             "enum_type",
             &generator
                 .clone()
-                .direction(&Direction::None)
+                .direction(&Direction::None)?
                 .type_declaration(true),
         );
         context.insert("enum_len", &decl.enumerator_list.len());
@@ -992,7 +1045,7 @@ impl Generator {
 
         let rendered = template()
             .render("enum", &context)
-            .expect("Failed to render enum template");
+            .map_err(|e| std::io::Error::other(format!("Failed to render enum template: {e}")))?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -1001,7 +1054,7 @@ impl Generator {
         &self,
         decl: &parser::UnionDecl,
         indent: usize,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, AidlError> {
         if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
         {
             return Ok(String::new());
@@ -1019,11 +1072,11 @@ impl Generator {
 
         for member in &decl.members {
             if let parser::Declaration::Variable(var) = member {
-                let generator = var.r#type.to_generator();
+                let generator = var.r#type.to_generator()?;
                 if var.constant {
                     constant_members.push((
                         var.const_identifier(),
-                        generator.const_type_decl(),
+                        generator.const_type_decl()?,
                         generator.init_value(
                             var.const_expr.as_ref(),
                             InitParam::builder().with_const(true),
@@ -1066,8 +1119,49 @@ impl Generator {
 
         let rendered = template()
             .render("union", &context)
-            .expect("Failed to render union template");
+            .map_err(|e| std::io::Error::other(format!("Failed to render union template: {e}")))?;
 
         Ok(add_indent(indent, rendered.trim()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::SemanticError;
+
+    // 3.1f: NegativeTransactionCode — AIDL 문법으로 도달 불가, 직접 구성으로 검증
+    #[test]
+    fn test_negative_transaction_code() {
+        let source = "interface ITest { void m() = -1; }";
+        let _guard = crate::parser::SourceGuard::new("test.aidl", source);
+
+        let decl = parser::InterfaceDecl {
+            name: "ITest".into(),
+            method_list: vec![parser::MethodDecl {
+                identifier: "m".into(),
+                intvalue: Some(-1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let gen = Generator::new(false, false);
+        let result = gen.decl_interface(&decl, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            AidlError::Semantic(SemanticError::NegativeTransactionCode {
+                interface,
+                method,
+                code,
+                ..
+            }) => {
+                assert_eq!(interface, "ITest");
+                assert_eq!(method, "m");
+                assert_eq!(code, -1);
+            }
+            other => panic!("Expected NegativeTransactionCode, got: {other:?}"),
+        }
     }
 }

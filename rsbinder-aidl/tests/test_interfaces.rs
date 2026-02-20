@@ -5,7 +5,8 @@ use similar::{ChangeTag, TextDiff};
 use std::error::Error;
 
 fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
     let diff = TextDiff::from_lines(res.1.trim(), expect.trim());
@@ -219,7 +220,8 @@ pub mod ArrayOfInterfaces {
 
 /// Helper to verify that generated code contains a specific string fragment
 fn aidl_generator_contains(input: &str, expected_fragment: &str) -> Result<(), Box<dyn Error>> {
-    let document = rsbinder_aidl::parse_document(input)?;
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
     let res = gen.document(&document)?;
     assert!(
@@ -233,7 +235,8 @@ fn aidl_generator_contains(input: &str, expected_fragment: &str) -> Result<(), B
 /// Helper to verify that AIDL parsing + code generation returns an error
 fn aidl_generator_should_fail(input: &str, expected_error_substring: &str) {
     let result = (|| -> Result<(), Box<dyn Error>> {
-        let document = rsbinder_aidl::parse_document(input)?;
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+        let document = rsbinder_aidl::parse_document(&ctx)?;
         let gen = rsbinder_aidl::Generator::new(false, false);
         gen.document(&document)?;
         Ok(())
@@ -287,7 +290,7 @@ interface IMixed {
     void method2();
 }
         "#,
-        "either all methods must have explicitly assigned transaction IDs",
+        "mixed explicit/implicit transaction IDs",
     );
 }
 
@@ -315,6 +318,6 @@ interface IDuplicate {
     void method2() = 10;
 }
         "#,
-        "have the same transaction code",
+        "transaction code 10 conflict between",
     );
 }
