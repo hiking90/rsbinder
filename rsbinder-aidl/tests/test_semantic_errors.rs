@@ -1,7 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 3 semantic error tests (작업 5.3)
+//! Phase 3 semantic error tests (task 5.3)
 //! Validates transaction code errors, import resolution errors, and error aggregation.
 
 use miette::Diagnostic;
@@ -332,4 +332,56 @@ fn test_parse_error_blocks_semantic_analysis() {
     );
 
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+// ── direction_span location verification ─────────────────────────────────────
+
+// direction_span: verify that the span points to the 'out' keyword
+#[test]
+fn test_out_primitive_span_points_to_out_keyword() {
+    let input = "interface IFoo {\n    void foo(out int x);\n}";
+    let err = expect_generation_error(input, "test.aidl");
+    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
+        let offset = span.offset();
+        let len = span.len();
+        assert!(len > 0, "span should have non-zero length");
+        let spanned_text = &input[offset..offset + len];
+        assert_eq!(spanned_text, "out", "span should point to 'out' keyword, got: '{spanned_text}'");
+    } else {
+        panic!("Expected InvalidOperation, got: {err}");
+    }
+}
+
+// direction_span: verify that the span points to the 'inout' keyword
+#[test]
+fn test_inout_string_span_points_to_inout_keyword() {
+    let input = "interface IFoo {\n    void bar(inout String s);\n}";
+    let err = expect_generation_error(input, "test.aidl");
+    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
+        let offset = span.offset();
+        let len = span.len();
+        assert!(len > 0, "span should have non-zero length");
+        let spanned_text = &input[offset..offset + len];
+        assert_eq!(spanned_text, "inout", "span should point to 'inout' keyword, got: '{spanned_text}'");
+    } else {
+        panic!("Expected InvalidOperation, got: {err}");
+    }
+}
+
+// ── EnumDecl.name_span location verification ─────────────────────────────────
+
+// verify that an invalid backing type error points to the enum name
+#[test]
+fn test_enum_bad_backing_span_points_to_enum_name() {
+    let input = "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1 }";
+    let err = expect_generation_error(input, "test.aidl");
+    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
+        let offset = span.offset();
+        let len = span.len();
+        assert!(len > 0, "span should have non-zero length");
+        let spanned_text = &input[offset..offset + len];
+        assert_eq!(spanned_text, "MyEnum", "span should point to enum name 'MyEnum', got: '{spanned_text}'");
+    } else {
+        panic!("Expected InvalidOperation, got: {err}");
+    }
 }

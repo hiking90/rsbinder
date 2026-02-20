@@ -276,18 +276,22 @@ impl TypeGenerator {
         self
     }
 
-    pub fn direction(mut self, direction: &Direction) -> Result<Self, AidlError> {
+    pub fn direction_at(mut self, direction: &Direction, direction_span: Option<(usize, usize)>) -> Result<Self, AidlError> {
         if matches!(direction, Direction::Out | Direction::Inout)
             && (Self::is_primitive(&self.value_type)
                 || matches!(self.value_type, ValueType::String(_)))
         {
             return Err(make_type_error(
                 "Primitive types and String cannot be an out or inout parameter",
-                self.type_span,
+                direction_span.or(self.type_span),
             ));
         }
         self.direction = direction.clone();
         Ok(self)
+    }
+
+    pub fn direction(self, direction: &Direction) -> Result<Self, AidlError> {
+        self.direction_at(direction, None)
     }
 
     // Switch to array type.

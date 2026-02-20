@@ -1,7 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 2 parse error tests (작업 5.2)
+//! Phase 2 parse error tests (task 5.2)
 //! Validates that AIDL syntax errors return Err (not panic) with proper diagnostics.
 
 use miette::Diagnostic;
@@ -46,10 +46,7 @@ fn test_empty_document() {
 // 2.1d: Keyword used as identifier
 #[test]
 fn test_keyword_as_identifier() {
-    let err = expect_parse_error(
-        "parcelable interface {\n    int val;\n}",
-        "test.aidl",
-    );
+    let err = expect_parse_error("parcelable interface {\n    int val;\n}", "test.aidl");
     assert!(matches!(&err, AidlError::Parse(_)));
 }
 
@@ -70,20 +67,14 @@ fn test_invalid_type_syntax() {
 // 2.1g: Duplicate package declaration
 #[test]
 fn test_duplicate_package() {
-    let err = expect_parse_error(
-        "package a;\npackage b;\nparcelable Foo {}",
-        "test.aidl",
-    );
+    let err = expect_parse_error("package a;\npackage b;\nparcelable Foo {}", "test.aidl");
     assert!(matches!(&err, AidlError::Parse(_)));
 }
 
 // 2.1h: Missing method parentheses
 #[test]
 fn test_missing_method_parens() {
-    let err = expect_parse_error(
-        "interface IFoo {\n    void method;\n}",
-        "test.aidl",
-    );
+    let err = expect_parse_error("interface IFoo {\n    void method;\n}", "test.aidl");
     assert!(matches!(&err, AidlError::Parse(_)));
 }
 
@@ -118,7 +109,11 @@ fn test_error_span_points_to_correct_location() {
         assert!(!labels.is_empty(), "must have at least one label");
         // The span should point somewhere in the input (not out of bounds)
         let offset = labels[0].inner().offset();
-        assert!(offset <= input.len(), "span offset {offset} exceeds input length {}", input.len());
+        assert!(
+            offset <= input.len(),
+            "span offset {offset} exceeds input length {}",
+            input.len()
+        );
     } else {
         panic!("Expected AidlError::Parse, got: {err:?}");
     }

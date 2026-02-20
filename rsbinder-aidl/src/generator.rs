@@ -1010,7 +1010,7 @@ impl Generator {
             return Ok(String::new());
         }
 
-        let generator = &parser::get_backing_type(&decl.annotation_list)?;
+        let generator = &parser::get_backing_type(&decl.annotation_list, decl.name_span)?;
 
         let mut members = Vec::new();
 
@@ -1130,7 +1130,7 @@ mod tests {
     use super::*;
     use crate::error::SemanticError;
 
-    // 3.1f: NegativeTransactionCode — AIDL 문법으로 도달 불가, 직접 구성으로 검증
+    // 3.1f: NegativeTransactionCode — unreachable via AIDL grammar, verified by direct construction
     #[test]
     fn test_negative_transaction_code() {
         let source = "interface ITest { void m() = -1; }";

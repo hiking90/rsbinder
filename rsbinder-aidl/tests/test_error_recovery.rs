@@ -1,7 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 4 panic removal verification (작업 5.4)
+//! Phase 4 panic removal verification (task 5.4)
 //! Validates that all former-panic paths now return Err instead of panicking.
 
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};

@@ -386,7 +386,7 @@ impl ValueType {
             '\"' => String::from("\\\""),
             '\n' => String::from("\\n"),
             '\t' => String::from("\\t"),
-            // ... 다른 특수 문자들을 필요에 따라 추가 ...
+            // ... add other special characters as needed ...
             _ => ch.to_string(),
         }
     }

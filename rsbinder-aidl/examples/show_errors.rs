@@ -30,29 +30,29 @@ fn demo_builder(label: &str, src: &str) {
 }
 
 fn main() {
-    // ── 구문 에러 (parse 단계) ──────────────────────────
+    // ── Syntax errors (parse phase) ─────────────────────
 
-    // 1) 숫자로 시작하는 식별자
+    // 1) identifier starting with a digit
     demo_parse(
         "syntax_error",
         "interface IHello {\n    void 123bad();\n}",
     );
 
-    // 2) 세미콜론 누락
+    // 2) missing semicolon
     demo_parse(
         "missing_semicolon",
         "parcelable Foo {\n    int field\n}",
     );
 
-    // 3) 닫는 중괄호 누락 (EOF)
+    // 3) missing closing brace (EOF)
     demo_parse(
         "unclosed_brace",
         "interface IBar {\n    void ok();\n",
     );
 
-    // ── 시맨틱 에러 (generator 단계, Builder 경유) ───────
+    // ── Semantic errors (generator phase, via Builder) ───
 
-    // 4) 중복 transaction code
+    // 4) duplicate transaction code
     demo_builder(
         "duplicate_transaction_code",
         "interface IDup {\n    void m1() = 10;\n    void m2() = 10;\n}",
@@ -64,7 +64,7 @@ fn main() {
         "interface IMixed {\n    void m1() = 1;\n    void m2();\n}",
     );
 
-    // 6) List에 Generic 없음
+    // 6) List without a Generic type argument
     demo_builder(
         "list_without_generic",
         "parcelable Foo {\n    List items;\n}",
@@ -74,5 +74,25 @@ fn main() {
     demo_builder(
         "nullable_primitive",
         "parcelable Foo {\n    @nullable int val;\n}",
+    );
+
+    // ── New: direction_span / name_span ──────────────────
+
+    // 8) out primitive: direction_span improvement (points to the 'out' keyword)
+    demo_builder(
+        "out_primitive",
+        "interface IFoo {\n    void foo(out int x);\n}",
+    );
+
+    // 9) inout String: direction_span improvement (points to the 'inout' keyword)
+    demo_builder(
+        "inout_string",
+        "interface IFoo {\n    void bar(inout String s);\n}",
+    );
+
+    // 10) enum invalid backing type: EnumDecl.name_span → points to the enum name
+    demo_builder(
+        "enum_bad_backing",
+        "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1, V2 = 2 }",
     );
 }

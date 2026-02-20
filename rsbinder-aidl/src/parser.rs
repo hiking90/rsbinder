@@ -46,14 +46,14 @@ thread_local! {
     // Universal Symbol Table - supports all types of named constants
     static SYMBOL_TABLE: RefCell<HashMap<String, Symbol>> = RefCell::new(HashMap::new());
 
-    // 현재 파싱 중인 소스의 파일명과 소스 텍스트 (에러 메시지 생성에 사용)
+    // Filename and source text of the source currently being parsed (used for error message generation)
     #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT_SOURCE_NAME: RefCell<String> = RefCell::new(String::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT_SOURCE_TEXT: RefCell<String> = RefCell::new(String::new());
 }
 
-/// SourceGuard와 동일한 thread-local 소스 정보를 사용하여 ParseError를 생성하는 헬퍼.
+/// Helper that creates a ParseError using the same thread-local source info as SourceGuard.
 fn make_parse_error(message: impl Into<String>, start: usize, end: usize) -> AidlError {
     let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
     let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
@@ -65,8 +65,8 @@ fn make_parse_error(message: impl Into<String>, start: usize, end: usize) -> Aid
     })
 }
 
-/// 파싱할 파일의 이름과 소스 텍스트를 담는 컨텍스트 구조체.
-/// `parse_document()`에 전달하여 에러 진단 메시지에 파일 정보를 포함시킨다.
+/// Context struct holding the filename and source text of a file to be parsed.
+/// Passed to `parse_document()` so that file information is included in error diagnostics.
 #[derive(Debug, Clone)]
 pub struct SourceContext {
     pub filename: String,
@@ -82,8 +82,8 @@ impl SourceContext {
     }
 }
 
-/// RAII guard: 생성 시 thread-local 소스 컨텍스트를 설정하고,
-/// drop 시 자동으로 정리한다. 에러 반환 및 panic 경로에서도 정리가 보장된다.
+/// RAII guard: sets the thread-local source context on creation and clears it
+/// automatically on drop, ensuring cleanup on both error-return and panic paths.
 pub struct SourceGuard;
 
 impl SourceGuard {
@@ -101,12 +101,12 @@ impl Drop for SourceGuard {
     }
 }
 
-/// 현재 설정된 소스 컨텍스트의 파일명을 반환한다.
+/// Returns the filename of the currently active source context.
 pub fn current_source_name() -> String {
     CURRENT_SOURCE_NAME.with(|name| name.borrow().clone())
 }
 
-/// 현재 설정된 소스 컨텍스트의 소스 텍스트를 반환한다.
+/// Returns the source text of the currently active source context.
 pub fn current_source_text() -> String {
     CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone())
 }
@@ -481,6 +481,7 @@ pub enum Direction {
 #[derive(Debug, Default, Clone)]
 pub struct Arg {
     pub direction: Direction,
+    pub direction_span: Option<(usize, usize)>,
     pub r#type: Type,
     pub identifier: String,
 }
@@ -490,7 +491,7 @@ impl Arg {
         let generator = type_generator::TypeGenerator::new_with_type(&self.r#type)?;
 
         Ok(generator
-            .direction(&self.direction)?
+            .direction_at(&self.direction, self.direction_span)?
             .identifier(&self.identifier))
     }
 
@@ -736,6 +737,7 @@ pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) ->
 
 pub fn get_backing_type(
     annotation_list: &Vec<Annotation>,
+    name_span: Option<(usize, usize)>,
 ) -> Result<type_generator::TypeGenerator, crate::error::AidlError> {
     // parse "@Backing(type="byte")"
     for annotation in annotation_list {
@@ -746,7 +748,7 @@ pub fn get_backing_type(
                         // The cstr is enclosed in quotes.
                         name: param.const_expr.to_value_string().trim_matches('"').into(),
                         generic: None,
-                        name_span: None,
+                        name_span,
                     });
                 }
             }
@@ -1188,12 +1190,12 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Result<Arg, AidlError> {
     for pair in pairs {
         match pair.as_rule() {
             Rule::direction => {
+                let span = pair.as_span();
                 arg.direction = match pair.as_str() {
                     "in" => Direction::In,
                     "out" => Direction::Out,
                     "inout" => Direction::Inout,
                     _ => {
-                        let span = pair.as_span();
                         return Err(make_parse_error(
                             format!("unsupported direction: {}", pair.as_str()),
                             span.start(),
@@ -1201,6 +1203,7 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Result<Arg, AidlError> {
                         ));
                     }
                 };
+                arg.direction_span = Some((span.start(), span.end()));
             }
             Rule::r#type => {
                 arg.r#type = parse_type(pair.into_inner())?;
@@ -1421,6 +1424,7 @@ pub struct EnumDecl {
     pub namespace: Namespace,
     pub annotation_list: Vec<Annotation>,
     pub name: String,
+    pub name_span: Option<(usize, usize)>,
     pub enumerator_list: Vec<Enumerator>,
     pub members: Vec<Declaration>,
 }
@@ -1455,7 +1459,9 @@ fn parse_enum_decl(
     for pair in pairs {
         match pair.as_rule() {
             Rule::qualified_name => {
+                let span = pair.as_span();
                 enum_decl.name = pair.as_str().into();
+                enum_decl.name_span = Some((span.start(), span.end()));
             }
             Rule::enumerator => enum_decl
                 .enumerator_list
@@ -1472,6 +1478,7 @@ pub struct UnionDecl {
     pub namespace: Namespace,
     pub annotation_list: Vec<Annotation>,
     pub name: String,
+    pub name_span: Option<(usize, usize)>,
     pub type_params: Vec<String>,
     pub members: Vec<Declaration>,
 }
@@ -1488,7 +1495,9 @@ fn parse_union_decl(
     for pair in pairs {
         match pair.as_rule() {
             Rule::qualified_name => {
+                let span = pair.as_span();
                 union_decl.name = pair.as_str().into();
+                union_decl.name_span = Some((span.start(), span.end()));
             }
             Rule::optional_type_params => {
                 union_decl.type_params = parse_optional_type_params(pair.into_inner());
@@ -1712,7 +1721,7 @@ mod tests {
         }
     }
 
-    // 1.1n: SourceGuard drop 후 thread-local 정리 검증
+    // 1.1n: thread-local state is cleared after SourceGuard is dropped
     #[test]
     fn test_source_guard_cleanup_on_drop() {
         {
@@ -1725,7 +1734,7 @@ mod tests {
         assert_eq!(current_source_text(), "");
     }
 
-    // 1.1o: SourceGuard panic 시에도 thread-local 정리 검증
+    // 1.1o: thread-local state is cleared even when a panic occurs inside SourceGuard
     #[test]
     fn test_source_guard_cleanup_on_panic() {
         let result = std::panic::catch_unwind(|| {

@@ -1,7 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 5 final integration tests (작업 5.5)
+//! Phase 5 final integration tests (task 5.5)
 //! Validates miette error output format and boundary conditions.
 
 use std::error::Error;
@@ -234,10 +234,10 @@ interface IFoo {
 }
 
 // ============================================================
-// 2.6: fancy / non-fancy / ascii 모드 출력 포맷 검증
+// 2.6: fancy / non-fancy / ascii output format verification
 // ============================================================
 
-// fancy 모드: GraphicalTheme::unicode() — ANSI 컬러 코드 포함
+// Fancy mode: GraphicalTheme::unicode() — includes ANSI color codes
 #[test]
 fn test_fancy_mode_output() {
     let err = expect_parse_error(
@@ -259,21 +259,21 @@ fn test_fancy_mode_output() {
         buf.contains("aidl::parse_error"),
         "Fancy mode must contain diagnostic code:\n{buf}"
     );
-    // ANSI 컬러 모드는 ESC 시퀀스('\x1b[')를 포함해야 한다
+    // Colored mode must contain ESC sequences ('\x1b[')
     assert!(
         buf.contains('\x1b'),
         "Fancy (colored) mode must contain ANSI escape codes:\n{buf}"
     );
 }
 
-// non-fancy 모드: GraphicalTheme::unicode_nocolor() — ANSI 컬러 코드 없음
+// Non-fancy mode: GraphicalTheme::unicode_nocolor() — no ANSI color codes
 #[test]
 fn test_non_fancy_mode_output() {
     let err = expect_parse_error(
         "interface IHello {\n    void 123bad();\n}",
         "hello.aidl",
     );
-    // render_error() 헬퍼가 이미 unicode_nocolor()를 사용함
+    // The render_error() helper already uses unicode_nocolor()
     let rendered = render_error(&err);
 
     assert!(!rendered.is_empty(), "Non-fancy mode output must not be empty");
@@ -285,14 +285,14 @@ fn test_non_fancy_mode_output() {
         rendered.contains("aidl::parse_error"),
         "Non-fancy mode must contain diagnostic code:\n{rendered}"
     );
-    // non-fancy 모드에는 ANSI 이스케이프 코드가 없어야 한다
+    // No-color mode must not contain any ANSI escape codes
     assert!(
         !rendered.contains('\x1b'),
         "Non-fancy (no-color) mode must not contain ANSI escape codes:\n{rendered}"
     );
 }
 
-// ASCII 모드: GraphicalTheme::ascii() — 유니코드 박스 문자 없이 순수 ASCII
+// ASCII mode: GraphicalTheme::ascii() — pure ASCII without Unicode box-drawing characters
 #[test]
 fn test_ascii_mode_output() {
     let err = expect_parse_error(
@@ -314,7 +314,7 @@ fn test_ascii_mode_output() {
         buf.contains("aidl::parse_error"),
         "ASCII mode must contain diagnostic code:\n{buf}"
     );
-    // ASCII 모드는 모든 문자가 ASCII 범위여야 한다
+    // ASCII mode output must consist entirely of ASCII characters
     assert!(
         buf.is_ascii(),
         "ASCII mode output must contain only ASCII characters"

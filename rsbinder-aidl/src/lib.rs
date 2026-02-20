@@ -283,8 +283,8 @@ impl Builder {
                                 }
 
                                 if !found {
-                                    // import 구문의 정확한 byte offset은 AST에 보존되지 않으므로
-                                    // 소스 텍스트 내에서 import 문자열을 검색하여 span을 추정한다.
+                                    // The exact byte offset of an import statement is not preserved in the AST,
+                                    // so search the source text for the import string to approximate the span.
                                     let source_text =
                                         fs::read_to_string(&path).unwrap_or_default();
                                     let import_offset = source_text.find(import).unwrap_or(0);
@@ -334,7 +334,7 @@ impl Builder {
             }
         }
 
-        // 파싱 에러가 있으면 시맨틱 분석 없이 에러만 보고 (cascading error 방지)
+        // If there are parse errors, report them immediately without semantic analysis (prevents cascading errors)
         if let Some(err) = AidlError::collect(errors) {
             return Err(err);
         }
