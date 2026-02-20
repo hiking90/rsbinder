@@ -46,10 +46,7 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
 // 5.5a: Parse error output includes filename, source snippet, diagnostic code
 #[test]
 fn test_parse_error_output_format() {
-    let err = expect_parse_error(
-        "interface IHello {\n    void 123bad();\n}",
-        "hello.aidl",
-    );
+    let err = expect_parse_error("interface IHello {\n    void 123bad();\n}", "hello.aidl");
     let rendered = render_error(&err);
     assert!(
         rendered.contains("hello.aidl"),
@@ -113,10 +110,7 @@ parcelable Foo {
     );
     let rendered = render_error(&err);
     // The error should have some diagnostic info (help or label)
-    assert!(
-        !rendered.is_empty(),
-        "Rendered output should not be empty"
-    );
+    assert!(!rendered.is_empty(), "Rendered output should not be empty");
 }
 
 // 5.5e: Error output includes source snippet
@@ -240,10 +234,7 @@ interface IFoo {
 // Fancy mode: GraphicalTheme::unicode() — includes ANSI color codes
 #[test]
 fn test_fancy_mode_output() {
-    let err = expect_parse_error(
-        "interface IHello {\n    void 123bad();\n}",
-        "hello.aidl",
-    );
+    let err = expect_parse_error("interface IHello {\n    void 123bad();\n}", "hello.aidl");
     let mut buf = String::new();
     GraphicalReportHandler::new()
         .with_theme(GraphicalTheme::unicode())
@@ -269,14 +260,14 @@ fn test_fancy_mode_output() {
 // Non-fancy mode: GraphicalTheme::unicode_nocolor() — no ANSI color codes
 #[test]
 fn test_non_fancy_mode_output() {
-    let err = expect_parse_error(
-        "interface IHello {\n    void 123bad();\n}",
-        "hello.aidl",
-    );
+    let err = expect_parse_error("interface IHello {\n    void 123bad();\n}", "hello.aidl");
     // The render_error() helper already uses unicode_nocolor()
     let rendered = render_error(&err);
 
-    assert!(!rendered.is_empty(), "Non-fancy mode output must not be empty");
+    assert!(
+        !rendered.is_empty(),
+        "Non-fancy mode output must not be empty"
+    );
     assert!(
         rendered.contains("hello.aidl"),
         "Non-fancy mode must contain filename:\n{rendered}"
@@ -295,10 +286,7 @@ fn test_non_fancy_mode_output() {
 // ASCII mode: GraphicalTheme::ascii() — pure ASCII without Unicode box-drawing characters
 #[test]
 fn test_ascii_mode_output() {
-    let err = expect_parse_error(
-        "parcelable Foo {\n    int field\n}",
-        "foo.aidl",
-    );
+    let err = expect_parse_error("parcelable Foo {\n    int field\n}", "foo.aidl");
     let mut buf = String::new();
     GraphicalReportHandler::new()
         .with_theme(GraphicalTheme::ascii())

@@ -260,10 +260,7 @@ pub fn pest_error_to_diagnostic<R: pest::RuleType>(
 }
 
 /// Formats expected/unexpected token information from a pest parse error into a human-readable message.
-fn format_pest_expectations<R: std::fmt::Debug>(
-    positives: &[R],
-    negatives: &[R],
-) -> String {
+fn format_pest_expectations<R: std::fmt::Debug>(positives: &[R], negatives: &[R]) -> String {
     let mut parts = Vec::new();
 
     if !positives.is_empty() {
@@ -363,10 +360,7 @@ mod tests {
             span: span(0, 18),
         };
         let display = format!("{err}");
-        assert!(
-            display.contains("foo.bar.Baz"),
-            "Got: {display}"
-        );
+        assert!(display.contains("foo.bar.Baz"), "Got: {display}");
         assert!(display.contains("not found"), "Got: {display}");
     }
 

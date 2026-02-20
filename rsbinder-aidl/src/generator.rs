@@ -624,10 +624,7 @@ impl Generator {
         }
     }
 
-    pub fn document(
-        &self,
-        document: &parser::Document,
-    ) -> Result<(String, String), AidlError> {
+    pub fn document(&self, document: &parser::Document) -> Result<(String, String), AidlError> {
         parser::set_current_document(document);
 
         let mut content = String::new();
@@ -751,53 +748,39 @@ impl Generator {
                     for method in decl.method_list.iter() {
                         if let Some(code) = method.intvalue {
                             if code < 0 {
-                                let (span_start, span_end) =
-                                    method.intvalue_span.unwrap_or((0, 0));
+                                let (span_start, span_end) = method.intvalue_span.unwrap_or((0, 0));
                                 return Err(SemanticError::NegativeTransactionCode {
                                     interface: decl.name.clone(),
                                     method: method.identifier.clone(),
                                     code,
                                     src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(
-                                        span_start.into(),
-                                        span_end - span_start,
-                                    ),
+                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
                                 }
                                 .into());
                             }
                             if code > u32::MAX as i64 {
-                                let (span_start, span_end) =
-                                    method.intvalue_span.unwrap_or((0, 0));
+                                let (span_start, span_end) = method.intvalue_span.unwrap_or((0, 0));
                                 return Err(SemanticError::TransactionCodeOverflow {
                                     interface: decl.name.clone(),
                                     method: method.identifier.clone(),
                                     code,
                                     src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(
-                                        span_start.into(),
-                                        span_end - span_start,
-                                    ),
+                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
                                 }
                                 .into());
                             }
-                            if let Some((prev_name, prev_span)) = seen.insert(
-                                code,
-                                (method.identifier.clone(), method.identifier_span),
-                            ) {
-                                let (span_start, span_end) =
-                                    prev_span.unwrap_or((0, 0));
-                                let (rel_start, rel_end) =
-                                    method.identifier_span.unwrap_or((0, 0));
+                            if let Some((prev_name, prev_span)) = seen
+                                .insert(code, (method.identifier.clone(), method.identifier_span))
+                            {
+                                let (span_start, span_end) = prev_span.unwrap_or((0, 0));
+                                let (rel_start, rel_end) = method.identifier_span.unwrap_or((0, 0));
                                 return Err(SemanticError::DuplicateTransactionCode {
                                     interface: decl.name.clone(),
                                     method1: prev_name.clone(),
                                     method2: method.identifier.clone(),
                                     code,
                                     src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(
-                                        span_start.into(),
-                                        span_end - span_start,
-                                    ),
+                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
                                     related: vec![DuplicateCodeRelated {
                                         method: method.identifier.clone(),
                                         src: NamedSource::new(&source_name, source_text.clone()),
@@ -840,9 +823,9 @@ impl Generator {
         context.insert("enabled_async", &enabled_async);
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = template()
-            .render("interface", &context)
-            .map_err(|e| std::io::Error::other(format!("Failed to render interface template: {e}")))?;
+        let rendered = template().render("interface", &context).map_err(|e| {
+            std::io::Error::other(format!("Failed to render interface template: {e}"))
+        })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -944,9 +927,9 @@ impl Generator {
         context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = template()
-            .render("parcelable", &context)
-            .map_err(|e| std::io::Error::other(format!("Failed to render parcelable template: {e}")))?;
+        let rendered = template().render("parcelable", &context).map_err(|e| {
+            std::io::Error::other(format!("Failed to render parcelable template: {e}"))
+        })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -1050,11 +1033,7 @@ impl Generator {
         Ok(add_indent(indent, rendered.trim()))
     }
 
-    fn decl_union(
-        &self,
-        decl: &parser::UnionDecl,
-        indent: usize,
-    ) -> Result<String, AidlError> {
+    fn decl_union(&self, decl: &parser::UnionDecl, indent: usize) -> Result<String, AidlError> {
         if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
         {
             return Ok(String::new());

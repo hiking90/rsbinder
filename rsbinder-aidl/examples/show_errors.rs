@@ -33,22 +33,13 @@ fn main() {
     // ── Syntax errors (parse phase) ─────────────────────
 
     // 1) identifier starting with a digit
-    demo_parse(
-        "syntax_error",
-        "interface IHello {\n    void 123bad();\n}",
-    );
+    demo_parse("syntax_error", "interface IHello {\n    void 123bad();\n}");
 
     // 2) missing semicolon
-    demo_parse(
-        "missing_semicolon",
-        "parcelable Foo {\n    int field\n}",
-    );
+    demo_parse("missing_semicolon", "parcelable Foo {\n    int field\n}");
 
     // 3) missing closing brace (EOF)
-    demo_parse(
-        "unclosed_brace",
-        "interface IBar {\n    void ok();\n",
-    );
+    demo_parse("unclosed_brace", "interface IBar {\n    void ok();\n");
 
     // ── Semantic errors (generator phase, via Builder) ───
 

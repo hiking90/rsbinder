@@ -162,7 +162,9 @@ impl Builder {
         self
     }
 
-    fn parse_file(filename: &Path) -> Result<(String, parser::Document, parser::SourceContext), AidlError> {
+    fn parse_file(
+        filename: &Path,
+    ) -> Result<(String, parser::Document, parser::SourceContext), AidlError> {
         println!("Parsing: {filename:?}");
         let source = fs::read_to_string(filename)?;
         let name = filename
@@ -235,7 +237,9 @@ impl Builder {
         Ok(content)
     }
 
-    fn parse_sources(&mut self) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
+    fn parse_sources(
+        &mut self,
+    ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
         let mut includes = take(&mut self.includes).into_iter().collect::<HashSet<_>>();
@@ -285,8 +289,7 @@ impl Builder {
                                 if !found {
                                     // The exact byte offset of an import statement is not preserved in the AST,
                                     // so search the source text for the import string to approximate the span.
-                                    let source_text =
-                                        fs::read_to_string(&path).unwrap_or_default();
+                                    let source_text = fs::read_to_string(&path).unwrap_or_default();
                                     let import_offset = source_text.find(import).unwrap_or(0);
                                     let import_len =
                                         if import_offset > 0 { import.len() } else { 0 };
@@ -297,10 +300,7 @@ impl Builder {
                                                 path.to_string_lossy().as_ref(),
                                                 source_text,
                                             ),
-                                            span: SourceSpan::new(
-                                                import_offset.into(),
-                                                import_len,
-                                            ),
+                                            span: SourceSpan::new(import_offset.into(), import_len),
                                         },
                                     ));
                                 }

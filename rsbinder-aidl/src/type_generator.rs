@@ -54,9 +54,10 @@ impl ArrayInfo {
             sizes: array_types
                 .iter()
                 .map(|t| {
-                    t.const_expr
-                        .clone()
-                        .map_or_else(|| 0, |v| v.calculate().and_then(|c| c.to_i64()).unwrap_or(0))
+                    t.const_expr.clone().map_or_else(
+                        || 0,
+                        |v| v.calculate().and_then(|c| c.to_i64()).unwrap_or(0),
+                    )
                 })
                 .collect(),
             value_type: value_type.clone(),
@@ -104,7 +105,12 @@ impl TypeGenerator {
                     array_types.push(ArrayInfo::new_list(&gen.to_value_type()?, &Vec::new()));
                     ValueType::Array(Vec::new())
                 }
-                None => return Err(make_type_error("Type \"List\" of AIDL must have Generic Type", aidl_type.name_span)),
+                None => {
+                    return Err(make_type_error(
+                        "Type \"List\" of AIDL must have Generic Type",
+                        aidl_type.name_span,
+                    ))
+                }
             },
             // "Map" => {
             //     is_primitive = false;
@@ -115,13 +121,17 @@ impl TypeGenerator {
                 let filename = parser::current_source_name();
                 let source = parser::current_source_text();
                 let (start, end) = aidl_type.name_span.unwrap_or((0, 0));
-                let src_name = if filename.is_empty() { "<type_generator>".to_string() } else { filename };
+                let src_name = if filename.is_empty() {
+                    "<type_generator>".to_string()
+                } else {
+                    filename
+                };
                 return Err(AidlError::from(SemanticError::UnsupportedType {
                     type_name: "FileDescriptor".to_string(),
                     help: Some("Use ParcelFileDescriptor instead".to_string()),
                     src: NamedSource::new(src_name, source),
                     span: SourceSpan::new(start.into(), end.saturating_sub(start)),
-                }))
+                }));
             }
             "ParcelFileDescriptor" => ValueType::FileDescriptor,
             "ParcelableHolder" => ValueType::Holder,
@@ -256,10 +266,16 @@ impl TypeGenerator {
         }
     }
 
-    pub fn nullable_at(mut self, annotation_span: Option<(usize, usize)>) -> Result<Self, AidlError> {
+    pub fn nullable_at(
+        mut self,
+        annotation_span: Option<(usize, usize)>,
+    ) -> Result<Self, AidlError> {
         if Self::is_primitive(&self.value_type) {
             return Err(make_type_error(
-                format!("Primitive type({:?}) cannot get nullable annotation", self.value_type),
+                format!(
+                    "Primitive type({:?}) cannot get nullable annotation",
+                    self.value_type
+                ),
                 annotation_span,
             ));
         }
@@ -276,7 +292,11 @@ impl TypeGenerator {
         self
     }
 
-    pub fn direction_at(mut self, direction: &Direction, direction_span: Option<(usize, usize)>) -> Result<Self, AidlError> {
+    pub fn direction_at(
+        mut self,
+        direction: &Direction,
+        direction_span: Option<(usize, usize)>,
+    ) -> Result<Self, AidlError> {
         if matches!(direction, Direction::Out | Direction::Inout)
             && (Self::is_primitive(&self.value_type)
                 || matches!(self.value_type, ValueType::String(_)))
@@ -669,13 +689,17 @@ impl TypeGenerator {
                     let array_info = self.array_types.first().unwrap();
                     let is_nullable =
                         self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
-                    match expr.calculate().and_then(|c| c.convert_to(&array_info.value_type)) {
+                    match expr
+                        .calculate()
+                        .and_then(|c| c.convert_to(&array_info.value_type))
+                    {
                         Ok(converted) => converted.value.to_init(
                             param
                                 .with_fixed_array(array_info.is_fixed())
                                 .with_nullable(is_nullable),
                         ),
-                        Err(_) => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
+                        Err(_) => ValueType::Void
+                            .to_init(param.with_fixed_array(false).with_nullable(false)),
                     }
                 } else {
                     match expr.calculate() {
@@ -695,12 +719,17 @@ impl TypeGenerator {
                             } else {
                                 // Normal processing for non-enum references
                                 match calculated.convert_to(&self.value_type) {
-                                    Ok(converted) => converted.value.to_init(param.with_fixed_array(false).with_nullable(false)),
-                                    Err(_) => calculated.value.to_init(param.with_fixed_array(false).with_nullable(false)),
+                                    Ok(converted) => converted.value.to_init(
+                                        param.with_fixed_array(false).with_nullable(false),
+                                    ),
+                                    Err(_) => calculated.value.to_init(
+                                        param.with_fixed_array(false).with_nullable(false),
+                                    ),
                                 }
                             }
                         }
-                        Err(_) => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
+                        Err(_) => ValueType::Void
+                            .to_init(param.with_fixed_array(false).with_nullable(false)),
                     }
                 };
                 if self.is_nullable {

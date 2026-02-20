@@ -131,9 +131,7 @@ impl Drop for NamespaceGuard {
 }
 
 pub fn current_namespace() -> Namespace {
-    NAMESPACE_STACK.with(|stack| {
-        stack.borrow().last().cloned().unwrap_or_default()
-    })
+    NAMESPACE_STACK.with(|stack| stack.borrow().last().cloned().unwrap_or_default())
 }
 
 pub fn set_current_document(document: &Document) {
@@ -443,7 +441,10 @@ pub struct InterfaceDecl {
 impl InterfaceDecl {
     pub fn pre_process(&mut self) {
         for decl in &mut self.constant_list {
-            decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
+            decl.const_expr = decl
+                .const_expr
+                .as_ref()
+                .map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
         }
     }
 }
@@ -463,7 +464,10 @@ impl ParcelableDecl {
     pub fn pre_process(&mut self) {
         for decl in &mut self.members {
             if let Declaration::Variable(decl) = decl {
-                decl.const_expr = decl.const_expr.as_ref().map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
+                decl.const_expr = decl
+                    .const_expr
+                    .as_ref()
+                    .map(|expr| expr.calculate().unwrap_or_else(|_| expr.clone()));
             }
         }
     }
@@ -1045,7 +1049,9 @@ fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, A
     Ok(annotation)
 }
 
-fn parse_annotation_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Annotation>, AidlError> {
+fn parse_annotation_list(
+    pairs: pest::iterators::Pairs<Rule>,
+) -> Result<Vec<Annotation>, AidlError> {
     let mut annotation_list = Vec::new();
     for pair in pairs {
         annotation_list.push(parse_annotation(pair.into_inner())?);
@@ -1141,7 +1147,9 @@ fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Result<Type, AidlError> {
                 r#type.non_array_type = parse_non_array_type(pair.into_inner())?;
             }
             Rule::array_type => {
-                r#type.array_types.push(parse_array_type(pair.into_inner())?);
+                r#type
+                    .array_types
+                    .push(parse_array_type(pair.into_inner())?);
             }
             _ => {
                 unreachable!("Unexpected rule in parse_type(): {}", pair);
@@ -1152,7 +1160,10 @@ fn parse_type(pairs: pest::iterators::Pairs<Rule>) -> Result<Type, AidlError> {
     Ok(r#type)
 }
 
-fn parse_variable_decl(pairs: pest::iterators::Pairs<Rule>, constant: bool) -> Result<VariableDecl, AidlError> {
+fn parse_variable_decl(
+    pairs: pest::iterators::Pairs<Rule>,
+    constant: bool,
+) -> Result<VariableDecl, AidlError> {
     let mut decl = VariableDecl {
         constant,
         ..Default::default()
@@ -1253,7 +1264,8 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, 
             }
             Rule::INTVALUE => {
                 let span = pair.as_span();
-                let expr = parse_intvalue(pair.as_str(), (span.start(), span.end()))?.calculate()
+                let expr = parse_intvalue(pair.as_str(), (span.start(), span.end()))?
+                    .calculate()
                     .map_err(|e| make_parse_error(e.message, span.start(), span.end()))?;
                 decl.intvalue = Some(match expr.value {
                     ValueType::Byte(v) => v as _,
@@ -1278,7 +1290,10 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, 
     Ok(decl)
 }
 
-fn parse_interface_members(pairs: pest::iterators::Pairs<Rule>, interface: &mut InterfaceDecl) -> Result<(), AidlError> {
+fn parse_interface_members(
+    pairs: pest::iterators::Pairs<Rule>,
+    interface: &mut InterfaceDecl,
+) -> Result<(), AidlError> {
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {
@@ -1298,7 +1313,9 @@ fn parse_interface_members(pairs: pest::iterators::Pairs<Rule>, interface: &mut 
             }
 
             Rule::decl => {
-                interface.members.append(&mut parse_decl(pair.into_inner())?);
+                interface
+                    .members
+                    .append(&mut parse_decl(pair.into_inner())?);
             }
 
             _ => unreachable!("Unexpected rule in parse_interface_members(): {}", pair),
@@ -1339,7 +1356,9 @@ fn parse_interface_decl(
     Ok(Declaration::Interface(interface))
 }
 
-fn parse_parcelable_members(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, AidlError> {
+fn parse_parcelable_members(
+    pairs: pest::iterators::Pairs<Rule>,
+) -> Result<Vec<Declaration>, AidlError> {
     let mut res = Vec::new();
 
     for pair in pairs {
@@ -1537,7 +1556,10 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, A
                 declarations.push(parse_enum_decl(annotation_list.clone(), pair.into_inner())?);
             }
             Rule::union_decl => {
-                declarations.push(parse_union_decl(annotation_list.clone(), pair.into_inner())?);
+                declarations.push(parse_union_decl(
+                    annotation_list.clone(),
+                    pair.into_inner(),
+                )?);
             }
 
             _ => unreachable!("Unexpected rule in parse_decl(): {}", pair),
@@ -1603,9 +1625,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
             // println!("{:?}", document);
         }
         Err(err) => {
-            return Err(
-                pest_error_to_diagnostic(err, &ctx.filename, &ctx.source).into(),
-            );
+            return Err(pest_error_to_diagnostic(err, &ctx.filename, &ctx.source).into());
         }
     }
 
@@ -1701,7 +1721,10 @@ mod tests {
         //     ConstExpr::default(),
         // );
 
-        assert_eq!(expr.calculate().unwrap(), ConstExpr::new(ValueType::Int64(-20)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int64(-20))
+        );
 
         Ok(())
     }

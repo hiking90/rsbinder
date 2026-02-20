@@ -38,7 +38,10 @@ interface IMixed {
         other => panic!("Expected MixedTransactionIds, got: {other}"),
     }
     if let AidlError::Semantic(se) = &err {
-        assert_eq!(se.code().unwrap().to_string(), "aidl::mixed_transaction_ids");
+        assert_eq!(
+            se.code().unwrap().to_string(),
+            "aidl::mixed_transaction_ids"
+        );
     }
 }
 
@@ -110,12 +113,13 @@ interface IDup {
         "#,
         "test.aidl",
     );
-    if let AidlError::Semantic(SemanticError::DuplicateTransactionCode {
-        span, related, ..
-    }) = &err
+    if let AidlError::Semantic(SemanticError::DuplicateTransactionCode { span, related, .. }) = &err
     {
         // span should be non-zero (pointing to first method)
-        assert!(!span.is_empty() || span.offset() > 0, "span should point to a method identifier");
+        assert!(
+            !span.is_empty() || span.offset() > 0,
+            "span should point to a method identifier"
+        );
         // related should have exactly 1 entry (the second method)
         assert_eq!(related.len(), 1, "expected 1 related diagnostic");
         let related_labels: Vec<_> = related[0]
@@ -157,11 +161,7 @@ fn test_import_not_found() {
     let tmp = std::env::temp_dir().join("rsbinder_test_import_not_found");
     std::fs::create_dir_all(&tmp).unwrap();
     let aidl_path = tmp.join("Foo.aidl");
-    std::fs::write(
-        &aidl_path,
-        "import foo.bar.NonExistent;\nparcelable Foo {}",
-    )
-    .unwrap();
+    std::fs::write(&aidl_path, "import foo.bar.NonExistent;\nparcelable Foo {}").unwrap();
 
     let result = rsbinder_aidl::Builder::new()
         .source(&aidl_path)
@@ -185,11 +185,7 @@ fn test_import_not_found_includes_help() {
     let tmp = std::env::temp_dir().join("rsbinder_test_import_help");
     std::fs::create_dir_all(&tmp).unwrap();
     let aidl_path = tmp.join("Bar.aidl");
-    std::fs::write(
-        &aidl_path,
-        "import nonexistent.Type;\nparcelable Bar {}",
-    )
-    .unwrap();
+    std::fs::write(&aidl_path, "import nonexistent.Type;\nparcelable Bar {}").unwrap();
 
     let result = rsbinder_aidl::Builder::new()
         .source(&aidl_path)
@@ -200,10 +196,7 @@ fn test_import_not_found_includes_help() {
     let err = result.unwrap_err();
     if let AidlError::Resolution(ref re) = err {
         let help = re.help().map(|h| h.to_string());
-        assert!(
-            help.is_some(),
-            "ImportNotFound should have a help message"
-        );
+        assert!(help.is_some(), "ImportNotFound should have a help message");
         assert!(
             help.unwrap().contains("include paths"),
             "help should mention include paths"
@@ -346,7 +339,10 @@ fn test_out_primitive_span_points_to_out_keyword() {
         let len = span.len();
         assert!(len > 0, "span should have non-zero length");
         let spanned_text = &input[offset..offset + len];
-        assert_eq!(spanned_text, "out", "span should point to 'out' keyword, got: '{spanned_text}'");
+        assert_eq!(
+            spanned_text, "out",
+            "span should point to 'out' keyword, got: '{spanned_text}'"
+        );
     } else {
         panic!("Expected InvalidOperation, got: {err}");
     }
@@ -362,7 +358,10 @@ fn test_inout_string_span_points_to_inout_keyword() {
         let len = span.len();
         assert!(len > 0, "span should have non-zero length");
         let spanned_text = &input[offset..offset + len];
-        assert_eq!(spanned_text, "inout", "span should point to 'inout' keyword, got: '{spanned_text}'");
+        assert_eq!(
+            spanned_text, "inout",
+            "span should point to 'inout' keyword, got: '{spanned_text}'"
+        );
     } else {
         panic!("Expected InvalidOperation, got: {err}");
     }
@@ -380,7 +379,10 @@ fn test_enum_bad_backing_span_points_to_enum_name() {
         let len = span.len();
         assert!(len > 0, "span should have non-zero length");
         let spanned_text = &input[offset..offset + len];
-        assert_eq!(spanned_text, "MyEnum", "span should point to enum name 'MyEnum', got: '{spanned_text}'");
+        assert_eq!(
+            spanned_text, "MyEnum",
+            "span should point to enum name 'MyEnum', got: '{spanned_text}'"
+        );
     } else {
         panic!("Expected InvalidOperation, got: {err}");
     }

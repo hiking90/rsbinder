@@ -276,16 +276,16 @@ impl ValueType {
     pub fn to_bool(&self) -> Result<bool, ConstExprError> {
         match self {
             ValueType::Void => Ok(false),
-            ValueType::String(_) => Err(ConstExprError::new("to_bool() for String is not supported")),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_bool() for String is not supported"))
+            }
             ValueType::Bool(v) => Ok(*v),
             ValueType::Char(_) => Ok(true),
             ValueType::Byte(v) => Ok(*v != 0),
             ValueType::Int32(v) => Ok(*v != 0),
             ValueType::Int64(v) => Ok(*v != 0),
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v != 0.),
-            ValueType::Array(_) => {
-                Err(ConstExprError::new("to_bool() for Array is not supported"))
-            }
+            ValueType::Array(_) => Err(ConstExprError::new("to_bool() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
@@ -304,23 +304,25 @@ impl ValueType {
                 let expr = self.calculate()?;
                 expr.to_bool()
             }
-            _ => Err(ConstExprError::new(format!("to_bool() not supported for {self:?}"))),
+            _ => Err(ConstExprError::new(format!(
+                "to_bool() not supported for {self:?}"
+            ))),
         }
     }
 
     pub fn to_f64(&self) -> Result<f64, ConstExprError> {
         match self {
             ValueType::Void => Ok(0.),
-            ValueType::String(_) => Err(ConstExprError::new("to_f64() for String is not supported")),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_f64() for String is not supported"))
+            }
             ValueType::Bool(v) => Ok(if *v { 1.0 } else { 0.0 }),
             ValueType::Char(v) => Ok(*v as i64 as _),
             ValueType::Byte(v) => Ok(*v as _),
             ValueType::Int32(v) => Ok(*v as _),
             ValueType::Int64(v) => Ok(*v as _),
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
-            ValueType::Array(_) => {
-                Err(ConstExprError::new("to_f64() for Array is not supported"))
-            }
+            ValueType::Array(_) => Err(ConstExprError::new("to_f64() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
@@ -339,23 +341,27 @@ impl ValueType {
                 let expr = self.calculate()?;
                 expr.to_f64()
             }
-            _ => Err(ConstExprError::new(format!("to_f64() not supported for {self:?}"))),
+            _ => Err(ConstExprError::new(format!(
+                "to_f64() not supported for {self:?}"
+            ))),
         }
     }
 
     pub fn to_i64(&self) -> Result<i64, ConstExprError> {
         match self {
             ValueType::Void => Ok(0),
-            ValueType::String(_) => Err(ConstExprError::new("to_i64() for String is not supported")),
+            ValueType::String(_) => {
+                Err(ConstExprError::new("to_i64() for String is not supported"))
+            }
             ValueType::Bool(v) => Ok(*v as _),
             ValueType::Char(v) => Ok(*v as _),
             ValueType::Byte(v) => Ok(*v as _),
             ValueType::Int32(v) => Ok(*v as _),
             ValueType::Int64(v) => Ok(*v as _),
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
-            ValueType::Array(_) => {
-                Err(ConstExprError::new(format!("to_i64() for Array is not supported: {self:?}")))
-            }
+            ValueType::Array(_) => Err(ConstExprError::new(format!(
+                "to_i64() for Array is not supported: {self:?}"
+            ))),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
                 match expr {
@@ -375,7 +381,9 @@ impl ValueType {
                 let expr = self.calculate()?;
                 expr.to_i64()
             }
-            _ => Err(ConstExprError::new(format!("to_i64() not supported for {self:?}"))),
+            _ => Err(ConstExprError::new(format!(
+                "to_i64() not supported for {self:?}"
+            ))),
         }
     }
 
@@ -520,7 +528,11 @@ impl ValueType {
         }
     }
 
-    fn calc_expr(lhs: &ConstExpr, operator: &str, rhs: &ConstExpr) -> Result<ConstExpr, ConstExprError> {
+    fn calc_expr(
+        lhs: &ConstExpr,
+        operator: &str,
+        rhs: &ConstExpr,
+    ) -> Result<ConstExpr, ConstExprError> {
         let lhs = lhs.calculate()?;
         let rhs = rhs.calculate()?;
 
@@ -530,8 +542,12 @@ impl ValueType {
         );
 
         match operator {
-            "||" => Ok(ConstExpr::new(ValueType::Bool(lhs.to_bool()? || rhs.to_bool()?))),
-            "&&" => Ok(ConstExpr::new(ValueType::Bool(lhs.to_bool()? && rhs.to_bool()?))),
+            "||" => Ok(ConstExpr::new(ValueType::Bool(
+                lhs.to_bool()? || rhs.to_bool()?,
+            ))),
+            "&&" => Ok(ConstExpr::new(ValueType::Bool(
+                lhs.to_bool()? && rhs.to_bool()?,
+            ))),
             "|" => {
                 arithmetic_bit_op!(lhs, |, rhs, "|", promoted)
             }
@@ -601,7 +617,10 @@ impl ValueType {
         self.calculate_with_visited(&mut std::collections::HashSet::new())
     }
 
-    fn calculate_with_visited(&self, visited: &mut std::collections::HashSet<String>) -> Result<ConstExpr, ConstExprError> {
+    fn calculate_with_visited(
+        &self,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<ConstExpr, ConstExprError> {
         match self {
             ValueType::Unary { operator, expr } => {
                 let expr = expr.value.calculate_with_visited(visited)?;
@@ -663,7 +682,9 @@ impl PartialOrd for ValueType {
             ValueType::Int64(v) => rhs.to_i64().ok().and_then(|r| v.partial_cmp(&(r as _))),
             ValueType::Char(v) => rhs.to_i64().ok().and_then(|r| (*v as i64).partial_cmp(&r)),
             ValueType::Bool(v) => rhs.to_bool().ok().and_then(|r| v.partial_cmp(&r)),
-            ValueType::Float(v) | ValueType::Double(v) => rhs.to_f64().ok().and_then(|r| v.partial_cmp(&r)),
+            ValueType::Float(v) | ValueType::Double(v) => {
+                rhs.to_f64().ok().and_then(|r| v.partial_cmp(&r))
+            }
             ValueType::Array(lhs_array) => {
                 if let ValueType::Array(rhs_array) = rhs {
                     lhs_array.partial_cmp(rhs_array)
@@ -793,11 +814,19 @@ impl ConstExpr {
         } else {
             match value_type {
                 ValueType::Void => Ok(Self::default()),
-                ValueType::String(_) => Ok(ConstExpr::new(ValueType::String(self.to_value_string()))),
-                ValueType::Byte(_) => Ok(ConstExpr::new(ValueType::Byte(self.to_i64()? as i8 as _))),
-                ValueType::Int32(_) => Ok(ConstExpr::new(ValueType::Int32(self.to_i64()? as i32 as _))),
+                ValueType::String(_) => {
+                    Ok(ConstExpr::new(ValueType::String(self.to_value_string())))
+                }
+                ValueType::Byte(_) => {
+                    Ok(ConstExpr::new(ValueType::Byte(self.to_i64()? as i8 as _)))
+                }
+                ValueType::Int32(_) => {
+                    Ok(ConstExpr::new(ValueType::Int32(self.to_i64()? as i32 as _)))
+                }
                 ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(self.to_i64()?))),
-                ValueType::Float(_) => Ok(ConstExpr::new(ValueType::Float(self.to_f64()? as f32 as _))),
+                ValueType::Float(_) => {
+                    Ok(ConstExpr::new(ValueType::Float(self.to_f64()? as f32 as _)))
+                }
                 ValueType::Double(_) => Ok(ConstExpr::new(ValueType::Float(self.to_f64()?))),
                 ValueType::Bool(_) => Ok(ConstExpr::new(ValueType::Bool(self.to_bool()?))),
                 ValueType::Char(_) => {
@@ -836,7 +865,10 @@ mod tests {
     fn test_expression_arithmatic() {
         let expr = ValueType::new_expr(ValueType::Int32(10), "+", ValueType::Int32(10));
 
-        assert_eq!(expr.calculate().unwrap(), ConstExpr::new(ValueType::Int32(20)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(20))
+        );
 
         let expr = ValueType::new_expr(ValueType::Byte(1), "<<", ValueType::Byte(31));
 
@@ -849,7 +881,10 @@ mod tests {
 
         let expr = ValueType::new_expr(ValueType::Byte(10), "/", ValueType::Float(2.0));
 
-        assert_eq!(expr.calculate().unwrap(), ConstExpr::new(ValueType::Float(5.0)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Float(5.0))
+        );
 
         let expr = ValueType::new_expr(ValueType::Float(10.0), "%", ValueType::Float(2.0));
 
@@ -860,7 +895,10 @@ mod tests {
 
         let expr = ValueType::new_expr(ValueType::Int32(10), "%", ValueType::Bool(true));
 
-        assert_eq!(expr.calculate().unwrap(), ConstExpr::new(ValueType::Int32(0)));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(0))
+        );
     }
 
     // #[test]
