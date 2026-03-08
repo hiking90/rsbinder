@@ -123,23 +123,22 @@ interface IDup {
         "test.aidl",
     );
     if let AidlError::Semantic(se) = &err {
-    if let SemanticError::DuplicateTransactionCode { span, related, .. } = se.as_ref()
-    {
-        // span should be non-zero (pointing to first method)
-        assert!(
-            !span.is_empty() || span.offset() > 0,
-            "span should point to a method identifier"
-        );
-        // related should have exactly 1 entry (the second method)
-        assert_eq!(related.len(), 1, "expected 1 related diagnostic");
-        let related_labels: Vec<_> = related[0]
-            .labels()
-            .expect("related must have labels")
-            .collect();
-        assert!(!related_labels.is_empty());
-    } else {
-        panic!("Expected DuplicateTransactionCode, got: {err}");
-    }
+        if let SemanticError::DuplicateTransactionCode { span, related, .. } = se.as_ref() {
+            // span should be non-zero (pointing to first method)
+            assert!(
+                !span.is_empty() || span.offset() > 0,
+                "span should point to a method identifier"
+            );
+            // related should have exactly 1 entry (the second method)
+            assert_eq!(related.len(), 1, "expected 1 related diagnostic");
+            let related_labels: Vec<_> = related[0]
+                .labels()
+                .expect("related must have labels")
+                .collect();
+            assert!(!related_labels.is_empty());
+        } else {
+            panic!("Expected DuplicateTransactionCode, got: {err}");
+        }
     } else {
         panic!("Expected Semantic error, got: {err}");
     }
