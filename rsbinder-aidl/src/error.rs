@@ -406,7 +406,7 @@ mod tests {
             help: None,
         };
         let aidl_err: AidlError = parse_err.into();
-        let _box_err: Box<dyn Error> = Box::new(aidl_err);
+        let _box_err: Box<dyn Error> = aidl_err.into();
     }
 
     // 1.1h: pest Pos location → SourceSpan conversion
