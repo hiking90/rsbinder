@@ -32,9 +32,12 @@ interface IMixed {
         "test.aidl",
     );
     match &err {
-        AidlError::Semantic(SemanticError::MixedTransactionIds { interface, .. }) => {
-            assert_eq!(interface, "IMixed");
-        }
+        AidlError::Semantic(se) => match se.as_ref() {
+            SemanticError::MixedTransactionIds { interface, .. } => {
+                assert_eq!(interface, "IMixed");
+            }
+            other => panic!("Expected MixedTransactionIds, got: {other}"),
+        },
         other => panic!("Expected MixedTransactionIds, got: {other}"),
     }
     if let AidlError::Semantic(se) = &err {
@@ -58,19 +61,22 @@ interface IDup {
         "test.aidl",
     );
     match &err {
-        AidlError::Semantic(SemanticError::DuplicateTransactionCode {
-            method1,
-            method2,
-            code,
-            ..
-        }) => {
-            assert_eq!(*code, 10);
-            // One of m1/m2 should be method1, the other method2
-            assert!(
-                (method1 == "m1" && method2 == "m2") || (method1 == "m2" && method2 == "m1"),
-                "Expected m1 and m2, got: {method1}, {method2}"
-            );
-        }
+        AidlError::Semantic(se) => match se.as_ref() {
+            SemanticError::DuplicateTransactionCode {
+                method1,
+                method2,
+                code,
+                ..
+            } => {
+                assert_eq!(*code, 10);
+                // One of m1/m2 should be method1, the other method2
+                assert!(
+                    (method1 == "m1" && method2 == "m2") || (method1 == "m2" && method2 == "m1"),
+                    "Expected m1 and m2, got: {method1}, {method2}"
+                );
+            }
+            other => panic!("Expected DuplicateTransactionCode, got: {other}"),
+        },
         other => panic!("Expected DuplicateTransactionCode, got: {other}"),
     }
 }
@@ -88,9 +94,12 @@ interface IOver {
         "test.aidl",
     );
     match &err {
-        AidlError::Semantic(SemanticError::TransactionCodeOverflow { code, .. }) => {
-            assert!(*code > u32::MAX as i64);
-        }
+        AidlError::Semantic(se) => match se.as_ref() {
+            SemanticError::TransactionCodeOverflow { code, .. } => {
+                assert!(*code > u32::MAX as i64);
+            }
+            other => panic!("Expected TransactionCodeOverflow, got: {other}"),
+        },
         other => panic!("Expected TransactionCodeOverflow, got: {other}"),
     }
     if let AidlError::Semantic(se) = &err {
@@ -113,7 +122,8 @@ interface IDup {
         "#,
         "test.aidl",
     );
-    if let AidlError::Semantic(SemanticError::DuplicateTransactionCode { span, related, .. }) = &err
+    if let AidlError::Semantic(se) = &err {
+    if let SemanticError::DuplicateTransactionCode { span, related, .. } = se.as_ref()
     {
         // span should be non-zero (pointing to first method)
         assert!(
@@ -130,6 +140,9 @@ interface IDup {
     } else {
         panic!("Expected DuplicateTransactionCode, got: {err}");
     }
+    } else {
+        panic!("Expected Semantic error, got: {err}");
+    }
 }
 
 // 3.1e: MixedTransactionIds span points to interface name
@@ -142,16 +155,20 @@ interface IMixed {
 }
     "#;
     let err = expect_generation_error(input, "test.aidl");
-    if let AidlError::Semantic(SemanticError::MixedTransactionIds { span, .. }) = &err {
-        // span should point to the interface name "IMixed"
-        let offset = span.offset();
-        let len = span.len();
-        assert!(len > 0, "span should have non-zero length");
-        // Verify the span covers "IMixed" in the source
-        let spanned_text = &input[offset..offset + len];
-        assert_eq!(spanned_text, "IMixed", "span should cover interface name");
+    if let AidlError::Semantic(se) = &err {
+        if let SemanticError::MixedTransactionIds { span, .. } = se.as_ref() {
+            // span should point to the interface name "IMixed"
+            let offset = span.offset();
+            let len = span.len();
+            assert!(len > 0, "span should have non-zero length");
+            // Verify the span covers "IMixed" in the source
+            let spanned_text = &input[offset..offset + len];
+            assert_eq!(spanned_text, "IMixed", "span should cover interface name");
+        } else {
+            panic!("Expected MixedTransactionIds, got: {err}");
+        }
     } else {
-        panic!("Expected MixedTransactionIds, got: {err}");
+        panic!("Expected Semantic error, got: {err}");
     }
 }
 
@@ -194,7 +211,7 @@ fn test_import_not_found_includes_help() {
 
     assert!(result.is_err());
     let err = result.unwrap_err();
-    if let AidlError::Resolution(ref re) = err {
+    if let AidlError::Resolution(re) = &err {
         let help = re.help().map(|h| h.to_string());
         assert!(help.is_some(), "ImportNotFound should have a help message");
         assert!(
@@ -334,17 +351,21 @@ fn test_parse_error_blocks_semantic_analysis() {
 fn test_out_primitive_span_points_to_out_keyword() {
     let input = "interface IFoo {\n    void foo(out int x);\n}";
     let err = expect_generation_error(input, "test.aidl");
-    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
-        let offset = span.offset();
-        let len = span.len();
-        assert!(len > 0, "span should have non-zero length");
-        let spanned_text = &input[offset..offset + len];
-        assert_eq!(
-            spanned_text, "out",
-            "span should point to 'out' keyword, got: '{spanned_text}'"
-        );
+    if let AidlError::Semantic(se) = &err {
+        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
+            let offset = span.offset();
+            let len = span.len();
+            assert!(len > 0, "span should have non-zero length");
+            let spanned_text = &input[offset..offset + len];
+            assert_eq!(
+                spanned_text, "out",
+                "span should point to 'out' keyword, got: '{spanned_text}'"
+            );
+        } else {
+            panic!("Expected InvalidOperation, got: {err}");
+        }
     } else {
-        panic!("Expected InvalidOperation, got: {err}");
+        panic!("Expected Semantic error, got: {err}");
     }
 }
 
@@ -353,17 +374,21 @@ fn test_out_primitive_span_points_to_out_keyword() {
 fn test_inout_string_span_points_to_inout_keyword() {
     let input = "interface IFoo {\n    void bar(inout String s);\n}";
     let err = expect_generation_error(input, "test.aidl");
-    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
-        let offset = span.offset();
-        let len = span.len();
-        assert!(len > 0, "span should have non-zero length");
-        let spanned_text = &input[offset..offset + len];
-        assert_eq!(
-            spanned_text, "inout",
-            "span should point to 'inout' keyword, got: '{spanned_text}'"
-        );
+    if let AidlError::Semantic(se) = &err {
+        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
+            let offset = span.offset();
+            let len = span.len();
+            assert!(len > 0, "span should have non-zero length");
+            let spanned_text = &input[offset..offset + len];
+            assert_eq!(
+                spanned_text, "inout",
+                "span should point to 'inout' keyword, got: '{spanned_text}'"
+            );
+        } else {
+            panic!("Expected InvalidOperation, got: {err}");
+        }
     } else {
-        panic!("Expected InvalidOperation, got: {err}");
+        panic!("Expected Semantic error, got: {err}");
     }
 }
 
@@ -374,16 +399,20 @@ fn test_inout_string_span_points_to_inout_keyword() {
 fn test_enum_bad_backing_span_points_to_enum_name() {
     let input = "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1 }";
     let err = expect_generation_error(input, "test.aidl");
-    if let AidlError::Semantic(SemanticError::InvalidOperation { span, .. }) = &err {
-        let offset = span.offset();
-        let len = span.len();
-        assert!(len > 0, "span should have non-zero length");
-        let spanned_text = &input[offset..offset + len];
-        assert_eq!(
-            spanned_text, "MyEnum",
-            "span should point to enum name 'MyEnum', got: '{spanned_text}'"
-        );
+    if let AidlError::Semantic(se) = &err {
+        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
+            let offset = span.offset();
+            let len = span.len();
+            assert!(len > 0, "span should have non-zero length");
+            let spanned_text = &input[offset..offset + len];
+            assert_eq!(
+                spanned_text, "MyEnum",
+                "span should point to enum name 'MyEnum', got: '{spanned_text}'"
+            );
+        } else {
+            panic!("Expected InvalidOperation, got: {err}");
+        }
     } else {
-        panic!("Expected InvalidOperation, got: {err}");
+        panic!("Expected Semantic error, got: {err}");
     }
 }

@@ -14,15 +14,15 @@ use thiserror::Error;
 pub enum AidlError {
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Parse(#[from] ParseError),
+    Parse(Box<ParseError>),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Semantic(#[from] SemanticError),
+    Semantic(Box<SemanticError>),
 
     #[error(transparent)]
     #[diagnostic(transparent)]
-    Resolution(#[from] ResolutionError),
+    Resolution(Box<ResolutionError>),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -34,6 +34,24 @@ pub enum AidlError {
         #[related]
         errors: Vec<AidlError>,
     },
+}
+
+impl From<ParseError> for AidlError {
+    fn from(e: ParseError) -> Self {
+        AidlError::Parse(Box::new(e))
+    }
+}
+
+impl From<SemanticError> for AidlError {
+    fn from(e: SemanticError) -> Self {
+        AidlError::Semantic(Box::new(e))
+    }
+}
+
+impl From<ResolutionError> for AidlError {
+    fn from(e: ResolutionError) -> Self {
+        AidlError::Resolution(Box::new(e))
+    }
 }
 
 impl AidlError {
@@ -449,12 +467,12 @@ mod tests {
     #[test]
     fn test_aidl_error_collect_flatten() {
         let make_parse_err = |msg: &str| {
-            AidlError::Parse(ParseError {
+            AidlError::Parse(Box::new(ParseError {
                 src: NamedSource::new("test.aidl", msg.to_string()),
                 span: span(0, 1),
                 message: msg.to_string(),
                 help: None,
-            })
+            }))
         };
 
         let a = make_parse_err("error A");
@@ -476,12 +494,12 @@ mod tests {
     // 1.1l: AidlError::collect() — single error is not wrapped in Multiple
     #[test]
     fn test_aidl_error_collect_single() {
-        let err = AidlError::Parse(ParseError {
+        let err = AidlError::Parse(Box::new(ParseError {
             src: NamedSource::new("test.aidl", "bad".to_string()),
             span: span(0, 3),
             message: "syntax error".to_string(),
             help: None,
-        });
+        }));
         let result = AidlError::collect(vec![err]);
         assert!(
             matches!(result, Some(AidlError::Parse(_))),

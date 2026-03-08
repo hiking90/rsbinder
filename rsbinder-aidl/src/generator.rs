@@ -1130,17 +1130,20 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
-            AidlError::Semantic(SemanticError::NegativeTransactionCode {
-                interface,
-                method,
-                code,
-                ..
-            }) => {
-                assert_eq!(interface, "ITest");
-                assert_eq!(method, "m");
-                assert_eq!(code, -1);
-            }
-            other => panic!("Expected NegativeTransactionCode, got: {other:?}"),
+            AidlError::Semantic(se) => match *se {
+                SemanticError::NegativeTransactionCode {
+                    ref interface,
+                    ref method,
+                    code,
+                    ..
+                } => {
+                    assert_eq!(interface, "ITest");
+                    assert_eq!(method, "m");
+                    assert_eq!(code, -1);
+                }
+                other => panic!("Expected NegativeTransactionCode, got: {other:?}"),
+            },
+            other => panic!("Expected Semantic error, got: {other:?}"),
         }
     }
 }

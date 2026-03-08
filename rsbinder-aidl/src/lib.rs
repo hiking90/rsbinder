@@ -1,9 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// rsbinder-aidl is a build-time AIDL compiler; large error types on the stack
-// have no meaningful performance impact, so suppress this clippy lint crate-wide.
-#![allow(clippy::result_large_err)]
 
 // #[macro_use]
 // extern crate lazy_static;
