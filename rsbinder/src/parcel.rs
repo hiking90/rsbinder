@@ -565,8 +565,8 @@ impl Parcel {
         self.data.reserve(pos + padded);
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
-                parcelable.as_ptr() as *const u8,
-                self.data.as_mut_ptr().add(pos) as *mut u8,
+                parcelable.as_ptr() as _,
+                self.data.as_mut_ptr().add(pos),
                 size,
             );
             if self.data.len() < pos + padded {
@@ -623,8 +623,8 @@ impl Parcel {
         self.data.reserve(pos + aligned);
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
-                data.as_ptr() as *const u8,
-                self.data.as_mut_ptr().add(pos) as *mut u8,
+                data.as_ptr(),
+                self.data.as_mut_ptr().add(pos),
                 unaligned,
             );
             if pos + aligned > self.data.len() {
@@ -751,8 +751,8 @@ impl Parcel {
         self.data.reserve(self.pos + size);
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
-                other.data.as_slice()[offset..offset + size].as_ptr() as *const u8,
-                self.data.as_mut_ptr().add(self.pos) as *mut u8,
+                other.data.as_slice()[offset..offset + size].as_ptr(),
+                self.data.as_mut_ptr().add(self.pos),
                 size,
             );
             if self.pos + size > self.data.len() {
