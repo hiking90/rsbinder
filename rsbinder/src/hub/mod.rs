@@ -309,22 +309,34 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
                 let result = android_12::get_service_debug_info(sm)?;
-                Ok(result.into_iter()
-                    .map(|info| ServiceDebugInfo { name: info.name, debugPid: info.debugPid })
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
                     .collect())
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
                 let result = android_13::get_service_debug_info(sm)?;
-                Ok(result.into_iter()
-                    .map(|info| ServiceDebugInfo { name: info.name, debugPid: info.debugPid })
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
                     .collect())
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
                 let result = android_14::get_service_debug_info(sm)?;
-                Ok(result.into_iter()
-                    .map(|info| ServiceDebugInfo { name: info.name, debugPid: info.debugPid })
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
                     .collect())
             }
             ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
