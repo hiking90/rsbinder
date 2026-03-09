@@ -205,24 +205,31 @@ impl From<&SIBinder> for flat_binder_object {
     }
 }
 
-impl From<(*const u8, usize)> for &flat_binder_object {
-    fn from(pointer: (*const u8, usize)) -> Self {
-        unsafe {
-            // Rust compiler requests 8 byte alignment, but flat_binder_object is 4 byte aligned.
-            // So, transmute must be used to convert the pointer.
-            #[allow(clippy::transmute_ptr_to_ref)]
-            std::mem::transmute::<*const u8, &flat_binder_object>(&*(pointer.0.add(pointer.1)))
-        }
-    }
+/// Reads a flat_binder_object from a potentially unaligned buffer position.
+///
+/// Parcel buffers use 4-byte alignment, but flat_binder_object requires 8-byte alignment
+/// due to its u64 fields. Using read_unaligned avoids alignment UB and returns a stack copy,
+/// which also eliminates lifetime soundness issues from the previous transmute approach.
+pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<flat_binder_object> {
+    let size = std::mem::size_of::<flat_binder_object>();
+    let bytes = data
+        .get(offset..offset + size)
+        .ok_or(StatusCode::NotEnoughData)?;
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const flat_binder_object) })
 }
 
-impl From<(*mut u8, usize)> for &mut flat_binder_object {
-    fn from(pointer: (*mut u8, usize)) -> Self {
-        unsafe {
-            #[allow(clippy::transmute_ptr_to_ref)]
-            std::mem::transmute::<*const u8, &mut flat_binder_object>(&*(pointer.0.add(pointer.1)))
-        }
-    }
+/// Writes a flat_binder_object to a potentially unaligned buffer position.
+pub(crate) fn write_flat_binder(
+    data: &mut [u8],
+    offset: usize,
+    obj: &flat_binder_object,
+) -> Result<()> {
+    let size = std::mem::size_of::<flat_binder_object>();
+    let bytes = data
+        .get_mut(offset..offset + size)
+        .ok_or(StatusCode::NotEnoughData)?;
+    unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
+    Ok(())
 }
 
 pub(crate) fn raw_pointer_to_strong_binder(

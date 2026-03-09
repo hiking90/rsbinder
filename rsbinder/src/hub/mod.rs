@@ -308,33 +308,36 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: Converting android_12::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
-                // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
-                // 2. Both have the same memory layout: name (String) + debugPid (i32)
-                // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
-                let a12_result = android_12::get_service_debug_info(sm)?;
-                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a12_result) };
-                Ok(a16_result)
+                let result = android_12::get_service_debug_info(sm)?;
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
+                    .collect())
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                // SAFETY: Converting android_13::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
-                // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
-                // 2. Both have the same memory layout: name (String) + debugPid (i32)
-                // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
-                let a13_result = android_13::get_service_debug_info(sm)?;
-                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a13_result) };
-                Ok(a16_result)
+                let result = android_13::get_service_debug_info(sm)?;
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
+                    .collect())
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: Converting android_14::ServiceDebugInfo to android_16::ServiceDebugInfo is safe because:
-                // 1. Both types represent identical AIDL parcelable definitions (android.os.ServiceDebugInfo)
-                // 2. Both have the same memory layout: name (String) + debugPid (i32)
-                // 3. Both are generated from the same ServiceDebugInfo.aidl file structure
-                let a14_result = android_14::get_service_debug_info(sm)?;
-                let a16_result: Vec<ServiceDebugInfo> = unsafe { std::mem::transmute(a14_result) };
-                Ok(a16_result)
+                let result = android_14::get_service_debug_info(sm)?;
+                Ok(result
+                    .into_iter()
+                    .map(|info| ServiceDebugInfo {
+                        name: info.name,
+                        debugPid: info.debugPid,
+                    })
+                    .collect())
             }
             ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
         }
