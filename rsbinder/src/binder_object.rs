@@ -205,24 +205,24 @@ impl From<&SIBinder> for flat_binder_object {
     }
 }
 
-impl From<(*const u8, usize)> for &flat_binder_object {
-    fn from(pointer: (*const u8, usize)) -> Self {
-        unsafe {
-            // Rust compiler requests 8 byte alignment, but flat_binder_object is 4 byte aligned.
-            // So, transmute must be used to convert the pointer.
-            #[allow(clippy::transmute_ptr_to_ref)]
-            std::mem::transmute::<*const u8, &flat_binder_object>(&*(pointer.0.add(pointer.1)))
-        }
-    }
+/// Reads a flat_binder_object from a potentially unaligned buffer position.
+///
+/// Parcel buffers use 4-byte alignment, but flat_binder_object requires 8-byte alignment
+/// due to its u64 fields. Using read_unaligned avoids alignment UB and returns a stack copy,
+/// which also eliminates lifetime soundness issues from the previous transmute approach.
+///
+/// # Safety
+/// `base.add(offset)` must point to a valid flat_binder_object within allocated memory.
+pub(crate) unsafe fn read_flat_binder(base: *const u8, offset: usize) -> flat_binder_object {
+    std::ptr::read_unaligned(base.add(offset) as *const flat_binder_object)
 }
 
-impl From<(*mut u8, usize)> for &mut flat_binder_object {
-    fn from(pointer: (*mut u8, usize)) -> Self {
-        unsafe {
-            #[allow(clippy::transmute_ptr_to_ref)]
-            std::mem::transmute::<*const u8, &mut flat_binder_object>(&*(pointer.0.add(pointer.1)))
-        }
-    }
+/// Writes a flat_binder_object to a potentially unaligned buffer position.
+///
+/// # Safety
+/// `base.add(offset)` must point to writable memory large enough for flat_binder_object.
+pub(crate) unsafe fn write_flat_binder(base: *mut u8, offset: usize, obj: &flat_binder_object) {
+    std::ptr::write_unaligned(base.add(offset) as *mut flat_binder_object, *obj);
 }
 
 pub(crate) fn raw_pointer_to_strong_binder(
