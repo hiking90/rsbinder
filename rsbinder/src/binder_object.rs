@@ -210,19 +210,26 @@ impl From<&SIBinder> for flat_binder_object {
 /// Parcel buffers use 4-byte alignment, but flat_binder_object requires 8-byte alignment
 /// due to its u64 fields. Using read_unaligned avoids alignment UB and returns a stack copy,
 /// which also eliminates lifetime soundness issues from the previous transmute approach.
-///
-/// # Safety
-/// `base.add(offset)` must point to a valid flat_binder_object within allocated memory.
-pub(crate) unsafe fn read_flat_binder(base: *const u8, offset: usize) -> flat_binder_object {
-    std::ptr::read_unaligned(base.add(offset) as *const flat_binder_object)
+pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<flat_binder_object> {
+    let size = std::mem::size_of::<flat_binder_object>();
+    let bytes = data
+        .get(offset..offset + size)
+        .ok_or(StatusCode::NotEnoughData)?;
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const flat_binder_object) })
 }
 
 /// Writes a flat_binder_object to a potentially unaligned buffer position.
-///
-/// # Safety
-/// `base.add(offset)` must point to writable memory large enough for flat_binder_object.
-pub(crate) unsafe fn write_flat_binder(base: *mut u8, offset: usize, obj: &flat_binder_object) {
-    std::ptr::write_unaligned(base.add(offset) as *mut flat_binder_object, *obj);
+pub(crate) fn write_flat_binder(
+    data: &mut [u8],
+    offset: usize,
+    obj: &flat_binder_object,
+) -> Result<()> {
+    let size = std::mem::size_of::<flat_binder_object>();
+    let bytes = data
+        .get_mut(offset..offset + size)
+        .ok_or(StatusCode::NotEnoughData)?;
+    unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
+    Ok(())
 }
 
 pub(crate) fn raw_pointer_to_strong_binder(

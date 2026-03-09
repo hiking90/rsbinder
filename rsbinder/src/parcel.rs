@@ -269,7 +269,10 @@ impl Parcel {
 
     pub fn close_file_descriptors(&self) {
         for offset in self.objects.as_slice() {
-            let obj = unsafe { read_flat_binder(self.data.as_ptr(), *offset as usize) };
+            let Ok(obj) = read_flat_binder(self.data.as_slice(), *offset as usize) else {
+                log::error!("Parcel: unable to read object at offset {offset}");
+                continue;
+            };
             if obj.header_type() == BINDER_TYPE_FD {
                 // Close the file descriptor
                 obj.owned_fd();
@@ -332,7 +335,7 @@ impl Parcel {
         let data_pos = self.pos as u64;
         let size = std::mem::size_of::<flat_binder_object>();
 
-        let obj = unsafe { read_flat_binder(self.read_aligned_data(size)?.as_ptr(), 0) };
+        let obj = read_flat_binder(self.read_aligned_data(size)?, 0)?;
 
         if !null_meta && obj.cookie == 0 && obj.pointer() == 0 {
             return Ok(obj);
@@ -770,14 +773,14 @@ impl Parcel {
                 let off = objects[i as usize] as usize - offset + start_pos;
                 objects[idx] = off as _;
                 idx += 1;
-                let mut flat = unsafe { read_flat_binder(self.data.as_ptr(), off) };
+                let mut flat = read_flat_binder(self.data.as_slice(), off)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
                     flat.set_handle(
                         rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0)?.into_raw_fd() as _,
                     );
                     flat.set_cookie(1);
-                    unsafe { write_flat_binder(self.data.as_mut_ptr(), off, &flat) };
+                    write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
                 }
             }
         }
@@ -791,7 +794,10 @@ impl Parcel {
         }
 
         for pos in self.objects.as_slice() {
-            let obj = unsafe { read_flat_binder(self.data.as_ptr(), *pos as usize) };
+            let Ok(obj) = read_flat_binder(self.data.as_slice(), *pos as usize) else {
+                log::error!("Parcel: unable to read object at position {pos}");
+                continue;
+            };
             obj.release()
                 .map_err(|e| log::error!("Parcel: unable to release object: {e:?}"))
                 .ok();
