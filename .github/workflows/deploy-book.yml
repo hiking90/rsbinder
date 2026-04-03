@@ -32,7 +32,7 @@ jobs:
           cargo install --version 0.12.6 mdbook-mermaid
       - name: Setup Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - name: Build with mdBook
         run: mdbook build book
       - name: Upload artifact
@@ -49,4 +49,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
