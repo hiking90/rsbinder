@@ -300,7 +300,8 @@ impl SerializeOption for str {
             None => parcel.write::<i32>(&-1),
 
             Some(text) => {
-                let mut utf16 = Vec::with_capacity(text.len() * 3); // Due to surrogate pair.
+                let mut utf16 = Vec::with_capacity(text.len() + 2); // Adding space for final 0 and
+                                                                    // padding.
                 utf16.extend(text.encode_utf16());
 
                 let len = utf16.len();
@@ -309,6 +310,7 @@ impl SerializeOption for str {
 
                 parcel.write::<i32>(&(len as i32))?;
                 let pad_size = crate::parcel::pad_size(utf16.len() * std::mem::size_of::<u16>());
+                utf16.resize(pad_size / std::mem::size_of::<u16>(), 0);
                 // SAFETY: We're creating a byte view of the UTF-16 encoded string.
                 // - utf16 is a valid Vec<u16> with proper alignment
                 // - pad_size was calculated with pad_size() to include padding
