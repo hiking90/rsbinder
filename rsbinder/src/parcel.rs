@@ -90,8 +90,12 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(data)
     }
 
-    fn from_raw_parts_mut(data: *mut T, len: usize) -> Self {
-        ParcelData::Slice(unsafe { std::slice::from_raw_parts_mut(data, len) })
+    unsafe fn from_raw_parts_mut(data: *mut T, len: usize) -> Self {
+        ParcelData::Slice(if len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(data, len) }
+        })
     }
 
     fn as_slice(&self) -> &[T] {
@@ -220,8 +224,8 @@ impl Parcel {
         ) -> Result<()>,
     ) -> Self {
         Parcel {
-            data: ParcelData::from_raw_parts_mut(data, length),
-            objects: ParcelData::from_raw_parts_mut(objects, object_count),
+            data: unsafe { ParcelData::from_raw_parts_mut(data, length) },
+            objects: unsafe { ParcelData::from_raw_parts_mut(objects, object_count) },
             pos: 0,
             next_object_hint: 0,
             request_header_present: false,
