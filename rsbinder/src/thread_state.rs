@@ -449,14 +449,18 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
-                            let reply = Parcel::from_ipc_parts(
-                                buffer as _,
-                                tr.data_size as _,
-                                offsets as _,
-                                (tr.offsets_size as usize)
-                                    / std::mem::size_of::<binder::binder_size_t>(),
-                                free_buffer,
-                            );
+                            // SAFETY: buffer and offsets are valid pointers from binder driver
+                            // transaction data, with sizes given by tr.data_size and tr.offsets_size
+                            let reply = unsafe {
+                                Parcel::from_ipc_parts(
+                                    buffer as _,
+                                    tr.data_size as _,
+                                    offsets as _,
+                                    (tr.offsets_size as usize)
+                                        / std::mem::size_of::<binder::binder_size_t>(),
+                                    free_buffer,
+                                )
+                            };
                             return Ok(Some(reply));
                         } else {
                             // SAFETY: Reading status code from binder transaction reply

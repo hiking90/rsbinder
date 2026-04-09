@@ -210,7 +210,11 @@ impl Parcel {
         }
     }
 
-    pub fn from_ipc_parts(
+    /// # Safety
+    /// - `data` must be valid for reads/writes of `length` bytes, or null if `length` is 0
+    /// - `objects` must be valid for reads/writes of `object_count` elements, or null if `object_count` is 0
+    /// - The memory must remain valid until the Parcel is dropped or `free_buffer` is called
+    pub unsafe fn from_ipc_parts(
         data: *mut u8,
         length: usize,
         objects: *mut binder_size_t,
@@ -224,8 +228,8 @@ impl Parcel {
         ) -> Result<()>,
     ) -> Self {
         Parcel {
-            data: unsafe { ParcelData::from_raw_parts_mut(data, length) },
-            objects: unsafe { ParcelData::from_raw_parts_mut(objects, object_count) },
+            data: ParcelData::from_raw_parts_mut(data, length),
+            objects: ParcelData::from_raw_parts_mut(objects, object_count),
             pos: 0,
             next_object_hint: 0,
             request_header_present: false,
