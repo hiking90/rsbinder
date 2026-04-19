@@ -947,3 +947,21 @@ pub mod Union {
     )?;
     Ok(())
 }
+
+#[test]
+fn test_unstructured_parcelable() -> Result<(), Box<dyn Error>> {
+    aidl_generator(
+        r#"
+        package android.os;
+
+        @JavaOnlyStableParcelable @NdkOnlyStableParcelable parcelable PersistableBundle cpp_header "binder/PersistableBundle.h" ndk_header "android/persistable_bundle_aidl.h" rust_type "crate::persistable_bundle::PersistableBundle";
+        "#,
+        r#"
+pub mod PersistableBundle {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    pub type PersistableBundle = crate::persistable_bundle::PersistableBundle;
+}
+        "#,
+    )?;
+    Ok(())
+}
