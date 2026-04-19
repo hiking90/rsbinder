@@ -17,10 +17,15 @@ annotation_list = { annotation+ }
 
 unannotated_decl = _{ parcelable_decl | interface_decl | enum_decl | union_decl }
 
+optional_unstructured_headers = {
+    CPP_HEADER ~ C_STR |
+    NDK_HEADER ~ C_STR |
+    RUST_TYPE ~ C_STR
+}
+
 parcelable_decl = {
     PARCELABLE ~ qualified_name ~ optional_type_params ~ "{" ~ parcelable_members* ~ "}" |
-    PARCELABLE ~ qualified_name ~ optional_type_params ~ ";" |
-    PARCELABLE ~ qualified_name ~ CPP_HEADER ~ C_STR ~ ";"
+    PARCELABLE ~ qualified_name ~ optional_type_params ~ optional_unstructured_headers* ~ ";"
 }
 
 interface_decl = {
@@ -108,7 +113,7 @@ parcelable_members = { (variable_decl | constant_decl | decl)+ }
 
 keywords = @{
     (
-        INTERFACE | ONEWAY | CONST | INOUT | IN | OUT | ENUM | UNION | CPP_HEADER | PARCELABLE |
+        INTERFACE | ONEWAY | CONST | INOUT | IN | OUT | ENUM | UNION | CPP_HEADER | NDK_HEADER | RUST_TYPE | PARCELABLE |
         TRUE_LITERAL | FALSE_LITERAL
     ) ~ &WHITESPACE
 }
@@ -125,7 +130,7 @@ annotation = {
 
 qualified_name = @{ identifier ~ ("." ~ identifier)* }
 
-identifier = { !keywords ~ (IDENTIFIER | CPP_HEADER) }
+identifier = { !keywords ~ (IDENTIFIER | CPP_HEADER | NDK_HEADER | RUST_TYPE) }
 
 constant_value_list = { const_expr ~ ("," ~ const_expr)* ~ ","? }
 
@@ -182,7 +187,9 @@ OUT = { "out" }
 INOUT = { "inout" }
 ENUM = _{ "enum" }
 UNION = _{ "union" }
-CPP_HEADER = _{ "cpp_header" }
+CPP_HEADER = { "cpp_header" }
+NDK_HEADER = { "ndk_header" }
+RUST_TYPE = { "rust_type" }
 PARCELABLE = _{ "parcelable" }
 IDENTIFIER = @{ ("_" | ASCII_ALPHA)+ ~ ("_" | ASCII_ALPHA | ASCII_DIGIT)* }
 TRUE_LITERAL = { "true" }

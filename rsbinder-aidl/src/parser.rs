@@ -456,6 +456,8 @@ pub struct ParcelableDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub cpp_header: String,
+    pub ndk_header: String,
+    pub rust_type: String,
     pub members: Vec<Declaration>,
     // pub name_dict: Option<HashMap<String, ConstExpr>>,
 }
@@ -1396,6 +1398,50 @@ fn parse_optional_type_params(pairs: pest::iterators::Pairs<Rule>) -> Vec<String
     res
 }
 
+fn parse_unstructured_parcelable(
+    parcelable: &mut ParcelableDecl,
+    mut pairs: pest::iterators::Pairs<Rule>,
+) -> Result<(), AidlError> {
+    enum HeaderType {
+        CppHeader,
+        NdkHeader,
+        RustType,
+    }
+
+    let (first, second) = pairs
+        .next()
+        .zip(pairs.next())
+        .expect("Incomplete rule in parse_unstructured_parcelable()");
+
+    let header = match first.as_rule() {
+        Rule::CPP_HEADER => HeaderType::CppHeader,
+        Rule::NDK_HEADER => HeaderType::NdkHeader,
+        Rule::RUST_TYPE => HeaderType::RustType,
+        _ => unreachable!(
+            "Unexpected rule in parse_unstructured_parcelable(): {}",
+            first
+        ),
+    };
+
+    match second.as_rule() {
+        Rule::C_STR => {
+            let str = second.as_str();
+            let str = str[1..str.len() - 1].into();
+            match header {
+                HeaderType::CppHeader => parcelable.cpp_header = str,
+                HeaderType::NdkHeader => parcelable.ndk_header = str,
+                HeaderType::RustType => parcelable.rust_type = str,
+            }
+        }
+        _ => unreachable!(
+            "Unexpected rule in parse_unstructured_parcelable(): {}",
+            second
+        ),
+    }
+
+    Ok(())
+}
+
 fn parse_parcelable_decl(
     annotation_list: Vec<Annotation>,
     pairs: pest::iterators::Pairs<Rule>,
@@ -1421,8 +1467,8 @@ fn parse_parcelable_decl(
                     .append(&mut parse_parcelable_members(pair.into_inner())?);
             }
 
-            Rule::C_STR => {
-                parcelable.cpp_header = pair.as_str().into();
+            Rule::optional_unstructured_headers => {
+                parse_unstructured_parcelable(&mut parcelable, pair.into_inner())?;
             }
 
             _ => unreachable!("Unexpected rule in parse_parcelable_decl(): {}", pair),

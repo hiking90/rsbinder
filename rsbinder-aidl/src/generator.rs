@@ -850,10 +850,29 @@ impl Generator {
             is_empty = true;
             // return Ok(String::new())
         }
+
+        if !decl.rust_type.is_empty() {
+            let rendered = format!(r#"
+pub mod {mod} {{
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    pub type {name} = {rust_type};
+}}
+"#, mod = &decl.name, name = &decl.name, rust_type = &decl.rust_type);
+            return Ok(add_indent(indent, rendered.trim()));
+        }
+
         if !decl.cpp_header.is_empty() {
             println!(
                 "cpp_header {} for Parcelable {} is not supported.",
                 decl.cpp_header, decl.name
+            );
+            is_empty = true;
+            // return Ok(String::new())
+        }
+        if !decl.ndk_header.is_empty() {
+            println!(
+                "ndk_header {} for Parcelable {} is not supported.",
+                decl.ndk_header, decl.name
             );
             is_empty = true;
             // return Ok(String::new())
