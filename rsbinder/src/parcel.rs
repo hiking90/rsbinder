@@ -773,14 +773,13 @@ impl Parcel {
         self.set_data_position(self.pos + size);
 
         if num_objects > 0 {
-            let mut idx = self.objects.len();
-            self.objects.resize(idx + (num_objects as usize));
+            let start = self.objects.len();
+            self.objects.resize(start + (num_objects as usize));
 
             let objects = self.objects.as_mut_slice();
-            for i in first_idx..=last_idx {
+            for (idx, i) in (start..).zip(first_idx..=last_idx) {
                 let off = objects[i as usize] as usize - offset + start_pos;
                 objects[idx] = off as _;
-                idx += 1;
                 let mut flat = read_flat_binder(self.data.as_slice(), off)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
