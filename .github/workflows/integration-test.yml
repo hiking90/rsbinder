@@ -145,6 +145,33 @@ jobs:
             --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
             --skip test_versioned_unknown_union_field_triggers_error
 
+      - name: Restart test_service for #[ignore]'d destructive tests
+        run: |
+          # The next step kills test_service to validate death-recipient and
+          # WIBinder::upgrade-after-obituary semantics. Restart the sync
+          # binary first; we run this destructive batch ONCE at the end
+          # because each test consumes the live test_service.
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run #[ignore]'d destructive tests (death-recipient + WIBinder fallibility)
+        run: |
+          # These tests kill test_service and would break parallel runs,
+          # so they are #[ignore]'d. Run them explicitly here, ONE AT A
+          # TIME (--test-threads=1) because they share a fragile
+          # post-kill state. test_wibinder_upgrade_after_obituary
+          # provides plan test plan #3's required `Err(DeadObject)`
+          # branch coverage on a real obituary path; without this step
+          # that acceptance criterion is not validated by CI.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            --test-threads=1 \
+            test_wibinder_upgrade_after_obituary \
+            test_death_recipient
+
       - name: Stop background services
         if: always()
         run: |

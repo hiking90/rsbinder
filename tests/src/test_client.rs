@@ -1787,15 +1787,27 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
 ///
 /// Under master pre-PR-#100 with aggressive concurrency, the cache
 /// could hand out a fresh `ProxyHandle` whose handle had been freed
-/// by a racing `BC_RELEASE`, surfacing as `DeadObject` /
-/// `BadType` / wrong descriptor. Under the cache-pin model the cache
-/// pin keeps the kernel slot alive across `strong = 0` windows, so
-/// every resurrection (case b) succeeds and yields the original
-/// descriptor.
+/// by a racing `BC_RELEASE`, surfacing as `DeadObject` / `BadType` /
+/// wrong descriptor. Under the cache-pin model the cache pin keeps
+/// the kernel slot alive across `strong = 0` windows, so every
+/// resurrection (case b) succeeds and yields the original descriptor.
 ///
-/// Stress assertion: across N×K iterations of "lookup + drop", every
-/// returned `Strong<dyn ITestService>` reports the canonical
-/// descriptor. No `DeadObject` / `BadType`.
+/// Stress strategy:
+///
+/// - **High thread count** (N=16): two threads per typical CI vCPU
+///   on a 2-vCPU runner, ample preemption pressure.
+/// - **Real transactions** (every iteration): each iteration runs an
+///   actual `RepeatString` transaction. If a race surfaced as a
+///   freed-but-cached handle, the kernel would reject the transaction
+///   with `DeadObject`, surfacing as a panic on the `expect("RepeatString
+///   must succeed")` instead of a silent descriptor-only check.
+/// - **Arc-identity invariant** (every iteration): two back-to-back
+///   lookups must yield the same `ProxyHandle` allocation while at
+///   least one Strong is alive. This catches a regression where the
+///   resurrection path accidentally allocates a fresh `ProxyHandle`
+///   while another thread still holds one.
+/// - **Immediate drop** drives the cache `Weak` to dangling between
+///   iterations, so subsequent lookups exercise case (b).
 #[test]
 fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
     init_test();
@@ -1805,8 +1817,8 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
     // path or case (b).
     let _seed = get_test_service();
 
-    const N: usize = 8;
-    const K: usize = 200;
+    const N: usize = 16;
+    const K: usize = 100;
     let expected = <BpTestService as ITestService::ITestService>::descriptor().to_string();
     let mut handles = Vec::with_capacity(N);
     for _ in 0..N {
@@ -1816,18 +1828,39 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
                 let svc: rsbinder::Strong<dyn ITestService::ITestService> =
                     hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
                         .expect("hub::get_interface must succeed");
-                let actual = svc.as_binder().descriptor().to_string();
+                let binder1 = svc.as_binder();
+                let actual = binder1.descriptor().to_string();
                 assert_eq!(
                     actual, expected,
                     "iteration {i}: descriptor mismatch; got '{actual}' expected '{expected}'"
                 );
-                // Optional ping — exercises the transaction path while
-                // the Arc is alive.
-                if i % 32 == 0 {
-                    svc.as_binder()
-                        .ping_binder()
-                        .expect("ping_binder must succeed across resurrections");
-                }
+
+                // Arc-identity invariant: a second lookup MUST return
+                // the same ProxyHandle while `svc` (and hence its
+                // Arc<ProxyHandle>) is alive. Production cache stores
+                // sync::Weak<ProxyHandle> exactly so that two
+                // concurrent lookups yielding live Arcs share the
+                // same allocation.
+                let svc2: rsbinder::Strong<dyn ITestService::ITestService> =
+                    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
+                        .expect("hub::get_interface must succeed (second lookup)");
+                assert_eq!(
+                    svc.as_binder(),
+                    svc2.as_binder(),
+                    "iteration {i}: Arc-identity invariant broken — two concurrent \
+                     lookups yielded different ProxyHandle allocations while both \
+                     Strong<ITestService> were alive"
+                );
+                drop(svc2);
+
+                // Real transaction — if the handle were freed-but-cached
+                // (the race this PR closes), the kernel would reject
+                // and `expect` would panic.
+                let echoed = svc
+                    .RepeatString("rsbinder-cache-pin")
+                    .expect("RepeatString must succeed across resurrections");
+                assert_eq!(echoed, "rsbinder-cache-pin");
+
                 // Immediate drop drives the cache `Weak` to dangling
                 // before the next iteration in this thread (and
                 // potentially before another thread's lookup).

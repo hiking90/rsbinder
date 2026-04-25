@@ -11,47 +11,78 @@
 //! RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
 //! ```
 //!
-//! ## Scope
+//! ## What this PoC does and does NOT validate
 //!
-//! Loom 0.7 does not model `Arc::Weak` / `Arc::downgrade`. Production
-//! `process_state::CacheEntry { weak: sync::Weak<ProxyHandle>, .. }`
-//! cannot be loom-modeled directly. This PoC instead verifies the
-//! **kernel-side invariants** (which are what the cache-pin model
-//! actually closes the race on) by representing the cache as
-//! "presence/absence of a pin record" without trying to model
-//! Arc-sharing across threads.
+//! **WARNING — read this before treating loom passes as production
+//! correctness evidence.** This is a Path-B simplified model, not an
+//! integration loom test. It re-implements a stripped-down version of
+//! the cache-pin state machine using `loom::sync::*`, then verifies
+//! invariants on that re-implementation. It does **not** loom-check
+//! the actual `process_state.rs` / `proxy.rs` / `thread_state.rs`
+//! code paths.
 //!
-//! Loom-checked invariants in this PoC:
+//! Concretely:
+//!
+//! - Loom 0.7 does not model `Arc::Weak` / `Arc::downgrade`.
+//!   Production `CacheEntry { weak: sync::Weak<ProxyHandle>, .. }`
+//!   cannot be loom-modeled directly, so the PoC's cache is
+//!   `RwLock<HashMap<u32, ()>>` — pin presence only, no Arc sharing.
+//!   The race that the cache-pin model closes (per-thread out-parcel
+//!   buffering, kernel BC_ACQUIRE seeing a freed slot) is captured
+//!   here only at the **kernel-state-invariant** level, not at the
+//!   per-thread out-parcel buffering level.
+//! - Production race detection lives in the **integration test
+//!   matrix** (`tests/src/test_client.rs::test_cache_pin_race_*`)
+//!   running 100 iterations × sync+async on real binderfs in CI.
+//!   Loom passing here is a *complementary* signal, not a substitute.
+//!
+//! ### Invariants this PoC's exhaustive interleaving DOES validate
 //!
 //! - **I1 (cache contains h ⟹ binder_ref(h).weak ≥ 1)** — under
 //!   exhaustive interleaving of N=2 worker threads doing
-//!   lookup/drop/lookup/drop loops, the mock kernel never sees
-//!   `BC_ACQUIRE` to a freed slot (`(0, 0)` state) when the cache
-//!   has a pin record for `h`.
+//!   lookup/drop loops, the mock kernel never sees `BC_ACQUIRE`
+//!   against a freed slot (`(0, 0)` state) when the cache has a pin
+//!   record for `h`.
 //! - **No double-pin** — case (b) (cache present) reuses the pin and
 //!   does not issue a second `BC_INCREFS` for the same handle.
-//! - **Paired BC_ACQUIRE / BC_RELEASE** — every `Arc<MockProxyHandle>`
-//!   allocation Drops exactly once, and Drop's `BC_RELEASE` always
-//!   lands on a live slot (kernel never rejects with `DeadObject`).
+//! - **Paired `BC_ACQUIRE` / `BC_RELEASE`** — every
+//!   `Arc<MockProxyHandle>` allocation Drops exactly once, and
+//!   Drop's `BC_RELEASE` always lands on a live slot.
 //!
-//! Out of scope (would require loom Weak support and Path-A integration):
+//! ### Why N=2 instead of plan-spec N=3
+//!
+//! Plan FOLLOW_UP_PR_100 test plan #6 specifies N=3. This PoC uses
+//! N=2 because the simplified single-handle model already saturates
+//! the relevant interleaving space at N=2: a third thread on the
+//! same handle cannot reach a qualitatively new interleaving — it
+//! just adds redundant copies of the existing two-thread
+//! interleavings (since the only operations are `lookup` and
+//! `drop`, which are commutative across threads at the cache-pin
+//! level). N=3 would be load-bearing for a Path-A integration that
+//! also models cross-thread out-parcel buffering, where a third
+//! thread can land BC_RELEASE between two others' commands. That
+//! integration is the proper place for N=3.
+//!
+//! ### Out of scope (would require Path-A integration)
 //!
 //! - **Arc-identity preservation** across concurrent lookups
 //!   (production guarantees `Arc::ptr_eq` between two `SIBinder`s
-//!   acquired for the same handle while any strong ref is alive —
-//!   this PoC creates a fresh Arc per lookup, so it cannot test that
-//!   property; AIDL out-parameter equality tests on the integration
-//!   side already cover it).
-//! - **Per-thread out-parcel buffering** effects on cross-thread BC_*
-//!   ordering (production wires BC_* through `thread_state.rs` which
-//!   buffers per thread; loom would need to model that buffer too).
-//! - **Obituary teardown timing** (BR_DEAD_BINDER → BC_DEAD_BINDER_DONE
-//!   → BC_DECREFS ordering).
+//!   acquired for the same handle while any strong ref is alive).
+//!   The integration test
+//!   `test_cache_pin_race_reproducer_no_descriptor_mismatch`
+//!   exercises this property on real binderfs.
+//! - **Per-thread out-parcel buffering** effects on cross-thread
+//!   `BC_*` ordering. Production wires `BC_*` through
+//!   `thread_state.rs` which buffers per thread; loom would need to
+//!   model that buffer too.
+//! - **Obituary teardown timing** (`BR_DEAD_BINDER` →
+//!   `BC_DEAD_BINDER_DONE` → `BC_DECREFS` ordering).
 //!
-//! These belong in a Path-A loom integration that swaps rsbinder's own
-//! sync primitives (process_state.rs cache RwLock, thread_state.rs
-//! THREAD_STATE thread-local, etc.) via cfg(loom). That refactor is a
-//! separate follow-up.
+//! Path-A integration would swap rsbinder's own sync primitives
+//! (process_state.rs cache RwLock, thread_state.rs THREAD_STATE
+//! thread-local, etc.) via cfg(loom) and add a `KernelCommander`
+//! trait abstraction over the ioctl path. That refactor is a
+//! separate follow-up tracked outside this PR.
 
 #![cfg(loom)]
 
