@@ -20,7 +20,7 @@ on:
       iterations:
         description: 'cargo test iterations for the Linux binder loop'
         required: false
-        default: '5'
+        default: '1'
         type: string
       run_android:
         description: 'Run the Android emulator matrix'
@@ -30,7 +30,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TEST_ITERATIONS: ${{ github.event.inputs.iterations || '5' }}
+  TEST_ITERATIONS: ${{ github.event.inputs.iterations || '1' }}
 
 jobs:
   # --------------------------------------------------------------------------
@@ -100,12 +100,15 @@ jobs:
           sleep 2
           kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to start"; cat test_service.log; exit 1; }
 
-      - name: Run cargo test (sync) — ${{ env.TEST_ITERATIONS }} iterations
+      - name: Run cargo test (sync) — ${{ env.TEST_ITERATIONS }} iteration(s)
         run: |
-          # Mirrors envsetup.sh::run_test — repeat to surface flakes / races.
-          # Issue #97 manifests as kernel-log warnings rather than test failures,
-          # so per-iteration test pass alone does not certify the fix; the
-          # dmesg check at the end is the actual regression gate.
+          # Issue #97 manifests as kernel-log warnings rather than test
+          # failures, and even a single non-oneway void call leaves a
+          # `BC_FREE_BUFFER no match` entry in dmesg when the regression is
+          # present, so one iteration is sufficient for the regression gate.
+          # envsetup.sh::run_test loops up to 100x locally to surface flakes —
+          # that goal is orthogonal to issue #97 and is left to the
+          # workflow_dispatch input for ad-hoc soak runs.
           #
           # The --skip list below corresponds to the unimplemented features
           # documented in tests/README.md. We skip the whole `test_renamed_interface_`
