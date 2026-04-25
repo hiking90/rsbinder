@@ -1719,9 +1719,29 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
         .as_proxy()
         .expect("test_service binder must be a proxy");
 
-    let count_initial = ProcessState::as_self()
-        .strong_ref_count_for_node(proxy_ref)
-        .expect("ioctl must succeed");
+    // BINDER_GET_NODE_INFO_FOR_REF requires CAP_SYS_NICE (or root) on
+    // mainline Linux — GitHub Actions Ubuntu runners run as the
+    // unprivileged `runner` user and the ioctl returns EPERM. Skip
+    // the test in that case rather than failing CI; the cache-pin
+    // model's invariants are independently exercised by the race
+    // reproducer + case-(b) round-trip tests above (no privileged
+    // ioctl required) and by the loom PoC. Real-device coverage
+    // (Android emulators, root Linux setups) still validates the
+    // kernel-side counts via this test.
+    let count_initial = match ProcessState::as_self().strong_ref_count_for_node(proxy_ref) {
+        Ok(n) => n,
+        Err(rsbinder::StatusCode::Errno(libc_errno))
+            if libc_errno == rustix::io::Errno::PERM.raw_os_error() =>
+        {
+            eprintln!(
+                "skipping test_kernel_strong_ref_count_one_per_proxy_handle: \
+                 BINDER_GET_NODE_INFO_FOR_REF returned EPERM (need root / CAP_SYS_NICE). \
+                 Cache-pin invariants are still covered by race-reproducer + case-(b) tests."
+            );
+            return;
+        }
+        Err(other) => panic!("ioctl failed unexpectedly: {other:?}"),
+    };
     assert!(
         count_initial >= 1,
         "kernel must report strong >= 1 while at least one Arc<ProxyHandle> is alive; \
@@ -1740,7 +1760,7 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
 
     let count_after_clones = ProcessState::as_self()
         .strong_ref_count_for_node(proxy_ref)
-        .expect("ioctl must succeed");
+        .expect("ioctl must succeed (we already verified permission above)");
     assert_eq!(
         count_after_clones, count_initial,
         "kernel strong count must NOT rise on SIBinder clone (cache-pin model invariant); \
