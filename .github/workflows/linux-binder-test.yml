@@ -52,7 +52,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build workspace
-        run: cargo build --workspace --tests
+        # --bins ensures rsb_device / rsb_hub / test_service[_async] are produced
+        # under target/debug/ where the later steps invoke them.
+        # --tests pre-compiles the integration test binaries so the per-iteration
+        # `cargo test` loop below does not pay rebuild cost on each pass.
+        run: cargo build --workspace --bins --tests
 
       - name: Setup binderfs and create binder device
         run: |
