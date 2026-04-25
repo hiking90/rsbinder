@@ -16,7 +16,7 @@ on:
       iterations:
         description: 'cargo test iterations for the Linux binder loop'
         required: false
-        default: '1'
+        default: '5'
         type: string
       run_linux:
         description: 'Run the Linux binder integration test'
@@ -31,7 +31,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TEST_ITERATIONS: ${{ github.event.inputs.iterations || '1' }}
+  TEST_ITERATIONS: ${{ github.event.inputs.iterations || '5' }}
 
 jobs:
   # --------------------------------------------------------------------------
@@ -107,22 +107,21 @@ jobs:
           # Issue #97 manifests as kernel-log warnings rather than test
           # failures, and even a single non-oneway void call leaves a
           # `BC_FREE_BUFFER no match` entry in dmesg when the regression is
-          # present, so one iteration is sufficient for the regression gate.
-          # envsetup.sh::run_test loops up to 100x locally to surface flakes —
-          # that goal is orthogonal to issue #97 and is left to the
-          # workflow_dispatch input for ad-hoc soak runs.
+          # present, so one iteration would already trip the gate. We loop
+          # 5x by default to also catch races/state-accumulation regressions
+          # in the proxy cache (the very class of bug this PR closes), giving
+          # the dmesg gate redundant coverage.
           #
-          # The --skip list below corresponds to the unimplemented features
-          # documented in tests/README.md. We skip the whole `test_renamed_interface_`
-          # family by prefix because in CI any of those tests can flake at the
-          # GetOldNameInterface lookup step (line 1059 of test_client.rs); the
-          # README only lists 3 of the 4 but the failure rotates between them
-          # depending on parallel-test scheduling. Skipping the family keeps
-          # the run focused on the issue #97 dmesg regression gate.
+          # The --skip list is restricted to the three test cases that
+          # tests/README.md still lists as unimplemented features. The
+          # `test_renamed_interface_*` family used to be skipped here too
+          # because of a flaky `GetOldNameInterface` lookup, but the
+          # underlying bug (silent BadType from an empty descriptor cached
+          # under a held write lock) is what this PR fixes — that family is
+          # now expected to pass and is left enabled as a regression check.
           for i in $(seq 1 "$TEST_ITERATIONS"); do
             echo "=== iteration $i / $TEST_ITERATIONS ==="
             RUST_BACKTRACE=1 cargo test --package tests -- \
-              --skip test_renamed_interface_ \
               --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
               --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
               --skip test_versioned_unknown_union_field_triggers_error
@@ -148,7 +147,6 @@ jobs:
           # is a setup gap in the async test binary, tracked separately and
           # not in scope for the issue #97 dmesg gate.
           RUST_BACKTRACE=1 cargo test --package tests -- \
-            --skip test_renamed_interface_ \
             --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
             --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
             --skip test_versioned_unknown_union_field_triggers_error \

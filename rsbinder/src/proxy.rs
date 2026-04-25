@@ -70,6 +70,17 @@ impl ProxyHandle {
         &self.descriptor
     }
 
+    /// Whether this proxy currently has no live user-visible references —
+    /// both strong and weak counters are at `INITIAL_STRONG_VALUE`. Used by
+    /// `ProcessState::release_*_under_cache_lock` to decide cache eviction
+    /// atomically with the kernel-side ref drop.
+    pub(crate) fn is_orphan(&self) -> bool {
+        use crate::ref_counter::INITIAL_STRONG_VALUE;
+        use std::sync::atomic::Ordering;
+        self.strong.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
+            && self.weak.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
+    }
+
     /// Submit a transaction to the remote service.
     pub fn submit_transact(
         &self,
@@ -279,22 +290,17 @@ impl IBinder for ProxyHandle {
     fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
         let handle = self.handle;
         self.strong.dec(|| {
-            thread_state::dec_strong_handle(handle)?;
-
-            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
-            // This means no active references exist (except WIBinder's Arc in cache)
-            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
-            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
-
-            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
-                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
-            {
-                // Both counters are reset - safe to remove from cache
-                // This prevents stale proxies when handles are reused (Issue #47)
-                ProcessState::as_self().expunge_handle(handle);
-            }
-
-            Ok(())
+            // Send BC_RELEASE and decide on cache eviction while holding the
+            // cache write lock. Doing the kernel ref drop OUTSIDE that lock
+            // races with concurrent lookups whose `inc_strong_handle`
+            // (BC_INCREFS) is sent while the lookup holds the cache read
+            // lock — the kernel can process BC_RELEASE first, free the
+            // handle, and reject (or strand) the BC_INCREFS, leaving a
+            // user-space proxy whose handle is no longer valid. Funneling
+            // both through the same write lock guarantees the binder
+            // driver sees the BC_INCREFS / BC_RELEASE pair in a consistent
+            // order with respect to user-space refs.
+            ProcessState::as_self().release_strong_under_cache_lock(handle, self)
         })
     }
 
@@ -305,24 +311,8 @@ impl IBinder for ProxyHandle {
 
     fn dec_weak(&self) -> Result<()> {
         let handle = self.handle;
-        self.weak.dec(|| {
-            thread_state::dec_weak_handle(handle)?;
-
-            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
-            // This means no active references exist (except WIBinder's Arc in cache)
-            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
-            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
-
-            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
-                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
-            {
-                // Both counters are reset - safe to remove from cache
-                // This prevents stale proxies when handles are reused (Issue #47)
-                ProcessState::as_self().expunge_handle(handle);
-            }
-
-            Ok(())
-        })
+        self.weak
+            .dec(|| ProcessState::as_self().release_weak_under_cache_lock(handle, self))
     }
 }
 

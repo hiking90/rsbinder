@@ -233,8 +233,29 @@ impl ProcessState {
             thread_state::set_call_restriction(original_call_restriction);
         }
 
-        // some binder objects do not have interface string
-        let interface: String = thread_state::query_interface(handle).unwrap_or_default();
+        // Hold the write lock across `query_interface` so that only one
+        // thread is performing the INTERFACE_TRANSACTION for `handle` at a
+        // time — under heavy parallel lookup load this naturally rate-limits
+        // the receiver's binder thread pool and avoids exhausting it with
+        // 100+ redundant queries for the same handle.
+        //
+        // Crucially do NOT silently swallow a transaction failure into an
+        // empty descriptor: doing so used to insert a permanent
+        // empty-descriptor entry into the cache, after which every
+        // `FromIBinder::try_from` for that handle returned `BadType` for
+        // the lifetime of the process (root cause of the intermittent
+        // CI flake on `test_renamed_interface_*` and similar tests).
+        // Propagate the error instead so the next caller retries.
+        let interface = match thread_state::query_interface(handle) {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!(
+                    "query_interface(handle={handle}) failed: {err:?}; \
+                     not caching, caller may retry"
+                );
+                return Err(err);
+            }
+        };
 
         let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, interface, stability);
         let weak = WIBinder::new(proxy)?;
@@ -281,20 +302,80 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Remove a proxy handle from the cache.
+    /// Send `BC_RELEASE` / `BC_DECREFS` to the kernel for `handle` while
+    /// holding the cache write lock, then drop the cache entry iff the
+    /// proxy is still orphaned (both strong and weak counters at
+    /// `INITIAL_STRONG_VALUE`).
     ///
-    /// This is called by ProxyHandle's Drop implementation to ensure that
-    /// when a proxy is destroyed, it is removed from the cache. This prevents
-    /// stale proxies from being returned when a handle is reused by the kernel.
+    /// Issue #47's stale-proxy fix needed to evict cache entries whose
+    /// user-visible refcounts had returned to "uninitialized." The original
+    /// implementation did the count check in the caller (`ProxyHandle::dec_*`)
+    /// BEFORE taking the cache lock, and called `dec_strong_handle` /
+    /// `dec_weak_handle` (which write `BC_RELEASE` / `BC_DECREFS` to the
+    /// out-parcel and flush) outside any lock. Two races followed:
     ///
-    /// This is equivalent to Android's ProcessState::expungeHandle().
-    pub(crate) fn expunge_handle(&self, handle: u32) {
+    ///   1. **Cache aliasing.** A concurrent
+    ///      `strong_proxy_for_handle_stability` lookup could inc the strong
+    ///      counter between the caller's check and the eventual map mutation,
+    ///      after which the cache was emptied even though a freshly-handed-out
+    ///      `Strong<...>` still referenced the now-orphaned ProxyHandle. The
+    ///      next lookup of the same kernel handle allocated a brand-new
+    ///      ProxyHandle, breaking the `Arc::ptr_eq` invariant that AIDL out-
+    ///      parameter equality relies on (e.g. `test_nullable_binder_array`).
+    ///
+    ///   2. **Kernel ref-count race.** Sending `BC_RELEASE` outside the lock
+    ///      let the binder driver process the release before a concurrent
+    ///      lookup's `BC_INCREFS` arrived; the kernel could free the handle
+    ///      and reject the late `BC_INCREFS`, leaving a user-space proxy
+    ///      whose handle was no longer valid. Subsequent transactions on
+    ///      that proxy returned `DeadObject` even though `Strong<...>` was
+    ///      still alive (e.g. intermittent `service.GetOldNameInterface()`
+    ///      failures in `test_renamed_interface_*`).
+    ///
+    /// Funneling the kernel-side ref drop AND the cache eviction through the
+    /// cache write lock closes both windows. The lookup path's
+    /// `weak.upgrade()` runs entirely inside the cache *read* lock, so any
+    /// `inc_strong_handle` (BC_INCREFS) it performs is dispatched to the
+    /// kernel before this function can acquire the *write* lock. By the time
+    /// we run, the binder driver sees the matched INC/RELEASE pair, the
+    /// counts here reflect the post-inc state, and `is_orphan()` correctly
+    /// keeps the entry cached for the still-live lookup.
+    pub(crate) fn release_strong_under_cache_lock(
+        &self,
+        handle: u32,
+        proxy: &ProxyHandle,
+    ) -> Result<()> {
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
-        handle_to_proxy.remove(&handle);
-        log::trace!("expunge_handle: removed handle {}", handle);
+
+        thread_state::dec_strong_handle(handle)?;
+
+        if proxy.is_orphan() {
+            handle_to_proxy.remove(&handle);
+            log::trace!("release_strong_under_cache_lock: removed handle {}", handle);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_weak_under_cache_lock(
+        &self,
+        handle: u32,
+        proxy: &ProxyHandle,
+    ) -> Result<()> {
+        let mut handle_to_proxy = self
+            .handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned");
+
+        thread_state::dec_weak_handle(handle)?;
+
+        if proxy.is_orphan() {
+            handle_to_proxy.remove(&handle);
+            log::trace!("release_weak_under_cache_lock: removed handle {}", handle);
+        }
+        Ok(())
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {
