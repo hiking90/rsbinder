@@ -1954,10 +1954,20 @@ fn test_wibinder_upgrade_after_obituary() {
         .killService()
         .expect("killService must succeed");
 
-    // Wait for the death notification.
-    let mut buf = String::new();
-    read_file.read_to_string(&mut buf).expect("read death pipe");
-    assert_eq!(buf, "died\n");
+    // Wait for the death notification. We cannot use `read_to_string`
+    // here: `recipient` (and therefore `write_file` inside its Mutex)
+    // stays alive until the end of this function, so the pipe's write
+    // end never closes and `read_to_string` would block forever
+    // waiting for EOF. Read exactly the 5 bytes the recipient wrote
+    // ("died\n") with `read_exact`, which returns as soon as the data
+    // is available without needing the writer side to close.
+    let mut buf = [0u8; 5];
+    read_file.read_exact(&mut buf).expect("read death pipe");
+    assert_eq!(&buf, b"died\n");
+
+    // Now we can drop `recipient` so the pipe writer side closes —
+    // not strictly required for the assertion below, but cleaner.
+    drop(recipient);
 
     // Drop our last Strong<dyn ITestService>; the obituary already
     // removed the cache entry, so the underlying `Arc<ProxyHandle>`
