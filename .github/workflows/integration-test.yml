@@ -1,20 +1,16 @@
 name: Integration Test
 
-# Combined Linux + Android integration test suite.
+# Combined Linux + Android integration test suite — manual trigger only.
 #
-# - The Linux job runs on every push and PR (cheap, ~10 min) so that the
-#   issue #97 dmesg regression cannot silently come back.
-# - The Android matrix is gated to workflow_dispatch (and limited to the
-#   repo owner) because each API level boots a full emulator and the matrix
-#   takes 30–45 min per leg.
-# - Manual `workflow_dispatch` runs both jobs in parallel — that is the
-#   "single request runs both tests" entry point.
+# Both jobs are cost-sensitive (the Linux binder job builds the workspace and
+# loops cargo test against a live rsb_hub; the Android matrix boots a full
+# emulator per API level). To keep CI minutes predictable, neither runs on
+# push/pull_request — the maintainer dispatches the workflow when integration
+# coverage is wanted (e.g. before cutting a release, or to validate a fix
+# that touches binder/IPC paths). A single dispatch runs both jobs in
+# parallel, which is the "one request runs both tests" entry point.
 
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
   workflow_dispatch:
     inputs:
       iterations:
@@ -22,6 +18,11 @@ on:
         required: false
         default: '1'
         type: string
+      run_linux:
+        description: 'Run the Linux binder integration test'
+        required: false
+        default: true
+        type: boolean
       run_android:
         description: 'Run the Android emulator matrix'
         required: false
@@ -38,6 +39,7 @@ jobs:
   # --------------------------------------------------------------------------
   linux-binder-test:
     name: Linux Binder Integration Test
+    if: github.actor == github.repository_owner && github.event.inputs.run_linux != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -192,7 +194,7 @@ jobs:
   # full Android emulator (~30 min each). Matrix runs in parallel.
   android-test:
     name: Android Test (API ${{ matrix.api-level }})
-    if: github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.event.inputs.run_android != 'false'
+    if: github.actor == github.repository_owner && github.event.inputs.run_android != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
