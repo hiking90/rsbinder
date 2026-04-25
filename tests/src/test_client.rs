@@ -1730,9 +1730,10 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     // kernel-side counts via this test.
     let count_initial = match ProcessState::as_self().strong_ref_count_for_node(proxy_ref) {
         Ok(n) => n,
-        Err(rsbinder::StatusCode::Errno(libc_errno))
-            if libc_errno == rustix::io::Errno::PERM.raw_os_error() =>
-        {
+        // EPERM maps to StatusCode::PermissionDenied (see
+        // rsbinder/src/error.rs's `From<rustix::io::Errno>` impl).
+        // Errno(EPERM) is therefore unreachable here.
+        Err(rsbinder::StatusCode::PermissionDenied) => {
             eprintln!(
                 "skipping test_kernel_strong_ref_count_one_per_proxy_handle: \
                  BINDER_GET_NODE_INFO_FOR_REF returned EPERM (need root / CAP_SYS_NICE). \
