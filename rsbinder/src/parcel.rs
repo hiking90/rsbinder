@@ -91,7 +91,20 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 
     unsafe fn from_raw_parts_mut(data: *mut T, len: usize) -> Self {
-        ParcelData::Slice(if len == 0 {
+        // For an empty IPC parcel the binder driver still allocates a buffer
+        // and returns its user-space address; that address must be returned
+        // verbatim in BC_FREE_BUFFER, so we cannot collapse `len == 0` to a
+        // dangling `&mut []` (whose `as_ptr()` is `NonNull::dangling()`, e.g.
+        // `0x1` for u8). Doing so causes the kernel to log
+        // `BC_FREE_BUFFER no match for buffer at offset ...` (issue #97).
+        //
+        // `slice::from_raw_parts_mut(data, 0)` is well-defined as long as
+        // `data` is non-null and properly aligned — both of which the binder
+        // ABI guarantees for non-empty replies. Only fall back to `&mut []`
+        // when `data` itself is null, preserving the null-pointer guard
+        // introduced in commit bae39ec.
+        ParcelData::Slice(if data.is_null() {
+            debug_assert_eq!(len, 0, "non-zero length with null data is invalid");
             &mut []
         } else {
             unsafe { std::slice::from_raw_parts_mut(data, len) }
@@ -990,5 +1003,82 @@ mod tests {
     #[test]
     fn test_errors() -> Result<()> {
         Ok(())
+    }
+
+    // Regression test for issue #97 (BC_FREE_BUFFER no match).
+    //
+    // When an IPC reply has data_size == 0 (e.g. a successful `void` AIDL
+    // method), the binder driver still allocates a buffer and returns its
+    // user-space address in `binder_transaction_data.data.ptr.buffer`. The
+    // receiver must echo that exact address back via `BC_FREE_BUFFER`. If
+    // `from_raw_parts_mut` collapsed the zero-length case to `&mut []` it
+    // would discard the kernel-supplied pointer and replace it with the
+    // empty-slice dangling pointer (0x1 for u8), causing the kernel to log
+    // `BC_FREE_BUFFER no match for buffer at offset ...001` on every empty
+    // reply. This test asserts the original pointer survives both the
+    // construction call and a Drop that funnels it back to free_buffer.
+    #[test]
+    fn from_ipc_parts_preserves_data_pointer_when_length_is_zero() {
+        use crate::sys::binder::binder_uintptr_t;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FREED_DATA_PTR: AtomicUsize = AtomicUsize::new(0);
+
+        fn capture(
+            _: Option<&Parcel>,
+            data: binder_uintptr_t,
+            _: usize,
+            _: binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            FREED_DATA_PTR.store(data as usize, Ordering::SeqCst);
+            Ok(())
+        }
+
+        // Page-aligned allocation stands in for the kernel-mapped buffer.
+        let mut backing = vec![0u8; 4096];
+        let original = backing.as_mut_ptr();
+
+        {
+            // SAFETY: `original` points to a valid allocation; `len == 0` exercises
+            // the regression path. `objects` is null with object_count == 0,
+            // exercising the preserved null guard.
+            let parcel =
+                unsafe { Parcel::from_ipc_parts(original, 0, std::ptr::null_mut(), 0, capture) };
+            assert_eq!(
+                parcel.as_ptr() as usize,
+                original as usize,
+                "as_ptr() must return the original buffer pointer for empty IPC parcels",
+            );
+        }
+
+        assert_eq!(
+            FREED_DATA_PTR.load(Ordering::SeqCst),
+            original as usize,
+            "BC_FREE_BUFFER must be issued with the original kernel-supplied pointer",
+        );
+    }
+
+    #[test]
+    fn from_ipc_parts_with_null_data_uses_empty_slice() {
+        // Preserves the null-pointer guard from commit bae39ec: a null `data`
+        // with `len == 0` is allowed (used elsewhere) and must not invoke
+        // `slice::from_raw_parts_mut` with a null pointer.
+        fn noop(
+            _: Option<&Parcel>,
+            _: crate::sys::binder::binder_uintptr_t,
+            _: usize,
+            _: crate::sys::binder::binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        let parcel = unsafe {
+            Parcel::from_ipc_parts(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, noop)
+        };
+        // Empty slice fallback — pointer is the dangling NonNull but no UB.
+        assert_eq!(parcel.data_size(), 0);
+        drop(parcel);
     }
 }
