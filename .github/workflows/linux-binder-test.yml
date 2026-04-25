@@ -1,0 +1,137 @@
+name: Linux Binder Test
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of cargo test iterations'
+        required: false
+        default: '5'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  TEST_ITERATIONS: ${{ github.event.inputs.iterations || '5' }}
+
+jobs:
+  linux-binder-test:
+    name: Linux Binder Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure binderfs is available
+        run: |
+          uname -a
+          cat /etc/os-release
+          # Three possibilities on a generic Ubuntu runner:
+          #   1) binderfs already built into the kernel (CONFIG_ANDROID_BINDERFS=y)
+          #   2) binder_linux module is already loadable (no install needed)
+          #   3) module ships in linux-modules-extra-* and must be apt-installed first
+          if grep -q binder /proc/filesystems; then
+            echo "binderfs already supported (built-in or module preloaded)"
+          elif sudo modprobe binder_linux 2>/dev/null; then
+            echo "binder_linux module loaded from existing modules tree"
+          else
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe binder_linux
+          fi
+          # Final gate — hard fail if binderfs still not visible
+          grep -q binder /proc/filesystems || { echo "::error::binderfs unavailable on this runner kernel"; exit 1; }
+          echo "binderfs OK"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --tests
+
+      - name: Setup binderfs and create binder device
+        run: |
+          # rsb_device mounts /dev/binderfs and creates the "binder" device
+          # with 0666 perms — matches DEFAULT_BINDER_PATH used by init_default()
+          sudo target/debug/rsb_device binder
+          ls -la /dev/binderfs/
+
+      - name: Clear kernel ring buffer
+        run: sudo dmesg -C
+
+      - name: Start rsb_hub
+        run: |
+          RUST_LOG=info nohup target/debug/rsb_hub > rsb_hub.log 2>&1 &
+          echo $! > rsb_hub.pid
+          sleep 1
+          kill -0 "$(cat rsb_hub.pid)" || { echo "::error::rsb_hub failed to start"; cat rsb_hub.log; exit 1; }
+
+      - name: Start test_service
+        run: |
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to start"; cat test_service.log; exit 1; }
+
+      - name: Run cargo test (sync) — ${{ env.TEST_ITERATIONS }} iterations
+        run: |
+          # Mirrors envsetup.sh::run_test — repeat to surface flakes / races.
+          # Issue #97 manifests as kernel-log warnings rather than test failures,
+          # so per-iteration test pass alone does not certify the fix; the
+          # dmesg check at the end is the actual regression gate.
+          set -e
+          for i in $(seq 1 "$TEST_ITERATIONS"); do
+            echo "=== iteration $i / $TEST_ITERATIONS ==="
+            RUST_BACKTRACE=1 cargo test --package tests
+          done
+
+      - name: Restart test_service for async run
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service_async > test_service_async.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service_async failed to start"; cat test_service_async.log; exit 1; }
+
+      - name: Run cargo test (async) — 1 iteration
+        run: |
+          # Async path exercises tokio runtime — covers the user's scenario in #97
+          # (oneway broadcasts spawned via tokio::runtime::Handle::spawn)
+          RUST_BACKTRACE=1 cargo test --package tests
+
+      - name: Stop background services
+        if: always()
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          [ -f rsb_hub.pid ] && sudo kill "$(cat rsb_hub.pid)" 2>/dev/null || true
+          sleep 1
+
+      - name: Check kernel log for binder errors (issue #97 regression gate)
+        run: |
+          echo "=== Captured dmesg ==="
+          sudo dmesg
+          echo "======================"
+          # Issue #97 signature: BC_FREE_BUFFER no match in proc->alloc.
+          # Other binder_user_error()s also indicate IPC misuse worth catching.
+          if sudo dmesg | grep -E "BC_FREE_BUFFER|binder_alloc.*no match" ; then
+            echo "::error::Binder kernel-log regression detected (see above)"
+            exit 1
+          fi
+          echo "OK: no binder kernel errors observed"
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binder-logs-${{ github.run_attempt }}
+          path: |
+            rsb_hub.log
+            test_service.log
+            test_service_async.log
+          if-no-files-found: ignore
