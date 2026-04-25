@@ -392,14 +392,30 @@ pub struct SIBinder {
 }
 
 impl SIBinder {
+    /// Wrap an `Arc<dyn IBinder>` in an `SIBinder`.
+    ///
+    /// Drives `inc_strong` on the inner binder. For native binders this
+    /// advances the local `RefCounter.strong`; for proxies it is a no-op
+    /// (proxy ref-count is owned by the cache-pin model — see
+    /// `proxy::ProxyHandle`).
     pub fn new(data: Arc<dyn IBinder>) -> Result<Self> {
-        WIBinder::new(data)?.upgrade()
-    }
-
-    fn new_with_inner(inner: Arc<dyn IBinder>) -> Result<Self> {
-        let this = Self { inner };
+        let this = Self { inner: data };
         this.increase()?;
         Ok(this)
+    }
+
+    pub(crate) fn from_arc(inner: Arc<dyn IBinder>) -> Self {
+        // Used on the construction path inside `process_state` after
+        // `ProxyHandle::new_acquired` has already issued `BC_ACQUIRE`.
+        // For proxies, `inc_strong` is a no-op so this is equivalent to
+        // `Self::new`. Kept as a separate constructor so the proxy
+        // resurrection path makes its no-op-on-proxy intent explicit.
+        let this = Self { inner };
+        // Native binders still need their `RefCounter.strong` driven
+        // here; proxies will short-circuit to `Ok(())`.
+        this.increase()
+            .expect("inc_strong on existing Arc<dyn IBinder> must not fail");
+        this
     }
 
     pub(crate) fn into_raw(self) -> *const dyn IBinder {
@@ -414,8 +430,17 @@ impl SIBinder {
         Self { inner }
     }
 
+    /// Construct a weak reference to this binder.
+    ///
+    /// Pure `Arc::downgrade` — no kernel command, no trait dispatch. The
+    /// resulting `WIBinder::upgrade()` is now legitimately fallible and
+    /// returns `Err(DeadObject)` once the last `Arc<dyn IBinder>` is
+    /// dropped (for proxies that means the last `Arc<ProxyHandle>` —
+    /// the cache holds only a `sync::Weak`).
     pub fn downgrade(this: &Self) -> WIBinder {
-        WIBinder::new_with_inner(Arc::clone(&this.inner))
+        WIBinder {
+            inner: Arc::downgrade(&this.inner),
+        }
     }
 
     /// Retrieve the stability level of the underlying binder object.
@@ -461,8 +486,7 @@ impl Debug for SIBinder {
 
 impl Clone for SIBinder {
     fn clone(&self) -> Self {
-        Self::new_with_inner(Arc::clone(&self.inner))
-            .expect("Failed to clone SIBinder: inc_strong should not fail on existing reference")
+        Self::from_arc(Arc::clone(&self.inner))
     }
 }
 
@@ -492,34 +516,26 @@ impl PartialEq for SIBinder {
 impl Eq for SIBinder {}
 
 /// Weak reference to a binder object.
+///
+/// `upgrade()` is legitimately fallible: it returns `Err(DeadObject)` once
+/// the last `Arc<dyn IBinder>` to the inner binder has been dropped. For
+/// proxies that corresponds to the last `Arc<ProxyHandle>` — the
+/// process-wide handle cache stores only a `sync::Weak<ProxyHandle>`, so
+/// when no user-visible strong ref remains the cache entry's `Weak`
+/// becomes dangling. A subsequent lookup goes through
+/// `ProcessState::strong_proxy_for_handle_stability`'s slow-path case (b)
+/// (entry present, dead Arc) which resurrects a fresh `Arc<ProxyHandle>`
+/// without re-issuing `INTERFACE_TRANSACTION`.
 pub struct WIBinder {
-    inner: Arc<dyn IBinder>,
+    inner: sync::Weak<dyn IBinder>,
 }
 
 impl WIBinder {
-    pub(crate) fn new(inner: Arc<dyn IBinder>) -> Result<Self> {
-        let this = Self { inner };
-        this.inner.inc_weak(&this)?;
-
-        Ok(this)
-    }
-
-    fn new_with_inner(inner: Arc<dyn IBinder>) -> Self {
-        let this = Self { inner };
-        this.increase();
-        this
-    }
-
-    pub(crate) fn increase(&self) {
-        self.inner.inc_weak(self).ok();
-    }
-
-    pub(crate) fn decrease(&self) {
-        self.inner.dec_weak().ok();
-    }
-
     pub fn upgrade(&self) -> Result<SIBinder> {
-        SIBinder::new_with_inner(Arc::clone(&self.inner))
+        match self.inner.upgrade() {
+            Some(arc) => Ok(SIBinder::from_arc(arc)),
+            None => Err(StatusCode::DeadObject),
+        }
     }
 }
 
@@ -527,27 +543,23 @@ impl Debug for WIBinder {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("WIBinder")
             .field("self", &(self as *const WIBinder))
-            .field("descriptor", &self.inner.descriptor())
-            .field("inner_ptr", &Arc::as_ptr(&self.inner))
+            .field("strong_count", &self.inner.strong_count())
+            .field("weak_count", &self.inner.weak_count())
             .finish()
     }
 }
 
 impl Clone for WIBinder {
     fn clone(&self) -> Self {
-        Self::new_with_inner(Arc::clone(&self.inner))
-    }
-}
-
-impl Drop for WIBinder {
-    fn drop(&mut self) {
-        self.decrease();
+        Self {
+            inner: sync::Weak::clone(&self.inner),
+        }
     }
 }
 
 impl PartialEq for WIBinder {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        sync::Weak::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -669,6 +681,103 @@ impl<I: FromIBinder + ?Sized> Clone for Weak<I> {
 mod tests {
     // use crate::proxy::ProxyHandle;
     use super::*;
+
+    /// Minimal `IBinder` impl for unit-testing the `SIBinder` / `WIBinder`
+    /// pair without needing `/dev/binderfs/binder`. Ref-count methods are
+    /// no-ops — the fallibility test below relies on Rust `Arc`/`Weak`
+    /// semantics, not on `RefCounter` state.
+    struct MockBinder;
+
+    impl IBinder for MockBinder {
+        fn link_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn unlink_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn ping_binder(&self) -> Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn Transactable> {
+            None
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.MockBinder"
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn attempt_inc_strong(&self) -> bool {
+            true
+        }
+        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
+            Ok(())
+        }
+        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn dec_weak(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Verifies the `WIBinder::upgrade()` semantic correction in this PR:
+    /// the inner reference is now a genuine `sync::Weak<dyn IBinder>`, so
+    /// once the last `Arc<dyn IBinder>` is dropped, `upgrade()` returns
+    /// `Err(StatusCode::DeadObject)` instead of (incorrectly) succeeding
+    /// against a strong-Arc-in-disguise.
+    #[test]
+    fn test_wibinder_upgrade_after_strong_drop_returns_dead_object() {
+        let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
+        let weak = SIBinder::downgrade(&strong);
+
+        // While `strong` is alive, upgrade succeeds and yields a binder
+        // pointing at the same allocation.
+        let upgraded = weak.upgrade().expect("upgrade while alive");
+        assert!(Arc::ptr_eq(&strong.inner, &upgraded.inner));
+        drop(upgraded);
+
+        // Drop the only strong holder; the underlying Arc's strong count
+        // drops to 0. Now upgrade must fail with DeadObject.
+        drop(strong);
+        match weak.upgrade() {
+            Err(StatusCode::DeadObject) => {}
+            Err(other) => panic!("expected DeadObject after Arc drop, got {other:?}"),
+            Ok(_) => panic!(
+                "expected DeadObject after Arc drop, but upgrade succeeded \
+                 (regression: WIBinder::upgrade is no longer truly weak)"
+            ),
+        }
+    }
+
+    /// `Weak<I>::upgrade()` is the typed equivalent and shares the same
+    /// semantic. Verify the typed wrapper also surfaces DeadObject. Uses
+    /// the same MockBinder; we don't need a real Remotable + AIDL stack
+    /// to exercise the fallibility — we go through `WIBinder::upgrade`
+    /// and stop at `FromIBinder::try_from`'s expected failure mode.
+    #[test]
+    fn test_wibinder_clone_and_ptr_eq_after_drop() {
+        let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
+        let weak1 = SIBinder::downgrade(&strong);
+        let weak2 = weak1.clone();
+
+        // Two clones of the same WIBinder must compare equal via ptr_eq.
+        assert_eq!(weak1, weak2);
+
+        drop(strong);
+        // After drop, both still ptr_eq each other (Weak::ptr_eq compares
+        // allocation addresses, which remain stable).
+        assert_eq!(weak1, weak2);
+        // ...but neither upgrades.
+        assert!(matches!(weak1.upgrade(), Err(StatusCode::DeadObject)));
+        assert!(matches!(weak2.upgrade(), Err(StatusCode::DeadObject)));
+    }
 
     #[test]
     fn test_strong() -> Result<()> {

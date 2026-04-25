@@ -16,7 +16,7 @@ on:
       iterations:
         description: 'cargo test iterations for the Linux binder loop'
         required: false
-        default: '5'
+        default: '100'
         type: string
       run_linux:
         description: 'Run the Linux binder integration test'
@@ -140,19 +140,10 @@ jobs:
         run: |
           # Async path exercises tokio runtime — covers the user's scenario in #97
           # (oneway broadcasts spawned via tokio::runtime::Handle::spawn).
-          #
-          # Additionally skip test_binder_extension_* tests that require the
-          # service-side to call set_extension(): only test_service.rs does
-          # that, test_service_async.rs has not been wired up for it. This
-          # is a setup gap in the async test binary, tracked separately and
-          # not in scope for the issue #97 dmesg gate.
           RUST_BACKTRACE=1 cargo test --package tests -- \
             --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
             --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
-            --skip test_versioned_unknown_union_field_triggers_error \
-            --skip test_binder_extension_get_from_remote \
-            --skip test_binder_extension_proxy_cache_with_ext \
-            --skip test_binder_extension_use_as_interface
+            --skip test_versioned_unknown_union_field_triggers_error
 
       - name: Stop background services
         if: always()

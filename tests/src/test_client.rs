@@ -1448,12 +1448,13 @@ fn test_hub() {
 
 /// Test for issue #47: cached interface string bug
 ///
-/// This test demonstrates the problem where handle_to_proxy cache
-/// returns a stale proxy with an incorrect descriptor when handles
-/// are reused for different services.
+/// Originally reproduced the case where `handle_to_proxy` returned a
+/// stale proxy with an incorrect descriptor when handles were reused
+/// for different services. The bug pattern below intentionally drove
+/// the kernel weak count for each service handle to zero between
+/// resolutions:
 ///
-/// Bug scenario from issue #47:
-/// ```
+/// ```ignore
 /// let service_manager = rsbinder::hub::default();
 /// let all_services = service_manager.list_services(0xf);
 /// for service_name in &all_services {
@@ -1462,7 +1463,18 @@ fn test_hub() {
 ///     service.dec_weak().unwrap();
 /// }
 /// ```
-/// The output shows all services have the same (first) descriptor.
+///
+/// Under the cache-pin model introduced by this PR, `dec_weak()` is a
+/// no-op on proxies — kernel weak refs are owned by the process-wide
+/// cache pin, not by user-side `WIBinder` clones. The test now
+/// vacuously demonstrates that lookup-after-zero is structurally safe:
+/// the cache `Weak<ProxyHandle>` may dangle, but the cache pin keeps
+/// `binder_ref(handle).weak >= 1`, so resurrection (slow-path case (b))
+/// reuses the cached descriptor and issues a fresh `BC_ACQUIRE` against
+/// a still-alive kernel slot. The `dec_weak()` calls below are kept as
+/// non-functional historical markers — if a future change accidentally
+/// re-introduces a code path where `dec_weak` is non-trivial on
+/// proxies, this test will exercise it.
 #[test]
 fn test_issue_47_cached_interface_string() {
     init_test();

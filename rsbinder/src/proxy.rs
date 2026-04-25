@@ -15,8 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{self, Arc, RwLock};
 
 use crate::{
-    binder::*, binder_object::*, error::*, parcel::*, parcelable::DeserializeOption,
-    process_state::ProcessState, ref_counter::RefCounter, thread_state,
+    binder::*, binder_object::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state,
 };
 
 /// Cache state for the extension binder object on the proxy side.
@@ -29,35 +28,43 @@ enum ExtensionCache {
 
 /// Handle for a proxy to a remote binder service.
 ///
-/// `ProxyHandle` represents the client-side handle to a remote service,
-/// managing the connection, transaction routing, and lifecycle events
-/// such as death notifications.
+/// Owns exactly **one kernel strong ref** (`BC_ACQUIRE` at construction,
+/// `BC_RELEASE` on `Drop`). The kernel weak ref that keeps the
+/// `binder_ref` slot alive across `strong = 0` windows is held by the
+/// process-wide cache pin (`ProcessState::handle_to_proxy`), not by this
+/// type — see `process_state::strong_proxy_for_handle_stability`.
 pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
     stability: Stability,
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
-
-    strong: RefCounter,
-    weak: RefCounter,
     extension: RwLock<ExtensionCache>,
 }
 
 impl ProxyHandle {
-    /// Create a new proxy handle for the given binder handle and descriptor.
-    /// Takes ownership of the descriptor String to avoid unnecessary allocation.
-    pub fn new(handle: u32, descriptor: String, stability: Stability) -> Arc<Self> {
-        Arc::new(Self {
+    /// Allocate a fresh `Arc<ProxyHandle>` and acquire one kernel strong ref
+    /// (`BC_ACQUIRE`). Caller must hold the `ProcessState::handle_to_proxy`
+    /// write lock and must have already issued+flushed the cache pin
+    /// (`BC_INCREFS`) for `handle` (sub-case (a)) or verified that an
+    /// existing cache entry's pin is still active (sub-case (b)) — the pin
+    /// keeps the `binder_ref` slot alive, so this `BC_ACQUIRE` cannot race
+    /// against a concurrent `BC_RELEASE` to a freed slot.
+    pub(crate) fn new_acquired(
+        handle: u32,
+        descriptor: String,
+        stability: Stability,
+    ) -> Result<Arc<Self>> {
+        let arc = Arc::new(Self {
             handle,
             descriptor,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
-            strong: Default::default(),
-            weak: Default::default(),
             extension: RwLock::new(ExtensionCache::NotQueried),
-        })
+        });
+        thread_state::inc_strong_handle(handle)?;
+        Ok(arc)
     }
 
     /// Get the underlying binder handle number.
@@ -68,17 +75,6 @@ impl ProxyHandle {
     /// Get the interface descriptor for this proxy.
     pub fn descriptor(&self) -> &str {
         &self.descriptor
-    }
-
-    /// Whether this proxy currently has no live user-visible references —
-    /// both strong and weak counters are at `INITIAL_STRONG_VALUE`. Used by
-    /// `ProcessState::release_*_under_cache_lock` to decide cache eviction
-    /// atomically with the kernel-side ref drop.
-    pub(crate) fn is_orphan(&self) -> bool {
-        use crate::ref_counter::INITIAL_STRONG_VALUE;
-        use std::sync::atomic::Ordering;
-        self.strong.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
-            && self.weak.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
     }
 
     /// Submit a transaction to the remote service.
@@ -162,6 +158,22 @@ impl Debug for ProxyHandle {
 impl PartialEq for ProxyHandle {
     fn eq(&self, other: &Self) -> bool {
         self.handle() == other.handle()
+    }
+}
+
+impl Drop for ProxyHandle {
+    fn drop(&mut self) {
+        // The cache pin's BC_INCREFS keeps `binder_ref(handle).weak >= 1`,
+        // so this BC_RELEASE is safe regardless of concurrent lookups: the
+        // kernel slot is alive on entry, and a future lookup that arrives
+        // after the strong count returns to 0 will resurrect a fresh
+        // `Arc<ProxyHandle>` via slow-path case (b).
+        if let Err(err) = thread_state::dec_strong_handle(self.handle) {
+            log::error!(
+                "BC_RELEASE for handle {} failed during Drop: {err:?}",
+                self.handle
+            );
+        }
     }
 }
 
@@ -262,57 +274,46 @@ impl IBinder for ProxyHandle {
         true
     }
 
-    fn inc_strong(&self, strong: &SIBinder) -> Result<()> {
-        // In the Android implementation, it simultaneously increases the weak reference,
-        // but until the necessity is confirmed, we will not support the related functionality here.
-        self.strong
-            .inc(|| thread_state::inc_strong_handle(self.handle(), strong.clone()))
+    // Proxy ref-count methods are no-ops under the cache-pin model.
+    //
+    // Kernel strong refs are owned 1-per-`Arc<ProxyHandle>` (acquired in
+    // `new_acquired`, released in `Drop`). Kernel weak refs are owned by
+    // the process-wide cache pin in `ProcessState::handle_to_proxy`. User-
+    // side `SIBinder` and `WIBinder` clone/drop is pure `Arc::clone` /
+    // `sync::Weak::clone` of the trait-object Arc — no kernel commands.
+
+    fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
+        Ok(())
     }
 
     fn attempt_inc_strong(&self) -> bool {
-        self.strong.attempt_inc(
+        // Unreachable on a proxy: every legitimate caller of
+        // `IBinder::attempt_inc_strong` for a proxy either already holds
+        // an `Arc<ProxyHandle>` (so the question is moot) or wants
+        // "atomically promote a weak ref to a strong ref" semantics — now
+        // covered by `Weak<I>::upgrade()` (which uses Rust's
+        // `sync::Weak::upgrade` CAS).
+        debug_assert!(
             false,
-            || {
-                if let Err(err) = thread_state::attempt_inc_strong_handle(self.handle()) {
-                    log::error!("Error in attempt_inc_strong_handle() is {err:?}");
-                    false
-                } else {
-                    true
-                }
-            },
-            || {
-                thread_state::dec_strong_handle(self.handle())
-                    .expect("Failed to decrease the binder strong reference count.");
-            },
-        )
+            "attempt_inc_strong called on ProxyHandle — should be unreachable \
+             (use Weak<I>::upgrade instead)"
+        );
+        // Release-build fallback: the cache pin keeps the kernel slot
+        // alive, so the legacy "succeed" contract is upheld for any
+        // vestigial caller that slips through.
+        true
     }
 
     fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        let handle = self.handle;
-        self.strong.dec(|| {
-            // Send BC_RELEASE and decide on cache eviction while holding the
-            // cache write lock. Doing the kernel ref drop OUTSIDE that lock
-            // races with concurrent lookups whose `inc_strong_handle`
-            // (BC_INCREFS) is sent while the lookup holds the cache read
-            // lock — the kernel can process BC_RELEASE first, free the
-            // handle, and reject (or strand) the BC_INCREFS, leaving a
-            // user-space proxy whose handle is no longer valid. Funneling
-            // both through the same write lock guarantees the binder
-            // driver sees the BC_INCREFS / BC_RELEASE pair in a consistent
-            // order with respect to user-space refs.
-            ProcessState::as_self().release_strong_under_cache_lock(handle, self)
-        })
+        Ok(())
     }
 
-    fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
-        self.weak
-            .inc(|| thread_state::inc_weak_handle(self.handle(), weak))
+    fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
+        Ok(())
     }
 
     fn dec_weak(&self) -> Result<()> {
-        let handle = self.handle;
-        self.weak
-            .dec(|| ProcessState::as_self().release_weak_under_cache_lock(handle, self))
+        Ok(())
     }
 }
 
@@ -333,23 +334,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_proxy_handle() {
-        let handle = ProxyHandle::new(1, "test".to_string(), Stability::Local);
+    fn test_proxy_handle_debug() {
+        // Direct `new_acquired` is unsafe in unit tests because there's no
+        // ProcessState backing — but the Debug impl just reads fields, so
+        // we can construct one synthetically via `Arc::new` of the inner
+        // struct without `BC_ACQUIRE`. We bypass `new_acquired` here.
+        let handle = Arc::new(ProxyHandle {
+            handle: 1,
+            descriptor: "test".to_string(),
+            stability: Stability::Local,
+            obituary_sent: AtomicBool::new(false),
+            recipients: RwLock::new(Vec::new()),
+            extension: RwLock::new(ExtensionCache::NotQueried),
+        });
         assert_eq!(handle.handle(), 1);
         assert_eq!(handle.descriptor(), "test");
 
         assert!(handle.as_transactable().is_none());
         assert!(handle.is_remote());
 
-        // Test for Debug trait
         let debug_str = format!("{handle:?}");
         assert_eq!(
             debug_str,
             "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
         );
 
-        // Test for PartialEq trait
-        let handle2 = ProxyHandle::new(1, "test".to_string(), Stability::Local);
-        assert_eq!(handle, handle2);
+        // Suppress drop's BC_RELEASE since this synthetic ProxyHandle never
+        // issued a BC_ACQUIRE — ProcessState isn't initialized in unit
+        // tests.
+        std::mem::forget(handle);
     }
 }
