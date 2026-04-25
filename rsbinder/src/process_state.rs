@@ -302,20 +302,39 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Remove a proxy handle from the cache.
+    /// Remove a proxy handle from the cache if and only if the proxy is still
+    /// orphaned (both strong and weak counts at `INITIAL_STRONG_VALUE`) at the
+    /// moment the cache write lock is held.
     ///
-    /// This is called by ProxyHandle's Drop implementation to ensure that
-    /// when a proxy is destroyed, it is removed from the cache. This prevents
-    /// stale proxies from being returned when a handle is reused by the kernel.
+    /// Issue #47's stale-proxy fix needed to evict cache entries whose user-
+    /// visible refcounts had returned to "uninitialized," but the original
+    /// `expunge_handle` did the count check in the caller (`dec_strong` /
+    /// `dec_weak`) before taking the cache lock. A concurrent
+    /// `strong_proxy_for_handle_stability` lookup could re-acquire the proxy
+    /// (incrementing its strong count) between the caller's check and the
+    /// `handle_to_proxy.write()` here — the lookup would then return an Arc
+    /// whose cache entry was about to be removed, and the *next* lookup would
+    /// allocate a fresh `ProxyHandle` for the same kernel handle. The two
+    /// `ProxyHandle` instances coexisted, breaking the `Arc::ptr_eq` invariant
+    /// that AIDL out-parameter equality (e.g. `test_nullable_binder_array`)
+    /// relies on.
     ///
-    /// This is equivalent to Android's ProcessState::expungeHandle().
-    pub(crate) fn expunge_handle(&self, handle: u32) {
+    /// Re-checking the counts under the write lock closes that window: the
+    /// lookup path's `weak.upgrade()` runs entirely inside the cache *read*
+    /// lock, so any `inc_strong` it performs is fully visible by the time we
+    /// acquire the *write* lock here. If the counts are no longer at
+    /// `INITIAL_STRONG_VALUE`, the proxy is in active use again and must
+    /// remain cached.
+    pub(crate) fn expunge_handle_if_orphan(&self, handle: u32, proxy: &ProxyHandle) {
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
-        handle_to_proxy.remove(&handle);
-        log::trace!("expunge_handle: removed handle {}", handle);
+
+        if proxy.is_orphan() {
+            handle_to_proxy.remove(&handle);
+            log::trace!("expunge_handle_if_orphan: removed handle {}", handle);
+        }
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {

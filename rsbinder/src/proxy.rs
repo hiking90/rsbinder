@@ -70,6 +70,17 @@ impl ProxyHandle {
         &self.descriptor
     }
 
+    /// Whether this proxy currently has no live user-visible references —
+    /// both strong and weak counters are at `INITIAL_STRONG_VALUE`. Used by
+    /// `ProcessState::expunge_handle_if_orphan` to make the cache eviction
+    /// decision atomic with respect to concurrent lookup re-acquisitions.
+    pub(crate) fn is_orphan(&self) -> bool {
+        use crate::ref_counter::INITIAL_STRONG_VALUE;
+        use std::sync::atomic::Ordering;
+        self.strong.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
+            && self.weak.count.load(Ordering::Acquire) == INITIAL_STRONG_VALUE
+    }
+
     /// Submit a transaction to the remote service.
     pub fn submit_transact(
         &self,
@@ -280,20 +291,13 @@ impl IBinder for ProxyHandle {
         let handle = self.handle;
         self.strong.dec(|| {
             thread_state::dec_strong_handle(handle)?;
-
-            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
-            // This means no active references exist (except WIBinder's Arc in cache)
-            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
-            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
-
-            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
-                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
-            {
-                // Both counters are reset - safe to remove from cache
-                // This prevents stale proxies when handles are reused (Issue #47)
-                ProcessState::as_self().expunge_handle(handle);
-            }
-
+            // Best-effort hint: ProcessState::expunge_handle_if_orphan re-checks
+            // the counts under the write lock, so a concurrent lookup that just
+            // re-acquired this proxy keeps it cached. This protects Issue #47's
+            // stale-proxy fix from a race in which the count check here and the
+            // map mutation in the old expunge_handle were not atomic, allowing
+            // two ProxyHandle instances for the same kernel handle to coexist.
+            ProcessState::as_self().expunge_handle_if_orphan(handle, self);
             Ok(())
         })
     }
@@ -307,20 +311,7 @@ impl IBinder for ProxyHandle {
         let handle = self.handle;
         self.weak.dec(|| {
             thread_state::dec_weak_handle(handle)?;
-
-            // Check if both strong and weak counts are reset (INITIAL_STRONG_VALUE)
-            // This means no active references exist (except WIBinder's Arc in cache)
-            let strong_count = self.strong.count.load(std::sync::atomic::Ordering::Relaxed);
-            let weak_count = self.weak.count.load(std::sync::atomic::Ordering::Relaxed);
-
-            if strong_count == crate::ref_counter::INITIAL_STRONG_VALUE
-                && weak_count == crate::ref_counter::INITIAL_STRONG_VALUE
-            {
-                // Both counters are reset - safe to remove from cache
-                // This prevents stale proxies when handles are reused (Issue #47)
-                ProcessState::as_self().expunge_handle(handle);
-            }
-
+            ProcessState::as_self().expunge_handle_if_orphan(handle, self);
             Ok(())
         })
     }
