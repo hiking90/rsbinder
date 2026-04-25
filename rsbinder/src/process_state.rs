@@ -233,8 +233,29 @@ impl ProcessState {
             thread_state::set_call_restriction(original_call_restriction);
         }
 
-        // some binder objects do not have interface string
-        let interface: String = thread_state::query_interface(handle).unwrap_or_default();
+        // Hold the write lock across `query_interface` so that only one
+        // thread is performing the INTERFACE_TRANSACTION for `handle` at a
+        // time — under heavy parallel lookup load this naturally rate-limits
+        // the receiver's binder thread pool and avoids exhausting it with
+        // 100+ redundant queries for the same handle.
+        //
+        // Crucially do NOT silently swallow a transaction failure into an
+        // empty descriptor: doing so used to insert a permanent
+        // empty-descriptor entry into the cache, after which every
+        // `FromIBinder::try_from` for that handle returned `BadType` for
+        // the lifetime of the process (root cause of the intermittent
+        // CI flake on `test_renamed_interface_*` and similar tests).
+        // Propagate the error instead so the next caller retries.
+        let interface = match thread_state::query_interface(handle) {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!(
+                    "query_interface(handle={handle}) failed: {err:?}; \
+                     not caching, caller may retry"
+                );
+                return Err(err);
+            }
+        };
 
         let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, interface, stability);
         let weak = WIBinder::new(proxy)?;
