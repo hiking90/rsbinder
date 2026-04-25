@@ -302,39 +302,80 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Remove a proxy handle from the cache if and only if the proxy is still
-    /// orphaned (both strong and weak counts at `INITIAL_STRONG_VALUE`) at the
-    /// moment the cache write lock is held.
+    /// Send `BC_RELEASE` / `BC_DECREFS` to the kernel for `handle` while
+    /// holding the cache write lock, then drop the cache entry iff the
+    /// proxy is still orphaned (both strong and weak counters at
+    /// `INITIAL_STRONG_VALUE`).
     ///
-    /// Issue #47's stale-proxy fix needed to evict cache entries whose user-
-    /// visible refcounts had returned to "uninitialized," but the original
-    /// `expunge_handle` did the count check in the caller (`dec_strong` /
-    /// `dec_weak`) before taking the cache lock. A concurrent
-    /// `strong_proxy_for_handle_stability` lookup could re-acquire the proxy
-    /// (incrementing its strong count) between the caller's check and the
-    /// `handle_to_proxy.write()` here — the lookup would then return an Arc
-    /// whose cache entry was about to be removed, and the *next* lookup would
-    /// allocate a fresh `ProxyHandle` for the same kernel handle. The two
-    /// `ProxyHandle` instances coexisted, breaking the `Arc::ptr_eq` invariant
-    /// that AIDL out-parameter equality (e.g. `test_nullable_binder_array`)
-    /// relies on.
+    /// Issue #47's stale-proxy fix needed to evict cache entries whose
+    /// user-visible refcounts had returned to "uninitialized." The original
+    /// implementation did the count check in the caller (`ProxyHandle::dec_*`)
+    /// BEFORE taking the cache lock, and called `dec_strong_handle` /
+    /// `dec_weak_handle` (which write `BC_RELEASE` / `BC_DECREFS` to the
+    /// out-parcel and flush) outside any lock. Two races followed:
     ///
-    /// Re-checking the counts under the write lock closes that window: the
-    /// lookup path's `weak.upgrade()` runs entirely inside the cache *read*
-    /// lock, so any `inc_strong` it performs is fully visible by the time we
-    /// acquire the *write* lock here. If the counts are no longer at
-    /// `INITIAL_STRONG_VALUE`, the proxy is in active use again and must
-    /// remain cached.
-    pub(crate) fn expunge_handle_if_orphan(&self, handle: u32, proxy: &ProxyHandle) {
+    ///   1. **Cache aliasing.** A concurrent
+    ///      `strong_proxy_for_handle_stability` lookup could inc the strong
+    ///      counter between the caller's check and the eventual map mutation,
+    ///      after which the cache was emptied even though a freshly-handed-out
+    ///      `Strong<...>` still referenced the now-orphaned ProxyHandle. The
+    ///      next lookup of the same kernel handle allocated a brand-new
+    ///      ProxyHandle, breaking the `Arc::ptr_eq` invariant that AIDL out-
+    ///      parameter equality relies on (e.g. `test_nullable_binder_array`).
+    ///
+    ///   2. **Kernel ref-count race.** Sending `BC_RELEASE` outside the lock
+    ///      let the binder driver process the release before a concurrent
+    ///      lookup's `BC_INCREFS` arrived; the kernel could free the handle
+    ///      and reject the late `BC_INCREFS`, leaving a user-space proxy
+    ///      whose handle was no longer valid. Subsequent transactions on
+    ///      that proxy returned `DeadObject` even though `Strong<...>` was
+    ///      still alive (e.g. intermittent `service.GetOldNameInterface()`
+    ///      failures in `test_renamed_interface_*`).
+    ///
+    /// Funneling the kernel-side ref drop AND the cache eviction through the
+    /// cache write lock closes both windows. The lookup path's
+    /// `weak.upgrade()` runs entirely inside the cache *read* lock, so any
+    /// `inc_strong_handle` (BC_INCREFS) it performs is dispatched to the
+    /// kernel before this function can acquire the *write* lock. By the time
+    /// we run, the binder driver sees the matched INC/RELEASE pair, the
+    /// counts here reflect the post-inc state, and `is_orphan()` correctly
+    /// keeps the entry cached for the still-live lookup.
+    pub(crate) fn release_strong_under_cache_lock(
+        &self,
+        handle: u32,
+        proxy: &ProxyHandle,
+    ) -> Result<()> {
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
 
+        thread_state::dec_strong_handle(handle)?;
+
         if proxy.is_orphan() {
             handle_to_proxy.remove(&handle);
-            log::trace!("expunge_handle_if_orphan: removed handle {}", handle);
+            log::trace!("release_strong_under_cache_lock: removed handle {}", handle);
         }
+        Ok(())
+    }
+
+    pub(crate) fn release_weak_under_cache_lock(
+        &self,
+        handle: u32,
+        proxy: &ProxyHandle,
+    ) -> Result<()> {
+        let mut handle_to_proxy = self
+            .handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned");
+
+        thread_state::dec_weak_handle(handle)?;
+
+        if proxy.is_orphan() {
+            handle_to_proxy.remove(&handle);
+            log::trace!("release_weak_under_cache_lock: removed handle {}", handle);
+        }
+        Ok(())
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {

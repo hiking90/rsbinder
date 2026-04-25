@@ -72,8 +72,8 @@ impl ProxyHandle {
 
     /// Whether this proxy currently has no live user-visible references —
     /// both strong and weak counters are at `INITIAL_STRONG_VALUE`. Used by
-    /// `ProcessState::expunge_handle_if_orphan` to make the cache eviction
-    /// decision atomic with respect to concurrent lookup re-acquisitions.
+    /// `ProcessState::release_*_under_cache_lock` to decide cache eviction
+    /// atomically with the kernel-side ref drop.
     pub(crate) fn is_orphan(&self) -> bool {
         use crate::ref_counter::INITIAL_STRONG_VALUE;
         use std::sync::atomic::Ordering;
@@ -290,15 +290,17 @@ impl IBinder for ProxyHandle {
     fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
         let handle = self.handle;
         self.strong.dec(|| {
-            thread_state::dec_strong_handle(handle)?;
-            // Best-effort hint: ProcessState::expunge_handle_if_orphan re-checks
-            // the counts under the write lock, so a concurrent lookup that just
-            // re-acquired this proxy keeps it cached. This protects Issue #47's
-            // stale-proxy fix from a race in which the count check here and the
-            // map mutation in the old expunge_handle were not atomic, allowing
-            // two ProxyHandle instances for the same kernel handle to coexist.
-            ProcessState::as_self().expunge_handle_if_orphan(handle, self);
-            Ok(())
+            // Send BC_RELEASE and decide on cache eviction while holding the
+            // cache write lock. Doing the kernel ref drop OUTSIDE that lock
+            // races with concurrent lookups whose `inc_strong_handle`
+            // (BC_INCREFS) is sent while the lookup holds the cache read
+            // lock — the kernel can process BC_RELEASE first, free the
+            // handle, and reject (or strand) the BC_INCREFS, leaving a
+            // user-space proxy whose handle is no longer valid. Funneling
+            // both through the same write lock guarantees the binder
+            // driver sees the BC_INCREFS / BC_RELEASE pair in a consistent
+            // order with respect to user-space refs.
+            ProcessState::as_self().release_strong_under_cache_lock(handle, self)
         })
     }
 
@@ -309,11 +311,8 @@ impl IBinder for ProxyHandle {
 
     fn dec_weak(&self) -> Result<()> {
         let handle = self.handle;
-        self.weak.dec(|| {
-            thread_state::dec_weak_handle(handle)?;
-            ProcessState::as_self().expunge_handle_if_orphan(handle, self);
-            Ok(())
-        })
+        self.weak
+            .dec(|| ProcessState::as_self().release_weak_under_cache_lock(handle, self))
     }
 }
 
