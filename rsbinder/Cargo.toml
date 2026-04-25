@@ -12,6 +12,9 @@ keywords.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 default = ["tokio"]
 tokio = ["async", "tokio/full"]
@@ -41,3 +44,10 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
 env_logger = { workspace = true }
+
+# loom is only used by tests gated on `--cfg loom`. Run with:
+#   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
+# It is NOT a normal test dependency — without the cfg, the gated test
+# files compile to empty crates.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
