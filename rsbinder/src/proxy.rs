@@ -134,6 +134,13 @@ impl ProxyHandle {
         // BR_DEAD_BINDER) takes the lock, sees `obituary_sent == true`,
         // and returns immediately — matching C++ line 500's
         // `if (mObitsSent) return;`.
+        //
+        // Error handling: queue BC_CLEAR_DEATH_NOTIFICATION BEFORE
+        // `mem::take` so a queueing failure leaves recipients intact
+        // for retry. Callbacks fire BEFORE the IPC flush so a
+        // `flush_commands` error does not swallow the obituary —
+        // matches C++ which ignores `clearDeathNotification` /
+        // `flushCommands` return values entirely.
         let recipients_snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
             let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
 
@@ -145,15 +152,15 @@ impl ProxyHandle {
                 return Ok(());
             }
 
-            // Detach first; only issue BC_CLEAR_DEATH_NOTIFICATION if
-            // we actually had registered recipients (an empty
-            // `recipients` means no `BC_REQUEST_DEATH_NOTIFICATION` was
-            // ever sent, so the kernel has nothing to clear).
-            let snapshot = std::mem::take(&mut *recipients);
-            if !snapshot.is_empty() {
+            if !recipients.is_empty() {
+                // Queue BC_CLEAR before draining. On queueing failure
+                // the recipients vector is unchanged and the caller
+                // (binder thread BR_DEAD_BINDER arm) can surface the
+                // error without losing the obituary.
                 thread_state::clear_death_notification(self.handle())?;
-                thread_state::flush_commands()?;
             }
+
+            let snapshot = std::mem::take(&mut *recipients);
 
             // `Release` so that lock-free `submit_transact` Acquire-loads
             // observing `true` see all writes that happened-before
@@ -164,12 +171,23 @@ impl ProxyHandle {
             snapshot
         };
 
+        // Callbacks first — these are the user-visible contract.
+        // Dispatching before the flush below ensures a transient
+        // ioctl failure cannot swallow death notifications.
         for weak in &recipients_snapshot {
             if let Some(recipient) = weak.upgrade() {
                 recipient.binder_died(who);
             }
             // Dead `Weak`s are dropped with the snapshot at scope end —
             // the source vector was already cleared by `mem::take`.
+        }
+
+        // Flush the queued BC_CLEAR_DEATH_NOTIFICATION outside the
+        // lock. If this fails, the command remains in out_parcel and
+        // will be sent by `release_obituary_pin`'s phase-2 flush in
+        // the same BR_DEAD_BINDER arm — kernel ordering is preserved.
+        if !recipients_snapshot.is_empty() {
+            thread_state::flush_commands()?;
         }
 
         Ok(())
