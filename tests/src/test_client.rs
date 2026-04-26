@@ -1903,6 +1903,77 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
     }
 }
 
+/// `WIBinder::upgrade()` for proxies must succeed across user-side
+/// `drop(strong)` as long as the cache entry (and therefore the
+/// kernel `binder_ref` slot's `BC_INCREFS` pin) is alive — matching
+/// Android `wp<BpBinder>::promote()` semantics.
+///
+/// Pre-PR `WIBinder::upgrade()` succeeded *unconditionally* because
+/// `WIBinder` held a strong Arc in disguise. The cache-pin refactor
+/// initially made it `sync::Weak::upgrade` only, which returned
+/// `DeadObject` once every user-side `Strong` was dropped — too
+/// strict, because the cache pin had already structurally guaranteed
+/// the kernel slot stayed alive. This test verifies the corrected
+/// semantics: `upgrade()` routes through the proxy cache and yields
+/// a freshly resurrected `Arc<ProxyHandle>` (different allocation,
+/// same kernel binder_node).
+#[test]
+fn test_weak_upgrade_resurrects_proxy_after_strong_drop() {
+    init_test();
+
+    let canonical = <BpTestService as ITestService::ITestService>::descriptor().to_string();
+    let svc = get_test_service();
+    let weak: WIBinder = SIBinder::downgrade(&svc.as_binder());
+    drop(svc);
+
+    // After `drop(svc)` the only `Arc<ProxyHandle>` is gone, but the
+    // cache entry is still there with its BC_INCREFS pin keeping
+    // `binder_ref(handle).weak >= 1`. `upgrade()` must succeed via
+    // case-(b) resurrection.
+    let resurrected = weak
+        .upgrade()
+        .expect("weak.upgrade must succeed while cache entry alive");
+
+    // Descriptor preserved across resurrection (cached, no new
+    // INTERFACE_TRANSACTION).
+    assert_eq!(
+        resurrected.descriptor(),
+        canonical,
+        "resurrected proxy must carry the original descriptor"
+    );
+
+    // Transaction succeeds, proving the resurrected proxy refers to
+    // the same kernel binder_node.
+    resurrected
+        .ping_binder()
+        .expect("ping after resurrection must succeed");
+}
+
+/// Two `WIBinder` clones for the same underlying handle compare
+/// equal under `PartialEq`, even after the original strong is
+/// dropped and resurrection has produced a different `Arc<ProxyHandle>`.
+/// Identity is `(handle, generation)`, matching Android `BpBinder`
+/// identity (stable across resurrection).
+#[test]
+fn test_weak_partial_eq_handle_identity_across_resurrection() {
+    init_test();
+
+    let svc1 = get_test_service();
+    let weak1: WIBinder = SIBinder::downgrade(&svc1.as_binder());
+    drop(svc1);
+
+    // Resurrect and downgrade again — fresh Arc<ProxyHandle>, but the
+    // cache entry's generation is preserved (same kernel slot), so the
+    // new WIBinder snapshots the same generation.
+    let svc2 = get_test_service();
+    let weak2: WIBinder = SIBinder::downgrade(&svc2.as_binder());
+
+    assert_eq!(
+        weak1, weak2,
+        "WIBinder for the same kernel binder_node must be equal across resurrection"
+    );
+}
+
 /// Test plan #3 second bullet — `WIBinder::upgrade()` `Err(DeadObject)`
 /// branch coverage on the in-tree death-recipient path.
 ///
