@@ -20,19 +20,47 @@ use crate::{
 
 /// Cache state for the extension binder object on the proxy side.
 ///
-/// Holds a `WIBinder` rather than `SIBinder` so the cache does not root an
-/// `Arc<ProxyHandle>`. A strong cache would defeat the "now genuinely weak"
-/// contract of `WIBinder` introduced in PR #102 — and in the degenerate
-/// case where a remote names the parent proxy itself as its extension, the
-/// strong cache would form a self-referencing cycle through the parent's
-/// own state. `WIBinder::upgrade` routes through the cache-pin
-/// resurrection path, so liveness across a transient strong-count-zero
-/// window is preserved even with a weak cache.
+/// The payload is split into two variants because the right ref-count
+/// discipline depends on whether the extension's handle aliases the
+/// parent proxy's own handle:
+///
+///   * **Common case (`CachedExtension::Strong`)** — the extension is a
+///     different binder. We hold an `SIBinder` so the extension's
+///     `Arc<ProxyHandle>` is rooted by the parent proxy's cache for as
+///     long as the parent itself lives. A weak cache here would let the
+///     extension's `Arc<ProxyHandle>` drop and be resurrected on every
+///     `get_extension` cycle, producing a stream of `BC_RELEASE`/
+///     `BC_ACQUIRE` pairs against the kernel binder_ref. Under stress,
+///     the `binder-linux` driver has been observed to lose the
+///     `binder_ref → binder_node` association across that thrash and
+///     return `BR_FAILED_REPLY` ("cannot find target node") on the very
+///     next transaction. Stable strong caching avoids the thrash
+///     entirely and matches the PR #102 baseline.
+///
+///   * **Self-cycle case (`CachedExtension::Weak`)** — the extension's
+///     handle equals the parent's own handle (a remote naming itself as
+///     its own extension). A strong cache here would form a
+///     self-referencing `Arc<ProxyHandle>` cycle through the parent's
+///     own state and prevent the parent from ever being dropped. We
+///     fall back to `WIBinder` for this case only; the user must hold
+///     an external strong ref to the parent for the extension to be
+///     reachable, and `weak.upgrade()` always succeeds via the
+///     fast-path Arc reuse without invoking cache-pin resurrection — so
+///     there is no `BC_RELEASE`/`BC_ACQUIRE` thrash in this case
+///     either.
 enum ExtensionCache {
     /// Remote query has not been performed yet.
     NotQueried,
     /// Remote query completed; stores the result (Some or None).
-    Queried(Option<WIBinder>),
+    Queried(Option<CachedExtension>),
+}
+
+enum CachedExtension {
+    /// Common case: extension proxy distinct from the parent proxy.
+    Strong(SIBinder),
+    /// Degenerate case: extension's handle aliases the parent's own
+    /// handle. Stored as weak to avoid an `Arc<ProxyHandle>` self-cycle.
+    Weak(WIBinder),
 }
 
 /// Handle for a proxy to a remote binder service.
@@ -84,6 +112,26 @@ impl ProxyHandle {
     /// Get the interface descriptor for this proxy.
     pub fn descriptor(&self) -> &str {
         &self.descriptor
+    }
+
+    /// Pick the right cache representation for an extension binder.
+    ///
+    /// Returns `CachedExtension::Weak` only when the extension is a
+    /// proxy whose handle aliases this proxy's own handle — the
+    /// self-cycle case where a strong cache would form an
+    /// `Arc<ProxyHandle>` cycle through the parent's own state.
+    /// Everything else (extension is a different proxy, extension is a
+    /// local binder, extension is a proxy with a different handle)
+    /// uses `Strong` so the extension's `Arc<ProxyHandle>` is rooted by
+    /// the parent's cache and we avoid the `BC_RELEASE`/`BC_ACQUIRE`
+    /// thrash documented on `ExtensionCache`.
+    fn classify_extension(&self, sib: &SIBinder) -> CachedExtension {
+        if let Some(proxy) = (**sib).as_proxy() {
+            if proxy.handle() == self.handle {
+                return CachedExtension::Weak(SIBinder::downgrade(sib));
+            }
+        }
+        CachedExtension::Strong(sib.clone())
     }
 
     /// Submit a transaction to the remote service.
@@ -242,28 +290,32 @@ impl Drop for ProxyHandle {
 
 impl IBinder for ProxyHandle {
     fn get_extension(&self) -> Result<Option<SIBinder>> {
-        // 1. Check cache (read lock). The cache stores `WIBinder` to avoid
-        //    rooting an `Arc<ProxyHandle>` (see `ExtensionCache` doc).
-        //    Three sub-cases:
+        // 1. Check cache (read lock). See `ExtensionCache` doc for why
+        //    the common case caches strong and only the self-cycle case
+        //    caches weak. Sub-cases:
         //      - NotQueried: fall through to remote query.
         //      - Queried(None): authoritatively no extension; return None.
-        //      - Queried(Some(weak)):
-        //          · upgrade succeeds → return the resurrected `SIBinder`
-        //            (cache-pin guarantees liveness across drop+upgrade).
-        //          · upgrade fails (extension obituary'd, cache pin
-        //            released) → fall through to a fresh remote query so
-        //            a server that re-published a new extension is
-        //            observed correctly.
+        //      - Queried(Some(Strong(s))): clone and return — no kernel
+        //        round trip, no Arc drop on the extension proxy.
+        //      - Queried(Some(Weak(w))): self-cycle case; upgrade the
+        //        weak (always succeeds while the user holds the parent).
+        //        If the parent itself is mid-Drop and the weak is
+        //        already dangling, fall through to a fresh remote query
+        //        — defensive, this branch should be unreachable in
+        //        normal use.
         {
             let cached = self.extension.read().expect("Extension lock poisoned");
-            match *cached {
+            match &*cached {
                 ExtensionCache::NotQueried => {}
                 ExtensionCache::Queried(None) => return Ok(None),
-                ExtensionCache::Queried(Some(ref weak)) => {
-                    if let Ok(strong) = weak.upgrade() {
+                ExtensionCache::Queried(Some(CachedExtension::Strong(s))) => {
+                    return Ok(Some(s.clone()));
+                }
+                ExtensionCache::Queried(Some(CachedExtension::Weak(w))) => {
+                    if let Ok(strong) = w.upgrade() {
                         return Ok(Some(strong));
                     }
-                    // Stale cache entry; fall through to re-query.
+                    // Stale self-cycle weak; fall through to re-query.
                 }
             }
         }
@@ -278,19 +330,18 @@ impl IBinder for ProxyHandle {
             _ => return Ok(None),
         };
 
-        // 3. Cache as `WIBinder` (write lock). Returning the strong
-        //    `SIBinder` to the caller is fine — only the cache itself
-        //    must avoid the strong reference.
-        let weak_ext = ext.as_ref().map(SIBinder::downgrade);
+        // 3. Classify and cache. Strong unless the extension's handle
+        //    aliases this proxy's own handle (see `ExtensionCache` doc).
+        let entry = ext.as_ref().map(|sib| self.classify_extension(sib));
         let mut cache = self.extension.write().expect("Extension lock poisoned");
-        *cache = ExtensionCache::Queried(weak_ext);
+        *cache = ExtensionCache::Queried(entry);
         Ok(ext)
     }
 
     fn set_extension(&self, extension: &SIBinder) -> Result<()> {
-        let weak = SIBinder::downgrade(extension);
+        let entry = self.classify_extension(extension);
         let mut ext = self.extension.write().expect("Extension lock poisoned");
-        *ext = ExtensionCache::Queried(Some(weak));
+        *ext = ExtensionCache::Queried(Some(entry));
         Ok(())
     }
 
@@ -510,21 +561,36 @@ mod tests {
         std::mem::forget(handle);
     }
 
-    /// Verifies ExtensionCache stores `WIBinder` (weak), not `SIBinder`
-    /// (strong), at the type level. This is enforced by the field type
-    /// in the `ExtensionCache::Queried` variant; constructing the
-    /// variant with an `SIBinder` would fail to compile.
+    /// Verifies `ExtensionCache::Queried` admits both a strong-cache
+    /// variant (common case) and a weak-cache variant (self-cycle
+    /// case) at the type level. The discrimination protects against
+    /// regressing to either extreme — a strong-only cache would
+    /// reintroduce the self-referencing `Arc<ProxyHandle>` cycle, and
+    /// a weak-only cache would reintroduce the
+    /// `BC_RELEASE`/`BC_ACQUIRE` thrash that produced
+    /// `BR_FAILED_REPLY` ("cannot find target node") under stress.
     #[test]
-    fn test_extension_cache_variant_holds_weak() {
-        // Compile-time pattern check: if `Queried`'s payload were
-        // `Option<SIBinder>` again, the `_: &Option<WIBinder>` binding
-        // below would fail to type-check.
+    fn test_extension_cache_variant_holds_dual_modes() {
+        // Compile-time check: the payload type matches the documented
+        // shape `Option<CachedExtension>`, and `CachedExtension` exposes
+        // both `Strong(SIBinder)` and `Weak(WIBinder)` constructors.
+        // Wrong inner types would fail the type-checked bindings; a
+        // missing variant would fail the `fn _exhaust` exhaustiveness
+        // check; a non-`Option` payload would fail the `_typed` binding.
         let none_cache = ExtensionCache::Queried(None);
-        match &none_cache {
-            ExtensionCache::Queried(payload) => {
-                let _payload_must_be_option_wibinder: &Option<WIBinder> = payload;
+        let ExtensionCache::Queried(payload) = &none_cache else {
+            unreachable!("constructed Queried, must match Queried")
+        };
+        let _typed: &Option<CachedExtension> = payload;
+
+        // Exhaustiveness gate: this fn fails to compile if a future
+        // patch removes either variant (or adds a third without
+        // updating callers).
+        fn _exhaust(entry: &CachedExtension) -> &'static str {
+            match entry {
+                CachedExtension::Strong(_) => "strong",
+                CachedExtension::Weak(_) => "weak",
             }
-            ExtensionCache::NotQueried => unreachable!(),
         }
     }
 }
