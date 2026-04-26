@@ -551,6 +551,112 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     })
 }
 
+/// Drive the kernel handshake for `BR_DEAD_BINDER` so that a
+/// user-side `send_obituary` failure cannot strand the kernel
+/// `binder_ref` slot.
+///
+/// The kernel slot is leaked permanently if either:
+///   1. `BC_DEAD_BINDER_DONE` is not written to `out_parcel`, or
+///   2. `release_obituary_pin`'s `BC_DECREFS` is not flushed.
+///
+/// So phases 2 (`queue_done`) and 3 (`pin_release`) always run
+/// regardless of phase 1's (`obituary`) outcome. The user-visible
+/// obituary error takes priority over the pin-release error;
+/// the pin error is also logged so it is not lost when both fail.
+///
+/// Residual edge: if `queue_done` itself fails (rare — `out_parcel`
+/// is unhealthy under e.g. allocator OOM), phase 3 is skipped and the
+/// pin leak still occurs. Documented; the next ioctl on this thread
+/// will fail anyway.
+fn drive_dead_binder_handshake<O, Q, P>(
+    handle: binder::binder_uintptr_t,
+    obituary: O,
+    queue_done: Q,
+    pin_release: P,
+) -> Result<()>
+where
+    O: FnOnce() -> Result<()>,
+    Q: FnOnce() -> Result<()>,
+    P: FnOnce() -> Result<()>,
+{
+    // Phase 1: dispatch recipients. Capture the result; do NOT
+    // short-circuit — kernel handshake must always complete.
+    let obituary_result = obituary();
+
+    // Phase 2: queue BC_DEAD_BINDER_DONE unconditionally. A failure
+    // here means out_parcel is unhealthy; propagate immediately
+    // because the next ioctl will surface it anyway. Phase 3 is
+    // skipped in this rare path (acknowledged residual edge). Log
+    // the obituary error first if it would otherwise be swallowed
+    // by the queue error — the obituary diagnostic is most valuable
+    // exactly when the kernel handshake is also breaking.
+    if let Err(qe) = queue_done() {
+        if let Err(oe) = &obituary_result {
+            error!(
+                "BR_DEAD_BINDER: queue BC_DEAD_BINDER_DONE failed ({qe:?}) \
+                 swallowing obituary error {oe:?} for handle {handle:X}"
+            );
+        }
+        return Err(qe);
+    }
+
+    // Phase 3: release the cache pin (BC_DECREFS via flush). Always
+    // attempted, even if obituary errored. A pin-release error is
+    // logged here so the diagnostic is not swallowed when the
+    // obituary error is surfaced below.
+    let pin_result = pin_release();
+    if let Err(e) = &pin_result {
+        error!(
+            "release_obituary_pin failed for handle {handle:X}: {e:?}; \
+             obituary_result: {obituary_result:?}"
+        );
+    }
+
+    // Surface obituary error first (user-visible — death recipient
+    // observed the failure). Fall back to pin error when obituary
+    // succeeded but pin failed.
+    obituary_result?;
+    pin_result?;
+    Ok(())
+}
+
+/// Invoke `Transactable::transact`, catching panics so a buggy
+/// service handler cannot terminate the binder worker thread.
+///
+/// On panic, the partial reply (if any) is discarded and the caller
+/// receives `StatusCode::Unknown`, so the existing `BR_TRANSACTION`
+/// reply path synthesizes a deterministic error reply for the
+/// calling client (rather than leaving the client hung waiting for
+/// `BR_REPLY`). Mirrors the panic guard around `DeathRecipient`
+/// callbacks in `ProxyHandle::dispatch_obituary_callbacks`. See the
+/// `Transactable` trait doc for the full guarantee scope.
+fn dispatch_transact_caught(
+    transactable: &dyn Transactable,
+    code: TransactionCode,
+    reader: &mut Parcel,
+    reply: &mut Parcel,
+) -> Result<()> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transactable.transact(code, reader, reply)
+    }));
+    match result {
+        Ok(transact_result) => transact_result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            error!("Transactable::transact panicked for code {code}: {msg}");
+            // Discard any partially-written reply so the client does
+            // not misparse half-formed data; the reply path below
+            // turns `Err` into a clean error status.
+            *reply = Parcel::new();
+            Err(StatusCode::Unknown)
+        }
+    }
+}
+
 fn execute_command(cmd: i32) -> Result<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
 
@@ -619,10 +725,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                             tr_secctx.transaction_data.cookie,
                         ));
                         if strong.attempt_increase() {
-                            let result = strong
-                                .as_transactable()
-                                .expect("Transactable is None.")
-                                .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply);
+                            let result = dispatch_transact_caught(
+                                strong.as_transactable().expect("Transactable is None."),
+                                tr_secctx.transaction_data.code,
+                                &mut reader,
+                                &mut reply,
+                            );
                             strong.decrease()?;
 
                             result
@@ -634,10 +742,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                         let context = ProcessState::as_self()
                             .context_manager()
                             .expect("Transactable is None.");
-                        context
-                            .as_transactable()
-                            .expect("Transactable is None.")
-                            .transact(tr_secctx.transaction_data.code, &mut reader, &mut reply)
+                        dispatch_transact_caught(
+                            context.as_transactable().expect("Transactable is None."),
+                            tr_secctx.transaction_data.code,
+                            &mut reader,
+                            &mut reply,
+                        )
                     }
                 };
                 let flags = tr_secctx.transaction_data.flags;
@@ -753,30 +863,21 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
 
-                // Phase 1: remove cache entry under write lock + notify
-                // recipients.
-                ProcessState::as_self().send_obituary_for_handle(handle as _)?;
-
-                // Queue BC_DEAD_BINDER_DONE first (kernel handshake).
-                {
-                    let mut state = thread_state.borrow_mut();
-                    state
-                        .out_parcel
-                        .write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
-                    state
-                        .out_parcel
-                        .write::<binder::binder_uintptr_t>(&handle)?;
-                }
-
-                // Phase 2: release the cache pin AFTER the death-done
-                // handshake is queued. `release_obituary_pin` flushes
-                // (commits BC_DEAD_BINDER_DONE plus any BC_RELEASEs
-                // already queued in this thread), then issues
-                // BC_DECREFS, then flushes again. Concurrent
-                // BC_RELEASEs from Drops on other threads can still
-                // arrive after our BC_DECREFS — the kernel rejects
-                // those with -EINVAL (logged but harmless).
-                ProcessState::as_self().release_obituary_pin(handle as _)?;
+                drive_dead_binder_handshake(
+                    handle,
+                    || ProcessState::as_self().send_obituary_for_handle(handle as _),
+                    || {
+                        let mut state = thread_state.borrow_mut();
+                        state
+                            .out_parcel
+                            .write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
+                        state
+                            .out_parcel
+                            .write::<binder::binder_uintptr_t>(&handle)?;
+                        Ok(())
+                    },
+                    || ProcessState::as_self().release_obituary_pin(handle as _),
+                )?;
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
                 let mut state = thread_state.borrow_mut();
@@ -1383,5 +1484,212 @@ mod tests {
             "BC_TRANSACTION_SG"
         );
         assert_eq!(command_to_str(binder::BC_REPLY_SG), "BC_REPLY_SG");
+    }
+
+    /// A panicking `Transactable::transact` must not unwind through
+    /// `dispatch_transact_caught` and must surface as
+    /// `Err(StatusCode::Unknown)` so the existing `BR_TRANSACTION`
+    /// reply path can synthesize a deterministic error reply for the
+    /// client. The partial reply (if any) must also be reset so the
+    /// client does not misparse half-formed bytes.
+    #[test]
+    fn test_dispatch_transact_caught_isolates_panic() {
+        struct PanickingTransactable;
+        impl Transactable for PanickingTransactable {
+            fn transact(
+                &self,
+                _code: TransactionCode,
+                _reader: &mut Parcel,
+                reply: &mut Parcel,
+            ) -> Result<()> {
+                // Write a few bytes then panic, so the test verifies
+                // the partial reply is discarded.
+                reply.write::<i32>(&0x6EAD_BEEFi32).ok();
+                panic!("simulated transactable panic");
+            }
+        }
+
+        let mut reader = Parcel::new();
+        let mut reply = Parcel::new();
+        let result = dispatch_transact_caught(&PanickingTransactable, 1, &mut reader, &mut reply);
+
+        assert!(
+            matches!(result, Err(StatusCode::Unknown)),
+            "expected Err(StatusCode::Unknown), got {result:?}"
+        );
+        assert_eq!(
+            reply.data_size(),
+            0,
+            "partial reply must be discarded after a panic so the \
+             client does not misparse half-formed data"
+        );
+    }
+
+    /// A non-panicking `Transactable::transact` must propagate its
+    /// `Result` unchanged through `dispatch_transact_caught` —
+    /// regression check that the panic guard does not interfere with
+    /// the normal path.
+    #[test]
+    fn test_dispatch_transact_caught_propagates_normal_result() {
+        struct OkTransactable;
+        impl Transactable for OkTransactable {
+            fn transact(
+                &self,
+                _code: TransactionCode,
+                _reader: &mut Parcel,
+                reply: &mut Parcel,
+            ) -> Result<()> {
+                reply.write::<i32>(&42i32)?;
+                Ok(())
+            }
+        }
+
+        struct ErrTransactable;
+        impl Transactable for ErrTransactable {
+            fn transact(
+                &self,
+                _code: TransactionCode,
+                _reader: &mut Parcel,
+                _reply: &mut Parcel,
+            ) -> Result<()> {
+                Err(StatusCode::PermissionDenied)
+            }
+        }
+
+        let mut reader = Parcel::new();
+        let mut reply = Parcel::new();
+        assert!(dispatch_transact_caught(&OkTransactable, 1, &mut reader, &mut reply).is_ok());
+        assert_eq!(reply.data_size(), std::mem::size_of::<i32>());
+
+        let mut reply = Parcel::new();
+        let err = dispatch_transact_caught(&ErrTransactable, 1, &mut reader, &mut reply);
+        assert!(matches!(err, Err(StatusCode::PermissionDenied)));
+    }
+
+    /// `drive_dead_binder_handshake` orchestration must guarantee:
+    /// - Phases run in obituary → queue → pin order on success
+    /// - An obituary error does NOT short-circuit queue or pin
+    /// - A queue error skips pin (acknowledged residual edge)
+    /// - When obituary errors and pin errors, obituary takes priority
+    /// - The kernel handshake (queue + pin) runs whenever queue succeeds
+    ///
+    /// These properties protect against the kernel `binder_ref` slot
+    /// leak that motivated the refactor — losing any of them
+    /// re-introduces the leak shape that the previous `?`-based
+    /// implementation exhibited.
+    #[test]
+    fn test_drive_dead_binder_handshake_orchestration() {
+        use std::cell::RefCell;
+
+        let order = RefCell::new(Vec::<&'static str>::new());
+        let push = |label: &'static str| order.borrow_mut().push(label);
+
+        // Case A: all phases succeed.
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                Ok(())
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+            || {
+                push("pin");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        order.borrow_mut().clear();
+
+        // Case B: obituary errors → queue and pin still run; obituary
+        // error surfaces. This is the headline guarantee: previously
+        // the kernel handshake was skipped on obituary error, leaking
+        // the binder_ref slot.
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                Err(StatusCode::DeadObject)
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+            || {
+                push("pin");
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(StatusCode::DeadObject)));
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        order.borrow_mut().clear();
+
+        // Case C: queue write fails → pin is skipped (documented
+        // residual edge), queue error surfaces.
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                Ok(())
+            },
+            || {
+                push("queue");
+                Err(StatusCode::NoMemory)
+            },
+            || {
+                push("pin");
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(StatusCode::NoMemory)));
+        assert_eq!(*order.borrow(), vec!["obituary", "queue"]);
+        order.borrow_mut().clear();
+
+        // Case D: obituary OK, pin errors → pin error surfaces.
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                Ok(())
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+            || {
+                push("pin");
+                Err(StatusCode::DeadObject)
+            },
+        );
+        assert!(matches!(result, Err(StatusCode::DeadObject)));
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        order.borrow_mut().clear();
+
+        // Case E: obituary errors AND pin errors → obituary error
+        // surfaces (priority); pin error is logged in the error path
+        // (asserting log content is out of scope for a unit test).
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                Err(StatusCode::PermissionDenied)
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+            || {
+                push("pin");
+                Err(StatusCode::DeadObject)
+            },
+        );
+        assert!(
+            matches!(result, Err(StatusCode::PermissionDenied)),
+            "obituary error must take priority over pin error, got {result:?}"
+        );
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
     }
 }

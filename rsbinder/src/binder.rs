@@ -147,6 +147,28 @@ pub trait FromIBinder: Interface {
 ///
 /// Implement this trait to receive notifications when a remote binder object dies.
 /// This is essential for cleanup and error handling in distributed systems.
+///
+/// # Panic safety
+///
+/// `binder_died` is invoked from the binder worker thread that processes
+/// `BR_DEAD_BINDER` from the kernel. rsbinder catches panics from
+/// `binder_died` per-recipient and logs them, so:
+///
+/// - A panic in one recipient does **not** prevent other recipients
+///   registered against the same binder from receiving their own
+///   `binder_died` callback.
+/// - A panic in `binder_died` does **not** terminate the binder worker
+///   thread.
+///
+/// rsbinder does **not** repair the panicking recipient's own internal
+/// state across the unwind boundary — implementations should keep
+/// `binder_died` panic-free to begin with, and use this guard only as a
+/// safety net.
+///
+/// The guard relies on `panic = "unwind"` (Rust's default). Builds that
+/// use `panic = "abort"` abort the whole process on any panic, including
+/// from `binder_died`, and the per-recipient isolation degrades to the
+/// abort behavior.
 pub trait DeathRecipient: Send + Sync {
     /// Called when the monitored binder object has died.
     fn binder_died(&self, who: &WIBinder);
@@ -196,11 +218,43 @@ pub trait IBinder: Any + Send + Sync {
     }
 
     /// Return the extension binder object, if set. Returns None if no extension is set.
+    ///
+    /// On a proxy this issues a remote `EXTENSION_TRANSACTION` and
+    /// caches the result; subsequent calls return the cached value.
+    /// On a native binder it returns the locally-stored extension.
+    ///
+    /// **Staleness on proxy.** The proxy cache holds a strong
+    /// `SIBinder` for the parent's lifetime in the common case (see
+    /// `ProxyHandle`'s `ExtensionCache` doc for the cache shape and
+    /// the `BC_RELEASE`/`BC_ACQUIRE` thrash motivation). The cache
+    /// is **not** invalidated when the extension itself is
+    /// obituary'd: subsequent `get_extension()` calls return the same
+    /// dead `SIBinder`, and IPC through it fast-fails with
+    /// `DeadObject` via `submit_transact`'s obituary check. A server
+    /// that re-publishes a fresh extension after the previous one
+    /// died is invisible to the client until the parent itself is
+    /// dropped and re-acquired. Matches Android C++ `BpBinder` —
+    /// not a correctness bug, but worth knowing for clients that
+    /// rely on dynamic re-publication.
     fn get_extension(&self) -> Result<Option<SIBinder>> {
         Ok(None)
     }
 
     /// Set the extension binder object.
+    ///
+    /// **Server-side only.** A service publishes its extension binder
+    /// via this call so clients can discover it through
+    /// `get_extension()`. Native binder implementations store the
+    /// extension locally; the default returns
+    /// `Err(StatusCode::InvalidOperation)`.
+    ///
+    /// Calling this on a **proxy** (client-side `ProxyHandle`) is a
+    /// programming error — a proxy has no way to inform the remote
+    /// service of the new extension, so the call would only mutate
+    /// the local cache and (after PR #104's §4 scope-down) silently
+    /// pin an unrelated `Arc<dyn IBinder>` for the parent's lifetime.
+    /// `ProxyHandle::set_extension` therefore rejects with
+    /// `InvalidOperation`.
     fn set_extension(&self, _extension: &SIBinder) -> Result<()> {
         Err(StatusCode::InvalidOperation)
     }
@@ -258,6 +312,33 @@ pub trait Remotable: Send + Sync {
 }
 
 /// A transactable object that can be used to process Binder commands.
+///
+/// # Panic safety
+///
+/// `transact` is invoked from the binder worker thread that processes
+/// incoming `BR_TRANSACTION` from the kernel. rsbinder catches panics
+/// from `transact` and converts them to `Err(StatusCode::Unknown)`, so:
+///
+/// - A panic in `transact` does **not** terminate the binder worker
+///   thread; subsequent transactions on the same thread continue to be
+///   processed.
+/// - For non-oneway calls, the calling client receives a deterministic
+///   error reply (`StatusCode::Unknown`) instead of hanging on a never-
+///   sent `BR_REPLY`. Any partially-written reply parcel is discarded
+///   before the error is returned, so the client does not misparse
+///   half-formed data.
+/// - For oneway calls, the panic is logged and the transaction is
+///   dropped (matching the existing oneway `Err` path).
+///
+/// rsbinder does **not** repair the panicking transactable's own
+/// internal state across the unwind boundary — implementations should
+/// keep `transact` panic-free to begin with, and use this guard only
+/// as a safety net.
+///
+/// The guard relies on `panic = "unwind"` (Rust's default). Builds that
+/// use `panic = "abort"` abort the whole process on any panic,
+/// including from `transact`, and the per-transaction isolation
+/// degrades to the abort behavior.
 pub trait Transactable: Send + Sync {
     fn transact(
         &self,
