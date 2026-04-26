@@ -2056,3 +2056,338 @@ fn test_wibinder_upgrade_after_obituary() {
         }
     }
 }
+
+// =============================================================================
+// FOLLOW_UP_PR_104 integration tests
+//
+// These exercise the death-notification / extension / dump fixes through real
+// binder communication against `test_service`, complementing the in-crate unit
+// tests in `rsbinder/src/proxy.rs` and `rsbinder/src/thread_state.rs`. The
+// `#[ignore]`'d tests destroy the live `test_service` via `killService()` and
+// must each be run after a service restart — see the integration-test CI
+// workflow for the restart-then-run pattern.
+//
+// Coverage notes for items NOT exercised here:
+//   - Item 5  (BR_DEAD_BINDER kernel handshake)         — needs driver-level
+//     fault injection that rsbinder has no harness for.
+//     Practical bar: the orchestration unit test in `thread_state.rs`.
+//   - Item 10 (`Transactable::transact` panic isolation) — would need a
+//     deliberately panicking `Transactable` registered as a service. Out of
+//     scope without modifying `test_service` or `ITestService.aidl`.
+//     Practical bar: the unit test in `thread_state.rs` exercising the
+//     same `dispatch_transact_caught` code path that the BR_TRANSACTION arm
+//     calls in production.
+//   - Item 11 (extension cache staleness)               — would need an
+//     extension that can die independently of its parent service, which the
+//     test_service's `NamedCallback` extension does not support.
+//     Practical bar: the unit test in `proxy.rs` that pre-populates the cache.
+// =============================================================================
+
+/// Item 6: a panicking `DeathRecipient` must not starve other recipients
+/// registered against the same handle, and must not terminate the binder
+/// worker thread. Two recipients are registered: a panicking one (which
+/// goes first in registration order) and a writing one. After `killService`
+/// the writing recipient's pipe-write must be observable — proof that
+/// `dispatch_obituary_callbacks`'s `catch_unwind` is in effect.
+#[test]
+#[ignore]
+fn test_death_recipient_panic_does_not_starve_others() {
+    init_test();
+    let test_service = get_test_service();
+    let (mut read_file, write_file) = build_pipe();
+
+    struct PanickingRecipient;
+    impl DeathRecipient for PanickingRecipient {
+        fn binder_died(&self, _: &WIBinder) {
+            panic!("intentional test panic in binder_died");
+        }
+    }
+
+    struct WritingRecipient(Mutex<File>);
+    impl DeathRecipient for WritingRecipient {
+        fn binder_died(&self, _: &WIBinder) {
+            self.0
+                .lock()
+                .unwrap()
+                .write_all(b"survived\n")
+                .expect("pipe write");
+        }
+    }
+
+    let panic_arc: Arc<dyn DeathRecipient> = Arc::new(PanickingRecipient);
+    let writing_arc: Arc<dyn DeathRecipient> = Arc::new(WritingRecipient(Mutex::new(write_file)));
+
+    let binder = test_service.as_binder();
+    // Order matters: the panicker registers first. A regression that
+    // drops the per-recipient `catch_unwind` would unwind through the
+    // dispatch loop and the writing recipient would never fire — the
+    // `read_exact` below would then block until pipe close (Mutex<File>
+    // dropping at end of test) and surface a different failure mode.
+    binder
+        .link_to_death(Arc::downgrade(&panic_arc))
+        .expect("link panicking recipient");
+    binder
+        .link_to_death(Arc::downgrade(&writing_arc))
+        .expect("link writing recipient");
+
+    test_service.killService().expect("killService");
+
+    let mut buf = [0u8; 9];
+    read_file
+        .read_exact(&mut buf)
+        .expect("writing recipient must fire despite panicking sibling");
+    assert_eq!(&buf, b"survived\n");
+
+    // Hold both recipients alive until the assertion above runs so
+    // their `Weak`s in the recipients vec stayed upgradable for the
+    // obituary dispatch.
+    drop(panic_arc);
+    drop(writing_arc);
+}
+
+/// Item 1: registering the same recipient twice and unlinking once must
+/// remove only one entry (matching C++ `BpBinder::unlinkToDeath`'s
+/// `removeAt(i)`). After `killService` exactly one `binder_died` call
+/// must fire on the duplicated recipient.
+///
+/// The recipients vec ends up `[counted, counted, signal]` (three
+/// `link_to_death` calls in registration order). `unlink_to_death`'s
+/// position-based first-match remove is then expected to leave
+/// `[counted, signal]`. The signal recipient is the synchronization
+/// barrier: dispatch fires recipients in vec order, so the signal
+/// byte arrives **after** every preceding `counted` invocation has
+/// returned. Reading the signal therefore guarantees the atomic
+/// counter has its final value — a pipe-only design risks a
+/// false positive where the test reads one byte, drops the recipient,
+/// and silently masks a still-pending second `binder_died` call (its
+/// `weak.upgrade()` would return None after the drop).
+///
+/// Failure modes a regression would cause:
+/// - `Vec::retain` (pre-Item-1): both `counted` entries removed →
+///   counter == 0 → assert fails.
+/// - No removal at all: vec stays `[counted, counted, signal]` →
+///   counter == 2 → assert fails.
+#[test]
+#[ignore]
+fn test_unlink_to_death_single_remove_via_obituary() {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    init_test();
+    let test_service = get_test_service();
+
+    struct CountingRecipient(Arc<AtomicU32>);
+    impl DeathRecipient for CountingRecipient {
+        fn binder_died(&self, _: &WIBinder) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+    let counter = Arc::new(AtomicU32::new(0));
+    let counted: Arc<dyn DeathRecipient> = Arc::new(CountingRecipient(counter.clone()));
+
+    let (mut signal_read, signal_write) = build_pipe();
+    struct SignalRecipient(Mutex<File>);
+    impl DeathRecipient for SignalRecipient {
+        fn binder_died(&self, _: &WIBinder) {
+            self.0
+                .lock()
+                .unwrap()
+                .write_all(b"!")
+                .expect("signal pipe write");
+        }
+    }
+    let signal: Arc<dyn DeathRecipient> = Arc::new(SignalRecipient(Mutex::new(signal_write)));
+
+    let binder = test_service.as_binder();
+    // recipients vec after these three calls: [counted, counted, signal]
+    binder
+        .link_to_death(Arc::downgrade(&counted))
+        .expect("link counted (1st)");
+    binder
+        .link_to_death(Arc::downgrade(&counted))
+        .expect("link counted (2nd duplicate)");
+    binder
+        .link_to_death(Arc::downgrade(&signal))
+        .expect("link signal");
+
+    // Single-position remove of the first match → [counted, signal].
+    binder
+        .unlink_to_death(Arc::downgrade(&counted))
+        .expect("unlink one of the duplicates");
+
+    test_service.killService().expect("killService");
+
+    // Wait for the signal byte. Because `signal` is last in the
+    // recipients vec, by the time we observe its byte the binder
+    // thread has already returned from every preceding
+    // `counted.binder_died` invocation.
+    let mut sentinel = [0u8; 1];
+    signal_read
+        .read_exact(&mut sentinel)
+        .expect("read signal pipe");
+    assert_eq!(&sentinel, b"!");
+
+    let count = counter.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        count, 1,
+        "exactly one binder_died expected for the duplicated recipient (got {count}). \
+         Vec::retain regression would yield 0; missed-removal regression would yield 2."
+    );
+
+    drop(counted);
+    drop(signal);
+}
+
+/// Item 8: passing an already-dead `Weak<dyn DeathRecipient>` to
+/// `link_to_death` against a live remote proxy must reject with
+/// `BadValue`, **not** silently register a subscription that
+/// `binder_died` would skip. Non-destructive — does not call
+/// `killService`.
+#[test]
+fn test_link_to_death_rejects_already_dead_weak_remote_proxy() {
+    init_test();
+    let test_service = get_test_service();
+
+    struct NoopRecipient;
+    impl DeathRecipient for NoopRecipient {
+        fn binder_died(&self, _: &WIBinder) {}
+    }
+
+    let arc: Arc<dyn DeathRecipient> = Arc::new(NoopRecipient);
+    let dead_weak = Arc::downgrade(&arc);
+    drop(arc);
+    assert!(
+        dead_weak.upgrade().is_none(),
+        "fixture sanity: weak must be dangling"
+    );
+
+    let result = test_service.as_binder().link_to_death(dead_weak);
+    assert_eq!(
+        result,
+        Err(rsbinder::StatusCode::BadValue),
+        "link_to_death must reject a dead weak with BadValue (got {result:?})"
+    );
+}
+
+/// Item 3: `set_extension` on a remote proxy must reject with
+/// `InvalidOperation` — the operation is server-side only and a proxy
+/// has no way to inform the remote service. The post-PR-104 §4
+/// strong-cache common case would otherwise silently pin an unrelated
+/// `Arc<dyn IBinder>` for the parent's lifetime. Non-destructive —
+/// `get_extension` continues to work, returning the extension that
+/// `test_service` set on its native side.
+#[test]
+fn test_set_extension_on_remote_proxy_rejects() {
+    init_test();
+    let test_service = get_test_service();
+    let binder = test_service.as_binder();
+
+    assert!(
+        binder.is_remote(),
+        "test_service.as_binder() must be a remote proxy for this test"
+    );
+
+    let new_ext = INamedCallback::BnNamedCallback::new_binder(ExtNamedCallback("rejected".into()));
+    let result = binder.set_extension(&new_ext.as_binder());
+    assert_eq!(
+        result,
+        Err(rsbinder::StatusCode::InvalidOperation),
+        "set_extension on a remote proxy must reject (got {result:?})"
+    );
+
+    // The proxy is still usable — `get_extension` returns the
+    // extension `test_service` set on its native side.
+    let got = binder
+        .get_extension()
+        .expect("get_extension must still succeed after rejected set_extension");
+    assert!(
+        got.is_some(),
+        "test_service publishes a NamedCallback extension"
+    );
+}
+
+/// Item 4: `dump` on an obituary'd proxy must return `DeadObject`
+/// and the caller's fd must end up closed.
+///
+/// Scope of this integration test: it verifies the **user-visible
+/// contract** (DeadObject return + fd no longer open) end-to-end
+/// against a real obituary'd proxy. It does **not** distinguish
+/// between Item 4's specific fast-fail path (which closes the fd
+/// via `File::Drop` *before* any parcel work) and the pre-existing
+/// `Parcel::Drop` cleanup path (which would close via
+/// `release_objects` *after* `into_raw_fd` and the parcel write,
+/// were Item 4's check ever removed and `submit_transact`'s own
+/// fast-fail relied upon instead). Both layers result in the same
+/// observable EOF on the read end.
+///
+/// The unit test
+/// `test_dump_fast_fails_and_drops_fd_when_obituary_sent` in
+/// `rsbinder/src/proxy.rs` covers Item 4's specific path with a
+/// synthetic `IntoRawFd` type whose `Drop` is observable separately
+/// from `into_raw_fd` — that test catches a regression that
+/// reverts Item 4's check while leaving `submit_transact`'s
+/// PR-#104 fast-fail in place. This integration test catches the
+/// broader regression where neither layer closes the fd
+/// (e.g. both fast-fail checks reverted).
+#[test]
+#[ignore]
+fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
+    init_test();
+    let test_service = get_test_service();
+    let binder = test_service.as_binder();
+
+    // Wait for obituary by registering a death recipient + pipe.
+    let (mut death_read, death_write) = build_pipe();
+    struct DR(Mutex<File>);
+    impl DeathRecipient for DR {
+        fn binder_died(&self, _: &WIBinder) {
+            self.0.lock().unwrap().write_all(b"died\n").unwrap();
+        }
+    }
+    let recipient: Arc<dyn DeathRecipient> = Arc::new(DR(Mutex::new(death_write)));
+    binder
+        .link_to_death(Arc::downgrade(&recipient))
+        .expect("link_to_death");
+
+    test_service.killService().expect("killService");
+
+    let mut sentinel = [0u8; 5];
+    death_read
+        .read_exact(&mut sentinel)
+        .expect("read death pipe");
+    assert_eq!(&sentinel, b"died\n");
+
+    // Now `obituary_sent` is published on the proxy. Build a fresh
+    // pipe; the write end is handed to `dump`, the read end stays in
+    // the test for EOF observation.
+    let (dump_read_owned, dump_write_owned) = rustix::pipe::pipe().expect("pipe for dump");
+    let dump_write = unsafe { File::from_raw_fd(dump_write_owned.into_raw_fd()) };
+    let mut dump_read = unsafe { File::from_raw_fd(dump_read_owned.into_raw_fd()) };
+
+    // `dump` is a `ProxyHandle` inherent method (not on the `IBinder`
+    // trait), so we go through `as_proxy` to reach it. Holding the
+    // SIBinder root in `binder` keeps the proxy reference valid.
+    let proxy = (*binder)
+        .as_proxy()
+        .expect("test_service is a remote proxy");
+    let result = proxy.dump(dump_write, &[]);
+    assert_eq!(
+        result,
+        Err(rsbinder::StatusCode::DeadObject),
+        "dump on obituary'd proxy must fast-fail with DeadObject (got {result:?})"
+    );
+
+    // `dump` dropped its `F` parameter without calling `into_raw_fd`,
+    // so File::Drop closed the fd. Reading from the other end must
+    // EOF — pipe semantics guarantee EOF on read once all write ends
+    // are closed.
+    let mut tail = [0u8; 16];
+    let n = dump_read
+        .read(&mut tail)
+        .expect("read dump pipe after fast-fail");
+    assert_eq!(
+        n, 0,
+        "dump's fd must have been closed by RAII (got {n} unexpected bytes)"
+    );
+
+    drop(recipient);
+}

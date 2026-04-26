@@ -204,6 +204,63 @@ jobs:
           RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
             test_client::test_wibinder_upgrade_after_obituary
 
+      - name: Restart test_service for test_death_recipient_panic_does_not_starve_others
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run test_death_recipient_panic_does_not_starve_others (destructive)
+        run: |
+          # FOLLOW_UP_PR_104 Item 6 — panic in one DeathRecipient must
+          # not abort the binder worker thread or starve other
+          # recipients. Real obituary path; the unit test in
+          # `proxy.rs` covers the dispatch-loop in isolation, this
+          # one verifies the same guarantee end-to-end through the
+          # kernel BR_DEAD_BINDER handshake.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            test_client::test_death_recipient_panic_does_not_starve_others
+
+      - name: Restart test_service for test_unlink_to_death_single_remove_via_obituary
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run test_unlink_to_death_single_remove_via_obituary (destructive)
+        run: |
+          # FOLLOW_UP_PR_104 Item 1 — `unlink_to_death` must remove a
+          # single matching entry, mirroring C++
+          # `BpBinder::unlinkToDeath`'s `removeAt(i)`. Register the
+          # same recipient twice, unlink once, then verify exactly
+          # one `binder_died` fires after killService.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            test_client::test_unlink_to_death_single_remove_via_obituary
+
+      - name: Restart test_service for test_dump_fast_fails_on_dead_proxy_closes_fd
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run test_dump_fast_fails_on_dead_proxy_closes_fd (destructive)
+        run: |
+          # FOLLOW_UP_PR_104 Item 4 — `dump` on an obituary'd proxy
+          # must fast-fail with DeadObject before consuming the fd,
+          # so the caller's fd is closed via RAII. Verified via pipe
+          # EOF on the read end after `dump` drops the write end.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            test_client::test_dump_fast_fails_on_dead_proxy_closes_fd
+
       - name: Stop background services
         if: always()
         run: |
