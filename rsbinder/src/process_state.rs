@@ -6,10 +6,52 @@ use std::fs::File;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{self, Arc, OnceLock, RwLock};
 use std::thread;
 
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
+
+/// Best-effort undo of the case (a) `BC_INCREFS` pin after a failure
+/// downstream of the pin's flush (descriptor query failure or
+/// `ProxyHandle::new_acquired` failure). If the kernel ack of the
+/// undo command is itself lost — driver write_read ioctl failure —
+/// we log and accept that the pin leaks until obituary or process
+/// teardown. The alternative (returning the secondary error) would
+/// mask the original failure that triggered the undo.
+fn undo_case_a_pin(handle: u32) {
+    if let Err(err) = thread_state::dec_weak_handle(handle) {
+        log::warn!(
+            "Best-effort BC_DECREFS for handle {handle} failed during \
+             case (a) cleanup: {err:?}; kernel binder_ref pin may leak \
+             until obituary"
+        );
+        return;
+    }
+    if let Err(err) = thread_state::flush_commands() {
+        log::warn!(
+            "Best-effort flush after BC_DECREFS for handle {handle} \
+             failed during case (a) cleanup: {err:?}; kernel binder_ref \
+             pin may leak until obituary"
+        );
+    }
+}
+
+/// Per-handle cache entry under the cache-pin model.
+///
+/// `weak` lets the process resurrect a fresh `Arc<ProxyHandle>` after the
+/// previous one has been dropped, without issuing a new
+/// `INTERFACE_TRANSACTION` (the cached `descriptor` is reused).
+///
+/// The kernel weak ref (`BC_INCREFS`) that keeps `binder_ref(handle)`
+/// alive while user-side strong count is 0 is **not** a separate field —
+/// it is owned implicitly by this entry's presence in
+/// `handle_to_proxy`. The pin is acquired exactly once on first
+/// insertion (slow-path case (a)) and released exactly once on obituary
+/// teardown.
+pub(crate) struct CacheEntry {
+    pub(crate) weak: sync::Weak<ProxyHandle>,
+    pub(crate) descriptor: String,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum CallRestriction {
@@ -37,7 +79,7 @@ pub struct ProcessState {
     driver: Arc<File>,
     mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<SIBinder>>,
-    handle_to_proxy: RwLock<HashMap<u32, WIBinder>>,
+    handle_to_proxy: RwLock<HashMap<u32, CacheEntry>>,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
@@ -206,175 +248,172 @@ impl ProcessState {
         handle: u32,
         stability: Stability,
     ) -> Result<SIBinder> {
-        // Double-Checked Locking Pattern is used.
-        if let Some(weak) = self
+        // Read-lock fast path: pure Arc::clone, no kernel command. Common
+        // case under steady-state load.
+        if let Some(arc) = self
             .handle_to_proxy
             .read()
             .expect("Handle to proxy lock poisoned")
             .get(&handle)
+            .and_then(|e| e.weak.upgrade())
         {
-            return weak.upgrade();
+            return Ok(SIBinder::from_arc(arc));
         }
 
+        // Write-lock slow path. Three sub-cases distinguished after taking
+        // the lock:
+        //   (a) entry absent          → BC_INCREFS pin + flush + query +
+        //                                 BC_ACQUIRE + insert
+        //   (b) entry present, dead   → reuse cached descriptor + BC_ACQUIRE
+        //                                 (cache pin still active)
+        //   (c) entry present, alive  → another thread won the race;
+        //                                 return its Arc
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
-        if let Some(weak) = handle_to_proxy.get(&handle) {
-            return weak.upgrade();
+
+        // Sub-case (c): another thread inserted/upgraded between our
+        // read-fast-path miss and write-lock acquisition.
+        if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
+            return Ok(SIBinder::from_arc(arc));
         }
+
+        // Distinguish (a) vs (b). On (b) the entry is present (with a
+        // dangling weak) and we reuse the cached descriptor; the cache
+        // pin (BC_INCREFS) issued at first insertion is still active so
+        // BC_ACQUIRE below will succeed. On (a) the entry is absent — we
+        // pin first, then query, then insert.
+        let cached_descriptor = handle_to_proxy.get(&handle).map(|e| e.descriptor.clone());
 
         if handle == 0 {
             let original_call_restriction = thread_state::call_restriction();
             thread_state::set_call_restriction(CallRestriction::None);
-
             thread_state::ping_binder(handle)?;
-
             thread_state::set_call_restriction(original_call_restriction);
         }
 
-        // Hold the write lock across `query_interface` so that only one
-        // thread is performing the INTERFACE_TRANSACTION for `handle` at a
-        // time — under heavy parallel lookup load this naturally rate-limits
-        // the receiver's binder thread pool and avoids exhausting it with
-        // 100+ redundant queries for the same handle.
-        //
-        // Crucially do NOT silently swallow a transaction failure into an
-        // empty descriptor: doing so used to insert a permanent
-        // empty-descriptor entry into the cache, after which every
-        // `FromIBinder::try_from` for that handle returned `BadType` for
-        // the lifetime of the process (root cause of the intermittent
-        // CI flake on `test_renamed_interface_*` and similar tests).
-        // Propagate the error instead so the next caller retries.
-        let interface = match thread_state::query_interface(handle) {
-            Ok(s) => s,
-            Err(err) => {
-                log::warn!(
-                    "query_interface(handle={handle}) failed: {err:?}; \
-                     not caching, caller may retry"
-                );
-                return Err(err);
+        let descriptor = match cached_descriptor {
+            Some(desc) => {
+                // Sub-case (b): entry present, dead Arc. Skip BC_INCREFS
+                // (would double-pin) and skip INTERFACE_TRANSACTION
+                // (descriptor immutable for the binder_ref slot's
+                // lifetime).
+                desc
+            }
+            None => {
+                // Sub-case (a): entry absent. Pin the kernel binder_ref
+                // slot before the (potentially failing) descriptor query.
+                //
+                // Step 1: queue BC_INCREFS on this thread's out-parcel.
+                thread_state::inc_weak_handle(handle)?;
+                // Step 2: flush so the kernel observes BC_INCREFS now.
+                // If the kernel has already freed binder_ref(handle) —
+                // recycled handle id, never-valid id, etc. — the ioctl
+                // returns -EINVAL and we propagate `DeadObject` without
+                // touching the cache. Subsequent re-resolution through
+                // service manager is the user's contract (same as after
+                // BR_DEAD_BINDER).
+                if let Err(err) = thread_state::flush_commands() {
+                    log::warn!(
+                        "BC_INCREFS for handle {handle} failed at flush: {err:?}; \
+                         handle is no longer valid in the kernel"
+                    );
+                    return Err(StatusCode::DeadObject);
+                }
+                // Step 3: pin is live in the kernel. Query the interface
+                // descriptor. On failure we MUST undo the pin so the
+                // kernel does not leak a binder_ref slot.
+                match thread_state::query_interface(handle) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        undo_case_a_pin(handle);
+                        return Err(err);
+                    }
+                }
             }
         };
 
-        let proxy: Arc<dyn IBinder> = ProxyHandle::new(handle, interface, stability);
-        let weak = WIBinder::new(proxy)?;
-
-        handle_to_proxy.insert(handle, weak.clone());
-
-        weak.upgrade()
+        // Allocate ProxyHandle + acquire kernel strong ref. The cache pin
+        // (already held for case (b), or freshly issued+flushed above for
+        // case (a)) guarantees binder_ref(handle) is alive at this moment,
+        // so BC_ACQUIRE succeeds.
+        //
+        // If `new_acquired` fails we MUST undo the case (a) pin (case (b)'s
+        // pin was issued at first insertion and is still owned by the
+        // existing cache entry, which we leave intact). Distinguishing the
+        // two cases is exactly `!handle_to_proxy.contains_key(&handle)` —
+        // case (a) entered with no entry, case (b) entered with one.
+        let arc = match ProxyHandle::new_acquired(handle, descriptor.clone(), stability) {
+            Ok(arc) => arc,
+            Err(err) => {
+                if !handle_to_proxy.contains_key(&handle) {
+                    undo_case_a_pin(handle);
+                }
+                return Err(err);
+            }
+        };
+        handle_to_proxy.insert(
+            handle,
+            CacheEntry {
+                weak: Arc::downgrade(&arc),
+                descriptor,
+            },
+        );
+        Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
     }
 
+    /// Phase 1 of obituary teardown: remove the cache entry under write
+    /// lock and notify recipients. Phase 2 (BC_DECREFS to release the
+    /// cache pin) is performed by `release_obituary_pin`, called from
+    /// `thread_state::execute_command`'s BR_DEAD_BINDER arm AFTER
+    /// BC_DEAD_BINDER_DONE has been queued.
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        // Extract the weak reference atomically by removing it from the map.
-        // This ensures only one thread can retrieve and process this handle's obituary.
-        let weak = {
+        let entry = {
             let mut handle_to_proxy = self
                 .handle_to_proxy
                 .write()
                 .expect("Handle to proxy lock poisoned");
             handle_to_proxy.remove(&handle)
         };
-        // Write lock is released here
 
-        // Send obituary notification outside the lock to avoid potential deadlock.
-        // If the handle wasn't in the map, this is a no-op.
-        if let Some(weak) = weak {
-            match weak.upgrade() {
-                Ok(strong) => {
-                    if let Some(proxy) = strong.as_proxy() {
-                        // Send obituary - this is best-effort notification
-                        proxy.send_obituary(&weak)?;
-                    } else {
-                        log::debug!("Handle {} is not a proxy during obituary", handle);
-                    }
-                }
-                Err(_) => {
-                    // Weak reference upgrade failed - object already destroyed
-                    // This is expected in many cases and not an error
-                    log::trace!("Object for handle {} already destroyed", handle);
-                }
+        if let Some(entry) = entry {
+            // The entry's `weak` may or may not still upgrade. Recipients
+            // are only meaningful while a live proxy exists, since
+            // `link_to_death` requires an `Arc<ProxyHandle>` to hand out
+            // recipients. If the Arc is gone, no recipients can be
+            // pending and we simply drop the cache entry.
+            if let Some(arc) = entry.weak.upgrade() {
+                let sibinder = SIBinder::from_arc(arc.clone() as Arc<dyn IBinder>);
+                let who = SIBinder::downgrade(&sibinder);
+                arc.send_obituary(&who)?;
+            } else {
+                log::trace!("Object for handle {handle} already destroyed at obituary time");
             }
         } else {
-            log::trace!("Handle {} was not in cache during obituary", handle);
+            log::trace!("Handle {handle} was not in cache during obituary");
         }
 
         Ok(())
     }
 
-    /// Send `BC_RELEASE` / `BC_DECREFS` to the kernel for `handle` while
-    /// holding the cache write lock, then drop the cache entry iff the
-    /// proxy is still orphaned (both strong and weak counters at
-    /// `INITIAL_STRONG_VALUE`).
+    /// Phase 2 of obituary teardown: release the cache pin
+    /// (BC_DECREFS). Called from `thread_state::execute_command`'s
+    /// BR_DEAD_BINDER arm AFTER `BC_DEAD_BINDER_DONE` has been queued
+    /// in this thread's out-parcel.
     ///
-    /// Issue #47's stale-proxy fix needed to evict cache entries whose
-    /// user-visible refcounts had returned to "uninitialized." The original
-    /// implementation did the count check in the caller (`ProxyHandle::dec_*`)
-    /// BEFORE taking the cache lock, and called `dec_strong_handle` /
-    /// `dec_weak_handle` (which write `BC_RELEASE` / `BC_DECREFS` to the
-    /// out-parcel and flush) outside any lock. Two races followed:
-    ///
-    ///   1. **Cache aliasing.** A concurrent
-    ///      `strong_proxy_for_handle_stability` lookup could inc the strong
-    ///      counter between the caller's check and the eventual map mutation,
-    ///      after which the cache was emptied even though a freshly-handed-out
-    ///      `Strong<...>` still referenced the now-orphaned ProxyHandle. The
-    ///      next lookup of the same kernel handle allocated a brand-new
-    ///      ProxyHandle, breaking the `Arc::ptr_eq` invariant that AIDL out-
-    ///      parameter equality relies on (e.g. `test_nullable_binder_array`).
-    ///
-    ///   2. **Kernel ref-count race.** Sending `BC_RELEASE` outside the lock
-    ///      let the binder driver process the release before a concurrent
-    ///      lookup's `BC_INCREFS` arrived; the kernel could free the handle
-    ///      and reject the late `BC_INCREFS`, leaving a user-space proxy
-    ///      whose handle was no longer valid. Subsequent transactions on
-    ///      that proxy returned `DeadObject` even though `Strong<...>` was
-    ///      still alive (e.g. intermittent `service.GetOldNameInterface()`
-    ///      failures in `test_renamed_interface_*`).
-    ///
-    /// Funneling the kernel-side ref drop AND the cache eviction through the
-    /// cache write lock closes both windows. The lookup path's
-    /// `weak.upgrade()` runs entirely inside the cache *read* lock, so any
-    /// `inc_strong_handle` (BC_INCREFS) it performs is dispatched to the
-    /// kernel before this function can acquire the *write* lock. By the time
-    /// we run, the binder driver sees the matched INC/RELEASE pair, the
-    /// counts here reflect the post-inc state, and `is_orphan()` correctly
-    /// keeps the entry cached for the still-live lookup.
-    pub(crate) fn release_strong_under_cache_lock(
-        &self,
-        handle: u32,
-        proxy: &ProxyHandle,
-    ) -> Result<()> {
-        let mut handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
-
-        thread_state::dec_strong_handle(handle)?;
-
-        if proxy.is_orphan() {
-            handle_to_proxy.remove(&handle);
-            log::trace!("release_strong_under_cache_lock: removed handle {}", handle);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn release_weak_under_cache_lock(
-        &self,
-        handle: u32,
-        proxy: &ProxyHandle,
-    ) -> Result<()> {
-        let mut handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
-
+    /// `flush_commands()` here commits BC_DEAD_BINDER_DONE plus any
+    /// BC_RELEASEs queued IN THIS THREAD before BC_DECREFS reaches the
+    /// kernel. It does NOT drain other threads' out-parcels —
+    /// concurrent BC_RELEASEs from Drops on other threads can still
+    /// arrive after our BC_DECREFS. The kernel rejects those with
+    /// -EINVAL and a dmesg log entry, which is acceptable; strict
+    /// elimination of that window would require global cross-thread
+    /// synchronization which isn't worth the cost.
+    pub(crate) fn release_obituary_pin(&self, handle: u32) -> Result<()> {
+        thread_state::flush_commands()?;
         thread_state::dec_weak_handle(handle)?;
-
-        if proxy.is_orphan() {
-            handle_to_proxy.remove(&handle);
-            log::trace!("release_weak_under_cache_lock: removed handle {}", handle);
-        }
+        thread_state::flush_commands()?;
         Ok(())
     }
 

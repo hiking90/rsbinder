@@ -136,13 +136,22 @@ impl TransactionState {
     }
 }
 
-// To avoid duplicate calls to borrow_mut() on ThreadState,
-// separate the data related to binder dereference.
+// Storage for inbound BR_RELEASE / BR_DECREFS payloads (pairs of raw
+// binder pointers delivered by the kernel for native binders we
+// previously published). These are processed lazily on the next
+// driver round-trip via `process_pending_derefs`.
+//
+// Outbound proxy ref-count (BC_ACQUIRE / BC_RELEASE / BC_INCREFS /
+// BC_DECREFS) is no longer routed through this state under the
+// cache-pin model — proxies own kernel strong refs 1-per-Arc
+// (acquire in `ProxyHandle::new_acquired`, release in
+// `ProxyHandle::Drop`) and the cache itself owns the kernel weak
+// ref. Hence `post_strong_derefs` / `post_weak_derefs` (which
+// existed only to keep `SIBinder` / `WIBinder` clones alive across
+// deferred flushes) are gone.
 struct BinderDerefs {
     pending_strong_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
     pending_weak_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
-    post_strong_derefs: Vec<SIBinder>,
-    post_weak_derefs: Vec<WIBinder>,
 }
 
 impl BinderDerefs {
@@ -150,14 +159,7 @@ impl BinderDerefs {
         BinderDerefs {
             pending_strong_derefs: Vec::new(),
             pending_weak_derefs: Vec::new(),
-            post_strong_derefs: Vec::new(),
-            post_weak_derefs: Vec::new(),
         }
-    }
-
-    fn process_post_write_derefs(&mut self) {
-        self.post_weak_derefs.clear();
-        self.post_strong_derefs.clear();
     }
 
     fn process_pending_derefs(&mut self) -> Result<()> {
@@ -172,8 +174,16 @@ impl BinderDerefs {
         // from the driver if we don't process it now.
         while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
             for raw_pointer in self.pending_weak_derefs.drain(..) {
+                // BR_DECREFS reflects the kernel releasing a weak ref it
+                // held to one of our published binders (always native
+                // under the cache-pin model — proxies own one kernel
+                // strong ref per Arc and never publish themselves as
+                // weak). Dispatch directly to the IBinder trait via the
+                // reconstructed SIBinder; for natives this drives
+                // RefCounter.weak, for proxies it would be a no-op
+                // (defensive).
                 let strong = raw_pointer_to_strong_binder(raw_pointer);
-                SIBinder::downgrade(&strong).decrease();
+                let _ = strong.dec_weak();
             }
 
             if let Some(raw_pointer) = self.pending_strong_derefs.pop() {
@@ -376,6 +386,14 @@ pub(crate) fn _setup_polling() -> Result<()> {
 enum UntilResponse {
     Reply,
     TransactionComplete,
+    /// Inbound `BR_ACQUIRE_RESULT` arm. Currently unreachable because
+    /// `BC_ATTEMPT_ACQUIRE` is no longer issued by rsbinder — under the
+    /// cache-pin model, regular `BC_ACQUIRE` always succeeds (the cache
+    /// pin keeps the slot alive) and `Weak<I>::upgrade` covers the
+    /// "atomically promote a weak ref" semantics. The variant is kept
+    /// only so the kernel-direction match in `wait_for_response` stays
+    /// exhaustive.
+    #[allow(dead_code)]
     AcquireResult,
 }
 
@@ -639,9 +657,17 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
                 let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
+                // BR_INCREFS reflects the kernel acquiring a weak ref to
+                // one of our published binders (always native under the
+                // cache-pin model). Dispatch directly to the IBinder
+                // trait via the reconstructed SIBinder; for natives this
+                // advances RefCounter.weak, for proxies it would be a
+                // no-op (defensive). The `WIBinder` argument is unused
+                // by both impls, but the trait signature requires one —
+                // pass a synthetic downgrade.
                 let strong = raw_pointer_to_strong_binder((refs, obj));
-                let weak = SIBinder::downgrade(&strong);
-                weak.increase();
+                let dummy = SIBinder::downgrade(&strong);
+                let _ = strong.inc_weak(&dummy);
 
                 state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
                 state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
@@ -705,8 +731,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                 };
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
+
+                // Phase 1: remove cache entry under write lock + notify
+                // recipients.
                 ProcessState::as_self().send_obituary_for_handle(handle as _)?;
 
+                // Queue BC_DEAD_BINDER_DONE first (kernel handshake).
                 {
                     let mut state = thread_state.borrow_mut();
                     state
@@ -716,6 +746,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                         .out_parcel
                         .write::<binder::binder_uintptr_t>(&handle)?;
                 }
+
+                // Phase 2: release the cache pin AFTER the death-done
+                // handshake is queued. `release_obituary_pin` flushes
+                // (commits BC_DEAD_BINDER_DONE plus any BC_RELEASEs
+                // already queued in this thread), then issues
+                // BC_DECREFS, then flushes again. Concurrent
+                // BC_RELEASEs from Drops on other threads can still
+                // arrive after our BC_DECREFS — the kernel rejects
+                // those with -EINVAL (logged but harmless).
+                ProcessState::as_self().release_obituary_pin(handle as _)?;
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
                 let mut state = thread_state.borrow_mut();
@@ -809,23 +849,19 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
         );
 
         // Process write and read results in a single borrow_mut scope
-        let should_process_derefs = {
+        {
             let mut thread_state = thread_state.borrow_mut();
 
-            let should_process = if bwr.write_consumed > 0 {
+            if bwr.write_consumed > 0 {
                 if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
                     panic!(
                         "Driver did not consume write buffer. consumed: {} of {}",
                         bwr.write_consumed,
                         thread_state.out_parcel.data_size()
                     );
-                } else {
-                    thread_state.out_parcel.set_data_size(0);
-                    true
                 }
-            } else {
-                false
-            };
+                thread_state.out_parcel.set_data_size(0);
+            }
 
             if bwr.read_consumed > 0 {
                 thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
@@ -836,14 +872,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     thread_state.in_parcel
                 );
             }
-
-            should_process
-        }; // thread_state is dropped here
-
-        if should_process_derefs {
-            BINDER_DEREFS
-                .with(|binder_derefs| binder_derefs.borrow_mut().process_post_write_derefs());
-        }
+        } // thread_state is dropped here
 
         Ok(())
     })
@@ -876,21 +905,7 @@ pub(crate) fn flush_commands() -> Result<()> {
     })
 }
 
-pub(crate) fn attempt_inc_strong_handle(handle: u32) -> Result<()> {
-    log::trace!("attempt_inc_strong_handle: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        let mut state = thread_state.borrow_mut();
-
-        state
-            .out_parcel
-            .write::<u32>(&(binder::BC_ATTEMPT_ACQUIRE))?;
-        state.out_parcel.write::<u32>(&0)?; // xxx was thread priority.
-        state.out_parcel.write::<u32>(&(handle))
-    })?;
-    wait_for_response(UntilResponse::AcquireResult).map(|_| ())
-}
-
-pub(crate) fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
+pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
     log::trace!("inc_strong_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -900,11 +915,7 @@ pub(crate) fn inc_strong_handle(handle: u32, proxy: SIBinder) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        if !(flash_if_needed()?) {
-            BINDER_DEREFS.with(|binder_derefs| {
-                binder_derefs.borrow_mut().post_strong_derefs.push(proxy);
-            });
-        }
+        flash_if_needed()?;
 
         Ok(())
     })
@@ -926,7 +937,7 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
-pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()> {
+pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
     log::trace!("inc_weak_handle: {handle}");
     THREAD_STATE.with(|thread_state| -> Result<()> {
         {
@@ -936,15 +947,7 @@ pub(crate) fn inc_weak_handle(handle: u32, weak: &WIBinder) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        if !(flash_if_needed()?) {
-            // This code is come from IPCThreadState.cpp. Is it necessaryq?
-            BINDER_DEREFS.with(|binder_derefs| {
-                binder_derefs
-                    .borrow_mut()
-                    .post_weak_derefs
-                    .push(weak.clone());
-            });
-        }
+        flash_if_needed()?;
 
         Ok(())
     })

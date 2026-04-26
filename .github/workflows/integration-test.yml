@@ -16,7 +16,7 @@ on:
       iterations:
         description: 'cargo test iterations for the Linux binder loop'
         required: false
-        default: '5'
+        default: '100'
         type: string
       run_linux:
         description: 'Run the Linux binder integration test'
@@ -140,19 +140,51 @@ jobs:
         run: |
           # Async path exercises tokio runtime — covers the user's scenario in #97
           # (oneway broadcasts spawned via tokio::runtime::Handle::spawn).
-          #
-          # Additionally skip test_binder_extension_* tests that require the
-          # service-side to call set_extension(): only test_service.rs does
-          # that, test_service_async.rs has not been wired up for it. This
-          # is a setup gap in the async test binary, tracked separately and
-          # not in scope for the issue #97 dmesg gate.
           RUST_BACKTRACE=1 cargo test --package tests -- \
             --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
             --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
-            --skip test_versioned_unknown_union_field_triggers_error \
-            --skip test_binder_extension_get_from_remote \
-            --skip test_binder_extension_proxy_cache_with_ext \
-            --skip test_binder_extension_use_as_interface
+            --skip test_versioned_unknown_union_field_triggers_error
+
+      - name: Restart test_service for test_death_recipient
+        run: |
+          # Each #[ignore]'d destructive test consumes a live
+          # test_service (it calls killService()) and panics if the
+          # service is missing. So each test needs its own fresh
+          # test_service restart — we cannot batch them in a single
+          # cargo test invocation.
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run test_death_recipient (destructive)
+        run: |
+          # Existing #[ignore]'d test exercising the death-recipient
+          # callback + post-obituary unlink_to_death returning
+          # DeadObject. Wired into CI here as part of the cache-pin
+          # follow-up so its coverage is no longer manual-only.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            test_client::test_death_recipient
+
+      - name: Restart test_service for test_wibinder_upgrade_after_obituary
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          sleep 2
+          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+
+      - name: Run test_wibinder_upgrade_after_obituary (destructive)
+        run: |
+          # Plan test plan #3's required Err(DeadObject) branch
+          # coverage on a real obituary path. The exact-path filter
+          # (test_client::test_wibinder_upgrade_after_obituary) avoids
+          # cargo's substring matching from picking up unrelated tests.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+            test_client::test_wibinder_upgrade_after_obituary
 
       - name: Stop background services
         if: always()

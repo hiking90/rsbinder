@@ -58,6 +58,15 @@ impl INamedCallback::INamedCallbackAsyncService for NamedCallback {
     }
 }
 
+// Sync impl exists alongside the async one so the binder extension below can
+// be wrapped with the non-async `new_binder` (set_extension is a non-async
+// IBinder trait method).
+impl INamedCallback::INamedCallback for NamedCallback {
+    fn GetName(&self) -> rsbinder::status::Result<String> {
+        Ok(self.0.clone())
+    }
+}
+
 struct OldName;
 
 impl Interface for OldName {}
@@ -736,6 +745,17 @@ fn main() {
         let service_name = <BpTestService as ITestService::ITestService>::descriptor();
         let service =
             BnTestService::new_async_binder(TestService::default(), rt());
+
+        // Set a NamedCallback as binder extension for testing get_extension/set_extension.
+        // The extension itself is a sync binder (set_extension is a non-async IBinder
+        // trait method) — same wiring as test_service.rs.
+        let ext_service =
+            INamedCallback::BnNamedCallback::new_binder(NamedCallback("binder_ext".into()));
+        service
+            .as_binder()
+            .set_extension(&ext_service.as_binder())
+            .expect("Could not set extension");
+
         hub::add_service(service_name, service.as_binder()).expect("Could not register service");
 
         let versioned_service_name = <BpFooInterface as IFooInterface::IFooInterface>::descriptor();
