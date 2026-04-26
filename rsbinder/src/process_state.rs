@@ -745,17 +745,26 @@ impl ProcessState {
             // `BR_INCREFS` thread is preempted before reaching
             // `ref_native_kernel`. Under that race the late
             // `BR_INCREFS` will bump `kernel_refs` from 0 to 1 (we
-            // missed the dec that should have followed), leaving a
-            // bounded off-by-one leak — one stranded entry per race
-            // occurrence. We accept this over a `debug_assert` panic:
-            // the race is a property of kernel scheduling, not our
-            // bookkeeping, so panicking would fail CI on a legitimate
-            // interleaving. (The OLD fat-pointer encoding hit the
-            // same race but masked it via `RefCounter`'s
-            // `INITIAL_STRONG_VALUE` pattern, which self-corrects the
-            // count to its initial value but silently skips the
-            // first/last-ref closures — equivalently broken in
-            // semantics, just lower-noise.) See plan §5 #7.
+            // missed the dec that should have followed). Each race
+            // occurrence on a given id adds one to `kernel_refs`'s
+            // over-count vs the kernel's true ref count; the
+            // accumulation is **unbounded** over the binder's
+            // lifetime if races recur, leaving the entry permanently
+            // stranded with `kernel_refs >= 1` even after the kernel
+            // has fully released. Bounded only by "one entry per
+            // long-lived published binder that ever raced." We
+            // accept this over a `debug_assert` panic: the race is a
+            // property of kernel scheduling, not our bookkeeping, so
+            // panicking would fail CI on a legitimate interleaving.
+            // (The OLD fat-pointer encoding hit the same race but
+            // masked it via `RefCounter`'s `INITIAL_STRONG_VALUE`
+            // pattern, which self-corrects the count to its initial
+            // value but silently skips the first/last-ref closures —
+            // equivalently broken in semantics, just lower-noise.)
+            // See plan §5 #7. A future change could move to a
+            // signed counter + dual-direction removal trigger to
+            // bound the drift, but that introduces premature-removal
+            // hazards in multi-pair scenarios; left as a follow-up.
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
             let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;

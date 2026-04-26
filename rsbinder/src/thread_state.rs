@@ -742,11 +742,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                         // while the entry exists, so the SIBinder we
                         // construct here can safely drive the user's
                         // `Transactable` impl. SIBinder construction
-                        // is contained within this scope: the
-                        // `attempt_increase` / `decrease` pair is
-                        // balanced, and `strong` drops at the end of
-                        // the block (canceling the +1 that
-                        // `SIBinder::from_arc` added).
+                        // is contained within this scope and the
+                        // RefCounter ops balance pairwise: `from_arc`
+                        // calls `inc_strong` (+1), `attempt_increase`
+                        // adds another (+1), `decrease()` cancels one
+                        // (−1), and `strong`'s `Drop` cancels the
+                        // last (−1) — net zero across the block.
                         let id = target_ptr;
                         match ProcessState::as_self().lookup_native(id) {
                             Some(arc) => {
