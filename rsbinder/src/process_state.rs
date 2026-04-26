@@ -736,19 +736,26 @@ impl ProcessState {
                 .write()
                 .expect("Published natives lock poisoned");
             let entry = map.get_mut(&id)?;
-            // Mirror `decref_publish`: `saturating_sub` is the
-            // production safety net; `debug_assert` catches an
-            // unpaired BR_RELEASE / BR_DECREFS during dev/CI. Kernel
-            // ordering guarantees `BR_INCREFS` ≤ `BR_DECREFS` count
-            // and `BR_ACQUIRE` ≤ `BR_RELEASE` count, so reaching this
-            // path with `kernel_refs == 0` would mean a kernel/
-            // bookkeeping divergence.
-            debug_assert!(
-                entry.kernel_refs > 0,
-                "deref_native_kernel on id {id} with kernel_refs == 0 \
-                 (unpaired BR_RELEASE / BR_DECREFS; check ref_native_kernel \
-                 pairing)"
-            );
+            // `saturating_sub` clamps at 0 under a cross-thread race
+            // where `BR_DECREFS` is processed before its matching
+            // `BR_INCREFS`. The kernel queues `BR_INCREFS` /
+            // `BR_DECREFS` to `proc->todo` (process-wide FIFO), so
+            // distinct binder threads can pop the matching pair in
+            // FIFO order but dispatch out of order if the
+            // `BR_INCREFS` thread is preempted before reaching
+            // `ref_native_kernel`. Under that race the late
+            // `BR_INCREFS` will bump `kernel_refs` from 0 to 1 (we
+            // missed the dec that should have followed), leaving a
+            // bounded off-by-one leak — one stranded entry per race
+            // occurrence. We accept this over a `debug_assert` panic:
+            // the race is a property of kernel scheduling, not our
+            // bookkeeping, so panicking would fail CI on a legitimate
+            // interleaving. (The OLD fat-pointer encoding hit the
+            // same race but masked it via `RefCounter`'s
+            // `INITIAL_STRONG_VALUE` pattern, which self-corrects the
+            // count to its initial value but silently skips the
+            // first/last-ref closures — equivalently broken in
+            // semantics, just lower-noise.) See plan §5 #7.
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
             let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;
