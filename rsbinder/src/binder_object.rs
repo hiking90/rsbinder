@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
 
@@ -86,9 +87,23 @@ impl flat_binder_object {
     pub(crate) fn acquire(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
+                // Native binder: bump publish_count for this buffer
+                // instance. Symmetric with `release()` below — every
+                // `Parcel::write_object` / `Parcel::append_from` call
+                // pairs an `acquire` here with exactly one `release`
+                // from `Parcel::release_objects` (driven by
+                // `Parcel::Drop` for caller-owned outgoing parcels).
+                // Driver-mmapped incoming parcels skip both ends
+                // symmetrically (their `Drop` calls `BC_FREE_BUFFER`
+                // instead of `release_objects`, and the deserializer
+                // does not call `acquire`), so the pairing invariant
+                // is preserved without any per-object bookkeeping.
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
-                    strong.increase()?;
+                    let id = self.pointer();
+                    if !process_state::ProcessState::as_self().incref_publish(id) {
+                        log::error!("flat_binder_object::acquire: unknown native id {id}");
+                        debug_assert!(false, "acquire on unknown native id {id}");
+                    }
                 }
 
                 Ok(())
@@ -110,9 +125,20 @@ impl flat_binder_object {
     pub(crate) fn release(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
+                // Native binder: decrement publish_count. If both
+                // publish_count and kernel_refs hit zero,
+                // decref_publish removes the entry, which drives
+                // RefCounter.strong / RefCounter.weak 1→0 and drops
+                // the canonical Arc<dyn IBinder> (Inner<T>::drop runs
+                // cleanly — kernel guaranteed no further BR_* will
+                // reference this id since kernel_refs was 0 at
+                // removal).
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
-                    strong.decrease()?;
+                    let id = self.pointer();
+                    if !process_state::ProcessState::as_self().decref_publish(id) {
+                        log::error!("flat_binder_object::release: unknown native id {id}");
+                        debug_assert!(false, "release on unknown native id {id}");
+                    }
                 }
                 Ok(())
             }
@@ -188,18 +214,36 @@ impl From<&SIBinder> for flat_binder_object {
                 cookie: 0,
             }
         } else {
-            let strong = binder.clone();
-            let (binder, cookie) = split_fat_pointer(strong.into_raw());
+            // Native binder. Acquire (or dedup-resolve) an id via the
+            // sidecar table on `ProcessState`; the table holds an
+            // `Arc<dyn IBinder>` strong reference for the duration
+            // either an outgoing parcel (`publish_count > 0`) or any
+            // kernel-held ref (`kernel_refs > 0`) references this
+            // binder. Replaces the previous fat-pointer encoding
+            // (data ptr in `binder`, vtable ptr in `cookie`) which
+            // could dangle once `Inner<T>` was dropped while a
+            // `BR_DECREFS` was still in flight — Android closes the
+            // same window with a two-allocation
+            // (`weakref_type*` / `BBinder*`) design; we reach the
+            // same invariant via id-indirection.
+            //
+            // The entry is created with `publish_count = 0`; the
+            // immediately-following `Parcel::write_object` →
+            // `flat_binder_object::acquire` brings it to 1. The
+            // single-statement window between this `From` returning
+            // and the first `acquire` is the only leak path under a
+            // `Parcel::write_aligned` panic (typically OOM), which is
+            // process-fatal anyway — see plan §5 #11.
+            let id = process_state::ProcessState::as_self()
+                .publish_native(Arc::clone(binder.as_arc()));
 
             flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_BINDER,
                 },
                 flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    binder: binder as _,
-                },
-                cookie: cookie as _,
+                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: id },
+                cookie: 0,
             }
         }
     }

@@ -26,6 +26,7 @@
 use log::error;
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::fmt::Debug;
 use std::fs::File;
@@ -136,80 +137,87 @@ impl TransactionState {
     }
 }
 
-// Storage for inbound BR_RELEASE / BR_DECREFS payloads (pairs of raw
-// binder pointers delivered by the kernel for native binders we
-// previously published). These are processed lazily on the next
-// driver round-trip via `process_pending_derefs`.
+// Storage for inbound BR_RELEASE / BR_DECREFS payloads — process-monotonic
+// u64 ids delivered by the kernel for native binders we previously
+// published. Processed lazily on the next driver round-trip via
+// `process_pending_derefs`.
+//
+// Under the new id-encoding model (replacing the fat-pointer scheme that
+// could dangle when `Inner<T>` was dropped between BR_RELEASE and
+// BR_DECREFS), the pending entries are pure ids — `deref_native_kernel`
+// looks them up in `ProcessState::published_natives` and drives
+// `kernel_refs--` / entry-removal-on-zero. No SIBinder reconstruction
+// from a raw pointer, no method dispatch on a possibly-freed `Inner<T>`.
 //
 // Outbound proxy ref-count (BC_ACQUIRE / BC_RELEASE / BC_INCREFS /
-// BC_DECREFS) is no longer routed through this state under the
-// cache-pin model — proxies own kernel strong refs 1-per-Arc
-// (acquire in `ProxyHandle::new_acquired`, release in
-// `ProxyHandle::Drop`) and the cache itself owns the kernel weak
-// ref. Hence `post_strong_derefs` / `post_weak_derefs` (which
-// existed only to keep `SIBinder` / `WIBinder` clones alive across
-// deferred flushes) are gone.
+// BC_DECREFS) is not routed through this state — proxies own kernel
+// strong refs 1-per-Arc (acquire in `ProxyHandle::new_acquired`, release
+// in `ProxyHandle::Drop`) and the cache pin owns the kernel weak ref.
 struct BinderDerefs {
-    pending_strong_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
-    pending_weak_derefs: Vec<(binder_uintptr_t, binder_uintptr_t)>,
+    pending_strong_derefs: VecDeque<u64>,
+    pending_weak_derefs: VecDeque<u64>,
 }
 
 impl BinderDerefs {
     fn new() -> Self {
         BinderDerefs {
-            pending_strong_derefs: Vec::new(),
-            pending_weak_derefs: Vec::new(),
+            pending_strong_derefs: VecDeque::new(),
+            pending_weak_derefs: VecDeque::new(),
         }
     }
 
     fn process_pending_derefs(&mut self) -> Result<()> {
-        // The decWeak()/decStrong() calls may cause a destructor to run,
-        // which in turn could have initiated an outgoing transaction,
-        // which in turn could cause us to add to the pending refs
-        // vectors; so instead of simply iterating, loop until they're empty.
+        // The deref operations may run user destructor code (when an
+        // entry's `kernel_refs` and `publish_count` both reach zero,
+        // `remove_entry_if_zero` drops the canonical Arc, which may
+        // fire `Inner<T>::drop` on the user's `Remotable` instance).
+        // That destructor could initiate outgoing transactions which
+        // in turn enqueue more pending derefs; so iterate in an outer
+        // loop until both queues are drained.
         //
-        // We do this in an outer loop, because calling decStrong()
-        // may result in something being added to mPendingWeakDerefs,
-        // which could be delayed until the next incoming command
-        // from the driver if we don't process it now.
+        // Order matters: process derefs in **FIFO** so the sequence of
+        // destructor side effects (further outgoing transactions,
+        // further deref additions, native-binder cleanup hooks) matches
+        // the order the kernel observed BR_RELEASE / BR_DECREFS.
+        // Android's libbinder uses the same FIFO discipline — a LIFO
+        // `Vec::pop()` would silently reverse the ordering and could
+        // break callers that rely on it (e.g. when a strong-deref's
+        // destructor queues a weak-deref that the outer loop is then
+        // supposed to drain before the next strong).
         //
-        // Order matters: process pending derefs in **FIFO** order so the
-        // sequence of destructor side effects (further outgoing
-        // transactions, further deref additions, native-binder cleanup
-        // hooks) matches the order the kernel observed BR_RELEASE /
-        // BR_DECREFS for these objects. Android's libbinder uses the
-        // same FIFO discipline (`mPendingStrongDerefs.removeAt(0)` /
-        // `mPendingWeakDerefs.removeAt(0)`); a LIFO `Vec::pop()` here
-        // would silently reverse the ordering and could break callers
-        // that rely on it (e.g. when a strong-deref's destructor queues
-        // a weak-deref that the outer loop is then supposed to drain
-        // before the next strong).
+        // The outer-while wrapper is defensive under the new model:
+        // `deref_native_kernel`'s entry removal hands off to
+        // `remove_entry_if_zero`, which itself releases the table lock
+        // before `SIBinder::Drop` fires — so destructors run without
+        // the table lock held, and the only re-entrant path back into
+        // the deref queues is the same thread's next ioctl, not from
+        // inside the destructor itself. The wrapper still costs little
+        // and matches Android's libbinder structure.
         while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
-            for raw_pointer in self.pending_weak_derefs.drain(..) {
-                // BR_DECREFS reflects the kernel releasing a weak ref it
-                // held to one of our published binders (always native
-                // under the cache-pin model — proxies own one kernel
-                // strong ref per Arc and never publish themselves as
-                // weak). Dispatch directly to the IBinder trait via the
-                // reconstructed SIBinder; for natives this drives
-                // RefCounter.weak, for proxies it would be a no-op
-                // (defensive).
-                let strong = raw_pointer_to_strong_binder(raw_pointer);
-                let _ = strong.dec_weak();
+            while let Some(id) = self.pending_weak_derefs.pop_front() {
+                // BR_DECREFS reflects the kernel releasing a weak ref
+                // it held to one of our published natives. Pure id
+                // bookkeeping: decrement `kernel_refs`; if both
+                // counters now zero, the entry is removed (RefCounter
+                // floor torn down, Arc dropped) — see
+                // `deref_native_kernel`. An unknown id at this point
+                // would mean the kernel sent a BR_DECREFS for an id
+                // we never published or already torn down; skip with
+                // a trace log.
+                if ProcessState::as_self().deref_native_kernel(id).is_none() {
+                    log::trace!("BR_DECREFS for unknown native id {id}");
+                }
             }
 
-            // FIFO front-pop on strong derefs (`remove(0)`). Process
+            // FIFO front-pop on strong derefs (`pop_front`). Process
             // exactly one before re-checking the outer loop so a
-            // destructor-queued weak-deref is drained ahead of the next
-            // pending strong — same pattern as Android's libbinder.
-            // The pending queue is bounded (at most one entry per
-            // recently-received BR_RELEASE), so the O(n) front-remove
-            // cost is negligible and the linear scan keeps the data
-            // structure simple (a `VecDeque` would also work).
-            if !self.pending_strong_derefs.is_empty() {
-                let raw_pointer = self.pending_strong_derefs.remove(0);
-                let strong = raw_pointer_to_strong_binder(raw_pointer);
-                SIBinder::decrease_drop(strong)?;
+            // destructor-queued weak-deref is drained ahead of the
+            // next pending strong — same pattern as Android's
+            // libbinder.
+            if let Some(id) = self.pending_strong_derefs.pop_front() {
+                if ProcessState::as_self().deref_native_kernel(id).is_none() {
+                    log::trace!("BR_RELEASE for unknown native id {id}");
+                }
             }
         }
         Ok(())
@@ -720,23 +728,44 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let result = {
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     if target_ptr != 0 {
-                        let strong = raw_pointer_to_strong_binder((
-                            target_ptr,
-                            tr_secctx.transaction_data.cookie,
-                        ));
-                        if strong.attempt_increase() {
-                            let result = dispatch_transact_caught(
-                                strong.as_transactable().expect("Transactable is None."),
-                                tr_secctx.transaction_data.code,
-                                &mut reader,
-                                &mut reply,
-                            );
-                            strong.decrease()?;
-
-                            result
-                        } else {
-                            log::warn!("Failed StrongBinder::attempt_increase.");
-                            Err(StatusCode::UnknownTransaction)
+                        // `target_ptr` is now the process-monotonic id
+                        // assigned by `publish_native`. Resolve via the
+                        // sidecar table (read-only, no count change) —
+                        // the table guarantees `Inner<T>` is alive
+                        // while the entry exists, so the SIBinder we
+                        // construct here can safely drive the user's
+                        // `Transactable` impl. SIBinder construction
+                        // is contained within this scope: the
+                        // `attempt_increase` / `decrease` pair is
+                        // balanced, and `strong` drops at the end of
+                        // the block (canceling the +1 that
+                        // `SIBinder::from_arc` added).
+                        let id = target_ptr;
+                        match ProcessState::as_self().lookup_native(id) {
+                            Some(arc) => {
+                                let strong = SIBinder::from_arc(arc);
+                                if strong.attempt_increase() {
+                                    let result = dispatch_transact_caught(
+                                        strong.as_transactable().expect("Transactable is None."),
+                                        tr_secctx.transaction_data.code,
+                                        &mut reader,
+                                        &mut reply,
+                                    );
+                                    strong.decrease()?;
+                                    result
+                                } else {
+                                    log::warn!(
+                                        "Failed strong.attempt_increase for native id {id}"
+                                    );
+                                    Err(StatusCode::UnknownTransaction)
+                                }
+                            }
+                            None => {
+                                log::error!(
+                                    "BR_TRANSACTION for unknown native id {id}"
+                                );
+                                Err(StatusCode::DeadObject)
+                            }
                         }
                     } else {
                         let context = ProcessState::as_self()
@@ -785,66 +814,94 @@ fn execute_command(cmd: i32) -> Result<()> {
 
             binder::BR_INCREFS => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                // The cookie half is unused under the new id encoding
+                // but the kernel still emits the original `cookie`
+                // (always 0 for our published natives). Echo it back
+                // verbatim in BC_INCREFS_DONE.
+                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                drop(state);
 
-                // BR_INCREFS reflects the kernel acquiring a weak ref to
-                // one of our published binders (always native under the
-                // cache-pin model). Dispatch directly to the IBinder
-                // trait via the reconstructed SIBinder; for natives this
-                // advances RefCounter.weak, for proxies it would be a
-                // no-op (defensive). The `WIBinder` argument is unused
-                // by both impls, but the trait signature requires one —
-                // pass a synthetic downgrade.
-                let strong = raw_pointer_to_strong_binder((refs, obj));
-                let dummy = SIBinder::downgrade(&strong);
-                let _ = strong.inc_weak(&dummy);
+                // BR_INCREFS reflects the kernel acquiring a weak ref
+                // to one of our published natives. Pure id
+                // bookkeeping: bump `kernel_refs` in the table; the
+                // RefCounter.weak alive-signal is held above zero by
+                // `publish_native` for the entry's lifetime — no
+                // per-event RefCounter touch needed (and no SIBinder
+                // construction, no method dispatch on a possibly-freed
+                // `Inner<T>`, closing the UAF that the old
+                // fat-pointer encoding could expose).
+                if ProcessState::as_self().ref_native_kernel(id).is_none() {
+                    log::error!("BR_INCREFS for unknown native id {id}");
+                    debug_assert!(false, "BR_INCREFS for unknown native id {id}");
+                }
 
+                let mut state = thread_state.borrow_mut();
                 state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&obj)?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                drop(state);
 
-                let strong = raw_pointer_to_strong_binder((refs, obj));
-                // strong is ManuallyDrop, so increase() is called once.
-                strong.increase()?;
+                // Same shape as BR_INCREFS — bookkeeping only.
+                // `RefCounter.strong` alive-signal is held by the
+                // table's `binder_pin: SIBinder` for the entry's
+                // lifetime.
+                if ProcessState::as_self().ref_native_kernel(id).is_none() {
+                    log::error!("BR_ACQUIRE for unknown native id {id}");
+                    debug_assert!(false, "BR_ACQUIRE for unknown native id {id}");
+                }
 
+                let mut state = thread_state.borrow_mut();
                 state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&refs)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&obj)?;
+                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_RELEASE => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                // cookie echo unused on the deferred-deref path.
+                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_strong_derefs.push((refs, obj));
+                    binder_derefs.pending_strong_derefs.push_back(id);
                 });
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_weak_derefs.push((refs, obj));
+                    binder_derefs.pending_weak_derefs.push_back(id);
                 });
             }
             binder::BR_ATTEMPT_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let refs = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let obj = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                drop(state);
 
-                let strong = raw_pointer_to_strong_binder((refs, obj));
-                let success = strong.attempt_increase();
+                // Probe the table's binary alive-signal: entry exists
+                // ⟹ promotion may proceed. If alive, bump
+                // `kernel_refs` (the kernel will hold a new strong
+                // ref on success). Unknown id is permitted here — it
+                // can race against unpublish (kernel may probe a
+                // binder that just lost its last ref); reply
+                // `success=0` without `debug_assert`.
+                let success = ProcessState::as_self().ref_native_kernel(id).is_some();
 
+                let mut state = thread_state.borrow_mut();
                 state.out_parcel.write::<u32>(&binder::BC_ACQUIRE_RESULT)?;
                 state.out_parcel.write::<i32>(&(success as _))?;
             }
