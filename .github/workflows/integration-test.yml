@@ -97,20 +97,13 @@ jobs:
 
       - name: Start test_service
         run: |
-          # rsbinder=trace enables per-handle BC_ACQUIRE / BC_RELEASE /
-          # BC_INCREFS / BC_DECREFS tracing on the server side. We only
-          # want this depth on the sync test_service (the obituary/cache
-          # races we're hunting only involve the sync path); other
-          # services keep info-level to bound noise. The full log is only
-          # uploaded as an artifact on failure.
-          RUST_LOG=info,rsbinder=trace nohup target/debug/test_service > test_service.log 2>&1 &
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
           sleep 2
           kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to start"; cat test_service.log; exit 1; }
 
       - name: Run cargo test (sync) — ${{ env.TEST_ITERATIONS }} iteration(s)
         run: |
-          set -o pipefail
           # Issue #97 manifests as kernel-log warnings rather than test
           # failures, and even a single non-oneway void call leaves a
           # `BC_FREE_BUFFER no match` entry in dmesg when the regression is
@@ -126,46 +119,29 @@ jobs:
           # underlying bug (silent BadType from an empty descriptor cached
           # under a held write lock) is what this PR fixes — that family is
           # now expected to pass and is left enabled as a regression check.
+          #
+          # Diagnostics policy: pass-path runs at default (info) log level
+          # with no per-iteration tee — the workflow log already records
+          # each iteration's output, and trace-level logging on the
+          # client+server quadrupled wall time on stress runs. Failure
+          # path captures dmesg + the full test_service / rsb_hub logs
+          # right at the failing iteration, before later steps mutate
+          # kernel state. That is enough to root-cause every failure
+          # observed so far (the BR_FAILED_REPLY signature in dmesg is
+          # the load-bearing signal; client trace was redundant).
           mkdir -p artifacts/sync
-          # Snapshot test_service.log line count before each iteration so we
-          # can extract only the chunk that corresponds to the failing run
-          # (server keeps appending across iterations, raw tail is noisy).
-          server_lines_before=$(wc -l < test_service.log 2>/dev/null || echo 0)
           for i in $(seq 1 "$TEST_ITERATIONS"); do
             echo "=== iteration $i / $TEST_ITERATIONS ==="
-            iter_log="artifacts/sync/iter-$(printf '%03d' "$i").log"
-            # RUST_LOG=info,rsbinder=trace mirrors the server-side filter
-            # so the captured client + server logs use the same vocabulary
-            # and we can correlate by timestamp on a failure.
-            if RUST_BACKTRACE=1 RUST_LOG=info,rsbinder=trace \
-                cargo test --package tests -- --nocapture \
+            if RUST_BACKTRACE=1 cargo test --package tests -- \
                 --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
                 --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
-                --skip test_versioned_unknown_union_field_triggers_error \
-                2>&1 | tee "$iter_log"; then
-              # Iteration succeeded — keep only the last 5 logs to bound
-              # artifact size. The failing run's predecessors are still
-              # the most diagnostically interesting context if any.
-              ls -1t artifacts/sync/iter-*.log | tail -n +6 | xargs -r rm -f
-              server_lines_before=$(wc -l < test_service.log)
+                --skip test_versioned_unknown_union_field_triggers_error; then
               continue
             fi
             echo "::error::Sync iteration $i failed — capturing diagnostics before later steps overwrite kernel state"
-            # Kernel ring buffer snapshot at the failure moment. Subsequent
-            # steps (async run, destructive death-recipient tests, service
-            # restarts) all generate kernel binder traffic that would
-            # crowd out the actual failure signature otherwise.
             sudo dmesg | tee "artifacts/sync/dmesg-at-iter-$i.log"
-            # Server log slice — only the lines emitted during this
-            # specific iteration. If the server log file no longer exists
-            # (it shouldn't in this step, but be defensive) we still get
-            # the iteration cargo log + dmesg, so don't fail the capture.
-            if [ -f test_service.log ]; then
-              awk -v start="$server_lines_before" 'NR > start' test_service.log \
-                > "artifacts/sync/test_service-iter-$i.log" || true
-            fi
-            cp -f test_service.log "artifacts/sync/test_service-full-at-iter-$i.log" 2>/dev/null || true
-            cp -f rsb_hub.log "artifacts/sync/rsb_hub-full-at-iter-$i.log" 2>/dev/null || true
+            cp -f test_service.log "artifacts/sync/test_service-at-iter-$i.log" 2>/dev/null || true
+            cp -f rsb_hub.log "artifacts/sync/rsb_hub-at-iter-$i.log" 2>/dev/null || true
             exit 1
           done
 
