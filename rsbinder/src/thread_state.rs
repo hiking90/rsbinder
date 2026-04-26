@@ -172,6 +172,18 @@ impl BinderDerefs {
         // may result in something being added to mPendingWeakDerefs,
         // which could be delayed until the next incoming command
         // from the driver if we don't process it now.
+        //
+        // Order matters: process pending derefs in **FIFO** order so the
+        // sequence of destructor side effects (further outgoing
+        // transactions, further deref additions, native-binder cleanup
+        // hooks) matches the order the kernel observed BR_RELEASE /
+        // BR_DECREFS for these objects. Android's libbinder uses the
+        // same FIFO discipline (`mPendingStrongDerefs.removeAt(0)` /
+        // `mPendingWeakDerefs.removeAt(0)`); a LIFO `Vec::pop()` here
+        // would silently reverse the ordering and could break callers
+        // that rely on it (e.g. when a strong-deref's destructor queues
+        // a weak-deref that the outer loop is then supposed to drain
+        // before the next strong).
         while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
             for raw_pointer in self.pending_weak_derefs.drain(..) {
                 // BR_DECREFS reflects the kernel releasing a weak ref it
@@ -186,7 +198,16 @@ impl BinderDerefs {
                 let _ = strong.dec_weak();
             }
 
-            if let Some(raw_pointer) = self.pending_strong_derefs.pop() {
+            // FIFO front-pop on strong derefs (`remove(0)`). Process
+            // exactly one before re-checking the outer loop so a
+            // destructor-queued weak-deref is drained ahead of the next
+            // pending strong — same pattern as Android's libbinder.
+            // The pending queue is bounded (at most one entry per
+            // recently-received BR_RELEASE), so the O(n) front-remove
+            // cost is negligible and the linear scan keeps the data
+            // structure simple (a `VecDeque` would also work).
+            if !self.pending_strong_derefs.is_empty() {
+                let raw_pointer = self.pending_strong_derefs.remove(0);
                 let strong = raw_pointer_to_strong_binder(raw_pointer);
                 SIBinder::decrease_drop(strong)?;
             }

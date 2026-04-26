@@ -432,14 +432,51 @@ impl SIBinder {
 
     /// Construct a weak reference to this binder.
     ///
-    /// Pure `Arc::downgrade` — no kernel command, no trait dispatch. The
-    /// resulting `WIBinder::upgrade()` is now legitimately fallible and
-    /// returns `Err(DeadObject)` once the last `Arc<dyn IBinder>` is
-    /// dropped (for proxies that means the last `Arc<ProxyHandle>` —
-    /// the cache holds only a `sync::Weak`).
+    /// Pure `Arc::downgrade` — no kernel command, no trait dispatch.
+    ///
+    /// For proxies, the resulting `WIBinder` snapshots `(handle,
+    /// stability, generation)` so a later `WIBinder::upgrade()` can
+    /// route through the process-wide proxy cache. As long as the
+    /// cache pin is alive (no obituary yet), `upgrade()` succeeds via
+    /// case-(b) resurrection — matching Android `wp<BpBinder>::promote()`
+    /// semantics. If the cache entry was removed (obituary) or the
+    /// handle id was recycled to a different binder_node (generation
+    /// mismatch), `upgrade()` returns `Err(DeadObject)`.
+    ///
+    /// For native binders, the `WIBinder` is a plain
+    /// `sync::Weak<dyn IBinder>` — `upgrade()` succeeds iff some
+    /// `Arc<dyn IBinder>` to the inner binder is still alive.
     pub fn downgrade(this: &Self) -> WIBinder {
-        WIBinder {
-            inner: Arc::downgrade(&this.inner),
+        let weak = Arc::downgrade(&this.inner);
+        if let Some(proxy_handle) = this.inner.as_any().downcast_ref::<proxy::ProxyHandle>() {
+            // For proxies, capture handle/stability/generation. The cache
+            // entry MUST exist at this point — `Arc<ProxyHandle>` is alive,
+            // and `strong_proxy_for_handle_stability` always inserts the
+            // entry alongside allocating the Arc under the same write lock.
+            // If we somehow miss it (race window during obituary), fall
+            // back to Native — `upgrade` will then see a dangling weak and
+            // return DeadObject, which is the correct contract.
+            let handle = proxy_handle.handle();
+            let stability = proxy_handle.stability();
+            let generation =
+                crate::process_state::ProcessState::as_self().cache_generation_for(handle);
+            match generation {
+                Some(generation) => WIBinder {
+                    inner: WIBinderInner::Proxy {
+                        handle,
+                        stability,
+                        generation,
+                        weak,
+                    },
+                },
+                None => WIBinder {
+                    inner: WIBinderInner::Native(weak),
+                },
+            }
+        } else {
+            WIBinder {
+                inner: WIBinderInner::Native(weak),
+            }
         }
     }
 
@@ -517,49 +554,159 @@ impl Eq for SIBinder {}
 
 /// Weak reference to a binder object.
 ///
-/// `upgrade()` is legitimately fallible: it returns `Err(DeadObject)` once
-/// the last `Arc<dyn IBinder>` to the inner binder has been dropped. For
-/// proxies that corresponds to the last `Arc<ProxyHandle>` — the
-/// process-wide handle cache stores only a `sync::Weak<ProxyHandle>`, so
-/// when no user-visible strong ref remains the cache entry's `Weak`
-/// becomes dangling. A subsequent lookup goes through
-/// `ProcessState::strong_proxy_for_handle_stability`'s slow-path case (b)
-/// (entry present, dead Arc) which resurrects a fresh `Arc<ProxyHandle>`
-/// without re-issuing `INTERFACE_TRANSACTION`.
+/// `upgrade()` is fallible. The conditions under which it succeeds
+/// depend on whether the underlying binder is a proxy (remote) or a
+/// native (local) one:
+///
+/// **Proxy.** `upgrade()` succeeds as long as the process-wide proxy
+/// cache entry for this binder is alive (no obituary yet) and the
+/// handle id has not been recycled to a different binder_node since
+/// this `WIBinder` was created. Specifically:
+///   - If some `Arc<ProxyHandle>` is still alive in the process,
+///     `upgrade()` returns it directly (analogous to a cache hit).
+///   - Otherwise the cache pin (`BC_INCREFS` taken at first
+///     resolution) keeps the kernel `binder_ref` slot alive, so a
+///     fresh `BC_ACQUIRE` succeeds and `upgrade()` returns a freshly
+///     allocated `Arc<ProxyHandle>` (case-(b) resurrection). The
+///     resurrected `Arc` is a different allocation than the original,
+///     but refers to the same kernel binder_node.
+///   - If `BR_DEAD_BINDER` was processed for this handle, the cache
+///     entry is gone and `upgrade()` returns `Err(DeadObject)`.
+///   - If the handle id was recycled to a different binder_node since
+///     this `WIBinder` was created, the snapshotted generation does
+///     not match the live entry's, and `upgrade()` returns
+///     `Err(DeadObject)`.
+///
+/// This matches Android `wp<BpBinder>::promote()` semantics: weak
+/// references can be promoted to strong as long as the binder is
+/// still alive in the kernel, even if every user-side strong ref has
+/// been dropped.
+///
+/// **Native.** `upgrade()` succeeds iff some `Arc<dyn IBinder>` to the
+/// inner binder is still alive in the process. This is plain
+/// `sync::Weak::upgrade` semantics — natives have no process-wide
+/// cache, so when the last strong is dropped, the binder is gone.
 pub struct WIBinder {
-    inner: sync::Weak<dyn IBinder>,
+    inner: WIBinderInner,
+}
+
+pub(crate) enum WIBinderInner {
+    /// Proxy weak reference. Carries `(handle, stability, generation)`
+    /// snapshot so `upgrade` can route through the proxy cache for
+    /// resurrection.
+    Proxy {
+        handle: u32,
+        stability: Stability,
+        generation: u64,
+        weak: sync::Weak<dyn IBinder>,
+    },
+    /// Native weak reference. Plain `sync::Weak`.
+    Native(sync::Weak<dyn IBinder>),
 }
 
 impl WIBinder {
     pub fn upgrade(&self) -> Result<SIBinder> {
-        match self.inner.upgrade() {
-            Some(arc) => Ok(SIBinder::from_arc(arc)),
-            None => Err(StatusCode::DeadObject),
+        match &self.inner {
+            WIBinderInner::Native(weak) => weak
+                .upgrade()
+                .map(SIBinder::from_arc)
+                .ok_or(StatusCode::DeadObject),
+            WIBinderInner::Proxy {
+                handle,
+                stability,
+                generation,
+                weak,
+            } => {
+                // Fast path: an `Arc<ProxyHandle>` is still alive
+                // somewhere in the process — reuse it without touching
+                // the cache lock.
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(SIBinder::from_arc(arc));
+                }
+                // Slow path: drive cache-(b) resurrection. The cache
+                // pin keeps the kernel binder_ref slot alive, so the
+                // BC_ACQUIRE inside `new_acquired` is guaranteed to
+                // succeed unless the entry was obituary'd or recycled
+                // (in which case we get DeadObject).
+                crate::process_state::ProcessState::as_self().resurrect_proxy_for_handle_stability(
+                    *handle,
+                    *stability,
+                    *generation,
+                )
+            }
         }
     }
 }
 
 impl Debug for WIBinder {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.debug_struct("WIBinder")
-            .field("self", &(self as *const WIBinder))
-            .field("strong_count", &self.inner.strong_count())
-            .field("weak_count", &self.inner.weak_count())
-            .finish()
+        match &self.inner {
+            WIBinderInner::Native(weak) => f
+                .debug_struct("WIBinder::Native")
+                .field("strong_count", &weak.strong_count())
+                .field("weak_count", &weak.weak_count())
+                .finish(),
+            WIBinderInner::Proxy {
+                handle,
+                stability,
+                generation,
+                weak,
+            } => f
+                .debug_struct("WIBinder::Proxy")
+                .field("handle", handle)
+                .field("stability", stability)
+                .field("generation", generation)
+                .field("strong_count", &weak.strong_count())
+                .finish(),
+        }
     }
 }
 
 impl Clone for WIBinder {
     fn clone(&self) -> Self {
-        Self {
-            inner: sync::Weak::clone(&self.inner),
-        }
+        let inner = match &self.inner {
+            WIBinderInner::Native(weak) => WIBinderInner::Native(sync::Weak::clone(weak)),
+            WIBinderInner::Proxy {
+                handle,
+                stability,
+                generation,
+                weak,
+            } => WIBinderInner::Proxy {
+                handle: *handle,
+                stability: *stability,
+                generation: *generation,
+                weak: sync::Weak::clone(weak),
+            },
+        };
+        Self { inner }
     }
 }
 
 impl PartialEq for WIBinder {
+    /// Equality matches Android `BpBinder` identity. For proxies, two
+    /// `WIBinder`s are equal iff they refer to the same kernel
+    /// binder_node — i.e. same `(handle, generation)` pair. This holds
+    /// even across resurrection (the new `Arc<ProxyHandle>` is a fresh
+    /// allocation, so `sync::Weak::ptr_eq` would say "different", but
+    /// they are conceptually the same binder). For natives, equality
+    /// is `sync::Weak::ptr_eq` on the inner Arc allocation.
     fn eq(&self, other: &Self) -> bool {
-        sync::Weak::ptr_eq(&self.inner, &other.inner)
+        match (&self.inner, &other.inner) {
+            (WIBinderInner::Native(a), WIBinderInner::Native(b)) => sync::Weak::ptr_eq(a, b),
+            (
+                WIBinderInner::Proxy {
+                    handle: ha,
+                    generation: ga,
+                    ..
+                },
+                WIBinderInner::Proxy {
+                    handle: hb,
+                    generation: gb,
+                    ..
+                },
+            ) => ha == hb && ga == gb,
+            _ => false,
+        }
     }
 }
 
