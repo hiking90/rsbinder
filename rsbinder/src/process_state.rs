@@ -1068,7 +1068,10 @@ mod tests {
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
 
         let id = process.publish_native(Arc::clone(&arc));
-        assert!(process.incref_publish(id), "incref on freshly published id must succeed");
+        assert!(
+            process.incref_publish(id),
+            "incref on freshly published id must succeed"
+        );
 
         // Drop the user-side Arc clone; only the table's binder_pin
         // SIBinder keeps the inner Arc alive now.

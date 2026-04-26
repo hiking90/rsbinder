@@ -205,8 +205,8 @@ impl From<&SIBinder> for flat_binder_object {
             // and the first `acquire` is the only leak path under a
             // `Parcel::write_aligned` panic (typically OOM), which is
             // process-fatal anyway — see plan §5 #11.
-            let id = process_state::ProcessState::as_self()
-                .publish_native(Arc::clone(binder.as_arc()));
+            let id =
+                process_state::ProcessState::as_self().publish_native(Arc::clone(binder.as_arc()));
 
             flat_binder_object {
                 hdr: binder_object_header {

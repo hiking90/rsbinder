@@ -201,9 +201,8 @@ fn process_pending_derefs() -> Result<()> {
         // `Inner<T>::drop` running user destructor code that
         // synchronously triggers another BR_DECREFS).
         loop {
-            let batch: VecDeque<u64> = BINDER_DEREFS.with(|d| {
-                std::mem::take(&mut d.borrow_mut().pending_weak_derefs)
-            });
+            let batch: VecDeque<u64> =
+                BINDER_DEREFS.with(|d| std::mem::take(&mut d.borrow_mut().pending_weak_derefs));
             if batch.is_empty() {
                 break;
             }
@@ -762,16 +761,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                                     strong.decrease()?;
                                     result
                                 } else {
-                                    log::warn!(
-                                        "Failed strong.attempt_increase for native id {id}"
-                                    );
+                                    log::warn!("Failed strong.attempt_increase for native id {id}");
                                     Err(StatusCode::UnknownTransaction)
                                 }
                             }
                             None => {
-                                log::error!(
-                                    "BR_TRANSACTION for unknown native id {id}"
-                                );
+                                log::error!("BR_TRANSACTION for unknown native id {id}");
                                 Err(StatusCode::DeadObject)
                             }
                         }
