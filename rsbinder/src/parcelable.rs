@@ -23,7 +23,7 @@
 //! serialized and deserialized in binder parcels, providing the foundation
 //! for AIDL-generated types and custom parcelable implementations.
 
-use crate::{binder::*, binder_object::*, error::*, parcel::Parcel, process_state::*, sys::*};
+use crate::{binder::*, error::*, parcel::Parcel, process_state::*, sys::*};
 
 /// Core trait for types that can be serialized to and from parcels.
 ///

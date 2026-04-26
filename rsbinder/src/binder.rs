@@ -499,25 +499,12 @@ impl SIBinder {
         this
     }
 
-    pub(crate) fn into_raw(self) -> *const dyn IBinder {
-        let inner = Arc::clone(&self.inner);
-        let raw = Arc::into_raw(inner);
-        std::mem::forget(self);
-        raw
-    }
-
-    pub(crate) fn from_raw(raw: *const dyn IBinder) -> Self {
-        let inner = unsafe { Arc::from_raw(raw) };
-        Self { inner }
-    }
-
     /// Borrow the underlying `Arc<dyn IBinder>`.
     ///
     /// Provides a non-consuming view of the inner trait-object Arc so
     /// callers can clone it for sidecar tables (e.g.
     /// `ProcessState::published_natives`) or compare identity via
-    /// `Arc::as_ptr` without going through the unsafe
-    /// `into_raw`/`from_raw` round trip.
+    /// `Arc::as_ptr` without an unsafe round trip through raw pointers.
     pub(crate) fn as_arc(&self) -> &Arc<dyn IBinder> {
         &self.inner
     }
@@ -587,11 +574,6 @@ impl SIBinder {
 
     pub(crate) fn decrease(&self) -> Result<()> {
         self.inner.dec_strong(None)
-    }
-
-    pub(crate) fn decrease_drop(this: ManuallyDrop<Self>) -> Result<()> {
-        let inner = Arc::clone(&this.inner);
-        inner.dec_strong(Some(this))
     }
 
     /// Try to convert this Binder object into a trait object for the given

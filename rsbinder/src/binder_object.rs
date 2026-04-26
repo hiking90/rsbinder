@@ -1,7 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
@@ -74,10 +73,6 @@ impl flat_binder_object {
 
     pub(crate) fn pointer(&self) -> binder_uintptr_t {
         unsafe { self.__bindgen_anon_1.binder }
-    }
-
-    pub(crate) fn cookie(&self) -> binder_uintptr_t {
-        self.cookie
     }
 
     pub(crate) fn set_cookie(&mut self, cookie: binder_uintptr_t) {
@@ -159,30 +154,6 @@ impl flat_binder_object {
             }
         }
     }
-}
-
-/// Splits a fat pointer (trait object) into its data and vtable components.
-///
-/// # Safety
-/// This function uses transmute to convert a fat pointer into two u64 values.
-/// This is safe because:
-/// 1. Fat pointers are always two usizes (data pointer + vtable pointer)
-/// 2. On 64-bit systems, usize == u64
-/// 3. We only use this for binder IPC serialization where we need both components
-///
-/// # Panics
-/// Will panic on 32-bit systems where usize != u64
-fn split_fat_pointer(ptr: *const dyn IBinder) -> (u64, u64) {
-    debug_assert_eq!(
-        std::mem::size_of::<*const dyn IBinder>(),
-        std::mem::size_of::<(u64, u64)>(),
-        "Fat pointer size mismatch - system not 64-bit?"
-    );
-    unsafe { std::mem::transmute(ptr) }
-}
-
-fn make_fat_pointer(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> *const dyn IBinder {
-    unsafe { std::mem::transmute(raw_pointer) }
 }
 
 const SCHED_NORMAL: u32 = 0;
@@ -274,14 +245,4 @@ pub(crate) fn write_flat_binder(
         .ok_or(StatusCode::NotEnoughData)?;
     unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
     Ok(())
-}
-
-pub(crate) fn raw_pointer_to_strong_binder(
-    raw_pointer: (binder_uintptr_t, binder_uintptr_t),
-) -> ManuallyDrop<SIBinder> {
-    assert!(
-        raw_pointer.0 != 0,
-        "raw_pointer_to_strong_binder(): raw_pointer is null"
-    );
-    ManuallyDrop::new(SIBinder::from_raw(make_fat_pointer(raw_pointer)))
 }

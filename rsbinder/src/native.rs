@@ -311,11 +311,20 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             return Err(StatusCode::BadType);
         }
 
-        // SAFETY: We just verified through downcast_ref that this IBinder
-        // is actually an Inner<B>, so the cast is safe. The into_raw()
-        // gives us the underlying Arc pointer which we reconstruct here.
         if ibinder.as_any().downcast_ref::<Inner<B>>().is_some() {
-            let inner_raw = ibinder.into_raw() as *const Inner<B>;
+            // SAFETY: `downcast_ref::<Inner<B>>` confirmed the
+            // underlying allocation is `Inner<B>`. The trait-object
+            // Arc's data pointer addresses that `Inner<B>` value
+            // directly, so casting `*const dyn IBinder` to
+            // `*const Inner<B>` is layout-correct. Cloning the
+            // trait-object Arc and consuming it via `Arc::into_raw`
+            // leaks one strong ref; `Arc::from_raw` on the cast
+            // pointer reclaims that ref as `Arc<Inner<B>>`, conserving
+            // the total strong count after `ibinder` drops at the end
+            // of this function.
+            let arc_dyn = Arc::clone(ibinder.as_arc());
+            let raw_dyn = Arc::into_raw(arc_dyn);
+            let inner_raw = raw_dyn as *const Inner<B>;
             let inner = unsafe { Arc::from_raw(inner_raw) };
 
             Ok(Self { inner })
