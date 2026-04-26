@@ -511,6 +511,17 @@ impl SIBinder {
         Self { inner }
     }
 
+    /// Borrow the underlying `Arc<dyn IBinder>`.
+    ///
+    /// Provides a non-consuming view of the inner trait-object Arc so
+    /// callers can clone it for sidecar tables (e.g.
+    /// `ProcessState::published_natives`) or compare identity via
+    /// `Arc::as_ptr` without going through the unsafe
+    /// `into_raw`/`from_raw` round trip.
+    pub(crate) fn as_arc(&self) -> &Arc<dyn IBinder> {
+        &self.inner
+    }
+
     /// Construct a weak reference to this binder.
     ///
     /// Pure `Arc::downgrade` — no kernel command, no trait dispatch.

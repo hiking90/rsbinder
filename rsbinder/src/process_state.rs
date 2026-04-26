@@ -63,6 +63,46 @@ pub(crate) struct CacheEntry {
     pub(crate) generation: u64,
 }
 
+/// Sidecar-table entry for a native binder this process has published.
+///
+/// Replaces the previous fat-pointer encoding (`flat_binder_object.binder` =
+/// data pointer, `flat_binder_object.cookie` = vtable pointer) with a
+/// process-monotonic u64 id. The id is what the kernel echoes back in
+/// `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` / `BR_DECREFS` /
+/// `BR_TRANSACTION` (`target.ptr`); lookup resolves to the live Arc via
+/// `binder_pin.as_arc()`. Closes a UAF where weak-ref BR handlers
+/// (`BR_DECREFS`) could fire after the underlying `Inner<T>` had been
+/// dropped under the old encoding — see Android's two-allocation
+/// (`weakref_type*` + `BBinder*`) design for the canonical fix shape.
+///
+/// Lifecycle: created on first `From<&SIBinder>` (BINDER_TYPE_BINDER), held
+/// as long as either parcel-side (`publish_count`) or kernel-side
+/// (`kernel_refs`) refs are outstanding, removed when both reach zero.
+/// While the entry exists, `binder_pin` keeps `Inner<T>` alive and
+/// `RefCounter.strong` / `RefCounter.weak` sit at the binary "alive"
+/// level (>= 1) so that `attempt_inc_*` succeeds.
+pub(crate) struct PublishedNative {
+    /// Owns `RefCounter.strong` >= 1 via `SIBinder::from_arc`'s
+    /// `inc_strong` (entry creation) and `SIBinder::Drop`'s
+    /// `dec_strong(None)` (entry removal). Also keeps the underlying
+    /// `Arc<dyn IBinder>` strong > 0 — this is the canonical reference
+    /// that keeps `Inner<T>` alive while the kernel or any outgoing
+    /// parcel still references the published binder.
+    pub(crate) binder_pin: SIBinder,
+    /// Number of live `flat_binder_object` instances of type
+    /// `BINDER_TYPE_BINDER` for this id across all parcel buffers in
+    /// this process. Driven by `flat_binder_object::acquire` /
+    /// `release` (the existing pair already invoked from
+    /// `Parcel::write_object`, `Parcel::append_from`, and
+    /// `Parcel::release_objects`).
+    pub(crate) publish_count: u32,
+    /// Number of outstanding kernel refs against this id.
+    /// `BR_INCREFS` / `BR_ACQUIRE` increment; `BR_RELEASE` /
+    /// `BR_DECREFS` decrement (deferred via `pending_*_derefs`,
+    /// processed FIFO).
+    pub(crate) kernel_refs: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum CallRestriction {
     // all calls okay
@@ -94,6 +134,18 @@ pub struct ProcessState {
     /// exactly once per case-(a) cache insertion (i.e. per fresh
     /// `BC_INCREFS` pin). Wrap-around is not a practical concern (u64).
     next_generation: AtomicU64,
+    /// Native binders this process has published, keyed by a
+    /// process-monotonic u64 id encoded in `flat_binder_object.binder`
+    /// (replacing the previous fat-pointer encoding). Lookup resolves
+    /// the id to a live `Arc<dyn IBinder>` for `BR_TRANSACTION` /
+    /// `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` / `BR_DECREFS` /
+    /// `BR_ATTEMPT_ACQUIRE` and for round-trip
+    /// `BINDER_TYPE_BINDER` deserialization. See
+    /// `PublishedNative` for entry-lifecycle invariants.
+    published_natives: RwLock<HashMap<u64, PublishedNative>>,
+    /// Monotonic id allocator for `published_natives`. u64 wrap-around
+    /// is not a practical concern.
+    next_native_id: AtomicU64,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
@@ -180,6 +232,8 @@ impl ProcessState {
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
+            published_natives: RwLock::new(HashMap::new()),
+            next_native_id: AtomicU64::new(1),
             disable_background_scheduling: AtomicBool::new(false),
             call_restriction: RwLock::new(CallRestriction::None),
             thread_pool_started: AtomicBool::new(false),
@@ -532,6 +586,207 @@ impl ProcessState {
         thread_state::dec_weak_handle(handle)?;
         thread_state::flush_commands()?;
         Ok(())
+    }
+
+    /// Publish a native binder into the sidecar table and return its id.
+    ///
+    /// The id is what `flat_binder_object.binder` will carry under the new
+    /// encoding (replacing the data half of the old fat-pointer pair).
+    ///
+    /// Dedup is by `Arc::ptr_eq` against existing `binder_pin` entries —
+    /// publishing the same `Arc` twice returns the same id without any
+    /// counter side effects, matching Android's behavior where a single
+    /// `binder_node` is allocated per `weakref_type*` regardless of how
+    /// many times it is sent.
+    ///
+    /// On a fresh insert, `RefCounter.strong` is driven 0→1 via
+    /// `SIBinder::from_arc` (which calls `inc_strong` once on the inner
+    /// trait object) and `RefCounter.weak` is driven 0→1 via an explicit
+    /// `arc.inc_weak(&dummy_wi)` call. Both counters stay at the binary
+    /// "alive" floor while the entry exists; user-side strong/weak
+    /// increments ride on top and never trigger the count→0 closure path
+    /// because the table-controlled +1 keeps the count above zero.
+    ///
+    /// `publish_count` starts at 0; the immediately-following
+    /// `Parcel::write_object` → `flat_binder_object::acquire` brings it
+    /// to 1. The single-statement window between this method returning
+    /// and the first `acquire` is the only leak path under
+    /// `Parcel::write_aligned` panics (typically OOM) — see plan §5
+    /// "From<&SIBinder> returning before acquire() is called".
+    pub(crate) fn publish_native(&self, arc: Arc<dyn IBinder>) -> u64 {
+        // Single write lock for dedup + insert: a read-then-write split
+        // would race two concurrent publishes of the same Arc into
+        // duplicate entries, breaking the dedup invariant.
+        let mut map = self
+            .published_natives
+            .write()
+            .expect("Published natives lock poisoned");
+        for (existing_id, entry) in map.iter() {
+            if Arc::ptr_eq(entry.binder_pin.as_arc(), &arc) {
+                return *existing_id;
+            }
+        }
+        // Drive RefCounter.strong 0→1 via SIBinder::from_arc → inc_strong.
+        let binder_pin = SIBinder::from_arc(Arc::clone(&arc));
+        // Drive RefCounter.weak 0→1 via explicit inc_weak. The dummy
+        // WIBinder satisfies the trait signature; native::inc_weak
+        // ignores it. WIBinder has no custom Drop impl, so dropping
+        // dummy_wi at scope end only decrements the std::sync::Weak's
+        // own reference count — RefCounter.weak is untouched.
+        let dummy_wi = SIBinder::downgrade(&binder_pin);
+        arc.inc_weak(&dummy_wi)
+            .expect("inc_weak on Arc<dyn IBinder> must not fail");
+        let id = self.next_native_id.fetch_add(1, Ordering::Relaxed);
+        map.insert(
+            id,
+            PublishedNative {
+                binder_pin,
+                publish_count: 0,
+                kernel_refs: 0,
+            },
+        );
+        id
+    }
+
+    /// `flat_binder_object::acquire` BINDER_TYPE_BINDER arm.
+    ///
+    /// Returns `false` if `id` is unknown — should not happen in practice
+    /// because every `acquire` is paired with a `From<&SIBinder>` that
+    /// just inserted the entry (or a buffer-clone via
+    /// `Parcel::append_from` whose source already holds an entry).
+    /// Callers `debug_assert!` in dev builds and `log::error!` + skip in
+    /// production.
+    pub(crate) fn incref_publish(&self, id: u64) -> bool {
+        let mut map = self
+            .published_natives
+            .write()
+            .expect("Published natives lock poisoned");
+        match map.get_mut(&id) {
+            Some(entry) => {
+                entry.publish_count += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `flat_binder_object::release` BINDER_TYPE_BINDER arm.
+    ///
+    /// Decrements `publish_count`. If both `publish_count` and
+    /// `kernel_refs` reach zero, the entry is removed (drives
+    /// `RefCounter.strong` / `RefCounter.weak` 1→0, drops the
+    /// `binder_pin` SIBinder). Returns `false` if `id` is unknown.
+    pub(crate) fn decref_publish(&self, id: u64) -> bool {
+        let trigger_remove = {
+            let mut map = self
+                .published_natives
+                .write()
+                .expect("Published natives lock poisoned");
+            match map.get_mut(&id) {
+                Some(entry) => {
+                    entry.publish_count = entry.publish_count.saturating_sub(1);
+                    entry.publish_count == 0 && entry.kernel_refs == 0
+                }
+                None => return false,
+            }
+        };
+        if trigger_remove {
+            self.remove_entry_if_zero(id);
+        }
+        true
+    }
+
+    /// `BR_INCREFS` / `BR_ACQUIRE` / `BR_ATTEMPT_ACQUIRE` arms: bump
+    /// `kernel_refs`. Returns `Some(arc)` while the entry is alive
+    /// (caller may dispatch methods on the arc); `None` if `id` is
+    /// unknown (kernel invariant violation in `BR_INCREFS` / `BR_ACQUIRE`,
+    /// expected race for `BR_ATTEMPT_ACQUIRE`).
+    pub(crate) fn ref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
+        let mut map = self
+            .published_natives
+            .write()
+            .expect("Published natives lock poisoned");
+        let entry = map.get_mut(&id)?;
+        entry.kernel_refs += 1;
+        Some(Arc::clone(entry.binder_pin.as_arc()))
+    }
+
+    /// `BR_RELEASE` / `BR_DECREFS` arms (deferred via
+    /// `pending_*_derefs`): decrement `kernel_refs`. If both
+    /// `publish_count` and `kernel_refs` reach zero, the entry is
+    /// removed (RefCounter floor torn down, Arc dropped). Returns
+    /// `Some(arc)` while the entry was still present pre-removal;
+    /// `None` if `id` is unknown.
+    pub(crate) fn deref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
+        let (arc, trigger_remove) = {
+            let mut map = self
+                .published_natives
+                .write()
+                .expect("Published natives lock poisoned");
+            let entry = map.get_mut(&id)?;
+            entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
+            let arc = Arc::clone(entry.binder_pin.as_arc());
+            let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;
+            (arc, trigger)
+        };
+        if trigger_remove {
+            self.remove_entry_if_zero(id);
+        }
+        Some(arc)
+    }
+
+    /// `BR_TRANSACTION` and round-trip `BINDER_TYPE_BINDER` receive
+    /// path: read-only lookup. Does not change counts. Returns `None`
+    /// if the id is unknown.
+    pub(crate) fn lookup_native(&self, id: u64) -> Option<Arc<dyn IBinder>> {
+        let map = self
+            .published_natives
+            .read()
+            .expect("Published natives lock poisoned");
+        map.get(&id).map(|e| Arc::clone(e.binder_pin.as_arc()))
+    }
+
+    /// Remove the entry for `id` and tear down the RefCounter floor —
+    /// but only if both `publish_count` and `kernel_refs` are still zero
+    /// when re-checked under the write lock. The two-phase pattern
+    /// (counter-mutate under lock, release lock, re-acquire for
+    /// removal) is required because `SIBinder::Drop` calls
+    /// `dec_strong(None)` which may run user destructor code (via
+    /// `Inner<T>::drop`) that itself calls back into `ProcessState` —
+    /// holding the write lock across that path would deadlock.
+    ///
+    /// The re-check under the new lock makes the two-phase pattern
+    /// race-free: if a concurrent `BR_INCREFS` / `From<&SIBinder>`
+    /// bumped a counter back above zero between phases, we abort the
+    /// removal. Same shape as the proxy-side `CacheEntry` removal in
+    /// `send_obituary_for_handle`.
+    fn remove_entry_if_zero(&self, id: u64) {
+        let entry = {
+            let mut map = self
+                .published_natives
+                .write()
+                .expect("Published natives lock poisoned");
+            let needs_remove = map
+                .get(&id)
+                .map(|e| e.publish_count == 0 && e.kernel_refs == 0)
+                .unwrap_or(false);
+            if !needs_remove {
+                return;
+            }
+            map.remove(&id).expect("just observed Some")
+        };
+        // Symmetric with publish_native: dec_weak first (no destructor
+        // side effect — `Inner<T>::dec_weak` only touches RefCounter.weak),
+        // then drop binder_pin which fires SIBinder::Drop →
+        // dec_strong(None) → RefCounter.strong 1→0. The Arc inside
+        // binder_pin is the canonical strong reference; if no user-side
+        // SIBinder clones survive, that drop also takes the Arc strong
+        // count to zero, triggering Inner<T>::drop CLEANLY — kernel has
+        // guaranteed no further BR_* will reference this id (kernel_refs
+        // was 0 to reach this branch).
+        let arc_for_weak = Arc::clone(entry.binder_pin.as_arc());
+        let _ = arc_for_weak.dec_weak();
+        drop(entry.binder_pin);
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {
