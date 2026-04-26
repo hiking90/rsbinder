@@ -2391,3 +2391,52 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
 
     drop(recipient);
 }
+
+/// Soak the publish-native → drop → kernel-deref cycle that the new
+/// id-encoded `flat_binder_object` lifecycle replaces. Under the prior
+/// fat-pointer encoding, this loop could trigger UAF when `Inner<T>`
+/// was dropped between `BR_RELEASE` and `BR_DECREFS` (the deferred
+/// `BR_DECREFS` arm reconstructed an SIBinder via `from_raw` and
+/// dispatched `dec_weak` on a freed allocation).
+///
+/// Each iteration:
+///   1. Constructs a fresh native binder (`BnNamedCallback::new_binder`
+///      over a local `ExtNamedCallback` impl).
+///   2. Publishes it across the kernel via `service.TakesAnIBinder` —
+///      our process emits `flat_binder_object { binder = id, cookie =
+///      0 }` for `BINDER_TYPE_BINDER`; the remote receives it as a
+///      handle, holds it for the call duration, then drops it. The
+///      kernel then schedules `BR_RELEASE` / `BR_DECREFS` back to us.
+///   3. Drops every user-side strong reference to the local binder.
+///      Under the new model the sidecar `published_natives` table
+///      keeps the canonical `Arc<dyn IBinder>` strong while
+///      `kernel_refs > 0`; entry removal — and therefore
+///      `Inner<T>::drop` — only happens once both `publish_count` and
+///      `kernel_refs` reach zero.
+///
+/// 100 iterations is the same soak depth used by
+/// `integration-test.yml`. A regression here surfaces either as a
+/// segfault (UAF) or as kernel-driver `EINVAL` on `BC_FREE_BUFFER`
+/// (table entry torn down before the kernel finished its
+/// dereferences).
+#[test]
+fn test_native_publish_drop_release_cycle() {
+    let service = get_test_service();
+
+    for i in 0..100 {
+        let local =
+            INamedCallback::BnNamedCallback::new_binder(ExtNamedCallback(format!("uaf_soak_{i}")));
+        let binder = local.as_binder();
+        // Fire-and-forget: the remote receives, holds briefly, then
+        // releases. We only care that the round-trip completes
+        // without crashing or returning an error.
+        service
+            .TakesAnIBinder(&binder)
+            .unwrap_or_else(|err| panic!("TakesAnIBinder iter {i} failed: {err:?}"));
+
+        // Drop both strong handles. The table's `binder_pin` keeps
+        // the inner Arc alive while the kernel still has refs.
+        drop(binder);
+        drop(local);
+    }
+}

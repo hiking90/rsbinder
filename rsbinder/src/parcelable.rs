@@ -23,7 +23,7 @@
 //! serialized and deserialized in binder parcels, providing the foundation
 //! for AIDL-generated types and custom parcelable implementations.
 
-use crate::{binder::*, binder_object::*, error::*, parcel::Parcel, process_state::*, sys::*};
+use crate::{binder::*, error::*, parcel::Parcel, process_state::*, sys::*};
 
 /// Core trait for types that can be serialized to and from parcels.
 ///
@@ -495,10 +495,25 @@ impl DeserializeOption for SIBinder {
 
         match flat.header_type() {
             BINDER_TYPE_BINDER => {
-                let pointer = flat.pointer();
-                if pointer != 0 {
-                    let strong = raw_pointer_to_strong_binder((flat.pointer(), flat.cookie()));
-                    Ok(Some(SIBinder::clone(&strong)))
+                // Receiving BINDER_TYPE_BINDER means the kernel routed
+                // a binder back to its original publisher (us).
+                // Cross-process binder transfers reach receivers as
+                // BINDER_TYPE_HANDLE — the kernel only emits
+                // BINDER_TYPE_BINDER on the publisher loopback path.
+                // Look up the id in our sidecar table; an unknown id
+                // here would mean either (a) a kernel bug surfacing a
+                // BINDER_TYPE_BINDER we never published, or (b) the
+                // entry was already torn down (shouldn't happen
+                // because the round-trip ride keeps `kernel_refs > 0`
+                // via the receiving process's outstanding handle).
+                // Either way it's an integrity error → DeadObject.
+                let id = flat.pointer();
+                if id != 0 {
+                    let arc = ProcessState::as_self().lookup_native(id).ok_or_else(|| {
+                        log::error!("BINDER_TYPE_BINDER for unknown native id {id}");
+                        StatusCode::DeadObject
+                    })?;
+                    Ok(Some(SIBinder::from_arc(arc)))
                 } else {
                     Ok(None)
                 }

@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
 
@@ -75,10 +75,6 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.binder }
     }
 
-    pub(crate) fn cookie(&self) -> binder_uintptr_t {
-        self.cookie
-    }
-
     pub(crate) fn set_cookie(&mut self, cookie: binder_uintptr_t) {
         self.cookie = cookie;
     }
@@ -86,9 +82,23 @@ impl flat_binder_object {
     pub(crate) fn acquire(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
+                // Native binder: bump publish_count for this buffer
+                // instance. Symmetric with `release()` below — every
+                // `Parcel::write_object` / `Parcel::append_from` call
+                // pairs an `acquire` here with exactly one `release`
+                // from `Parcel::release_objects` (driven by
+                // `Parcel::Drop` for caller-owned outgoing parcels).
+                // Driver-mmapped incoming parcels skip both ends
+                // symmetrically (their `Drop` calls `BC_FREE_BUFFER`
+                // instead of `release_objects`, and the deserializer
+                // does not call `acquire`), so the pairing invariant
+                // is preserved without any per-object bookkeeping.
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
-                    strong.increase()?;
+                    let id = self.pointer();
+                    if !process_state::ProcessState::as_self().incref_publish(id) {
+                        log::error!("flat_binder_object::acquire: unknown native id {id}");
+                        debug_assert!(false, "acquire on unknown native id {id}");
+                    }
                 }
 
                 Ok(())
@@ -110,9 +120,20 @@ impl flat_binder_object {
     pub(crate) fn release(&self) -> Result<()> {
         match self.hdr.type_ {
             BINDER_TYPE_BINDER => {
+                // Native binder: decrement publish_count. If both
+                // publish_count and kernel_refs hit zero,
+                // decref_publish removes the entry, which drives
+                // RefCounter.strong / RefCounter.weak 1→0 and drops
+                // the canonical Arc<dyn IBinder> (Inner<T>::drop runs
+                // cleanly — kernel guaranteed no further BR_* will
+                // reference this id since kernel_refs was 0 at
+                // removal).
                 if self.pointer() != 0 {
-                    let strong = raw_pointer_to_strong_binder((self.pointer(), self.cookie()));
-                    strong.decrease()?;
+                    let id = self.pointer();
+                    if !process_state::ProcessState::as_self().decref_publish(id) {
+                        log::error!("flat_binder_object::release: unknown native id {id}");
+                        debug_assert!(false, "release on unknown native id {id}");
+                    }
                 }
                 Ok(())
             }
@@ -133,30 +154,6 @@ impl flat_binder_object {
             }
         }
     }
-}
-
-/// Splits a fat pointer (trait object) into its data and vtable components.
-///
-/// # Safety
-/// This function uses transmute to convert a fat pointer into two u64 values.
-/// This is safe because:
-/// 1. Fat pointers are always two usizes (data pointer + vtable pointer)
-/// 2. On 64-bit systems, usize == u64
-/// 3. We only use this for binder IPC serialization where we need both components
-///
-/// # Panics
-/// Will panic on 32-bit systems where usize != u64
-fn split_fat_pointer(ptr: *const dyn IBinder) -> (u64, u64) {
-    debug_assert_eq!(
-        std::mem::size_of::<*const dyn IBinder>(),
-        std::mem::size_of::<(u64, u64)>(),
-        "Fat pointer size mismatch - system not 64-bit?"
-    );
-    unsafe { std::mem::transmute(ptr) }
-}
-
-fn make_fat_pointer(raw_pointer: (binder_uintptr_t, binder_uintptr_t)) -> *const dyn IBinder {
-    unsafe { std::mem::transmute(raw_pointer) }
 }
 
 const SCHED_NORMAL: u32 = 0;
@@ -188,18 +185,36 @@ impl From<&SIBinder> for flat_binder_object {
                 cookie: 0,
             }
         } else {
-            let strong = binder.clone();
-            let (binder, cookie) = split_fat_pointer(strong.into_raw());
+            // Native binder. Acquire (or dedup-resolve) an id via the
+            // sidecar table on `ProcessState`; the table holds an
+            // `Arc<dyn IBinder>` strong reference for the duration
+            // either an outgoing parcel (`publish_count > 0`) or any
+            // kernel-held ref (`kernel_refs > 0`) references this
+            // binder. Replaces the previous fat-pointer encoding
+            // (data ptr in `binder`, vtable ptr in `cookie`) which
+            // could dangle once `Inner<T>` was dropped while a
+            // `BR_DECREFS` was still in flight — Android closes the
+            // same window with a two-allocation
+            // (`weakref_type*` / `BBinder*`) design; we reach the
+            // same invariant via id-indirection.
+            //
+            // The entry is created with `publish_count = 0`; the
+            // immediately-following `Parcel::write_object` →
+            // `flat_binder_object::acquire` brings it to 1. The
+            // single-statement window between this `From` returning
+            // and the first `acquire` is the only leak path under a
+            // `Parcel::write_aligned` panic (typically OOM), which is
+            // process-fatal anyway — see plan §5 #11.
+            let id =
+                process_state::ProcessState::as_self().publish_native(Arc::clone(binder.as_arc()));
 
             flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_BINDER,
                 },
                 flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    binder: binder as _,
-                },
-                cookie: cookie as _,
+                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: id },
+                cookie: 0,
             }
         }
     }
@@ -230,14 +245,4 @@ pub(crate) fn write_flat_binder(
         .ok_or(StatusCode::NotEnoughData)?;
     unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
     Ok(())
-}
-
-pub(crate) fn raw_pointer_to_strong_binder(
-    raw_pointer: (binder_uintptr_t, binder_uintptr_t),
-) -> ManuallyDrop<SIBinder> {
-    assert!(
-        raw_pointer.0 != 0,
-        "raw_pointer_to_strong_binder(): raw_pointer is null"
-    );
-    ManuallyDrop::new(SIBinder::from_raw(make_fat_pointer(raw_pointer)))
 }
