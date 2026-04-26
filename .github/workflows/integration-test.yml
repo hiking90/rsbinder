@@ -119,12 +119,30 @@ jobs:
           # underlying bug (silent BadType from an empty descriptor cached
           # under a held write lock) is what this PR fixes — that family is
           # now expected to pass and is left enabled as a regression check.
+          #
+          # Diagnostics policy: pass-path runs at default (info) log level
+          # with no per-iteration tee — the workflow log already records
+          # each iteration's output, and trace-level logging on the
+          # client+server quadrupled wall time on stress runs. Failure
+          # path captures dmesg + the full test_service / rsb_hub logs
+          # right at the failing iteration, before later steps mutate
+          # kernel state. That is enough to root-cause every failure
+          # observed so far (the BR_FAILED_REPLY signature in dmesg is
+          # the load-bearing signal; client trace was redundant).
+          mkdir -p artifacts/sync
           for i in $(seq 1 "$TEST_ITERATIONS"); do
             echo "=== iteration $i / $TEST_ITERATIONS ==="
-            RUST_BACKTRACE=1 cargo test --package tests -- \
-              --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
-              --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
-              --skip test_versioned_unknown_union_field_triggers_error
+            if RUST_BACKTRACE=1 cargo test --package tests -- \
+                --skip test_vintf_parcelable_holder_cannot_contain_unstable_parcelable \
+                --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
+                --skip test_versioned_unknown_union_field_triggers_error; then
+              continue
+            fi
+            echo "::error::Sync iteration $i failed — capturing diagnostics before later steps overwrite kernel state"
+            sudo dmesg | tee "artifacts/sync/dmesg-at-iter-$i.log"
+            cp -f test_service.log "artifacts/sync/test_service-at-iter-$i.log" 2>/dev/null || true
+            cp -f rsb_hub.log "artifacts/sync/rsb_hub-at-iter-$i.log" 2>/dev/null || true
+            exit 1
           done
 
       - name: Restart test_service for async run
@@ -194,9 +212,16 @@ jobs:
           sleep 1
 
       - name: Check kernel log for binder errors (issue #97 regression gate)
+        # `always()` so that a failure inside the test loop does not skip
+        # the issue-#97 regression gate. The sync-loop already captures a
+        # dmesg snapshot at the precise failure moment; this final check
+        # additionally surfaces any kernel-log regressions that the
+        # iteration loop tolerated without exiting.
+        if: always()
         run: |
+          mkdir -p artifacts
           echo "=== Captured dmesg ==="
-          sudo dmesg
+          sudo dmesg | tee artifacts/dmesg-final.log
           echo "======================"
           # Issue #97 signature: BC_FREE_BUFFER no match in proc->alloc.
           # Other binder_user_error()s also indicate IPC misuse worth catching.
@@ -215,6 +240,7 @@ jobs:
             rsb_hub.log
             test_service.log
             test_service_async.log
+            artifacts/
           if-no-files-found: ignore
 
   # --------------------------------------------------------------------------
