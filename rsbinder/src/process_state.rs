@@ -958,4 +958,196 @@ mod tests {
             1
         );
     }
+
+    /// Minimal `IBinder` impl for the `published_natives` bookkeeping
+    /// tests below. Ref-count methods are no-ops — these tests exercise
+    /// the table's accounting (publish_count / kernel_refs and entry
+    /// removal-on-zero) without relying on `RefCounter` state.
+    struct MockNative;
+
+    impl IBinder for MockNative {
+        fn link_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn unlink_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn ping_binder(&self) -> Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn crate::Transactable> {
+            None
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.MockNative"
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn attempt_inc_strong(&self) -> bool {
+            true
+        }
+        fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
+            Ok(())
+        }
+        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn dec_weak(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// End-to-end of the table-controlled lifecycle that closes the UAF
+    /// window. Mirrors plan §4 "test_native_uaf_window_closed":
+    ///
+    ///   1. publish a native binder → entry created, `publish_count = 0`,
+    ///      `kernel_refs = 0`, RefCounter floor armed.
+    ///   2. `incref_publish` (mirrors the first `acquire()` that
+    ///      `Parcel::write_object` would call): `publish_count = 1`.
+    ///   3. drop the local user-side strong ref (under the OLD encoding
+    ///      this could dangle `Inner<T>` once the kernel finished
+    ///      releasing; under the new model the table's `binder_pin`
+    ///      keeps the canonical Arc alive).
+    ///   4. simulate `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` /
+    ///      `BR_DECREFS` arrival as pure id-bookkeeping.
+    ///   5. mirror `Parcel::release_objects` → `release()` →
+    ///      `decref_publish`: `publish_count = 0`. Now both counters
+    ///      are zero and the entry is removed → `lookup_native` returns
+    ///      `None`.
+    #[test]
+    fn test_native_uaf_window_closed() {
+        let process = ProcessState::init_default();
+        let arc: Arc<dyn IBinder> = Arc::new(MockNative);
+
+        let id = process.publish_native(Arc::clone(&arc));
+        assert!(process.incref_publish(id), "incref on freshly published id must succeed");
+
+        // Drop the user-side Arc clone; only the table's binder_pin
+        // SIBinder keeps the inner Arc alive now.
+        drop(arc);
+
+        // BR_INCREFS / BR_ACQUIRE: kernel_refs goes 0→1→2.
+        assert!(process.ref_native_kernel(id).is_some());
+        assert!(process.ref_native_kernel(id).is_some());
+        // BR_RELEASE: kernel_refs 2→1. Entry still alive
+        // (publish_count=1, kernel_refs=1).
+        assert!(process.deref_native_kernel(id).is_some());
+        assert!(
+            process.lookup_native(id).is_some(),
+            "entry must remain while publish_count > 0"
+        );
+
+        // Parcel::release_objects → release() → decref_publish:
+        // publish_count 1→0; kernel_refs still 1.
+        assert!(process.decref_publish(id));
+        assert!(
+            process.lookup_native(id).is_some(),
+            "entry must remain while kernel_refs > 0"
+        );
+
+        // BR_DECREFS: kernel_refs 1→0. Both zero → entry removed.
+        assert!(process.deref_native_kernel(id).is_some());
+        assert!(
+            process.lookup_native(id).is_none(),
+            "entry must be removed after both counts hit zero"
+        );
+
+        // Subsequent unknown-id ops are graceful.
+        assert!(!process.incref_publish(id));
+        assert!(!process.decref_publish(id));
+        assert!(process.ref_native_kernel(id).is_none());
+        assert!(process.deref_native_kernel(id).is_none());
+    }
+
+    /// Two `publish_native` calls with the same `Arc<dyn IBinder>`
+    /// dedup to the same id. Driving each parcel slot's
+    /// `acquire`/`release` independently keeps the entry alive until
+    /// the last `release` fires.
+    #[test]
+    fn test_native_dedup_same_arc() {
+        let process = ProcessState::init_default();
+        let arc: Arc<dyn IBinder> = Arc::new(MockNative);
+
+        let id1 = process.publish_native(Arc::clone(&arc));
+        let id2 = process.publish_native(Arc::clone(&arc));
+        assert_eq!(id1, id2, "publishing the same Arc twice must dedup");
+
+        // Two parcel slots reference the same id — `acquire` runs
+        // twice, `release` must run twice before the entry can drop.
+        assert!(process.incref_publish(id1));
+        assert!(process.incref_publish(id1));
+
+        assert!(process.decref_publish(id1));
+        assert!(
+            process.lookup_native(id1).is_some(),
+            "entry must remain while one parcel slot still holds a ref"
+        );
+
+        assert!(process.decref_publish(id1));
+        assert!(
+            process.lookup_native(id1).is_none(),
+            "entry must be removed after the last release fires"
+        );
+
+        drop(arc);
+    }
+
+    /// Distinct `Arc`s get distinct ids (no false-positive dedup via
+    /// e.g. `MockNative` being a unit struct — `Arc::ptr_eq` keys on
+    /// allocation, not type).
+    #[test]
+    fn test_native_distinct_arcs_get_distinct_ids() {
+        let process = ProcessState::init_default();
+        let arc_a: Arc<dyn IBinder> = Arc::new(MockNative);
+        let arc_b: Arc<dyn IBinder> = Arc::new(MockNative);
+        assert!(!Arc::ptr_eq(&arc_a, &arc_b));
+
+        let id_a = process.publish_native(Arc::clone(&arc_a));
+        let id_b = process.publish_native(Arc::clone(&arc_b));
+        assert_ne!(id_a, id_b);
+
+        // Cleanup.
+        for id in [id_a, id_b] {
+            assert!(process.incref_publish(id));
+            assert!(process.decref_publish(id));
+            assert!(process.lookup_native(id).is_none());
+        }
+    }
+
+    /// `lookup_native` is read-only — does not change `publish_count`
+    /// or `kernel_refs`. Exercises the BR_TRANSACTION /
+    /// `deserialize_option` round-trip path where the kernel routes a
+    /// previously-published binder back to its publisher.
+    #[test]
+    fn test_native_lookup_does_not_change_counts() {
+        let process = ProcessState::init_default();
+        let arc: Arc<dyn IBinder> = Arc::new(MockNative);
+        let id = process.publish_native(Arc::clone(&arc));
+
+        assert!(process.incref_publish(id)); // publish_count = 1
+        assert!(process.ref_native_kernel(id).is_some()); // kernel_refs = 1
+
+        // Look up multiple times — must not affect either counter.
+        for _ in 0..5 {
+            assert!(process.lookup_native(id).is_some());
+        }
+
+        // Decrement both: entry must be removed exactly once.
+        assert!(process.decref_publish(id));
+        assert!(
+            process.lookup_native(id).is_some(),
+            "lookup must not have decremented kernel_refs"
+        );
+        assert!(process.deref_native_kernel(id).is_some());
+        assert!(process.lookup_native(id).is_none());
+
+        drop(arc);
+    }
 }
