@@ -684,6 +684,18 @@ impl ProcessState {
                 .expect("Published natives lock poisoned");
             match map.get_mut(&id) {
                 Some(entry) => {
+                    // `saturating_sub` is the production safety net for
+                    // an unpaired `release` (which would otherwise wrap
+                    // u32 → 4 billion); the `debug_assert` makes the
+                    // unpaired call loud during dev/CI so a future
+                    // `acquire`/`release` pairing bug doesn't slip
+                    // through silently.
+                    debug_assert!(
+                        entry.publish_count > 0,
+                        "decref_publish on id {id} with publish_count == 0 \
+                         (unpaired release; check From<&SIBinder> ↔ \
+                         flat_binder_object::release pairing)"
+                    );
                     entry.publish_count = entry.publish_count.saturating_sub(1);
                     entry.publish_count == 0 && entry.kernel_refs == 0
                 }
@@ -724,6 +736,19 @@ impl ProcessState {
                 .write()
                 .expect("Published natives lock poisoned");
             let entry = map.get_mut(&id)?;
+            // Mirror `decref_publish`: `saturating_sub` is the
+            // production safety net; `debug_assert` catches an
+            // unpaired BR_RELEASE / BR_DECREFS during dev/CI. Kernel
+            // ordering guarantees `BR_INCREFS` ≤ `BR_DECREFS` count
+            // and `BR_ACQUIRE` ≤ `BR_RELEASE` count, so reaching this
+            // path with `kernel_refs == 0` would mean a kernel/
+            // bookkeeping divergence.
+            debug_assert!(
+                entry.kernel_refs > 0,
+                "deref_native_kernel on id {id} with kernel_refs == 0 \
+                 (unpaired BR_RELEASE / BR_DECREFS; check ref_native_kernel \
+                 pairing)"
+            );
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
             let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;

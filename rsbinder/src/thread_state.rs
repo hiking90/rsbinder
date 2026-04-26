@@ -165,62 +165,69 @@ impl BinderDerefs {
             pending_weak_derefs: VecDeque::new(),
         }
     }
+}
 
-    fn process_pending_derefs(&mut self) -> Result<()> {
-        // The deref operations may run user destructor code (when an
-        // entry's `kernel_refs` and `publish_count` both reach zero,
-        // `remove_entry_if_zero` drops the canonical Arc, which may
-        // fire `Inner<T>::drop` on the user's `Remotable` instance).
-        // That destructor could initiate outgoing transactions which
-        // in turn enqueue more pending derefs; so iterate in an outer
-        // loop until both queues are drained.
-        //
-        // Order matters: process derefs in **FIFO** so the sequence of
-        // destructor side effects (further outgoing transactions,
-        // further deref additions, native-binder cleanup hooks) matches
-        // the order the kernel observed BR_RELEASE / BR_DECREFS.
-        // Android's libbinder uses the same FIFO discipline — a LIFO
-        // `Vec::pop()` would silently reverse the ordering and could
-        // break callers that rely on it (e.g. when a strong-deref's
-        // destructor queues a weak-deref that the outer loop is then
-        // supposed to drain before the next strong).
-        //
-        // The outer-while wrapper is defensive under the new model:
-        // `deref_native_kernel`'s entry removal hands off to
-        // `remove_entry_if_zero`, which itself releases the table lock
-        // before `SIBinder::Drop` fires — so destructors run without
-        // the table lock held, and the only re-entrant path back into
-        // the deref queues is the same thread's next ioctl, not from
-        // inside the destructor itself. The wrapper still costs little
-        // and matches Android's libbinder structure.
-        while !self.pending_weak_derefs.is_empty() || !self.pending_strong_derefs.is_empty() {
-            while let Some(id) = self.pending_weak_derefs.pop_front() {
-                // BR_DECREFS reflects the kernel releasing a weak ref
-                // it held to one of our published natives. Pure id
-                // bookkeeping: decrement `kernel_refs`; if both
-                // counters now zero, the entry is removed (RefCounter
-                // floor torn down, Arc dropped) — see
-                // `deref_native_kernel`. An unknown id at this point
-                // would mean the kernel sent a BR_DECREFS for an id
-                // we never published or already torn down; skip with
-                // a trace log.
+/// Drain `BINDER_DEREFS` of pending BR_RELEASE / BR_DECREFS ids.
+///
+/// Each `deref_native_kernel(id)` call may, when an entry's counters
+/// both reach zero, trigger `remove_entry_if_zero` which drops the
+/// canonical `Arc<dyn IBinder>` and synchronously fires
+/// `Inner<T>::drop` on the user's `Remotable` instance. A user
+/// destructor that initiates an outgoing synchronous IPC ends up in
+/// `wait_for_response` → `talk_with_driver` → `execute_command`,
+/// whose BR_RELEASE / BR_DECREFS arms try to push back into
+/// `BINDER_DEREFS` via a fresh `borrow_mut()`.
+///
+/// To make that re-entrancy safe, this function never holds the
+/// `BINDER_DEREFS` `RefCell` borrow across a `deref_native_kernel`
+/// call. It alternates between:
+///
+///   1. Acquire the borrow, take the entire weak queue (or pop one
+///      strong id), release the borrow.
+///   2. Dispatch outside the borrow.
+///
+/// Pushes from re-entrant BR handlers go into a fresh `borrow_mut`,
+/// and the outer loop picks them up on the next iteration.
+///
+/// Order matches Android's libbinder: drain ALL weak derefs before
+/// dispatching the next strong, so a strong-deref destructor that
+/// queues a weak-deref gets drained ahead of the next pending
+/// strong. FIFO within each queue (`VecDeque::pop_front` /
+/// `mem::take` preserves insertion order).
+fn process_pending_derefs() -> Result<()> {
+    loop {
+        // Inner loop: drain weak fully. Re-take after each batch
+        // because dispatch may push more weak entries (from
+        // `Inner<T>::drop` running user destructor code that
+        // synchronously triggers another BR_DECREFS).
+        loop {
+            let batch: VecDeque<u64> = BINDER_DEREFS.with(|d| {
+                std::mem::take(&mut d.borrow_mut().pending_weak_derefs)
+            });
+            if batch.is_empty() {
+                break;
+            }
+            for id in batch {
                 if ProcessState::as_self().deref_native_kernel(id).is_none() {
                     log::trace!("BR_DECREFS for unknown native id {id}");
                 }
             }
+        }
 
-            // FIFO front-pop on strong derefs (`pop_front`). Process
-            // exactly one before re-checking the outer loop so a
-            // destructor-queued weak-deref is drained ahead of the
-            // next pending strong — same pattern as Android's
-            // libbinder.
-            if let Some(id) = self.pending_strong_derefs.pop_front() {
+        // Pop exactly one strong id under a fresh borrow, then
+        // dispatch outside the borrow. If none, both queues are
+        // empty (the inner loop just confirmed weak is empty), so
+        // we're done. Re-checking weak after dispatch is handled by
+        // looping back to the inner loop above.
+        let id = BINDER_DEREFS.with(|d| d.borrow_mut().pending_strong_derefs.pop_front());
+        match id {
+            Some(id) => {
                 if ProcessState::as_self().deref_native_kernel(id).is_none() {
                     log::trace!("BR_RELEASE for unknown native id {id}");
                 }
             }
+            None => return Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -1319,9 +1326,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
 
         loop {
             if thread_state.borrow_mut().is_process_pending_derefs() {
-                BINDER_DEREFS.with(|binder_derefs| -> Result<()> {
-                    binder_derefs.borrow_mut().process_pending_derefs()
-                })?;
+                process_pending_derefs()?;
             }
             if let Err(e) = get_and_execute_command() {
                 match e {
