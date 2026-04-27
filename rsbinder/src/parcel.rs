@@ -680,7 +680,9 @@ impl Parcel {
             thread_state::UNSET_WORK_SOURCE
         };
         self.write(&work_source)?;
-        self.write(&binder::INTERFACE_HEADER)?;
+        if crate::sdk_at_least(30) {
+            self.write(&binder::INTERFACE_HEADER)?;
+        }
         self.write(&interface)?;
 
         Ok(())

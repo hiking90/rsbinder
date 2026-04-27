@@ -459,13 +459,17 @@ impl SerializeOption for SIBinder {
         match this {
             Some(binder) => {
                 parcel.write::<flat_binder_object>(&binder.into())?;
-                parcel.write::<i32>(&binder.stability().into())?;
+                if crate::sdk_at_least(30) {
+                    parcel.write::<i32>(&binder.stability().into())?;
+                }
                 Ok(())
             }
 
             None => {
                 parcel.write::<flat_binder_object>(&flat_binder_object::default())?;
-                parcel.write::<i32>(&Stability::Local.into())?;
+                if crate::sdk_at_least(30) {
+                    parcel.write::<i32>(&Stability::Local.into())?;
+                }
 
                 Ok(())
             }
@@ -491,7 +495,11 @@ impl Deserialize for SIBinder {
 impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let flat: flat_binder_object = parcel.read()?;
-        let stability: i32 = parcel.read()?;
+        let stability: i32 = if crate::sdk_at_least(30) {
+            parcel.read()?
+        } else {
+            Stability::Local.into()
+        };
 
         match flat.header_type() {
             BINDER_TYPE_BINDER => {

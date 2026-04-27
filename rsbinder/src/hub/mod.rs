@@ -48,6 +48,13 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[cfg(all(target_os = "android", feature = "android_10"))]
+mod servicemanager_10;
+#[cfg(all(target_os = "android", feature = "android_10"))]
+pub mod android_10 {
+    pub use super::servicemanager_10::*;
+}
+
 #[cfg(all(target_os = "android", feature = "android_11"))]
 mod servicemanager_11;
 #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -107,9 +114,11 @@ pub mod sdk_versions {
     pub const ANDROID_12: u32 = 31;
     /// Android 11 (API level 30)
     pub const ANDROID_11: u32 = 30;
+    /// Android 10 (API level 29)
+    pub const ANDROID_10: u32 = 29;
 
     /// Minimum supported Android SDK version
-    pub const MIN_SUPPORTED: u32 = ANDROID_11;
+    pub const MIN_SUPPORTED: u32 = ANDROID_10;
     /// Maximum supported Android SDK version
     pub const MAX_SUPPORTED: u32 = ANDROID_16;
 }
@@ -123,6 +132,8 @@ pub mod sdk_versions {
 /// For version-specific features not covered by the common API, cast to the specific
 /// version's ServiceManager implementation or use the version-specific modules directly.
 pub enum ServiceManager {
+    #[cfg(all(target_os = "android", feature = "android_10"))]
+    Android10(android_10::BpServiceManager),
     #[cfg(all(target_os = "android", feature = "android_11"))]
     Android11(android_11::BpServiceManager),
     #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -169,6 +180,8 @@ pub fn default() -> Arc<ServiceManager> {
                 sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
                 #[cfg(feature = "android_11")]
                 sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
+                #[cfg(feature = "android_10")]
+                sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
                 _ => panic!("default: Unsupported Android SDK version: {}", sdk_version),
             }
         };
@@ -187,6 +200,8 @@ impl ServiceManager {
     /// This method is version-agnostic and works across all supported Android versions.
     pub fn get_service(&self, name: &str) -> Option<SIBinder> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -206,6 +221,8 @@ impl ServiceManager {
     /// This method is version-agnostic and works across all supported Android versions.
     pub fn get_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::get_interface(sm, name),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::get_interface(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -223,6 +240,8 @@ impl ServiceManager {
     /// This method is version-agnostic and works across all supported Android versions.
     pub fn check_service(&self, name: &str) -> Option<SIBinder> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::check_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::check_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -239,9 +258,14 @@ impl ServiceManager {
 
     /// Checks if a service with the given name is declared.
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// Note: not supported on Android 10 - always returns false.
     pub fn is_declared(&self, name: &str) -> bool {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("is_declared: not supported on Android 10");
+                false
+            }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::is_declared(sm, name),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -257,8 +281,11 @@ impl ServiceManager {
     /// Returns a list of all registered services with the specified dump priority.
     ///
     /// This method is version-agnostic and works across all supported Android versions.
+    /// On Android 10, uses the iterative wire protocol internally.
     pub fn list_services(&self, dump_priority: i32) -> Vec<String> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::list_services(sm, dump_priority),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::list_services(sm, dump_priority),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -280,6 +307,8 @@ impl ServiceManager {
         binder: SIBinder,
     ) -> std::result::Result<(), Status> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_12"))]
@@ -292,12 +321,19 @@ impl ServiceManager {
         }
     }
 
-    /// Retrieves debug information about all registered services.
+    /// Retrieves debug information about all currently registered services.
     ///
-    /// Note: This feature may not be available on all Android versions.
-    /// On Android 11, this method will return an error.
+    /// Note: not supported on Android 10 or Android 11 - returns an error on those versions.
     pub fn get_service_debug_info(&self) -> Result<Vec<ServiceDebugInfo>> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!(
+                    "get_service_debug_info: Unsupported Android SDK version: {}",
+                    crate::get_android_sdk_version()
+                );
+                Err(StatusCode::UnknownTransaction)
+            }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(_) => {
                 log::error!(
@@ -345,13 +381,18 @@ impl ServiceManager {
 
     /// Registers for notifications when a service becomes available.
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// Note: not supported on Android 10 - returns an error on that version.
     pub fn register_for_notifications(
         &self,
         name: &str,
         callback: &crate::Strong<dyn IServiceCallback>,
     ) -> Result<()> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("register_for_notifications: not supported on Android 10");
+                Err(StatusCode::UnknownTransaction)
+            }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
@@ -396,13 +437,18 @@ impl ServiceManager {
 
     /// Unregisters from notifications for a service.
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// Note: not supported on Android 10 - returns an error on that version.
     pub fn unregister_for_notifications(
         &self,
         name: &str,
         callback: &crate::Strong<dyn IServiceCallback>,
     ) -> Result<()> {
         match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("unregister_for_notifications: not supported on Android 10");
+                Err(StatusCode::UnknownTransaction)
+            }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
                 // SAFETY: This transmutation is safe because both types represent the same AIDL interface
