@@ -34,7 +34,7 @@ pest_derive = "2.8"
 convert_case = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 tera = "1.20.*"
-similar = "2.4"
+similar = "3.1"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "2.0"
 rustix = "1.1"
