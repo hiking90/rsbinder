@@ -178,10 +178,26 @@ pub use status::{ExceptionCode, Status};
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
-/// Default path to the binder device
+/// Default path to the binder device (binderfs, used on Android 11+).
 pub const DEFAULT_BINDER_PATH: &str = "/dev/binderfs/binder";
 /// Default path to the binderfs mount point
 pub const DEFAULT_BINDERFS_PATH: &str = "/dev/binderfs";
+/// Legacy binder device path used on Android 10 and earlier.
+pub const LEGACY_BINDER_PATH: &str = "/dev/binder";
+
+/// Returns `true` when the runtime Android SDK version is at least `version`.
+/// On non-Android platforms this always returns `true`.
+#[cfg(target_os = "android")]
+#[inline]
+pub fn sdk_at_least(version: u32) -> bool {
+    get_android_sdk_version() >= version
+}
+
+#[cfg(not(target_os = "android"))]
+#[inline]
+pub fn sdk_at_least(_version: u32) -> bool {
+    true
+}
 
 #[cfg(target_os = "android")]
 static ANDROID_SDK_VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
