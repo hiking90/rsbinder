@@ -6,13 +6,17 @@ use crate::*;
 // Interface descriptor for the Android 10 C service manager.
 pub const SERVICE_MANAGER_DESCRIPTOR: &str = "android.os.IServiceManager";
 
-// Dump priority flags.
-pub const DUMP_FLAG_PRIORITY_CRITICAL: i32 = 1 << 0;
-pub const DUMP_FLAG_PRIORITY_HIGH: i32 = 1 << 1;
-pub const DUMP_FLAG_PRIORITY_NORMAL: i32 = 1 << 2;
-pub const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 1 << 3;
-pub const DUMP_FLAG_PRIORITY_ALL: i32 = 0x0f;
+// Re-export the priority flags from the hub root so values can never drift
+// from the AIDL-generated constants used by API 30+.
+pub use crate::hub::{
+    DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
+    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL,
+};
 pub const DUMP_FLAG_PROTO: i32 = 1 << 4;
+
+// `addService` allow_isolated argument; the C service manager treats any
+// non-zero value as true.
+const ALLOW_ISOLATED_FALSE: i32 = 0;
 
 // Transaction codes used by the Android 10 C service manager.
 const GET_SERVICE: TransactionCode = FIRST_CALL_TRANSACTION;
@@ -103,7 +107,16 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
                 services.push(name);
                 n += 1;
             }
-            Err(_) => break,
+            Err(err) => {
+                // Termination is signalled by an error after the last
+                // entry, so a failure on n>0 is the normal end-of-list
+                // path. n==0 means we never read a single entry — that
+                // is a real IPC failure worth surfacing.
+                if n == 0 {
+                    log::error!("Failed to list services: {err}");
+                }
+                break;
+            }
         }
     }
 
@@ -119,7 +132,7 @@ pub fn add_service(
         let mut data = sm.proxy().prepare_transact(true)?;
         data.write(identifier)?;
         data.write(&binder)?;
-        data.write::<i32>(&0)?;
+        data.write::<i32>(&ALLOW_ISOLATED_FALSE)?;
         data.write::<i32>(&DUMP_FLAG_PRIORITY_DEFAULT)?;
 
         let mut reply = sm.transact(ADD_SERVICE, &data)?;
