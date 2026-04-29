@@ -312,7 +312,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        api-level: [30, 32, 34, 36]
+        api-level: [29, 30, 32, 34, 36]
       fail-fast: false
 
     steps:
