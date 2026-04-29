@@ -102,6 +102,22 @@ fn test_notifications() -> rsbinder::Result<()> {
 
     let callback = hub::BnServiceCallback::new_binder(MyServiceCallback {});
 
+    // Notifications are not supported on Android 10's C service manager —
+    // the hub maps that to UnknownTransaction. Verify that contract instead
+    // of trying to register.
+    #[cfg(target_os = "android")]
+    if get_android_sdk_version() == hub::sdk_versions::ANDROID_10 {
+        assert_eq!(
+            hub::register_for_notifications("mytest_service", &callback),
+            Err(StatusCode::UnknownTransaction)
+        );
+        assert_eq!(
+            hub::unregister_for_notifications("mytest_service", &callback),
+            Err(StatusCode::UnknownTransaction)
+        );
+        return Ok(());
+    }
+
     hub::register_for_notifications("mytest_service", &callback)?;
     hub::unregister_for_notifications("mytest_service", &callback)?;
 
@@ -112,7 +128,15 @@ fn test_notifications() -> rsbinder::Result<()> {
 fn test_others() -> rsbinder::Result<()> {
     setup();
 
+    // is_declared is not implemented in Android 10's C service manager;
+    // the hub returns false for any name there.
     assert!(!hub::is_declared("android.debug.IAdbManager/default"));
+
+    #[cfg(target_os = "android")]
+    if get_android_sdk_version() == hub::sdk_versions::ANDROID_10 {
+        assert!(!hub::is_declared("manager"));
+        assert!(!hub::is_declared(""));
+    }
 
     Ok(())
 }
