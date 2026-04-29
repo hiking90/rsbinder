@@ -22,6 +22,40 @@
 //! This module manages the per-thread state for binder operations, including
 //! transaction context, reference counting, and communication with the binder driver.
 //! Each thread participating in binder IPC maintains its own state through this module.
+//!
+//! # Borrow-Discipline Invariant (R1)
+//!
+//! `THREAD_STATE` and `BINDER_DEREFS` are `RefCell`s. Their `borrow*()` guards
+//! must NOT be held across calls that may re-borrow either cell. The set of
+//! calls that may re-borrow includes:
+//!
+//!   - User-code entry points: `Transactable::transact`, `Inner<T>::drop`
+//!     (invoked via `deref_native_kernel`), and
+//!     `DeathRecipient::binder_died`.
+//!   - Other functions in this module that take a borrow at some point:
+//!     `transact`, `wait_for_response`, `flush_commands`, `flash_if_needed`,
+//!     `inc_strong_handle`, `dec_strong_handle`, `inc_weak_handle`,
+//!     `dec_weak_handle`, `free_buffer`, and `process_pending_derefs`.
+//!
+//! Violation manifests as a `RefCell` panic ("already borrowed" /
+//! "already mutably borrowed"). Binder's nested-IPC protocol means user
+//! callbacks routinely make outgoing binder calls from inside an incoming
+//! `BR_TRANSACTION`, so this is not a theoretical concern.
+//!
+//! ## Patterns to satisfy R1
+//!
+//! - **P2 — Minimal scope**: scope each borrow as tightly as "read value →
+//!   process → write value". Drop the borrow before calling out, then
+//!   re-acquire a fresh borrow afterwards. Don't span the entire function
+//!   body inside one `borrow_mut()`.
+//! - **P3 — Stack-save**: when a user callback is about to be invoked, save
+//!   and restore logical state (e.g. `transaction`) via local variables on
+//!   the call stack, not via persisted `RefCell` borrows. Persisting state
+//!   in a `RefCell` borrow across a callback risks dragging the borrow into
+//!   re-entrant code.
+//!
+//! See `b17d522` for the regression that motivated the explicit P2 split in
+//! `process_pending_derefs`.
 
 use log::error;
 use std::backtrace::Backtrace;
@@ -34,6 +68,9 @@ use std::sync::{atomic::Ordering, Arc};
 
 use crate::{binder::*, error::*, parcel::*, process_state::*, sys::*};
 
+// See module doc — R1: borrows of these `RefCell`s must not be held across
+// calls that may re-borrow either cell (user callbacks, other binder entry
+// points). Use the P2 (minimal scope) and P3 (stack-save) patterns.
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
@@ -194,6 +231,13 @@ impl BinderDerefs {
 /// queues a weak-deref gets drained ahead of the next pending
 /// strong. FIFO within each queue (`VecDeque::pop_front` /
 /// `mem::take` preserves insertion order).
+///
+/// # Borrow discipline (R1)
+///
+/// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow held
+/// — `deref_native_kernel` may invoke user `Inner<T>::drop`, which can
+/// re-enter the binder stack. The acquire/release alternation inside this
+/// function maintains R1; do not hoist the borrow out of the loop.
 fn process_pending_derefs() -> Result<()> {
     loop {
         // Inner loop: drain weak fully. Re-take after each batch
@@ -644,6 +688,12 @@ where
 /// `BR_REPLY`). Mirrors the panic guard around `DeathRecipient`
 /// callbacks in `ProxyHandle::dispatch_obituary_callbacks`. See the
 /// `Transactable` trait doc for the full guarantee scope.
+///
+/// # Borrow discipline (R1)
+///
+/// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow held —
+/// `Transactable::transact` is user code that may issue nested binder
+/// calls (re-entering this module). See module doc.
 fn dispatch_transact_caught(
     transactable: &dyn Transactable,
     code: TransactionCode,
@@ -953,6 +1003,25 @@ fn execute_command(cmd: i32) -> Result<()> {
     })
 }
 
+/// Drive one round-trip with the binder kernel driver.
+///
+/// # Borrow discipline (H1, hygiene only)
+///
+/// The `BINDER_WRITE_READ` ioctl does not re-enter Rust on the same
+/// thread (the kernel only schedules our incoming queue and returns),
+/// so holding a `THREAD_STATE` borrow across the syscall does not
+/// violate R1 today. The current code does hold an immutable
+/// `thread_state.borrow()` across the `write_read` call to read
+/// `driver` — correct under the no-re-entry property.
+///
+/// H1 is the hygiene note that this boundary should ideally be
+/// tightened: future EINTR / signal-safety / cancellation handling
+/// changes, or any logic that gains a same-thread Rust callback here,
+/// would break the no-re-entry assumption and quietly turn this into
+/// an R1 violation. A defensive refactor would clone the `Arc<File>`
+/// out under a short borrow and pass it by value across the syscall.
+/// Not done today (no concrete risk); recorded so a future change
+/// knows to revisit.
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut bwr = {
@@ -1757,5 +1826,219 @@ mod tests {
             "obituary error must take priority over pin error, got {result:?}"
         );
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+    }
+
+    /// Regression test for `b17d522`: `process_pending_derefs` must
+    /// tolerate a re-entrant push to `BINDER_DEREFS` from a user
+    /// `Inner<T>::drop` callback.
+    ///
+    /// Pre-`b17d522`, the function held the `BINDER_DEREFS` borrow
+    /// across `deref_native_kernel`. When entry removal triggered an
+    /// `Inner<T>::drop` whose user destructor synchronously caused
+    /// another BR_RELEASE / BR_DECREFS to land (path: outgoing IPC →
+    /// `wait_for_response` → `talk_with_driver` → `execute_command`
+    /// queues into `BINDER_DEREFS`), the second `borrow_mut()` panicked.
+    ///
+    /// We simulate that re-entrancy in-process by pushing a second id
+    /// into `BINDER_DEREFS.pending_weak_derefs` directly from a
+    /// drop-fired sentinel — no kernel needed.
+    ///
+    /// **Linux + binderfs only** (uses `ProcessState::init_default`,
+    /// which opens `/dev/binderfs/binder`). Same convention as the
+    /// `process_state` M4 tests; surfaces under
+    /// `.github/workflows/integration-test.yml`.
+    #[test]
+    fn test_process_pending_derefs_handles_reentrant_push_from_drop() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{self, Mutex};
+        let process = ProcessState::init_default();
+
+        let drop_log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let pusher_target: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        // Sentinel B: drop pushes nothing, only records that it fired.
+        struct DropFireSentinel {
+            my_id: Arc<AtomicU64>,
+            log: Arc<Mutex<Vec<u64>>>,
+        }
+        impl Drop for DropFireSentinel {
+            fn drop(&mut self) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(self.my_id.load(Ordering::SeqCst));
+            }
+        }
+        impl IBinder for DropFireSentinel {
+            fn link_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+                Err(StatusCode::InvalidOperation)
+            }
+            fn unlink_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+                Err(StatusCode::InvalidOperation)
+            }
+            fn ping_binder(&self) -> Result<()> {
+                Ok(())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_transactable(&self) -> Option<&dyn Transactable> {
+                None
+            }
+            fn descriptor(&self) -> &str {
+                "rsbinder.test.DropFireSentinel"
+            }
+            fn is_remote(&self) -> bool {
+                false
+            }
+            fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+                Ok(())
+            }
+            fn attempt_inc_strong(&self) -> bool {
+                true
+            }
+            fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
+                Ok(())
+            }
+            fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+                Ok(())
+            }
+            fn dec_weak(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Sentinel A: drop pushes B's id back into BINDER_DEREFS,
+        // simulating an outgoing IPC's BR_DECREFS landing during the
+        // drain.
+        struct ReentrantPusher {
+            my_id: Arc<AtomicU64>,
+            target: Arc<AtomicU64>,
+            log: Arc<Mutex<Vec<u64>>>,
+        }
+        impl Drop for ReentrantPusher {
+            fn drop(&mut self) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(self.my_id.load(Ordering::SeqCst));
+                let target_id = self.target.load(Ordering::SeqCst);
+                if target_id != 0 {
+                    BINDER_DEREFS.with(|d| {
+                        d.borrow_mut().pending_weak_derefs.push_back(target_id);
+                    });
+                }
+            }
+        }
+        impl IBinder for ReentrantPusher {
+            fn link_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+                Err(StatusCode::InvalidOperation)
+            }
+            fn unlink_to_death(&self, _: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+                Err(StatusCode::InvalidOperation)
+            }
+            fn ping_binder(&self) -> Result<()> {
+                Ok(())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_transactable(&self) -> Option<&dyn Transactable> {
+                None
+            }
+            fn descriptor(&self) -> &str {
+                "rsbinder.test.ReentrantPusher"
+            }
+            fn is_remote(&self) -> bool {
+                false
+            }
+            fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+                Ok(())
+            }
+            fn attempt_inc_strong(&self) -> bool {
+                true
+            }
+            fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
+                Ok(())
+            }
+            fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+                Ok(())
+            }
+            fn dec_weak(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Publish B first so we know its id before constructing A.
+        let id_b_holder = Arc::new(AtomicU64::new(0));
+        let arc_b: Arc<dyn IBinder> = Arc::new(DropFireSentinel {
+            my_id: Arc::clone(&id_b_holder),
+            log: Arc::clone(&drop_log),
+        });
+        let id_b = process.publish_native(Arc::clone(&arc_b));
+        id_b_holder.store(id_b, Ordering::SeqCst);
+        // Bump kernel_refs so deref_native_kernel later drives it 1→0
+        // and removes the entry. Drop the returned strong arc at
+        // semicolon so the table's binder_pin is the only holder.
+        process
+            .ref_native_kernel(id_b)
+            .expect("ref_native_kernel(id_b)");
+        // Drop user-side clone: the table holds the only strong now.
+        drop(arc_b);
+
+        // Configure pusher target to id_b before publishing A.
+        pusher_target.store(id_b, Ordering::SeqCst);
+
+        let id_a_holder = Arc::new(AtomicU64::new(0));
+        let arc_a: Arc<dyn IBinder> = Arc::new(ReentrantPusher {
+            my_id: Arc::clone(&id_a_holder),
+            target: Arc::clone(&pusher_target),
+            log: Arc::clone(&drop_log),
+        });
+        let id_a = process.publish_native(Arc::clone(&arc_a));
+        id_a_holder.store(id_a, Ordering::SeqCst);
+        process
+            .ref_native_kernel(id_a)
+            .expect("ref_native_kernel(id_a)");
+        drop(arc_a);
+
+        // Push id_a as a strong deref. Do NOT push id_b — A's drop
+        // will push it during the drain.
+        BINDER_DEREFS.with(|d| {
+            d.borrow_mut().pending_strong_derefs.push_back(id_a);
+        });
+
+        // Drive the drain. Pre-`b17d522` this would panic with
+        // "already mutably borrowed: BorrowError" the moment A's drop
+        // tried to re-borrow BINDER_DEREFS.
+        process_pending_derefs().expect("process_pending_derefs must not panic or error");
+
+        // Both natives must have dropped — re-entrant push picked up
+        // by the outer loop.
+        let log = drop_log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            2,
+            "both A and B must have dropped exactly once, got {log:?}"
+        );
+        assert!(log.contains(&id_a), "A's drop must fire, got {log:?}");
+        assert!(log.contains(&id_b), "B's drop must fire, got {log:?}");
+
+        // Both queues must be empty after drain.
+        BINDER_DEREFS.with(|d| {
+            let derefs = d.borrow();
+            assert!(
+                derefs.pending_weak_derefs.is_empty(),
+                "weak queue must be empty after drain"
+            );
+            assert!(
+                derefs.pending_strong_derefs.is_empty(),
+                "strong queue must be empty after drain"
+            );
+        });
+
+        // Both entries must be removed from the published_natives table.
+        assert!(process.lookup_native(id_a).is_none());
+        assert!(process.lookup_native(id_b).is_none());
     }
 }

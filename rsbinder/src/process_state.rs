@@ -544,6 +544,13 @@ impl ProcessState {
     /// cache pin) is performed by `release_obituary_pin`, called from
     /// `thread_state::execute_command`'s BR_DEAD_BINDER arm AFTER
     /// BC_DEAD_BINDER_DONE has been queued.
+    ///
+    /// # Borrow discipline (R1)
+    ///
+    /// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow
+    /// held — `arc.send_obituary` invokes user
+    /// `DeathRecipient::binder_died` callbacks, which can issue nested
+    /// binder calls. See [`thread_state`](super::thread_state) module doc.
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         let entry = {
             let mut handle_to_proxy = self
