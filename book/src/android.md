@@ -12,6 +12,7 @@ See: [Android Build Environment Setup](./android-build.md)
 
 ### Supported Android Versions
 
+- **Android 10 (API 29)**: `android_10` feature
 - **Android 11 (API 30)**: `android_11` feature
 - **Android 12 (API 31) / 12L (API 32)**: `android_12` feature
 - **Android 13 (API 33)**: `android_13` feature
@@ -20,16 +21,19 @@ See: [Android Build Environment Setup](./android-build.md)
 
 > **Note**: Android 12L (API 32) uses the same Binder protocol as Android 12, so both are covered by the `android_12` feature flag. Similarly, Android 15 (API 35) uses the same Binder protocol as Android 14, so it is covered by the `android_14` or `android_14_plus` feature flag. No separate `android_12l` or `android_15` feature is needed.
 
+> **Android 10 caveat**: Android 10 uses the legacy C `IServiceManager` (the AIDL-based interface only landed in Android 11). The `android_10` dispatch supports `get_service`, `check_service`, `add_service`, and `list_services`. APIs introduced later — `is_declared`, `register_for_notifications`, `unregister_for_notifications`, and `get_service_debug_info` — return `false` or `StatusCode::UnknownTransaction` so callers can detect the gap rather than silently misbehave.
+
 ### Feature Flag Configuration
 
 In your `Cargo.toml`, specify the Android versions you want to support:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.5", features = ["android_14_plus"] }
+rsbinder = { version = "0.7", features = ["android_14_plus"] }
 ```
 
 Available feature combinations:
+- `android_10_plus`: Supports Android 10 through 16
 - `android_11_plus`: Supports Android 11 through 16
 - `android_12_plus`: Supports Android 12 through 16
 - `android_13_plus`: Supports Android 13 through 16

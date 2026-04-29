@@ -81,12 +81,12 @@ Add the following configuration to your Cargo.toml file:
 
 ```toml
 [dependencies]
-rsbinder = "0.5"
+rsbinder = "0.7"
 async-trait = "0.1"
 env_logger = "0.11"  # Optional: for logging
 
 [build-dependencies]
-rsbinder-aidl = "0.5"
+rsbinder-aidl = "0.7"
 ```
 
 ### Feature Flags
@@ -94,11 +94,11 @@ rsbinder-aidl = "0.5"
 
 ```toml
 [dependencies]
-rsbinder = "0.5"  # Default: includes tokio async runtime
+rsbinder = "0.7"  # Default: includes tokio async runtime
 # or
-rsbinder = { version = "0.5", features = ["async"] }  # Async trait support without tokio — use your own async runtime
+rsbinder = { version = "0.7", features = ["async"] }  # Async trait support without tokio — use your own async runtime
 # or
-rsbinder = { version = "0.5", default-features = false }  # Synchronous only (no async support)
+rsbinder = { version = "0.7", default-features = false }  # Synchronous only (no async support)
 ```
 
 Available features:
