@@ -226,8 +226,8 @@ The returned `ServiceDebugInfo` struct has two fields:
 - `name` (`String`) -- the registered service name.
 - `debugPid` (`i32`) -- the PID of the process that registered the service.
 
-This feature is available on Android 12 and above. On Android 11, calling
-`get_service_debug_info` returns an error.
+This feature is available on Android 12 and above. On Android 10 and Android 11,
+calling `get_service_debug_info` returns an error.
 
 ## Linux vs. Android Differences
 
@@ -240,14 +240,18 @@ Android's native `servicemanager`:
 | **Process**             | User-space `rsb_hub` binary             | System `servicemanager` daemon          |
 | **Access control**      | No SELinux enforcement                  | Full SELinux MAC policy enforcement     |
 | **VINTF manifests**     | Not supported (`is_declared` is false)  | Supported and enforced                  |
-| **Service debug info**  | Supported                               | Supported (Android 12+)                 |
+| **Service debug info**  | Supported                               | Supported (Android 12+; not on 10/11)   |
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
 | **Version selection**   | Always uses Android 16 protocol         | Auto-detected from SDK version          |
 | **Death notifications** | Supported                               | Supported                               |
 
 On Android, rsbinder automatically detects the SDK version and uses the
-appropriate service manager protocol (Android 11 through 16). On Linux, it
-always uses the Android 16 protocol, which is what `rsb_hub` implements.
+appropriate service manager protocol (Android 10 through 16). Android 10
+falls back to the legacy C `IServiceManager` and therefore lacks
+`is_declared`, service notification callbacks, and `get_service_debug_info`
+— those entry points return `false` or `StatusCode::UnknownTransaction`.
+On Linux, rsbinder always uses the Android 16 protocol, which is what
+`rsb_hub` implements.
 
 ## Using the ServiceManager Object Directly
 

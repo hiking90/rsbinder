@@ -18,12 +18,12 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.5"
+rsbinder = "0.7"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.5"
+rsbinder-aidl = "0.7"
 ```
 Add rsbinder and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
 

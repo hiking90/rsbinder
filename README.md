@@ -108,7 +108,7 @@ Both rsbinder and Android Binder utilize the same core protocol, enabling seamle
 - **Memory Management**: Compatible parcel serialization and shared memory handling
 
 ### Android Version Support:
-**rsbinder** supports Android versions 11 through 16.
+**rsbinder** supports Android versions 10 through 16 (API levels 29–36). Android 10 uses the legacy C service manager protocol; APIs not implemented there (`is_declared`, `register_for_notifications`, `unregister_for_notifications`, `get_service_debug_info`) return an error or `false` so callers can detect the gap. CI exercises emulator API levels 29, 30, 32, 34, and 36.
 
 ### AIDL Compatibility:
 The **rsbinder-aidl** compiler generates Rust code that maintains compatibility with Android's AIDL:
