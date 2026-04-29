@@ -26,7 +26,7 @@ rsbinder = { version = "0.6.1", path = "rsbinder" }
 log = "0.4"
 env_logger = "0.11"
 anstyle = "1.0"
-tokio = { version = "1.50", default-features = false }
+tokio = { version = "1.52", default-features = false }
 async-trait = "0.1"
 rsbinder-aidl = { version = "0.6.1", path = "rsbinder-aidl" }
 pest = "2.8"
@@ -38,7 +38,7 @@ similar = "2.4"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "2.0"
 rustix = "1.1"
-clap = "4.5"
+clap = "4.6"
 rsproperties = "0.3"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2"
