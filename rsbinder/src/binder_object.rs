@@ -212,7 +212,7 @@ impl From<&SIBinder> for flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_BINDER,
                 },
-                flags: FLAT_BINDER_FLAG_ACCEPTS_FDS | sched_bits,
+                flags: binder.local_binder_flags() | sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: id },
                 cookie: 0,
             }
