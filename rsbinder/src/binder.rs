@@ -259,9 +259,11 @@ pub trait IBinder: Any + Send + Sync {
         Err(StatusCode::InvalidOperation)
     }
 
-    /// Return the local binder flags exported to the binder driver.
+    /// Local binder flags exported to the binder driver via
+    /// `flat_binder_object.flags`. Only native binders return a meaningful
+    /// value; proxies and test mocks inherit the `0` default.
     fn local_binder_flags(&self) -> u32 {
-        sys::FLAT_BINDER_FLAG_ACCEPTS_FDS
+        0
     }
 
     fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
