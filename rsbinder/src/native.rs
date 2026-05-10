@@ -36,9 +36,54 @@ use crate::{
     thread_state,
 };
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Opt-in flags requested at native-binder construction time.
+///
+/// Each flag triggers a kernel-side behavior that has a non-zero cost,
+/// so callers explicitly opt in only what they need. The struct is
+/// `#[non_exhaustive]` to allow new flags to be added without a SemVer
+/// break. From outside this crate, construct it by starting from
+/// [`BinderFeatures::default`] and assigning the flags you want:
+///
+/// ```
+/// use rsbinder::BinderFeatures;
+/// let mut features = BinderFeatures::default();
+/// features.set_requesting_sid = true;
+/// ```
+///
+/// ```compile_fail
+/// use rsbinder::BinderFeatures;
+/// // E0639 — both struct-literal forms are blocked from outside the
+/// // defining crate, with or without functional update syntax.
+/// let _ = BinderFeatures { set_requesting_sid: true };
+/// let _ = BinderFeatures { set_requesting_sid: true, ..Default::default() };
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct BinderFeatures {
+    /// Request that the kernel attach the caller's SELinux security
+    /// context to every transaction targeting this binder. When set,
+    /// the kernel dispatches via `BR_TRANSACTION_SEC_CTX` and the
+    /// transaction handler can read the caller's context through
+    /// [`crate::thread_state::CallingContext::default`]`.sid`.
+    ///
+    /// Default: `false`. Has a per-transaction cost (kernel must
+    /// serialize `secctx`), so opt in only on services that perform
+    /// SELinux-domain-based authorization.
     pub set_requesting_sid: bool,
+}
+
+impl BinderFeatures {
+    /// Encode this feature set into the `flat_binder_object.flags`
+    /// bitfield. `FLAT_BINDER_FLAG_ACCEPTS_FDS` is always set —
+    /// rsbinder unconditionally accepts file descriptors in its
+    /// native binder protocol implementation.
+    pub(crate) fn flat_flags(self) -> u32 {
+        let mut f = crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        if self.set_requesting_sid {
+            f |= crate::sys::FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
+        }
+        f
+    }
 }
 
 struct Inner<T: Remotable + Send + Sync> {
@@ -246,22 +291,39 @@ pub struct Binder<T: 'static + Remotable + Send + Sync> {
 }
 
 impl<T: 'static + Remotable> Binder<T> {
-    /// Create a new Binder object with default stability.
+    /// Create a new `Binder<T>` with default stability and no opt-in features.
+    ///
+    /// Equivalent to `new_with_stability_and_features(remotable,
+    /// Stability::default(), BinderFeatures::default())`. Use this for the
+    /// common case where the AIDL generator (or the caller) does not need to
+    /// override stability or request kernel-side features such as
+    /// [`BinderFeatures::set_requesting_sid`].
     pub fn new(remotable: T) -> Self {
         Self::new_with_stability_and_features(remotable, Default::default(), Default::default())
     }
 
-    /// Create a new Binder object with default stability and custom features.
+    /// Create a new `Binder<T>` with default stability and a custom feature set.
+    ///
+    /// See [`BinderFeatures`] for the available opt-ins.
     pub fn new_with_features(remotable: T, features: BinderFeatures) -> Self {
         Self::new_with_stability_and_features(remotable, Default::default(), features)
     }
 
-    /// Create a new Binder object with the specified stability level.
+    /// Create a new `Binder<T>` with an explicit stability level and default
+    /// features.
+    ///
+    /// Stability is normally set by the AIDL generator via `@VintfStability`,
+    /// not by user-side construction. Reach for this only when constructing
+    /// `Binder<T>` directly without going through the generator.
     pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
         Self::new_with_stability_and_features(remotable, stability, Default::default())
     }
 
-    /// Create a new Binder object with the specified stability level and features.
+    /// Create a new `Binder<T>` with explicit stability and feature set.
+    ///
+    /// This is the underlying constructor; the other `new_*` variants
+    /// delegate to this with default values for the parameters they
+    /// don't take. See [`BinderFeatures`] for the available feature opt-ins.
     pub fn new_with_stability_and_features(
         remotable: T,
         stability: Stability,
@@ -271,12 +333,7 @@ impl<T: 'static + Remotable> Binder<T> {
             inner: Arc::new(Inner {
                 remotable,
                 stability,
-                binder_flags: if features.set_requesting_sid {
-                    crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS
-                        | crate::sys::FLAT_BINDER_FLAG_TXN_SECURITY_CTX
-                } else {
-                    crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS
-                },
+                binder_flags: features.flat_flags(),
                 strong: Default::default(),
                 weak: Default::default(),
                 extension: RwLock::new(None),
@@ -373,4 +430,51 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 /// transaction.
 pub fn is_handling_transaction() -> bool {
     thread_state::is_handling_transaction()
+}
+
+#[cfg(test)]
+mod feature_flags_tests {
+    use super::*;
+    use crate::sys::{FLAT_BINDER_FLAG_ACCEPTS_FDS, FLAT_BINDER_FLAG_TXN_SECURITY_CTX};
+
+    struct DummyRemotable;
+    impl crate::Remotable for DummyRemotable {
+        fn descriptor() -> &'static str
+        where
+            Self: Sized,
+        {
+            "test.dummy"
+        }
+        fn on_transact(
+            &self,
+            _: crate::TransactionCode,
+            _: &mut crate::Parcel,
+            _: &mut crate::Parcel,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_features_set_only_accepts_fds() {
+        let b = Binder::new(DummyRemotable);
+        let flags = b.inner.local_binder_flags();
+        assert_eq!(flags, FLAT_BINDER_FLAG_ACCEPTS_FDS);
+        assert_eq!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX, 0);
+    }
+
+    #[test]
+    fn requesting_sid_sets_txn_security_ctx() {
+        let features = BinderFeatures {
+            set_requesting_sid: true,
+            ..Default::default()
+        };
+        let b = Binder::new_with_features(DummyRemotable, features);
+        let flags = b.inner.local_binder_flags();
+        assert_ne!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX, 0);
+        assert_ne!(flags & FLAT_BINDER_FLAG_ACCEPTS_FDS, 0);
+    }
 }

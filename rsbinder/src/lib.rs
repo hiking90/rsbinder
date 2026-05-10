@@ -114,6 +114,13 @@
 //! # }
 //! ```
 //!
+//! ## Opting into kernel-level features
+//!
+//! Native binders can opt into per-binder kernel features (for example,
+//! receiving the caller's SELinux security context) via [`BinderFeatures`]
+//! and the `*_with_features` constructor variants. See [`BinderFeatures`]
+//! for the available opt-ins.
+//!
 //! # License
 //!
 //! Licensed under Apache License, Version 2.0.

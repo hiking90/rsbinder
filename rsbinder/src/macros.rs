@@ -50,6 +50,10 @@ macro_rules! __declare_binder_interface {
                 }
 
                 /// Create a new binder service with explicit binder features.
+                ///
+                /// Equivalent to [`Self::new_binder`] but lets the caller opt into
+                /// kernel-level features such as `set_requesting_sid`.
+                /// See `rsbinder::BinderFeatures`.
                 pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
                     inner: T,
                     features: $crate::BinderFeatures,
@@ -173,6 +177,10 @@ macro_rules! __declare_binder_interface {
             }
 
             /// Create a new binder service with explicit binder features.
+            ///
+            /// Equivalent to [`Self::new_binder`] but lets the caller opt into
+            /// kernel-level features such as `set_requesting_sid`.
+            /// See `rsbinder::BinderFeatures`.
             pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
                 inner: T,
                 features: $crate::BinderFeatures,
