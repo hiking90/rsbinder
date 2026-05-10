@@ -46,6 +46,14 @@ macro_rules! __declare_binder_interface {
             impl $native {
                 /// Create a new binder service.
                 pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+                    Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
+                }
+
+                /// Create a new binder service with explicit binder features.
+                pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
+                    inner: T,
+                    features: $crate::BinderFeatures,
+                ) -> $crate::Strong<dyn $interface> {
                     struct Wrapper<T> {
                         _inner: T,
                     }
@@ -58,7 +66,11 @@ macro_rules! __declare_binder_interface {
                             unreachable!("{} doesn't support async interface.", stringify!($interface))
                         }
                     }
-                    let binder = $crate::native::Binder::new_with_stability($native(Box::new(Wrapper {_inner: inner})), $stability);
+                    let binder = $crate::native::Binder::new_with_stability_and_features(
+                        $native(Box::new(Wrapper {_inner: inner})),
+                        $stability,
+                        features,
+                    );
                     $crate::Strong::new(Box::new(binder))
                 }
             }
@@ -157,7 +169,19 @@ macro_rules! __declare_binder_interface {
         impl $native {
             /// Create a new binder service.
             pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
-                let binder = $crate::native::Binder::new_with_stability($native(Box::new(inner)), $stability);
+                Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
+            }
+
+            /// Create a new binder service with explicit binder features.
+            pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
+                inner: T,
+                features: $crate::BinderFeatures,
+            ) -> $crate::Strong<dyn $interface> {
+                let binder = $crate::native::Binder::new_with_stability_and_features(
+                    $native(Box::new(inner)),
+                    $stability,
+                    features,
+                );
                 $crate::Strong::new(Box::new(binder))
             }
         }

@@ -36,9 +36,15 @@ use crate::{
     thread_state,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BinderFeatures {
+    pub set_requesting_sid: bool,
+}
+
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
     stability: Stability,
+    binder_flags: u32,
     strong: RefCounter,
     weak: RefCounter,
     extension: RwLock<Option<SIBinder>>,
@@ -126,6 +132,10 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
 
     fn stability(&self) -> Stability {
         self.stability
+    }
+
+    fn local_binder_flags(&self) -> u32 {
+        self.binder_flags
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -238,15 +248,35 @@ pub struct Binder<T: 'static + Remotable + Send + Sync> {
 impl<T: 'static + Remotable> Binder<T> {
     /// Create a new Binder object with default stability.
     pub fn new(remotable: T) -> Self {
-        Self::new_with_stability(remotable, Default::default())
+        Self::new_with_stability_and_features(remotable, Default::default(), Default::default())
+    }
+
+    /// Create a new Binder object with default stability and custom features.
+    pub fn new_with_features(remotable: T, features: BinderFeatures) -> Self {
+        Self::new_with_stability_and_features(remotable, Default::default(), features)
     }
 
     /// Create a new Binder object with the specified stability level.
     pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
+        Self::new_with_stability_and_features(remotable, stability, Default::default())
+    }
+
+    /// Create a new Binder object with the specified stability level and features.
+    pub fn new_with_stability_and_features(
+        remotable: T,
+        stability: Stability,
+        features: BinderFeatures,
+    ) -> Self {
         Binder::<T> {
             inner: Arc::new(Inner {
                 remotable,
                 stability,
+                binder_flags: if features.set_requesting_sid {
+                    crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS
+                        | crate::sys::FLAT_BINDER_FLAG_TXN_SECURITY_CTX
+                } else {
+                    crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS
+                },
                 strong: Default::default(),
                 weak: Default::default(),
                 extension: RwLock::new(None),
