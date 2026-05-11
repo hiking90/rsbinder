@@ -41,6 +41,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create a binder service.
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService {});
+    // Alternative: opt into receiving the caller's SELinux security
+    // context (read via `CallingContext::default().sid` in transactions):
+    //
+    //     use rsbinder::BinderFeatures;
+    //     let mut features = BinderFeatures::default();
+    //     features.set_requesting_sid = true;
+    //     let service = BnHello::new_binder_with_features(IHelloService {}, features);
 
     // Add the service to binder service manager.
     println!("Adding service to hub...");
