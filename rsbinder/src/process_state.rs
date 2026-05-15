@@ -1378,26 +1378,14 @@ mod tests {
     /// released the lock by the time the obituary fires, so the
     /// re-acquisition succeeds.
     ///
-    /// The simulation injects the obituary call via the
-    /// `slow_path_p2_test_hook` cfg(test) entry hook (fired the
+    /// The simulation drives the slow path on a worker thread that
+    /// installs a `slow_path_p2` cfg(test) hook calling
+    /// `send_obituary_for_handle` from the same thread (fired the
     /// instant P1 releases the lock and before P2 enters IPC).
     /// Driving the obituary from the actual binder driver would
     /// require crashing a service mid-transact — too brittle for a
     /// unit test, and the lock semantics being tested are
     /// driver-independent.
-    ///
-    /// Wallclock-bounded so a regression manifests as a CI timeout
-    /// failure rather than an indefinite hang.
-    /// Plan §5.2 — same-thread re-entrant obituary regression guard.
-    ///
-    /// Drives the slow path on a worker thread that has installed a
-    /// `slow_path_p2` hook calling `send_obituary_for_handle` from
-    /// the same thread. Under non-reentrant `std::sync::RwLock`
-    /// write semantics, the hook's `handle_to_proxy.write()` call
-    /// would deadlock if the slow path were still holding the write
-    /// lock at the P2 entry point. The current three-phase split
-    /// releases the lock between P1 and P2, so the obituary
-    /// re-acquisition succeeds.
     ///
     /// Wallclock-bounded so a regression manifests as a CI timeout
     /// failure rather than an indefinite hang. The `fired` flag
