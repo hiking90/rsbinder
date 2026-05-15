@@ -204,25 +204,76 @@ pub fn default() -> Result<Arc<ServiceManager>> {
     Ok(GLOBAL_SM.get_or_init(|| Arc::new(service_manager)).clone())
 }
 
-/// Re-wraps a version-agnostic `IServiceCallback` as the version-specific
-/// `Strong<dyn android_N::IServiceCallback>` expected by a per-version
-/// service-manager shim.
+/// Forwards an existing `IServiceCallback` to a per-version
+/// service-manager shim without reconstructing a typed `Strong`.
 ///
 /// Each `android_N::IServiceCallback` is generated from its own AIDL unit,
-/// so they are distinct trait types with independently-built vtables.
-/// Reinterpreting the `Strong` (a `Box<dyn _>` fat pointer) across them
-/// would dispatch through a foreign vtable — a layout Rust does not
-/// guarantee. Instead we extract the underlying `SIBinder` (via the real
-/// type's correct vtable) and rebuild the target `Strong` through the safe
-/// `FromIBinder` path. All `IServiceCallback` variants share the AIDL
-/// descriptor `"android.os.IServiceCallback"`, so this round-trip always
-/// succeeds and serializes to the identical wire bytes.
-#[cfg(target_os = "android")]
-fn rewrap_callback<T: crate::FromIBinder + ?Sized>(
-    callback: &crate::Strong<dyn IServiceCallback>,
-) -> Result<crate::Strong<T>> {
-    <T as crate::FromIBinder>::try_from(callback.as_binder())
+/// so they are distinct trait types with independently-built vtables;
+/// transmuting a `Strong<dyn _>` (a `Box<dyn _>` fat pointer) across them
+/// would dispatch through a foreign vtable, a layout Rust does not
+/// guarantee. A `FromIBinder::try_from` round-trip is also wrong: it
+/// rejects a *local* callback whose concrete native type differs from the
+/// target version's (descriptor matches but the `Inner<B>` downcast
+/// fails), which is the normal case for this API.
+///
+/// `register/unregister_for_notifications` only ever serialize the
+/// callback as its underlying `SIBinder` (`Serialize for dyn _` calls
+/// `as_binder()` and nothing else), so a thin wrapper that returns the
+/// original `SIBinder` is wire-identical and behavior-identical for both
+/// local and proxy callbacks, with no `unsafe`. `onRegistration` is
+/// unreachable here: the wrapper is only serialized and sent; inbound
+/// notifications are delivered by the kernel to the original binder node,
+/// never to this transient local forwarder.
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+struct ForwardServiceCallback(crate::SIBinder);
+
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+impl crate::Interface for ForwardServiceCallback {
+    fn as_binder(&self) -> crate::SIBinder {
+        self.0.clone()
+    }
 }
+
+/// Emits the per-version `IServiceCallback` impl for [`ForwardServiceCallback`]
+/// (one per supported pre-16 version; collapses what was 4× duplicated).
+macro_rules! forward_service_callback_impl {
+    ($modu:ident, $feat:literal) => {
+        #[cfg(all(target_os = "android", feature = $feat))]
+        impl $modu::IServiceCallback for ForwardServiceCallback {
+            fn r#onRegistration(
+                &self,
+                _name: &str,
+                _binder: &crate::SIBinder,
+            ) -> crate::status::Result<()> {
+                // Unreachable on the serialize-only path; see the
+                // ForwardServiceCallback doc. Return an error rather than
+                // panic in library code if it is ever reached.
+                Err(crate::StatusCode::UnknownTransaction.into())
+            }
+        }
+    };
+}
+
+forward_service_callback_impl!(android_11, "android_11");
+forward_service_callback_impl!(android_12, "android_12");
+forward_service_callback_impl!(android_13, "android_13");
+forward_service_callback_impl!(android_14, "android_14");
 
 impl ServiceManager {
     /// Retrieves a service by name.
@@ -425,22 +476,26 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                let callback = rewrap_callback::<dyn android_11::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_11::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_11::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                let callback = rewrap_callback::<dyn android_12::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_12::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_12::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                let callback = rewrap_callback::<dyn android_13::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_13::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_13::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                let callback = rewrap_callback::<dyn android_14::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_14::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_14::register_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
@@ -465,22 +520,26 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                let callback = rewrap_callback::<dyn android_11::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_11::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_11::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                let callback = rewrap_callback::<dyn android_12::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_12::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_12::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                let callback = rewrap_callback::<dyn android_13::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_13::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_13::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                let callback = rewrap_callback::<dyn android_14::IServiceCallback>(callback)?;
+                let callback: crate::Strong<dyn android_14::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
                 android_14::unregister_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
