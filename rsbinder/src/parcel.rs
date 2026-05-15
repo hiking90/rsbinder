@@ -286,11 +286,22 @@ impl Parcel {
         self.pos >= self.data.len()
     }
 
-    pub fn set_data_size(&mut self, new_len: usize) {
+    pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
+        if new_len > self.data.capacity() {
+            // The backing buffer cannot hold `new_len` bytes — a broken
+            // driver/buffer contract. Refuse rather than enter the
+            // `Vec::set_len` UB of claiming uninitialized capacity.
+            log::error!(
+                "set_data_size({new_len}) exceeds capacity {}",
+                self.data.capacity()
+            );
+            return Err(StatusCode::BadValue);
+        }
         self.data.set_len(new_len);
         if new_len < self.pos {
             self.pos = new_len;
         }
+        Ok(())
     }
 
     pub fn close_file_descriptors(&self) {
@@ -335,7 +346,10 @@ impl Parcel {
     }
 
     pub fn data_avail(&self) -> usize {
-        let result = self.data.len() - self.pos;
+        // `pos` can legitimately be moved past `len` (set_data_position is
+        // unbounded), so saturate instead of underflow-panicking: nothing
+        // is available once the cursor is at/after the end.
+        let result = self.data.len().saturating_sub(self.pos);
         assert!(result < i32::MAX as _, "data too big: {result}");
 
         result
@@ -855,17 +869,20 @@ impl Drop for Parcel {
     fn drop(&mut self) {
         match self.free_buffer {
             Some(free_buffer) => {
-                // Free buffer must succeed - if it fails, we have a critical system issue
-                // that will lead to resource leaks. Better to abort than continue in
-                // an inconsistent state.
-                free_buffer(
+                // Never panic in Drop: a failure here may run during unwind,
+                // and a double-panic aborts the whole process — strictly
+                // worse than logging and leaking the kernel buffer.
+                if let Err(e) = free_buffer(
                     Some(self),
                     self.data.as_ptr() as _,
                     self.data.len(),
                     self.objects.as_ptr() as _,
                     self.objects.len(),
-                )
-                .expect("Failed to free parcel buffer: critical system resource leak");
+                ) {
+                    log::error!(
+                        "Failed to free parcel buffer ({e}); leaking the kernel buffer"
+                    );
+                }
             }
             None => {
                 self.release_objects();

@@ -1123,11 +1123,11 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                         thread_state.out_parcel.data_size()
                     );
                 }
-                thread_state.out_parcel.set_data_size(0);
+                thread_state.out_parcel.set_data_size(0)?;
             }
 
             if bwr.read_consumed > 0 {
-                thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
+                thread_state.in_parcel.set_data_size(bwr.read_consumed as _)?;
                 thread_state.in_parcel.set_data_position(0);
 
                 log::trace!(
