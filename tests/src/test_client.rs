@@ -1455,7 +1455,7 @@ fn test_hub() {
 /// resolutions:
 ///
 /// ```ignore
-/// let service_manager = rsbinder::hub::default();
+/// let service_manager = rsbinder::hub::default()?;
 /// let all_services = service_manager.list_services(0xf);
 /// for service_name in &all_services {
 ///     let service = service_manager.get_service(service_name).unwrap();

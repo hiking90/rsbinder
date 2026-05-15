@@ -147,51 +147,61 @@ pub enum ServiceManager {
 
 /// Returns the global ServiceManager instance appropriate for the current Android version.
 ///
-/// This function creates a singleton ServiceManager instance on first call and returns it
-/// for subsequent calls. The correct version-specific implementation is automatically
-/// selected based on the detected Android SDK version.
-pub fn default() -> Arc<ServiceManager> {
+/// The singleton is created on first call and reused afterwards. The correct
+/// version-specific implementation is selected from the detected Android SDK
+/// version.
+///
+/// Returns an error instead of panicking when the context object cannot be
+/// obtained, the proxy cannot be created, or the SDK version is unsupported.
+/// A failed initialization is not cached, so a later call may retry.
+pub fn default() -> Result<Arc<ServiceManager>> {
     static GLOBAL_SM: OnceLock<Arc<ServiceManager>> = OnceLock::new();
 
-    GLOBAL_SM.get_or_init(|| {
-        let process = ProcessState::as_self();
-        let context = process.context_object()
-            .expect("Failed to get context_object during ServiceManager initialization");
-        #[cfg(target_os = "android")]
-        let sdk_version = crate::get_android_sdk_version();
+    if let Some(sm) = GLOBAL_SM.get() {
+        return Ok(sm.clone());
+    }
 
-        const ERROR_MSG: &str = "Failed to create BpServiceManager from binder during ServiceManager initialization";
+    let process = ProcessState::as_self();
+    let context = process.context_object()?;
+    #[cfg(target_os = "android")]
+    let sdk_version = crate::get_android_sdk_version();
 
-        #[cfg(target_os = "android")]
-        let service_manager = {
-            macro_rules! create_service_manager {
-                ($variant:ident, $module:ident) => {
-                    ServiceManager::$variant($module::BpServiceManager::from_binder(context).expect(ERROR_MSG))
-                };
-            }
+    #[cfg(target_os = "android")]
+    let service_manager = {
+        macro_rules! create_service_manager {
+            ($variant:ident, $module:ident) => {
+                ServiceManager::$variant(
+                    $module::BpServiceManager::from_binder(context)
+                        .ok_or(StatusCode::BadType)?,
+                )
+            };
+        }
 
-            match sdk_version {
-                sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
-                #[cfg(feature = "android_14")]
-                sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => create_service_manager!(Android14, android_14),
-                #[cfg(feature = "android_13")]
-                sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
-                #[cfg(feature = "android_12")]
-                sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
-                #[cfg(feature = "android_11")]
-                sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
-                #[cfg(feature = "android_10")]
-                sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
-                _ => panic!("default: Unsupported Android SDK version: {}", sdk_version),
-            }
-        };
+        match sdk_version {
+            sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
+            #[cfg(feature = "android_14")]
+            sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => create_service_manager!(Android14, android_14),
+            #[cfg(feature = "android_13")]
+            sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
+            #[cfg(feature = "android_12")]
+            sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
+            #[cfg(feature = "android_11")]
+            sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
+            #[cfg(feature = "android_10")]
+            sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
+            _ => return Err(StatusCode::InvalidOperation),
+        }
+    };
 
-        #[cfg(not(target_os = "android"))]
-        let service_manager = ServiceManager::Android16(android_16::BpServiceManager::from_binder(context)
-            .expect(ERROR_MSG));
+    #[cfg(not(target_os = "android"))]
+    let service_manager = ServiceManager::Android16(
+        android_16::BpServiceManager::from_binder(context).ok_or(StatusCode::BadType)?,
+    );
 
-        Arc::new(service_manager)
-    }).clone()
+    // Cache only on success; a failed init returned above is not stored,
+    // so a later call may retry. If two threads race here, get_or_init
+    // keeps the first stored instance and the extra one is dropped.
+    Ok(GLOBAL_SM.get_or_init(|| Arc::new(service_manager)).clone())
 }
 
 impl ServiceManager {
@@ -502,7 +512,7 @@ impl ServiceManager {
 /// This is equivalent to `default().get_interface(name)`.
 #[inline]
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
-    default().get_interface(name)
+    default()?.get_interface(name)
 }
 
 /// Convenience function to list services from the default ServiceManager.
@@ -510,7 +520,11 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
 /// This is equivalent to `default().list_services(dump_priority)`.
 #[inline]
 pub fn list_services(dump_priority: i32) -> Vec<String> {
-    default().list_services(dump_priority)
+    // Consistent with this wrapper's existing error-swallowing contract:
+    // an unavailable ServiceManager yields an empty list rather than a panic.
+    default()
+        .map(|sm| sm.list_services(dump_priority))
+        .unwrap_or_default()
 }
 
 /// Convenience function to register for notifications from the default ServiceManager.
@@ -521,7 +535,7 @@ pub fn register_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> Result<()> {
-    default().register_for_notifications(name, callback)
+    default()?.register_for_notifications(name, callback)
 }
 
 /// Convenience function to unregister from notifications from the default ServiceManager.
@@ -532,7 +546,7 @@ pub fn unregister_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> Result<()> {
-    default().unregister_for_notifications(name, callback)
+    default()?.unregister_for_notifications(name, callback)
 }
 
 /// Convenience function to add a service to the default ServiceManager.
@@ -540,7 +554,8 @@ pub fn unregister_for_notifications(
 /// This is equivalent to `default().add_service(identifier, binder)`.
 #[inline]
 pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
-    default().add_service(identifier, binder)
+    // `?` converts a StatusCode init failure into Status via From<StatusCode>.
+    default()?.add_service(identifier, binder)
 }
 
 /// Convenience function to get a service from the default ServiceManager.
@@ -548,7 +563,7 @@ pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<()
 /// This is equivalent to `default().get_service(name)`.
 #[inline]
 pub fn get_service(name: &str) -> Option<SIBinder> {
-    default().get_service(name)
+    default().ok()?.get_service(name)
 }
 
 /// Convenience function to check if a service is available from the default ServiceManager.
@@ -556,7 +571,7 @@ pub fn get_service(name: &str) -> Option<SIBinder> {
 /// This is equivalent to `default().check_service(name)`.
 #[inline]
 pub fn check_service(name: &str) -> Option<SIBinder> {
-    default().check_service(name)
+    default().ok()?.check_service(name)
 }
 
 /// Convenience function to check if a service is declared from the default ServiceManager.
@@ -564,7 +579,7 @@ pub fn check_service(name: &str) -> Option<SIBinder> {
 /// This is equivalent to `default().is_declared(name)`.
 #[inline]
 pub fn is_declared(name: &str) -> bool {
-    default().is_declared(name)
+    default().map(|sm| sm.is_declared(name)).unwrap_or(false)
 }
 
 /// Convenience function to get debug information about all services from the default ServiceManager.
@@ -573,5 +588,5 @@ pub fn is_declared(name: &str) -> bool {
 /// Note that this feature may not be available on all Android versions.
 #[inline]
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
-    default().get_service_debug_info()
+    default()?.get_service_debug_info()
 }
