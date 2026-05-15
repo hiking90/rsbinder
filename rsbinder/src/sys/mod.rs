@@ -8,6 +8,11 @@
     non_snake_case,
     unused_qualifications
 )]
+// `missing_safety_doc` is allowed for the bindgen-generated `sys.rs`
+// below: it emits many `pub unsafe fn` FFI bindings without `# Safety`
+// rustdoc and is not hand-editable. The hand-written ioctl wrappers in
+// this module are safe `pub(crate) fn`, so the lint does not apply to
+// them; their inner `unsafe` blocks carry explicit SAFETY comments.
 #![allow(clippy::unreadable_literal, clippy::missing_safety_doc)]
 
 include!("sys.rs");
@@ -91,13 +96,24 @@ pub mod binder {
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
 
+    // Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` below:
+    // `rustix::ioctl::ioctl` is unsafe because it cannot verify that the
+    // opcode matches the argument type or that the request is valid for
+    // the fd. In each wrapper the opcode is built at compile time from
+    // the binder UAPI request number (`b'b'`, N) and the exact argument
+    // type via `ioctl::opcode::{read_write,write}::<T>`, the typed
+    // `Setter`/`Updater` holds a value/buffer of precisely that `T`, and
+    // the `Fd: AsFd` bound guarantees a valid borrowed fd for the call's
+    // duration. So the opcode <-> arg-type <-> fd precondition holds and
+    // no memory unsafety is possible. Each block notes only its request.
+
     // nix::ioctl_readwrite!(write_read, b'b', 1, binder_write_read);
     pub(crate) fn write_read<Fd: AsFd>(
         fd: Fd,
         write_read: &mut binder_write_read,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_WRITE_READ
+            // SAFETY: see shared rationale above. Request: BINDER_WRITE_READ.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_write_read>(b'b', 1) },
                 _,
@@ -112,7 +128,7 @@ pub mod binder {
         max_threads: u32,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_SET_MAX_THREADS
+            // SAFETY: see shared rationale above. Request: BINDER_SET_MAX_THREADS.
             let ctl =
                 ioctl::Setter::<{ ioctl::opcode::write::<__u32>(b'b', 5) }, _>::new(max_threads);
             ioctl::ioctl(fd, ctl)
@@ -125,7 +141,7 @@ pub mod binder {
         pid: i32,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_SET_CONTEXT_MGR
+            // SAFETY: see shared rationale above. Request: BINDER_SET_CONTEXT_MGR.
             let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__s32>(b'b', 7) }, _>::new(pid);
             ioctl::ioctl(fd, ctl)
         }
@@ -137,7 +153,7 @@ pub mod binder {
         ver: &mut binder_version,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_VERSION
+            // SAFETY: see shared rationale above. Request: BINDER_VERSION.
             let ctl =
                 ioctl::Updater::<{ ioctl::opcode::read_write::<binder_version>(b'b', 9) }, _>::new(
                     ver,
@@ -152,7 +168,7 @@ pub mod binder {
         obj: flat_binder_object,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_SET_CONTEXT_MGR_EXT
+            // SAFETY: see shared rationale above. Request: BINDER_SET_CONTEXT_MGR_EXT.
             let ctl =
                 ioctl::Setter::<{ ioctl::opcode::write::<flat_binder_object>(b'b', 13) }, _>::new(
                     obj,
@@ -167,7 +183,7 @@ pub mod binder {
         enable: __u32,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_ENABLE_ONEWAY_SPAM_DETECTION
+            // SAFETY: see shared rationale above. Request: BINDER_ENABLE_ONEWAY_SPAM_DETECTION.
             let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__u32>(b'b', 16) }, _>::new(enable);
             ioctl::ioctl(fd, ctl)
         }
@@ -179,7 +195,7 @@ pub mod binder {
         device: &mut binderfs_device,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_CTL_ADD
+            // SAFETY: see shared rationale above. Request: BINDER_CTL_ADD.
             let ctl =
                 ioctl::Updater::<{ ioctl::opcode::read_write::<binderfs_device>(b'b', 1) }, _>::new(
                     device,
@@ -194,7 +210,7 @@ pub mod binder {
         timeout: i64,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_SET_IDLE_TIMEOUT
+            // SAFETY: see shared rationale above. Request: BINDER_SET_IDLE_TIMEOUT.
             let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__s64>(b'b', 3) }, _>::new(timeout);
             ioctl::ioctl(fd, ctl)
         }
@@ -206,7 +222,7 @@ pub mod binder {
         priority: i32,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_SET_IDLE_PRIORITY
+            // SAFETY: see shared rationale above. Request: BINDER_SET_IDLE_PRIORITY.
             let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__s32>(b'b', 6) }, _>::new(priority);
             ioctl::ioctl(fd, ctl)
         }
@@ -215,7 +231,7 @@ pub mod binder {
     // nix::ioctl_write_ptr!(thread_exit, b'b', 8, __s32);
     pub(crate) fn thread_exit<Fd: AsFd>(fd: Fd, pid: i32) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_THREAD_EXIT
+            // SAFETY: see shared rationale above. Request: BINDER_THREAD_EXIT.
             let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__s32>(b'b', 8) }, _>::new(pid);
             ioctl::ioctl(fd, ctl)
         }
@@ -227,7 +243,7 @@ pub mod binder {
         node_debug_info: &mut binder_node_debug_info,
     ) -> std::result::Result<(), rustix::io::Errno> {
         unsafe {
-            // BINDER_GET_NODE_DEBUG_INFO
+            // SAFETY: see shared rationale above. Request: BINDER_GET_NODE_DEBUG_INFO.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_node_debug_info>(b'b', 11) },
                 _,
@@ -242,7 +258,7 @@ pub mod binder {
         node_info: &mut binder_node_info_for_ref,
     ) -> std::result::Result<(), rustix::io::Errno> {
         unsafe {
-            // BINDER_GET_NODE_INFO_FOR_REF
+            // SAFETY: see shared rationale above. Request: BINDER_GET_NODE_INFO_FOR_REF.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_node_info_for_ref>(b'b', 12) },
                 _,
@@ -257,7 +273,7 @@ pub mod binder {
         info: binder_freeze_info,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_FREEZE
+            // SAFETY: see shared rationale above. Request: BINDER_FREEZE.
             let ctl =
                 ioctl::Setter::<{ ioctl::opcode::write::<binder_freeze_info>(b'b', 14) }, _>::new(
                     info,
@@ -272,7 +288,7 @@ pub mod binder {
         frozen_info: &mut binder_frozen_status_info,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // BINDER_GET_FROZEN_INFO
+            // SAFETY: see shared rationale above. Request: BINDER_GET_FROZEN_INFO.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_frozen_status_info>(b'b', 15) },
                 _,

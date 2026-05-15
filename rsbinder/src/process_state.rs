@@ -272,6 +272,11 @@ struct MemoryMap {
     ptr: *mut c_void,
     size: usize,
 }
+// SAFETY: `ptr` is a PROT_READ binder mapping owned for the whole
+// ProcessState lifetime. It is never written through and never read as
+// Rust data (the binder driver manages the pages); the only use is the
+// single `munmap(ptr, size)` in ProcessState::drop. No data race is
+// possible, so the handle is safe to send and share across threads.
 unsafe impl Sync for MemoryMap {}
 unsafe impl Send for MemoryMap {}
 
@@ -353,14 +358,13 @@ impl ProcessState {
         let vm_size = (1024 * 1024) - rustix::param::page_size() * 2;
         // let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
 
+        // SAFETY: `mmap` is unsafe because it creates a new mapping. `driver`
+        // is a live, open binder device fd; `vm_size > 0`; addr is null so
+        // the kernel chooses the address; PROT_READ + MAP_PRIVATE means the
+        // region is never written through this pointer; offset 0 is the
+        // binder ABI contract. The result is `?`-checked, and the mapping is
+        // unmapped exactly once in ProcessState::drop.
         let mmap = unsafe {
-            // let vm_start = nix::sys::mman::mmap(None,
-            //     vm_size,
-            //     nix::sys::mman::ProtFlags::PROT_READ,
-            //     nix::sys::mman::MapFlags::MAP_PRIVATE | nix::sys::mman::MapFlags::MAP_NORESERVE,
-            //     &driver,
-            //     0)?;
-
             let vm_start = rustix::mm::mmap(
                 std::ptr::null_mut(),
                 vm_size,
@@ -1244,6 +1248,10 @@ fn open_driver(
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
         let mmap = self.mmap.read().expect("Mmap lock poisoned");
+        // SAFETY: `mmap.ptr`/`mmap.size` are exactly the address and length
+        // returned by the `mmap` call in `ProcessState::new`. This runs only
+        // in `Drop`, so the mapping is still live and is unmapped exactly
+        // once; no references into the region outlive `ProcessState`.
         unsafe {
             rustix::mm::munmap(mmap.ptr, mmap.size).expect("Failed to unmap memory");
         }

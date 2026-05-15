@@ -145,6 +145,11 @@ impl<T: Clone + Default> ParcelData<T> {
 
     fn set_len(&mut self, len: usize) {
         match self {
+            // SAFETY: Vec::set_len requires `len <= capacity` and that the
+            // first `len` bytes are initialized. Element type is `u8`, so any
+            // byte pattern is a valid value; every caller reserves capacity
+            // and writes the bytes (copy_nonoverlapping) before calling this,
+            // so the caller must uphold `len <= capacity`.
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
             _ => panic!("&[u8] can't support set_len()."),
         }
@@ -587,6 +592,11 @@ impl Parcel {
         let pos = self.pos;
 
         self.data.reserve(pos + padded);
+        // SAFETY: `reserve(pos + padded)` above guarantees the destination
+        // has at least `pos + padded` bytes of capacity, so `add(pos)` and
+        // the `size`-byte copy (size <= padded) stay in-bounds and the
+        // ranges do not overlap (distinct allocations). `set_len` only grows
+        // up to the just-reserved capacity over now-initialized `u8` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 parcelable.as_ptr() as _,
@@ -633,6 +643,9 @@ impl Parcel {
 
     pub(crate) fn write_aligned<T>(&mut self, val: &T) {
         let unaligned = std::mem::size_of::<T>();
+        // SAFETY: `val` is a live `&T`, so its `size_of::<T>()` bytes are
+        // valid to read as `u8` for the borrow's duration. The resulting
+        // slice does not outlive `val` (consumed synchronously below).
         let val_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
 
@@ -645,6 +658,11 @@ impl Parcel {
         let pos = self.pos;
 
         self.data.reserve(pos + aligned);
+        // SAFETY: `reserve(pos + aligned)` guarantees capacity for `add(pos)`
+        // and the `unaligned`-byte copy (unaligned <= aligned). Source `data`
+        // and the parcel buffer are distinct allocations (non-overlapping).
+        // `set_len` only grows up to the reserved capacity over `u8` bytes
+        // just initialized by the copy.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 data.as_ptr(),
@@ -775,6 +793,12 @@ impl Parcel {
         let num_objects = last_idx - first_idx + 1;
 
         self.data.reserve(self.pos + size);
+        // SAFETY: the source range `other.data[offset..offset + size]` is
+        // bounds-checked by the slice index above (panics if out of range),
+        // and `reserve(self.pos + size)` guarantees the destination has
+        // capacity for `add(self.pos)` plus `size` bytes. `other` and `self`
+        // are distinct parcels (non-overlapping). `set_len` only grows up to
+        // the reserved capacity over the `u8` bytes just copied.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 other.data.as_slice()[offset..offset + size].as_ptr(),
@@ -854,6 +878,10 @@ impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         if self.objects.len() > 0 {
+            // SAFETY: `self.objects` is a live `Vec<binder_size_t>`, so its
+            // `len * size_of::<binder_size_t>()` bytes are a valid contiguous
+            // region readable as `u8`. The slice is consumed synchronously by
+            // `pretty_hex` and does not outlive the borrow of `self.objects`.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     self.objects.as_ptr() as *const u8,

@@ -60,14 +60,25 @@ impl flat_binder_object {
     }
 
     pub(crate) fn handle(&self) -> u32 {
+        // SAFETY: `__bindgen_anon_1` is an integer union (`binder: u64` |
+        // `handle: u32`); every bit pattern is a valid value for both
+        // variants, so the read itself is never UB. Reading `.handle` is
+        // meaningful only for handle/FD-typed objects — that selection is
+        // the caller's contract per `hdr.type`.
         unsafe { self.__bindgen_anon_1.handle }
     }
 
     pub(crate) fn borrowed_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: caller invariant — only called on a BINDER_TYPE_FD object
+        // whose fd is kept alive by the owning parcel for the returned
+        // borrow's lifetime (tied to `&self`).
         unsafe { BorrowedFd::borrow_raw(self.handle() as _) }
     }
 
     pub(crate) fn owned_fd(&self) -> OwnedFd {
+        // SAFETY: caller invariant — only called on a BINDER_TYPE_FD object
+        // that owns its fd, and at most once, so the resulting OwnedFd has
+        // exclusive ownership and will not double-close.
         unsafe { OwnedFd::from_raw_fd(self.handle() as _) }
     }
 
@@ -76,6 +87,8 @@ impl flat_binder_object {
     }
 
     pub(crate) fn pointer(&self) -> binder_uintptr_t {
+        // SAFETY: integer union read (see `handle`); never UB. Meaningful
+        // only for BINDER_TYPE_(WEAK_)BINDER objects — caller's contract.
         unsafe { self.__bindgen_anon_1.binder }
     }
 
@@ -234,6 +247,11 @@ pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<flat_binder
     let bytes = data
         .get(offset..offset + size)
         .ok_or(StatusCode::NotEnoughData)?;
+    // SAFETY: `get(offset..offset + size)` guarantees `bytes` is exactly
+    // `size_of::<flat_binder_object>()` readable bytes. `flat_binder_object`
+    // is a bindgen `#[repr(C)]` POD (no invalid bit patterns), so any byte
+    // pattern is a valid value; `read_unaligned` covers the unknown
+    // alignment of the parcel offset and returns an owned stack copy.
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const flat_binder_object) })
 }
 
@@ -247,6 +265,10 @@ pub(crate) fn write_flat_binder(
     let bytes = data
         .get_mut(offset..offset + size)
         .ok_or(StatusCode::NotEnoughData)?;
+    // SAFETY: `get_mut(offset..offset + size)` guarantees `bytes` is exactly
+    // `size_of::<flat_binder_object>()` writable bytes. `*obj` is a valid
+    // `flat_binder_object`; `write_unaligned` covers the unknown alignment
+    // of the parcel offset.
     unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
     Ok(())
 }

@@ -750,6 +750,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }
                 };
 
+                // SAFETY: `tr_secctx` was just filled by the kernel on the
+                // BR_TRANSACTION(_SEC_CTX) path, so `transaction_data` is
+                // fully initialized and the `data.ptr` union variant (buffer
+                // + offsets, not `data.buf`) is the active one for a
+                // kernel-delivered transaction. `from_ipc_parts` adopts the
+                // driver-owned buffer/offsets with sizes taken from the same
+                // struct and the matching `free_buffer` reclaimer.
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
@@ -782,6 +789,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let mut reply = Parcel::new();
 
                 let result = {
+                    // SAFETY: kernel-delivered transaction (see above); for a
+                    // transaction targeting a local binder the `target` union's
+                    // `ptr` variant is the active one. Read-only.
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     if target_ptr != 0 {
                         // `target_ptr` is now the process-monotonic id
@@ -852,6 +862,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                     let mut log = format!(
                         "oneway function results for code {} on binder at {:X}",
                         tr_secctx.transaction_data.code,
+                        // SAFETY: kernel-delivered transaction; `target.ptr`
+                        // is the active union variant. Read-only (logging).
                         unsafe { tr_secctx.transaction_data.target.ptr }
                     );
                     log += &format!(" will be dropped but finished with status {err}");
