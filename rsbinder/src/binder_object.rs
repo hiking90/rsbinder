@@ -32,8 +32,12 @@ impl flat_binder_object {
             hdr: binder_object_header {
                 type_: BINDER_TYPE_FD,
             },
-            flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { handle: fd as _ },
+            flags: 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            // Init via the 8-byte `binder` field (not the u32 `handle`) so the upper bytes are zeroed:
+            // mirrors AOSP Parcel.cpp `obj.binder = 0; obj.handle = fd;`, avoids leaking uninit stack to the remote.
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: (fd as u32) as u64,
+            },
             cookie: if take_ownership { 1 } else { 0 },
         }
     }
