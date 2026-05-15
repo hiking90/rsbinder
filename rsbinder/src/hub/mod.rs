@@ -204,6 +204,26 @@ pub fn default() -> Result<Arc<ServiceManager>> {
     Ok(GLOBAL_SM.get_or_init(|| Arc::new(service_manager)).clone())
 }
 
+/// Re-wraps a version-agnostic `IServiceCallback` as the version-specific
+/// `Strong<dyn android_N::IServiceCallback>` expected by a per-version
+/// service-manager shim.
+///
+/// Each `android_N::IServiceCallback` is generated from its own AIDL unit,
+/// so they are distinct trait types with independently-built vtables.
+/// Reinterpreting the `Strong` (a `Box<dyn _>` fat pointer) across them
+/// would dispatch through a foreign vtable — a layout Rust does not
+/// guarantee. Instead we extract the underlying `SIBinder` (via the real
+/// type's correct vtable) and rebuild the target `Strong` through the safe
+/// `FromIBinder` path. All `IServiceCallback` variants share the AIDL
+/// descriptor `"android.os.IServiceCallback"`, so this round-trip always
+/// succeeds and serializes to the identical wire bytes.
+#[cfg(target_os = "android")]
+fn rewrap_callback<T: crate::FromIBinder + ?Sized>(
+    callback: &crate::Strong<dyn IServiceCallback>,
+) -> Result<crate::Strong<T>> {
+    <T as crate::FromIBinder>::try_from(callback.as_binder())
+}
+
 impl ServiceManager {
     /// Retrieves a service by name.
     ///
@@ -405,39 +425,23 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_11::IServiceCallback>)
-                };
-                android_11::register_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_11::IServiceCallback>(callback)?;
+                android_11::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_12::IServiceCallback>)
-                };
-                android_12::register_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_12::IServiceCallback>(callback)?;
+                android_12::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_13::IServiceCallback>)
-                };
-                android_13::register_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_13::IServiceCallback>(callback)?;
+                android_13::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_14::IServiceCallback>)
-                };
-                android_14::register_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_14::IServiceCallback>(callback)?;
+                android_14::register_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
                 android_16::register_for_notifications(sm, name, callback)
@@ -461,39 +465,23 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_11::IServiceCallback>)
-                };
-                android_11::unregister_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_11::IServiceCallback>(callback)?;
+                android_11::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_12::IServiceCallback>)
-                };
-                android_12::unregister_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_12::IServiceCallback>(callback)?;
+                android_12::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_13::IServiceCallback>)
-                };
-                android_13::unregister_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_13::IServiceCallback>(callback)?;
+                android_13::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_14::IServiceCallback>)
-                };
-                android_14::unregister_for_notifications(sm, name, callback)
+                let callback = rewrap_callback::<dyn android_14::IServiceCallback>(callback)?;
+                android_14::unregister_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
