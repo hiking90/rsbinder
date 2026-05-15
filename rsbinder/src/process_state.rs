@@ -36,6 +36,136 @@ fn undo_case_a_pin(handle: u32) {
     }
 }
 
+/// Plan computed under P1's write lock and consumed by P2/P3.
+///
+/// Drives the lock-decoupled three-phase slow path: the case decision
+/// is made under one short write-lock window, IPC runs with the lock
+/// released, and a second short write-lock window commits the cache
+/// entry while re-checking cross-thread races.
+enum SlowPathPlan {
+    /// Sub-case (a): entry absent at P1 time. P1 issued `BC_INCREFS`
+    /// then flushed, so this thread now owns the cache pin. P3 either
+    /// transfers ownership to the cache entry on insert, or undoes the
+    /// pin via [`undo_case_a_pin`] on failure / cross-thread race.
+    CaseA,
+    /// Sub-case (b): entry present at P1 time but its `weak` is
+    /// dangling. The cache pin remains owned by the existing entry —
+    /// this thread does not issue or own a pin. P1 snapshotted the
+    /// entry's descriptor and generation; P2 skips
+    /// `query_interface` (descriptor immutable for the binder_ref
+    /// slot's lifetime) and P3 resurrects under the same generation
+    /// when the snapshot still matches.
+    CaseB { descriptor: String, generation: u64 },
+}
+
+/// Outcome of P1: either we observed a live entry and the slow path
+/// is done, or we have a [`SlowPathPlan`] to drive P2/P3.
+enum SlowPathDecision {
+    /// Sub-case (c): another thread inserted/upgraded between the
+    /// read-fast-path miss and the P1 write-lock acquisition.
+    Cached(SIBinder),
+    /// Sub-cases (a)/(b) — proceed to P2 (IPC) and P3 (commit).
+    NeedIpc(SlowPathPlan),
+}
+
+/// Output of P2 — carries the descriptor each branch needs into P3,
+/// so the (CaseA, _) commit arms can consume the freshly-queried
+/// descriptor without going through an `Option<String>` that P3
+/// would otherwise have to runtime-`expect` for `(CaseA, None)`.
+enum SlowPathReady {
+    /// Sub-case (a) ready for commit: P2 issued `query_interface`
+    /// and obtained a fresh descriptor.
+    CaseA { descriptor: String },
+    /// Sub-case (b) ready for commit: descriptor and generation
+    /// snapshotted by P1, no IPC required in P2.
+    CaseB { descriptor: String, generation: u64 },
+}
+
+/// RAII guard that restores this thread's [`CallRestriction`] to its
+/// pre-call value when dropped. Applied around `ping_binder(0)` in
+/// P2 so an early-`Err` return or panic cannot leak
+/// [`CallRestriction::None`] into subsequent calls on this thread.
+struct RestoreCallRestriction(CallRestriction);
+
+impl Drop for RestoreCallRestriction {
+    fn drop(&mut self) {
+        thread_state::set_call_restriction(self.0);
+    }
+}
+
+// Test-only hook fired at the entry of `ProcessState::slow_path_p2`
+// (immediately after P1 releases the `handle_to_proxy` write lock
+// and before P2 issues any IPC). Used by the same-thread deadlock
+// regression test to invoke `send_obituary_for_handle` on the same
+// thread that is currently in the slow path — the pre-fix code held
+// the write lock across this point and would deadlock on the
+// obituary's `handle_to_proxy.write()` re-entry; the post-fix split
+// releases the lock during P2 so the obituary acquires it cleanly.
+// Empty-by-default; tests install a closure via
+// `set_slow_path_p2_test_hook`.
+#[cfg(test)]
+type SlowPathP2TestHook = Box<dyn FnMut(u32)>;
+
+#[cfg(test)]
+thread_local! {
+    static SLOW_PATH_P2_TEST_HOOK: std::cell::RefCell<Option<SlowPathP2TestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_slow_path_p2_test_hook(hook: Option<SlowPathP2TestHook>) {
+    SLOW_PATH_P2_TEST_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn slow_path_p2_test_hook(handle: u32) {
+    // Take the closure out before invoking so the hook body can
+    // re-enter `strong_proxy_for_handle` (and thus this function)
+    // without a nested-borrow panic on the RefCell.
+    let hook = SLOW_PATH_P2_TEST_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(handle);
+        SLOW_PATH_P2_TEST_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    }
+}
+
+/// P3 commit primitive: acquire one kernel strong ref
+/// (`BC_ACQUIRE`) and insert (or replace) the cache entry. Caller
+/// holds the `handle_to_proxy` write lock.
+///
+/// `owns_case_a_pin` records whether *this thread* issued the
+/// case (a) `BC_INCREFS` pin during P1; on `new_acquired` failure it
+/// gates whether to undo our own pin. Case (b) and the cross-thread
+/// `(CaseA, Some(_))` race both pass `false` because the existing
+/// cache entry's pin is owned by the entry, not by us.
+fn commit_new_acquired(
+    handle_to_proxy: &mut HashMap<u32, CacheEntry>,
+    handle: u32,
+    descriptor: String,
+    generation: u64,
+    stability: Stability,
+    owns_case_a_pin: bool,
+) -> Result<SIBinder> {
+    let arc = match ProxyHandle::new_acquired(handle, descriptor.clone(), stability) {
+        Ok(arc) => arc,
+        Err(err) => {
+            if owns_case_a_pin {
+                undo_case_a_pin(handle);
+            }
+            return Err(err);
+        }
+    };
+    handle_to_proxy.insert(
+        handle,
+        CacheEntry {
+            weak: Arc::downgrade(&arc),
+            descriptor,
+            generation,
+        },
+    );
+    Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
+}
+
 /// Per-handle cache entry under the cache-pin model.
 ///
 /// `weak` lets the process resurrect a fresh `Arc<ProxyHandle>` after the
@@ -48,6 +178,28 @@ fn undo_case_a_pin(handle: u32) {
 /// `handle_to_proxy`. The pin is acquired exactly once on first
 /// insertion (slow-path case (a)) and released exactly once on obituary
 /// teardown.
+///
+/// **Slow-path lock discipline.** The slow path is split into three
+/// phases (P1/P2/P3) so that the descriptor query (and the
+/// `ping_binder(0)` issued for service manager on Android sdk>=30)
+/// runs with `handle_to_proxy` *unlocked*. This is required for
+/// re-entrancy: the catch-all arm of `wait_for_response` dispatches
+/// `BR_DEAD_BINDER` to `execute_command`, which calls
+/// [`ProcessState::send_obituary_for_handle`] and re-acquires the
+/// same write lock. Holding the lock across IPC would deadlock under
+/// `std::sync::RwLock`'s non-reentrant write semantics.
+///
+/// To preserve the cache pin invariant under that split, P3 covers a
+/// race where another thread (T2) ran a complete case (a) during our
+/// P2 IPC and then dropped its `Arc`: when our P3 plan was CaseA but
+/// the cache slot is again "present + dangling weak", we have one
+/// spare BC_INCREFS pin (ours) on top of T2's cache-owned pin. P3
+/// undoes our pin and adopts T2's descriptor/generation, restoring
+/// "entry-1 ↔ pin-1". The companion `(CaseB, None)` arm — cache
+/// entry vanished mid-flight via obituary — returns `DeadObject`
+/// rather than racing BC_ACQUIRE against a freed binder_ref slot;
+/// this is the one window where the "BC_ACQUIRE precondition = pin
+/// alive" invariant could otherwise break.
 ///
 /// `generation` is a process-wide monotonic counter snapshotted at
 /// case-(a) insertion. It enables `WIBinder::upgrade()` to detect when
@@ -334,122 +486,240 @@ impl ProcessState {
             return Ok(SIBinder::from_arc(arc));
         }
 
-        // Write-lock slow path. Three sub-cases distinguished after taking
-        // the lock:
-        //   (a) entry absent          → BC_INCREFS pin + flush + query +
-        //                                 BC_ACQUIRE + insert
-        //   (b) entry present, dead   → reuse cached descriptor + BC_ACQUIRE
-        //                                 (cache pin still active)
-        //   (c) entry present, alive  → another thread won the race;
-        //                                 return its Arc
+        // Slow path: lock-decoupled three phases.
+        //
+        //   P1: short write-lock window. Decide the sub-case and, for
+        //        case (a), issue BC_INCREFS + flush so the cache pin
+        //        is live in the kernel before any IPC enters.
+        //        flush_commands is a write-only ioctl (read_size = 0),
+        //        so no BR_* — including BR_DEAD_BINDER — can be
+        //        dispatched while the lock is held; reentrant
+        //        send_obituary_for_handle paths only originate from
+        //        BR_DEAD_BINDER.
+        //   P2: lock released. IPC (ping_binder for handle 0 sdk>=30
+        //        and query_interface for case (a)) runs without the
+        //        handle_to_proxy lock held, so a re-entrant
+        //        BR_DEAD_BINDER → send_obituary_for_handle path can
+        //        take the lock without deadlocking against us.
+        //   P3: re-acquire write lock. Re-check case (c) and the
+        //        case (a)→(b) cross-thread race, undo any spare pin,
+        //        and commit the cache entry.
+        let plan = match self.slow_path_p1(handle)? {
+            SlowPathDecision::Cached(arc) => return Ok(arc),
+            SlowPathDecision::NeedIpc(plan) => plan,
+        };
+        let ready = self.slow_path_p2(handle, plan)?;
+        self.slow_path_p3(handle, stability, ready)
+    }
+
+    /// Slow-path phase 1: short write-lock window that decides the
+    /// sub-case and, for case (a), issues the kernel cache pin
+    /// (`BC_INCREFS` + `flush_commands`) before releasing the lock.
+    fn slow_path_p1(&self, handle: u32) -> Result<SlowPathDecision> {
+        // Write lock — even though P1 only reads, holding the write
+        // lock here prevents two concurrent slow paths from both
+        // observing "absent" and producing two case-(a) commits with
+        // distinct generations. The write lock serializes the
+        // BC_INCREFS issue point.
+        let handle_to_proxy = self
+            .handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned");
+
+        // Sub-case (c): another thread inserted/upgraded between the
+        // read-fast-path miss and this write-lock acquisition.
+        if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
+            return Ok(SlowPathDecision::Cached(SIBinder::from_arc(arc)));
+        }
+
+        // Sub-case (b): entry present with dangling weak. Snapshot the
+        // descriptor/generation; the cache pin (BC_INCREFS issued at
+        // first insertion) is still active so P3's BC_ACQUIRE will
+        // succeed without needing a new pin.
+        if let Some(entry) = handle_to_proxy.get(&handle) {
+            return Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseB {
+                descriptor: entry.descriptor.clone(),
+                generation: entry.generation,
+            }));
+        }
+
+        // Sub-case (a): entry absent. Pin the kernel binder_ref slot
+        // here, under the lock, so that:
+        //   - the pin is observable in the kernel before P2 runs any
+        //     transaction on this handle (BC_ACQUIRE in P3 cannot
+        //     race against a freed binder_ref slot);
+        //   - concurrent slow paths cannot both observe "absent" and
+        //     thus collapse onto the (CaseA, Some(_)) race in P3
+        //     instead of producing two true case-(a) commits.
+        //
+        // BC_INCREFS + flush_commands inside the lock is safe —
+        // talk_with_driver(false) sets read_size = 0 so no BR_* are
+        // dispatched, including BR_DEAD_BINDER.
+        thread_state::inc_weak_handle(handle)?;
+        if let Err(err) = thread_state::flush_commands() {
+            log::warn!(
+                "BC_INCREFS for handle {handle} failed at flush: {err:?}; \
+                 handle is no longer valid in the kernel"
+            );
+            return Err(StatusCode::DeadObject);
+        }
+        Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA))
+    }
+
+    /// Slow-path phase 2: lock-released IPC.
+    ///
+    /// Performs `ping_binder(0)` for `handle == 0 && sdk_at_least(30)`
+    /// and, for [`SlowPathPlan::CaseA`], `query_interface(handle)`.
+    /// On any IPC failure, undoes our case (a) pin (if owned) before
+    /// propagating the error.
+    fn slow_path_p2(&self, handle: u32, plan: SlowPathPlan) -> Result<SlowPathReady> {
+        // P2 entry hook (test-only). Used by the same-thread deadlock
+        // regression test to fire `send_obituary_for_handle(handle)`
+        // from inside the slow path while the `handle_to_proxy` lock
+        // is released — the exact scenario that used to deadlock under
+        // the monolithic pre-fix slow path.
+        #[cfg(test)]
+        slow_path_p2_test_hook(handle);
+
+        if handle == 0 && crate::sdk_at_least(30) {
+            // RAII restore so a ping failure can't leak
+            // CallRestriction::None into later calls on this thread.
+            let _restore = RestoreCallRestriction(thread_state::call_restriction());
+            thread_state::set_call_restriction(CallRestriction::None);
+            if let Err(err) = thread_state::ping_binder(handle) {
+                if matches!(plan, SlowPathPlan::CaseA) {
+                    undo_case_a_pin(handle);
+                }
+                return Err(err);
+            }
+        }
+        match plan {
+            SlowPathPlan::CaseA => match thread_state::query_interface(handle) {
+                Ok(descriptor) => Ok(SlowPathReady::CaseA { descriptor }),
+                Err(err) => {
+                    undo_case_a_pin(handle);
+                    Err(err)
+                }
+            },
+            SlowPathPlan::CaseB {
+                descriptor,
+                generation,
+            } => Ok(SlowPathReady::CaseB {
+                descriptor,
+                generation,
+            }),
+        }
+    }
+
+    /// Slow-path phase 3: short write-lock window that re-checks
+    /// races spawned during P2 and commits the cache entry.
+    ///
+    /// Race resolution table (P2 ready × cache state at P3):
+    ///
+    /// | ready  | cached at P3 | action                                              |
+    /// |--------|--------------|-----------------------------------------------------|
+    /// | (any)  | live entry   | drop our work; if CaseA, undo our pin               |
+    /// | CaseA  | None         | standard commit; new generation                     |
+    /// | CaseA  | Some(_)      | undo our pin; commit using cached desc/gen          |
+    /// | CaseB  | None         | DeadObject (cache pin gone — BC_ACQUIRE unsafe)     |
+    /// | CaseB  | Some, gen=   | resurrect under same generation                     |
+    /// | CaseB  | Some, gen≠   | adopt new entry's desc/gen                          |
+    fn slow_path_p3(
+        &self,
+        handle: u32,
+        stability: Stability,
+        ready: SlowPathReady,
+    ) -> Result<SIBinder> {
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
 
-        // Sub-case (c): another thread inserted/upgraded between our
-        // read-fast-path miss and write-lock acquisition.
+        // Re-check (c): a concurrent slow path completed during our
+        // P2 IPC. Our work is redundant.
         if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
+            if matches!(ready, SlowPathReady::CaseA { .. }) {
+                undo_case_a_pin(handle);
+            }
             return Ok(SIBinder::from_arc(arc));
         }
 
-        // Distinguish (a) vs (b). On (b) the entry is present (with a
-        // dangling weak) and we reuse the cached descriptor; the cache
-        // pin (BC_INCREFS) issued at first insertion is still active so
-        // BC_ACQUIRE below will succeed. On (a) the entry is absent — we
-        // pin first, then query, then insert.
-        //
-        // Generation handling:
-        //   - Case (a): allocate a fresh generation (new BC_INCREFS pin
-        //     means a fresh kernel binder_ref slot from the user's POV;
-        //     even if the handle id is being recycled in the kernel,
-        //     the generation snapshot held by any old WIBinder will not
-        //     match, correctly returning DeadObject on resurrection).
-        //   - Case (b): preserve the existing entry's generation —
-        //     same kernel slot (cache pin held), same binder_node,
-        //     same descriptor; this is just user-space resurrection.
         let cached = handle_to_proxy
             .get(&handle)
             .map(|e| (e.descriptor.clone(), e.generation));
 
-        if handle == 0 && crate::sdk_at_least(30) {
-            let original_call_restriction = thread_state::call_restriction();
-            thread_state::set_call_restriction(CallRestriction::None);
-            thread_state::ping_binder(handle)?;
-            thread_state::set_call_restriction(original_call_restriction);
+        match (ready, cached) {
+            (SlowPathReady::CaseA { descriptor }, None) => {
+                // Standard case (a): fresh entry, fresh generation.
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                commit_new_acquired(
+                    &mut handle_to_proxy,
+                    handle,
+                    descriptor,
+                    generation,
+                    stability,
+                    true,
+                )
+            }
+            (SlowPathReady::CaseA { .. }, Some((cached_desc, cached_gen))) => {
+                // Cross-thread race: while P2 ran, another thread
+                // (T2) completed a case (a) for this handle and then
+                // dropped its Arc, leaving the entry present + weak
+                // dead. T2's BC_INCREFS pin is owned by the cache
+                // entry; ours is spare. Undo ours so the
+                // "entry-1 ↔ pin-1" invariant holds, then resurrect
+                // under T2's descriptor/generation.
+                undo_case_a_pin(handle);
+                commit_new_acquired(
+                    &mut handle_to_proxy,
+                    handle,
+                    cached_desc,
+                    cached_gen,
+                    stability,
+                    false,
+                )
+            }
+            (
+                SlowPathReady::CaseB {
+                    descriptor,
+                    generation,
+                },
+                Some((_, cached_gen)),
+            ) if cached_gen == generation => {
+                // CaseB confirmed: same entry, same generation. The
+                // cache pin from first insertion is still active.
+                commit_new_acquired(
+                    &mut handle_to_proxy,
+                    handle,
+                    descriptor,
+                    generation,
+                    stability,
+                    false,
+                )
+            }
+            (SlowPathReady::CaseB { .. }, Some((cached_desc, cached_gen))) => {
+                // Generation differs: original entry was obituary'd
+                // and a new case (a) installed a fresh slot during
+                // P2. Drop our CaseB plan and follow the new entry.
+                commit_new_acquired(
+                    &mut handle_to_proxy,
+                    handle,
+                    cached_desc,
+                    cached_gen,
+                    stability,
+                    false,
+                )
+            }
+            (SlowPathReady::CaseB { .. }, None) => {
+                // Cache entry vanished mid-flight (obituary). The
+                // pin we relied on for BC_ACQUIRE may be gone.
+                // Surfacing DeadObject is safer than racing
+                // BC_ACQUIRE against a freed binder_ref slot — the
+                // user's contract is to re-resolve through service
+                // manager, identical to BR_DEAD_BINDER recovery.
+                Err(StatusCode::DeadObject)
+            }
         }
-
-        let (descriptor, generation) = match cached {
-            Some((desc, gen)) => {
-                // Sub-case (b): entry present, dead Arc. Skip BC_INCREFS
-                // (would double-pin) and skip INTERFACE_TRANSACTION
-                // (descriptor immutable for the binder_ref slot's
-                // lifetime). Preserve the existing generation.
-                (desc, gen)
-            }
-            None => {
-                // Sub-case (a): entry absent. Pin the kernel binder_ref
-                // slot before the (potentially failing) descriptor query.
-                //
-                // Step 1: queue BC_INCREFS on this thread's out-parcel.
-                thread_state::inc_weak_handle(handle)?;
-                // Step 2: flush so the kernel observes BC_INCREFS now.
-                // If the kernel has already freed binder_ref(handle) —
-                // recycled handle id, never-valid id, etc. — the ioctl
-                // returns -EINVAL and we propagate `DeadObject` without
-                // touching the cache. Subsequent re-resolution through
-                // service manager is the user's contract (same as after
-                // BR_DEAD_BINDER).
-                if let Err(err) = thread_state::flush_commands() {
-                    log::warn!(
-                        "BC_INCREFS for handle {handle} failed at flush: {err:?}; \
-                         handle is no longer valid in the kernel"
-                    );
-                    return Err(StatusCode::DeadObject);
-                }
-                // Step 3: pin is live in the kernel. Query the interface
-                // descriptor. On failure we MUST undo the pin so the
-                // kernel does not leak a binder_ref slot.
-                let desc = match thread_state::query_interface(handle) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        undo_case_a_pin(handle);
-                        return Err(err);
-                    }
-                };
-                let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                (desc, gen)
-            }
-        };
-
-        // Allocate ProxyHandle + acquire kernel strong ref. The cache pin
-        // (already held for case (b), or freshly issued+flushed above for
-        // case (a)) guarantees binder_ref(handle) is alive at this moment,
-        // so BC_ACQUIRE succeeds.
-        //
-        // If `new_acquired` fails we MUST undo the case (a) pin (case (b)'s
-        // pin was issued at first insertion and is still owned by the
-        // existing cache entry, which we leave intact). Distinguishing the
-        // two cases is exactly `!handle_to_proxy.contains_key(&handle)` —
-        // case (a) entered with no entry, case (b) entered with one.
-        let arc = match ProxyHandle::new_acquired(handle, descriptor.clone(), stability) {
-            Ok(arc) => arc,
-            Err(err) => {
-                if !handle_to_proxy.contains_key(&handle) {
-                    undo_case_a_pin(handle);
-                }
-                return Err(err);
-            }
-        };
-        handle_to_proxy.insert(
-            handle,
-            CacheEntry {
-                weak: Arc::downgrade(&arc),
-                descriptor,
-                generation,
-            },
-        );
-        Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
     }
 
     /// Snapshot the cache entry's generation for `handle`, if present.
@@ -544,6 +814,19 @@ impl ProcessState {
     /// cache pin) is performed by `release_obituary_pin`, called from
     /// `thread_state::execute_command`'s BR_DEAD_BINDER arm AFTER
     /// BC_DEAD_BINDER_DONE has been queued.
+    ///
+    /// # Reentrancy with the slow path
+    ///
+    /// `wait_for_response`'s catch-all arm dispatches
+    /// `BR_DEAD_BINDER` to `execute_command`, which calls this
+    /// method on the same thread that issued the originating
+    /// transaction — including a thread currently inside
+    /// [`Self::strong_proxy_for_handle_stability`]. Under
+    /// `std::sync::RwLock`'s non-reentrant write semantics, the
+    /// `handle_to_proxy.write()` taken here would deadlock if the
+    /// slow path were holding that lock across IPC; the slow path's
+    /// P1/P2/P3 split keeps the lock released during all IPC for
+    /// exactly this reason.
     ///
     /// # Borrow discipline (R1)
     ///
@@ -991,6 +1274,196 @@ mod tests {
     fn test_process_state_strong_proxy_for_handle() {
         let process = ProcessState::init_default();
         assert!(process.strong_proxy_for_handle(0).is_ok());
+    }
+
+    /// N threads racing on the same uncached handle (service manager =
+    /// 0) must converge on a single cache entry and a single `Arc`
+    /// identity. Exercises the lock-decoupled three-phase slow path's
+    /// race-resolution table — at most one P3 winner installs the
+    /// entry, every other thread either short-circuits in P1's case
+    /// (c) re-check, P3's case (c) re-check, or P3's
+    /// `(CaseA, Some(_))` cross-thread arm.
+    #[test]
+    fn test_concurrent_strong_proxy_same_handle_returns_same_arc() {
+        let _ = ProcessState::init_default();
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| ProcessState::as_self().strong_proxy_for_handle(0)))
+            .collect();
+        let arcs: Vec<SIBinder> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .expect("thread panic")
+                    .expect("strong_proxy failed")
+            })
+            .collect();
+        let first = &arcs[0];
+        for a in &arcs[1..] {
+            assert_eq!(
+                first, a,
+                "concurrent slow-path winners must share a single Arc"
+            );
+        }
+        // Exactly one cache entry for this handle.
+        let map = ProcessState::as_self()
+            .handle_to_proxy
+            .read()
+            .expect("Handle to proxy lock poisoned");
+        assert!(
+            map.contains_key(&0),
+            "case (a) winner must have installed an entry for handle 0"
+        );
+    }
+
+    /// Drop all live `Arc<ProxyHandle>` for handle 0 so the cache
+    /// entry's `weak` is dangling, then race N threads through the
+    /// resurrection path. Each thread observes case (b) in P1 (entry
+    /// present, weak dead) and races to commit in P3 — only one
+    /// winner; the rest fall through P3's case (c) re-check and reuse
+    /// the winner's Arc. Verifies the case (b) generation-preservation
+    /// invariant survives concurrent resurrection.
+    #[test]
+    fn test_concurrent_strong_proxy_case_b_resurrection() {
+        let _ = ProcessState::init_default();
+        // Force a cache entry to exist for handle 0.
+        let initial = ProcessState::as_self()
+            .strong_proxy_for_handle(0)
+            .expect("initial strong_proxy failed");
+        let initial_gen = ProcessState::as_self()
+            .cache_generation_for(0)
+            .expect("entry must exist for handle 0");
+        // Drop all strong refs to make `weak` dangling.
+        drop(initial);
+        // Yield so any other Arc borrowers (e.g. `context_manager`
+        // cache) settle. In a clean test process there are no other
+        // strong refs to handle 0 by this point.
+        std::thread::yield_now();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| ProcessState::as_self().strong_proxy_for_handle(0)))
+            .collect();
+        let arcs: Vec<SIBinder> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .expect("thread panic")
+                    .expect("strong_proxy failed")
+            })
+            .collect();
+        let first = &arcs[0];
+        for a in &arcs[1..] {
+            assert_eq!(
+                first, a,
+                "concurrent case (b) resurrection must produce a single Arc"
+            );
+        }
+        // Generation preserved (case (b) reuses the existing entry's
+        // generation; a fresh case (a) would have allocated a new one).
+        assert_eq!(
+            ProcessState::as_self().cache_generation_for(0),
+            Some(initial_gen),
+            "case (b) resurrection must preserve the entry's generation"
+        );
+    }
+
+    /// Plan §5.2 — same-thread re-entrant obituary regression guard.
+    ///
+    /// Reproduces the exact deadlock the P1/P2/P3 split closes:
+    /// while the slow path is mid-flight, a `BR_DEAD_BINDER` for the
+    /// same handle dispatches `send_obituary_for_handle` on the
+    /// *same* thread, which re-acquires `handle_to_proxy.write()`.
+    /// Under the pre-fix monolithic slow path that lock was already
+    /// held by this thread → `std::sync::RwLock`'s non-reentrant
+    /// write semantics → hang. Under the post-fix split P1 has
+    /// released the lock by the time the obituary fires, so the
+    /// re-acquisition succeeds.
+    ///
+    /// The simulation injects the obituary call via the
+    /// `slow_path_p2_test_hook` cfg(test) entry hook (fired the
+    /// instant P1 releases the lock and before P2 enters IPC).
+    /// Driving the obituary from the actual binder driver would
+    /// require crashing a service mid-transact — too brittle for a
+    /// unit test, and the lock semantics being tested are
+    /// driver-independent.
+    ///
+    /// Wallclock-bounded so a regression manifests as a CI timeout
+    /// failure rather than an indefinite hang.
+    /// Plan §5.2 — same-thread re-entrant obituary regression guard.
+    ///
+    /// Drives the slow path on a worker thread that has installed a
+    /// `slow_path_p2` hook calling `send_obituary_for_handle` from
+    /// the same thread. Under non-reentrant `std::sync::RwLock`
+    /// write semantics, the hook's `handle_to_proxy.write()` call
+    /// would deadlock if the slow path were still holding the write
+    /// lock at the P2 entry point. The current three-phase split
+    /// releases the lock between P1 and P2, so the obituary
+    /// re-acquisition succeeds.
+    ///
+    /// Wallclock-bounded so a regression manifests as a CI timeout
+    /// failure rather than an indefinite hang. The `fired` flag
+    /// asserts the hook actually ran — required because the
+    /// process-wide singleton `ProcessState` is shared with other
+    /// parallel tests, and a sibling test holding an `Arc` for
+    /// handle 0 could keep the cache `Weak` upgradeable, causing P1
+    /// to short-circuit at case (c) and the hook to never fire
+    /// (vacuous pass).
+    #[test]
+    fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
+        let process = ProcessState::init_default();
+
+        // Seed handle 0 (service manager) into the cache, then drop
+        // so the next lookup hits case (b) — entry present, weak
+        // dead. Case (b) lets us exercise the lock pattern without
+        // having to issue a fresh BC_INCREFS that the kernel might
+        // reject mid-test.
+        let seed = process
+            .strong_proxy_for_handle(0)
+            .expect("seed strong_proxy_for_handle(0) must succeed");
+        drop(seed);
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_w = std::sync::Arc::clone(&fired);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            // Hook is thread-local: install on the worker so the
+            // injected obituary fires on the same thread that is
+            // running strong_proxy_for_handle.
+            super::set_slow_path_p2_test_hook(Some(Box::new(move |handle| {
+                fired_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                ProcessState::as_self()
+                    .send_obituary_for_handle(handle)
+                    .expect("send_obituary_for_handle from P2 hook must not fail");
+            })));
+            let r = ProcessState::as_self().strong_proxy_for_handle(0);
+            super::set_slow_path_p2_test_hook(None);
+            tx.send(r).expect("result channel must not drop");
+        });
+
+        // Wallclock bound: regression in the lock structure manifests
+        // as an indefinite hang here.
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("strong_proxy_for_handle must complete within 5s — deadlock regression");
+        join.join().expect("worker thread must not panic");
+
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "P2 hook never fired — P1 short-circuited at case (c), most likely \
+             because a parallel test held an Arc for handle 0 and kept the \
+             cache Weak upgradeable. Test passed vacuously."
+        );
+
+        // Either outcome is acceptable — what we are guarding
+        // against is the deadlock, not the resolution. After the
+        // obituary, P3's (CaseB, None) arm normally returns
+        // DeadObject; a parallel resurrection might also produce a
+        // live Arc.
+        match result {
+            Ok(_arc) => {}
+            Err(StatusCode::DeadObject) => {}
+            Err(other) => panic!("unexpected slow-path result: {other:?}"),
+        }
     }
 
     #[test]
