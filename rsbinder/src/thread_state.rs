@@ -1229,9 +1229,20 @@ pub(crate) fn flash_if_needed() -> Result<bool> {
             }
         }
 
+        // Reset is_flushing on every exit (Ok / Err / panic) so a failed
+        // flush_commands() cannot leave the flag stuck true and wedge all
+        // future flushes. Must NOT hold a THREAD_STATE borrow across
+        // flush_commands() — it re-borrows internally (R1).
+        struct FlushGuard;
+        impl Drop for FlushGuard {
+            fn drop(&mut self) {
+                THREAD_STATE.with(|ts| ts.borrow_mut().is_flushing = false);
+            }
+        }
+
         thread_state.borrow_mut().is_flushing = true;
+        let _guard = FlushGuard;
         flush_commands()?;
-        thread_state.borrow_mut().is_flushing = false;
 
         Ok(true)
     })
