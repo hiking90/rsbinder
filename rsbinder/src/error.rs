@@ -164,8 +164,15 @@ impl From<std::array::TryFromSliceError> for StatusCode {
 }
 
 impl From<std::io::Error> for StatusCode {
-    fn from(_: std::io::Error) -> Self {
-        StatusCode::BadFd
+    fn from(err: std::io::Error) -> Self {
+        // Preserve the underlying errno instead of flattening every I/O
+        // failure to BadFd. OS-backed errors route through the errno
+        // mapping (BADF still yields BadFd); non-OS errors have no errno
+        // to map, so they surface as Unknown.
+        match err.raw_os_error() {
+            Some(raw) => StatusCode::from(rustix::io::Errno::from_raw_os_error(raw)),
+            None => StatusCode::Unknown,
+        }
     }
 }
 

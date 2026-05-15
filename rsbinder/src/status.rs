@@ -216,7 +216,19 @@ impl From<ExceptionCode> for StatusCode {
 
 impl From<Status> for StatusCode {
     fn from(status: Status) -> Self {
-        status.code
+        // A Status that carries an exception must never collapse to `Ok`.
+        // An application-level exception (e.g. IllegalArgument) with an
+        // `Ok` status code means "no transaction error, but the call did
+        // not succeed" — surface it as FailedTransaction so callers that
+        // map this into a `Result` cannot end up with `Err(StatusCode::Ok)`.
+        // The success path (exception None) and real error codes
+        // (TransactionFailed / ServiceSpecific) are preserved unchanged.
+        match status.code {
+            StatusCode::Ok if status.exception != ExceptionCode::None => {
+                StatusCode::FailedTransaction
+            }
+            code => code,
+        }
     }
 }
 
@@ -251,6 +263,12 @@ impl From<StatusCode> for Status {
 
 impl Serialize for Status {
     fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
+        // Mirrors AOSP `Status::writeToParcel`: on EX_TRANSACTION_FAILED
+        // the binder layer already failed, so nothing is written and the
+        // status code is returned via the error channel rather than as
+        // wire data. This is intentionally indistinguishable from a real
+        // parcel-write failure — same as libbinder ("not going to even
+        // try returning rich error data").
         if self.exception == ExceptionCode::TransactionFailed {
             return Err(self.code);
         }
