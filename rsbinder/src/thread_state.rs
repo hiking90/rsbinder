@@ -1437,7 +1437,16 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         break;
                     }
                     _ => {
-                        panic!("get_and_execute_command() returned unexpected error {e}, aborting");
+                        // A non-EINTR ioctl error (EAGAIN/EBUSY/ENOMEM/…)
+                        // must not abort the process. Leave the thread pool
+                        // gracefully like the TimedOut/CONNREFUSED arms so
+                        // the pool can spawn a replacement looper.
+                        log::error!(
+                            "get_and_execute_command() returned unexpected error {e}; \
+                             leaving the thread pool"
+                        );
+                        result = e;
+                        break;
                     }
                 }
             }
@@ -1874,7 +1883,7 @@ mod tests {
     fn test_process_pending_derefs_handles_reentrant_push_from_drop() {
         use std::sync::atomic::AtomicU64;
         use std::sync::{self, Mutex};
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
 
         let drop_log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let pusher_target: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));

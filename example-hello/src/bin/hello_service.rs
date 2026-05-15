@@ -31,7 +31,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Initialize ProcessState with the default binder path and the default max threads.
     println!("Initializing ProcessState...");
-    ProcessState::init_default();
+    ProcessState::init_default()?;
 
     // Start the thread pool.
     // This is optional. If you don't call this, only one thread will be created to handle the binder transactions.

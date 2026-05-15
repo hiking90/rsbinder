@@ -54,7 +54,7 @@ fn init_logger() {
 
 fn init_test() {
     init_logger();
-    ProcessState::init_default();
+    ProcessState::init_default().expect("init_default");
     ProcessState::start_thread_pool();
 }
 

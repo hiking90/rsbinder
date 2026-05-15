@@ -691,7 +691,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
-    ProcessState::init(&binder_path, 0);
+    ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.
     let service = BnServiceManager::new_binder(ServiceManager::new());

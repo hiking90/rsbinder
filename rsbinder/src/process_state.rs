@@ -402,21 +402,27 @@ impl ProcessState {
     /// Initialize ProcessState with binder path and max threads.
     /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
     /// If you want to use the default binder path, use init_default().
-    pub fn init(driver_name: &str, max_threads: u32) -> &'static ProcessState {
-        // TODO: panic! is not good. It should return Result.
-        // But, get_or_try_init is not stable yet.
-        Self::instance().get_or_init(|| match Self::inner_init(driver_name, max_threads) {
-            Ok(instance) => instance,
-            Err(e) => {
-                panic!("Error in init(): {e}");
-            }
-        })
+    pub fn init(
+        driver_name: &str,
+        max_threads: u32,
+    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
+        let cell = Self::instance();
+        if let Some(existing) = cell.get() {
+            return Ok(existing);
+        }
+        // Build outside the cell so a failed init is NOT cached: a later
+        // call can retry (this is why `get_or_try_init`, still unstable,
+        // is avoided). If two threads race here, `get_or_init` keeps the
+        // first stored instance and the extra one is dropped.
+        let instance = Self::inner_init(driver_name, max_threads)?;
+        Ok(cell.get_or_init(|| instance))
     }
 
     /// Initialize ProcessState with default binder path and max threads.
     /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
     /// DEFAULT_BINDER_PATH is "/dev/binderfs/binder".
-    pub fn init_default() -> &'static ProcessState {
+    pub fn init_default(
+    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
         let path = if Path::new(crate::DEFAULT_BINDER_PATH).exists() {
             crate::DEFAULT_BINDER_PATH
         } else {
@@ -1264,7 +1270,7 @@ mod tests {
 
     #[test]
     fn test_process_state() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,
@@ -1274,13 +1280,13 @@ mod tests {
 
     #[test]
     fn test_process_state_context_object() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         assert!(process.context_object().is_ok());
     }
 
     #[test]
     fn test_process_state_strong_proxy_for_handle() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         assert!(process.strong_proxy_for_handle(0).is_ok());
     }
 
@@ -1405,7 +1411,7 @@ mod tests {
     /// (vacuous pass).
     #[test]
     fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
 
         // Seed handle 0 (service manager) into the cache, then drop
         // so the next lookup hits case (b) — entry present, weak
@@ -1464,7 +1470,7 @@ mod tests {
 
     #[test]
     fn test_process_state_disable_background_scheduling() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         process.disable_background_scheduling(true);
         assert!(process.background_scheduling_disabled());
     }
@@ -1545,7 +1551,7 @@ mod tests {
     ///      `None`.
     #[test]
     fn test_native_uaf_window_closed() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
 
         let id = process.publish_native(Arc::clone(&arc));
@@ -1597,7 +1603,7 @@ mod tests {
     /// the last `release` fires.
     #[test]
     fn test_native_dedup_same_arc() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
 
         let id1 = process.publish_native(Arc::clone(&arc));
@@ -1629,7 +1635,7 @@ mod tests {
     /// allocation, not type).
     #[test]
     fn test_native_distinct_arcs_get_distinct_ids() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         let arc_a: Arc<dyn IBinder> = Arc::new(MockNative);
         let arc_b: Arc<dyn IBinder> = Arc::new(MockNative);
         assert!(!Arc::ptr_eq(&arc_a, &arc_b));
@@ -1652,7 +1658,7 @@ mod tests {
     /// previously-published binder back to its publisher.
     #[test]
     fn test_native_lookup_does_not_change_counts() {
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
         let id = process.publish_native(Arc::clone(&arc));
 
