@@ -273,6 +273,31 @@ pub trait IBinder: Any + Send + Sync {
         0
     }
 
+    /// RPC server dispatch entrypoint (subplan 2-2.d2-SRV).
+    ///
+    /// The RPC server adapter calls this *instead of* the kernel
+    /// `Transactable::transact` → `thread_state::check_interface`
+    /// path. `check_interface` reads the kernel transaction header and
+    /// mutates `THREAD_STATE` (strict-mode / work-source) — both
+    /// meaningless for RPC and forbidden to touch (P1). The adapter has
+    /// already consumed + validated the RPC interface token, so this
+    /// just dispatches `code` to the generated, transport-neutral
+    /// `Remotable::on_transact`. Native binders override it; the
+    /// default is "not an RPC dispatch target".
+    ///
+    /// Present only with the `rpc` feature, so the default public API
+    /// surface is unchanged.
+    #[cfg(feature = "rpc")]
+    fn rpc_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        let _ = (code, reader, reply);
+        Err(StatusCode::UnknownTransaction)
+    }
+
     fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
     fn attempt_inc_strong(&self) -> bool;
     fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()>;

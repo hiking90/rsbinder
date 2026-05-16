@@ -25,9 +25,19 @@
 //! network transport is never appropriate for production (use the
 //! `tls` backend, added by subplan 2-4).
 
+pub mod address;
+pub mod proxy;
+pub mod session;
+pub mod state;
 pub mod transport;
+pub mod wire;
 
+pub use address::{RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
+pub use proxy::RpcProxy;
+pub use session::RpcSession;
+pub use state::RpcState;
 pub use transport::{PeerIdentity, RpcTransport};
+pub use wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 
 use std::fmt;
 

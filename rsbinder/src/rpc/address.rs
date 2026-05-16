@@ -1,0 +1,176 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
+//! `RpcAddress` — RPC object identity (subplan 2-2 S-a).
+//!
+//! Mirrors android-12 r34 `RpcWireAddress` (`u8 address[32]`, opaque —
+//! `RpcAddress.h:34` "hide the ABI ... potentially change the size").
+//! This is **not** a u32 kernel handle: the RPC stack has its own
+//! identity space, decoupled from `proxy::ProxyHandle` (P5).
+//!
+//! Allocation is a per-session monotonic counter (plan 2-2.a1: not a
+//! CSPRNG — uniqueness *within a session* is sufficient; android fills
+//! it from `/dev/urandom` but treats it as opaque, so a counter is
+//! wire-compatible). `zero()` is the reserved address used for the
+//! special server-channel transactions.
+
+use std::fmt;
+
+/// On-wire length of an `RpcWireAddress` (android-12 r34: `u8[32]`).
+pub(crate) const RPC_ADDR_LEN: usize = 32;
+
+/// New-session sentinel for the raw `int32` session-id preamble
+/// (`RPC_SESSION_ID_NEW = -1` in android-12 r34).
+pub const RPC_SESSION_ID_NEW: i32 = -1;
+
+/// Opaque RPC object address. ABI is hidden: no public field, no public
+/// length constant, `Debug` shows only a short fingerprint (AC-2.1).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RpcAddress {
+    bytes: [u8; RPC_ADDR_LEN],
+}
+
+impl RpcAddress {
+    /// The reserved all-zero address. In r34 this is the special
+    /// server channel target for `GET_ROOT`/`GET_MAX_THREADS`/
+    /// `GET_SESSION_ID` (see [`SpecialTransaction`]).
+    pub fn zero() -> Self {
+        RpcAddress {
+            bytes: [0u8; RPC_ADDR_LEN],
+        }
+    }
+
+    /// `true` iff this is [`RpcAddress::zero`].
+    pub fn is_zero(&self) -> bool {
+        self.bytes == [0u8; RPC_ADDR_LEN]
+    }
+
+    /// Allocate a fresh, session-unique address from a monotonic
+    /// counter. The counter is session-owned (P6 — no global). The
+    /// value is never zero (zero is reserved); the first allocation is
+    /// `1`.
+    pub fn unique(counter: &mut u64) -> Self {
+        *counter = counter.wrapping_add(1);
+        // A 2^64 monotonic space never collides within a realistic
+        // session; encode LE into the low 8 bytes, rest zero. Distinct
+        // from `zero()` because `*counter >= 1`.
+        let mut bytes = [0u8; RPC_ADDR_LEN];
+        bytes[..8].copy_from_slice(&counter.to_le_bytes());
+        RpcAddress { bytes }
+    }
+
+    /// Borrow the raw 32 wire bytes (crate-internal — wire codec only).
+    pub(crate) fn as_wire_bytes(&self) -> &[u8; RPC_ADDR_LEN] {
+        &self.bytes
+    }
+
+    /// Reconstruct from exactly 32 wire bytes (crate-internal).
+    pub(crate) fn from_wire_bytes(bytes: [u8; RPC_ADDR_LEN]) -> Self {
+        RpcAddress { bytes }
+    }
+}
+
+impl fmt::Debug for RpcAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Fingerprint only — never expose the full ABI representation.
+        if self.is_zero() {
+            return write!(f, "RpcAddress(zero)");
+        }
+        write!(
+            f,
+            "RpcAddress({:02x}{:02x}{:02x}{:02x}…)",
+            self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]
+        )
+    }
+}
+
+/// Special transactions targeting the reserved zero address
+/// (android-12 r34 `RpcWireFormat.h`). These travel as a normal
+/// `TRANSACT` command whose `RpcWireTransaction.address` is
+/// [`RpcAddress::zero`] and whose `code` is one of these values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SpecialTransaction {
+    /// Fetch the server's root object.
+    GetRoot = 0,
+    /// Negotiate the server's max thread count.
+    GetMaxThreads = 1,
+    /// Obtain the server-assigned session id.
+    GetSessionId = 2,
+}
+
+impl SpecialTransaction {
+    /// The raw `code` value carried on the wire.
+    pub fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// Decode a zero-address transaction `code`.
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(SpecialTransaction::GetRoot),
+            1 => Some(SpecialTransaction::GetMaxThreads),
+            2 => Some(SpecialTransaction::GetSessionId),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_is_distinct_and_stable() {
+        assert!(RpcAddress::zero().is_zero());
+        assert_eq!(RpcAddress::zero(), RpcAddress::zero());
+        assert_eq!(RpcAddress::zero().as_wire_bytes(), &[0u8; RPC_ADDR_LEN]);
+    }
+
+    /// AC-2.1 / T2.2: 1e6 `unique()` calls in one session collide 0
+    /// times and never equal `zero()`.
+    #[test]
+    fn unique_is_collision_free_and_nonzero() {
+        let mut ctr = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        let zero = RpcAddress::zero();
+        for _ in 0..1_000_000 {
+            let a = RpcAddress::unique(&mut ctr);
+            assert!(!a.is_zero(), "unique() must never be zero");
+            assert_ne!(a, zero);
+            assert!(seen.insert(a), "unique() collision");
+        }
+        assert_eq!(seen.len(), 1_000_000);
+    }
+
+    #[test]
+    fn debug_is_fingerprint_only() {
+        // AC-2.1: Debug must not dump the full ABI bytes.
+        let mut ctr = 0u64;
+        let a = RpcAddress::unique(&mut ctr);
+        let s = format!("{a:?}");
+        assert!(s.starts_with("RpcAddress("));
+        assert!(s.contains('…'), "Debug must be a truncated fingerprint");
+        assert_eq!(format!("{:?}", RpcAddress::zero()), "RpcAddress(zero)");
+    }
+
+    #[test]
+    fn wire_bytes_roundtrip() {
+        let mut ctr = 41u64;
+        let a = RpcAddress::unique(&mut ctr);
+        let b = RpcAddress::from_wire_bytes(*a.as_wire_bytes());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn special_transaction_codes_match_r34() {
+        assert_eq!(SpecialTransaction::GetRoot.code(), 0);
+        assert_eq!(SpecialTransaction::GetMaxThreads.code(), 1);
+        assert_eq!(SpecialTransaction::GetSessionId.code(), 2);
+        assert_eq!(
+            SpecialTransaction::from_code(2),
+            Some(SpecialTransaction::GetSessionId)
+        );
+        assert_eq!(SpecialTransaction::from_code(3), None);
+    }
+}

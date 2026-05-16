@@ -187,6 +187,28 @@ impl<T: Clone + Default> ParcelData<T> {
 pub type FnFreeBuffer =
     fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
+/// RPC object-marshalling hooks attached to an RPC-mode `Parcel`
+/// (subplan 2-2, the rsbinder equivalent of android's
+/// `Parcel::mSession`/`RpcState`).
+///
+/// `parcel.rs` only knows this trait; the implementation lives in the
+/// `rpc` module's session/state. When a `Parcel` is in RPC mode the
+/// `SIBinder` (de)serializers route through these hooks instead of the
+/// kernel `flat_binder_object` path — the kernel path is byte-identical
+/// when `is_for_rpc == false` (AC-2.9).
+#[cfg(feature = "rpc")]
+pub trait RpcParcelOps: Send + Sync {
+    /// Marshal a possibly-null binder leaving this process: append the
+    /// r34 RPC object encoding (`i32` present flag + 32B address).
+    fn write_binder(
+        &self,
+        binder: Option<&crate::binder::SIBinder>,
+        parcel: &mut Parcel,
+    ) -> Result<()>;
+    /// Unmarshal a binder entering this process from the RPC encoding.
+    fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<crate::binder::SIBinder>>;
+}
+
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
 ///
@@ -201,6 +223,17 @@ pub struct Parcel {
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
+    /// RPC serialization mode (subplan 2-2). Default `false` == kernel
+    /// path, byte-identical to before (AC-2.9). Only object marshalling
+    /// and the object/FD lifetime branch on this; scalar/string/POD
+    /// paths are unaffected.
+    #[cfg(feature = "rpc")]
+    is_for_rpc: bool,
+    /// Object-marshalling hooks for RPC mode (android `mSession`
+    /// equivalent). `Some` only on an RPC-mode parcel that will carry
+    /// binders.
+    #[cfg(feature = "rpc")]
+    rpc_ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
 }
 
 impl Default for Parcel {
@@ -225,6 +258,10 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
+            #[cfg(feature = "rpc")]
+            is_for_rpc: false,
+            #[cfg(feature = "rpc")]
+            rpc_ops: None,
         }
     }
 
@@ -253,6 +290,10 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: Some(free_buffer),
+            #[cfg(feature = "rpc")]
+            is_for_rpc: false,
+            #[cfg(feature = "rpc")]
+            rpc_ops: None,
         }
     }
 
@@ -267,6 +308,10 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
+            #[cfg(feature = "rpc")]
+            is_for_rpc: false,
+            #[cfg(feature = "rpc")]
+            rpc_ops: None,
         }
     }
 
@@ -284,6 +329,41 @@ impl Parcel {
 
     pub fn is_empty(&self) -> bool {
         self.pos >= self.data.len()
+    }
+
+    /// Switch this parcel between the kernel and RPC serialization
+    /// modes (subplan 2-2 / §7-3). Default is kernel mode; only object
+    /// marshalling and the object/FD lifetime branch on this — scalar,
+    /// string and POD bytes are identical in both modes.
+    #[cfg(feature = "rpc")]
+    pub fn set_for_rpc(&mut self, yes: bool) {
+        self.is_for_rpc = yes;
+    }
+
+    /// `true` if this parcel serializes binders/FDs the RPC way
+    /// (`RpcAddress` instead of `flat_binder_object`; FD rejected).
+    #[cfg(feature = "rpc")]
+    pub fn is_for_rpc(&self) -> bool {
+        self.is_for_rpc
+    }
+
+    /// Attach the RPC object-marshalling hooks and enter RPC mode
+    /// (android `Parcel::markForRpc`/`mSession` equivalent).
+    #[cfg(feature = "rpc")]
+    pub fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
+        self.is_for_rpc = true;
+        self.rpc_ops = Some(ops);
+    }
+
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_ops(&self) -> Option<std::sync::Arc<dyn RpcParcelOps>> {
+        self.rpc_ops.clone()
+    }
+
+    /// The written byte buffer (for placing into an RPC wire body).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_data_bytes(&self) -> &[u8] {
+        self.data.as_slice()
     }
 
     pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
@@ -305,6 +385,13 @@ impl Parcel {
     }
 
     pub fn close_file_descriptors(&self) {
+        // RPC-mode parcels never carry kernel FD objects (FD over RPC
+        // is rejected in 2-2 / opt-in in 2-7); nothing to close here.
+        #[cfg(feature = "rpc")]
+        if self.is_for_rpc {
+            return;
+        }
+
         for offset in self.objects.as_slice() {
             let Ok(obj) = read_flat_binder(self.data.as_slice(), *offset as usize) else {
                 log::error!("Parcel: unable to read object at offset {offset}");
@@ -372,6 +459,15 @@ impl Parcel {
     }
 
     pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
+        // The kernel offset-table scan below is meaningless for an
+        // RPC-mode parcel (RPC carries `RpcAddress`, not
+        // `flat_binder_object`). Reaching here in RPC mode is a
+        // protocol error, not a silent mis-read (2-2.d2 #4).
+        #[cfg(feature = "rpc")]
+        if self.is_for_rpc {
+            return Err(StatusCode::BadType);
+        }
+
         let data_pos = self.pos as u64;
         let size = std::mem::size_of::<flat_binder_object>();
 
@@ -692,6 +788,18 @@ impl Parcel {
     }
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
+        // RPC mode never carries `flat_binder_object`s: binders are
+        // marshalled as `RpcAddress` and FDs are rejected upstream
+        // (2-2.d2 #3). Write the bytes verbatim but never load the
+        // kernel offset table or take a kernel `acquire()` — RPC has
+        // its own refcount. The kernel path below is byte-identical
+        // when `is_for_rpc == false` (AC-2.9).
+        #[cfg(feature = "rpc")]
+        if self.is_for_rpc {
+            self.write_aligned(obj);
+            return Ok(());
+        }
+
         let data_pos = self.pos;
         self.write_aligned(obj);
 
@@ -825,7 +933,16 @@ impl Parcel {
         }
         self.set_data_position(self.pos + size);
 
-        if num_objects > 0 {
+        // An RPC-mode parcel carries no `flat_binder_object`s, so the
+        // offset recompute / re-acquire / FD-dup below is kernel-only
+        // (2-2.d2 #5). `self.objects` is already empty in RPC mode so
+        // this is also defence-in-depth.
+        #[cfg(feature = "rpc")]
+        let skip_objects = self.is_for_rpc;
+        #[cfg(not(feature = "rpc"))]
+        let skip_objects = false;
+
+        if num_objects > 0 && !skip_objects {
             let start = self.objects.len();
             self.objects.resize(start + (num_objects as usize));
 
@@ -849,6 +966,15 @@ impl Parcel {
     }
 
     fn release_objects(&self) {
+        // An RPC-mode parcel must never run kernel `release()` /
+        // `decref_publish` — RPC objects have a different
+        // (DecStrong-based) lifetime (2-2.d2 #6). `self.objects` is
+        // empty in RPC mode anyway; this is defence-in-depth + intent.
+        #[cfg(feature = "rpc")]
+        if self.is_for_rpc {
+            return;
+        }
+
         if self.objects.len() == 0 {
             return;
         }

@@ -82,6 +82,16 @@ impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+        // android-12 r34 rejects FDs in RPC-mode parcels categorically
+        // (`Parcel::writeFileDescriptor` → `BAD_TYPE`). FD-over-RPC is
+        // an opt-in android-13+ feature (subplan 2-7); in 2-2 it is a
+        // hard, deterministic reject — never a silent corruption or a
+        // partial write (AC-2.11 / D2).
+        #[cfg(feature = "rpc")]
+        if parcel.is_for_rpc() {
+            return Err(StatusCode::BadType);
+        }
+
         // Not null
         parcel.write::<i32>(&1)?;
         let dup_fd = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
