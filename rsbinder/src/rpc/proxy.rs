@@ -80,6 +80,34 @@ impl RpcProxy {
     }
 }
 
+/// Subplan 2-6 (D1): the RPC proxy implements the same generalized
+/// [`RemoteProxy`](crate::RemoteProxy) trait as the kernel
+/// `ProxyHandle`, so one generated `Bp*` stub can drive either stack
+/// once the generator emits `as_remote()` (2-6.B). `prepare_transact`
+/// writes the interface token using this proxy's descriptor (stamped
+/// by the typed-stub constructor in 2-6.B).
+impl crate::binder::RemoteProxy for RpcProxy {
+    fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
+        let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
+        let mut data = Parcel::new();
+        data.attach_rpc_ops(inner.parcel_ops());
+        data.set_rpc_fd_mode(inner.fd_mode());
+        if write_header {
+            super::session::write_rpc_interface_token(&mut data, &self.descriptor)?;
+        }
+        Ok(data)
+    }
+
+    fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>> {
+        RpcProxy::transact(self, code, data, flags)
+    }
+}
+
 impl Drop for RpcProxy {
     fn drop(&mut self) {
         // Last `Arc<RpcProxy>` for this address is going away: tell the

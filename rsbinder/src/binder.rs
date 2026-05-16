@@ -305,10 +305,52 @@ pub trait IBinder: Any + Send + Sync {
     fn dec_weak(&self) -> Result<()>;
 }
 
+/// An outbound-transaction-issuing proxy, abstract over the kernel
+/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks (subplan
+/// 2-6, D1). The AIDL generator currently hard-downcasts to
+/// `ProxyHandle` (`as_proxy().unwrap()`); this trait + the
+/// `<dyn IBinder>::as_remote()` accessor generalize that so one
+/// generated `Bp*` can drive either stack.
+///
+/// The signatures are exactly `ProxyHandle`'s existing inherent
+/// `prepare_transact`/`submit_transact` — `ProxyHandle` implements
+/// this by **delegating to those unchanged methods**, so the kernel
+/// proxy's runtime behavior is bit-identical by construction (no
+/// codegen change required for the kernel path — AC-6.2).
+pub trait RemoteProxy {
+    /// Allocate the request `Parcel`, optionally writing the AIDL
+    /// interface header.
+    fn prepare_transact(&self, write_header: bool) -> Result<Parcel>;
+    /// Submit the transaction and return the reply (`None` for oneway).
+    fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>>;
+}
+
 impl dyn IBinder {
     /// Convert this binder object into a proxy binder object.
     pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
+    }
+
+    /// Generalized proxy dispatch (subplan 2-6): a kernel
+    /// [`proxy::ProxyHandle`] **or** (with the `rpc` feature) an
+    /// [`rpc::RpcProxy`](crate::rpc::RpcProxy), as a single
+    /// [`RemoteProxy`] trait object. Lets one generated `Bp*` stub
+    /// call either stack. `as_proxy()` is retained unchanged so the
+    /// existing generated kernel code keeps working verbatim.
+    pub fn as_remote(&self) -> Option<&dyn RemoteProxy> {
+        if let Some(p) = self.as_any().downcast_ref::<proxy::ProxyHandle>() {
+            return Some(p as &dyn RemoteProxy);
+        }
+        #[cfg(feature = "rpc")]
+        if let Some(p) = self.as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            return Some(p as &dyn RemoteProxy);
+        }
+        None
     }
 }
 

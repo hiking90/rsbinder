@@ -336,6 +336,57 @@ fn rpc_e2e_over_unix_socketpair() {
     run_scenario(Box::new(a), Box::new(b));
 }
 
+/// Subplan 2-6 (D1): an RPC binder obtained from the stack is
+/// reachable through the **generalized** `dyn IBinder::as_remote()`
+/// as a `&dyn RemoteProxy`, and a full AIDL call driven via the
+/// trait's `prepare_transact`/`submit_transact` (the exact shape the
+/// generator will emit after 2-6.B) works over RPC — the same trait
+/// `ProxyHandle` implements for the kernel path. Proves the single
+/// abstraction without any generator change.
+#[test]
+fn rpc_call_via_generalized_remote_proxy_trait() {
+    use rsbinder::RemoteProxy;
+
+    let (a, b) = MemTransport::pair();
+    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor);
+    server.set_root(make_root());
+    let h = thread::spawn(move || {
+        let _ = server.serve_blocking();
+    });
+
+    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator);
+    let root = client.get_root().expect("get_root");
+
+    // Generalized dispatch: not `as_proxy()` (kernel-only), but
+    // `as_remote()` → `&dyn RemoteProxy`. An RPC binder resolves here.
+    let remote = (*root)
+        .as_remote()
+        .expect("AC-6: an RpcProxy must be reachable as &dyn RemoteProxy");
+
+    // The trait's `prepare_transact` is callable on the RPC proxy
+    // (it allocates an RPC-mode parcel). Descriptor *stamping* of an
+    // RpcProxy from `get_root` is 2-6.B's typed-stub constructor
+    // change, so for this pre-2-6.B check the real call is issued with
+    // an explicitly-built request parcel and dispatched **through the
+    // generalized `&dyn RemoteProxy::submit_transact`** (exactly what
+    // the generator will emit after 2-6.B).
+    let _ = remote
+        .prepare_transact(true)
+        .expect("prepare_transact callable");
+    let rp = rpc_of(&root);
+    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    d.write(&"via-remote-proxy").unwrap();
+    let mut reply = RemoteProxy::submit_transact(remote, TX_ECHO, &d, 0)
+        .expect("submit_transact via &dyn RemoteProxy")
+        .expect("reply");
+    read_status(&mut reply).unwrap();
+    assert_eq!(reply.read::<String>().unwrap(), "via-remote-proxy");
+
+    drop(root);
+    drop(client);
+    h.join().unwrap();
+}
+
 /// AC-2.11 / T2.11: an FD written into an RPC-mode parcel is a hard
 /// `BadType` reject (android-12 r34 fidelity), never a silent
 /// corruption or partial write.
