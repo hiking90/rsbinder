@@ -1126,4 +1126,43 @@ mod tests {
         assert_eq!(parcel.data_size(), 0);
         drop(parcel);
     }
+
+    // Hardening regression: `set_data_size` must reject a length larger
+    // than the backing buffer's capacity instead of entering the
+    // `Vec::set_len` UB of claiming uninitialized capacity. A broken
+    // driver/buffer contract is the untrusted-input source here.
+    #[test]
+    fn set_data_size_rejects_over_capacity() {
+        let mut parcel = Parcel::new();
+        let cap = parcel.capacity();
+
+        // Exactly at capacity is the boundary and must succeed.
+        assert!(parcel.set_data_size(cap).is_ok());
+        // One past capacity must be refused with BadValue, not panic/UB.
+        assert_eq!(parcel.set_data_size(cap + 1), Err(StatusCode::BadValue));
+        // Zero is always valid.
+        assert!(parcel.set_data_size(0).is_ok());
+    }
+
+    // Hardening regression: `data_avail` must saturate when the cursor
+    // has been moved past the end (`set_data_position` is unbounded).
+    // The pre-fix `len - pos` underflowed and panicked in debug builds
+    // on attacker-influenced positions.
+    #[test]
+    fn data_avail_saturates_when_pos_past_end() {
+        let mut parcel = Parcel::new();
+        parcel.write(&0u64).expect("write u64");
+        assert_eq!(parcel.data_avail(), 0, "cursor at end → nothing available");
+
+        parcel.set_data_position(0);
+        assert_eq!(parcel.data_avail(), 8, "8 bytes available from start");
+
+        // Cursor far past the end must not underflow-panic.
+        parcel.set_data_position(9999);
+        assert_eq!(
+            parcel.data_avail(),
+            0,
+            "saturating_sub, not underflow panic"
+        );
+    }
 }

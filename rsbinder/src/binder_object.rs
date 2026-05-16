@@ -272,3 +272,65 @@ pub(crate) fn write_flat_binder(
     unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the `new_with_fd` construction fix.
+    ///
+    /// Two distinct defects were present before the fix:
+    ///
+    ///  1. `flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS` — a bitwise AND
+    ///     between disjoint bit ranges (`0x7F` vs `0x100`) is always 0,
+    ///     so every FD object went on the wire with `flags == 0`. The
+    ///     fix is `0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS`, byte-identical
+    ///     to AOSP `Parcel::writeFileDescriptor`.
+    ///  2. The union was initialized via the u32 `handle` variant, so
+    ///     the upper 4 bytes of the 8-byte `binder` field were left
+    ///     uninitialized and leaked uninitialized stack to the remote
+    ///     (Rust UB). The fix initializes the full-width `binder` field
+    ///     so the upper bytes are guaranteed zero.
+    #[test]
+    fn new_with_fd_flags_and_full_width_init() {
+        let fd: i32 = 7;
+        let obj = flat_binder_object::new_with_fd(fd, false);
+
+        assert_eq!(obj.header_type(), BINDER_TYPE_FD, "must be a FD object");
+
+        // Defect 1: flags must be the OR (0x7F | 0x100 == 0x17F), never 0.
+        assert_eq!(
+            obj.flags,
+            0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            "flags must be 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS (regression: was 0x7F & ... == 0)"
+        );
+        assert_ne!(
+            obj.flags, 0,
+            "AND-instead-of-OR regression: flags collapsed to 0"
+        );
+        assert_eq!(
+            obj.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            "ACCEPTS_FDS bit must be set"
+        );
+
+        // Defect 2: the full 8-byte union must equal exactly `fd` with a
+        // zeroed upper half — no uninitialized stack bytes leaked.
+        assert_eq!(
+            obj.pointer(),
+            fd as u32 as u64,
+            "upper 32 bits of the union must be zero (uninit-leak UB regression)"
+        );
+        assert_eq!(
+            obj.handle(),
+            fd as u32,
+            "handle variant must round-trip the fd"
+        );
+    }
+
+    #[test]
+    fn new_with_fd_cookie_tracks_take_ownership() {
+        assert_eq!(flat_binder_object::new_with_fd(3, true).cookie, 1);
+        assert_eq!(flat_binder_object::new_with_fd(3, false).cookie, 0);
+    }
+}

@@ -102,6 +102,24 @@ jobs:
           sleep 2
           kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to start"; cat test_service.log; exit 1; }
 
+      - name: Run rsbinder unit tests (slow-path / hardening regression gate)
+        run: |
+          # The `rsbinder` crate's own unit tests are NOT exercised by the
+          # `cargo test --package tests` loop below, and build.yml only
+          # compiles them (`--no-run`). Several of them need a live binder
+          # device + service manager (handle 0) — e.g. the P1/P2/P3
+          # slow-path concurrency / same-thread re-entrant obituary
+          # deadlock guards (PR #118, `481b8c9`). This binder-enabled job
+          # is the only place they can actually run, so gate them here.
+          # rsb_hub is already up (handle 0); test_service is up so the
+          # cache has real entries to resurrect across the parallel tests.
+          RUST_BACKTRACE=1 cargo test --package rsbinder || {
+            echo "::error::rsbinder unit tests failed — capturing dmesg"
+            sudo dmesg | tail -200
+            cat rsb_hub.log
+            exit 1
+          }
+
       - name: Run cargo test (sync) — ${{ env.TEST_ITERATIONS }} iteration(s)
         run: |
           # Issue #97 manifests as kernel-log warnings rather than test
