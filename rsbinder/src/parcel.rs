@@ -234,6 +234,18 @@ pub struct Parcel {
     /// binders.
     #[cfg(feature = "rpc")]
     rpc_ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
+    /// Negotiated FD-over-RPC mode (subplan 2-7). Default `None` ⇒ the
+    /// 2-2 reject, bit-identical (AC-7.1).
+    #[cfg(feature = "rpc")]
+    rpc_fd_mode: crate::rpc::FileDescriptorTransportMode,
+    /// FDs collected while serializing this (outgoing) RPC parcel in
+    /// `Unix` fd-mode — sent out-of-band via `SCM_RIGHTS`.
+    #[cfg(feature = "rpc")]
+    rpc_fds_out: Vec<std::os::fd::OwnedFd>,
+    /// FDs received out-of-band with this (incoming) RPC parcel,
+    /// indexed by the in-body fd-table index.
+    #[cfg(feature = "rpc")]
+    rpc_fds_in: Vec<Option<std::os::fd::OwnedFd>>,
 }
 
 impl Default for Parcel {
@@ -262,6 +274,12 @@ impl Parcel {
             is_for_rpc: false,
             #[cfg(feature = "rpc")]
             rpc_ops: None,
+            #[cfg(feature = "rpc")]
+            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
+            #[cfg(feature = "rpc")]
+            rpc_fds_out: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_fds_in: Vec::new(),
         }
     }
 
@@ -294,6 +312,12 @@ impl Parcel {
             is_for_rpc: false,
             #[cfg(feature = "rpc")]
             rpc_ops: None,
+            #[cfg(feature = "rpc")]
+            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
+            #[cfg(feature = "rpc")]
+            rpc_fds_out: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_fds_in: Vec::new(),
         }
     }
 
@@ -312,6 +336,12 @@ impl Parcel {
             is_for_rpc: false,
             #[cfg(feature = "rpc")]
             rpc_ops: None,
+            #[cfg(feature = "rpc")]
+            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
+            #[cfg(feature = "rpc")]
+            rpc_fds_out: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_fds_in: Vec::new(),
         }
     }
 
@@ -364,6 +394,52 @@ impl Parcel {
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_data_bytes(&self) -> &[u8] {
         self.data.as_slice()
+    }
+
+    // ---- subplan 2-7: FD-over-RPC (opt-in, Unix mode) --------------
+
+    /// Set the negotiated FD-over-RPC mode for this parcel (default
+    /// `None` ⇒ FD write is the 2-2 reject, bit-identical).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
+        self.rpc_fd_mode = mode;
+    }
+
+    /// The negotiated FD-over-RPC mode.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_fd_mode(&self) -> crate::rpc::FileDescriptorTransportMode {
+        self.rpc_fd_mode
+    }
+
+    /// Stash an outgoing fd (already an owned dup) and return its
+    /// in-body table index. Called by `ParcelFileDescriptor::serialize`
+    /// only in `Unix` fd-mode.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
+        let idx = self.rpc_fds_out.len() as i32;
+        self.rpc_fds_out.push(fd);
+        idx
+    }
+
+    /// Borrow the collected outgoing fds. The session sends them
+    /// out-of-band via `SCM_RIGHTS`; the parcel keeps ownership and
+    /// closes them on drop (after the send completes — the peer
+    /// already has its own dup'd copies via the kernel).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_out_fds(&self) -> &[std::os::fd::OwnedFd] {
+        &self.rpc_fds_out
+    }
+
+    /// Install the fds received out-of-band, before deserialization.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_set_in_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
+        self.rpc_fds_in = fds.into_iter().map(Some).collect();
+    }
+
+    /// Take the received fd at table `index` (consumed once).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_take_in_fd(&mut self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.rpc_fds_in.get_mut(index).and_then(Option::take)
     }
 
     pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {

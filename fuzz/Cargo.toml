@@ -50,5 +50,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rpc_fd_ancillary"
+path = "fuzz_targets/rpc_fd_ancillary.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

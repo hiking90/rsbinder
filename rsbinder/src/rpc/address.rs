@@ -124,6 +124,10 @@ pub enum SpecialTransaction {
     GetMaxThreads = 1,
     /// Obtain the server-assigned session id.
     GetSessionId = 2,
+    /// Negotiate the FD-over-RPC mode (subplan 2-7). **Not r34** — an
+    /// rsbinder/android-13+ extension sent *only* when a client opts
+    /// into FD passing, so the default (`None`) path stays r34-faithful.
+    GetFdMode = 3,
 }
 
 impl SpecialTransaction {
@@ -138,6 +142,7 @@ impl SpecialTransaction {
             0 => Some(SpecialTransaction::GetRoot),
             1 => Some(SpecialTransaction::GetMaxThreads),
             2 => Some(SpecialTransaction::GetSessionId),
+            3 => Some(SpecialTransaction::GetFdMode),
             _ => None,
         }
     }
@@ -198,6 +203,13 @@ mod tests {
             SpecialTransaction::from_code(2),
             Some(SpecialTransaction::GetSessionId)
         );
-        assert_eq!(SpecialTransaction::from_code(3), None);
+        // 0..=2 are the android-12 r34 special codes. Code 3
+        // (`GetFdMode`) is the rsbinder/2-7 extension — explicitly
+        // NOT r34, sent only when a client opts into FD passing.
+        assert_eq!(
+            SpecialTransaction::from_code(3),
+            Some(SpecialTransaction::GetFdMode)
+        );
+        assert_eq!(SpecialTransaction::from_code(4), None);
     }
 }

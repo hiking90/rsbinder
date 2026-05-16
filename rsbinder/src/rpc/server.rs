@@ -82,6 +82,9 @@ pub struct RpcServer {
     root: Mutex<Option<SIBinder>>,
     named: Mutex<HashMap<String, SIBinder>>,
     max_threads: Mutex<u32>,
+    /// Whether per-connection sessions advertise `Unix` FD support
+    /// (subplan 2-7; default false ⇒ FD reject everywhere).
+    fd_unix_supported: AtomicBool,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -102,6 +105,7 @@ impl RpcServer {
             root: Mutex::new(None),
             named: Mutex::new(HashMap::new()),
             max_threads: Mutex::new(1),
+            fd_unix_supported: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }))
@@ -132,6 +136,15 @@ impl RpcServer {
         *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
     }
 
+    /// Advertise the FD-over-RPC modes this server will accept
+    /// (subplan 2-7). Default: only `None` (the 2-2 reject). Pass
+    /// `&[FileDescriptorTransportMode::Unix]` to opt in to UDS
+    /// `SCM_RIGHTS` fd passing for clients that also opt in.
+    pub fn set_supported_fd_modes(&self, modes: &[crate::rpc::FileDescriptorTransportMode]) {
+        let unix = modes.contains(&crate::rpc::FileDescriptorTransportMode::Unix);
+        self.fd_unix_supported.store(unix, Ordering::SeqCst);
+    }
+
     /// Build a per-connection session sharing this server's root +
     /// negotiated max-threads (its `RpcState` is fresh — P6 isolation).
     fn make_session(&self, transport: Box<dyn RpcTransport>) -> RpcSession {
@@ -141,6 +154,9 @@ impl RpcServer {
             session.set_root(root);
         }
         session.set_max_threads(*self.max_threads.lock().expect("max_threads poisoned"));
+        if self.fd_unix_supported.load(Ordering::SeqCst) {
+            session.set_supported_fd_modes(&[crate::rpc::FileDescriptorTransportMode::Unix]);
+        }
         session
     }
 

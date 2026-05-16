@@ -50,6 +50,7 @@
 //! is exercised by `rsbinder/tests/rpc_server.rs`.
 
 pub mod address;
+pub mod fd_mode;
 pub mod proxy;
 pub mod server;
 pub mod session;
@@ -58,6 +59,7 @@ pub mod transport;
 pub mod wire;
 
 pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
+pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
 pub use session::RpcSession;

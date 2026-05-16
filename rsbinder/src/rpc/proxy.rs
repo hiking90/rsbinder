@@ -60,6 +60,9 @@ impl RpcProxy {
         let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
         let mut data = Parcel::new();
         data.attach_rpc_ops(inner.parcel_ops());
+        // So `ParcelFileDescriptor::serialize` applies the negotiated
+        // FD policy (default `None` ⇒ the 2-2 reject — subplan 2-7).
+        data.set_rpc_fd_mode(inner.fd_mode());
         super::session::write_rpc_interface_token(&mut data, descriptor)?;
         Ok(data)
     }

@@ -95,6 +95,34 @@ pub trait RpcTransport: Send + Sync {
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
+
+    /// Send one frame plus passed file descriptors out-of-band
+    /// (subplan 2-7, opt-in `FileDescriptorTransportMode::Unix`).
+    ///
+    /// The **default rejects any fd** — so `mem`/`vsock`/`tls` are
+    /// fd-incapable *by type*, with no extra code (plan 2-7 §4). Only
+    /// `unix` overrides this with `SCM_RIGHTS`. An empty `fds` slice
+    /// falls back to the plain framed send.
+    fn send_frame_with_fds(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> RpcResult<()> {
+        if fds.is_empty() {
+            self.send_frame(buf)
+        } else {
+            Err(RpcError::Protocol(
+                "this transport cannot pass file descriptors (UDS only)",
+            ))
+        }
+    }
+
+    /// Receive one frame plus any out-of-band file descriptors
+    /// (subplan 2-7). Default: never yields fds (the plain framed
+    /// recv); only `unix` overrides with `SCM_RIGHTS`.
+    fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+        Ok((self.recv_frame()?, Vec::new()))
+    }
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].

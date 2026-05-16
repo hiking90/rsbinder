@@ -82,14 +82,25 @@ impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        // android-12 r34 rejects FDs in RPC-mode parcels categorically
-        // (`Parcel::writeFileDescriptor` → `BAD_TYPE`). FD-over-RPC is
-        // an opt-in android-13+ feature (subplan 2-7); in 2-2 it is a
-        // hard, deterministic reject — never a silent corruption or a
-        // partial write (AC-2.11 / D2).
+        // RPC-mode FD policy (subplan 2-2 / 2-7). `None` (default,
+        // android-12 fidelity / android-13 default) is the hard
+        // `BAD_TYPE` reject — **bit-identical to 2-2** (AC-7.1). `Unix`
+        // (both peers opted in + UDS) stashes a dup'd fd for
+        // out-of-band `SCM_RIGHTS` transfer and writes only an
+        // ancillary-table index in the body (android-13+ shape).
         #[cfg(feature = "rpc")]
         if parcel.is_for_rpc() {
-            return Err(StatusCode::BadType);
+            use crate::rpc::FileDescriptorTransportMode as M;
+            match parcel.rpc_fd_mode() {
+                M::None => return Err(StatusCode::BadType),
+                M::Unix => {
+                    let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
+                    let idx = parcel.rpc_push_out_fd(dup);
+                    parcel.write::<i32>(&1)?; // present
+                    parcel.write::<i32>(&idx)?; // ancillary fd-table index
+                    return Ok(());
+                }
+            }
         }
 
         // Not null
@@ -122,6 +133,32 @@ impl SerializeOption for ParcelFileDescriptor {
 
 impl DeserializeOption for ParcelFileDescriptor {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        // RPC-mode FD read (subplan 2-7). `None`: an FD in an incoming
+        // RPC parcel is impossible (the sender was rejected) → BadType.
+        // `Unix`: body is `i32 present, i32 ancillary-index`; the real
+        // fd arrived out-of-band via `SCM_RIGHTS`.
+        #[cfg(feature = "rpc")]
+        if parcel.is_for_rpc() {
+            use crate::rpc::FileDescriptorTransportMode as M;
+            let present = parcel.read::<i32>()?;
+            if present == 0 {
+                return Ok(None);
+            }
+            return match parcel.rpc_fd_mode() {
+                M::None => Err(StatusCode::BadType),
+                M::Unix => {
+                    let idx = parcel.read::<i32>()?;
+                    if idx < 0 {
+                        return Err(StatusCode::BadValue);
+                    }
+                    let fd = parcel
+                        .rpc_take_in_fd(idx as usize)
+                        .ok_or(StatusCode::BadValue)?;
+                    Ok(Some(ParcelFileDescriptor::new(fd)))
+                }
+            };
+        }
+
         let present = parcel.read::<i32>()?;
         if present == 0 {
             return Ok(None);
@@ -149,6 +186,22 @@ impl Deserialize for ParcelFileDescriptor {
 }
 
 impl DeserializeArray for ParcelFileDescriptor {}
+
+/// Fuzz entrypoint for the `rpc_fd_ancillary` target (subplan 2-7
+/// §6.3 / V4 / T7.6): arbitrary body bytes through the RPC `Unix`-mode
+/// FD-table decode **with no received fds**. Property: no panic / UB /
+/// fd leak — an out-of-bounds or dangling fd-table index is a clean
+/// `Err`, never a crash. Not part of the supported API surface.
+#[cfg(feature = "rpc")]
+#[doc(hidden)]
+pub fn __fuzz_rpc_fd_index(input: &[u8]) {
+    let mut p = Parcel::from_vec(input.to_vec());
+    p.set_for_rpc(true);
+    p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+    // No ancillary fds installed: every index must be rejected, not
+    // panic / leak.
+    let _ = <ParcelFileDescriptor as DeserializeOption>::deserialize_option(&mut p);
+}
 
 #[cfg(test)]
 mod tests {

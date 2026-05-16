@@ -15,10 +15,12 @@
 //! / threaded / negotiated session is subplan 2-3; this is the minimal
 //! single-connection request/reply driver 2-2 needs for its e2e.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use super::fd_mode::FileDescriptorTransportMode;
 use crate::binder::{SIBinder, FLAG_ONEWAY, INTERFACE_HEADER};
 use crate::error::{Result, StatusCode};
 use crate::parcel::{Parcel, RpcParcelOps};
@@ -28,7 +30,7 @@ use super::proxy::RpcProxy;
 use super::state::RpcState;
 use super::transport::RpcTransport;
 use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
-use super::RpcError;
+use super::{RpcError, RpcResult};
 
 /// `strict_mode_policy() == 0 | STRICT_MODE_PENALTY_GATHER`, written
 /// without touching `thread_state` (RPC must never couple to the
@@ -98,6 +100,13 @@ pub struct RpcSessionInner {
     negotiated: AtomicU32,
     /// Optional reply/handshake wait deadline (AC-3.8).
     timeout: Mutex<Option<Duration>>,
+    /// Negotiated FD-over-RPC mode (subplan 2-7). Default `None` ⇒ the
+    /// 2-2 reject path, and `send/recv` use the unchanged framed calls
+    /// (AC-7.1 bit-identical).
+    fd_mode: Mutex<crate::rpc::FileDescriptorTransportMode>,
+    /// Server role: does this endpoint advertise `Unix` FD support on
+    /// `GET_FD_MODE`. Default false.
+    fd_unix_supported: std::sync::atomic::AtomicBool,
 }
 
 /// The [`RpcParcelOps`] implementation bound to one session.
@@ -119,6 +128,33 @@ impl RpcSessionInner {
         Arc::new(SessionParcelOps(
             self.self_weak.lock().expect("self_weak").clone(),
         ))
+    }
+
+    pub(crate) fn fd_mode(&self) -> FileDescriptorTransportMode {
+        *self.fd_mode.lock().expect("fd_mode poisoned")
+    }
+
+    /// Send one wire frame. Only a `Unix`-mode connection routes fds
+    /// via `SCM_RIGHTS`; the default (`None`) uses the unchanged
+    /// framed send and never carries fds (AC-7.1 bit-identical).
+    fn send_msg(&self, frame: &[u8], fds: &[OwnedFd]) -> RpcResult<()> {
+        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+            let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
+            self.transport.send_frame_with_fds(frame, &borrowed)
+        } else {
+            self.transport.send_frame(frame)
+        }
+    }
+
+    /// Receive one wire frame (+ any `SCM_RIGHTS` fds in `Unix` mode).
+    /// A connection never mixes the `Read` and `recvmsg` paths because
+    /// the mode is fixed by negotiation before any RPC traffic.
+    fn recv_msg(&self) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
+        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+            self.transport.recv_frame_with_fds()
+        } else {
+            Ok((self.transport.recv_frame()?, Vec::new()))
+        }
     }
 
     fn self_weak(&self) -> Weak<RpcSessionInner> {
@@ -202,7 +238,9 @@ impl RpcSessionInner {
             data: data.rpc_data_bytes().to_vec(),
         };
         let frame = self.codec.encode_transact(&txn);
-        self.transport.send_frame(&frame)?;
+        // Out-of-band fds collected while serializing the request
+        // (empty unless `Unix` fd-mode — subplan 2-7).
+        self.send_msg(&frame, data.rpc_out_fds())?;
         if oneway {
             return Ok(None);
         }
@@ -213,7 +251,7 @@ impl RpcSessionInner {
             self.transport.set_read_timeout(Some(d))?;
         }
         loop {
-            let frame = self.transport.recv_frame()?;
+            let (frame, in_fds) = self.recv_msg()?;
             match self.codec.decode_message(&frame)? {
                 WireMessage::Reply(WireReply { status, data }) => {
                     if status != 0 {
@@ -221,6 +259,8 @@ impl RpcSessionInner {
                     }
                     let mut reply = Parcel::from_vec(data);
                     reply.attach_rpc_ops(self.parcel_ops());
+                    reply.set_rpc_fd_mode(self.fd_mode());
+                    reply.rpc_set_in_fds(in_fds);
                     reply.set_data_position(0);
                     return Ok(Some(reply));
                 }
@@ -237,7 +277,7 @@ impl RpcSessionInner {
                     // stack over the same connection (single thread per
                     // connection ⇒ correct FIFO nesting, no lock, no
                     // deadlock — AC-3.6).
-                    self.dispatch_transact(t)?;
+                    self.dispatch_transact(t, in_fds)?;
                 }
             }
         }
@@ -245,7 +285,7 @@ impl RpcSessionInner {
 
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress) -> Result<()> {
         let frame = self.codec.encode_dec_strong(&addr);
-        self.transport.send_frame(&frame)?;
+        self.send_msg(&frame, &[])?;
         Ok(())
     }
 
@@ -256,23 +296,23 @@ impl RpcSessionInner {
             .forget_remote(addr);
     }
 
-    /// Send a `REPLY` (status + parcel bytes).
-    fn send_reply(&self, status: i32, data: &[u8]) -> Result<()> {
+    /// Send a `REPLY` (status + parcel bytes + any out-of-band fds).
+    fn send_reply(&self, status: i32, data: &[u8], fds: &[OwnedFd]) -> Result<()> {
         let frame = self.codec.encode_reply(&WireReply {
             status,
             data: data.to_vec(),
         });
-        Ok(self.transport.send_frame(&frame)?)
+        Ok(self.send_msg(&frame, fds)?)
     }
 
     /// Dispatch one inbound `TRANSACT` (server role, or a nested
     /// callback while a client call is in flight) and send its reply.
     /// Shared by [`RpcSessionInner::serve_once`] and the nested-call
     /// arm of [`RpcSessionInner::client_transact`].
-    fn dispatch_transact(&self, t: WireTransaction) -> Result<()> {
+    fn dispatch_transact(&self, t: WireTransaction, in_fds: Vec<OwnedFd>) -> Result<()> {
         let oneway = (t.flags & FLAG_ONEWAY) != 0;
         if t.address.is_zero() {
-            return self.serve_special(t.code, oneway);
+            return self.serve_special(&t, oneway);
         }
         let target = self
             .state
@@ -281,16 +321,19 @@ impl RpcSessionInner {
             .lookup_local(&t.address);
         let Some(target) = target else {
             if !oneway {
-                self.send_reply(StatusCode::DeadObject.into(), &[])?;
+                self.send_reply(StatusCode::DeadObject.into(), &[], &[])?;
             }
             return Ok(());
         };
 
         let mut reader = Parcel::from_vec(t.data);
         reader.attach_rpc_ops(self.parcel_ops());
+        reader.set_rpc_fd_mode(self.fd_mode());
+        reader.rpc_set_in_fds(in_fds);
         reader.set_data_position(0);
         let mut reply = Parcel::new();
         reply.attach_rpc_ops(self.parcel_ops());
+        reply.set_rpc_fd_mode(self.fd_mode());
 
         let result = consume_rpc_interface_token(&mut reader, target.descriptor())
             .and_then(|()| target.rpc_transact(t.code, &mut reader, &mut reply));
@@ -302,21 +345,21 @@ impl RpcSessionInner {
             return Ok(());
         }
         match result {
-            Ok(()) => self.send_reply(0, reply.rpc_data_bytes()),
-            Err(e) => self.send_reply(e.into(), &[]),
+            Ok(()) => self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_out_fds()),
+            Err(e) => self.send_reply(e.into(), &[], &[]),
         }
     }
 
     /// Handle one inbound message. `Ok(false)` ⇒ peer closed (stop).
     fn serve_once(&self) -> Result<bool> {
-        let frame = match self.transport.recv_frame() {
+        let (frame, in_fds) = match self.recv_msg() {
             Ok(f) => f,
             Err(RpcError::PeerClosed) => return Ok(false),
             Err(e) => return Err(e.into()),
         };
         match self.codec.decode_message(&frame)? {
             WireMessage::Transact(t) => {
-                self.dispatch_transact(t)?;
+                self.dispatch_transact(t, in_fds)?;
                 Ok(true)
             }
             WireMessage::DecStrong(a) => {
@@ -334,14 +377,14 @@ impl RpcSessionInner {
     }
 
     /// Special zero-address transactions (android `RpcState`
-    /// `GET_ROOT`/`GET_MAX_THREADS`/`GET_SESSION_ID`). Full multi-conn
-    /// negotiation is subplan 2-3; 2-2 needs `GET_ROOT`.
-    fn serve_special(&self, code: u32, oneway: bool) -> Result<()> {
+    /// `GET_ROOT`/`GET_MAX_THREADS`/`GET_SESSION_ID`, plus the
+    /// rsbinder/2-7 `GET_FD_MODE` extension).
+    fn serve_special(&self, t: &WireTransaction, oneway: bool) -> Result<()> {
         if oneway {
             // Special transactions are never oneway.
             return Ok(());
         }
-        match SpecialTransaction::from_code(code) {
+        match SpecialTransaction::from_code(t.code) {
             Some(SpecialTransaction::GetRoot) => {
                 let root = self.root.lock().expect("root poisoned").clone();
                 let mut reply = Parcel::new();
@@ -351,20 +394,48 @@ impl RpcSessionInner {
                     Some(b) => reply.write(b)?,
                     None => reply.write(&0i32)?,
                 }
-                self.send_reply(0, reply.rpc_data_bytes())
+                self.send_reply(0, reply.rpc_data_bytes(), &[])
             }
             Some(SpecialTransaction::GetMaxThreads) => {
                 let n = self.max_threads.load(Ordering::SeqCst) as i32;
                 let mut reply = Parcel::new();
                 reply.write(&n)?;
-                self.send_reply(0, reply.rpc_data_bytes())
+                self.send_reply(0, reply.rpc_data_bytes(), &[])
             }
             Some(SpecialTransaction::GetSessionId) => {
                 let mut reply = Parcel::new();
                 reply.write(&1i32)?;
-                self.send_reply(0, reply.rpc_data_bytes())
+                self.send_reply(0, reply.rpc_data_bytes(), &[])
             }
-            None => self.send_reply(StatusCode::UnknownTransaction.into(), &[]),
+            Some(SpecialTransaction::GetFdMode) => {
+                // Body: i32 — does the client want `Unix`. Agree only
+                // if this endpoint also supports it (else `None`, never
+                // an error — AC-7.3). The reply (0=None,1=Unix) is sent
+                // in the *current* (None) mode; both sides switch only
+                // after this exchange completes, so framing stays
+                // consistent.
+                let mut req = Parcel::from_vec(t.data.clone());
+                req.set_data_position(0);
+                let want_unix = req.read::<i32>().unwrap_or(0) == 1;
+                let agreed = if want_unix && self.fd_unix_supported.load(Ordering::SeqCst) {
+                    FileDescriptorTransportMode::Unix
+                } else {
+                    FileDescriptorTransportMode::None
+                };
+                let mut reply = Parcel::new();
+                reply.write(
+                    &(if agreed == FileDescriptorTransportMode::Unix {
+                        1i32
+                    } else {
+                        0i32
+                    }),
+                )?;
+                self.send_reply(0, reply.rpc_data_bytes(), &[])?;
+                // Switch AFTER the reply is on the wire (None-mode).
+                *self.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+                Ok(())
+            }
+            None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[]),
         }
     }
 }
@@ -392,9 +463,57 @@ impl RpcSession {
             max_threads: AtomicU32::new(1),
             negotiated: AtomicU32::new(0),
             timeout: Mutex::new(None),
+            fd_mode: Mutex::new(FileDescriptorTransportMode::None),
+            fd_unix_supported: AtomicBool::new(false),
         });
         *inner.self_weak.lock().expect("self_weak") = Arc::downgrade(&inner);
         RpcSession { inner }
+    }
+
+    /// Server role: advertise that this endpoint will accept the
+    /// `Unix` FD-over-RPC mode on `GET_FD_MODE` (subplan 2-7). Default
+    /// is *not* advertised, so the FD reject (2-2) is the default
+    /// everywhere. Has no effect on a non-UDS transport (the transport
+    /// fd methods reject by type regardless).
+    pub fn set_supported_fd_modes(&self, modes: &[FileDescriptorTransportMode]) {
+        let unix = modes.contains(&FileDescriptorTransportMode::Unix);
+        self.inner.fd_unix_supported.store(unix, Ordering::SeqCst);
+    }
+
+    /// Client role: negotiate the FD-over-RPC mode (subplan 2-7).
+    /// Sends exactly one `GET_FD_MODE` packet; the agreed mode is
+    /// `Unix` iff *both* peers opted in, else `None` (never an error —
+    /// AC-7.3). Must be called before any FD-bearing call, like
+    /// [`RpcSession::negotiate`].
+    pub fn negotiate_fd_transport(
+        &self,
+        want: FileDescriptorTransportMode,
+    ) -> Result<FileDescriptorTransportMode> {
+        let want_unix = want == FileDescriptorTransportMode::Unix;
+        let mut req = Parcel::new();
+        req.write(&(if want_unix { 1i32 } else { 0i32 }))?;
+        let mut reply = self
+            .inner
+            .client_transact(
+                RpcAddress::zero(),
+                SpecialTransaction::GetFdMode.code(),
+                &req,
+                0,
+            )?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        let agreed = if reply.read::<i32>()? == 1 {
+            FileDescriptorTransportMode::Unix
+        } else {
+            FileDescriptorTransportMode::None
+        };
+        // Switch AFTER the reply has been fully read in None-mode.
+        *self.inner.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+        Ok(agreed)
+    }
+
+    /// The negotiated FD-over-RPC mode (default `None`).
+    pub fn fd_transport_mode(&self) -> FileDescriptorTransportMode {
+        self.inner.fd_mode()
     }
 
     /// Publish the server's root object (returned by `get_root`).
