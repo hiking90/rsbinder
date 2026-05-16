@@ -28,12 +28,20 @@ use super::{RpcError, RpcResult};
 mod mem;
 #[cfg(feature = "rpc-tcp-debug")]
 mod tcp_debug;
+#[cfg(feature = "rpc-tls")]
+mod tls;
 mod unix;
+#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+mod vsock;
 
 pub use mem::MemTransport;
 #[cfg(feature = "rpc-tcp-debug")]
 pub use tcp_debug::{insecure_warning_emitted, TcpDebugTransport};
+#[cfg(feature = "rpc-tls")]
+pub use tls::TlsTransport;
 pub use unix::UnixTransport;
+#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+pub use vsock::VsockTransport;
 
 /// Hard cap on a single decoded frame.
 ///
@@ -105,10 +113,63 @@ pub enum PeerIdentity {
         /// Peer process PID (`-1` if unavailable on this platform).
         pid: i32,
     },
+    /// A vsock peer, identified by its context id. **Not an ACL
+    /// basis** — `cid` is a routing address, and the trust boundary is
+    /// hypervisor VM isolation (subplan 2-4 R1). Logged with the cid.
+    Vsock {
+        /// vsock context id of the peer VM/host.
+        cid: u32,
+    },
+    /// A TLS peer authenticated by its leaf certificate (subplan 2-4
+    /// track T). The trust boundary is the certificate chain.
+    Certificate(CertId),
     /// No identity is available. **ACL is not possible** against an
     /// anonymous peer; this must be surfaced in logs and never treated
     /// as trusted. Used by the debug-only plaintext TCP backend.
     Anonymous,
+}
+
+/// Identity extracted from a peer's TLS leaf certificate (subplan
+/// 2-4 track T). Carries the subject and a SHA-256 fingerprint; ACL
+/// is the caller's responsibility on top of this.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CertId {
+    subject: String,
+    fingerprint: [u8; 32],
+}
+
+impl CertId {
+    /// Construct from a subject string and the leaf cert SHA-256.
+    pub fn new(subject: impl Into<String>, fingerprint: [u8; 32]) -> Self {
+        CertId {
+            subject: subject.into(),
+            fingerprint,
+        }
+    }
+    /// The certificate subject (DN / SAN summary).
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+    /// The leaf certificate SHA-256 fingerprint.
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+    /// Lowercase hex of the fingerprint (for logging / pinning).
+    pub fn fingerprint_hex(&self) -> String {
+        self.fingerprint
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+impl fmt::Debug for CertId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CertId")
+            .field("subject", &self.subject)
+            .field("fingerprint", &self.fingerprint_hex())
+            .finish()
+    }
 }
 
 impl PeerIdentity {
@@ -139,6 +200,17 @@ impl fmt::Display for PeerIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PeerIdentity::Local { uid, pid } => write!(f, "local(uid={uid}, pid={pid})"),
+            PeerIdentity::Vsock { cid } => {
+                write!(f, "vsock(cid={cid}; routing only, NOT an ACL basis)")
+            }
+            PeerIdentity::Certificate(c) => {
+                write!(
+                    f,
+                    "cert(subject={:?}, sha256={})",
+                    c.subject(),
+                    c.fingerprint_hex()
+                )
+            }
             // Make the security-relevant "no identity" state loud.
             PeerIdentity::Anonymous => {
                 write!(

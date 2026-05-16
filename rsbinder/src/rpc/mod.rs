@@ -62,7 +62,13 @@ pub use proxy::RpcProxy;
 pub use server::RpcServer;
 pub use session::RpcSession;
 pub use state::RpcState;
-pub use transport::{PeerIdentity, RpcTransport};
+pub use transport::{CertId, PeerIdentity, RpcTransport};
+
+/// Re-export of the exact `rustls` the `tls` backend links, so callers
+/// build `ClientConfig`/`ServerConfig` against a matching version
+/// (subplan 2-4 track T — key/cert management stays caller-side).
+#[cfg(feature = "rpc-tls")]
+pub use rustls;
 pub use wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 
 use std::fmt;

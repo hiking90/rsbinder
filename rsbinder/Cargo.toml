@@ -29,6 +29,15 @@ rpc = ["rustix/net"]
 # production (use `tls` for real networks). Gated separately so it is
 # absent from a plain `rpc` build. See plan/2-1 §2-1.f2 / AC-1.8.
 rpc-tcp-debug = ["rpc"]
+# vsock backend (subplan 2-4 track V). host↔VM, trust = hypervisor VM
+# isolation. **Linux-only** (the `vsock` crate is Linux-specific);
+# enabling this on a non-Linux target is unsupported. Zero cost when
+# off (optional dep). See plan/2-4-vsock-tls.md.
+rpc-vsock = ["rpc", "dep:vsock"]
+# TLS backend over rustls (subplan 2-4 track T) for untrusted
+# channels. Zero cost when off (optional deps). rsbinder never
+# invents crypto — it delegates entirely to rustls (plan §5).
+rpc-tls = ["rpc", "dep:rustls", "dep:sha2"]
 android_10 = []
 android_11 = []
 android_12 = []
@@ -50,6 +59,11 @@ downcast-rs = { workspace = true }
 async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 rsproperties.workspace = true
+# RPC additive backends (subplan 2-4) — all optional, feature-gated,
+# so default / `rpc` / `rpc-tcp-debug` builds pull none of them.
+vsock = { version = "0.5", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }
@@ -57,6 +71,9 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 [dev-dependencies]
 env_logger = { workspace = true }
 serial_test = { workspace = true }
+# PEM parsing for the `rpc-tls` e2e test only (tiny, no crypto). The
+# test itself is `#![cfg(feature = "rpc-tls")]`.
+rustls-pemfile = "2"
 
 # loom is only used by tests gated on `--cfg loom`. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
