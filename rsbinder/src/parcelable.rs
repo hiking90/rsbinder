@@ -373,6 +373,13 @@ macro_rules! impl_parcelable_struct {
         impl Deserialize for $ty {
             fn deserialize(parcel: &mut Parcel) -> Result<Self> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
+                // SAFETY: this macro arm is only instantiated for the
+                // bindgen `#[repr(C)]` binder-ABI structs listed in the
+                // `parcelable_struct!` invocations below — plain-old-data
+                // (integers / unions / fixed arrays) with no invalid bit
+                // patterns, so every `[u8; SIZE]` is a valid `$ty`.
+                // `parcel.try_into()?` yields exactly `SIZE` initialized
+                // bytes (length-checked; returns Err otherwise).
                 Ok(unsafe { std::mem::transmute::<[u8; SIZE], $ty>(parcel.try_into()?) })
             }
         }

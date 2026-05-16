@@ -145,6 +145,11 @@ impl<T: Clone + Default> ParcelData<T> {
 
     fn set_len(&mut self, len: usize) {
         match self {
+            // SAFETY: Vec::set_len requires `len <= capacity` and that the
+            // first `len` bytes are initialized. Element type is `u8`, so any
+            // byte pattern is a valid value; every caller reserves capacity
+            // and writes the bytes (copy_nonoverlapping) before calling this,
+            // so the caller must uphold `len <= capacity`.
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
             _ => panic!("&[u8] can't support set_len()."),
         }
@@ -281,11 +286,22 @@ impl Parcel {
         self.pos >= self.data.len()
     }
 
-    pub fn set_data_size(&mut self, new_len: usize) {
+    pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
+        if new_len > self.data.capacity() {
+            // The backing buffer cannot hold `new_len` bytes — a broken
+            // driver/buffer contract. Refuse rather than enter the
+            // `Vec::set_len` UB of claiming uninitialized capacity.
+            log::error!(
+                "set_data_size({new_len}) exceeds capacity {}",
+                self.data.capacity()
+            );
+            return Err(StatusCode::BadValue);
+        }
         self.data.set_len(new_len);
         if new_len < self.pos {
             self.pos = new_len;
         }
+        Ok(())
     }
 
     pub fn close_file_descriptors(&self) {
@@ -330,7 +346,10 @@ impl Parcel {
     }
 
     pub fn data_avail(&self) -> usize {
-        let result = self.data.len() - self.pos;
+        // `pos` can legitimately be moved past `len` (set_data_position is
+        // unbounded), so saturate instead of underflow-panicking: nothing
+        // is available once the cursor is at/after the end.
+        let result = self.data.len().saturating_sub(self.pos);
         assert!(result < i32::MAX as _, "data too big: {result}");
 
         result
@@ -587,6 +606,11 @@ impl Parcel {
         let pos = self.pos;
 
         self.data.reserve(pos + padded);
+        // SAFETY: `reserve(pos + padded)` above guarantees the destination
+        // has at least `pos + padded` bytes of capacity, so `add(pos)` and
+        // the `size`-byte copy (size <= padded) stay in-bounds and the
+        // ranges do not overlap (distinct allocations). `set_len` only grows
+        // up to the just-reserved capacity over now-initialized `u8` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 parcelable.as_ptr() as _,
@@ -633,6 +657,9 @@ impl Parcel {
 
     pub(crate) fn write_aligned<T>(&mut self, val: &T) {
         let unaligned = std::mem::size_of::<T>();
+        // SAFETY: `val` is a live `&T`, so its `size_of::<T>()` bytes are
+        // valid to read as `u8` for the borrow's duration. The resulting
+        // slice does not outlive `val` (consumed synchronously below).
         let val_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
 
@@ -645,6 +672,11 @@ impl Parcel {
         let pos = self.pos;
 
         self.data.reserve(pos + aligned);
+        // SAFETY: `reserve(pos + aligned)` guarantees capacity for `add(pos)`
+        // and the `unaligned`-byte copy (unaligned <= aligned). Source `data`
+        // and the parcel buffer are distinct allocations (non-overlapping).
+        // `set_len` only grows up to the reserved capacity over `u8` bytes
+        // just initialized by the copy.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 data.as_ptr(),
@@ -775,6 +807,12 @@ impl Parcel {
         let num_objects = last_idx - first_idx + 1;
 
         self.data.reserve(self.pos + size);
+        // SAFETY: the source range `other.data[offset..offset + size]` is
+        // bounds-checked by the slice index above (panics if out of range),
+        // and `reserve(self.pos + size)` guarantees the destination has
+        // capacity for `add(self.pos)` plus `size` bytes. `other` and `self`
+        // are distinct parcels (non-overlapping). `set_len` only grows up to
+        // the reserved capacity over the `u8` bytes just copied.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 other.data.as_slice()[offset..offset + size].as_ptr(),
@@ -831,17 +869,18 @@ impl Drop for Parcel {
     fn drop(&mut self) {
         match self.free_buffer {
             Some(free_buffer) => {
-                // Free buffer must succeed - if it fails, we have a critical system issue
-                // that will lead to resource leaks. Better to abort than continue in
-                // an inconsistent state.
-                free_buffer(
+                // Never panic in Drop: a failure here may run during unwind,
+                // and a double-panic aborts the whole process — strictly
+                // worse than logging and leaking the kernel buffer.
+                if let Err(e) = free_buffer(
                     Some(self),
                     self.data.as_ptr() as _,
                     self.data.len(),
                     self.objects.as_ptr() as _,
                     self.objects.len(),
-                )
-                .expect("Failed to free parcel buffer: critical system resource leak");
+                ) {
+                    log::error!("Failed to free parcel buffer ({e}); leaking the kernel buffer");
+                }
             }
             None => {
                 self.release_objects();
@@ -854,6 +893,10 @@ impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         if self.objects.len() > 0 {
+            // SAFETY: `self.objects` is a live `Vec<binder_size_t>`, so its
+            // `len * size_of::<binder_size_t>()` bytes are a valid contiguous
+            // region readable as `u8`. The slice is consumed synchronously by
+            // `pretty_hex` and does not outlive the borrow of `self.objects`.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     self.objects.as_ptr() as *const u8,
@@ -1082,5 +1125,44 @@ mod tests {
         // Empty slice fallback — pointer is the dangling NonNull but no UB.
         assert_eq!(parcel.data_size(), 0);
         drop(parcel);
+    }
+
+    // Hardening regression: `set_data_size` must reject a length larger
+    // than the backing buffer's capacity instead of entering the
+    // `Vec::set_len` UB of claiming uninitialized capacity. A broken
+    // driver/buffer contract is the untrusted-input source here.
+    #[test]
+    fn set_data_size_rejects_over_capacity() {
+        let mut parcel = Parcel::new();
+        let cap = parcel.capacity();
+
+        // Exactly at capacity is the boundary and must succeed.
+        assert!(parcel.set_data_size(cap).is_ok());
+        // One past capacity must be refused with BadValue, not panic/UB.
+        assert_eq!(parcel.set_data_size(cap + 1), Err(StatusCode::BadValue));
+        // Zero is always valid.
+        assert!(parcel.set_data_size(0).is_ok());
+    }
+
+    // Hardening regression: `data_avail` must saturate when the cursor
+    // has been moved past the end (`set_data_position` is unbounded).
+    // The pre-fix `len - pos` underflowed and panicked in debug builds
+    // on attacker-influenced positions.
+    #[test]
+    fn data_avail_saturates_when_pos_past_end() {
+        let mut parcel = Parcel::new();
+        parcel.write(&0u64).expect("write u64");
+        assert_eq!(parcel.data_avail(), 0, "cursor at end → nothing available");
+
+        parcel.set_data_position(0);
+        assert_eq!(parcel.data_avail(), 8, "8 bytes available from start");
+
+        // Cursor far past the end must not underflow-panic.
+        parcel.set_data_position(9999);
+        assert_eq!(
+            parcel.data_avail(),
+            0,
+            "saturating_sub, not underflow panic"
+        );
     }
 }

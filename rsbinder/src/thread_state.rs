@@ -750,6 +750,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }
                 };
 
+                // SAFETY: `tr_secctx` was just filled by the kernel on the
+                // BR_TRANSACTION(_SEC_CTX) path, so `transaction_data` is
+                // fully initialized and the `data.ptr` union variant (buffer
+                // + offsets, not `data.buf`) is the active one for a
+                // kernel-delivered transaction. `from_ipc_parts` adopts the
+                // driver-owned buffer/offsets with sizes taken from the same
+                // struct and the matching `free_buffer` reclaimer.
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
@@ -782,6 +789,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let mut reply = Parcel::new();
 
                 let result = {
+                    // SAFETY: kernel-delivered transaction (see above); for a
+                    // transaction targeting a local binder the `target` union's
+                    // `ptr` variant is the active one. Read-only.
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     if target_ptr != 0 {
                         // `target_ptr` is now the process-monotonic id
@@ -852,6 +862,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                     let mut log = format!(
                         "oneway function results for code {} on binder at {:X}",
                         tr_secctx.transaction_data.code,
+                        // SAFETY: kernel-delivered transaction; `target.ptr`
+                        // is the active union variant. Read-only (logging).
                         unsafe { tr_secctx.transaction_data.target.ptr }
                     );
                     log += &format!(" will be dropped but finished with status {err}");
@@ -1111,11 +1123,13 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                         thread_state.out_parcel.data_size()
                     );
                 }
-                thread_state.out_parcel.set_data_size(0);
+                thread_state.out_parcel.set_data_size(0)?;
             }
 
             if bwr.read_consumed > 0 {
-                thread_state.in_parcel.set_data_size(bwr.read_consumed as _);
+                thread_state
+                    .in_parcel
+                    .set_data_size(bwr.read_consumed as _)?;
                 thread_state.in_parcel.set_data_position(0);
 
                 log::trace!(
@@ -1229,9 +1243,20 @@ pub(crate) fn flash_if_needed() -> Result<bool> {
             }
         }
 
+        // Reset is_flushing on every exit (Ok / Err / panic) so a failed
+        // flush_commands() cannot leave the flag stuck true and wedge all
+        // future flushes. Must NOT hold a THREAD_STATE borrow across
+        // flush_commands() — it re-borrows internally (R1).
+        struct FlushGuard;
+        impl Drop for FlushGuard {
+            fn drop(&mut self) {
+                THREAD_STATE.with(|ts| ts.borrow_mut().is_flushing = false);
+            }
+        }
+
         thread_state.borrow_mut().is_flushing = true;
+        let _guard = FlushGuard;
         flush_commands()?;
-        thread_state.borrow_mut().is_flushing = false;
 
         Ok(true)
     })
@@ -1414,7 +1439,16 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         break;
                     }
                     _ => {
-                        panic!("get_and_execute_command() returned unexpected error {e}, aborting");
+                        // A non-EINTR ioctl error (EAGAIN/EBUSY/ENOMEM/…)
+                        // must not abort the process. Leave the thread pool
+                        // gracefully like the TimedOut/CONNREFUSED arms so
+                        // the pool can spawn a replacement looper.
+                        log::error!(
+                            "get_and_execute_command() returned unexpected error {e}; \
+                             leaving the thread pool"
+                        );
+                        result = e;
+                        break;
                     }
                 }
             }
@@ -1851,7 +1885,7 @@ mod tests {
     fn test_process_pending_derefs_handles_reentrant_push_from_drop() {
         use std::sync::atomic::AtomicU64;
         use std::sync::{self, Mutex};
-        let process = ProcessState::init_default();
+        let process = ProcessState::init_default().expect("init_default");
 
         let drop_log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let pusher_target: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));

@@ -54,7 +54,7 @@ fn init_logger() {
 
 fn init_test() {
     init_logger();
-    ProcessState::init_default();
+    ProcessState::init_default().expect("init_default");
     ProcessState::start_thread_pool();
 }
 
@@ -1446,6 +1446,67 @@ fn test_hub() {
         .any(|s| s.name == ITestService::BpTestService::descriptor()));
 }
 
+/// Real-binder regression for the lock-decoupled slow path
+/// (PR #118, `481b8c9`). N threads concurrently resolve the same
+/// service, racing through `strong_proxy_for_handle`'s P1/P2/P3 slow
+/// path while it performs IPC (descriptor query / service-manager
+/// ping) with the `handle_to_proxy` lock released.
+///
+/// Guards two properties the P1/P2/P3 split must preserve under real
+/// binder traffic:
+///
+///  1. **No deadlock.** The pre-fix monolithic slow path held the
+///     `handle_to_proxy` write lock across IPC; the re-entrant
+///     `BR_DEAD_BINDER → send_obituary_for_handle` path then wedged
+///     on the non-reentrant write lock. A regression manifests here
+///     as the `recv_timeout` firing — a bounded test failure, not an
+///     indefinite hang.
+///  2. **Single-Arc convergence.** Every concurrent slow-path
+///     winner/loser must end up sharing one cached proxy identity
+///     (the race-resolution table's whole purpose).
+///
+/// The rsbinder-crate unit tests cover the same logic with a
+/// `cfg(test)` hook; this one adds coverage over a real kernel binder
+/// path and runs inside the integration-test.yml 100-iteration loop,
+/// so it also accumulates cross-iteration cache state (case (b)
+/// resurrection).
+#[test]
+fn test_concurrent_service_resolution_slow_path_no_deadlock() {
+    init_test();
+    let name = ITestService::BpTestService::descriptor();
+
+    const N: usize = 8;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut joins = Vec::with_capacity(N);
+    for _ in 0..N {
+        let tx = tx.clone();
+        joins.push(std::thread::spawn(move || {
+            tx.send(hub::get_service(name))
+                .expect("result channel must not drop");
+        }));
+    }
+    drop(tx);
+
+    let mut binders = Vec::with_capacity(N);
+    for _ in 0..N {
+        let r = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "concurrent get_service must complete within 10s — slow-path deadlock regression",
+        );
+        binders.push(r.expect("test_service must be registered"));
+    }
+    for j in joins {
+        j.join().expect("worker thread must not panic");
+    }
+
+    let first = &binders[0];
+    for b in &binders[1..] {
+        assert_eq!(
+            first, b,
+            "concurrent slow-path resolutions must share one proxy identity"
+        );
+    }
+}
+
 /// Test for issue #47: cached interface string bug
 ///
 /// Originally reproduced the case where `handle_to_proxy` returned a
@@ -1455,7 +1516,7 @@ fn test_hub() {
 /// resolutions:
 ///
 /// ```ignore
-/// let service_manager = rsbinder::hub::default();
+/// let service_manager = rsbinder::hub::default()?;
 /// let all_services = service_manager.list_services(0xf);
 /// for service_name in &all_services {
 ///     let service = service_manager.get_service(service_name).unwrap();

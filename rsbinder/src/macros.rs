@@ -311,13 +311,13 @@ macro_rules! declare_binder_interface {
     } => {
         $crate::declare_binder_interface! {
             $interface[$descriptor] {
-                @doc[concat!("A binder [`Remotable`]($crate::binder_impl::Remotable) that holds an [`", stringify!($interface), "`] object.")]
+                @doc[concat!("A binder `Remotable` that holds an [`", stringify!($interface), "`] object.")]
                 native: {
                     $native($on_transact),
                     $(adapter: $native_adapter,)?
                     $(r#async: $native_async,)?
                 },
-                @doc[concat!("A binder [`Proxy`]($crate::binder_impl::Proxy) that holds an [`", stringify!($interface), "`] remote interface.")]
+                @doc[concat!("A binder `Proxy` that holds an [`", stringify!($interface), "`] remote interface.")]
                 proxy: $proxy {
                     $($fname: $fty = $finit),*
                 },
@@ -405,7 +405,7 @@ macro_rules! declare_binder_interface {
             }
         }
 
-        impl $crate::parcelable::Serialize for dyn $interface
+        impl $crate::parcelable::Serialize for dyn $interface + '_
         where
             dyn $interface: $crate::Interface
         {
@@ -416,7 +416,7 @@ macro_rules! declare_binder_interface {
             }
         }
 
-        impl $crate::parcelable::SerializeOption for dyn $interface {
+        impl $crate::parcelable::SerializeOption for dyn $interface + '_ {
             fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 parcel.write(&this.map($crate::Interface::as_binder))
             }

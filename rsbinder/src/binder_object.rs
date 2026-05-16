@@ -32,8 +32,12 @@ impl flat_binder_object {
             hdr: binder_object_header {
                 type_: BINDER_TYPE_FD,
             },
-            flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { handle: fd as _ },
+            flags: 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            // Init via the 8-byte `binder` field (not the u32 `handle`) so the upper bytes are zeroed:
+            // mirrors AOSP Parcel.cpp `obj.binder = 0; obj.handle = fd;`, avoids leaking uninit stack to the remote.
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: (fd as u32) as u64,
+            },
             cookie: if take_ownership { 1 } else { 0 },
         }
     }
@@ -56,14 +60,25 @@ impl flat_binder_object {
     }
 
     pub(crate) fn handle(&self) -> u32 {
+        // SAFETY: `__bindgen_anon_1` is an integer union (`binder: u64` |
+        // `handle: u32`); every bit pattern is a valid value for both
+        // variants, so the read itself is never UB. Reading `.handle` is
+        // meaningful only for handle/FD-typed objects — that selection is
+        // the caller's contract per `hdr.type`.
         unsafe { self.__bindgen_anon_1.handle }
     }
 
     pub(crate) fn borrowed_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: caller invariant — only called on a BINDER_TYPE_FD object
+        // whose fd is kept alive by the owning parcel for the returned
+        // borrow's lifetime (tied to `&self`).
         unsafe { BorrowedFd::borrow_raw(self.handle() as _) }
     }
 
     pub(crate) fn owned_fd(&self) -> OwnedFd {
+        // SAFETY: caller invariant — only called on a BINDER_TYPE_FD object
+        // that owns its fd, and at most once, so the resulting OwnedFd has
+        // exclusive ownership and will not double-close.
         unsafe { OwnedFd::from_raw_fd(self.handle() as _) }
     }
 
@@ -72,6 +87,8 @@ impl flat_binder_object {
     }
 
     pub(crate) fn pointer(&self) -> binder_uintptr_t {
+        // SAFETY: integer union read (see `handle`); never UB. Meaningful
+        // only for BINDER_TYPE_(WEAK_)BINDER objects — caller's contract.
         unsafe { self.__bindgen_anon_1.binder }
     }
 
@@ -230,6 +247,11 @@ pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<flat_binder
     let bytes = data
         .get(offset..offset + size)
         .ok_or(StatusCode::NotEnoughData)?;
+    // SAFETY: `get(offset..offset + size)` guarantees `bytes` is exactly
+    // `size_of::<flat_binder_object>()` readable bytes. `flat_binder_object`
+    // is a bindgen `#[repr(C)]` POD (no invalid bit patterns), so any byte
+    // pattern is a valid value; `read_unaligned` covers the unknown
+    // alignment of the parcel offset and returns an owned stack copy.
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const flat_binder_object) })
 }
 
@@ -243,6 +265,72 @@ pub(crate) fn write_flat_binder(
     let bytes = data
         .get_mut(offset..offset + size)
         .ok_or(StatusCode::NotEnoughData)?;
+    // SAFETY: `get_mut(offset..offset + size)` guarantees `bytes` is exactly
+    // `size_of::<flat_binder_object>()` writable bytes. `*obj` is a valid
+    // `flat_binder_object`; `write_unaligned` covers the unknown alignment
+    // of the parcel offset.
     unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the `new_with_fd` construction fix.
+    ///
+    /// Two distinct defects were present before the fix:
+    ///
+    ///  1. `flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS` — a bitwise AND
+    ///     between disjoint bit ranges (`0x7F` vs `0x100`) is always 0,
+    ///     so every FD object went on the wire with `flags == 0`. The
+    ///     fix is `0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS`, byte-identical
+    ///     to AOSP `Parcel::writeFileDescriptor`.
+    ///  2. The union was initialized via the u32 `handle` variant, so
+    ///     the upper 4 bytes of the 8-byte `binder` field were left
+    ///     uninitialized and leaked uninitialized stack to the remote
+    ///     (Rust UB). The fix initializes the full-width `binder` field
+    ///     so the upper bytes are guaranteed zero.
+    #[test]
+    fn new_with_fd_flags_and_full_width_init() {
+        let fd: i32 = 7;
+        let obj = flat_binder_object::new_with_fd(fd, false);
+
+        assert_eq!(obj.header_type(), BINDER_TYPE_FD, "must be a FD object");
+
+        // Defect 1: flags must be the OR (0x7F | 0x100 == 0x17F), never 0.
+        assert_eq!(
+            obj.flags,
+            0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            "flags must be 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS (regression: was 0x7F & ... == 0)"
+        );
+        assert_ne!(
+            obj.flags, 0,
+            "AND-instead-of-OR regression: flags collapsed to 0"
+        );
+        assert_eq!(
+            obj.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            "ACCEPTS_FDS bit must be set"
+        );
+
+        // Defect 2: the full 8-byte union must equal exactly `fd` with a
+        // zeroed upper half — no uninitialized stack bytes leaked.
+        assert_eq!(
+            obj.pointer(),
+            fd as u32 as u64,
+            "upper 32 bits of the union must be zero (uninit-leak UB regression)"
+        );
+        assert_eq!(
+            obj.handle(),
+            fd as u32,
+            "handle variant must round-trip the fd"
+        );
+    }
+
+    #[test]
+    fn new_with_fd_cookie_tracks_take_ownership() {
+        assert_eq!(flat_binder_object::new_with_fd(3, true).cookie, 1);
+        assert_eq!(flat_binder_object::new_with_fd(3, false).cookie, 0);
+    }
 }

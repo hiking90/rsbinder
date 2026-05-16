@@ -734,7 +734,7 @@ fn rt() -> TokioRuntime<tokio::runtime::Handle> {
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    ProcessState::init_default();
+    ProcessState::init_default().expect("init_default");
     ProcessState::start_thread_pool();
 
     let runtime = tokio::runtime::Builder::new_current_thread()

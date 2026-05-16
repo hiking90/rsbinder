@@ -687,7 +687,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Initialize ProcessState with binder path and max threads.
     // The meaning of zero max threads is to use the default value. It is dependent on the kernel.
-    ProcessState::init_default();
+    ProcessState::init_default()?;
     ProcessState::start_thread_pool();
 
     let service_name = <BpTestService as ITestService::ITestService>::descriptor();

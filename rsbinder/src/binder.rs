@@ -92,6 +92,13 @@ pub const INTERFACE_HEADER: u32 = b_pack_chars('S', 'Y', 'S', 'T');
 /// Equivalent to `IInterface` in Android's C++ binder implementation.
 pub trait Interface: Send + Sync {
     /// Convert this binder object into a generic [`SIBinder`] reference.
+    ///
+    /// Has a default because AIDL interface traits have `Interface` as a
+    /// supertrait, so every service impl must write `impl Interface for
+    /// MyService {}`; the inner service value is never itself a binder
+    /// (it is wrapped by a generated `Bn*`), so calling `as_binder` on it
+    /// is a programmer error. Real binder types (native `Binder<T>`,
+    /// generated `Bp*` proxies, async wrappers) all override this.
     fn as_binder(&self) -> SIBinder {
         log::error!(
             "as_binder() called on non-Binder object of type {}. \

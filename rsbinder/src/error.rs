@@ -164,8 +164,15 @@ impl From<std::array::TryFromSliceError> for StatusCode {
 }
 
 impl From<std::io::Error> for StatusCode {
-    fn from(_: std::io::Error) -> Self {
-        StatusCode::BadFd
+    fn from(err: std::io::Error) -> Self {
+        // Preserve the underlying errno instead of flattening every I/O
+        // failure to BadFd. OS-backed errors route through the errno
+        // mapping (BADF still yields BadFd); non-OS errors have no errno
+        // to map, so they surface as Unknown.
+        match err.raw_os_error() {
+            Some(raw) => StatusCode::from(rustix::io::Errno::from_raw_os_error(raw)),
+            None => StatusCode::Unknown,
+        }
     }
 }
 
@@ -434,5 +441,27 @@ mod tests {
 
         let code = StatusCode::from(rustix::io::Errno::from_raw_os_error(64));
         assert_eq!(code, StatusCode::Errno(-64));
+    }
+
+    // Regression: `From<std::io::Error>` must preserve the underlying
+    // errno through the Errno mapping instead of flattening every I/O
+    // failure to `BadFd`. Non-OS errors (no errno) surface as `Unknown`.
+    #[test]
+    fn status_code_from_io_error_preserves_errno() {
+        let enoent = std::io::Error::from_raw_os_error(rustix::io::Errno::NOENT.raw_os_error());
+        assert_eq!(
+            StatusCode::from(enoent),
+            StatusCode::NameNotFound,
+            "ENOENT must map to NameNotFound, not be flattened to BadFd"
+        );
+
+        // BADF still resolves to BadFd — via the errno mapping, not a blanket default.
+        let ebadf = std::io::Error::from_raw_os_error(rustix::io::Errno::BADF.raw_os_error());
+        assert_eq!(StatusCode::from(ebadf), StatusCode::BadFd);
+
+        // A non-OS error has no errno to map → Unknown.
+        let non_os = std::io::Error::other("no errno");
+        assert_eq!(non_os.raw_os_error(), None);
+        assert_eq!(StatusCode::from(non_os), StatusCode::Unknown);
     }
 }

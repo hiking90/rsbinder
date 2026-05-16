@@ -73,7 +73,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // Initialize the process state
-//! ProcessState::init_default();
+//! ProcessState::init_default()?;
 //!
 //! // Start the thread pool
 //! ProcessState::start_thread_pool();
@@ -101,7 +101,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // Initialize the process state
-//! ProcessState::init_default();
+//! ProcessState::init_default()?;
 //!
 //! // Get service from service manager
 //! let service = hub::get_service("hello_service")?;
@@ -224,6 +224,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn process_state() {
-        ProcessState::init("/dev/binderfs/binder", 0);
+        ProcessState::init("/dev/binderfs/binder", 0).expect("init");
     }
 }

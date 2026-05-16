@@ -216,7 +216,19 @@ impl From<ExceptionCode> for StatusCode {
 
 impl From<Status> for StatusCode {
     fn from(status: Status) -> Self {
-        status.code
+        // A Status that carries an exception must never collapse to `Ok`.
+        // An application-level exception (e.g. IllegalArgument) with an
+        // `Ok` status code means "no transaction error, but the call did
+        // not succeed" — surface it as FailedTransaction so callers that
+        // map this into a `Result` cannot end up with `Err(StatusCode::Ok)`.
+        // The success path (exception None) and real error codes
+        // (TransactionFailed / ServiceSpecific) are preserved unchanged.
+        match status.code {
+            StatusCode::Ok if status.exception != ExceptionCode::None => {
+                StatusCode::FailedTransaction
+            }
+            code => code,
+        }
     }
 }
 
@@ -251,6 +263,12 @@ impl From<StatusCode> for Status {
 
 impl Serialize for Status {
     fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
+        // Mirrors AOSP `Status::writeToParcel`: on EX_TRANSACTION_FAILED
+        // the binder layer already failed, so nothing is written and the
+        // status code is returned via the error channel rather than as
+        // wire data. This is intentionally indistinguishable from a real
+        // parcel-write failure — same as libbinder ("not going to even
+        // try returning rich error data").
         if self.exception == ExceptionCode::TransactionFailed {
             return Err(self.code);
         }
@@ -432,5 +450,53 @@ mod tests {
         assert_eq!(status, deserialized);
 
         Ok(())
+    }
+
+    // Regression: a Status that carries an application-level exception
+    // but an `Ok` status code must never collapse to `StatusCode::Ok`.
+    // Callers map this into a `Result`, so an `Err(StatusCode::Ok)`
+    // would be a silent success that wasn't one.
+    #[test]
+    fn status_with_exception_never_maps_to_ok() {
+        let status = Status::new(ExceptionCode::IllegalArgument, StatusCode::Ok, None);
+        assert_eq!(
+            StatusCode::from(status),
+            StatusCode::FailedTransaction,
+            "exception + Ok code must surface as FailedTransaction, not Ok"
+        );
+
+        // Success path: no exception, Ok code → preserved as Ok.
+        let ok = Status::new(ExceptionCode::None, StatusCode::Ok, None);
+        assert_eq!(StatusCode::from(ok), StatusCode::Ok);
+
+        // Real error codes are preserved unchanged.
+        let svc = Status::from(StatusCode::ServiceSpecific(7));
+        assert_eq!(StatusCode::from(svc), StatusCode::ServiceSpecific(7));
+        let txn = Status::new(
+            ExceptionCode::TransactionFailed,
+            StatusCode::DeadObject,
+            None,
+        );
+        assert_eq!(StatusCode::from(txn), StatusCode::DeadObject);
+    }
+
+    // Regression: `Serialize for Status` mirrors AOSP
+    // `Status::writeToParcel` — on EX_TRANSACTION_FAILED nothing is
+    // written and the code is returned via the error channel instead
+    // of as wire data.
+    #[test]
+    fn serialize_transaction_failed_returns_err_without_writing() {
+        let status = Status::new(
+            ExceptionCode::TransactionFailed,
+            StatusCode::DeadObject,
+            None,
+        );
+        let mut parcel = Parcel::new();
+        assert_eq!(status.serialize(&mut parcel), Err(StatusCode::DeadObject));
+        assert_eq!(
+            parcel.data_size(),
+            0,
+            "nothing must be written on the failed path"
+        );
     }
 }

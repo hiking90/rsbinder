@@ -147,52 +147,136 @@ pub enum ServiceManager {
 
 /// Returns the global ServiceManager instance appropriate for the current Android version.
 ///
-/// This function creates a singleton ServiceManager instance on first call and returns it
-/// for subsequent calls. The correct version-specific implementation is automatically
-/// selected based on the detected Android SDK version.
-pub fn default() -> Arc<ServiceManager> {
+/// The singleton is created on first call and reused afterwards. The correct
+/// version-specific implementation is selected from the detected Android SDK
+/// version.
+///
+/// Returns an error instead of panicking when the context object cannot be
+/// obtained, the proxy cannot be created, or the SDK version is unsupported.
+/// A failed initialization is not cached, so a later call may retry.
+pub fn default() -> Result<Arc<ServiceManager>> {
     static GLOBAL_SM: OnceLock<Arc<ServiceManager>> = OnceLock::new();
 
-    GLOBAL_SM.get_or_init(|| {
-        let process = ProcessState::as_self();
-        let context = process.context_object()
-            .expect("Failed to get context_object during ServiceManager initialization");
-        #[cfg(target_os = "android")]
-        let sdk_version = crate::get_android_sdk_version();
+    if let Some(sm) = GLOBAL_SM.get() {
+        return Ok(sm.clone());
+    }
 
-        const ERROR_MSG: &str = "Failed to create BpServiceManager from binder during ServiceManager initialization";
+    let process = ProcessState::as_self();
+    let context = process.context_object()?;
+    #[cfg(target_os = "android")]
+    let sdk_version = crate::get_android_sdk_version();
 
-        #[cfg(target_os = "android")]
-        let service_manager = {
-            macro_rules! create_service_manager {
-                ($variant:ident, $module:ident) => {
-                    ServiceManager::$variant($module::BpServiceManager::from_binder(context).expect(ERROR_MSG))
-                };
+    #[cfg(target_os = "android")]
+    let service_manager = {
+        macro_rules! create_service_manager {
+            ($variant:ident, $module:ident) => {
+                ServiceManager::$variant(
+                    $module::BpServiceManager::from_binder(context).ok_or(StatusCode::BadType)?,
+                )
+            };
+        }
+
+        match sdk_version {
+            sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
+            #[cfg(feature = "android_14")]
+            sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => {
+                create_service_manager!(Android14, android_14)
             }
-
-            match sdk_version {
-                sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
-                #[cfg(feature = "android_14")]
-                sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => create_service_manager!(Android14, android_14),
-                #[cfg(feature = "android_13")]
-                sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
-                #[cfg(feature = "android_12")]
-                sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
-                #[cfg(feature = "android_11")]
-                sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
-                #[cfg(feature = "android_10")]
-                sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
-                _ => panic!("default: Unsupported Android SDK version: {}", sdk_version),
+            #[cfg(feature = "android_13")]
+            sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
+            #[cfg(feature = "android_12")]
+            sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => {
+                create_service_manager!(Android12, android_12)
             }
-        };
+            #[cfg(feature = "android_11")]
+            sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
+            #[cfg(feature = "android_10")]
+            sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
+            _ => return Err(StatusCode::InvalidOperation),
+        }
+    };
 
-        #[cfg(not(target_os = "android"))]
-        let service_manager = ServiceManager::Android16(android_16::BpServiceManager::from_binder(context)
-            .expect(ERROR_MSG));
+    #[cfg(not(target_os = "android"))]
+    let service_manager = ServiceManager::Android16(
+        android_16::BpServiceManager::from_binder(context).ok_or(StatusCode::BadType)?,
+    );
 
-        Arc::new(service_manager)
-    }).clone()
+    // Cache only on success; a failed init returned above is not stored,
+    // so a later call may retry. If two threads race here, get_or_init
+    // keeps the first stored instance and the extra one is dropped.
+    Ok(GLOBAL_SM.get_or_init(|| Arc::new(service_manager)).clone())
 }
+
+/// Forwards an existing `IServiceCallback` to a per-version
+/// service-manager shim without reconstructing a typed `Strong`.
+///
+/// Each `android_N::IServiceCallback` is generated from its own AIDL unit,
+/// so they are distinct trait types with independently-built vtables;
+/// transmuting a `Strong<dyn _>` (a `Box<dyn _>` fat pointer) across them
+/// would dispatch through a foreign vtable, a layout Rust does not
+/// guarantee. A `FromIBinder::try_from` round-trip is also wrong: it
+/// rejects a *local* callback whose concrete native type differs from the
+/// target version's (descriptor matches but the `Inner<B>` downcast
+/// fails), which is the normal case for this API.
+///
+/// `register/unregister_for_notifications` only ever serialize the
+/// callback as its underlying `SIBinder` (`Serialize for dyn _` calls
+/// `as_binder()` and nothing else), so a thin wrapper that returns the
+/// original `SIBinder` is wire-identical and behavior-identical for both
+/// local and proxy callbacks, with no `unsafe`. `onRegistration` is
+/// unreachable here: the wrapper is only serialized and sent; inbound
+/// notifications are delivered by the kernel to the original binder node,
+/// never to this transient local forwarder.
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+struct ForwardServiceCallback(crate::SIBinder);
+
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+impl crate::Interface for ForwardServiceCallback {
+    fn as_binder(&self) -> crate::SIBinder {
+        self.0.clone()
+    }
+}
+
+/// Emits the per-version `IServiceCallback` impl for [`ForwardServiceCallback`]
+/// (one per supported pre-16 version; collapses what was 4× duplicated).
+macro_rules! forward_service_callback_impl {
+    ($modu:ident, $feat:literal) => {
+        #[cfg(all(target_os = "android", feature = $feat))]
+        impl $modu::IServiceCallback for ForwardServiceCallback {
+            fn r#onRegistration(
+                &self,
+                _name: &str,
+                _binder: &crate::SIBinder,
+            ) -> crate::status::Result<()> {
+                // Unreachable on the serialize-only path; see the
+                // ForwardServiceCallback doc. Return an error rather than
+                // panic in library code if it is ever reached.
+                Err(crate::StatusCode::UnknownTransaction.into())
+            }
+        }
+    };
+}
+
+forward_service_callback_impl!(android_11, "android_11");
+forward_service_callback_impl!(android_12, "android_12");
+forward_service_callback_impl!(android_13, "android_13");
+forward_service_callback_impl!(android_14, "android_14");
 
 impl ServiceManager {
     /// Retrieves a service by name.
@@ -395,39 +479,27 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_11::IServiceCallback>)
-                };
-                android_11::register_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_11::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_11::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_12::IServiceCallback>)
-                };
-                android_12::register_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_12::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_12::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_13::IServiceCallback>)
-                };
-                android_13::register_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_13::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_13::register_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_14::IServiceCallback>)
-                };
-                android_14::register_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_14::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_14::register_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
                 android_16::register_for_notifications(sm, name, callback)
@@ -451,39 +523,27 @@ impl ServiceManager {
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_11::IServiceCallback>)
-                };
-                android_11::unregister_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_11::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_11::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_12::IServiceCallback>)
-                };
-                android_12::unregister_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_12::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_12::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_13::IServiceCallback>)
-                };
-                android_13::unregister_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_13::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_13::unregister_for_notifications(sm, name, &callback)
             }
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
-                // SAFETY: This transmutation is safe because both types represent the same AIDL interface
-                let callback = unsafe {
-                    &*(callback as *const _
-                        as *const crate::Strong<dyn android_14::IServiceCallback>)
-                };
-                android_14::unregister_for_notifications(sm, name, callback)
+                let callback: crate::Strong<dyn android_14::IServiceCallback> =
+                    crate::Strong::new(Box::new(ForwardServiceCallback(callback.as_binder())));
+                android_14::unregister_for_notifications(sm, name, &callback)
             }
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
@@ -502,7 +562,7 @@ impl ServiceManager {
 /// This is equivalent to `default().get_interface(name)`.
 #[inline]
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
-    default().get_interface(name)
+    default()?.get_interface(name)
 }
 
 /// Convenience function to list services from the default ServiceManager.
@@ -510,7 +570,11 @@ pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
 /// This is equivalent to `default().list_services(dump_priority)`.
 #[inline]
 pub fn list_services(dump_priority: i32) -> Vec<String> {
-    default().list_services(dump_priority)
+    // Consistent with this wrapper's existing error-swallowing contract:
+    // an unavailable ServiceManager yields an empty list rather than a panic.
+    default()
+        .map(|sm| sm.list_services(dump_priority))
+        .unwrap_or_default()
 }
 
 /// Convenience function to register for notifications from the default ServiceManager.
@@ -521,7 +585,7 @@ pub fn register_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> Result<()> {
-    default().register_for_notifications(name, callback)
+    default()?.register_for_notifications(name, callback)
 }
 
 /// Convenience function to unregister from notifications from the default ServiceManager.
@@ -532,7 +596,7 @@ pub fn unregister_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> Result<()> {
-    default().unregister_for_notifications(name, callback)
+    default()?.unregister_for_notifications(name, callback)
 }
 
 /// Convenience function to add a service to the default ServiceManager.
@@ -540,7 +604,8 @@ pub fn unregister_for_notifications(
 /// This is equivalent to `default().add_service(identifier, binder)`.
 #[inline]
 pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
-    default().add_service(identifier, binder)
+    // `?` converts a StatusCode init failure into Status via From<StatusCode>.
+    default()?.add_service(identifier, binder)
 }
 
 /// Convenience function to get a service from the default ServiceManager.
@@ -548,7 +613,7 @@ pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<()
 /// This is equivalent to `default().get_service(name)`.
 #[inline]
 pub fn get_service(name: &str) -> Option<SIBinder> {
-    default().get_service(name)
+    default().ok()?.get_service(name)
 }
 
 /// Convenience function to check if a service is available from the default ServiceManager.
@@ -556,7 +621,7 @@ pub fn get_service(name: &str) -> Option<SIBinder> {
 /// This is equivalent to `default().check_service(name)`.
 #[inline]
 pub fn check_service(name: &str) -> Option<SIBinder> {
-    default().check_service(name)
+    default().ok()?.check_service(name)
 }
 
 /// Convenience function to check if a service is declared from the default ServiceManager.
@@ -564,7 +629,7 @@ pub fn check_service(name: &str) -> Option<SIBinder> {
 /// This is equivalent to `default().is_declared(name)`.
 #[inline]
 pub fn is_declared(name: &str) -> bool {
-    default().is_declared(name)
+    default().map(|sm| sm.is_declared(name)).unwrap_or(false)
 }
 
 /// Convenience function to get debug information about all services from the default ServiceManager.
@@ -573,5 +638,5 @@ pub fn is_declared(name: &str) -> bool {
 /// Note that this feature may not be available on all Android versions.
 #[inline]
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
-    default().get_service_debug_info()
+    default()?.get_service_debug_info()
 }
