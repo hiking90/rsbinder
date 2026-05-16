@@ -171,8 +171,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         macro_rules! create_service_manager {
             ($variant:ident, $module:ident) => {
                 ServiceManager::$variant(
-                    $module::BpServiceManager::from_binder(context)
-                        .ok_or(StatusCode::BadType)?,
+                    $module::BpServiceManager::from_binder(context).ok_or(StatusCode::BadType)?,
                 )
             };
         }
@@ -180,11 +179,15 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         match sdk_version {
             sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
             #[cfg(feature = "android_14")]
-            sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => create_service_manager!(Android14, android_14),
+            sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => {
+                create_service_manager!(Android14, android_14)
+            }
             #[cfg(feature = "android_13")]
             sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
             #[cfg(feature = "android_12")]
-            sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => create_service_manager!(Android12, android_12),
+            sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => {
+                create_service_manager!(Android12, android_12)
+            }
             #[cfg(feature = "android_11")]
             sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
             #[cfg(feature = "android_10")]

@@ -879,9 +879,7 @@ impl Drop for Parcel {
                     self.objects.as_ptr() as _,
                     self.objects.len(),
                 ) {
-                    log::error!(
-                        "Failed to free parcel buffer ({e}); leaking the kernel buffer"
-                    );
+                    log::error!("Failed to free parcel buffer ({e}); leaking the kernel buffer");
                 }
             }
             None => {

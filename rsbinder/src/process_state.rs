@@ -421,8 +421,8 @@ impl ProcessState {
     /// Initialize ProcessState with default binder path and max threads.
     /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
     /// DEFAULT_BINDER_PATH is "/dev/binderfs/binder".
-    pub fn init_default(
-    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
+    pub fn init_default() -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>>
+    {
         let path = if Path::new(crate::DEFAULT_BINDER_PATH).exists() {
             crate::DEFAULT_BINDER_PATH
         } else {
