@@ -19,6 +19,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 default = ["tokio"]
 tokio = ["async", "tokio/full"]
 async = ["rsbinder-aidl/async", "async-trait"]
+# RPC transport (binder-over-socket) — a separate stack from the kernel
+# binder path. Off by default; enabling it pulls in rustix's `net` APIs
+# (socketpair / SO_PEERCRED / SCM_RIGHTS) only when `rpc` is selected, so
+# default and `--no-default-features` builds carry zero RPC/net cost.
+# See plan/2-rpc-transport.md and plan/2-1-skeleton-transport.md.
+rpc = ["rustix/net"]
+# Plaintext TCP transport — DEBUG / interop bring-up ONLY, never
+# production (use `tls` for real networks). Gated separately so it is
+# absent from a plain `rpc` build. See plan/2-1 §2-1.f2 / AC-1.8.
+rpc-tcp-debug = ["rpc"]
 android_10 = []
 android_11 = []
 android_12 = []

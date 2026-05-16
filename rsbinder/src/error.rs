@@ -62,6 +62,17 @@ pub enum StatusCode {
     TimedOut,
     /// Bad file descriptor
     BadFd,
+    /// RPC transport/protocol error (binder-over-socket stack).
+    ///
+    /// Payload-free on purpose: `StatusCode` derives `Copy`/`Ord`/`Hash`
+    /// and has three hand-written exhaustive matches, so a rich payload
+    /// variant is impossible here. The detailed error lives in
+    /// [`crate::rpc::RpcError`]; this variant is only the boundary
+    /// projection used when an RPC failure must surface through
+    /// `rsbinder::Result`. Present only with the `rpc` feature, so the
+    /// default / rpc-off public API surface is unchanged.
+    #[cfg(feature = "rpc")]
+    RpcError,
     /// System errno value
     Errno(i32),
     /// Service-specific error code
@@ -93,6 +104,8 @@ impl fmt::Display for StatusCode {
             StatusCode::WouldBlock => write!(f, "WouldBlock"),
             StatusCode::TimedOut => write!(f, "TimedOut"),
             StatusCode::BadFd => write!(f, "BadFd"),
+            #[cfg(feature = "rpc")]
+            StatusCode::RpcError => write!(f, "RpcError"),
             StatusCode::Errno(errno) => write!(f, "Errno({errno})"),
             StatusCode::ServiceSpecific(v) => write!(f, "ServiceSpecific({v})"),
         }
@@ -118,6 +131,8 @@ impl From<StatusCode> for i32 {
             StatusCode::BadIndex => -(rustix::io::Errno::OVERFLOW.raw_os_error()),
             StatusCode::FdsNotAllowed => UNKNOWN_ERROR + 7,
             StatusCode::UnexpectedNull => UNKNOWN_ERROR + 8,
+            #[cfg(feature = "rpc")]
+            StatusCode::RpcError => UNKNOWN_ERROR + 9,
             StatusCode::NotEnoughData => -(rustix::io::Errno::NODATA.raw_os_error()),
             StatusCode::WouldBlock => -(rustix::io::Errno::WOULDBLOCK.raw_os_error()),
             StatusCode::TimedOut => -(rustix::io::Errno::TIMEDOUT.raw_os_error()),
@@ -151,6 +166,8 @@ impl From<i32> for StatusCode {
             code if code == StatusCode::WouldBlock.into() => StatusCode::WouldBlock,
             code if code == StatusCode::TimedOut.into() => StatusCode::TimedOut,
             code if code == StatusCode::BadFd.into() => StatusCode::BadFd,
+            #[cfg(feature = "rpc")]
+            code if code == Into::<i32>::into(StatusCode::RpcError) => StatusCode::RpcError,
             code if code < 0 => StatusCode::Errno(code),
             _ => StatusCode::ServiceSpecific(code),
         }
