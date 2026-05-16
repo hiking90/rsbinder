@@ -1268,8 +1268,12 @@ impl Drop for ProcessState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_process_state() {
+    /// Shared init + invariant checks for the two tests that assert a
+    /// freshly-initialized `ProcessState`. Deliberately NOT `#[serial]`:
+    /// both callers already run inside the `binder` serial section, so
+    /// keeping this a plain fn avoids depending on serial_test's lock
+    /// being reentrant for a same-thread nested `#[serial]` call.
+    fn assert_process_state_initialized() {
         let process = ProcessState::init_default().expect("init_default");
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
@@ -1279,12 +1283,20 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
+    fn test_process_state() {
+        assert_process_state_initialized();
+    }
+
+    #[test]
+    #[serial_test::serial(binder)]
     fn test_process_state_context_object() {
         let process = ProcessState::init_default().expect("init_default");
         assert!(process.context_object().is_ok());
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn test_process_state_strong_proxy_for_handle() {
         let process = ProcessState::init_default().expect("init_default");
         assert!(process.strong_proxy_for_handle(0).is_ok());
@@ -1298,6 +1310,7 @@ mod tests {
     /// (c) re-check, P3's case (c) re-check, or P3's
     /// `(CaseA, Some(_))` cross-thread arm.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_concurrent_strong_proxy_same_handle_returns_same_arc() {
         let _ = ProcessState::init_default();
         let handles: Vec<_> = (0..8)
@@ -1337,6 +1350,7 @@ mod tests {
     /// the winner's Arc. Verifies the case (b) generation-preservation
     /// invariant survives concurrent resurrection.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_concurrent_strong_proxy_case_b_resurrection() {
         let _ = ProcessState::init_default();
         // Force a cache entry to exist for handle 0.
@@ -1410,6 +1424,7 @@ mod tests {
     /// to short-circuit at case (c) and the hook to never fire
     /// (vacuous pass).
     #[test]
+    #[serial_test::serial(binder)]
     fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
         let process = ProcessState::init_default().expect("init_default");
 
@@ -1469,6 +1484,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn test_process_state_disable_background_scheduling() {
         let process = ProcessState::init_default().expect("init_default");
         process.disable_background_scheduling(true);
@@ -1476,8 +1492,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn test_process_state_start_thread_pool() {
-        test_process_state();
+        assert_process_state_initialized();
         ProcessState::start_thread_pool();
         assert_eq!(
             ProcessState::as_self()
@@ -1550,6 +1567,7 @@ mod tests {
     ///      are zero and the entry is removed → `lookup_native` returns
     ///      `None`.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_native_uaf_window_closed() {
         let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
@@ -1602,6 +1620,7 @@ mod tests {
     /// `acquire`/`release` independently keeps the entry alive until
     /// the last `release` fires.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_native_dedup_same_arc() {
         let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);
@@ -1634,6 +1653,7 @@ mod tests {
     /// e.g. `MockNative` being a unit struct — `Arc::ptr_eq` keys on
     /// allocation, not type).
     #[test]
+    #[serial_test::serial(binder)]
     fn test_native_distinct_arcs_get_distinct_ids() {
         let process = ProcessState::init_default().expect("init_default");
         let arc_a: Arc<dyn IBinder> = Arc::new(MockNative);
@@ -1657,6 +1677,7 @@ mod tests {
     /// `deserialize_option` round-trip path where the kernel routes a
     /// previously-published binder back to its publisher.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_native_lookup_does_not_change_counts() {
         let process = ProcessState::init_default().expect("init_default");
         let arc: Arc<dyn IBinder> = Arc::new(MockNative);

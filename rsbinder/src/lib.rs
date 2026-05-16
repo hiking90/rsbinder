@@ -223,6 +223,7 @@ mod tests {
     use crate::*;
     #[test]
     #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
     fn process_state() {
         ProcessState::init("/dev/binderfs/binder", 0).expect("init");
     }
