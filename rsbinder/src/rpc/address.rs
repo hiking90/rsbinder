@@ -45,17 +45,24 @@ impl RpcAddress {
         self.bytes == [0u8; RPC_ADDR_LEN]
     }
 
-    /// Allocate a fresh, session-unique address from a monotonic
-    /// counter. The counter is session-owned (P6 — no global). The
-    /// value is never zero (zero is reserved); the first allocation is
-    /// `1`.
-    pub fn unique(counter: &mut u64) -> Self {
+    /// Allocate a fresh address from a per-session monotonic counter,
+    /// **namespaced by connection role**.
+    ///
+    /// Both endpoints of a connection allocate into the *same on-wire
+    /// address space* (a callback the initiator sends to the acceptor
+    /// gets an address the acceptor must not confuse with one it minted
+    /// itself). A bare per-session counter collides across the two
+    /// peers (both start at 1). android fills the 32 bytes from
+    /// `/dev/urandom`; rsbinder instead tags byte 8 with the
+    /// allocating role so the initiator's and acceptor's subspaces are
+    /// disjoint — uniqueness then holds across the *whole connection*,
+    /// not just one endpoint. The counter is session-owned (P6 — no
+    /// global); the value is never `zero()` (counter ≥ 1).
+    pub fn unique(counter: &mut u64, space: AddressSpace) -> Self {
         *counter = counter.wrapping_add(1);
-        // A 2^64 monotonic space never collides within a realistic
-        // session; encode LE into the low 8 bytes, rest zero. Distinct
-        // from `zero()` because `*counter >= 1`.
         let mut bytes = [0u8; RPC_ADDR_LEN];
         bytes[..8].copy_from_slice(&counter.to_le_bytes());
+        bytes[8] = space.tag();
         RpcAddress { bytes }
     }
 
@@ -81,6 +88,26 @@ impl fmt::Debug for RpcAddress {
             "RpcAddress({:02x}{:02x}{:02x}{:02x}…)",
             self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]
         )
+    }
+}
+
+/// Which endpoint of a connection is allocating an [`RpcAddress`].
+/// Tags the address so the connection initiator's and acceptor's
+/// monotonic subspaces never collide on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressSpace {
+    /// The side that `connect`ed (RPC client).
+    Initiator,
+    /// The side that `accept`ed (RPC server).
+    Acceptor,
+}
+
+impl AddressSpace {
+    fn tag(self) -> u8 {
+        match self {
+            AddressSpace::Initiator => 1,
+            AddressSpace::Acceptor => 2,
+        }
     }
 }
 
@@ -135,7 +162,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let zero = RpcAddress::zero();
         for _ in 0..1_000_000 {
-            let a = RpcAddress::unique(&mut ctr);
+            let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
             assert!(!a.is_zero(), "unique() must never be zero");
             assert_ne!(a, zero);
             assert!(seen.insert(a), "unique() collision");
@@ -147,7 +174,7 @@ mod tests {
     fn debug_is_fingerprint_only() {
         // AC-2.1: Debug must not dump the full ABI bytes.
         let mut ctr = 0u64;
-        let a = RpcAddress::unique(&mut ctr);
+        let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
         let s = format!("{a:?}");
         assert!(s.starts_with("RpcAddress("));
         assert!(s.contains('…'), "Debug must be a truncated fingerprint");
@@ -157,7 +184,7 @@ mod tests {
     #[test]
     fn wire_bytes_roundtrip() {
         let mut ctr = 41u64;
-        let a = RpcAddress::unique(&mut ctr);
+        let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
         let b = RpcAddress::from_wire_bytes(*a.as_wire_bytes());
         assert_eq!(a, b);
     }

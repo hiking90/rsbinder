@@ -76,6 +76,17 @@ pub trait RpcTransport: Send + Sync {
     /// Short human-readable description for diagnostics/logging
     /// (e.g. socket path, `"mem"`, vsock cid). Never carries secrets.
     fn describe(&self) -> &str;
+
+    /// Set a read deadline for subsequent [`RpcTransport::recv_frame`]
+    /// calls (subplan 2-3). `None` clears it (fully blocking). The
+    /// default is a no-op for backends with no read-timeout notion;
+    /// `unix` / `mem` / `tcp_debug` override it. A deadline that
+    /// elapses with **nothing consumed** surfaces as
+    /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
+    /// deadline that elapses mid-frame is [`RpcError::Truncated`].
+    fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        Ok(())
+    }
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].
@@ -177,10 +188,25 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // A read deadline that elapses with nothing consumed is a
+            // clean Timeout (stream still frame-synchronized); mid-
+            // header it is a desync → Truncated (2-3 §timeout).
+            Err(e) if is_timeout(&e) => {
+                return Err(if filled == 0 {
+                    RpcError::Timeout
+                } else {
+                    RpcError::Truncated
+                });
+            }
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
+}
+
+/// `WouldBlock`/`TimedOut` is how a socket read deadline surfaces.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 /// Read exactly `buf.len()` body bytes. The header was already
@@ -192,6 +218,8 @@ fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Ok(0) => return Err(RpcError::Truncated),
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // Mid-frame deadline = desync, not a clean timeout.
+            Err(e) if is_timeout(&e) => return Err(RpcError::Truncated),
             Err(e) => return Err(e.into()),
         }
     }

@@ -43,5 +43,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rpc_session_handshake"
+path = "fuzz_targets/rpc_session_handshake.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

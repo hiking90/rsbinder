@@ -118,6 +118,11 @@ impl RpcTransport for UnixTransport {
     fn describe(&self) -> &str {
         &self.desc
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@
 use std::thread;
 
 use rsbinder::rpc::transport::{MemTransport, UnixTransport};
-use rsbinder::rpc::{RpcProxy, RpcSession, RpcTransport};
+use rsbinder::rpc::{AddressSpace, RpcProxy, RpcSession, RpcTransport};
 use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
     FIRST_CALL_TRANSACTION,
@@ -277,7 +277,7 @@ fn make_root() -> SIBinder {
 /// Run the full scenario over a connected transport pair. Returns the
 /// server session so the caller can assert AC-2.5 node accounting.
 fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
-    let server = RpcSession::new(server_t);
+    let server = RpcSession::new(server_t, AddressSpace::Acceptor);
     server.set_root(make_root());
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
@@ -285,7 +285,7 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
     });
 
     {
-        let client = RpcSession::new(client_t);
+        let client = RpcSession::new(client_t, AddressSpace::Initiator);
         let root = SmokeProxy(client.get_root().expect("get_root"));
 
         // AC-2.4: scalar + string round-trip, exact values.

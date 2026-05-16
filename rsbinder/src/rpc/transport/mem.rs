@@ -24,6 +24,7 @@ pub struct MemTransport {
     rx: Mutex<Receiver<Vec<u8>>>,
     peer: PeerIdentity,
     desc: &'static str,
+    timeout: Mutex<Option<std::time::Duration>>,
 }
 
 impl MemTransport {
@@ -40,12 +41,14 @@ impl MemTransport {
                 rx: Mutex::new(b_rx),
                 peer: peer.clone(),
                 desc: "mem",
+                timeout: Mutex::new(None),
             },
             MemTransport {
                 tx: Mutex::new(b_tx),
                 rx: Mutex::new(a_rx),
                 peer,
                 desc: "mem",
+                timeout: Mutex::new(None),
             },
         )
     }
@@ -73,13 +76,18 @@ impl RpcTransport for MemTransport {
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        // `recv` blocks until a frame arrives or every sender is
-        // dropped (peer closed) — never spins, never panics.
-        self.rx
-            .lock()
-            .expect("mem rx poisoned")
-            .recv()
-            .map_err(|_| RpcError::PeerClosed)
+        let timeout = *self.timeout.lock().expect("mem timeout poisoned");
+        let rx = self.rx.lock().expect("mem rx poisoned");
+        match timeout {
+            // `recv`/`recv_timeout` block until a frame arrives, the
+            // deadline elapses, or every sender drops (peer closed) —
+            // never spin, never panic.
+            None => rx.recv().map_err(|_| RpcError::PeerClosed),
+            Some(d) => rx.recv_timeout(d).map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => RpcError::Timeout,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => RpcError::PeerClosed,
+            }),
+        }
     }
 
     fn peer_identity(&self) -> PeerIdentity {
@@ -88,6 +96,11 @@ impl RpcTransport for MemTransport {
 
     fn describe(&self) -> &str {
         self.desc
+    }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        *self.timeout.lock().expect("mem timeout poisoned") = timeout;
+        Ok(())
     }
 }
 

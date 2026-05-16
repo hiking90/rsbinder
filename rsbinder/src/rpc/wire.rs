@@ -256,6 +256,20 @@ pub fn __fuzz_decode_wire(input: &[u8]) {
 /// the address sits inside a TRANSACT/DEC_STRONG body, so feeding
 /// arbitrary bytes through the message decoder also exercises the
 /// 32-byte address parse path with full bounds checking.
+/// Decode-only entrypoint for the `rpc_session_handshake` fuzz target
+/// (subplan 2-3 §6.3 / V4): the first 4 bytes are fed to the session
+/// preamble decoder, the remainder through the message decoder — the
+/// exact untrusted path a session's negotiation/serve loop walks. No
+/// panic / OOM / hang on any input; bad negotiation values are
+/// rejected, not trusted.
+#[doc(hidden)]
+pub fn __fuzz_session_handshake(input: &[u8]) {
+    let c = R34Codec;
+    let (pre, rest) = input.split_at(input.len().min(4));
+    let _ = c.decode_session_preamble(pre);
+    let _ = c.decode_message(rest);
+}
+
 #[doc(hidden)]
 pub fn __fuzz_decode_address(input: &[u8]) {
     // Wrap as a DEC_STRONG frame so the address parser is reached even
@@ -283,7 +297,7 @@ mod tests {
         for size in [0usize, 1, 4, 17, 4096, 1 << 20] {
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let mut ctr = 7u64;
-            let addr = RpcAddress::unique(&mut ctr);
+            let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
 
             let txn = WireTransaction {
                 address: addr,
@@ -319,7 +333,7 @@ mod tests {
         }
 
         let mut ctr = 99u64;
-        let addr = RpcAddress::unique(&mut ctr);
+        let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
         let enc = c.encode_dec_strong(&addr);
         match c.decode_message(&enc).unwrap() {
             WireMessage::DecStrong(a) => assert_eq!(a, addr),
@@ -380,7 +394,7 @@ mod tests {
 
         // -- DEC_STRONG: header + 32B RpcWireAddress --
         let mut ctr = 0x4142_4344u64;
-        let addr = RpcAddress::unique(&mut ctr);
+        let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
         let enc = c.encode_dec_strong(&addr);
         assert_eq!(&enc[0..4], &2u32.to_le_bytes()); // command = DEC_STRONG
         assert_eq!(&enc[4..8], &32u32.to_le_bytes()); // bodySize = 32

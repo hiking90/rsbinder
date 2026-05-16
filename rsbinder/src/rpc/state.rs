@@ -23,7 +23,7 @@ use std::sync::{self, Arc};
 
 use crate::binder::{IBinder, SIBinder};
 
-use super::address::RpcAddress;
+use super::address::{AddressSpace, RpcAddress};
 
 /// A local object exposed to the peer under [`RpcAddress`].
 struct LocalNode {
@@ -36,7 +36,6 @@ struct LocalNode {
 /// Per-session object/address table. Owned by `RpcSessionInner` behind
 /// a `Mutex`; never global (P6 — enforced by the `rpc_no_globals`
 /// grep gate).
-#[derive(Default)]
 pub struct RpcState {
     /// Objects we exposed to the peer, keyed by assigned address.
     local_nodes: HashMap<RpcAddress, LocalNode>,
@@ -49,6 +48,9 @@ pub struct RpcState {
     remote_proxies: HashMap<RpcAddress, sync::Weak<dyn IBinder>>,
     /// Monotonic address allocator (per-session — P6).
     addr_counter: u64,
+    /// This endpoint's address subspace (initiator vs acceptor) so the
+    /// two peers on a connection never mint colliding addresses.
+    space: AddressSpace,
 }
 
 /// Stable identity for a local binder's allocation (data pointer of
@@ -58,9 +60,15 @@ fn binder_ptr(b: &SIBinder) -> usize {
 }
 
 impl RpcState {
-    /// New empty per-session state.
-    pub fn new() -> Self {
-        Self::default()
+    /// New empty per-session state for the given address subspace.
+    pub fn new(space: AddressSpace) -> Self {
+        RpcState {
+            local_nodes: HashMap::new(),
+            local_by_ptr: HashMap::new(),
+            remote_proxies: HashMap::new(),
+            addr_counter: 0,
+            space,
+        }
     }
 
     /// Register a local object leaving this process and return its
@@ -74,7 +82,7 @@ impl RpcState {
         if let Some(addr) = self.local_by_ptr.get(&ptr) {
             return *addr;
         }
-        let addr = RpcAddress::unique(&mut self.addr_counter);
+        let addr = RpcAddress::unique(&mut self.addr_counter, self.space);
         self.local_nodes.insert(
             addr,
             LocalNode {
@@ -186,7 +194,7 @@ mod tests {
 
     #[test]
     fn leaving_is_idempotent_by_identity() {
-        let mut st = RpcState::new();
+        let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a1 = st.on_binder_leaving(&b);
         let a2 = st.on_binder_leaving(&b);
@@ -199,7 +207,7 @@ mod tests {
     /// leak.
     #[test]
     fn dec_strong_releases_node() {
-        let mut st = RpcState::new();
+        let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b);
         assert_eq!(st.local_node_count(), 1);
@@ -218,8 +226,8 @@ mod tests {
     /// mutating one session never touches another.
     #[test]
     fn two_states_are_isolated() {
-        let mut s1 = RpcState::new();
-        let s2 = RpcState::new(); // fresh, empty, independent table
+        let mut s1 = RpcState::new(AddressSpace::Acceptor);
+        let s2 = RpcState::new(AddressSpace::Acceptor); // fresh, empty, independent table
         let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a1 = s1.on_binder_leaving(&b1);
 

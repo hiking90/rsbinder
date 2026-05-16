@@ -24,16 +24,42 @@
 //! logged explicitly and must be treated as untrusted. Plaintext
 //! network transport is never appropriate for production (use the
 //! `tls` backend, added by subplan 2-4).
+//!
+//! # Example (Unix-domain server + client)
+//!
+//! ```no_run
+//! # #[cfg(feature = "rpc")] {
+//! use rsbinder::rpc::{RpcServer, RpcSession};
+//!
+//! // Server: bind, publish a root binder, accept in the background.
+//! let server = RpcServer::setup_unix_server("/tmp/demo.sock").unwrap();
+//! # let root: rsbinder::SIBinder = unimplemented!();
+//! server.set_root(root);
+//! let _bg = server.run_background();
+//!
+//! // Client: connect, (optionally) negotiate, fetch the root object.
+//! let client = RpcSession::setup_unix_client("/tmp/demo.sock").unwrap();
+//! let _negotiated = client.negotiate(4).unwrap();
+//! let _root = client.get_root().unwrap();
+//! // Drive `_root` with a typed stub (subplan 2-6 makes the AIDL
+//! // generator emit RPC-capable stubs; until then, hand-written).
+//! # }
+//! ```
+//!
+//! A full client/server pair (incl. nested callbacks, oneway, timeout)
+//! is exercised by `rsbinder/tests/rpc_server.rs`.
 
 pub mod address;
 pub mod proxy;
+pub mod server;
 pub mod session;
 pub mod state;
 pub mod transport;
 pub mod wire;
 
-pub use address::{RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
+pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
 pub use proxy::RpcProxy;
+pub use server::RpcServer;
 pub use session::RpcSession;
 pub use state::RpcState;
 pub use transport::{PeerIdentity, RpcTransport};
@@ -79,6 +105,11 @@ pub enum RpcError {
     Io(std::io::Error),
     /// A protocol-level violation (used by the wire codec in 2-2+).
     Protocol(&'static str),
+    /// A configured wait deadline elapsed with no frame boundary
+    /// reached (subplan 2-3 — reply / negotiation timeout). Reported
+    /// only when nothing partial was consumed, so the stream stays
+    /// frame-synchronized.
+    Timeout,
 }
 
 impl fmt::Display for RpcError {
@@ -94,6 +125,7 @@ impl fmt::Display for RpcError {
             }
             RpcError::Io(e) => write!(f, "RPC transport I/O error: {e}"),
             RpcError::Protocol(why) => write!(f, "RPC protocol violation: {why}"),
+            RpcError::Timeout => write!(f, "RPC wait deadline elapsed"),
         }
     }
 }
@@ -135,6 +167,7 @@ impl From<RpcError> for crate::StatusCode {
             RpcError::FrameTooLarge { .. } => crate::StatusCode::BadValue,
             RpcError::Io(io) => crate::StatusCode::from(io),
             RpcError::Protocol(_) => crate::StatusCode::RpcError,
+            RpcError::Timeout => crate::StatusCode::TimedOut,
         }
     }
 }
