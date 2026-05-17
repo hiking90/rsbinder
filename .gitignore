@@ -7,3 +7,6 @@ REMOTE_LINUX
 *.iml
 
 book/build/
+
+# Local development plans (not tracked)
+plans/
