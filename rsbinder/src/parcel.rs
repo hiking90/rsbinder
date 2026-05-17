@@ -724,6 +724,17 @@ impl Parcel {
 
         // usize in Rust may be 16-bit, so i32 may not fit
         let len = len.try_into().or(Err(StatusCode::BadValue))?;
+        // NOTE (T1-3): no `len <= data_avail()` cap here. Unlike an
+        // `in` array, an `out`/`inout` vec sends only its *length* in
+        // the parcel — the elements are produced by the callee, not
+        // read from the bytes that follow — so `len > data_avail()` is
+        // the normal, valid case. Capping it here regressed every
+        // out-array AIDL method on the live kernel binder (caught by
+        // the Android emulator integration run, not macOS). The
+        // unbounded-`len` OOM concern is real but must be bounded by a
+        // configured maximum, not by `data_avail()`; left as upstream
+        // (Android libbinder's `resizeOutVector` is likewise unbounded)
+        // — see RPC_STATUS T1-3 follow-up.
         out_vec.resize_with(len, Default::default);
 
         Ok(())
@@ -746,6 +757,9 @@ impl Parcel {
         } else {
             // usize in Rust may be 16-bit, so i32 may not fit
             let len = len.try_into().or(Err(StatusCode::BadValue))?;
+            // See `resize_out_vec` (T1-3): an out-vec length is not
+            // backed by parcel data, so no `data_avail()` cap here —
+            // capping it regressed the live kernel out-array path.
             let mut vec = Vec::with_capacity(len);
             vec.resize_with(len, Default::default);
             *out_vec = Some(vec);

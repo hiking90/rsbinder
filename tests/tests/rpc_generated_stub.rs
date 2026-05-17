@@ -77,7 +77,10 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         // Scalar + string round-trip, exact values (build_parcel →
         // prepare_transact[interface token from the stamped descriptor]
         // → submit_transact → read_response, all generated).
-        assert_eq!(smoke.r#echo("hello generated rpc").unwrap(), "hello generated rpc");
+        assert_eq!(
+            smoke.r#echo("hello generated rpc").unwrap(),
+            "hello generated rpc"
+        );
         assert_eq!(smoke.r#echo("").unwrap(), "");
         assert_eq!(smoke.r#add(2, 3).unwrap(), 5);
         assert_eq!(smoke.r#add(-7, 7).unwrap(), 0);

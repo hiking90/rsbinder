@@ -44,6 +44,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rpc_parcel_rpc_mode"
+path = "fuzz_targets/rpc_parcel_rpc_mode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rpc_session_handshake"
 path = "fuzz_targets/rpc_session_handshake.rs"
 test = false

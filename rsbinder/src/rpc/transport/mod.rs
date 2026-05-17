@@ -123,6 +123,26 @@ pub trait RpcTransport: Send + Sync {
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_frame()?, Vec::new()))
     }
+
+    /// Send raw bytes with **no framing**. The real android RPC wire
+    /// has no length prefix (`RpcState::rpcSend` writes the
+    /// `RpcWireHeader` + body directly) — the android-13+ profile
+    /// (subplan 2-5b / G4) drives framing itself via
+    /// [`wire_android13`](super::super::wire_android13). The default is
+    /// **unsupported**, so `mem`/`tls`/`vsock` stay frame-only *by
+    /// type* (no extra code); only `unix` overrides it. The existing
+    /// R34 path never calls this — `send_frame`/`recv_frame` are
+    /// byte-unchanged.
+    fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
+        Err(RpcError::Protocol("this transport has no raw byte access"))
+    }
+
+    /// Read up to `buf.len()` raw bytes (one `read`; `Ok(0)` = peer
+    /// closed). Pairs with [`RpcTransport::send_raw`]. Default:
+    /// unsupported (see [`RpcTransport::send_raw`]).
+    fn recv_raw(&self, _buf: &mut [u8]) -> RpcResult<usize> {
+        Err(RpcError::Protocol("this transport has no raw byte access"))
+    }
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].
@@ -265,9 +285,18 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
             max: MAX_FRAME_LEN,
         });
     }
-    let len = (buf.len() as u32).to_le_bytes();
-    w.write_all(&len)?;
-    w.write_all(buf)?;
+    // Length prefix + body coalesced into ONE buffer / ONE `write_all`
+    // so the 4-byte length and the body can never be spliced by a
+    // concurrent writer (the 3-`write_all` form let two threads
+    // interleave a frame irrecoverably). The cross-thread *correctness*
+    // guarantee is the per-session connection lock (session.rs
+    // `enter_connection`); this additionally keeps the lock-free
+    // small-frame paths (e.g. a `DEC_STRONG` from `RpcProxy::drop`)
+    // from ever emitting a half-frame.
+    let mut framed = Vec::with_capacity(4 + buf.len());
+    framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+    framed.extend_from_slice(buf);
+    w.write_all(&framed)?;
     w.flush()?;
     Ok(())
 }

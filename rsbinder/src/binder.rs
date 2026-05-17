@@ -366,10 +366,7 @@ impl dyn IBinder {
 #[doc(hidden)]
 #[cfg(feature = "rpc")]
 pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
-    if let Some(rp) = (**binder)
-        .as_any()
-        .downcast_ref::<crate::rpc::RpcProxy>()
-    {
+    if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
         rp.stamp_descriptor(descriptor);
     }
 }

@@ -64,6 +64,44 @@ jobs:
         run: |
           cargo test --workspace --no-run
 
+  rpc-suite:
+    name: RPC Transport Suite
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      # The RPC stack is hermetic — mem/unix backends only, no
+      # /dev/binder, no binderfs, no servicemanager (master §6). It
+      # runs on a plain runner, unlike the kernel-binder matrix in
+      # integration-test.yml. This job is the missing CI enforcement
+      # of the plan's V1/V4/V5 gates for the RPC stack (T3).
+      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls)
+        run: |
+          cargo build -p rsbinder
+          cargo build -p rsbinder --features rpc
+          cargo build -p rsbinder --features rpc-tcp-debug
+          cargo build -p rsbinder --features rpc-tls
+      - name: RPC unit + e2e (rsbinder, hermetic)
+        run: |
+          cargo test -p rsbinder --features rpc --lib rpc::
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
+          cargo test -p rsbinder --features rpc-tls --test rpc_tls
+      - name: Generated-stub e2e (tests crate)
+        run: |
+          cargo test -p tests --features rpc --test rpc_generated_stub
+          cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
+      - name: V5 parallel-safety soak (default test-threads, 5x)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "soak iteration $i"
+            cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e || exit 1
+          done
+
   android-build:
     name: Android Build
     runs-on: ubuntu-latest

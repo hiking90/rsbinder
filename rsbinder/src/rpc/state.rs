@@ -308,6 +308,9 @@ mod tests {
             remade = true;
             sib3.clone()
         });
-        assert!(remade, "after identity-checked forget, the address re-mints");
+        assert!(
+            remade,
+            "after identity-checked forget, the address re-mints"
+        );
     }
 }

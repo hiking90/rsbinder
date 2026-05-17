@@ -7,6 +7,28 @@ license = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Build the RPC (binder-over-socket) example bins. Off by default so
+# the normal `cargo build --workspace` and the kernel-binder examples
+# are unchanged; opt in explicitly:
+#   cargo run -p example-hello --features rpc --bin rpc_hello_service
+#   cargo run -p example-hello --features rpc --bin rpc_hello_client
+rpc = ["rsbinder/rpc"]
+
+[[bin]]
+name = "rpc_hello_service"
+required-features = ["rpc"]
+
+[[bin]]
+name = "rpc_hello_client"
+required-features = ["rpc"]
+
+# G4(b)-v0 live-interop harness (rsbinder side); pairs with a real
+# android libbinder `RpcPreconnectedClient` on the Android 13 emulator.
+[[bin]]
+name = "g4b_interop_server"
+required-features = ["rpc"]
+
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 env_logger = { workspace = true }

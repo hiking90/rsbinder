@@ -8,8 +8,9 @@
 //! implementation of the real android-12 r34 RPC wire* (spec extracted
 //! in `plan/2-5-android-interop.md` §9). So the Track-1 round-trip and
 //! golden tests are simultaneously r34 spec-conformance (AC-2.2r) — no
-//! device, no AOSP build needed. android-13+ versioned wire is a future
-//! additive `Android13Codec` behind the same trait (2-5b).
+//! device, no AOSP build needed. android-13+ versioned wire is the
+//! additive [`Android13PlusCodec`](super::wire_android13::Android13PlusCodec)
+//! behind the same trait (2-5b; v0 = android-13, v1 = android-14/15).
 //!
 //! r34 layout (LE, explicit serialization — no `#[repr]` dependency):
 //! * `RpcWireHeader` (16B): `u32 command; u32 bodySize; u32 reserved[2]`

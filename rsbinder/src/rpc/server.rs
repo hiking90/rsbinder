@@ -85,6 +85,11 @@ pub struct RpcServer {
     /// Whether per-connection sessions advertise `Unix` FD support
     /// (subplan 2-7; default false ⇒ FD reject everywhere).
     fd_unix_supported: AtomicBool,
+    /// Opt-in android-13+ versioned wire (subplan 2-5b / G4(a)):
+    /// `None` ⇒ the default android-12 r34 wire (byte-unchanged);
+    /// `Some(max)` ⇒ each accepted connection runs the AOSP handshake
+    /// negotiating `min(max, client_max)`.
+    wire_max_version: Mutex<Option<u32>>,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -106,6 +111,7 @@ impl RpcServer {
             named: Mutex::new(HashMap::new()),
             max_threads: Mutex::new(1),
             fd_unix_supported: AtomicBool::new(false),
+            wire_max_version: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }))
@@ -145,11 +151,25 @@ impl RpcServer {
         self.fd_unix_supported.store(unix, Ordering::SeqCst);
     }
 
-    /// Build a per-connection session sharing this server's root +
-    /// negotiated max-threads (its `RpcState` is fresh — P6 isolation).
-    fn make_session(&self, transport: Box<dyn RpcTransport>) -> RpcSession {
-        // The server accepted this connection ⇒ Acceptor subspace.
-        let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor);
+    /// Opt in to the **android-13+ versioned RPC wire** (subplan 2-5b /
+    /// G4(a)). `max_version` is the highest `RPC_WIRE_PROTOCOL_VERSION`
+    /// this server offers (`0` = android-13, `1` = android-14/15); each
+    /// accepted connection then runs the AOSP connection handshake and
+    /// negotiates `min(max_version, client_max)`. Default (unset) keeps
+    /// the android-12 r34 wire, byte-unchanged. Has effect only on a
+    /// transport with raw byte access (`unix`).
+    pub fn set_android13plus(&self, max_version: u32) {
+        *self
+            .wire_max_version
+            .lock()
+            .expect("wire_max_version poisoned") = Some(max_version);
+    }
+
+    /// Apply this server's shared root + negotiated max-threads + FD
+    /// policy to a freshly-built per-connection session (its `RpcState`
+    /// is fresh — P6 isolation). Shared by the r34 and android-13+
+    /// connection paths.
+    fn configure_session(&self, session: &RpcSession) {
         if let Some(root) = self.root.lock().expect("root poisoned").clone() {
             session.set_root(root);
         }
@@ -157,18 +177,62 @@ impl RpcServer {
         if self.fd_unix_supported.load(Ordering::SeqCst) {
             session.set_supported_fd_modes(&[crate::rpc::FileDescriptorTransportMode::Unix]);
         }
+    }
+
+    /// Build a per-connection r34 session sharing this server's root +
+    /// negotiated max-threads (its `RpcState` is fresh — P6 isolation).
+    fn make_session(&self, transport: Box<dyn RpcTransport>) -> RpcSession {
+        // The server accepted this connection ⇒ Acceptor subspace.
+        let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor);
+        self.configure_session(&session);
         session
     }
 
     /// Serve one already-connected transport on its own worker thread
     /// (used by the accept loop and by in-memory tests).
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
-        let session = self.make_session(transport);
-        let handle = std::thread::spawn(move || {
-            if let Err(e) = session.serve_blocking() {
-                log::debug!("RPC session ended: {e:?}");
+        let a13_max = *self
+            .wire_max_version
+            .lock()
+            .expect("wire_max_version poisoned");
+        let handle = match a13_max {
+            Some(max) => {
+                // android-13+ (G4(a)): the AOSP connection handshake is
+                // blocking I/O on the accepted socket, so it must run on
+                // the worker — never the accept loop. Build + configure
+                // the session AFTER the handshake, then serve. A
+                // handshake failure ends just this connection (the
+                // accept loop and other sessions are unaffected).
+                let server = Arc::clone(self);
+                std::thread::spawn(
+                    move || match RpcSession::accept_android13plus(transport, max) {
+                        Ok(session) => {
+                            server.configure_session(&session);
+                            if let Err(e) = session.serve_blocking() {
+                                log::debug!("RPC session ended: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            // Abnormal interop/security event (version
+                            // mismatch, truncated header, hostile peer)
+                            // — not the routine post-handshake
+                            // peer-close drain, so `warn!` not `debug!`.
+                            log::warn!("android-13+ RPC handshake failed: {e:?}")
+                        }
+                    },
+                )
             }
-        });
+            None => {
+                // r34 (default) — unchanged: session built here, served
+                // on the worker.
+                let session = self.make_session(transport);
+                std::thread::spawn(move || {
+                    if let Err(e) = session.serve_blocking() {
+                        log::debug!("RPC session ended: {e:?}");
+                    }
+                })
+            }
+        };
         let mut workers = self.workers.lock().expect("workers poisoned");
         // Reap handles of already-finished sessions so `workers` is
         // bounded by *concurrent* (not cumulative) connections — a
@@ -203,8 +267,7 @@ impl RpcServer {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::Interrupted
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
                     ) =>
                 {
                     // Transient: peer reset between SYN and accept()
@@ -240,8 +303,14 @@ impl RpcServer {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Join all finished session workers (best effort — call after the
-    /// clients disconnect).
+    /// Join all session workers (call after the clients disconnect).
+    ///
+    /// `Drop` only flips the shutdown flag and removes the socket — it
+    /// deliberately does **not** join in-flight session workers (they
+    /// drain on peer close). A worker that panicked is therefore only
+    /// observable through this call: for clean shutdown and worker
+    /// error/panic observability, call `join_workers` explicitly rather
+    /// than relying on `Drop` (Minor-3).
     pub fn join_workers(&self) {
         let handles: Vec<_> = std::mem::take(&mut *self.workers.lock().expect("workers poisoned"));
         for h in handles {

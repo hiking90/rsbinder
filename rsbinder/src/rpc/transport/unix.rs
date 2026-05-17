@@ -11,6 +11,7 @@
 //! constructor for tests, and a `connect(path)` convenience. The
 //! server-side `bind`/`listen`/`accept` loop is subplan 2-3.
 
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -123,6 +124,24 @@ impl RpcTransport for UnixTransport {
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
         let mut r = &self.stream;
         read_frame(&mut r)
+    }
+
+    /// Raw, unframed write (android-13+ profile — the real android RPC
+    /// wire has no length prefix). `&UnixStream: Write`, so a shared
+    /// `&self` stays full-duplex (same as `send_frame`).
+    fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        let mut w = &self.stream;
+        w.write_all(buf).map_err(RpcError::from)?;
+        w.flush().map_err(RpcError::from)?;
+        Ok(())
+    }
+
+    /// Raw, unframed read (one `read`; `Ok(0)` = peer closed). The
+    /// android-13+ profile drives `RpcWireHeader`-based framing on top
+    /// of this (`wire_android13::read_aosp_message`).
+    fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        let mut r = &self.stream;
+        r.read(buf).map_err(RpcError::from)
     }
 
     fn peer_identity(&self) -> PeerIdentity {

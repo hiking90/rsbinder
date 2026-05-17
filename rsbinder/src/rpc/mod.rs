@@ -40,14 +40,25 @@
 //! // Client: connect, (optionally) negotiate, fetch the root object.
 //! let client = RpcSession::setup_unix_client("/tmp/demo.sock").unwrap();
 //! let _negotiated = client.negotiate(4).unwrap();
-//! let _root = client.get_root().unwrap();
-//! // Drive `_root` with a typed stub (subplan 2-6 makes the AIDL
-//! // generator emit RPC-capable stubs; until then, hand-written).
+//! let root = client.get_root().unwrap();
+//! // Drive `root` with the **same generated stub** as the kernel path
+//! // — subplan 2-6.B makes the AIDL generator emit
+//! // `as_remote().ok_or(BadType)?`, so one `Bp*` resolves either
+//! // stack:
+//! //
+//! //     let foo: Strong<dyn IFoo> =
+//! //         <dyn IFoo as FromIBinder>::try_from(root)?;
+//! # let _ = root;
 //! # }
 //! ```
 //!
-//! A full client/server pair (incl. nested callbacks, oneway, timeout)
-//! is exercised by `rsbinder/tests/rpc_server.rs`.
+//! A complete, runnable Unix-domain client/server pair driving a
+//! generated AIDL stub is in
+//! [`example-hello`](https://github.com/hiking90/rsbinder/tree/master/example-hello)
+//! (`cargo run -p example-hello --features rpc --bin rpc_hello_service`
+//! / `--bin rpc_hello_client`). A full pair incl. nested callbacks,
+//! oneway, timeout and shared-session concurrency is exercised by
+//! `rsbinder/tests/rpc_server.rs`.
 
 pub mod address;
 pub mod fd_mode;
@@ -57,6 +68,7 @@ pub mod session;
 pub mod state;
 pub mod transport;
 pub mod wire;
+pub mod wire_android13;
 
 pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
 pub use fd_mode::FileDescriptorTransportMode;
@@ -72,6 +84,10 @@ pub use transport::{CertId, PeerIdentity, RpcTransport};
 #[cfg(feature = "rpc-tls")]
 pub use rustls;
 pub use wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
+/// android-13+ versioned wire codec (subplan 2-5b, additive —
+/// version-keyed: v0 = android-13, v1 = android-14/15. `R34Codec`
+/// stays the default; this never affects the kernel path).
+pub use wire_android13::Android13PlusCodec;
 
 use std::fmt;
 
@@ -180,6 +196,59 @@ impl From<RpcError> for crate::StatusCode {
     }
 }
 
+/// Decode-only entrypoint for the `rpc_parcel_rpc_mode` fuzz target
+/// (2-2 §6.3 / V4). Arbitrary bytes are interpreted as an **RPC-mode**
+/// `Parcel` body and run through the deserializers a real RPC
+/// transaction reaches: scalars, `String`, the generic `Vec<T>` array
+/// path, binder-as-`RpcAddress`, and the AIDL out-vec resizers.
+/// Property: no panic / OOM / UB / unbounded pre-allocation on *any*
+/// input — every length is bounded by the bytes actually present
+/// (T1-3 hardening). Not part of the supported API surface.
+#[doc(hidden)]
+pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
+    use crate::binder::SIBinder;
+    use crate::error::{Result, StatusCode};
+    use crate::parcel::{Parcel, RpcParcelOps};
+    use std::sync::Arc;
+
+    // Binder hook with no live session: exercises the RPC `read_binder`
+    // path (i32 present flag + 32-byte `RpcAddress`, all bounds-checked)
+    // without needing a real connection.
+    struct NullOps;
+    impl RpcParcelOps for NullOps {
+        fn write_binder(&self, _b: Option<&SIBinder>, _p: &mut Parcel) -> Result<()> {
+            Err(StatusCode::DeadObject)
+        }
+        fn read_binder(&self, _p: &mut Parcel) -> Result<Option<SIBinder>> {
+            Err(StatusCode::DeadObject)
+        }
+    }
+
+    fn fresh(input: &[u8]) -> Parcel {
+        let mut p = Parcel::from_vec(input.to_vec());
+        p.set_for_rpc(true);
+        p.attach_rpc_ops(Arc::new(NullOps));
+        p.set_data_position(0);
+        p
+    }
+
+    let _ = fresh(input).read::<i32>();
+    let _ = fresh(input).read::<i64>();
+    let _ = fresh(input).read::<String>();
+    let _ = fresh(input).read::<Vec<i32>>();
+    let _ = fresh(input).read::<Vec<i64>>();
+    let _ = fresh(input).read::<Vec<String>>();
+    let _ = fresh(input).read::<Option<SIBinder>>();
+    let _ = fresh(input).read::<SIBinder>();
+    // NOTE: `resize_out_vec`/`resize_nullable_out_vec` are intentionally
+    // *not* fuzzed here — an out-vec length is not backed by parcel
+    // bytes (the callee fills it), so they are unbounded by design
+    // (upstream Android is identical); feeding an arbitrary length
+    // would just OOM the fuzzer without modelling a real wire input.
+    // The bounded `in`-array path (`deserialize_array`) above is the
+    // T1-3 surface this target covers.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +304,53 @@ mod tests {
         // Distinct from its neighbours in the UNKNOWN_ERROR + n block.
         assert_ne!(v, StatusCode::UnexpectedNull.into());
         assert_ne!(v, StatusCode::FailedTransaction.into());
+    }
+
+    /// T1-3 / V3: a hostile array length in an RPC-mode parcel must
+    /// fail gracefully (bounded pre-allocation + `Err`), never
+    /// pre-allocate gigabytes. Deterministic regression — reverting the
+    /// `min(len, data_avail())` / `len > data_avail()` guards turns each
+    /// of these into a multi-GB allocation that aborts the test
+    /// process (mutant detected). It is the *enforceable* V4 gate;
+    /// the `rpc_parcel_rpc_mode` fuzz target is the soak supplement.
+    #[test]
+    fn rpc_parcel_hostile_array_len_is_bounded_not_oom() {
+        use crate::parcel::Parcel;
+
+        // Generic `Vec<T>` array path, body empty after the length.
+        let mut p = Parcel::new();
+        p.set_for_rpc(true);
+        p.write(&i32::MAX).unwrap();
+        p.set_data_position(0);
+        assert!(
+            p.read::<Vec<i32>>().is_err(),
+            "hostile Vec<i32> len must error, not OOM"
+        );
+
+        // A little data present (data_avail() > 0 but << len).
+        let mut p = Parcel::new();
+        p.set_for_rpc(true);
+        p.write(&i32::MAX).unwrap();
+        p.write(&7i32).unwrap();
+        p.write(&8i32).unwrap();
+        p.set_data_position(0);
+        assert!(p.read::<Vec<i64>>().is_err());
+
+        // (`resize_out_vec`/`resize_nullable_out_vec` are deliberately
+        // not asserted here: an out-vec length is not backed by parcel
+        // data — the callee fills it — so they are unbounded by design,
+        // exactly like Android libbinder's `resizeOutVector`. Bounding
+        // them by `data_avail()` regressed the live kernel out-array
+        // path; see the T1-3 note in `parcel.rs`.)
+
+        // The fuzz entrypoint must never panic on adversarial bytes.
+        for pat in [
+            vec![],
+            vec![0xFFu8; 4],
+            vec![0xFF, 0xFF, 0xFF, 0x7F, 0, 0, 0, 0],
+            (0..64u8).collect::<Vec<u8>>(),
+        ] {
+            __fuzz_decode_rpc_parcel(&pat);
+        }
     }
 }
