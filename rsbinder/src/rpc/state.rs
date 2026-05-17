@@ -133,10 +133,26 @@ impl RpcState {
         sib
     }
 
-    /// Forget the remote-proxy table entry for `addr` (called from
-    /// `RpcProxy::drop` after its `DEC_STRONG` is sent).
-    pub fn forget_remote(&mut self, addr: &RpcAddress) {
-        self.remote_proxies.remove(addr);
+    /// Forget the remote-proxy table entry for `addr`, but **only if
+    /// the slot still points at the proxy `who`** (the dropping
+    /// `RpcProxy`'s data address). Called from `RpcProxy::drop` after
+    /// its `DEC_STRONG` is sent.
+    ///
+    /// A proxy whose `Arc` strong-count hit 0 in the window *before*
+    /// its `Drop` body runs may already have been replaced in the
+    /// cache by a freshly-resolved live proxy for the same address (a
+    /// concurrent `read_binder` on a `Clone`d session observed the
+    /// stale `Weak` and re-`make`d). An unconditional `remove` would
+    /// then evict that **live** entry, splitting the per-address dedup
+    /// and breaking the "exactly one live proxy ⇒ exactly one
+    /// `DEC_STRONG`" invariant (AC-2.5 / P5). The identity check makes
+    /// a stale `Drop` a no-op against a re-cached successor.
+    pub fn forget_remote_if(&mut self, addr: &RpcAddress, who: *const ()) {
+        if let Some(weak) = self.remote_proxies.get(addr) {
+            if weak.as_ptr() as *const () == who {
+                self.remote_proxies.remove(addr);
+            }
+        }
     }
 
     /// Test/diagnostic: number of live local nodes (AC-2.5 leak check).
@@ -244,5 +260,54 @@ mod tests {
         s1.dec_strong_local(&a1);
         assert_eq!(s1.local_node_count(), 0);
         assert_eq!(s2.local_node_count(), 0);
+    }
+
+    /// AC-2.5 / P5 regression: a stale `RpcProxy::drop` (its `Arc` hit
+    /// 0 before `Drop` ran, and a concurrent `read_binder` already
+    /// re-cached a fresh live proxy for the same address) must NOT
+    /// evict the successor. Deterministically reproduces the exact
+    /// drop / re-cache interleave at the `RpcState` level without
+    /// thread timing, then asserts identity-checked `forget_remote_if`
+    /// keeps "exactly one live proxy per address".
+    #[test]
+    fn stale_drop_does_not_split_remote_dedup() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let addr = RpcAddress::from_wire_bytes([7u8; 32]); // RPC_ADDR_LEN
+
+        // P1 resolved for `addr`, then its last strong ref goes away
+        // (cached `Weak` now dead) — but P1's `Drop` has not yet run.
+        let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let p1 = Arc::as_ptr(sib1.as_arc()) as *const ();
+        let got1 = st.remote_proxy(addr, || sib1.clone());
+        drop(got1);
+        drop(sib1);
+
+        // Concurrent re-resolve: another `read_binder` for the SAME
+        // address sees the dead `Weak` and mints + re-caches P2.
+        let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let got2 = st.remote_proxy(addr, || sib2.clone());
+        let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
+
+        // P1's delayed `Drop` now runs `forget_remote_if(addr, P1)`.
+        // The old unconditional remove would evict the live P2 slot.
+        st.forget_remote_if(&addr, p1);
+        let again = st.remote_proxy(addr, || panic!("must dedup to P2, not re-make"));
+        assert!(
+            Arc::ptr_eq(again.as_arc(), got2.as_arc()),
+            "stale P1 Drop must not split the per-address dedup (AC-2.5/P5)"
+        );
+
+        // The genuinely-current proxy's Drop *does* evict.
+        drop(again);
+        drop(got2);
+        drop(sib2);
+        st.forget_remote_if(&addr, p2);
+        let sib3 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let mut remade = false;
+        let _p3 = st.remote_proxy(addr, || {
+            remade = true;
+            sib3.clone()
+        });
+        assert!(remade, "after identity-checked forget, the address re-mints");
     }
 }

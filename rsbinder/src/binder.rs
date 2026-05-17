@@ -307,10 +307,10 @@ pub trait IBinder: Any + Send + Sync {
 
 /// An outbound-transaction-issuing proxy, abstract over the kernel
 /// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks (subplan
-/// 2-6, D1). The AIDL generator currently hard-downcasts to
-/// `ProxyHandle` (`as_proxy().unwrap()`); this trait + the
-/// `<dyn IBinder>::as_remote()` accessor generalize that so one
-/// generated `Bp*` can drive either stack.
+/// 2-6, D1). The AIDL generator emits `as_remote().ok_or(BadType)?`
+/// (subplan 2-6.B) so one generated `Bp*` drives either stack via
+/// this trait + the `<dyn IBinder>::as_remote()` accessor; the
+/// kernel-only `as_proxy()` is retained for any direct callers.
 ///
 /// The signatures are exactly `ProxyHandle`'s existing inherent
 /// `prepare_transact`/`submit_transact` — `ProxyHandle` implements
@@ -353,6 +353,32 @@ impl dyn IBinder {
         None
     }
 }
+
+/// Subplan 2-6.B: stamp the generated stub's interface descriptor
+/// onto an `RpcProxy` resolved from the RPC wire (the wire carries
+/// only an address, so such a proxy starts descriptor-less). A
+/// `#[doc(hidden)]` shim the generated `from_binder` calls
+/// unconditionally — the feature gate lives **here**, resolved
+/// against rsbinder's own `rpc` feature, not in the `macro_rules!`
+/// (where `cfg(feature = "rpc")` would wrongly resolve against the
+/// *consumer* crate). The non-`rpc` build is a zero-cost no-op, so
+/// the kernel path and `rpc`-off consumers stay byte-unaffected (V1).
+#[doc(hidden)]
+#[cfg(feature = "rpc")]
+pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
+    if let Some(rp) = (**binder)
+        .as_any()
+        .downcast_ref::<crate::rpc::RpcProxy>()
+    {
+        rp.stamp_descriptor(descriptor);
+    }
+}
+
+/// No-op shim (see the `rpc`-gated variant): keeps the generated
+/// `from_binder` compiling identically with or without `rpc`.
+#[doc(hidden)]
+#[cfg(not(feature = "rpc"))]
+pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
 
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

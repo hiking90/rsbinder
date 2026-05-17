@@ -85,6 +85,39 @@ fn read_addr(p: &mut Parcel) -> Result<RpcAddress> {
     Ok(RpcAddress::from_wire_bytes(bytes))
 }
 
+/// RAII clear for the `client_transact` reply read-deadline (AC-3.8).
+///
+/// `set_read_timeout(Some(d))` sets a sticky `SO_RCVTIMEO` on the
+/// shared connection. This guard clears it on **every** exit from the
+/// reply wait — normal return, `?`-propagation, or panic — so the
+/// deadline can never leak onto the next `client_transact`, a nested
+/// inbound dispatch, or a subsequent server-side `recv` on the same
+/// connection.
+struct ReplyDeadlineGuard<'a> {
+    transport: &'a dyn RpcTransport,
+    armed: bool,
+}
+
+impl<'a> ReplyDeadlineGuard<'a> {
+    fn arm(transport: &'a dyn RpcTransport, deadline: Option<Duration>) -> RpcResult<Self> {
+        let armed = deadline.is_some();
+        if let Some(d) = deadline {
+            transport.set_read_timeout(Some(d))?;
+        }
+        Ok(Self { transport, armed })
+    }
+}
+
+impl Drop for ReplyDeadlineGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: a failure to clear cannot be surfaced from
+            // Drop, and the next caller re-arms/clears explicitly anyway.
+            let _ = self.transport.set_read_timeout(None);
+        }
+    }
+}
+
 /// Shared session state. Held behind `Arc`; never global (P6).
 pub struct RpcSessionInner {
     transport: Box<dyn RpcTransport>,
@@ -208,7 +241,7 @@ impl RpcSessionInner {
             .lock()
             .expect("rpc state poisoned")
             .remote_proxy(addr, || {
-                SIBinder::new(Arc::new(RpcProxy::new(addr, String::new(), weak)))
+                SIBinder::new(Arc::new(RpcProxy::new(addr, weak)))
                     .expect("SIBinder::new(RpcProxy)")
             });
         Ok(Some(sib))
@@ -244,12 +277,12 @@ impl RpcSessionInner {
         if oneway {
             return Ok(None);
         }
-        // Apply the configured reply deadline (AC-3.8). A timeout that
-        // elapses at a frame boundary is reported with nothing
-        // consumed, so the connection stays usable for DEC_STRONG etc.
-        if let Some(d) = *self.timeout.lock().expect("timeout poisoned") {
-            self.transport.set_read_timeout(Some(d))?;
-        }
+        // Apply the configured reply deadline (AC-3.8) for the duration
+        // of the reply wait only. `ReplyDeadlineGuard` clears the sticky
+        // `SO_RCVTIMEO` on every exit (return / `?` / panic) so it never
+        // leaks onto the next call or a later recv on this connection.
+        let deadline = *self.timeout.lock().expect("timeout poisoned");
+        let _deadline_guard = ReplyDeadlineGuard::arm(self.transport.as_ref(), deadline)?;
         loop {
             let (frame, in_fds) = self.recv_msg()?;
             match self.codec.decode_message(&frame)? {
@@ -276,8 +309,17 @@ impl RpcSessionInner {
                     // our own reply. Dispatch it inline on this call
                     // stack over the same connection (single thread per
                     // connection ⇒ correct FIFO nesting, no lock, no
-                    // deadlock — AC-3.6).
+                    // deadlock — AC-3.6). A nested call is forward
+                    // progress, not a stall: drop the reply deadline for
+                    // the (unbounded) nested dispatch, then re-arm it
+                    // for the continued reply wait.
+                    if deadline.is_some() {
+                        self.transport.set_read_timeout(None)?;
+                    }
                     self.dispatch_transact(t, in_fds)?;
+                    if let Some(d) = deadline {
+                        self.transport.set_read_timeout(Some(d))?;
+                    }
                 }
             }
         }
@@ -289,11 +331,11 @@ impl RpcSessionInner {
         Ok(())
     }
 
-    pub(crate) fn forget_remote(&self, addr: &RpcAddress) {
+    pub(crate) fn forget_remote_if(&self, addr: &RpcAddress, who: *const ()) {
         self.state
             .lock()
             .expect("rpc state poisoned")
-            .forget_remote(addr);
+            .forget_remote_if(addr, who);
     }
 
     /// Send a `REPLY` (status + parcel bytes + any out-of-band fds).

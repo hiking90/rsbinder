@@ -273,12 +273,12 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
-            let mut data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             {%- for func in member.write_funcs %}
             {{ func }}
             {%- endfor %}
             {%- else %}
-            let data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             {%- endif %}
             Ok(data)
         }
@@ -313,7 +313,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -332,7 +332,7 @@ pub mod {{mod}} {
             };
             let binder = self.binder.clone();
             P::spawn(
-                move || binder.as_proxy().unwrap().submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
+                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
                     self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)

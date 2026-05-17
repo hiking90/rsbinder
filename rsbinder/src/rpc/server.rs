@@ -169,7 +169,14 @@ impl RpcServer {
                 log::debug!("RPC session ended: {e:?}");
             }
         });
-        self.workers.lock().expect("workers poisoned").push(handle);
+        let mut workers = self.workers.lock().expect("workers poisoned");
+        // Reap handles of already-finished sessions so `workers` is
+        // bounded by *concurrent* (not cumulative) connections — a
+        // long-lived server otherwise leaks one JoinHandle per
+        // connection ever accepted. Dropping a finished handle detaches
+        // without blocking, so this cannot stall the accept loop.
+        workers.retain(|h| !h.is_finished());
+        workers.push(handle);
     }
 
     /// Run the accept loop until [`RpcServer::shutdown`]. Each accepted
@@ -189,11 +196,30 @@ impl RpcServer {
                     self.serve_connection(Box::new(t));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Listener is non-blocking only so we can poll
+                    // `shutdown`; no pending connection.
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // Transient: peer reset between SYN and accept()
+                    // (ECONNABORTED), or EINTR. A normal accept loop
+                    // continues past these — they must NOT take the
+                    // whole server down for all future clients.
+                    log::warn!("transient accept error, continuing: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 Err(e) => {
-                    log::debug!("accept loop ending: {e}");
-                    break;
+                    // Fatal (e.g. the listener was closed): surface it.
+                    // Never disguise a hard failure as `Ok(())`, which
+                    // would make `run_background` silently dead.
+                    log::debug!("accept loop ending (fatal): {e}");
+                    return Err(e.into());
                 }
             }
         }

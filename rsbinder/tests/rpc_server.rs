@@ -469,6 +469,14 @@ fn rpc_stack_has_no_globals() {
                     if name == "tcp_debug.rs" && line.contains("INSECURE_WARNED") {
                         continue;
                     }
+                    // proxy.rs `descriptor: OnceLock<String>` (and its
+                    // import) is a *per-RpcProxy-instance* write-once
+                    // field — the 2-6.B typed-stub descriptor stamp,
+                    // owned per session, never a process global. A real
+                    // `static` here is still caught by `static_item`.
+                    if name == "proxy.rs" && l.contains("OnceLock") && !static_item {
+                        continue;
+                    }
                     offenders.push(format!("{name}:{}: {}", lineno + 1, line.trim()));
                 }
             }
