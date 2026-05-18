@@ -46,6 +46,7 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
 env_logger = { workspace = true }
+serial_test = { workspace = true }
 
 # loom is only used by tests gated on `--cfg loom`. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release

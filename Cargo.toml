@@ -42,6 +42,11 @@ clap = "4.6"
 rsproperties = "0.3"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2"
+# dev-only: serializes the handful of rsbinder unit tests that share the
+# process-wide `ProcessState` singleton + single binder fd (group key
+# `binder`). default-features = false drops the `logging`/`async` features
+# (and the `futures` dep) — every gated test is a sync `#[test]`.
+serial_test = { version = "3", default-features = false }
 
 [patch.crates-io]
 chrono = { git = "https://github.com/chronotope/chrono", tag = "v0.4.41" }
