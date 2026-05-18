@@ -1882,6 +1882,7 @@ mod tests {
     /// `process_state` M4 tests; surfaces under
     /// `.github/workflows/integration-test.yml`.
     #[test]
+    #[serial_test::serial(binder)]
     fn test_process_pending_derefs_handles_reentrant_push_from_drop() {
         use std::sync::atomic::AtomicU64;
         use std::sync::{self, Mutex};

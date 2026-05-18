@@ -114,18 +114,22 @@ jobs:
           # rsb_hub is already up (handle 0); test_service is up so the
           # cache has real entries to resurrect.
           #
-          # --test-threads=1 is required: these tests share the
-          # process-wide `ProcessState` singleton and a single binder fd.
-          # The slow-path concurrency / re-entrant-obituary guards
-          # deliberately drop and obituary the handle-0 (service manager)
-          # cache entry; running them concurrently with siblings that
-          # assert `strong_proxy_for_handle(0).is_ok()` or read the
-          # process-global thread-pool counter is inherently racy. Each
-          # guard spawns its own internal threads, so serializing test
-          # *functions* does not weaken them — it also makes the
-          # same-thread deadlock test reliably non-vacuous (no sibling
-          # keeps the handle-0 Weak upgradeable).
-          RUST_BACKTRACE=1 cargo test --package rsbinder -- --test-threads=1 || {
+          # No `--test-threads=1`: only the ~14 tests that share the
+          # process-wide `ProcessState` singleton + single binder fd carry
+          # `#[serial_test::serial(binder)]` (group key `binder`), so they
+          # are mutually exclusive while the ~100 pure unit tests still run
+          # in parallel. The slow-path concurrency / re-entrant-obituary
+          # guards deliberately drop and obituary the handle-0 (service
+          # manager) cache entry; the `binder` group lock keeps them from
+          # overlapping a sibling that asserts
+          # `strong_proxy_for_handle(0).is_ok()` or reads the
+          # process-global thread-pool counter. Each guard spawns its own
+          # internal threads, so the group lock does not weaken them — and
+          # pure tests never touch handle 0, so the same-thread deadlock
+          # test stays reliably non-vacuous (no sibling keeps the handle-0
+          # Weak upgradeable). If this step flakes, the bug is a missing
+          # `#[serial(binder)]`, not a reason to re-add `--test-threads=1`.
+          RUST_BACKTRACE=1 cargo test --package rsbinder || {
             echo "::error::rsbinder unit tests failed — capturing dmesg"
             sudo dmesg | tail -200
             cat rsb_hub.log
