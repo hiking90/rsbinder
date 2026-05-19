@@ -105,7 +105,12 @@ impl UnixTransport {
 /// accepted cross-process connection was the *server itself*, an
 /// authoritative-looking forged identity (the §0 contract defect).
 fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
-    #[cfg(target_os = "linux")]
+    // Android's bionic has no `getpeereid`, but its kernel supports
+    // `SO_PEERCRED` exactly like Linux — so android takes the Linux
+    // arm (otherwise the `not(target_os="linux")` BSD arm would pull in
+    // `libc::getpeereid` and break the aarch64-linux-android build,
+    // e.g. the subplan 2-8/2-11 emulator interop harness).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         match rustix::net::sockopt::socket_peercred(stream) {
             Ok(ucred) => PeerIdentity::Local {
@@ -117,7 +122,7 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
             Err(_) => PeerIdentity::Anonymous,
         }
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
     {
         resolve_peer_bsd(stream)
     }
@@ -131,7 +136,7 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
 /// macOS/BSD peer resolution — the subplan 2-9 Phase A failure-mode
 /// -driven fallback ladder. `getpeereid` is connect-time
 /// kernel-vouched (the BSD analogue of `SO_PEERCRED`).
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
 fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -197,7 +202,12 @@ fn peer_pid(fd: std::os::fd::RawFd) -> i32 {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+#[cfg(all(
+    unix,
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "android")
+))]
 fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
     -1
 }
@@ -231,6 +241,94 @@ impl RpcTransport for UnixTransport {
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         let mut r = &self.stream;
         r.read(buf).map_err(RpcError::from)
+    }
+
+    /// Raw, **unframed** write + `SCM_RIGHTS` (subplan 2-11 Phase A0:
+    /// the android-13+ v1+ `Unix` FD-over-RPC path). Identical to
+    /// [`UnixTransport::send_frame_with_fds`] minus the 4-byte length
+    /// prefix — the AOSP RPC wire has none. The fds ride the **first**
+    /// `sendmsg` (AOSP `RpcTransportRaw::interruptableWriteFully`,
+    /// `sentFds |= ret > 0`); the rest (rare — fd transactions are
+    /// tiny) follow without ancillary.
+    fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use std::io::IoSlice;
+        use std::mem::MaybeUninit;
+
+        if fds.is_empty() {
+            return self.send_raw(buf);
+        }
+        if fds.len() > MAX_FDS_PER_FRAME {
+            return Err(RpcError::Protocol("too many fds in one RPC frame"));
+        }
+        if buf.len() > MAX_FRAME_LEN {
+            return Err(RpcError::FrameTooLarge {
+                declared: buf.len(),
+                max: MAX_FRAME_LEN,
+            });
+        }
+        let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
+        let mut sent = 0;
+        while sent < buf.len() {
+            let mut anc = SendAncillaryBuffer::new(&mut space);
+            if sent == 0 {
+                let ok = anc.push(SendAncillaryMessage::ScmRights(fds));
+                debug_assert!(ok, "cmsg_space sized for exactly these fds");
+            }
+            let n = rustix::net::sendmsg(
+                &self.stream,
+                &[IoSlice::new(&buf[sent..])],
+                &mut anc,
+                SendFlags::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            if n == 0 {
+                return Err(RpcError::PeerClosed);
+            }
+            sent += n;
+        }
+        Ok(())
+    }
+
+    /// Raw, **unframed** read (one `recvmsg`) + any `SCM_RIGHTS` fds
+    /// (subplan 2-11 Phase A0). Pairs with
+    /// [`UnixTransport::send_raw_with_fds`]; received fds are
+    /// `O_CLOEXEC` (set explicitly — `MSG_CMSG_CLOEXEC` is Linux-only).
+    /// `Ok((0, _))` ⇒ peer closed. Unlike
+    /// [`UnixTransport::recv_frame_with_fds`] there is **no** leftover
+    /// buffer: the android-13+ message reader (`read_aosp_message
+    /// _with_fds`) drives exact header/body byte counts and accumulates
+    /// fds across those `recvmsg`s (AOSP
+    /// `RpcTransportRaw::interruptableReadFully`).
+    fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+        use std::io::IoSliceMut;
+        use std::mem::MaybeUninit;
+
+        let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+        let mut space =
+            vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
+        let mut anc = RecvAncillaryBuffer::new(&mut space);
+        let r = rustix::net::recvmsg(
+            &self.stream,
+            &mut [IoSliceMut::new(buf)],
+            &mut anc,
+            RecvFlags::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        for msg in anc.drain() {
+            if let RecvAncillaryMessage::ScmRights(iter) = msg {
+                for fd in iter {
+                    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+                        .map_err(std::io::Error::from)?;
+                    fds.push(fd);
+                    if fds.len() > MAX_FDS_PER_FRAME {
+                        return Err(RpcError::Protocol("too many fds in one RPC frame"));
+                    }
+                }
+            }
+        }
+        Ok((r.bytes, fds))
     }
 
     fn peer_identity(&self) -> PeerIdentity {

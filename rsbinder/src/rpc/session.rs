@@ -32,8 +32,9 @@ use super::state::RpcState;
 use super::transport::RpcTransport;
 use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 use super::wire_android13::{
-    client_connect, read_aosp_message, server_accept, write_aosp_message, Android13PlusCodec,
-    RawTransportIo, A13_ADDR_LEN, FD_MODE_NONE, PROTOCOL_V1, PROTOCOL_V2,
+    client_connect, read_aosp_message, read_aosp_message_with_fds, server_accept,
+    write_aosp_message, write_aosp_message_with_fds, Android13PlusCodec, RawTransportIo,
+    A13_ADDR_LEN, FD_MODE_NONE, FD_MODE_UNIX, PROTOCOL_V1, PROTOCOL_V2,
 };
 use super::{RpcError, RpcResult};
 
@@ -417,16 +418,21 @@ impl RpcSessionInner {
     /// framed send and never carries fds (AC-7.1 bit-identical).
     fn send_msg(&self, frame: &[u8], fds: &[OwnedFd]) -> RpcResult<()> {
         if self.profile.aosp_framing() {
-            // android-13+ (G4(a)): the real AOSP wire has **no** length
-            // prefix — write `frame` (= the codec's
-            // `[RpcWireHeader|body]`) raw over the transport's byte
-            // channel, exactly what a genuine android-13/14/15 peer
-            // reads. FD-over-RPC on android-13+ is negotiated in the
-            // connection header (out of G4(a) no-FD scope), so `fd_mode`
-            // stays `None` and no fds are ever produced here.
+            // android-13+: the real AOSP wire has **no** length prefix —
+            // write `frame` (= the codec's `[RpcWireHeader|body]`) raw
+            // over the transport's byte channel, exactly what a genuine
+            // android-13/14/15/16 peer reads. On a v1+ `Unix` session
+            // (subplan 2-11 Phase A0, header-negotiated FD mode) the fds
+            // ride the message's first `sendmsg` (AOSP `RpcTransportRaw`);
+            // otherwise no fds are ever produced here (no-FD scope —
+            // R34/v0/`None`, byte-identical).
+            if self.fd_mode() == FileDescriptorTransportMode::Unix {
+                let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
+                return write_aosp_message_with_fds(self.transport.as_ref(), frame, &borrowed);
+            }
             debug_assert!(
                 fds.is_empty(),
-                "android-13+ G4(a) is no-FD scope (header-negotiated FD mode is G4(b))"
+                "non-Unix android-13+ session must not carry fds"
             );
             let _ = fds; // release: `debug_assert!` is compiled out, so `fds` is otherwise unused
             let mut io = RawTransportIo(self.transport.as_ref());
@@ -445,11 +451,17 @@ impl RpcSessionInner {
     /// the mode is fixed by negotiation before any RPC traffic.
     fn recv_msg(&self) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
         if self.profile.aosp_framing() {
-            // android-13+ (G4(a)): read `RpcWireHeader` then exactly
-            // `bodySize` bytes (capped vs `MAX_FRAME_LEN` — V4); a clean
-            // EOF before any byte surfaces as `PeerClosed` so the
-            // `serve_blocking` loop terminates exactly like the R34
-            // path. No out-of-band fds in no-FD scope.
+            // android-13+: read `RpcWireHeader` then exactly `bodySize`
+            // bytes (capped vs `MAX_FRAME_LEN` — V4); a clean EOF before
+            // any byte surfaces as `PeerClosed` so the `serve_blocking`
+            // loop terminates exactly like the R34 path. On a v1+ `Unix`
+            // session (subplan 2-11 Phase A0) the same connection always
+            // uses `recvmsg` (never mixes with `Read`), accumulating the
+            // `SCM_RIGHTS` fds across the header+body reads; otherwise no
+            // out-of-band fds (no-FD scope, byte-identical).
+            if self.fd_mode() == FileDescriptorTransportMode::Unix {
+                return read_aosp_message_with_fds(self.transport.as_ref());
+            }
             let mut io = RawTransportIo(self.transport.as_ref());
             let frame = read_aosp_message(&mut io)?;
             return Ok((frame, Vec::new()));
@@ -812,6 +824,13 @@ impl RpcSessionInner {
         let mut reader = Parcel::from_vec(t.data);
         reader.attach_rpc_ops(self.parcel_ops());
         reader.set_rpc_fd_mode(self.fd_mode());
+        // Subplan 2-11 A2b: the inbound *args* parcel must know it
+        // speaks the v1+ AOSP fd body too (the reply paths already set
+        // this; the args path did not — a v1+ fd *argument* would
+        // otherwise be read as the R34 `[present|idx]` legacy shape and
+        // desync). v1+ ⇒ `[not-null|hasComm|TYPE|idx]` + strict
+        // position read; R34/v0 ⇒ legacy, byte-unchanged.
+        reader.set_rpc_record_fd_positions(self.records_fd_positions());
         reader.rpc_set_in_fds(in_fds);
         // Install the inbound wire object table (subplan 2-8 Phase C
         // position validation); empty on R34 / v0 / no-object.
@@ -1019,15 +1038,47 @@ impl RpcSession {
         transport: Box<dyn RpcTransport>,
         max_version: u32,
     ) -> Result<RpcSession> {
+        Self::connect_android13plus_fd(transport, max_version, FileDescriptorTransportMode::None)
+    }
+
+    /// Client role, opt-in android-13+ wire **with FD-over-RPC**
+    /// (subplan 2-11 Phase A0). Requests `fd_mode` in the
+    /// `RpcConnectionHeader.fileDescriptorTransportMode` byte (byte-exact
+    /// to AOSP `setFileDescriptorTransportMode`/`setupClient`, **not**
+    /// the R34 `GET_FD_MODE` special-transact) and, on a successful
+    /// handshake at **v1+** (android-14/15/16; v0 category-forbids fd,
+    /// AOSP-faithful), switches the session to `Unix`.
+    /// `FileDescriptorTransportMode::None` is exactly
+    /// [`RpcSession::connect_android13plus`] (byte-identical no-FD path).
+    pub fn connect_android13plus_fd(
+        transport: Box<dyn RpcTransport>,
+        max_version: u32,
+        fd_mode: FileDescriptorTransportMode,
+    ) -> Result<RpcSession> {
+        let want_unix = fd_mode == FileDescriptorTransportMode::Unix;
+        let hdr_fd_mode = if want_unix {
+            FD_MODE_UNIX
+        } else {
+            FD_MODE_NONE
+        };
         let codec = {
             let mut io = RawTransportIo(transport.as_ref());
-            client_connect(&mut io, max_version, false, FD_MODE_NONE).map_err(StatusCode::from)?
+            client_connect(&mut io, max_version, false, hdr_fd_mode).map_err(StatusCode::from)?
         };
-        Ok(RpcSession::with_profile(
+        let negotiated = codec.version();
+        let session = RpcSession::with_profile(
             transport,
             AddressSpace::Initiator,
             WireProfile::Android13Plus(codec),
-        ))
+        );
+        // v0 (android-13) category-forbids fd-over-RPC; only commit to
+        // `Unix` when the negotiated wire is v1+ (else stay `None` and
+        // any fd write is the AOSP-faithful `BAD_TYPE` reject).
+        if want_unix && negotiated >= PROTOCOL_V1 {
+            *session.inner.fd_mode.lock().expect("fd_mode poisoned") =
+                FileDescriptorTransportMode::Unix;
+        }
+        Ok(session)
     }
 
     /// Server role, **opt-in android-13+ versioned wire** (G4(a)). Runs
@@ -1035,25 +1086,48 @@ impl RpcSession {
     /// (negotiates `min(server_max_version, client_max)`), then returns
     /// an [`AddressSpace::Acceptor`] session speaking the negotiated
     /// version. Called by [`super::RpcServer`] on its worker thread (the
-    /// handshake is blocking I/O on the accepted socket). The session id
-    /// / FD-mode byte from the client header are read for wire fidelity
-    /// but, in no-FD G4(a) scope, not yet acted on (a real-peer
-    /// refinement is G4(b)).
+    /// handshake is blocking I/O on the accepted socket). Keeps the
+    /// no-FD scope (the client's FD-mode byte is read for wire fidelity
+    /// but not acted on — use [`RpcSession::accept_android13plus_fd`]).
     pub fn accept_android13plus(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
     ) -> Result<RpcSession> {
-        let codec = {
+        Self::accept_android13plus_fd(transport, server_max_version, false)
+    }
+
+    /// Server role, opt-in android-13+ wire **with FD-over-RPC**
+    /// (subplan 2-11 Phase A0). Reads the client's requested FD mode
+    /// from the `RpcConnectionHeader` and, when the client asked for
+    /// `Unix`, this server opted in (`server_fd_unix`,
+    /// [`super::RpcServer::set_supported_fd_modes`]), **and** the
+    /// negotiated wire is v1+ (v0 forbids fd), switches the session to
+    /// `Unix`. Lenient: a client/server FD-mode mismatch degrades to
+    /// `None` (the fd write then `BAD_TYPE`-rejects) rather than AOSP's
+    /// hard session-reject. `server_fd_unix == false` is exactly
+    /// [`RpcSession::accept_android13plus`] (byte-identical no-FD path).
+    pub fn accept_android13plus_fd(
+        transport: Box<dyn RpcTransport>,
+        server_max_version: u32,
+        server_fd_unix: bool,
+    ) -> Result<RpcSession> {
+        let (codec, client_fd_mode) = {
             let mut io = RawTransportIo(transport.as_ref());
-            let (codec, _fd_mode, _session_id) =
+            let (codec, fd_mode, _session_id) =
                 server_accept(&mut io, server_max_version).map_err(StatusCode::from)?;
-            codec
+            (codec, fd_mode)
         };
-        Ok(RpcSession::with_profile(
+        let negotiated = codec.version();
+        let session = RpcSession::with_profile(
             transport,
             AddressSpace::Acceptor,
             WireProfile::Android13Plus(codec),
-        ))
+        );
+        if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
+            *session.inner.fd_mode.lock().expect("fd_mode poisoned") =
+                FileDescriptorTransportMode::Unix;
+        }
+        Ok(session)
     }
 
     /// The negotiated android-13+ wire protocol version
@@ -1228,6 +1302,21 @@ impl RpcSession {
     ) -> Result<RpcSession> {
         let t = super::transport::UnixTransport::connect(path)?;
         RpcSession::connect_android13plus(Box::new(t), max_version)
+    }
+
+    /// Client: connect to a Unix-domain android-13+ RPC server **with
+    /// FD-over-RPC** opt-in (subplan 2-11 Phase A0). UDS connect + the
+    /// AOSP handshake requesting `fd_mode` in the connection header
+    /// (see [`RpcSession::connect_android13plus_fd`]).
+    /// `FileDescriptorTransportMode::None` ==
+    /// [`RpcSession::setup_unix_client_android13plus`] (byte-identical).
+    pub fn setup_unix_client_android13plus_fd(
+        path: impl AsRef<std::path::Path>,
+        max_version: u32,
+        fd_mode: FileDescriptorTransportMode,
+    ) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect(path)?;
+        RpcSession::connect_android13plus_fd(Box::new(t), max_version, fd_mode)
     }
 
     /// Test/diagnostic: live local-node count (AC-2.5 leak check).

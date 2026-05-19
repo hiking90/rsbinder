@@ -332,8 +332,15 @@ impl RpcServer {
                 // handshake failure ends just this connection (the
                 // accept loop and other sessions are unaffected).
                 let server = Arc::clone(self);
-                std::thread::spawn(
-                    move || match RpcSession::accept_android13plus(transport, max) {
+                // Subplan 2-11 Phase A0: the AOSP handshake reads the
+                // client's `RpcConnectionHeader.fileDescriptorTransport
+                // Mode`; honor `Unix` only if this server opted in
+                // (`set_supported_fd_modes`) — else degrade to `None`
+                // (the fd write then `BAD_TYPE`-rejects). `false` keeps
+                // the byte-identical no-FD android-13+ path.
+                let fd_unix = server.fd_unix_supported.load(Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    match RpcSession::accept_android13plus_fd(transport, max, fd_unix) {
                         Ok(session) => {
                             server.configure_session(&session);
                             if let Err(e) = session.serve_blocking() {
@@ -347,8 +354,8 @@ impl RpcServer {
                             // peer-close drain, so `warn!` not `debug!`.
                             log::warn!("android-13+ RPC handshake failed: {e:?}")
                         }
-                    },
-                )
+                    }
+                })
             }
             None => {
                 // r34 (default) — unchanged: session built here, served

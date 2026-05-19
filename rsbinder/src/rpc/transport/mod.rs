@@ -143,6 +143,40 @@ pub trait RpcTransport: Send + Sync {
     fn recv_raw(&self, _buf: &mut [u8]) -> RpcResult<usize> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
+
+    /// Send raw bytes with **no framing**, passing `fds` out-of-band via
+    /// `SCM_RIGHTS` (subplan 2-11 Phase A0 — the android-13+ v1+
+    /// `Unix` FD-over-RPC path). This is [`RpcTransport::send_raw`] +
+    /// the ancillary channel of [`RpcTransport::send_frame_with_fds`],
+    /// minus the length prefix: the real android RPC wire has none
+    /// (`RpcWireHeader.bodySize` is authoritative) and AOSP rides the
+    /// fds on the **first** `sendmsg` of the message
+    /// (`RpcTransportRaw::interruptableWriteFully`, `sentFds`). An empty
+    /// `fds` slice is exactly [`RpcTransport::send_raw`]. Default:
+    /// unsupported unless `fds` is empty (frame-only transports stay
+    /// fd-incapable *by type*, no extra code); only `unix` overrides.
+    fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
+        if fds.is_empty() {
+            self.send_raw(buf)
+        } else {
+            Err(RpcError::Protocol(
+                "this transport cannot pass file descriptors (UDS only)",
+            ))
+        }
+    }
+
+    /// Read up to `buf.len()` raw bytes (one `recvmsg`; `Ok((0, _))` =
+    /// peer closed) plus any `SCM_RIGHTS` fds delivered with them
+    /// (subplan 2-11 Phase A0). Pairs with
+    /// [`RpcTransport::send_raw_with_fds`]; received fds are
+    /// `O_CLOEXEC`. AOSP accumulates ancillary fds across the
+    /// `recvmsg`s that read one message
+    /// (`RpcTransportRaw::interruptableReadFully`), so the caller
+    /// gathers fds across the header+body reads. Default: never yields
+    /// fds (plain [`RpcTransport::recv_raw`]); only `unix` overrides.
+    fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
+        Ok((self.recv_raw(buf)?, Vec::new()))
+    }
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].

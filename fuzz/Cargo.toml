@@ -64,5 +64,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rpc_fd_v1_body"
+path = "fuzz_targets/rpc_fd_v1_body.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

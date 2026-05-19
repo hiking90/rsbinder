@@ -176,6 +176,15 @@ pub const FD_MODE_NONE: u8 = 0;
 pub const FD_MODE_UNIX: u8 = 1;
 pub const FD_MODE_TRUSTY: u8 = 2;
 
+/// AOSP `RpcFields::ObjectType::TYPE_NATIVE_FILE_DESCRIPTOR`
+/// (`Parcel.h`, `int32_t`) — the first int32 of an RPC-Parcel fd
+/// object body. Pinned byte-exact android-14.0.0_r75…android-16.0.0_r4
+/// (`TYPE_BINDER_NULL=0, TYPE_BINDER=1, TYPE_NATIVE_FILE_DESCRIPTOR=2`).
+/// Load-bearing for subplan 2-11: the AOSP-faithful FD-over-RPC v1+
+/// Parcel body (`[not-null|hasComm|TYPE|fdIndex]`) that replaces
+/// rsbinder's internal `[present|idx]` shape.
+pub const TYPE_NATIVE_FILE_DESCRIPTOR: i32 = 2;
+
 /// `setProtocolVersion` acceptance for a peer that supports up to
 /// [`SUPPORTED_MAX_VERSION`] (AOSP rule, android-16.0.0_r4 `_NEXT = 3`):
 /// accept `0..=2`, or exactly `_EXPERIMENTAL`. Equivalent to AOSP's
@@ -742,6 +751,85 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
         out.extend_from_slice(&read_exact_raw(r, body_size)?);
     }
     Ok(out)
+}
+
+/// [`write_aosp_message`] + out-of-band `SCM_RIGHTS` fds (subplan 2-11
+/// Phase A0 — the android-13+ v1+ `Unix` FD-over-RPC path). `msg` is
+/// the codec output (`[RpcWireHeader(16) | body]`, `bodySize` correct),
+/// emitted raw with **no length prefix**; `fds` ride the first
+/// `sendmsg` (AOSP `RpcTransportRaw`). With `fds` empty this is exactly
+/// [`write_aosp_message`] on the transport's raw channel (byte-identical
+/// to the no-FD android-13+ path).
+pub fn write_aosp_message_with_fds(
+    t: &dyn super::transport::RpcTransport,
+    msg: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> RpcResult<()> {
+    if msg.len() < WIRE_HEADER_LEN {
+        return Err(RpcError::Protocol("message shorter than RpcWireHeader"));
+    }
+    if msg.len() - WIRE_HEADER_LEN > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: msg.len() - WIRE_HEADER_LEN,
+            max: MAX_FRAME_LEN,
+        });
+    }
+    t.send_raw_with_fds(msg, fds)
+}
+
+/// [`read_aosp_message`] + the `SCM_RIGHTS` fds delivered with it
+/// (subplan 2-11 Phase A0). Reads the 16-byte `RpcWireHeader`, then
+/// exactly `bodySize` body bytes (capped vs [`MAX_FRAME_LEN`] before
+/// allocation — V4), **accumulating ancillary fds across every
+/// `recvmsg`** that read the message (AOSP
+/// `RpcTransportRaw::interruptableReadFully`: the kernel delivers
+/// `SCM_RIGHTS` with the first byte of the sender's `sendmsg`, i.e. on
+/// the header read). Clean EOF before any byte ⇒ [`RpcError::PeerClosed`];
+/// a short read after partial progress ⇒ [`RpcError::Truncated`]
+/// (mirrors [`read_aosp_message`]).
+pub fn read_aosp_message_with_fds(
+    t: &dyn super::transport::RpcTransport,
+) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+    let mut total_read = 0usize;
+    // Read exactly `want` bytes via `recvmsg`, accumulating any fds
+    // into `fds`. `total_read` tracks progress across header+body so a
+    // 0-byte recv distinguishes a clean pre-message close (PeerClosed)
+    // from a mid-message truncation (Truncated) — same contract as
+    // `read_exact_raw`.
+    let mut fill = |want: usize| -> RpcResult<Vec<u8>> {
+        let mut buf = vec![0u8; want];
+        let mut got = 0;
+        while got < want {
+            let (n, mut more) = t.recv_raw_with_fds(&mut buf[got..])?;
+            fds.append(&mut more);
+            if n == 0 {
+                return Err(if total_read == 0 {
+                    RpcError::PeerClosed
+                } else {
+                    RpcError::Truncated
+                });
+            }
+            got += n;
+            total_read += n;
+        }
+        Ok(buf)
+    };
+
+    let header = fill(WIRE_HEADER_LEN)?;
+    let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if body_size > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: body_size,
+            max: MAX_FRAME_LEN,
+        });
+    }
+    let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_size);
+    out.extend_from_slice(&header);
+    if body_size > 0 {
+        out.extend_from_slice(&fill(body_size)?);
+    }
+    Ok((out, fds))
 }
 
 /// Client side of the android-13+ connection handshake (new session).
