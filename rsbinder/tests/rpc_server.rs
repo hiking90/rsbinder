@@ -370,6 +370,80 @@ fn concurrent_clients_isolated_sessions() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---- 2-10: opt-in server-side connection admission bound -----------
+
+/// `set_max_connections(N)` caps *concurrent* connection workers via
+/// reactor-free accept backpressure (excess clients wait in the kernel
+/// listen backlog, none dropped; a freed slot resumes accept). This is
+/// the reactor-free, Android-faithful resource bound that the 2-10
+/// decision record carves out as the genuine middle ground (the
+/// no-reactor decision does NOT foreclose it).
+///
+/// Mutant: deleting the `max_connections` gate in `RpcServer::run`
+/// makes the 3rd client served immediately ⇒ its bounded-timeout
+/// `get_root` would *succeed*, failing this test.
+#[test]
+fn max_connections_admission_bound() {
+    let path = tmp_sock("admit");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server.set_max_connections(2);
+    let bg = server.run_background();
+    wait_for_sock(&path);
+
+    // Two long-lived sessions occupy both worker slots: each get_root
+    // succeeds (proves served), then the session is *held* so its
+    // worker stays blocked in `serve_once`/recv.
+    let c1 = RpcSession::setup_unix_client(&path).expect("connect c1");
+    assert_eq!(
+        EchoProxy(c1.get_root().expect("c1 get_root"))
+            .echo("c1")
+            .unwrap(),
+        "c1"
+    );
+    let c2 = RpcSession::setup_unix_client(&path).expect("connect c2");
+    assert_eq!(
+        EchoProxy(c2.get_root().expect("c2 get_root"))
+            .echo("c2")
+            .unwrap(),
+        "c2"
+    );
+
+    // 3rd connects (into the kernel backlog — `connect()` succeeds
+    // without a server `accept()`), but the accept loop is gated at 2,
+    // so no worker ever serves it: a bounded-deadline `get_root` must
+    // time out, not succeed.
+    let c3 = RpcSession::setup_unix_client(&path).expect("connect c3 (backlog)");
+    c3.set_timeout(Some(Duration::from_millis(600)));
+    assert!(
+        c3.get_root().is_err(),
+        "3rd connection must be admission-blocked while 2 workers are live"
+    );
+    drop(c3);
+
+    // Free a slot: dropping c1 closes its socket ⇒ the worker's recv
+    // hits EOF ⇒ `serve_blocking` returns ⇒ the JoinHandle finishes ⇒
+    // the next accept tick reaps it (`live_worker_count`) ⇒ accept
+    // resumes. A fresh 4th client is then served within a generous
+    // deadline.
+    drop(c1);
+    let c4 = RpcSession::setup_unix_client(&path).expect("connect c4");
+    c4.set_timeout(Some(Duration::from_secs(5)));
+    assert_eq!(
+        EchoProxy(c4.get_root().expect("c4 get_root after a slot freed"))
+            .echo("c4")
+            .unwrap(),
+        "c4",
+        "a freed worker slot must let the accept loop resume"
+    );
+
+    drop(c2);
+    drop(c4);
+    server.shutdown();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
+}
+
 // ---- AC-3.5 oneway FIFO + non-blocking send ------------------------
 
 #[test]
@@ -494,6 +568,10 @@ fn android13plus_profile_e2e() {
         (1, 1, 1),          // v1 — android-14/15
         (1, 0, 0),          // mismatch ⇒ min = v0
         (0, 1, 0),          // mismatch ⇒ min = v0
+        (2, 2, 2),          // v2 — android-16 (subplan 2-8)
+        (2, 1, 1),          // v2↔v1 ⇒ min = v1
+        (1, 2, 1),          // v1↔v2 ⇒ min = v1
+        (2, 0, 0),          // v2↔v0 ⇒ min = v0
     ] {
         let path = tmp_sock(&format!("a13_{smax}_{cmax}"));
         let counter = Arc::new(AtomicI64::new(0));
@@ -669,4 +747,226 @@ fn rpc_stack_has_no_globals() {
         "P6 violation — RPC stack must own all state per-session, found globals:\n{}",
         offenders.join("\n")
     );
+}
+
+// ---- 2-9 Phase A / D1: accepted peer identity is the CLIENT --------
+
+/// AC-9.1 / D1 (defect-regression, **deterministic mutant gate**).
+///
+/// A real cross-process connection: a forked child connects, the
+/// parent `accept`s. `peer_identity()` on the accepted socket must be
+/// the **client's** pid, never the server's own. Before subplan 2-9
+/// Phase A the non-Linux `resolve_peer` returned `self_identity()` for
+/// *every* socket, so a macOS/BSD server saw **itself** as the peer —
+/// an authoritative-looking forged identity (the §0 contract defect).
+/// Reverting Phase A makes `pid == std::process::id()` (the parent)
+/// instead of `child.id()`, failing the assert. On Linux the real
+/// `SO_PEERCRED` already gave the client pid, so this is a permanent
+/// cross-platform regression gate.
+#[test]
+#[cfg(unix)]
+fn unix_accepted_peer_identity_is_the_client_not_self() {
+    use rsbinder::rpc::transport::UnixTransport;
+    use rsbinder::rpc::{PeerIdentity, RpcTransport};
+
+    // Child role: connect, hold the connection briefly, exit.
+    if let Ok(path) = std::env::var("RSB_RPC_PEERID_CLIENT") {
+        let _s = std::os::unix::net::UnixStream::connect(&path).expect("child connect");
+        std::thread::sleep(Duration::from_millis(1500));
+        std::process::exit(0);
+    }
+
+    let path = tmp_sock("peerid");
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "unix_accepted_peer_identity_is_the_client_not_self",
+            "--nocapture",
+        ])
+        .env("RSB_RPC_PEERID_CLIENT", &path)
+        .spawn()
+        .expect("spawn client child");
+
+    let (stream, _addr) = listener.accept().expect("accept");
+    let t = UnixTransport::from_stream(stream).expect("from_stream");
+    let id = t.peer_identity();
+
+    let self_pid = std::process::id() as i32;
+    let child_pid = child.id() as i32;
+    match id {
+        PeerIdentity::Local { pid, .. } => {
+            assert_ne!(
+                pid, self_pid,
+                "AC-9.1: accepted peer must NOT be the server itself \
+                 (the §0 forged-self defect)"
+            );
+            // macOS LOCAL_PEERPID / Linux SO_PEERCRED ⇒ the exact
+            // client pid. (`-1` would mean a BSD without LOCAL_PEERPID
+            // — not this CI's macOS/Linux, so require the exact pid.)
+            assert_eq!(
+                pid, child_pid,
+                "accepted peer pid must be the client child's pid"
+            );
+        }
+        other => panic!("expected Local peer identity for an accepted UDS, got {other:?}"),
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---- RPC death notification (link/unlink_to_death over RPC) --------
+
+struct DeathFlag(std::sync::mpsc::SyncSender<()>);
+impl rsbinder::DeathRecipient for DeathFlag {
+    fn binder_died(&self, _who: &rsbinder::WIBinder) {
+        // Best-effort: the receiver may already be gone on a late fire.
+        let _ = self.0.try_send(());
+    }
+}
+
+/// A `DeathRecipient` linked to an RPC proxy fires when the **session
+/// connection drops** (AOSP `RpcState::sendObituaries`). The peer that
+/// wants the notification runs a serve loop (the AOSP "incoming
+/// thread" requirement); when the server process is killed the
+/// client's `serve_blocking` ends on `PeerClosed` and delivers the
+/// obituary. Also covers `unlink_to_death` (an unlinked recipient must
+/// NOT fire) and the post-death `link_to_death`→`DeadObject` contract.
+///
+/// Mutant: dropping the `send_session_obituaries()` call from
+/// `serve_blocking` (or reverting `RpcProxy::link_to_death` to the old
+/// `InvalidOperation` stub) makes `binder_died` never arrive ⇒ the
+/// `recv_timeout` below returns `Err` and the test fails.
+#[test]
+fn rpc_death_recipient_fires_on_session_drop() {
+    if let Ok(path) = std::env::var("RSB_RPC_DEATH_SERVER") {
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        let _ = server.run(); // blocks until killed
+        std::process::exit(0);
+    }
+
+    let path = tmp_sock("death");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "rpc_death_recipient_fires_on_session_drop",
+            "--nocapture",
+        ])
+        .env("RSB_RPC_DEATH_SERVER", &path)
+        .spawn()
+        .expect("spawn server child");
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client(&path).expect("connect");
+    let root = client.get_root().expect("get_root");
+
+    // An unlinked recipient must NOT fire; a linked one must.
+    let (tx_live, rx_live) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_dead, rx_dead) = std::sync::mpsc::sync_channel::<()>(1);
+    let live: Arc<DeathFlag> = Arc::new(DeathFlag(tx_live));
+    let dead: Arc<DeathFlag> = Arc::new(DeathFlag(tx_dead));
+
+    let weak_live: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&live) as _;
+    let weak_dead: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&dead) as _;
+    root.link_to_death(weak_live.clone()).expect("link live");
+    root.link_to_death(weak_dead.clone()).expect("link dead");
+    // Single-position removal: only `dead` is unlinked.
+    root.unlink_to_death(weak_dead).expect("unlink dead");
+    assert!(
+        matches!(
+            root.unlink_to_death(Arc::downgrade(&dead) as _),
+            Err(rsbinder::StatusCode::NameNotFound)
+        ),
+        "a second unlink of an already-removed recipient is NameNotFound"
+    );
+
+    // The "incoming thread": the client serves this session so it can
+    // observe the connection drop (AOSP getMaxIncomingThreads>=1).
+    let serving = client.clone();
+    let serve = std::thread::spawn(move || {
+        let _ = serving.serve_blocking();
+    });
+
+    // Kill the server process ⇒ socket closes ⇒ client serve loop ends
+    // ⇒ obituary delivered.
+    child.kill().expect("kill server");
+    child.wait().expect("reap server");
+
+    rx_dead
+        .recv_timeout(Duration::from_secs(5))
+        .expect_err("unlinked recipient must NOT receive binder_died");
+    rx_live
+        .recv_timeout(Duration::from_secs(5))
+        .expect("linked recipient must receive binder_died on session drop");
+
+    // After the obituary, a new link is DEAD_OBJECT (AOSP parity).
+    let (tx_late, _rx_late) = std::sync::mpsc::sync_channel::<()>(1);
+    let late: Arc<DeathFlag> = Arc::new(DeathFlag(tx_late));
+    assert!(
+        matches!(
+            root.link_to_death(Arc::downgrade(&late) as _),
+            Err(rsbinder::StatusCode::DeadObject)
+        ),
+        "link_to_death after the obituary must be DeadObject"
+    );
+
+    let _ = serve.join();
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---- 2-9 Phase B: opt-in authorization hook --------------------------
+
+/// AC-9.4 — the opt-in `set_authorizer` gate runs *before any RPC
+/// byte* and is backend-independent. A rejecting hook closes the
+/// connection (the peer's next op is `DeadObject`, zero payload); an
+/// accepting hook is transparent; unset is accept-all = the prior
+/// behavior (every other test in this suite, unmodified, is the
+/// additive-invariant evidence). Builds directly on Phase A: the
+/// `PeerIdentity` the hook inspects is now the *real* peer.
+///
+/// Mutant: deleting the `serve_connection` authorizer block makes the
+/// rejected client's `get_root()` succeed ⇒ the `is_err` assert fails.
+#[test]
+fn authorizer_gate_rejects_before_any_rpc_byte() {
+    use rsbinder::rpc::PeerIdentity;
+
+    // (1) Rejecting hook ⇒ connection refused, no RPC exchanged.
+    let path = tmp_sock("authz_no");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server.set_authorizer(|_peer| false);
+    let bg = server.run_background();
+    wait_for_sock(&path);
+    {
+        let client = RpcSession::setup_unix_client(&path).expect("connect");
+        client.set_timeout(Some(Duration::from_secs(3)));
+        assert!(
+            client.get_root().is_err(),
+            "a rejecting authorizer must close the connection (zero RPC bytes)"
+        );
+    }
+    server.shutdown();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
+
+    // (2) Accepting hook (inspects the real PeerIdentity) ⇒ transparent.
+    let path = tmp_sock("authz_yes");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server.set_authorizer(|peer| matches!(peer, PeerIdentity::Local { .. }));
+    let bg = server.run_background();
+    wait_for_sock(&path);
+    {
+        let client = RpcSession::setup_unix_client(&path).expect("connect");
+        let root = EchoProxy(client.get_root().expect("get_root (authorized)"));
+        assert_eq!(root.echo("authorized").unwrap(), "authorized");
+    }
+    server.shutdown();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
 }

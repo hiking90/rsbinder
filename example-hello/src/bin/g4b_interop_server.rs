@@ -77,11 +77,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let sock = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/data/local/tmp/g4b.sock".to_string());
+    // argv[2] = max RPC_WIRE_PROTOCOL_VERSION offered: 0 = android-13
+    // (v0, G4(b) STAGE1), 1 = android-14/15 (v1, subplan 2-8 D2),
+    // 2 = android-16 (v2 object table, subplan 2-8 D3). libbinder
+    // negotiates min(its_own_max, this); on the android-16 emulator
+    // libbinder's own max is 2, so this selects the negotiated wire.
+    // Default 0 keeps the original G4(b)-v0 harness behaviour.
+    let max_version: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let _ = std::fs::remove_file(&sock);
 
     let server = RpcServer::setup_unix_server(&sock)?;
-    // G4(a) opt-in: speak the android-13 (v0) versioned RPC wire.
-    server.set_android13plus(0);
+    // G4(a)/subplan-2-8 opt-in: speak the android-13+ versioned RPC
+    // wire at the requested max version (v0/v1/v2).
+    server.set_android13plus(max_version);
     // 1 ⇒ libbinder opens exactly one outgoing connection. rsbinder's
     // model is one-connection-per-session; android-13's
     // multiple-connections-per-session thread pool is a documented
@@ -90,7 +101,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     server.set_max_threads(1);
     server.set_root(Interface::as_binder(&Binder::new(Interop)));
 
-    println!("[rsbinder-server] READY android13plus(v0) on {sock}");
+    println!("[rsbinder-server] READY android13plus(v{max_version}) on {sock}");
     // Block in the accept loop until killed.
     server.run()?;
     Ok(())

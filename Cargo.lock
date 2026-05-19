@@ -1124,6 +1124,7 @@ dependencies = [
  "async-trait",
  "downcast-rs",
  "env_logger",
+ "libc",
  "log",
  "loom",
  "pretty-hex",

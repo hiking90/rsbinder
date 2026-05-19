@@ -59,6 +59,31 @@
 //! / `--bin rpc_hello_client`). A full pair incl. nested callbacks,
 //! oneway, timeout and shared-session concurrency is exercised by
 //! `rsbinder/tests/rpc_server.rs`.
+//!
+//! # Async
+//!
+//! The RPC stack's I/O is **blocking** (subplan 2-3 §7-2 — matches
+//! android-12 r34's blocking-thread model). There is deliberately *no*
+//! non-blocking `RpcTransport` / async serve loop; that "true async
+//! I/O" is a separately-deferred §7-2 item.
+//!
+//! What *is* supported (and verified — `tests/rpc_async.rs`) is the
+//! same `spawn_blocking` adapter the kernel async path uses, over RPC:
+//!
+//! * **Async client** — the generated `…Async<P>` stub
+//!   (`Strong::into_async::<rsbinder::Tokio>()`) runs each blocking
+//!   `client_transact` on `tokio::task::spawn_blocking`; the reply
+//!   parse is the async continuation. Concurrent calls on one shared
+//!   session stay correctly serialized by the per-connection driver
+//!   lock (AC-3.2), now under genuine async concurrency.
+//! * **Async service** — `Bn*::new_async_binder(impl …AsyncService,
+//!   TokioRuntime(handle))` drives an `async fn` handler via
+//!   `rt.block_on` from the blocking serve worker.
+//!
+//! Note this needs no kernel binder: the `Tokio` pool's
+//! "am-I-in-a-kernel-transaction?" guard short-circuits via
+//! `ProcessState::is_initialized()` so a pure-RPC process (e.g. on
+//! macOS) no longer panics on an uninitialized `ProcessState`.
 
 pub mod address;
 pub mod fd_mode;

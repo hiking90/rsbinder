@@ -159,6 +159,20 @@ impl RpcState {
     pub fn local_node_count(&self) -> usize {
         self.local_nodes.len()
     }
+
+    /// Strong snapshot of every cached remote proxy still alive, for
+    /// the session's connection-loss obituary sweep (AOSP
+    /// `RpcState::sendObituaries` gathers strong pointers under the
+    /// node lock, then the *caller* fires `binder_died` **after**
+    /// releasing the lock — so a recipient may re-enter
+    /// `unlink_to_death` without deadlocking). Dead `Weak`s are
+    /// skipped (their proxies are already gone).
+    pub(crate) fn remote_proxy_snapshot(&self) -> Vec<sync::Arc<dyn IBinder>> {
+        self.remote_proxies
+            .values()
+            .filter_map(sync::Weak::upgrade)
+            .collect()
+    }
 }
 
 #[cfg(test)]

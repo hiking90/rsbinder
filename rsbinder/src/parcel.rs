@@ -246,6 +246,25 @@ pub struct Parcel {
     /// indexed by the in-body fd-table index.
     #[cfg(feature = "rpc")]
     rpc_fds_in: Vec<Option<std::os::fd::OwnedFd>>,
+    /// AOSP `RpcFields::mObjectPositions` — sorted byte offsets of
+    /// flattened RPC objects (binder at android-16 v2, FD at v1+),
+    /// produced by `write_binder` / FD-write while serializing an
+    /// RPC-mode parcel and consumed by the wire codec as the trailing
+    /// `u32[]` object table (subplan 2-8). **Always empty unless
+    /// `is_for_rpc`** — the kernel path never touches it (P1, AC-2.9):
+    /// kernel objects live in [`Parcel::objects`], a wholly separate
+    /// field. Empty ⇒ byte-identical to the pre-2-8 wire.
+    #[cfg(feature = "rpc")]
+    rpc_object_positions: Vec<u32>,
+    /// Whether an FD flattened into this parcel records its position
+    /// in [`Parcel::rpc_object_positions`] (subplan 2-8 Phase B). The
+    /// session sets this from its wire profile alongside the FD mode:
+    /// `true` only on the android-13+ v1+ profile (R34 has no object
+    /// table — keeps the 2-7 FD-over-RPC wire byte-unchanged). Binder
+    /// positions are recorded by the session directly (it owns the
+    /// profile); only the FD path needs this Parcel-side flag.
+    #[cfg(feature = "rpc")]
+    rpc_record_fd_positions: bool,
 }
 
 impl Default for Parcel {
@@ -280,6 +299,10 @@ impl Parcel {
             rpc_fds_out: Vec::new(),
             #[cfg(feature = "rpc")]
             rpc_fds_in: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_object_positions: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_record_fd_positions: false,
         }
     }
 
@@ -318,6 +341,10 @@ impl Parcel {
             rpc_fds_out: Vec::new(),
             #[cfg(feature = "rpc")]
             rpc_fds_in: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_object_positions: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_record_fd_positions: false,
         }
     }
 
@@ -342,6 +369,10 @@ impl Parcel {
             rpc_fds_out: Vec::new(),
             #[cfg(feature = "rpc")]
             rpc_fds_in: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_object_positions: Vec::new(),
+            #[cfg(feature = "rpc")]
+            rpc_record_fd_positions: false,
         }
     }
 
@@ -396,6 +427,67 @@ impl Parcel {
         self.data.as_slice()
     }
 
+    // ---- subplan 2-8: RPC object table (android-16 v2) -------------
+
+    /// The sorted object-position table (AOSP `mObjectPositions`),
+    /// consumed by the wire codec as a trailing `u32[]`. Always empty
+    /// on the kernel path (`!is_for_rpc`) and when no RPC object was
+    /// flattened — i.e. byte-identical to the pre-2-8 wire.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_object_positions(&self) -> &[u32] {
+        &self.rpc_object_positions
+    }
+
+    /// Install the object table that arrived with an incoming RPC
+    /// parcel (AOSP `rpcSetDataReference`'s `mObjectPositions` copy),
+    /// so the binder/FD deserializers can validate object positions
+    /// (subplan 2-8 Phase C). No-op kernel-side (`!is_for_rpc`).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
+        if !self.is_for_rpc {
+            return;
+        }
+        self.rpc_object_positions = positions;
+    }
+
+    /// AOSP `Parcel::unflattenBinder` v2 strict check: a binder may
+    /// only be read from a position that is in the object table
+    /// (`std::binary_search(mObjectPositions, objectPos)`; subplan
+    /// 2-8 Phase C / AC-8.7). The table arrives sorted from a
+    /// conformant peer; an unsorted/forged table simply fails the
+    /// search ⇒ the caller returns `BAD_VALUE` (safe).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_object_position_present(&self, pos: usize) -> bool {
+        let Ok(pos) = u32::try_from(pos) else {
+            return false;
+        };
+        self.rpc_object_positions.binary_search(&pos).is_ok()
+    }
+
+    /// Record the start offset of an RPC object just flattened into
+    /// this parcel, keeping the table sorted (AOSP
+    /// `Parcel::flattenBinder`/`writeFileDescriptor`:
+    /// `mObjectPositions.insert(upper_bound(...), dataPos)`).
+    ///
+    /// **Hard-gated on `is_for_rpc`**: a stray call on a kernel parcel
+    /// is a no-op, so the kernel wire (P1, AC-2.9) can never grow an
+    /// object table. The producer (subplan 2-8 Phase B) only calls
+    /// this from the RPC `write_binder` / FD-write paths, and the
+    /// caller decides *whether* to record (binder ⇒ v2 only; FD ⇒
+    /// v1+), faithfully mirroring AOSP's per-call version gate.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_record_object_position(&mut self, pos: usize) {
+        if !self.is_for_rpc {
+            return;
+        }
+        let pos = pos as u32;
+        // `upper_bound` ⇒ stable, AOSP-faithful sorted insert (positions
+        // are produced in ascending write order in practice, so this is
+        // an O(1) push on the common path).
+        let at = self.rpc_object_positions.partition_point(|&p| p <= pos);
+        self.rpc_object_positions.insert(at, pos);
+    }
+
     // ---- subplan 2-7: FD-over-RPC (opt-in, Unix mode) --------------
 
     /// Set the negotiated FD-over-RPC mode for this parcel (default
@@ -409,6 +501,21 @@ impl Parcel {
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_fd_mode(&self) -> crate::rpc::FileDescriptorTransportMode {
         self.rpc_fd_mode
+    }
+
+    /// Set by the session from its wire profile (alongside the FD
+    /// mode): record FD object positions only on the android-13+ v1+
+    /// profile (subplan 2-8 Phase B). R34 stays `false` ⇒ the 2-7
+    /// FD-over-RPC wire is byte-unchanged.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
+        self.rpc_record_fd_positions = yes;
+    }
+
+    /// Whether the FD-write path records its object position.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_record_fd_positions(&self) -> bool {
+        self.rpc_record_fd_positions
     }
 
     /// Stash an outgoing fd (already an owned dup) and return its
@@ -1380,5 +1487,138 @@ mod tests {
             0,
             "saturating_sub, not underflow panic"
         );
+    }
+
+    /// **AC-8.6 / subplan 2-8 Phase B** — the RPC object-position
+    /// table is collected AOSP-faithfully: the recorded offset is the
+    /// position of the object's leading int32 (AOSP `dataPos =
+    /// mDataPos` *before* `writeInt32(TYPE_*)`), the table stays
+    /// **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
+    /// dataPos)`) even when objects are recorded out of order, it is
+    /// hard-gated on `is_for_rpc` (kernel diff 0, AC-2.9), and it
+    /// survives a v2 codec encode→decode with the AOSP `bodySize =
+    /// fixed + parcelDataSize + 4·N` framing. Single / multiple /
+    /// mixed (binder-shaped + FD-shaped) objects.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn rpc_object_position_table_is_aosp_faithful_and_sorted() {
+        use crate::rpc::wire::{WireCodec, WireMessage, WireTransaction};
+        use crate::rpc::wire_android13::Android13PlusCodec;
+
+        // ---- kernel parcel: recording is a hard no-op (P1/AC-2.9) ----
+        let mut kparcel = Parcel::new();
+        kparcel.write(&7i32).unwrap();
+        kparcel.rpc_record_object_position(0); // !is_for_rpc ⇒ ignored
+        assert!(
+            kparcel.rpc_object_positions().is_empty(),
+            "kernel parcel must never grow an object table"
+        );
+
+        // ---- RPC parcel: AOSP-faithful flatten sequence ----
+        let mut p = Parcel::new();
+        p.set_for_rpc(true);
+        p.set_rpc_record_fd_positions(true);
+
+        // Interface-token-like prefix, then a mix of objects and
+        // scalars. Each "object" mirrors the android-16 wire body:
+        //   binder: [i32 present=1][8B RpcWireAddress][i32 stability]
+        //   fd    : [i32 present=1][i32 ancillary-index]
+        // The position recorded is the offset of the leading int32,
+        // captured *before* it is written (AOSP `Parcel::flattenBinder`
+        // / `writeFileDescriptor`).
+        p.write(&0xDEAD_BEEFu32).unwrap(); // token-ish
+        p.write(&"iface".to_owned()).unwrap(); // a String arg
+
+        let mut expect: Vec<u32> = Vec::new();
+
+        // binder #1
+        let pos = p.data_position();
+        expect.push(pos as u32);
+        p.write(&1i32).unwrap(); // present/TYPE_BINDER
+        p.write_aligned_data(&[0u8; 8]); // 8B RpcWireAddress
+        p.write(&0x0Ci32).unwrap(); // stability
+        p.rpc_record_object_position(pos);
+
+        p.write(&123i64).unwrap(); // an interleaved scalar
+
+        // fd #1
+        let pos = p.data_position();
+        expect.push(pos as u32);
+        p.write(&1i32).unwrap(); // present
+        p.write(&0i32).unwrap(); // ancillary index
+        p.rpc_record_object_position(pos);
+
+        // binder #2
+        let pos = p.data_position();
+        expect.push(pos as u32);
+        p.write(&1i32).unwrap();
+        p.write_aligned_data(&[0u8; 8]);
+        p.write(&0x0Ci32).unwrap();
+        p.rpc_record_object_position(pos);
+
+        // Already ascending (objects written front-to-back).
+        assert_eq!(
+            p.rpc_object_positions(),
+            &expect[..],
+            "AOSP dataPos offsets"
+        );
+        assert!(
+            p.rpc_object_positions().windows(2).all(|w| w[0] < w[1]),
+            "table strictly ascending"
+        );
+
+        // AOSP `mObjectPositions.insert(upper_bound(...), dataPos)`:
+        // a late out-of-order record still lands sorted.
+        let mut q = Parcel::new();
+        q.set_for_rpc(true);
+        for pos in [40u32, 8, 24, 8, 0] {
+            q.rpc_record_object_position(pos as usize);
+        }
+        assert_eq!(
+            q.rpc_object_positions(),
+            &[0, 8, 8, 24, 40],
+            "upper_bound insert keeps the table sorted (dups allowed)"
+        );
+
+        // AC-8.7 — the v2 strict-receive `binary_search` primitive
+        // (`Parcel::unflattenBinder`): a recorded position passes, an
+        // unrecorded one fails ⇒ `read_binder` returns BAD_VALUE.
+        for &good in &[0u32, 8, 24, 40] {
+            assert!(q.rpc_object_position_present(good as usize), "pos {good}");
+        }
+        for bad in [4usize, 12, 41, 9999] {
+            assert!(
+                !q.rpc_object_position_present(bad),
+                "unrecorded pos {bad} must fail the v2 binary_search"
+            );
+        }
+
+        // ---- v2 codec framing: positions survive encode→decode and
+        //      bodySize = 40 + parcelDataSize + 4·N (AOSP RpcState) ----
+        let c = Android13PlusCodec::android16();
+        let data = p.rpc_data_bytes().to_vec();
+        let positions = p.rpc_object_positions().to_vec();
+        let txn = WireTransaction {
+            address: crate::rpc::address::RpcAddress::zero(),
+            code: 1,
+            flags: 0,
+            async_number: 0,
+            data: data.clone(),
+            object_positions: positions.clone(),
+        };
+        let enc = c.encode_transact(&txn).unwrap();
+        let body = u32::from_le_bytes([enc[4], enc[5], enc[6], enc[7]]) as usize;
+        assert_eq!(
+            body,
+            40 + data.len() + 4 * positions.len(),
+            "bodySize = fixed(40) + parcelDataSize + 4·N"
+        );
+        match c.decode_message(&enc).unwrap() {
+            WireMessage::Transact(d) => {
+                assert_eq!(d.data, data, "parcel data intact");
+                assert_eq!(d.object_positions, positions, "object table intact");
+            }
+            o => panic!("expected Transact, got {o:?}"),
+        }
     }
 }

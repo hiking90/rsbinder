@@ -20,7 +20,8 @@
 
 use std::any::Any;
 use std::mem::ManuallyDrop;
-use std::sync::{self, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{self, OnceLock, RwLock, Weak};
 
 use crate::binder::{DeathRecipient, IBinder, SIBinder, Stability, Transactable, WIBinder};
 use crate::binder::{TransactionCode, TransactionFlags};
@@ -42,6 +43,16 @@ pub struct RpcProxy {
     /// identity and the single `DEC_STRONG` intact (AC-2.5 / P5).
     descriptor: OnceLock<String>,
     session: Weak<RpcSessionInner>,
+    /// Death-notification state, mirroring the kernel
+    /// [`ProxyHandle`](crate::proxy::ProxyHandle) exactly. RPC has no
+    /// death *wire* message (AOSP `RpcState::sendObituaries`): an RPC
+    /// object dies when its **session connection drops**, so the
+    /// session fires every cached proxy's obituary when its serve loop
+    /// ends (see [`RpcSessionInner::send_session_obituaries`]). Set
+    /// once when the obituary is dispatched (`Acquire`/`Release`
+    /// publishes the recipients teardown to lock-free readers).
+    obituary_sent: AtomicBool,
+    recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
 }
 
 impl RpcProxy {
@@ -50,6 +61,57 @@ impl RpcProxy {
             addr,
             descriptor: OnceLock::new(),
             session,
+            obituary_sent: AtomicBool::new(false),
+            recipients: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Fire `binder_died` on every registered recipient — called by the
+    /// owning session when its connection drops (AOSP
+    /// `BpBinder::sendObituary`, the RPC branch). Mirrors the kernel
+    /// [`ProxyHandle::send_obituary`](crate::proxy::ProxyHandle) state
+    /// machine **minus** the kernel-only `BC_CLEAR_DEATH_NOTIFICATION`
+    /// / `flush_commands` (death over RPC is connection-drop-driven,
+    /// not a wire command). Idempotent: a second call (e.g. a serve
+    /// loop ending after a transact already observed the close) sees
+    /// `obituary_sent == true` and returns.
+    pub(crate) fn send_obituary(&self, who: &WIBinder) {
+        let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
+            // All `obituary_sent` reads/writes that race `link`/`unlink`
+            // happen under this write lock (kernel parity: `mLock`).
+            let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+            if self.obituary_sent.load(Ordering::Relaxed) {
+                return;
+            }
+            let snapshot = std::mem::take(&mut *recipients);
+            // `Release` so a lock-free `link_to_death` Acquire-load that
+            // observes `true` also sees the drained vector.
+            self.obituary_sent.store(true, Ordering::Release);
+            snapshot
+        };
+        // Callbacks outside the lock so a recipient may re-enter
+        // `unlink_to_death`/`link_to_death` without self-deadlock
+        // (AOSP unlocks before `reportOneDeath`). Panic-isolated so one
+        // buggy recipient cannot abort the serve thread or starve the
+        // rest.
+        for weak in &snapshot {
+            let Some(recipient) = weak.upgrade() else {
+                continue;
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recipient.binder_died(who);
+            }));
+            if let Err(payload) = r {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                log::error!(
+                    "DeathRecipient panicked during binder_died for RPC addr {:?}: {msg}",
+                    self.addr
+                );
+            }
         }
     }
 
@@ -98,6 +160,7 @@ impl RpcProxy {
         // So `ParcelFileDescriptor::serialize` applies the negotiated
         // FD policy (default `None` ⇒ the 2-2 reject — subplan 2-7).
         data.set_rpc_fd_mode(inner.fd_mode());
+        data.set_rpc_record_fd_positions(inner.records_fd_positions());
         super::session::write_rpc_interface_token(&mut data, descriptor)?;
         Ok(data)
     }
@@ -127,6 +190,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
         let mut data = Parcel::new();
         data.attach_rpc_ops(inner.parcel_ops());
         data.set_rpc_fd_mode(inner.fd_mode());
+        data.set_rpc_record_fd_positions(inner.records_fd_positions());
         if write_header {
             super::session::write_rpc_interface_token(&mut data, self.descriptor_str())?;
         }
@@ -161,14 +225,51 @@ impl Drop for RpcProxy {
 }
 
 impl IBinder for RpcProxy {
-    fn link_to_death(&self, _r: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Death notification over RPC is a later subplan; reject
-        // explicitly rather than silently succeed.
-        Err(StatusCode::InvalidOperation)
+    /// Register a death recipient. Death over RPC = the **session
+    /// connection dropping** (AOSP `RpcState::sendObituaries`): the
+    /// recipient fires when the session's serve loop ends. Mirrors the
+    /// kernel [`ProxyHandle::link_to_death`](crate::proxy::ProxyHandle)
+    /// minus the kernel `requestDeathNotification` IPC (RPC has no
+    /// death wire message).
+    ///
+    /// **Detection requires the session to be served.** AOSP rejects an
+    /// RPC `linkToDeath` outright unless `getMaxIncomingThreads() >= 1`;
+    /// the rsbinder analogue is that the obituary is delivered by
+    /// [`RpcSession::serve_blocking`](super::session::RpcSession) on
+    /// connection loss, so a peer that wants death notification must
+    /// run a serve loop (it already does for nested callbacks). A
+    /// session that is never served still registers the recipient but
+    /// will not deliver until something drives the connection — a
+    /// documented rsbinder model property, faithful to AOSP's
+    /// incoming-thread requirement.
+    fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+        // Lock first, then check `obituary_sent` — kernel/AOSP ordering
+        // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
+        let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+        if self.obituary_sent.load(Ordering::Relaxed) {
+            // Connection already dropped — AOSP returns DEAD_OBJECT.
+            return Err(StatusCode::DeadObject);
+        }
+        recipients.push(recipient);
+        Ok(())
     }
 
-    fn unlink_to_death(&self, _r: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        Err(StatusCode::InvalidOperation)
+    /// Unregister a death recipient (single-position, order-preserving
+    /// — kernel `removeAt(i)` parity, *not* `retain`, so a duplicate
+    /// registration keeps its remaining subscriptions).
+    fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+        let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+        if self.obituary_sent.load(Ordering::Relaxed) {
+            return Err(StatusCode::DeadObject);
+        }
+        let Some(i) = recipients
+            .iter()
+            .position(|r| sync::Weak::ptr_eq(r, &recipient))
+        else {
+            return Err(StatusCode::NameNotFound);
+        };
+        recipients.remove(i);
+        Ok(())
     }
 
     fn ping_binder(&self) -> Result<()> {

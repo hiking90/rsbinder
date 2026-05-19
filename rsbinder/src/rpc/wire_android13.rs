@@ -13,13 +13,30 @@
 //! * **v1** = android-14 **and** android-15
 //!   (`RPC_WIRE_PROTOCOL_VERSION = 1`; their `RpcWireFormat.h` is
 //!   byte-identical to each other)
+//! * **v2** = android-16 (`RPC_WIRE_PROTOCOL_VERSION = 2`,
+//!   `RPC_HEADER_INCLUDES_BINDER_POSITIONS`; subplan 2-8)
 //!
 //! The negotiated version is selected at runtime by the connection
 //! handshake (`RpcConnectionHeader`/`RpcNewSessionResponse`). r34
 //! (android-12, pre-versioning, 32-byte address, no handshake) stays a
-//! separate codec. android-16 is **not** covered (its source is not in
-//! the local AOSP checkout — tags stop at android-15.0.0; gated, see
-//! RPC_STATUS §2-5b).
+//! separate codec.
+//!
+//! # v1 ≡ v2 framing (subplan 2-8 §0.3, verified vs `android-16.0.0_r4`)
+//!
+//! v2's wire-protocol delta is **not** a framing change. A full sweep
+//! of `RpcState.cpp` + `RpcWireFormat.h` (android-16.0.0_r4) shows
+//! **zero** `>= RPC_HEADER_INCLUDES_BINDER_POSITIONS` branches in the
+//! framing layer — every wire branch is v0-vs-v1+
+//! (`RpcWireReply::wireSize` = `v0?4:20`, the `>= EXPLICIT_PARCEL_SIZE`
+//! object-table split). The only `INCLUDES_BINDER_POSITIONS` uses are
+//! in `Parcel.cpp` (`flattenBinder`/`unflattenBinder`/
+//! `rpcSetDataReference`): whether a *binder* (vs only an FD) position
+//! is recorded in `mObjectPositions`. So v1 and v2 share **one
+//! framing path**; the codec is version-agnostic about the object
+//! table's *contents* (it just frames the trailing `u32[]`), and the
+//! v1↔v2 distinction lives entirely in the Parcel position producer
+//! (subplan 2-8 Phase B). A no-object parcel ⇒ empty table ⇒
+//! byte-identical v1/v2 wire (AC-8.2, structural v1 no-regression).
 //!
 //! # Spec of record
 //!
@@ -61,12 +78,26 @@
 //!   FD mode is negotiated *in the connection header* at v1, not via
 //!   the separate `GET_FD_MODE` special transact rsbinder/2-7 uses.
 //!
-//! Version constants (`include/binder/RpcSession.h` @ android-15):
-//! `RPC_WIRE_PROTOCOL_VERSION = 1`,
-//! `RPC_WIRE_PROTOCOL_VERSION_NEXT = 2`,
-//! `..._EXPERIMENTAL = 0xF000_0000`. `setProtocolVersion` rejects
-//! `version >= _NEXT && version != _EXPERIMENTAL` — so a peer that
-//! supports up to v1 accepts {0, 1, EXPERIMENTAL}.
+//! ## v1 → v2 (android-16, subplan 2-8)
+//!
+//! **No struct/framing change.** `RpcWireFormat.h` is byte-identical to
+//! v1 (`RpcWireReply::wireSize` still `v0?4:20`; `RpcWireTransaction`
+//! still 40 B with `parcelDataSize`). The only delta is that the
+//! trailing object table (`mObjectPositions`, framed as a `u32[]` after
+//! the parcel data — already present at v1 for FD positions) now also
+//! carries **binder** positions. That is a Parcel-producer concern
+//! (subplan 2-8 Phase B), not a codec/framing concern: the codec
+//! frames the `u32[]` identically for v1 and v2.
+//!
+//! Version constants (`include/binder/RpcSession.h` @
+//! **android-16.0.0_r4**): `RPC_WIRE_PROTOCOL_VERSION = 2`,
+//! `RPC_WIRE_PROTOCOL_VERSION_NEXT = 3`,
+//! `..._EXPERIMENTAL = 0xF000_0000`,
+//! `..._RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE = 1`,
+//! `..._RPC_HEADER_INCLUDES_BINDER_POSITIONS = 2`.
+//! `setProtocolVersion` rejects `version >= _NEXT && version !=
+//! _EXPERIMENTAL` — so a peer that supports up to v2 accepts
+//! {0, 1, 2, EXPERIMENTAL}.
 //!
 //! ## Scope (2-5b, device-free)
 //!
@@ -118,10 +149,22 @@ pub const CONN_INIT_OKAY: [u8; 4] = *b"cci\0";
 
 /// android-13 stable wire protocol version (`RPC_WIRE_PROTOCOL_VERSION`).
 pub const PROTOCOL_V0: u32 = 0;
-/// android-14 / android-15 stable wire protocol version.
+/// android-14 / android-15 stable wire protocol version
+/// (`RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE`).
 pub const PROTOCOL_V1: u32 = 1;
-/// Highest version this codec implements.
-pub const SUPPORTED_MAX_VERSION: u32 = PROTOCOL_V1;
+/// android-16 stable wire protocol version
+/// (`RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_INCLUDES_BINDER_POSITIONS`;
+/// subplan 2-8). Framing is byte-identical to [`PROTOCOL_V1`]; the
+/// only delta is that binder positions also enter the object table
+/// (a Parcel-producer concern — Phase B).
+pub const PROTOCOL_V2: u32 = 2;
+/// Highest version this codec implements (android-16.0.0_r4
+/// `RPC_WIRE_PROTOCOL_VERSION`).
+pub const SUPPORTED_MAX_VERSION: u32 = PROTOCOL_V2;
+/// `RPC_WIRE_PROTOCOL_VERSION_NEXT` (android-16.0.0_r4) — the first
+/// version rsbinder cannot speak; `setProtocolVersion` rejects
+/// `>= _NEXT` (unless `_EXPERIMENTAL`).
+pub const RPC_WIRE_PROTOCOL_VERSION_NEXT: u32 = 3;
 /// `RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL`.
 pub const RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL: u32 = 0xF000_0000;
 
@@ -134,21 +177,33 @@ pub const FD_MODE_UNIX: u8 = 1;
 pub const FD_MODE_TRUSTY: u8 = 2;
 
 /// `setProtocolVersion` acceptance for a peer that supports up to
-/// [`SUPPORTED_MAX_VERSION`] (AOSP rule with `_NEXT = 2`): accept
-/// `0..=1`, or exactly `_EXPERIMENTAL`.
+/// [`SUPPORTED_MAX_VERSION`] (AOSP rule, android-16.0.0_r4 `_NEXT = 3`):
+/// accept `0..=2`, or exactly `_EXPERIMENTAL`. Equivalent to AOSP's
+/// `version < _NEXT || version == _EXPERIMENTAL` since
+/// `SUPPORTED_MAX_VERSION == _NEXT - 1`.
 pub fn is_supported_protocol_version(version: u32) -> bool {
     version <= SUPPORTED_MAX_VERSION || version == RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL
 }
 
 /// `RpcWireReply::wireSize(protocolVersion)` (RpcWireFormat.h): v0 is
-/// just `i32 status` (4 B); v1+ adds `parcelDataSize + reserved[3]`
-/// (20 B). The Parcel data follows this fixed prefix.
+/// just `i32 status` (4 B); v1+ (incl. v2 — byte-identical) adds
+/// `parcelDataSize + reserved[3]` (20 B). The Parcel data follows
+/// this fixed prefix.
 fn reply_fixed_len(version: u32) -> usize {
     if version == PROTOCOL_V0 {
         4
     } else {
         20
     }
+}
+
+/// `true` once the wire carries a trailing object table — i.e. v1+
+/// (`>= RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE`).
+/// v0 has no `parcelDataSize` and no object table at all. (v1 and v2
+/// are identical here — the v1↔v2 distinction is purely *which*
+/// objects the Parcel producer records, subplan 2-8 Phase B.)
+fn has_object_table(version: u32) -> bool {
+    version >= PROTOCOL_V1
 }
 
 // --- bounds-checked LE readers (local — keeps wire.rs byte-unchanged) -
@@ -200,6 +255,15 @@ impl Android13PlusCodec {
     pub fn android14_15() -> Self {
         Self {
             version: PROTOCOL_V1,
+        }
+    }
+
+    /// v2 — android-16 (subplan 2-8). Framing byte-identical to v1;
+    /// differs only in that the Parcel producer also records binder
+    /// positions in the object table (Phase B).
+    pub fn android16() -> Self {
+        Self {
+            version: PROTOCOL_V2,
         }
     }
 
@@ -363,11 +427,88 @@ impl Android13PlusCodec {
     }
 }
 
+/// AOSP `RpcState::sendTransaction`/`reply`: append the parcel data
+/// then the object table as a trailing LE `u32[]` (`objectTableSpan
+/// .toIovec()`). The wire body is `[fixed prefix][parcel data
+/// (parcelDataSize bytes)][object table (4·N bytes)]`. v0 has no
+/// object table (`validateParcel` rejects v0 + non-empty positions —
+/// AC-8.4); v1 and v2 are byte-identical here (the table is just a
+/// `u32[]`, version-agnostic — subplan 2-8 §0.3).
+fn encode_data_and_table(
+    out: &mut Vec<u8>,
+    version: u32,
+    data: &[u8],
+    object_positions: &[u32],
+) -> RpcResult<()> {
+    if !has_object_table(version) {
+        if !object_positions.is_empty() {
+            // AOSP `RpcState::validateParcel` (RpcState.cpp:1469):
+            // `protocolVersion < EXPLICIT_PARCEL_SIZE && !mObjectPositions
+            // .empty()` ⇒ BAD_VALUE.
+            return Err(RpcError::Protocol(
+                "v0 wire has no object table (objects need protocol version >= 1)",
+            ));
+        }
+        out.extend_from_slice(data);
+        return Ok(());
+    }
+    out.extend_from_slice(data);
+    for pos in object_positions {
+        out.extend_from_slice(&pos.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Inverse of [`encode_data_and_table`]: AOSP's `parcelSpan.splitOff(
+/// parcelDataSize)` + `objectTableBytes->reinterpret<uint32_t>()`
+/// (`RpcState.cpp:840-866`/`1144-1176`). `rest` is the body after the
+/// fixed prefix. Phase A does **length + %4 validation only**; v2
+/// strict position-content validation (`binary_search`/range) is
+/// Phase C (subplan 2-8 §3.1 — a lenient decoder still interops).
+fn split_data_and_table(
+    version: u32,
+    rest: &[u8],
+    parcel_data_size: usize,
+) -> RpcResult<(Vec<u8>, Vec<u32>)> {
+    if !has_object_table(version) {
+        // v0: no parcelDataSize, no object table — the whole `rest`
+        // is parcel data (bodySize authoritative).
+        return Ok((rest.to_vec(), Vec::new()));
+    }
+    // `splitOff(parcelDataSize)` ⇒ nullopt (⇒ BAD_VALUE) if it runs
+    // past the available bytes.
+    if parcel_data_size > rest.len() {
+        return Err(RpcError::Protocol(
+            "parcelDataSize larger than available bytes",
+        ));
+    }
+    let (data, table_bytes) = rest.split_at(parcel_data_size);
+    // `reinterpret<uint32_t>()` ⇒ nullopt (⇒ BAD_VALUE) if the object
+    // table byte length isn't a whole number of u32.
+    if table_bytes.len() % 4 != 0 {
+        return Err(RpcError::Protocol(
+            "object table byte size not a multiple of 4",
+        ));
+    }
+    let positions = table_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((data.to_vec(), positions))
+}
+
 impl WireCodec for Android13PlusCodec {
-    fn encode_transact(&self, txn: &WireTransaction) -> Vec<u8> {
-        // 40 B fixed at both versions; at v1 the first reserved word
-        // carries parcelDataSize (size of the Parcel data following).
-        let body_len = A13_TXN_FIXED_LEN + txn.data.len();
+    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
+        // 40 B fixed at all versions; at v1+ the first reserved word
+        // carries parcelDataSize (size of the Parcel data following),
+        // then the object table is appended as a trailing LE u32[]
+        // (bodySize = 40 + parcelDataSize + 4·N). v0: no table.
+        let table_bytes = if has_object_table(self.version) {
+            4 * txn.object_positions.len()
+        } else {
+            0
+        };
+        let body_len = A13_TXN_FIXED_LEN + txn.data.len() + table_bytes;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len));
         out.extend_from_slice(&Self::encode_addr(&txn.address)); // 8
@@ -381,13 +522,18 @@ impl WireCodec for Android13PlusCodec {
         };
         out.extend_from_slice(&parcel_size.to_le_bytes()); // 4 (v0: reserved)
         out.extend_from_slice(&[0u8; 12]); // reserved[3]
-        out.extend_from_slice(&txn.data); // data[]
-        out
+        encode_data_and_table(&mut out, self.version, &txn.data, &txn.object_positions)?;
+        Ok(out)
     }
 
-    fn encode_reply(&self, reply: &WireReply) -> Vec<u8> {
+    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
         let fixed = reply_fixed_len(self.version);
-        let body_len = fixed + reply.data.len();
+        let table_bytes = if has_object_table(self.version) {
+            4 * reply.object_positions.len()
+        } else {
+            0
+        };
+        let body_len = fixed + reply.data.len() + table_bytes;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&Self::header(CMD_REPLY, body_len));
         out.extend_from_slice(&reply.status.to_le_bytes()); // i32 status
@@ -395,8 +541,8 @@ impl WireCodec for Android13PlusCodec {
             out.extend_from_slice(&(reply.data.len() as u32).to_le_bytes()); // parcelDataSize
             out.extend_from_slice(&[0u8; 12]); // reserved[3]
         }
-        out.extend_from_slice(&reply.data);
-        out
+        encode_data_and_table(&mut out, self.version, &reply.data, &reply.object_positions)?;
+        Ok(out)
     }
 
     fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8> {
@@ -439,17 +585,24 @@ impl WireCodec for Android13PlusCodec {
                 let code = rd_u32(body, A13_ADDR_LEN)?;
                 let flags = rd_u32(body, A13_ADDR_LEN + 4)?;
                 let async_number = rd_u64(body, A13_ADDR_LEN + 8)?;
-                // +24: parcelDataSize (v1) / reserved (v0); +28: reserved[3].
-                // RpcWireHeader.bodySize is authoritative for the body
-                // extent (parcelDataSize is informational and, in the
-                // no-FD path, equals data.len()).
-                let data = body[A13_TXN_FIXED_LEN..].to_vec();
+                // body[24..28] = parcelDataSize (v1+) / reserved (v0);
+                // body[28..40] = reserved[3]. At v1+ parcelDataSize is
+                // **authoritative** for the data/table split (AOSP
+                // `parcelSpan.splitOff(parcelDataSize)`); at v0 there is
+                // no table and the whole body tail is the parcel data.
+                let parcel_data_size = rd_u32(body, A13_ADDR_LEN + 16)? as usize;
+                let (data, object_positions) = split_data_and_table(
+                    self.version,
+                    &body[A13_TXN_FIXED_LEN..],
+                    parcel_data_size,
+                )?;
                 Ok(WireMessage::Transact(WireTransaction {
                     address,
                     code,
                     flags,
                     async_number,
                     data,
+                    object_positions,
                 }))
             }
             CMD_REPLY => {
@@ -458,10 +611,21 @@ impl WireCodec for Android13PlusCodec {
                     return Err(RpcError::Protocol("RpcWireReply truncated"));
                 }
                 let status = rd_u32(body, 0)? as i32;
-                // v1: parcelDataSize @4, reserved[3] @8..20 — ignored
-                // (bodySize authoritative for the no-FD path).
-                let data = body[fixed..].to_vec();
-                Ok(WireMessage::Reply(WireReply { status, data }))
+                // v1+: parcelDataSize @4 is authoritative for the
+                // data/table split; reserved[3] @8..20. v0: 4 B fixed,
+                // no table.
+                let parcel_data_size = if has_object_table(self.version) {
+                    rd_u32(body, 4)? as usize
+                } else {
+                    0
+                };
+                let (data, object_positions) =
+                    split_data_and_table(self.version, &body[fixed..], parcel_data_size)?;
+                Ok(WireMessage::Reply(WireReply {
+                    status,
+                    data,
+                    object_positions,
+                }))
             }
             CMD_DEC_STRONG => {
                 if body.len() != A13_DEC_STRONG_LEN {
@@ -710,6 +874,7 @@ mod tests {
             flags: 1,
             async_number: 0x0102_0304_0506_0708,
             data,
+            ..Default::default()
         }
     }
 
@@ -724,13 +889,16 @@ mod tests {
 
         // TRANSACT(zero, GET_ROOT, no data): 16B header + 40B body, all
         // zero (v0: bytes 24..40 are reserved[4] = 0).
-        let enc = c0.encode_transact(&WireTransaction {
-            address: RpcAddress::zero(),
-            code: 0,
-            flags: 0,
-            async_number: 0,
-            data: vec![],
-        });
+        let enc = c0
+            .encode_transact(&WireTransaction {
+                address: RpcAddress::zero(),
+                code: 0,
+                flags: 0,
+                async_number: 0,
+                data: vec![],
+                ..Default::default()
+            })
+            .unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&0u32.to_le_bytes()); // TRANSACT
         want.extend_from_slice(&40u32.to_le_bytes()); // bodySize = 40
@@ -740,10 +908,13 @@ mod tests {
         assert_eq!(A13_TXN_FIXED_LEN, 40);
 
         // REPLY v0 = 4B fixed (i32 status) + data.
-        let enc = c0.encode_reply(&WireReply {
-            status: 0,
-            data: vec![0xAA, 0xBB],
-        });
+        let enc = c0
+            .encode_reply(&WireReply {
+                status: 0,
+                data: vec![0xAA, 0xBB],
+                ..Default::default()
+            })
+            .unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&1u32.to_le_bytes()); // REPLY
         want.extend_from_slice(&6u32.to_le_bytes()); // bodySize = 4 + 2
@@ -758,7 +929,9 @@ mod tests {
 
         // TRANSACT v1: bytes 24..28 = parcelDataSize = data.len().
         let data = vec![1u8, 2, 3, 4, 5];
-        let enc = c1.encode_transact(&txn(RpcAddress::zero(), data.clone()));
+        let enc = c1
+            .encode_transact(&txn(RpcAddress::zero(), data.clone()))
+            .unwrap();
         // body[24..28] is parcelDataSize.
         let body = &enc[WIRE_HEADER_LEN..];
         assert_eq!(
@@ -770,10 +943,13 @@ mod tests {
         assert_eq!(&body[40..], &data[..]);
 
         // REPLY v1 = 20B fixed (status|parcelDataSize|reserved[3]) + data.
-        let enc = c1.encode_reply(&WireReply {
-            status: 7,
-            data: vec![0xCC, 0xDD, 0xEE],
-        });
+        let enc = c1
+            .encode_reply(&WireReply {
+                status: 7,
+                data: vec![0xCC, 0xDD, 0xEE],
+                ..Default::default()
+            })
+            .unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&1u32.to_le_bytes()); // REPLY
         want.extend_from_slice(&23u32.to_le_bytes()); // bodySize = 20 + 3
@@ -827,51 +1003,81 @@ mod tests {
         assert_eq!(&init[0..4], b"cci\0");
         c1.decode_connection_init(&init).expect("\"cci\"");
 
-        // Version acceptance (AOSP rule, _NEXT = 2): accept 0,1,EXPERIMENTAL.
+        // Version acceptance (AOSP rule @ android-16.0.0_r4, _NEXT = 3):
+        // accept 0,1,2,EXPERIMENTAL; reject 3 and above (AC-8.1).
         assert!(is_supported_protocol_version(0));
         assert!(is_supported_protocol_version(1));
+        assert!(is_supported_protocol_version(2));
         assert!(is_supported_protocol_version(
             RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL
         ));
-        assert!(!is_supported_protocol_version(2));
-        assert!(Android13PlusCodec::with_version(2).is_err());
-        assert_eq!(Android13PlusCodec::with_version(1).unwrap().version(), 1);
+        assert!(!is_supported_protocol_version(3));
+        assert!(!is_supported_protocol_version(
+            RPC_WIRE_PROTOCOL_VERSION_NEXT
+        ));
+        assert!(Android13PlusCodec::with_version(3).is_err());
+        assert_eq!(Android13PlusCodec::with_version(2).unwrap().version(), 2);
+        assert_eq!(SUPPORTED_MAX_VERSION, 2);
+        assert_eq!(RPC_WIRE_PROTOCOL_VERSION_NEXT, 3);
     }
 
-    /// encode∘decode == identity, both versions, both address spaces.
+    /// encode∘decode == identity, all versions (incl. android-16 v2),
+    /// both address spaces. v2 also round-trips a non-empty object
+    /// table (synthetic positions).
     #[test]
     fn android13plus_roundtrip_all_commands() {
         for c in [
             Android13PlusCodec::android13(),
             Android13PlusCodec::android14_15(),
+            Android13PlusCodec::android16(),
         ] {
             for size in [0usize, 1, 17, 4096, 1 << 20] {
                 let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                // v1+ may carry an object table; synthesize sorted
+                // positions within the parcel data (v0 must stay empty
+                // — exercised separately by the AC-8.4 negative test).
+                let positions: Vec<u32> = if c.version() >= PROTOCOL_V1 && size >= 8 {
+                    vec![0, (size / 2) as u32, (size - 4) as u32]
+                } else {
+                    Vec::new()
+                };
                 for space in [AddressSpace::Initiator, AddressSpace::Acceptor] {
                     let mut ctr = 0x4142u64;
                     let addr = RpcAddress::unique(&mut ctr, space);
-                    let t = txn(addr, data.clone());
-                    match c.decode_message(&c.encode_transact(&t)).unwrap() {
+                    let mut t = txn(addr, data.clone());
+                    t.object_positions = positions.clone();
+                    match c.decode_message(&c.encode_transact(&t).unwrap()).unwrap() {
                         WireMessage::Transact(d) => {
                             assert_eq!(d.address, addr, "addr rt (v{}, {space:?})", c.version());
                             assert_eq!(d.code, 0xdead_beef);
                             assert_eq!(d.flags, 1);
                             assert_eq!(d.async_number, 0x0102_0304_0506_0708);
                             assert_eq!(d.data, data);
+                            assert_eq!(
+                                d.object_positions,
+                                positions,
+                                "object table rt (v{})",
+                                c.version()
+                            );
                         }
                         other => panic!("expected Transact, got {other:?}"),
                     }
                 }
                 match c
-                    .decode_message(&c.encode_reply(&WireReply {
-                        status: -42,
-                        data: data.clone(),
-                    }))
+                    .decode_message(
+                        &c.encode_reply(&WireReply {
+                            status: -42,
+                            data: data.clone(),
+                            object_positions: positions.clone(),
+                        })
+                        .unwrap(),
+                    )
                     .unwrap()
                 {
                     WireMessage::Reply(r) => {
                         assert_eq!(r.status, -42, "v{}", c.version());
                         assert_eq!(r.data, data);
+                        assert_eq!(r.object_positions, positions, "reply table rt");
                     }
                     other => panic!("expected Reply, got {other:?}"),
                 }
@@ -896,29 +1102,51 @@ mod tests {
             flags: 0,
             async_number: 0,
             data: vec![],
+            ..Default::default()
         };
-        let r34 = R34Codec.encode_transact(&t);
+        let r34 = R34Codec.encode_transact(&t).unwrap();
         assert_eq!(r34.len(), WIRE_HEADER_LEN + WIRE_TXN_FIXED_LEN); // 16 + 64
         assert_eq!(&r34[4..8], &64u32.to_le_bytes());
 
-        let v0 = Android13PlusCodec::android13().encode_transact(&t);
-        let v1 = Android13PlusCodec::android14_15().encode_transact(&t);
+        let v0 = Android13PlusCodec::android13().encode_transact(&t).unwrap();
+        let v1 = Android13PlusCodec::android14_15()
+            .encode_transact(&t)
+            .unwrap();
+        let v2 = Android13PlusCodec::android16().encode_transact(&t).unwrap();
         assert_eq!(v0.len(), WIRE_HEADER_LEN + 40);
         assert_eq!(v1.len(), WIRE_HEADER_LEN + 40);
         assert_ne!(v0, r34, "android-13+ must differ from r34");
+        // No-object parcel ⇒ v1 and v2 wire are byte-identical
+        // (AC-8.2 — the structural v1 no-regression invariant).
+        assert_eq!(v1, v2, "no-object v1 ≡ v2 (AC-8.2)");
 
-        // Reply: the load-bearing v0/v1 divergence (4B vs 20B fixed).
+        // Reply: the load-bearing v0/v1 divergence (4B vs 20B fixed);
+        // v1 ≡ v2.
         let rep = WireReply {
             status: 0,
             data: vec![],
+            ..Default::default()
         };
         assert_eq!(
-            Android13PlusCodec::android13().encode_reply(&rep).len(),
+            Android13PlusCodec::android13()
+                .encode_reply(&rep)
+                .unwrap()
+                .len(),
             WIRE_HEADER_LEN + 4
         );
         assert_eq!(
-            Android13PlusCodec::android14_15().encode_reply(&rep).len(),
+            Android13PlusCodec::android14_15()
+                .encode_reply(&rep)
+                .unwrap()
+                .len(),
             WIRE_HEADER_LEN + 20
+        );
+        assert_eq!(
+            Android13PlusCodec::android14_15()
+                .encode_reply(&rep)
+                .unwrap(),
+            Android13PlusCodec::android16().encode_reply(&rep).unwrap(),
+            "no-object reply v1 ≡ v2 (AC-8.2)"
         );
     }
 
@@ -928,6 +1156,7 @@ mod tests {
         for c in [
             Android13PlusCodec::android13(),
             Android13PlusCodec::android14_15(),
+            Android13PlusCodec::android16(),
         ] {
             assert!(c.decode_message(&[]).is_err());
             assert!(c.decode_message(&[0u8; 15]).is_err());
@@ -1000,8 +1229,18 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::thread;
 
-        // (client_max, server_max, expected_negotiated)
-        for (cmax, smax, expect) in [(0u32, 0u32, 0u32), (1, 1, 1), (1, 0, 0), (0, 1, 0)] {
+        // (client_max, server_max, expected_negotiated) — incl.
+        // android-16 v2 and v2↔v1 / v2↔v0 downgrade negotiation.
+        for (cmax, smax, expect) in [
+            (0u32, 0u32, 0u32),
+            (1, 1, 1),
+            (1, 0, 0),
+            (0, 1, 0),
+            (2, 2, 2),
+            (2, 1, 1),
+            (1, 2, 1),
+            (2, 0, 0),
+        ] {
             let (mut c, mut s) = UnixStream::pair().expect("socketpair");
 
             let srv = thread::spawn(move || -> u32 {
@@ -1022,10 +1261,13 @@ mod tests {
                 // Reply.
                 write_aosp_message(
                     &mut s,
-                    &codec.encode_reply(&WireReply {
-                        status: 0,
-                        data: b"root!".to_vec(),
-                    }),
+                    &codec
+                        .encode_reply(&WireReply {
+                            status: 0,
+                            data: b"root!".to_vec(),
+                            ..Default::default()
+                        })
+                        .unwrap(),
                 )
                 .expect("write reply");
 
@@ -1049,8 +1291,9 @@ mod tests {
                 flags: 0,
                 async_number: 0,
                 data: vec![],
+                ..Default::default()
             };
-            let encoded = codec.encode_transact(&txn);
+            let encoded = codec.encode_transact(&txn).unwrap();
             // First 4 wire bytes are the RpcWireHeader.command
             // (TRANSACT=0), NOT an rsbinder u32 frame length.
             assert_eq!(&encoded[0..4], &0u32.to_le_bytes());
@@ -1089,12 +1332,12 @@ mod tests {
         use crate::rpc::transport::UnixTransport;
         use std::thread;
 
-        for (cmax, expect) in [(0u32, 0u32), (1, 1)] {
+        for (cmax, expect) in [(0u32, 0u32), (1, 1), (2, 2)] {
             let (a, b) = UnixTransport::pair().expect("unix pair");
 
             let srv = thread::spawn(move || -> u32 {
                 let mut io = RawTransportIo(&b);
-                let (codec, fd, sid) = server_accept(&mut io, 1).expect("server_accept");
+                let (codec, fd, sid) = server_accept(&mut io, 2).expect("server_accept");
                 assert_eq!(fd, FD_MODE_NONE);
                 assert!(sid.is_empty());
                 let raw = read_aosp_message(&mut io).expect("read transact");
@@ -1104,10 +1347,13 @@ mod tests {
                 }
                 write_aosp_message(
                     &mut io,
-                    &codec.encode_reply(&WireReply {
-                        status: 0,
-                        data: b"via-transport".to_vec(),
-                    }),
+                    &codec
+                        .encode_reply(&WireReply {
+                            status: 0,
+                            data: b"via-transport".to_vec(),
+                            ..Default::default()
+                        })
+                        .unwrap(),
                 )
                 .expect("write reply");
                 codec.version()
@@ -1118,13 +1364,16 @@ mod tests {
             assert_eq!(codec.version(), expect);
             write_aosp_message(
                 &mut io,
-                &codec.encode_transact(&WireTransaction {
-                    address: RpcAddress::zero(),
-                    code: 0,
-                    flags: 0,
-                    async_number: 0,
-                    data: vec![],
-                }),
+                &codec
+                    .encode_transact(&WireTransaction {
+                        address: RpcAddress::zero(),
+                        code: 0,
+                        flags: 0,
+                        async_number: 0,
+                        data: vec![],
+                        ..Default::default()
+                    })
+                    .unwrap(),
             )
             .expect("write transact");
             let raw = read_aosp_message(&mut io).expect("read reply");
@@ -1143,5 +1392,215 @@ mod tests {
         let (m, _m2) = crate::rpc::transport::MemTransport::pair();
         assert!(m.send_raw(b"x").is_err(), "mem has no raw byte access");
         assert!(m.recv_raw(&mut [0u8; 4]).is_err());
+    }
+
+    // ===== subplan 2-8 — android-16 RPC wire v2 (Phase A) ==========
+
+    /// **AC-8.1** — android-16.0.0_r4 version constants golden.
+    /// `RpcSession.h`: `RPC_WIRE_PROTOCOL_VERSION = 2`, `_NEXT = 3`,
+    /// `_EXPLICIT_PARCEL_SIZE = 1`, `_INCLUDES_BINDER_POSITIONS = 2`.
+    /// `setProtocolVersion` accepts {0,1,2,EXPERIMENTAL}, rejects ≥3.
+    #[test]
+    fn android16_v2_version_constants_golden() {
+        assert_eq!(PROTOCOL_V0, 0);
+        assert_eq!(PROTOCOL_V1, 1);
+        assert_eq!(PROTOCOL_V2, 2);
+        assert_eq!(
+            SUPPORTED_MAX_VERSION, 2,
+            "android-16 RPC_WIRE_PROTOCOL_VERSION"
+        );
+        assert_eq!(RPC_WIRE_PROTOCOL_VERSION_NEXT, 3);
+        assert_eq!(RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL, 0xF000_0000);
+        for v in [0, 1, 2] {
+            assert!(is_supported_protocol_version(v));
+            assert_eq!(Android13PlusCodec::with_version(v).unwrap().version(), v);
+        }
+        assert!(is_supported_protocol_version(
+            RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL
+        ));
+        for v in [3u32, 4, 100, RPC_WIRE_PROTOCOL_VERSION_NEXT] {
+            assert!(!is_supported_protocol_version(v), "reject v{v}");
+            assert!(Android13PlusCodec::with_version(v).is_err());
+        }
+        assert_eq!(Android13PlusCodec::android16().version(), 2);
+        // `RpcWireReply::wireSize` is byte-identical v1≡v2 (4 vs 20 is
+        // strictly the v0-vs-v1+ split — no v2 framing change).
+        assert_eq!(reply_fixed_len(0), 4);
+        assert_eq!(reply_fixed_len(1), 20);
+        assert_eq!(reply_fixed_len(2), 20);
+        assert!(!has_object_table(0));
+        assert!(has_object_table(1));
+        assert!(has_object_table(2));
+    }
+
+    /// **AC-8.2** — a no-object parcel encodes **byte-identically** at
+    /// v1 and v2 (TRANSACT *and* REPLY, several payload sizes). This is
+    /// the structural v1-no-regression guarantee: an empty object table
+    /// is 0 wire bytes ⇒ `bodySize` unchanged ⇒ a v2-capable rsbinder's
+    /// no-object traffic is wire-identical to its v1 traffic (and to
+    /// the pre-2-8 wire).
+    #[test]
+    fn android16_no_object_v1_eq_v2_byte_identical() {
+        let v1 = Android13PlusCodec::android14_15();
+        let v2 = Android13PlusCodec::android16();
+        for size in [0usize, 1, 4, 5, 64, 4096] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut ctr = 0xABCDu64;
+            let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
+            let t = txn(addr, data.clone()); // object_positions empty
+            assert_eq!(
+                v1.encode_transact(&t).unwrap(),
+                v2.encode_transact(&t).unwrap(),
+                "no-object TRANSACT v1≡v2 (size {size})"
+            );
+            let r = WireReply {
+                status: -7,
+                data: data.clone(),
+                object_positions: Vec::new(),
+            };
+            assert_eq!(
+                v1.encode_reply(&r).unwrap(),
+                v2.encode_reply(&r).unwrap(),
+                "no-object REPLY v1≡v2 (size {size})"
+            );
+        }
+    }
+
+    /// **AC-8.3** — object-table framing golden vs AOSP
+    /// `RpcState.cpp`: `bodySize = fixed + parcelDataSize + 4·N`; the
+    /// table is the trailing LE `u32[]` after the parcel data;
+    /// `parcelDataSize` is the data length (unchanged); encode→decode
+    /// round-trips the positions; and the android-16 `splitOff` /
+    /// `reinterpret<uint32_t>` receive rules (parcelDataSize past the
+    /// body, or a table byte-size not a multiple of 4) are rejected.
+    #[test]
+    fn android16_v2_object_table_framing_golden() {
+        let c = Android13PlusCodec::android16();
+        let data = vec![0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let positions = vec![0u32, 4];
+
+        // ---- TRANSACT ----
+        let t = WireTransaction {
+            address: RpcAddress::zero(),
+            code: 0xCAFE,
+            flags: 0,
+            async_number: 0,
+            data: data.clone(),
+            object_positions: positions.clone(),
+        };
+        let enc = c.encode_transact(&t).unwrap();
+        // bodySize = 40 + 8 (data) + 4*2 (table) = 56.
+        assert_eq!(&enc[4..8], &56u32.to_le_bytes(), "bodySize = 40+pds+4N");
+        let body = &enc[WIRE_HEADER_LEN..];
+        // parcelDataSize @24 = data.len() (UNCHANGED by the table).
+        assert_eq!(&body[24..28], &(data.len() as u32).to_le_bytes());
+        // [40 .. 40+8] = parcel data, then the LE u32[] table.
+        assert_eq!(&body[40..48], &data[..]);
+        assert_eq!(&body[48..52], &0u32.to_le_bytes());
+        assert_eq!(&body[52..56], &4u32.to_le_bytes());
+        assert_eq!(enc.len(), WIRE_HEADER_LEN + 56);
+        match c.decode_message(&enc).unwrap() {
+            WireMessage::Transact(d) => {
+                assert_eq!(d.data, data);
+                assert_eq!(d.object_positions, positions);
+            }
+            o => panic!("expected Transact, got {o:?}"),
+        }
+
+        // ---- REPLY ----
+        let r = WireReply {
+            status: 0,
+            data: data.clone(),
+            object_positions: positions.clone(),
+        };
+        let enc = c.encode_reply(&r).unwrap();
+        // bodySize = 20 + 8 + 8 = 36.
+        assert_eq!(&enc[4..8], &36u32.to_le_bytes());
+        let body = &enc[WIRE_HEADER_LEN..];
+        assert_eq!(&body[4..8], &(data.len() as u32).to_le_bytes()); // parcelDataSize
+        assert_eq!(&body[20..28], &data[..]);
+        assert_eq!(&body[28..32], &0u32.to_le_bytes());
+        assert_eq!(&body[32..36], &4u32.to_le_bytes());
+        match c.decode_message(&enc).unwrap() {
+            WireMessage::Reply(d) => {
+                assert_eq!(d.data, data);
+                assert_eq!(d.object_positions, positions);
+            }
+            o => panic!("expected Reply, got {o:?}"),
+        }
+
+        // android-16 `parcelSpan.splitOff(parcelDataSize)` ⇒ nullopt
+        // ⇒ BAD_VALUE: forge a TRANSACT whose parcelDataSize exceeds
+        // the available body tail.
+        let mut bad = c
+            .encode_transact(&WireTransaction {
+                address: RpcAddress::zero(),
+                code: 1,
+                flags: 0,
+                async_number: 0,
+                data: vec![1, 2, 3, 4],
+                object_positions: vec![0],
+            })
+            .unwrap();
+        // body[24..28] = parcelDataSize; bump it past the tail.
+        let pds_off = WIRE_HEADER_LEN + 24;
+        bad[pds_off..pds_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert!(matches!(c.decode_message(&bad), Err(RpcError::Protocol(_))));
+
+        // `objectTableBytes->reinterpret<uint32_t>()` ⇒ nullopt if the
+        // table byte-size isn't a multiple of 4: parcelDataSize that
+        // leaves a 2-byte tail.
+        let mut bad = c
+            .encode_transact(&WireTransaction {
+                address: RpcAddress::zero(),
+                code: 1,
+                flags: 0,
+                async_number: 0,
+                data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+                object_positions: Vec::new(),
+            })
+            .unwrap();
+        // data.len()=6, no table ⇒ tail after pds is 0 (ok). Now claim
+        // parcelDataSize=4 ⇒ 2-byte trailing "table" ⇒ %4 != 0.
+        bad[pds_off..pds_off + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(c.decode_message(&bad), Err(RpcError::Protocol(_))));
+    }
+
+    /// **AC-8.4** — `validateParcel` analogue: a v0 (android-13) or r34
+    /// wire can carry **no** object table; a non-empty `object_positions`
+    /// on those is a protocol error, not a silently-dropped table
+    /// (AOSP `RpcState::validateParcel` ⇒ `BAD_VALUE`).
+    #[test]
+    fn android16_v0_and_r34_reject_object_positions() {
+        let t = WireTransaction {
+            address: RpcAddress::zero(),
+            code: 1,
+            flags: 0,
+            async_number: 0,
+            data: vec![1, 2, 3, 4],
+            object_positions: vec![0],
+        };
+        let r = WireReply {
+            status: 0,
+            data: vec![1, 2, 3, 4],
+            object_positions: vec![0],
+        };
+        // v0 (android-13) — no parcelDataSize, no table.
+        let v0 = Android13PlusCodec::android13();
+        assert!(matches!(v0.encode_transact(&t), Err(RpcError::Protocol(_))));
+        assert!(matches!(v0.encode_reply(&r), Err(RpcError::Protocol(_))));
+        // r34 (android-12, pre-versioning) — no object table concept.
+        assert!(matches!(
+            R34Codec.encode_transact(&t),
+            Err(RpcError::Protocol(_))
+        ));
+        assert!(matches!(
+            R34Codec.encode_reply(&r),
+            Err(RpcError::Protocol(_))
+        ));
+        // …and empty positions on v0/r34 still encode fine (unchanged).
+        let t0 = txn(RpcAddress::zero(), vec![9, 9, 9, 9]);
+        assert!(v0.encode_transact(&t0).is_ok());
+        assert!(R34Codec.encode_transact(&t0).is_ok());
     }
 }

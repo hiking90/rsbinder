@@ -32,7 +32,7 @@ use crate::native::Binder;
 use crate::parcel::Parcel;
 
 use super::session::RpcSession;
-use super::transport::{RpcTransport, UnixTransport};
+use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 
 /// Built-in directory interface descriptor + its single transaction.
 const DIRECTORY_DESC: &str = "rsbinder.rpc.IServiceDirectory";
@@ -75,6 +75,12 @@ impl Remotable for ServiceDirectory {
     }
 }
 
+/// Authorization hook (subplan 2-9 Phase B): given the connecting
+/// peer's [`PeerIdentity`], return `true` to admit, `false` to refuse
+/// (the connection is closed before any RPC byte). `Arc` so it can be
+/// cloned out of the lock and invoked lock-free.
+type Authorizer = Arc<dyn Fn(&PeerIdentity) -> bool + Send + Sync>;
+
 /// A Unix-domain RPC server.
 pub struct RpcServer {
     listener: UnixListener,
@@ -90,6 +96,35 @@ pub struct RpcServer {
     /// `Some(max)` ⇒ each accepted connection runs the AOSP handshake
     /// negotiating `min(max, client_max)`.
     wire_max_version: Mutex<Option<u32>>,
+    /// Opt-in **server-side admission bound** on the number of
+    /// *concurrent* connection-worker threads. `None` (default) ⇒
+    /// unbounded, byte-for-byte the prior behavior (additive
+    /// invariant). `Some(max)` ⇒ the accept loop stops accepting while
+    /// `max` workers are live (excess clients wait in the kernel listen
+    /// backlog — clean backpressure, no reactor, no dropped client),
+    /// resuming when a worker finishes. This is the rsbinder analogue
+    /// of AOSP `RpcServer`'s bounded server resources (rsbinder is
+    /// 1-connection = 1-session = 1-worker, so the resource to bound is
+    /// the concurrent worker count); it is **not** a wire/semantic port
+    /// and does **not** reduce workers below the connection count
+    /// (that would require I/O multiplexing — explicitly out of scope,
+    /// see `plans/2-10-async-rpc-io.md`).
+    max_connections: Mutex<Option<usize>>,
+    /// Opt-in authorization hook (subplan 2-9 Phase B). `None`
+    /// (default) ⇒ accept-all = byte-for-byte the prior behavior
+    /// (additive invariant — AC-9.4). When set, it runs at
+    /// [`serve_connection`](RpcServer::serve_connection) entry —
+    /// **before** the wire-profile branch, session build, handshake,
+    /// or any `recv_frame` — so a rejected peer receives **zero RPC
+    /// bytes** (the connection is closed). Backend-independent: it is
+    /// pure on [`RpcTransport::peer_identity`] (unix `SO_PEERCRED`/
+    /// `getpeereid`, tls cert, vsock cid, …). `Arc` (not `Box`) so the
+    /// hook is cloned out of the lock and invoked **lock-free**, so a
+    /// hook may itself touch the server without self-deadlock (same
+    /// discipline as `RpcProxy::send_obituary`). This is the
+    /// *enforcement point* the 2-9 §0/G2 gap identified as missing
+    /// (`peer_identity()` was computed but read nowhere).
+    authorizer: Mutex<Option<Authorizer>>,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -112,6 +147,8 @@ impl RpcServer {
             max_threads: Mutex::new(1),
             fd_unix_supported: AtomicBool::new(false),
             wire_max_version: Mutex::new(None),
+            max_connections: Mutex::new(None),
+            authorizer: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }))
@@ -138,8 +175,69 @@ impl RpcServer {
     }
 
     /// Advertised max-threads (negotiation, AC-3.4). Default 1.
+    ///
+    /// This is **only** the value advertised to clients on
+    /// `GET_MAX_THREADS`; it does *not* bound server-side resources.
+    /// To cap concurrent connection workers use
+    /// [`set_max_connections`](RpcServer::set_max_connections).
     pub fn set_max_threads(&self, n: u32) {
         *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
+    }
+
+    /// Opt-in **server-side admission bound** on concurrent
+    /// connection-worker threads (reactor-free backpressure). Default
+    /// (unset) is unbounded — byte-for-byte the prior behavior, so this
+    /// is purely additive. When set, the accept loop stops accepting
+    /// while `n` workers are live; pending clients wait in the kernel
+    /// listen backlog and are served as workers finish (no client is
+    /// dropped, `shutdown` is still polled). `n` is clamped to ≥ 1.
+    ///
+    /// rsbinder is 1-connection = 1-session = 1-worker, so the bounded
+    /// resource is the worker count; this is the rsbinder analogue of
+    /// AOSP `RpcServer`'s bounded server limits, **not** a wire/semantic
+    /// port. It does not (and structurally cannot, without I/O
+    /// multiplexing) make workers fewer than connections — see the
+    /// `plans/2-10-async-rpc-io.md` decision record.
+    pub fn set_max_connections(&self, n: usize) {
+        *self
+            .max_connections
+            .lock()
+            .expect("max_connections poisoned") = Some(n.max(1));
+    }
+
+    /// Reap finished worker handles and return the live (concurrent)
+    /// count. Shared by [`serve_connection`](RpcServer::serve_connection)
+    /// (bounds `workers` by concurrent, not cumulative, connections)
+    /// and the accept-loop admission gate.
+    fn live_worker_count(&self) -> usize {
+        let mut workers = self.workers.lock().expect("workers poisoned");
+        workers.retain(|h| !h.is_finished());
+        workers.len()
+    }
+
+    /// Opt-in **authorization hook** (subplan 2-9 Phase B). `f` is
+    /// invoked once per accepted connection with the peer's
+    /// [`PeerIdentity`] **before any RPC byte is exchanged**; returning
+    /// `false` closes the connection immediately (the peer's next op
+    /// sees `DeadObject` — RPC payload zero bytes, the local-transport
+    /// analogue of subplan 2-4's TLS reject). Unset (default) =
+    /// accept-all = the prior behavior, byte-for-byte (AC-9.4) — so
+    /// this is purely additive and satisfies the user's *opt-in*
+    /// "mutual authentication when needed" constraint with no cost
+    /// when off.
+    ///
+    /// rsbinder provides only the gate; the policy is the caller's
+    /// closure (subplan 2-4 philosophy), e.g.
+    /// `|p| p.uid() == Some(EXPECTED_UID)` or, with the
+    /// `rpc-macos-codesign` feature (Phase C),
+    /// `matches!(p, PeerIdentity::CodeSigned(c) if c.team_id() == Some("TEAMID"))`.
+    /// Backend-independent (unix/mem/tls/vsock). The hook must not
+    /// block indefinitely (it runs on the accept path).
+    pub fn set_authorizer<F>(&self, f: F)
+    where
+        F: Fn(&PeerIdentity) -> bool + Send + Sync + 'static,
+    {
+        *self.authorizer.lock().expect("authorizer poisoned") = Some(Arc::new(f));
     }
 
     /// Advertise the FD-over-RPC modes this server will accept
@@ -153,11 +251,23 @@ impl RpcServer {
 
     /// Opt in to the **android-13+ versioned RPC wire** (subplan 2-5b /
     /// G4(a)). `max_version` is the highest `RPC_WIRE_PROTOCOL_VERSION`
-    /// this server offers (`0` = android-13, `1` = android-14/15); each
-    /// accepted connection then runs the AOSP connection handshake and
-    /// negotiates `min(max_version, client_max)`. Default (unset) keeps
-    /// the android-12 r34 wire, byte-unchanged. Has effect only on a
+    /// this server offers (`0` = android-13, `1` = android-14/15,
+    /// **`2` = android-16** — subplan 2-8); each accepted connection
+    /// then runs the AOSP connection handshake and negotiates
+    /// `min(max_version, client_max)`. Default (unset) keeps the
+    /// android-12 r34 wire, byte-unchanged. Has effect only on a
     /// transport with raw byte access (`unix`).
+    ///
+    /// **Sequencing (subplan 2-8 §0.3/§9):** advertising `2` is sound
+    /// only because the Parcel binder/FD object-position producer
+    /// (Phase B — [`Parcel::rpc_record_object_position`], the
+    /// `records_binder_positions`/`records_fd_positions` profile gate)
+    /// is compiled in unconditionally here. Were this a Phase-A-only
+    /// build, `2` would frame a *binder-bearing* parcel with an empty
+    /// object table and a real libbinder v2 peer would `BAD_VALUE` it;
+    /// no-object traffic is v1≡v2 byte-identical and safe at any
+    /// version. Negotiating down to v0/v1 against an older peer stays
+    /// correct (the codec is version-keyed).
     pub fn set_android13plus(&self, max_version: u32) {
         *self
             .wire_max_version
@@ -191,6 +301,24 @@ impl RpcServer {
     /// Serve one already-connected transport on its own worker thread
     /// (used by the accept loop and by in-memory tests).
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
+        // Subplan 2-9 Phase B: authorization gate. The single
+        // chokepoint common to r34, android-13+, AND in-memory test
+        // direct calls — *before* the wire-profile branch, session
+        // build, handshake, or any `recv_frame`, so a rejected peer
+        // gets zero RPC bytes. The hook is cloned out of the lock and
+        // called lock-free (a hook may touch the server without
+        // self-deadlock). Default (unset) ⇒ this whole block is a
+        // no-op and behavior is byte-identical (additive — AC-9.4).
+        let authorizer = self.authorizer.lock().expect("authorizer poisoned").clone();
+        if let Some(authz) = authorizer {
+            let peer = transport.peer_identity();
+            if !authz(&peer) {
+                // `transport` drops here → socket closed, no worker
+                // spawned; the peer's next op is `DeadObject`.
+                log::warn!("RPC connection rejected by authorizer: peer {peer:?}");
+                return;
+            }
+        }
         let a13_max = *self
             .wire_max_version
             .lock()
@@ -249,6 +377,24 @@ impl RpcServer {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
+            }
+            // Admission bound (opt-in; `None` ⇒ skip entirely, prior
+            // behavior bit-identical). At capacity we simply don't
+            // accept this iteration: pending clients wait in the kernel
+            // listen backlog (reactor-free backpressure, no client
+            // dropped). `continue` re-checks `shutdown` every tick, so
+            // a full server still shuts down promptly. `live_worker_
+            // count()` reaps finished handles, so a freed slot is
+            // observed here.
+            if let Some(max) = *self
+                .max_connections
+                .lock()
+                .expect("max_connections poisoned")
+            {
+                if self.live_worker_count() >= max {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
             }
             match self.listener.accept() {
                 Ok((stream, _addr)) => {

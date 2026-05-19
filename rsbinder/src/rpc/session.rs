@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use super::fd_mode::FileDescriptorTransportMode;
-use crate::binder::{
-    SIBinder, FLAG_ONEWAY, INTERFACE_HEADER, INTERFACE_TRANSACTION, PING_TRANSACTION,
-};
+use crate::binder::{SIBinder, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
 use crate::error::{Result, StatusCode};
 use crate::parcel::{Parcel, RpcParcelOps};
 
@@ -35,7 +33,7 @@ use super::transport::RpcTransport;
 use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 use super::wire_android13::{
     client_connect, read_aosp_message, server_accept, write_aosp_message, Android13PlusCodec,
-    RawTransportIo, A13_ADDR_LEN, FD_MODE_NONE,
+    RawTransportIo, A13_ADDR_LEN, FD_MODE_NONE, PROTOCOL_V1, PROTOCOL_V2,
 };
 use super::{RpcError, RpcResult};
 
@@ -87,40 +85,60 @@ impl WireProfile {
     fn aosp_framing(&self) -> bool {
         matches!(self, WireProfile::Android13Plus(_))
     }
+
+    /// The negotiated wire protocol version, or `None` for the
+    /// pre-versioning R34 (android-12) profile (which has no object
+    /// table at all — subplan 2-8).
+    fn wire_version(&self) -> Option<u32> {
+        match self {
+            WireProfile::R34(_) => None,
+            WireProfile::Android13Plus(c) => Some(c.version()),
+        }
+    }
+
+    /// Does a *binder* flattened into an RPC parcel get its position
+    /// recorded in the object table? AOSP `Parcel::flattenBinder`:
+    /// only at `>= RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_INCLUDES_
+    /// BINDER_POSITIONS` (v2 = android-16). v0/v1/R34: no.
+    fn records_binder_positions(&self) -> bool {
+        matches!(self.wire_version(), Some(v) if v >= PROTOCOL_V2)
+    }
+
+    /// Does an *FD* flattened into an RPC parcel get its position
+    /// recorded? AOSP `Parcel::writeFileDescriptor` records it
+    /// version-independently, but `validateParcel` rejects a v0
+    /// parcel that carries any object ⇒ effectively v1+ (FD over RPC
+    /// is itself v1+ negotiated). R34 has no object table.
+    fn records_fd_positions(&self) -> bool {
+        matches!(self.wire_version(), Some(v) if v >= PROTOCOL_V1)
+    }
 }
 
-/// `strict_mode_policy() == 0 | STRICT_MODE_PENALTY_GATHER`, written
-/// without touching `thread_state` (RPC must never couple to the
-/// kernel thread state — master §4.1.1).
-const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
-/// `thread_state::UNSET_WORK_SOURCE` (mirrored as a constant).
-const UNSET_WORK_SOURCE: i32 = -1;
-
-/// Write the AIDL interface token in the same byte layout as
-/// `Parcel::write_interface_token`/`thread_state::check_interface`, but
-/// with constants instead of `thread_state` reads (RPC decoupling).
+/// Write the RPC interface token — **byte-exact to AOSP
+/// `Parcel::writeInterfaceToken` on an RPC parcel**, verified against
+/// `android-12.0.0_r34` … `android-16.0.0_r4`: for an RPC parcel
+/// (`isForRpc()` / no `kernelFields`) the strict-mode / work-source /
+/// `kHeader` triple is **skipped entirely** — it is kernel-binder-only.
+/// "the interface identification token is just its name as a string"
+/// ⇒ exactly `writeString16(descriptor)` and nothing else.
+///
+/// rsbinder's `&str` serializer is already byte-identical to AOSP
+/// `writeString16` (`[i32 char16_count][UTF-16 LE][u16 0][pad 4]`), so
+/// this is now wire-correct against a real libbinder RPC peer for
+/// **every** profile (r34 / android-13 v0 / v1 / android-16 v2). The
+/// prior 3-int header was an rsbinder-ism that only ever round-tripped
+/// hermetically (rsbinder↔rsbinder, symmetric) and was the documented
+/// G4(b)/2-8 STAGE3 `kCurrentRepr` residual — now resolved. RPC never
+/// touches `thread_state` (master §4.1.1) — trivially still true.
 pub(crate) fn write_rpc_interface_token(p: &mut Parcel, descriptor: &str) -> Result<()> {
-    p.write(&STRICT_MODE_PENALTY_GATHER)?;
-    p.write(&UNSET_WORK_SOURCE)?;
-    if crate::sdk_at_least(30) {
-        p.write(&INTERFACE_HEADER)?;
-    }
     p.write(&descriptor)?;
     Ok(())
 }
 
-/// Consume + validate the interface token the RPC server adapter must
-/// strip before calling `IBinder::rpc_transact` (the RPC equivalent of
-/// what `check_interface` did, minus the `THREAD_STATE` mutation).
+/// Consume + validate the RPC interface token (AOSP RPC
+/// `enforceInterface`: just the `String16` descriptor — no
+/// strict-mode/work-source/`kHeader`, those are kernel-only).
 fn consume_rpc_interface_token(reader: &mut Parcel, expected: &str) -> Result<()> {
-    let _strict: i32 = reader.read()?;
-    let _work_source: i32 = reader.read()?;
-    if crate::sdk_at_least(30) {
-        let header: u32 = reader.read()?;
-        if header != INTERFACE_HEADER {
-            return Err(StatusCode::BadType);
-        }
-    }
     let got: String = reader.read()?;
     if got != expected {
         log::error!("RPC interface token mismatch: expected '{expected}', got '{got}'");
@@ -384,6 +402,16 @@ impl RpcSessionInner {
         *self.fd_mode.lock().expect("fd_mode poisoned")
     }
 
+    /// Whether an RPC parcel built for this session records FD object
+    /// positions (subplan 2-8 Phase B) — i.e. the android-13+ v1+
+    /// profile. The session stamps every RPC parcel with this
+    /// alongside the FD mode; binder positions are recorded by
+    /// [`RpcSessionInner::write_binder`] directly (it owns the
+    /// profile). R34 ⇒ `false` (no object table — 2-7 byte-unchanged).
+    pub(crate) fn records_fd_positions(&self) -> bool {
+        self.profile.records_fd_positions()
+    }
+
     /// Send one wire frame. Only a `Unix`-mode connection routes fds
     /// via `SCM_RIGHTS`; the default (`None`) uses the unchanged
     /// framed send and never carries fds (AC-7.1 bit-identical).
@@ -487,8 +515,21 @@ impl RpcSessionInner {
                         .expect("rpc state poisoned")
                         .on_binder_leaving(b)
                 };
+                // AOSP `Parcel::flattenBinder`: `dataPos = mDataPos`
+                // is captured **before** `writeInt32(TYPE_BINDER)` —
+                // the position points at the `present`/TYPE_BINDER
+                // int32 itself, and is recorded into the object table
+                // only at v2 (`>= INCLUDES_BINDER_POSITIONS`; subplan
+                // 2-8 Phase B). null binders (`TYPE_BINDER_NULL`, the
+                // `None` arm) get no position. `rpc_record_object_
+                // position` is itself hard-gated on `is_for_rpc`, so
+                // the kernel wire can never grow a table (P1, AC-2.9).
+                let obj_pos = parcel.data_position();
                 parcel.write(&1i32)?;
                 self.wire_write_binder_addr(parcel, &addr);
+                if self.profile.records_binder_positions() {
+                    parcel.rpc_record_object_position(obj_pos);
+                }
                 if matches!(self.profile, WireProfile::Android13Plus(_)) {
                     // AOSP `Parcel::finishFlattenBinder` →
                     // `writeInt32(Stability::getRepr(binder))`. r34's
@@ -511,9 +552,24 @@ impl RpcSessionInner {
 
     /// android `unflattenBinder` (RPC branch).
     fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<SIBinder>> {
+        // AOSP `Parcel::unflattenBinder`: `objectPos = mDataPos`
+        // captured **before** reading the present/type int32.
+        let obj_pos = parcel.data_position();
         let present: i32 = parcel.read()?;
         if present == 0 {
             return Ok(None);
+        }
+        // Phase C / AC-8.7 — v2 strict receive validation: at v2 a
+        // binder may only be read from a position recorded in the
+        // object table (`std::binary_search(mObjectPositions,
+        // objectPos)` ⇒ `BAD_VALUE` otherwise). v0/v1/R34 never
+        // record binder positions (binder is inline-lazy), so the
+        // check is correctly v2-only — exactly AOSP's
+        // `bindersInObjectPositions` gate. Interop does not require
+        // this (a lenient decoder still round-trips — subplan 2-8
+        // §3.1); it hardens v2 *conformance*.
+        if self.profile.records_binder_positions() && !parcel.rpc_object_position_present(obj_pos) {
+            return Err(StatusCode::BadValue);
         }
         let addr = self.wire_read_binder_addr(parcel)?;
         if matches!(self.profile, WireProfile::Android13Plus(_)) {
@@ -568,8 +624,13 @@ impl RpcSessionInner {
             flags,
             async_number,
             data: data.rpc_data_bytes().to_vec(),
+            // Object table (subplan 2-8): the RPC-mode Parcel collects
+            // binder (v2) / FD (v1+) positions during serialization;
+            // empty on R34 / v0 (and pre-Phase-B). Byte-identical to
+            // the pre-2-8 wire when empty.
+            object_positions: data.rpc_object_positions().to_vec(),
         };
-        let frame = self.profile.codec().encode_transact(&txn);
+        let frame = self.profile.codec().encode_transact(&txn)?;
         // Out-of-band fds collected while serializing the request
         // (empty unless `Unix` fd-mode — subplan 2-7).
         self.send_msg(&frame, data.rpc_out_fds())?;
@@ -585,14 +646,23 @@ impl RpcSessionInner {
         loop {
             let (frame, in_fds) = self.recv_msg()?;
             match self.profile.codec().decode_message(&frame)? {
-                WireMessage::Reply(WireReply { status, data }) => {
+                WireMessage::Reply(WireReply {
+                    status,
+                    data,
+                    object_positions,
+                }) => {
                     if status != 0 {
                         return Err(StatusCode::from(status));
                     }
                     let mut reply = Parcel::from_vec(data);
                     reply.attach_rpc_ops(self.parcel_ops());
                     reply.set_rpc_fd_mode(self.fd_mode());
+                    reply.set_rpc_record_fd_positions(self.records_fd_positions());
                     reply.rpc_set_in_fds(in_fds);
+                    // Install the wire object table (after attach_rpc_ops
+                    // sets RPC mode) so binder/FD reads can validate
+                    // positions (subplan 2-8 Phase C).
+                    reply.rpc_set_object_positions(object_positions);
                     reply.set_data_position(0);
                     return Ok(Some(reply));
                 }
@@ -637,12 +707,49 @@ impl RpcSessionInner {
             .forget_remote_if(addr, who);
     }
 
-    /// Send a `REPLY` (status + parcel bytes + any out-of-band fds).
-    fn send_reply(&self, status: i32, data: &[u8], fds: &[OwnedFd]) -> Result<()> {
+    /// Connection lost ⇒ every remote object on this session is dead:
+    /// fire `binder_died` on each cached proxy's recipients (AOSP
+    /// `RpcState::sendObituaries`). The strong snapshot is gathered
+    /// under the state lock, which is released **before** the
+    /// callbacks, so a recipient may re-enter `unlink_to_death`
+    /// without deadlocking (AOSP unlocks before the obituary loop).
+    /// Each `send_obituary` is idempotent, so calling this more than
+    /// once for a session (e.g. a transact already saw the close, then
+    /// the serve loop ends) is harmless.
+    pub(crate) fn send_session_obituaries(&self) {
+        let snapshot = self
+            .state
+            .lock()
+            .expect("rpc state poisoned")
+            .remote_proxy_snapshot();
+        for arc in snapshot {
+            let Some(proxy) = arc.as_any().downcast_ref::<RpcProxy>() else {
+                continue;
+            };
+            // `who` = the dying proxy's weak binder (kernel
+            // `send_obituary(&WIBinder)` parity).
+            let sib = SIBinder::from_arc(arc.clone());
+            let who = SIBinder::downgrade(&sib);
+            proxy.send_obituary(&who);
+        }
+    }
+
+    /// Send a `REPLY` (status + parcel bytes + object table + any
+    /// out-of-band fds). `object_positions` is the reply parcel's
+    /// object table (subplan 2-8); empty for error / no-payload
+    /// replies and on R34 / v0 (byte-identical to the pre-2-8 wire).
+    fn send_reply(
+        &self,
+        status: i32,
+        data: &[u8],
+        object_positions: &[u32],
+        fds: &[OwnedFd],
+    ) -> Result<()> {
         let frame = self.profile.codec().encode_reply(&WireReply {
             status,
             data: data.to_vec(),
-        });
+            object_positions: object_positions.to_vec(),
+        })?;
         Ok(self.send_msg(&frame, fds)?)
     }
 
@@ -670,7 +777,7 @@ impl RpcSessionInner {
                     t.address
                 );
             } else {
-                self.send_reply(StatusCode::DeadObject.into(), &[], &[])?;
+                self.send_reply(StatusCode::DeadObject.into(), &[], &[], &[])?;
             }
             return Ok(());
         };
@@ -688,10 +795,15 @@ impl RpcSessionInner {
                     let mut reply = Parcel::new();
                     reply.attach_rpc_ops(self.parcel_ops());
                     reply.write(&target.descriptor())?;
-                    return self.send_reply(0, reply.rpc_data_bytes(), &[]);
+                    return self.send_reply(
+                        0,
+                        reply.rpc_data_bytes(),
+                        reply.rpc_object_positions(),
+                        &[],
+                    );
                 }
                 PING_TRANSACTION => {
-                    return self.send_reply(0, &[], &[]);
+                    return self.send_reply(0, &[], &[], &[]);
                 }
                 _ => {}
             }
@@ -701,10 +813,14 @@ impl RpcSessionInner {
         reader.attach_rpc_ops(self.parcel_ops());
         reader.set_rpc_fd_mode(self.fd_mode());
         reader.rpc_set_in_fds(in_fds);
+        // Install the inbound wire object table (subplan 2-8 Phase C
+        // position validation); empty on R34 / v0 / no-object.
+        reader.rpc_set_object_positions(t.object_positions);
         reader.set_data_position(0);
         let mut reply = Parcel::new();
         reply.attach_rpc_ops(self.parcel_ops());
         reply.set_rpc_fd_mode(self.fd_mode());
+        reply.set_rpc_record_fd_positions(self.records_fd_positions());
 
         let result = consume_rpc_interface_token(&mut reader, target.descriptor())
             .and_then(|()| target.rpc_transact(t.code, &mut reader, &mut reply));
@@ -716,8 +832,13 @@ impl RpcSessionInner {
             return Ok(());
         }
         match result {
-            Ok(()) => self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_out_fds()),
-            Err(e) => self.send_reply(e.into(), &[], &[]),
+            Ok(()) => self.send_reply(
+                0,
+                reply.rpc_data_bytes(),
+                reply.rpc_object_positions(),
+                reply.rpc_out_fds(),
+            ),
+            Err(e) => self.send_reply(e.into(), &[], &[], &[]),
         }
     }
 
@@ -769,13 +890,15 @@ impl RpcSessionInner {
                     Some(b) => reply.write(b)?,
                     None => reply.write(&0i32)?,
                 }
-                self.send_reply(0, reply.rpc_data_bytes(), &[])
+                // GET_ROOT carries a binder-in-parcel: at v2 its
+                // position is in the object table (subplan 2-8 / D3).
+                self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_object_positions(), &[])
             }
             Some(SpecialTransaction::GetMaxThreads) => {
                 let n = self.max_threads.load(Ordering::SeqCst) as i32;
                 let mut reply = Parcel::new();
                 reply.write(&n)?;
-                self.send_reply(0, reply.rpc_data_bytes(), &[])
+                self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetSessionId) => {
                 // AOSP `RpcState` server replies `reply.writeByteVector(
@@ -788,7 +911,7 @@ impl RpcSessionInner {
                 // the real-peer round-trip, G4(b).)
                 let mut reply = Parcel::new();
                 reply.write(&self.rpc_session_id[..])?;
-                self.send_reply(0, reply.rpc_data_bytes(), &[])
+                self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetFdMode) => {
                 // Body: i32 — does the client want `Unix`. Agree only
@@ -822,12 +945,12 @@ impl RpcSessionInner {
                         0i32
                     }),
                 )?;
-                self.send_reply(0, reply.rpc_data_bytes(), &[])?;
+                self.send_reply(0, reply.rpc_data_bytes(), &[], &[])?;
                 // Switch AFTER the reply is on the wire (None-mode).
                 *self.fd_mode.lock().expect("fd_mode poisoned") = agreed;
                 Ok(())
             }
-            None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[]),
+            None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[], &[]),
         }
     }
 }
@@ -1015,9 +1138,33 @@ impl RpcSession {
     }
 
     /// Server: process inbound messages until the peer closes.
+    ///
+    /// When the loop ends — peer closed (clean) **or** a fatal serve
+    /// error — every remote object reachable over this session is dead,
+    /// so registered death recipients are fired here (AOSP
+    /// `RpcState::sendObituaries` when a session's incoming threads
+    /// end). This is the rsbinder death-detection point: a peer that
+    /// linked a `DeathRecipient` (e.g. a client wanting to learn the
+    /// server died) must be running this serve loop — faithful to
+    /// AOSP's `getMaxIncomingThreads() >= 1` requirement for an RPC
+    /// `linkToDeath`.
     pub fn serve_blocking(&self) -> Result<()> {
-        while self.inner.serve_once()? {}
-        Ok(())
+        let result = {
+            let mut r = Ok(());
+            loop {
+                match self.inner.serve_once() {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        r = Err(e);
+                        break;
+                    }
+                }
+            }
+            r
+        };
+        self.inner.send_session_obituaries();
+        result
     }
 
     /// Server role: the max-threads value advertised to a client on

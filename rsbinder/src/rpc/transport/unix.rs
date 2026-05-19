@@ -87,12 +87,23 @@ impl UnixTransport {
 
 /// Resolve the peer identity of a connected Unix socket.
 ///
-/// * Linux: real `SO_PEERCRED` (the peer's actual uid/pid).
-/// * Other Unix (macOS/BSD): `SO_PEERCRED` is unavailable, so this
-///   reports the **current process** identity. That is exact for a
-///   same-process `socketpair` and a documented best-effort for a
-///   same-host connected socket; cross-credential ACL on non-Linux
-///   must not rely on it (subplan 2-4 may add `LOCAL_PEERCRED`).
+/// * **Linux**: real `SO_PEERCRED` (the peer's actual uid/pid).
+/// * **macOS / BSD** (subplan 2-9 Phase A): real `getpeereid` (peer
+///   effective uid) + `LOCAL_PEERPID` (peer pid on macOS). This is the
+///   **true peer** for an accepted cross-process socket, and *this
+///   process* for a `socketpair` (correct — both ends are us; Phase
+///   A.0 measured Darwin 25.4: `getpeereid`/`LOCAL_PEERPID` succeed for
+///   both and return self for a socketpair, the real peer for an
+///   accepted fd). A `getpeereid` failure is **never** reported as a
+///   forged `Local`: a same-process / unconnected errno
+///   (`ENOTCONN`/`EINVAL`) falls back to the self identity (still the
+///   correct answer there), any other error to
+///   [`PeerIdentity::Anonymous`] (no ACL possible — logged loudly).
+///
+/// Before Phase A the non-Linux arm reported the **current process**
+/// for *every* socket — i.e. a server's `peer_identity()` for an
+/// accepted cross-process connection was the *server itself*, an
+/// authoritative-looking forged identity (the §0 contract defect).
 fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     #[cfg(target_os = "linux")]
     {
@@ -106,11 +117,89 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
             Err(_) => PeerIdentity::Anonymous,
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        resolve_peer_bsd(stream)
+    }
+    #[cfg(not(unix))]
     {
         let _ = stream;
-        super::mem::self_identity()
+        PeerIdentity::Anonymous
     }
+}
+
+/// macOS/BSD peer resolution — the subplan 2-9 Phase A failure-mode
+/// -driven fallback ladder. `getpeereid` is connect-time
+/// kernel-vouched (the BSD analogue of `SO_PEERCRED`).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    let mut euid: libc::uid_t = 0;
+    let mut egid: libc::gid_t = 0;
+    // SAFETY: `fd` is a valid socket fd owned by `stream` for the
+    // duration of this call; `euid`/`egid` are valid, initialized,
+    // correctly-typed out-params. `getpeereid` does not retain `fd`.
+    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+    if rc != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        return match errno {
+            // No peer credentials: an unconnected fd, or a socketpair
+            // on a BSD that does not populate peercred over the pipe
+            // path. Either way it is the *same process* (there is no
+            // remote peer), so the self identity is the correct,
+            // non-forged answer and the hermetic socketpair test still
+            // holds on such platforms (Phase A ladder branch 2 —
+            // defensive; not reached on Darwin 25.4, where a
+            // socketpair *does* populate peercred → branch 1 → self).
+            Some(libc::ENOTCONN) | Some(libc::EINVAL) => super::mem::self_identity(),
+            // Any other error: NEVER a forged `Local`. No ACL is
+            // possible against an unknown peer — surface it loudly.
+            _ => {
+                log::warn!(
+                    "RPC unix peer-cred unavailable (getpeereid errno={errno:?}); \
+                     reporting Anonymous — no peer ACL is possible"
+                );
+                PeerIdentity::Anonymous
+            }
+        };
+    }
+    PeerIdentity::Local {
+        uid: euid as u32,
+        pid: peer_pid(fd),
+    }
+}
+
+/// Peer pid via `LOCAL_PEERPID` (macOS 10.8+). Other BSDs have no such
+/// option, so the pid is reported as `-1` (the [`PeerIdentity::Local`]
+/// contract documents `-1` = unavailable) — the uid from `getpeereid`
+/// is still authoritative.
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: std::os::fd::RawFd) -> i32 {
+    let mut pid: libc::pid_t = -1;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: valid socket `fd`; `pid` and `len` are valid,
+    // correctly-sized out-params for the `LOCAL_PEERPID` getsockopt.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        pid
+    } else {
+        -1
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
+    -1
 }
 
 impl RpcTransport for UnixTransport {

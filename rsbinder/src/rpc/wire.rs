@@ -53,15 +53,41 @@ pub struct WireTransaction {
     pub async_number: u64,
     /// The serialized RPC-mode `Parcel` payload.
     pub data: Vec<u8>,
+    /// AOSP `RpcFields::mObjectPositions` — the sorted byte offsets,
+    /// **within `data`**, of every flattened RPC object (binder at
+    /// android-16 v2, FD at v1+). Sent on the wire as a trailing LE
+    /// `u32[]` after the parcel data (subplan 2-8, android-16 v2).
+    /// **Default empty** ⇒ the wire is byte-identical to the pre-2-8
+    /// no-object encoding (the v1≡v2 invariant, AC-8.2). The R34 and
+    /// v0 wires have no object table; a non-empty table on those is a
+    /// protocol error (`validateParcel`, AC-8.4).
+    pub object_positions: Vec<u32>,
 }
 
 /// A decoded reply (`RpcWireReply` + parcel payload).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WireReply {
     /// AIDL/binder status (`0` == ok).
     pub status: i32,
     /// The serialized RPC-mode `Parcel` payload.
     pub data: Vec<u8>,
+    /// See [`WireTransaction::object_positions`] — the reply parcel's
+    /// object table (subplan 2-8). Default empty = byte-identical to
+    /// the pre-2-8 reply encoding.
+    pub object_positions: Vec<u32>,
+}
+
+impl Default for WireTransaction {
+    fn default() -> Self {
+        Self {
+            address: RpcAddress::zero(),
+            code: 0,
+            flags: 0,
+            async_number: 0,
+            data: Vec::new(),
+            object_positions: Vec::new(),
+        }
+    }
 }
 
 /// One decoded wire message.
@@ -78,10 +104,14 @@ pub enum WireMessage {
 /// Pluggable RPC wire format. The session owns a codec instance (P6 —
 /// no global). android-13+ versioned wire is a future additional impl.
 pub trait WireCodec: Send + Sync {
-    /// Encode a complete `TRANSACT` message (header + txn + data).
-    fn encode_transact(&self, txn: &WireTransaction) -> Vec<u8>;
-    /// Encode a complete `REPLY` message.
-    fn encode_reply(&self, reply: &WireReply) -> Vec<u8>;
+    /// Encode a complete `TRANSACT` message (header + txn + data +
+    /// optional object table). Fails (`validateParcel`, AC-8.4) if the
+    /// codec's wire version has no object table but
+    /// `txn.object_positions` is non-empty.
+    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>>;
+    /// Encode a complete `REPLY` message. Same object-table version
+    /// rule as [`WireCodec::encode_transact`].
+    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>>;
     /// Encode a complete `DEC_STRONG` message.
     fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8>;
     /// Decode one complete wire message (header + body).
@@ -146,7 +176,19 @@ fn rd_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
 }
 
 impl WireCodec for R34Codec {
-    fn encode_transact(&self, txn: &WireTransaction) -> Vec<u8> {
+    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
+        // android-12 r34 predates the versioned wire: there is **no**
+        // object table on this wire at all. The android-13+ v2 object
+        // table is a separate codec; the R34 path never records
+        // positions (subplan 2-8 Phase B gates recording behind the
+        // android-13+ v2 profile), so a non-empty table here is a
+        // protocol break — reject it rather than silently drop the
+        // table and desync the peer (AOSP `validateParcel` analogue).
+        if !txn.object_positions.is_empty() {
+            return Err(RpcError::Protocol(
+                "r34 wire has no object table (object_positions must be empty)",
+            ));
+        }
         let body_len = WIRE_TXN_FIXED_LEN + txn.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len));
@@ -156,16 +198,21 @@ impl WireCodec for R34Codec {
         out.extend_from_slice(&txn.async_number.to_le_bytes()); // 8
         out.extend_from_slice(&[0u8; 16]); // reserved[4]
         out.extend_from_slice(&txn.data); // data[]
-        out
+        Ok(out)
     }
 
-    fn encode_reply(&self, reply: &WireReply) -> Vec<u8> {
+    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
+        if !reply.object_positions.is_empty() {
+            return Err(RpcError::Protocol(
+                "r34 wire has no object table (object_positions must be empty)",
+            ));
+        }
         let body_len = 4 + reply.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&Self::header(CMD_REPLY, body_len));
         out.extend_from_slice(&reply.status.to_le_bytes());
         out.extend_from_slice(&reply.data);
-        out
+        Ok(out)
     }
 
     fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8> {
@@ -214,6 +261,8 @@ impl WireCodec for R34Codec {
                     flags,
                     async_number,
                     data,
+                    // r34 has no object table.
+                    object_positions: Vec::new(),
                 }))
             }
             CMD_REPLY => {
@@ -222,7 +271,11 @@ impl WireCodec for R34Codec {
                 }
                 let status = rd_i32(body, 0)?;
                 let data = body[4..].to_vec();
-                Ok(WireMessage::Reply(WireReply { status, data }))
+                Ok(WireMessage::Reply(WireReply {
+                    status,
+                    data,
+                    object_positions: Vec::new(),
+                }))
             }
             CMD_DEC_STRONG => {
                 if body.len() != RPC_ADDR_LEN {
@@ -306,8 +359,9 @@ mod tests {
                 flags: 1,
                 async_number: 0x0102_0304_0506_0708,
                 data: data.clone(),
+                ..Default::default()
             };
-            let enc = c.encode_transact(&txn);
+            let enc = c.encode_transact(&txn).unwrap();
             match c.decode_message(&enc).unwrap() {
                 WireMessage::Transact(t) => {
                     assert_eq!(t.address, addr);
@@ -322,8 +376,9 @@ mod tests {
             let reply = WireReply {
                 status: -42,
                 data: data.clone(),
+                ..Default::default()
             };
-            let enc = c.encode_reply(&reply);
+            let enc = c.encode_reply(&reply).unwrap();
             match c.decode_message(&enc).unwrap() {
                 WireMessage::Reply(r) => {
                     assert_eq!(r.status, -42);
@@ -360,8 +415,9 @@ mod tests {
             flags: 0,
             async_number: 0,
             data: vec![],
+            ..Default::default()
         };
-        let enc = c.encode_transact(&txn);
+        let enc = c.encode_transact(&txn).unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&0u32.to_le_bytes()); // command = TRANSACT
         want.extend_from_slice(&64u32.to_le_bytes()); // bodySize = 64 (fixed, no data)
@@ -383,8 +439,9 @@ mod tests {
         let reply = WireReply {
             status: 0,
             data: vec![0xAA, 0xBB],
+            ..Default::default()
         };
-        let enc = c.encode_reply(&reply);
+        let enc = c.encode_reply(&reply).unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&1u32.to_le_bytes()); // command = REPLY
         want.extend_from_slice(&6u32.to_le_bytes()); // bodySize = 4 + 2
@@ -415,10 +472,13 @@ mod tests {
     #[test]
     fn golden_is_not_close_enough() {
         let c = R34Codec;
-        let mut enc = c.encode_reply(&WireReply {
-            status: 0,
-            data: vec![],
-        });
+        let mut enc = c
+            .encode_reply(&WireReply {
+                status: 0,
+                data: vec![],
+                ..Default::default()
+            })
+            .unwrap();
         let original = enc.clone();
         enc[0] ^= 0x01; // flip command LSB
         assert_ne!(enc, original);

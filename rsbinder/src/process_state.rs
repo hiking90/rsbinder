@@ -326,6 +326,22 @@ impl ProcessState {
             .expect("ProcessState is not initialized!")
     }
 
+    /// Whether the kernel-binder `ProcessState` singleton has been
+    /// initialized (`init`/`init_default` called).
+    ///
+    /// Additive, read-only, and **not used by the kernel path** — its
+    /// only caller is the `Tokio` async pool's "are we currently
+    /// servicing a kernel binder transaction?" guard, which must answer
+    /// `false` (instead of panicking via [`as_self`]) in a pure RPC
+    /// process that never brought up kernel binder. When `ProcessState`
+    /// *is* initialized this returns `true`, so every kernel scenario is
+    /// byte-for-byte the prior behavior.
+    ///
+    /// [`as_self`]: ProcessState::as_self
+    pub fn is_initialized() -> bool {
+        Self::instance().get().is_some()
+    }
+
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
         let mut self_call_restriction = self
             .call_restriction

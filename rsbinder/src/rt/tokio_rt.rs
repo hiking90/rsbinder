@@ -98,7 +98,18 @@ impl BinderAsyncPool for Tokio {
         B: Send + 'a,
         E: From<crate::StatusCode>,
     {
-        if crate::is_handling_transaction() {
+        // `is_handling_transaction()` forces the `THREAD_STATE`
+        // thread-local, whose ctor eagerly pulls `ProcessState::as_self()`
+        // — that panics in a pure RPC process (this same `Tokio` pool
+        // also drives the generated async `Bp*` over the RPC stack,
+        // which never brings up kernel binder). With no kernel
+        // `ProcessState` there is by definition no in-flight *kernel*
+        // binder transaction, so the answer is `false` and we take the
+        // `spawn_blocking` arm (RPC nested-callback re-entrancy is
+        // handled separately by the session's `DRIVING` marker, not
+        // here). Short-circuit keeps every kernel scenario — where
+        // `ProcessState` is always initialized — bit-for-bit unchanged.
+        if crate::ProcessState::is_initialized() && crate::is_handling_transaction() {
             // We are currently on the thread pool for a binder server, so we should execute the
             // transaction on the current thread so that the binder kernel driver is able to apply
             // its deadlock prevention strategy to the sub-call.

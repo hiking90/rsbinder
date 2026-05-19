@@ -96,8 +96,23 @@ impl Serialize for ParcelFileDescriptor {
                 M::Unix => {
                     let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
                     let idx = parcel.rpc_push_out_fd(dup);
+                    // AOSP `Parcel::writeFileDescriptor`: `dataPos =
+                    // mDataPos` captured **before** the type/present
+                    // int32, then `mObjectPositions.insert(upper_bound,
+                    // dataPos)`. rsbinder's RPC FD body is still its
+                    // internal `[present|idx]` shape (the AOSP-faithful
+                    // `[TYPE_NATIVE_FILE_DESCRIPTOR|fdCount]` body =
+                    // future §7 FD-object-table-over-libbinder); Phase B
+                    // adds only the *position bookkeeping* so the
+                    // sorted binder+FD table is exercised. Recorded
+                    // only on the android-13+ v1+ profile (R34 ⇒
+                    // `false` ⇒ 2-7 wire byte-unchanged).
+                    let obj_pos = parcel.data_position();
                     parcel.write::<i32>(&1)?; // present
                     parcel.write::<i32>(&idx)?; // ancillary fd-table index
+                    if parcel.rpc_record_fd_positions() {
+                        parcel.rpc_record_object_position(obj_pos);
+                    }
                     return Ok(());
                 }
             }
