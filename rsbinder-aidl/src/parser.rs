@@ -4,7 +4,7 @@
 // #![allow(clippy::missing_const_for_fn)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{pest_error_to_diagnostic, AidlError, ParseError};
 
@@ -45,6 +45,8 @@ thread_local! {
 
     // Universal Symbol Table - supports all types of named constants
     static SYMBOL_TABLE: RefCell<HashMap<String, Symbol>> = RefCell::new(HashMap::new());
+    static ENUM_VALUE_CACHE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
+    static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
     // Filename and source text of the source currently being parsed (used for error message generation)
     #[allow(clippy::missing_const_for_thread_local)]
@@ -134,6 +136,15 @@ pub fn current_namespace() -> Namespace {
     NAMESPACE_STACK.with(|stack| stack.borrow().last().cloned().unwrap_or_default())
 }
 
+fn reset_enum_resolution_state() {
+    ENUM_VALUE_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+    ENUM_RESOLUTION_STACK.with(|stack| {
+        stack.borrow_mut().clear();
+    });
+}
+
 pub fn set_current_document(document: &Document) {
     DOCUMENT.with(|doc| {
         let mut doc = doc.borrow_mut();
@@ -192,6 +203,11 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
             ns_vec.push(new_ns);
         }
     });
+
+    // 3. check fully-qualified names as written.
+    if namespace.ns.len() > 1 {
+        ns_vec.append(&mut make_ns_candidate(&Namespace::default(), &namespace));
+    }
 
     let (decl, ns) = DECLARATION_MAP.with(|hashmap| {
         for ns in &ns_vec {
@@ -264,7 +280,7 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
         Declaration::Enum(ref decl) => {
             for enumerator in &decl.enumerator_list {
                 if enumerator.identifier == lookup_ident {
-                    return Some(make_const_expr(None, lookup_decl));
+                    return enum_member_const_expr_from_lookup(lookup_decl, &lookup_ident);
                 }
             }
             lookup_name_members(&decl.members, lookup_decl)
@@ -281,6 +297,119 @@ fn lookup_name_members(members: &Vec<Declaration>, lookup_decl: &LookupDecl) -> 
         }
     }
     None
+}
+
+pub(crate) fn enum_member_const_expr_from_lookup(
+    lookup_decl: &LookupDecl,
+    member_name: &str,
+) -> Option<ConstExpr> {
+    let Declaration::Enum(enum_decl) = &lookup_decl.decl else {
+        return None;
+    };
+
+    let mut enum_val: i64 = 0;
+    let enum_type = lookup_decl.ns.to_string(Namespace::AIDL);
+    let resolution_key = format!("{enum_type}.{member_name}");
+
+    if let Some(cached) =
+        ENUM_VALUE_CACHE.with(|cache| cache.borrow().get(&resolution_key).cloned())
+    {
+        return Some(cached);
+    }
+
+    let is_circular = ENUM_RESOLUTION_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.contains(&resolution_key) {
+            true
+        } else {
+            stack.insert(resolution_key.clone());
+            false
+        }
+    });
+    if is_circular {
+        return None;
+    }
+
+    let _guard = NamespaceGuard::new(&lookup_decl.ns);
+    let mut result = None;
+
+    // Resolve inside the enum declaration, not through a global member name.
+    for enumerator in &enum_decl.enumerator_list {
+        if let Some(const_expr) = &enumerator.const_expr {
+            if let Ok(calculated) = const_expr.calculate() {
+                if !matches!(calculated.value, ValueType::Name(_)) {
+                    enum_val = calculated.to_i64().unwrap_or(enum_val);
+                }
+            }
+        }
+
+        if enumerator.identifier == member_name {
+            result = Some(ConstExpr::new(ValueType::Reference {
+                enum_type: enum_type.clone(),
+                enum_name: enum_decl.name.clone(),
+                member_name: member_name.to_string(),
+                value: enum_val,
+            }));
+            break;
+        }
+
+        enum_val += 1;
+    }
+
+    ENUM_RESOLUTION_STACK.with(|stack| {
+        stack.borrow_mut().remove(&resolution_key);
+    });
+
+    if let Some(expr) = &result {
+        ENUM_VALUE_CACHE.with(|cache| {
+            cache.borrow_mut().insert(resolution_key, expr.clone());
+        });
+    }
+
+    result
+}
+
+pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> Option<ConstExpr> {
+    // A field default has a target type. Use it to resolve unqualified
+    // members and reject defaults from a different enum family.
+    if let Some((enum_name, member_name)) = name.rsplit_once('.') {
+        let lookup_decl = lookup_decl_from_name(enum_name, Namespace::AIDL)?;
+        if !matches!(lookup_decl.decl, Declaration::Enum(_)) {
+            return None;
+        }
+
+        if let Some(target_enum) = target_enum {
+            let target_lookup = lookup_decl_from_name(target_enum, Namespace::AIDL)?;
+            if lookup_decl.ns != target_lookup.ns {
+                return None;
+            }
+        }
+
+        return enum_member_const_expr_from_lookup(&lookup_decl, member_name);
+    }
+
+    if let Some(target_enum) = target_enum {
+        let lookup_decl = lookup_decl_from_name(target_enum, Namespace::AIDL)?;
+        if matches!(lookup_decl.decl, Declaration::Enum(_)) {
+            return enum_member_const_expr_from_lookup(&lookup_decl, name);
+        }
+        return None;
+    }
+
+    let curr_ns = current_namespace();
+    DECLARATION_MAP.with(|hashmap| {
+        let lookup_decl = hashmap
+            .borrow()
+            .get(&curr_ns)
+            .filter(|decl| matches!(decl, Declaration::Enum(_)))
+            .cloned()
+            .map(|decl| LookupDecl {
+                decl,
+                ns: curr_ns.clone(),
+                name: Namespace::new(name, Namespace::AIDL),
+            })?;
+        enum_member_const_expr_from_lookup(&lookup_decl, name)
+    })
 }
 
 // Universal symbol registration - supports all types of named constants
@@ -300,13 +429,25 @@ pub fn register_symbol(
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();
 
-        // Register with simple name
-        table.insert(name.to_string(), symbol.clone());
+        match &symbol.symbol_type {
+            SymbolType::EnumMember => {
+                // Enum members are only registered under their enum type.
+                // Simple enum member names are not globally unique.
+                if let Some(ns) = namespace {
+                    let qualified_name = format!("{}.{}", ns, name);
+                    table.insert(qualified_name, symbol);
+                }
+            }
+            _ => {
+                // Register with simple name
+                table.insert(name.to_string(), symbol.clone());
 
-        // Also register with qualified name if namespace is provided
-        if let Some(ns) = namespace {
-            let qualified_name = format!("{}.{}", ns, name);
-            table.insert(qualified_name, symbol);
+                // Also register with qualified name if namespace is provided
+                if let Some(ns) = namespace {
+                    let qualified_name = format!("{}.{}", ns, name);
+                    table.insert(qualified_name, symbol);
+                }
+            }
         }
     });
 }
@@ -316,6 +457,10 @@ pub fn register_symbol(
 
 // Enhanced name resolution with universal symbol table
 pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
+    if let Some(expr) = name_to_enum_member_const_expr(name, None) {
+        return Some(expr);
+    }
+
     // First, try to resolve from universal symbol table (exact match)
     let symbol_result =
         SYMBOL_TABLE.with(|table| table.borrow().get(name).map(|symbol| symbol.value.clone()));
@@ -1635,6 +1780,7 @@ pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
 
 pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
     let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
+    reset_enum_resolution_state();
     let mut document = Document::new();
 
     match AIDLParser::parse(Rule::document, &ctx.source) {
@@ -1701,6 +1847,7 @@ pub fn reset() {
     SYMBOL_TABLE.with(|table| {
         table.borrow_mut().clear();
     });
+    reset_enum_resolution_state();
 }
 
 #[cfg(test)]
