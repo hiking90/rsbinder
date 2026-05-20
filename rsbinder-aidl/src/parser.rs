@@ -39,6 +39,7 @@ pub struct Symbol {
 
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
+    static DECLARATION_DOCUMENT_MAP: RefCell<HashMap<Namespace, DocumentContext>> = RefCell::new(HashMap::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
@@ -146,12 +147,44 @@ fn reset_enum_resolution_state() {
 }
 
 pub fn set_current_document(document: &Document) {
+    let context = DocumentContext::from_document(document);
+    set_current_document_context(&context);
+}
+
+fn set_current_document_context(context: &DocumentContext) {
     DOCUMENT.with(|doc| {
         let mut doc = doc.borrow_mut();
 
-        doc.package = document.package.clone();
-        doc.imports = document.imports.clone();
+        doc.package = context.package.clone();
+        doc.imports = context.imports.clone();
     })
+}
+
+fn current_document_context() -> DocumentContext {
+    DOCUMENT.with(|doc| {
+        let doc = doc.borrow();
+        DocumentContext::from_document(&doc)
+    })
+}
+
+struct DocumentGuard(DocumentContext);
+
+impl DocumentGuard {
+    fn new(context: &DocumentContext) -> Self {
+        let previous = current_document_context();
+        set_current_document_context(context);
+        Self(previous)
+    }
+}
+
+impl Drop for DocumentGuard {
+    fn drop(&mut self) {
+        set_current_document_context(&self.0);
+    }
+}
+
+fn declaration_document_context(ns: &Namespace) -> Option<DocumentContext> {
+    DECLARATION_DOCUMENT_MAP.with(|hashmap| hashmap.borrow().get(ns).cloned())
 }
 
 fn make_ns_candidate(ns: &Namespace, name: &Namespace) -> Vec<Namespace> {
@@ -330,6 +363,8 @@ pub(crate) fn enum_member_const_expr_from_lookup(
         return None;
     }
 
+    let document_context = declaration_document_context(&lookup_decl.ns);
+    let _document_guard = document_context.as_ref().map(DocumentGuard::new);
     let _guard = NamespaceGuard::new(&lookup_decl.ns);
     let mut result = None;
 
@@ -540,6 +575,21 @@ impl Document {
             package: None,
             imports: HashMap::new(),
             decls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct DocumentContext {
+    package: Option<String>,
+    imports: HashMap<String, String>,
+}
+
+impl DocumentContext {
+    fn from_document(document: &Document) -> Self {
+        Self {
+            package: document.package.clone(),
+            imports: document.imports.clone(),
         }
     }
 }
@@ -1760,7 +1810,11 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, A
     Ok(declarations)
 }
 
-pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
+fn calculate_namespace(
+    decl: &mut Declaration,
+    mut namespace: Namespace,
+    document_context: &DocumentContext,
+) {
     if decl.is_variable().is_some() {
         return;
     }
@@ -1772,9 +1826,14 @@ pub fn calculate_namespace(decl: &mut Declaration, mut namespace: Namespace) {
     DECLARATION_MAP.with(|hashmap| {
         hashmap.borrow_mut().insert(namespace.clone(), decl.clone());
     });
+    DECLARATION_DOCUMENT_MAP.with(|hashmap| {
+        hashmap
+            .borrow_mut()
+            .insert(namespace.clone(), document_context.clone());
+    });
 
     for decl in decl.members_mut() {
-        calculate_namespace(decl, namespace.clone());
+        calculate_namespace(decl, namespace.clone(), document_context);
     }
 }
 
@@ -1827,8 +1886,9 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
         Namespace::default()
     };
 
+    let document_context = DocumentContext::from_document(&document);
     for decl in &mut document.decls {
-        calculate_namespace(decl, namespace.clone());
+        calculate_namespace(decl, namespace.clone(), &document_context);
     }
 
     Ok(document)
@@ -1836,6 +1896,9 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
 
 pub fn reset() {
     DECLARATION_MAP.with(|hashmap| {
+        hashmap.borrow_mut().clear();
+    });
+    DECLARATION_DOCUMENT_MAP.with(|hashmap| {
         hashmap.borrow_mut().clear();
     });
     NAMESPACE_STACK.with(|stack| {
