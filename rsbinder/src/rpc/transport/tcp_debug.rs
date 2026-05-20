@@ -22,6 +22,7 @@
 //! * For real networks use the `tls` backend (subplan 2-4) instead.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{read_frame, write_frame, PeerIdentity, RpcTransport};
@@ -65,6 +66,14 @@ impl TcpDebugTransport {
             Err(_) => "tcp_debug".to_string(),
         };
         Ok(TcpDebugTransport { stream, desc })
+    }
+
+    /// Wrap a preconnected `OwnedFd` (subplan 2-13 A0.2 — the
+    /// `IAccessor::addConnection()` fd-adopt path, `AF_INET` family).
+    /// `std`'s `From<OwnedFd> for TcpStream` is stable cross-platform;
+    /// the caller is responsible for asserting the fd's address family.
+    pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
+        Self::from_stream(TcpStream::from(fd))
     }
 
     /// Connect to `addr` (client side). Warns; identity is always
@@ -165,6 +174,35 @@ mod tests {
             assert_eq!(server.recv_frame().expect("recv"), payload, "size {size}");
             sender.join().unwrap();
         }
+    }
+
+    /// Subplan 2-13 A0.2: `from_owned_fd` adopt → frame roundtrip.
+    /// Mirrors the `unix` counterpart but uses the TCP loopback pair.
+    #[test]
+    fn tcp_debug_from_owned_fd_roundtrip() {
+        use std::os::fd::OwnedFd;
+
+        // Bind a listener, connect a client, accept on the server end —
+        // exactly what an external bridge would hand us as two fds.
+        let listener = TcpDebugTransport::bind_loopback().expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let client_stream = TcpStream::connect(addr).expect("connect");
+        let (server_stream, _) = listener.accept().expect("accept");
+
+        let client_fd: OwnedFd = client_stream.into();
+        let server_fd: OwnedFd = server_stream.into();
+        let client = TcpDebugTransport::from_owned_fd(client_fd).expect("adopt client");
+        let server = TcpDebugTransport::from_owned_fd(server_fd).expect("adopt server");
+
+        let payload = b"hello-accessor-tcp".to_vec();
+        let client = Arc::new(client);
+        let sender = {
+            let c = client.clone();
+            let p = payload.clone();
+            std::thread::spawn(move || c.send_frame(&p).unwrap())
+        };
+        assert_eq!(server.recv_frame().expect("recv"), payload);
+        sender.join().unwrap();
     }
 
     #[test]

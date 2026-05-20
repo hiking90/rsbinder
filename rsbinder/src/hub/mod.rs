@@ -83,8 +83,21 @@ pub mod android_14 {
     pub use super::servicemanager_14::*;
 }
 
+#[cfg(feature = "rpc")]
+pub(crate) mod accessor_16;
 mod servicemanager_16;
 pub mod android_16 {
+    /// Subplan 2-13 B.6: expose the deterministic error-name decoder
+    /// (and its `__fuzz_*` hook) so the libFuzzer target can drive it
+    /// without re-implementing the i32→symbol map.
+    #[cfg(feature = "rpc")]
+    pub use super::accessor_16::{
+        __fuzz_accessor_error_decode, accessor_error_name, resolve_accessor, BnAccessor,
+        BpAccessor, IAccessor, IAccessorAsyncService, IAccessorDefault, IAccessorDefaultRef,
+        ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
+        ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
+        ERROR_UNSUPPORTED_SOCKET_FAMILY,
+    };
     pub use super::servicemanager_16::*;
 }
 

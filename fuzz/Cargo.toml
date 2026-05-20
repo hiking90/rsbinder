@@ -20,7 +20,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rsbinder = { path = "../rsbinder", features = ["rpc"] }
+rsbinder = { path = "../rsbinder", features = ["rpc", "android_16"] }
 
 [[bin]]
 name = "rpc_frame_decode"
@@ -67,6 +67,13 @@ bench = false
 [[bin]]
 name = "rpc_fd_v1_body"
 path = "fuzz_targets/rpc_fd_v1_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_accessor_error"
+path = "fuzz_targets/rpc_accessor_error.rs"
 test = false
 doc = false
 bench = false

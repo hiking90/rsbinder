@@ -168,17 +168,61 @@ fn read_addr(p: &mut Parcel) -> Result<RpcAddress> {
     Ok(RpcAddress::from_wire_bytes(bytes))
 }
 
-/// A per-session opaque 32-byte id (AOSP `kSessionIdBytes`). AOSP fills
-/// it from a CSPRNG and rsbinder must do the same: subplan 2-12 A0b
-/// made the id a **capability for attach** — a 2nd connection that
-/// echoes this id is bound to the *same* `SharedSession`
-/// (`state`/`root`/cached proxies), so a predictable id would be a
-/// session-hijack primitive for any same-host peer reachable on the
-/// UDS. **Global-free** (P6 — no `static` counter); the underlying
-/// `getrandom` is a stateless syscall (`getrandom(2)` on Linux,
-/// `SecRandomCopyBytes` on macOS), so the `rpc_stack_has_no_globals`
-/// gate stays clean.
-fn gen_rpc_session_id() -> [u8; 32] {
+/// 32-byte AOSP `kSessionIdBytes` opaque session identifier — a
+/// CSPRNG-minted **capability for attach** under subplan 2-12 A0a/A0b:
+/// a peer that echoes this id in the connection header is bound to
+/// the *same* `SharedSession` (shared `state`/`root`/cached proxies),
+/// so the wire bytes are not just an opaque identifier but a
+/// privilege token. Wrapping the `[u8; 32]` in a newtype makes that
+/// "attach capability" semantic type-explicit at every internal touch
+/// point ([`RpcServer.sessions`](super::RpcServer), `register/resolve/
+/// unregister_session`, [`SharedSession::rpc_session_id`],
+/// [`gen_rpc_session_id`]), so raw 32-byte values from unrelated
+/// origins (e.g. hashes) can't be passed in by accident. Public
+/// wire-facing APIs ([`RpcSession::session_id`],
+/// [`connect_android13plus_fd_with_id`](RpcSession::connect_android13plus_fd_with_id),
+/// [`add_outgoing_connection_android13plus`](RpcSession::add_outgoing_connection_android13plus))
+/// keep the raw `[u8; 32]` / `&[u8]` shape for ergonomic compatibility
+/// — a future R2-full PR can promote them.
+///
+/// `Debug` deliberately masks the bytes: this id is a capability —
+/// logging it leaks the attach token.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RpcSessionId([u8; 32]);
+
+impl RpcSessionId {
+    pub(crate) fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Construct from a wire-bytes slice. `None` if `s.len() != 32`
+    /// (AOSP `kSessionIdBytes` is a hard 32-byte invariant; anything
+    /// else is wire-illegal — see `connect_*_with_id`'s length gate).
+    pub(crate) fn try_from_slice(s: &[u8]) -> Option<Self> {
+        <[u8; 32]>::try_from(s).ok().map(Self)
+    }
+}
+
+impl std::fmt::Debug for RpcSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mask the bytes — capability-leak hazard if a casual {:?} in
+        // a log line dumps an attach token.
+        f.write_str("RpcSessionId(...)")
+    }
+}
+
+/// Mint a fresh [`RpcSessionId`] via the OS CSPRNG. AOSP fills it
+/// from a CSPRNG and rsbinder must do the same: A0b made the id a
+/// **capability for attach**, so a predictable id would be a session-
+/// hijack primitive for any same-host peer reachable on the UDS.
+/// **Global-free** (P6 — no `static` counter); `getrandom` is a
+/// stateless syscall (`getrandom(2)` on Linux, `SecRandomCopyBytes`
+/// on macOS), so the `rpc_stack_has_no_globals` gate stays clean.
+fn gen_rpc_session_id() -> RpcSessionId {
     let mut id = [0u8; 32];
     // `getrandom` only fails on platforms without a working CSPRNG —
     // not a runtime condition rsbinder can recover from, and the only
@@ -188,7 +232,7 @@ fn gen_rpc_session_id() -> [u8; 32] {
     // an `.expect(&'static str)` would lose it.
     getrandom::getrandom(&mut id)
         .unwrap_or_else(|e| panic!("CSPRNG getrandom failed for RPC session id: {e}"));
-    id
+    RpcSessionId::new(id)
 }
 
 /// RAII clear for the `client_transact` reply read-deadline (AC-3.8).
@@ -433,8 +477,9 @@ pub(crate) struct SharedSession {
     /// (G4(b): real-peer-validated). Per-session, never global (P6) —
     /// generated global-free in [`RpcSession::with_profile`]. Shared
     /// across the session's connections (A0b: an attached 2nd
-    /// connection reports the *same* id).
-    rpc_session_id: [u8; 32],
+    /// connection reports the *same* id). [`RpcSessionId`] newtype
+    /// (R2) makes the "attach capability" semantic type-explicit.
+    rpc_session_id: RpcSessionId,
     /// **F4 (Phase A0b)**: number of live connections driving this
     /// session. Starts at 1 (the founding connection); the server's
     /// id-demux attach bumps it. `serve_blocking` decrements on exit
@@ -459,6 +504,17 @@ impl SharedSession {
             .lock()
             .expect("rpc state poisoned")
             .local_node_count()
+    }
+
+    /// Current live connection count — the F4 ledger primitive. Used
+    /// by tests as a *deterministic* witness that a connection-drop
+    /// has been fully reaped by its server worker (`serve_blocking_on`
+    /// exit's `live_conns.fetch_sub`), replacing the prior
+    /// `sleep(50ms)` heuristic in `a0b_multi_connection_shared_session`
+    /// that raced server-scheduler jitter. Always observes the latest
+    /// monotonic value (SeqCst).
+    pub(crate) fn live_conn_count(&self) -> usize {
+        self.live_conns.load(Ordering::SeqCst)
     }
 
     /// **F4 anti-resurrection primitive.** Atomically add one to
@@ -1354,7 +1410,7 @@ impl RpcSessionInner {
                 // (Was a bare `i32` ⇒ libbinder `BAD_VALUE` — found by
                 // the real-peer round-trip, G4(b).)
                 let mut reply = Parcel::new();
-                reply.write(&self.shared.rpc_session_id[..])?;
+                reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetFdMode) => {
@@ -1746,7 +1802,10 @@ impl RpcSession {
     /// [`super::RpcServer`] registry key. Per-session, never global
     /// (P6).
     pub fn session_id(&self) -> [u8; 32] {
-        self.inner.shared.rpc_session_id
+        // Public API keeps the raw-byte shape for ergonomic
+        // compatibility (R2 internal-only newtype). Future R2-full PR
+        // can promote this to `RpcSessionId`.
+        *self.inner.shared.rpc_session_id.as_bytes()
     }
 
     /// Client (subplan 2-12 Phase A0a): fetch the server-minted 32-byte
@@ -2076,6 +2135,101 @@ impl RpcSession {
         RpcSession::connect_android13plus_fd(Box::new(t), max_version, fd_mode)
     }
 
+    /// Subplan 2-13 A0.3 — adopt a **preconnected** RPC socket fd handed
+    /// to us by an out-of-band channel (the AOSP `IAccessor::addConnection`
+    /// path: `BackendUnifiedServiceManager` receives a `unique_fd` and
+    /// hands it to `RpcSession::setupPreconnectedClient(fd, request)`).
+    ///
+    /// The fd's address family (`SO_DOMAIN`) selects the rsbinder
+    /// transport — `AF_UNIX` → [`super::transport::UnixTransport`],
+    /// `AF_VSOCK` → [`super::transport::VsockTransport`] (feature
+    /// `rpc-vsock`, Linux only), `AF_INET`/`AF_INET6` →
+    /// [`super::transport::TcpDebugTransport`] (feature
+    /// `rpc-tcp-debug`). Any other family is rejected as
+    /// [`StatusCode::BadType`], paralleling AOSP's
+    /// `IAccessor::ERROR_UNSUPPORTED_SOCKET_FAMILY`. The handshake then
+    /// runs through [`RpcSession::connect_android13plus_fd`] with
+    /// `FileDescriptorTransportMode::None` (the fd carries no FD-mode
+    /// metadata of its own — re-using 2-8 wire bytes, neither a new
+    /// codec nor a new framing path). `max_version` is the highest
+    /// `RPC_WIRE_PROTOCOL_VERSION` to offer (`2` for android-16, `1` for
+    /// android-14/15, `0` for android-13). The peer's `RpcServer`
+    /// negotiates `min(max_version, server_max)` exactly as for the
+    /// path-based client (G4(a) / 2-8 Phase D verified live).
+    ///
+    /// rsbinder uses a single-connection session (plan 2-13 §7), so no
+    /// AOSP `request` reconnect closure is needed — the closure regains
+    /// meaning once 2-12 multi-conn lands.
+    pub fn from_preconnected_fd(fd: OwnedFd, max_version: u32) -> Result<RpcSession> {
+        // (a) Determine the fd's address family. Linux exposes
+        //     `SO_DOMAIN` directly (`rustix::sockopt::socket_domain`),
+        //     but macOS has no equivalent — `getsockname()` works on
+        //     both, returning the local address whose family is the
+        //     socket's. For the Accessor path the fd is always
+        //     `connect()`-ed by the server before being handed over, so
+        //     it always has a local name (`socketpair` halves also do —
+        //     `AF_UNIX` with an empty path).
+        let local = rustix::net::getsockname(fd.as_fd())
+            .map_err(|e| RpcError::from(std::io::Error::from(e)))?;
+        let family = local.address_family();
+
+        // (a') Clear `O_NONBLOCK`. AOSP `singleSocketConnection`
+        // (frameworks/native/libs/binder/RpcSession.cpp:614, android-
+        // 16.0.0_r4) opens its preconnected socket with
+        // `SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK` and the same
+        // fd is what `LocalAccessor::addConnection` returns to a client
+        // — so an Accessor-supplied fd arrives non-blocking. rsbinder
+        // RPC I/O is structurally blocking (the codec/handshake runs
+        // `read`/`write_all` as synchronous calls; an EAGAIN surfaces
+        // as `Io(WouldBlock)` mid-handshake and tears the connection
+        // down). Clear `O_NONBLOCK` here so `UnixStream`/`TcpStream`
+        // inherit blocking semantics. Re-applying the flag from
+        // userspace is harmless if it wasn't set.
+        let flags = rustix::fs::fcntl_getfl(fd.as_fd())
+            .map_err(|e| RpcError::from(std::io::Error::from(e)))?;
+        if flags.contains(rustix::fs::OFlags::NONBLOCK) {
+            rustix::fs::fcntl_setfl(fd.as_fd(), flags - rustix::fs::OFlags::NONBLOCK)
+                .map_err(|e| RpcError::from(std::io::Error::from(e)))?;
+        }
+
+        // (b) Map family → backend. Each branch is feature-gated
+        //     identically to the transport `mod` declarations so the OFF
+        //     build is byte-identical (a missing backend rejects with
+        //     `BadType`, mirroring the AOSP `UNSUPPORTED_SOCKET_FAMILY`).
+        let transport: Box<dyn RpcTransport> = match family {
+            rustix::net::AddressFamily::UNIX => {
+                Box::new(super::transport::UnixTransport::from_owned_fd(fd)?)
+            }
+            #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+            rustix::net::AddressFamily::VSOCK => {
+                Box::new(super::transport::VsockTransport::from_owned_fd(fd)?)
+            }
+            #[cfg(feature = "rpc-tcp-debug")]
+            rustix::net::AddressFamily::INET | rustix::net::AddressFamily::INET6 => {
+                Box::new(super::transport::TcpDebugTransport::from_owned_fd(fd)?)
+            }
+            _ => {
+                log::warn!(
+                    "RPC preconnected fd has unsupported socket family ({:?}); \
+                     rejecting (AOSP IAccessor::ERROR_UNSUPPORTED_SOCKET_FAMILY)",
+                    family.as_raw()
+                );
+                return Err(StatusCode::BadType);
+            }
+        };
+
+        // (c) Run the android-13+ versioned handshake. No FD-over-RPC —
+        //     the Accessor-fd carries no fd-mode metadata of its own and
+        //     the consumer (the eventual proxy returned by `get_root`)
+        //     drives any later FD passing through the negotiated wire
+        //     directly.
+        RpcSession::connect_android13plus_fd(
+            transport,
+            max_version,
+            FileDescriptorTransportMode::None,
+        )
+    }
+
     /// Test/diagnostic: live local-node count (AC-2.5 leak check).
     pub fn local_node_count(&self) -> usize {
         self.inner
@@ -2084,5 +2238,149 @@ impl RpcSession {
             .lock()
             .expect("rpc state poisoned")
             .local_node_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Subplan 2-13 A0.3 unit gate (plan §9 matrix). Exercises
+    //! [`RpcSession::from_preconnected_fd`]'s family-dispatch +
+    //! `O_NONBLOCK` clear at the unit layer, without standing up an
+    //! `RpcServer` (the end-to-end handshake against a peer is the
+    //! `tests/rpc_accessor.rs` integration suite's job — A.4/A.5/D.7).
+    //!
+    //! Cross-platform host (Linux + macOS): every test uses
+    //! `rustix::net::socketpair(AF_UNIX, ...)` so it's deterministic
+    //! and filesystem-free.
+    use super::*;
+    use std::os::fd::{AsFd, OwnedFd};
+
+    /// Build a Unix socketpair and return one half as `OwnedFd`.
+    fn unix_socketpair_fd() -> (OwnedFd, OwnedFd) {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+        rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::empty(),
+            None,
+        )
+        .expect("socketpair")
+    }
+
+    /// `from_preconnected_fd` on an `AF_UNIX` socketpair half: family
+    /// dispatch hits the `UnixTransport` arm. The handshake itself
+    /// can't complete without a real RPC peer on the other end — so
+    /// pair the call with a peer that closes immediately and assert
+    /// the *outcome* is a clean `Err`, never a panic / hang. This is
+    /// the negative-path proof; the positive path (live handshake +
+    /// echo) is `tests/rpc_accessor.rs`.
+    #[test]
+    fn from_preconnected_fd_unix_dispatches_then_fails_cleanly_on_eof() {
+        let (a, b) = unix_socketpair_fd();
+        // Close the peer end immediately: the v2 client handshake's
+        // first read of `RpcNewSessionResponse` then hits EOF.
+        drop(b);
+        let err = match RpcSession::from_preconnected_fd(a, 2) {
+            Ok(_) => panic!("expected Err on closed peer"),
+            Err(e) => e,
+        };
+        // Wire failure must surface as a peer/io-class status, never
+        // a panic or a hang.
+        assert!(
+            matches!(
+                err,
+                StatusCode::DeadObject | StatusCode::NotEnoughData | StatusCode::Unknown
+            ),
+            "unexpected status for closed peer: {err}"
+        );
+    }
+
+    /// AC-13.5 (regression gate, host-side): assert that the
+    /// `O_NONBLOCK` clear actually runs — `from_preconnected_fd` must
+    /// drop the flag *before* returning the session, so subsequent
+    /// blocking reads on the underlying fd don't trip EAGAIN.
+    ///
+    /// Strategy: don't try to *observe* a stuck read (any synthetic
+    /// EOF setup we craft hides EAGAIN behind it). Instead, after the
+    /// bridge fails the handshake (no real peer), re-check the flag
+    /// directly via `fcntl_getfl` on a dup of the fd. The fd is
+    /// transferred to a transport on success, but on failure the
+    /// transport drops and closes it. To get observable post-state,
+    /// dup the fd *before* calling the bridge — the dup shares the
+    /// same open-file description ([fcntl(2): "Each duplicate file
+    /// descriptor refers to the same open file description and …
+    /// the same file status flags"]), so the bridge's `fcntl_setfl`
+    /// is reflected through our dup.
+    #[test]
+    fn from_preconnected_fd_clears_o_nonblock_before_dispatch() {
+        use std::os::fd::IntoRawFd;
+        let (a, _b) = unix_socketpair_fd();
+        // Set O_NONBLOCK on the half we hand in — mirroring AOSP
+        // `singleSocketConnection` (SOCK_NONBLOCK at socket creation).
+        let flags = rustix::fs::fcntl_getfl(a.as_fd()).expect("getfl");
+        rustix::fs::fcntl_setfl(a.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)
+            .expect("setfl NONBLOCK");
+        assert!(
+            rustix::fs::fcntl_getfl(a.as_fd())
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK),
+            "test setup: O_NONBLOCK must be set"
+        );
+        // Dup BEFORE handing `a` to the bridge: both fds share the
+        // same open-file description (status flags are shared per
+        // POSIX), so the bridge's `fcntl_setfl` is observable
+        // through `observer`.
+        let observer = rustix::io::fcntl_dupfd_cloexec(a.as_fd(), 0).expect("dup");
+        // _b is still alive, so the handshake's first read blocks;
+        // we don't actually want it to succeed (no real peer), so
+        // close _b mid-flight is unhelpful. Just race the bridge in
+        // a background thread and shut the peer down so the bridge
+        // returns; then observe the flag.
+        let bridge_t = std::thread::spawn(move || {
+            // The peer (_b in this scope) is still alive here, so the
+            // bridge blocks reading the response. We rely on _b being
+            // dropped at the end of the outer scope to unblock us.
+            let _ = RpcSession::from_preconnected_fd(a, 2);
+        });
+        // Give the bridge a moment to clear the flag + start reading.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The bridge must have cleared O_NONBLOCK by now (the clear
+        // happens BEFORE the family dispatch which is BEFORE the read).
+        let observed = rustix::fs::fcntl_getfl(observer.as_fd()).expect("getfl observer");
+        assert!(
+            !observed.contains(rustix::fs::OFlags::NONBLOCK),
+            "from_preconnected_fd did NOT clear O_NONBLOCK — handshake will trip EAGAIN \
+             against a non-blocking peer fd from libbinder"
+        );
+        // Drop _b to unblock the bridge thread, then join.
+        drop(_b);
+        bridge_t.join().expect("bridge thread");
+        // `observer` drops here; keep it explicit so the IntoRawFd
+        // import isn't 'unused' if the helper closes are reordered.
+        let _ = observer.into_raw_fd();
+    }
+
+    /// `getsockname` is the cross-platform family probe (Linux's
+    /// `SO_DOMAIN` is absent on macOS). For an unconnected non-socket
+    /// fd it errors out — assert that path is clean.
+    #[test]
+    fn from_preconnected_fd_rejects_non_socket_fd() {
+        // `/dev/null` is a character device, never a socket — the
+        // `getsockname()` syscall returns ENOTSOCK. Use rustix to open
+        // it with no allocation footprint.
+        let fd = rustix::fs::open(
+            "/dev/null",
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open /dev/null");
+        // ENOTSOCK round-trips through `rustix::io::Errno → io::Error
+        // → StatusCode` — we don't care which variant rustix maps
+        // ENOTSOCK to, only that the call fails cleanly without
+        // panic, allocation, or peer wire I/O.
+        assert!(
+            RpcSession::from_preconnected_fd(fd, 2).is_err(),
+            "non-socket fd must reject before any handshake I/O"
+        );
     }
 }

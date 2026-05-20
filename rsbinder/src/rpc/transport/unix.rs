@@ -12,6 +12,7 @@
 //! server-side `bind`/`listen`/`accept` loop is subplan 2-3.
 
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -74,6 +75,18 @@ impl UnixTransport {
             Self::from_stream(UnixStream::from(a))?,
             Self::from_stream(UnixStream::from(b))?,
         ))
+    }
+
+    /// Wrap a preconnected Unix-domain `OwnedFd` (subplan 2-13 A0.2 —
+    /// the `IAccessor::addConnection()` fd-adopt path). `std`'s
+    /// `From<OwnedFd> for UnixStream` is stable cross-platform (Linux +
+    /// macOS), and the resulting transport is byte-identical to
+    /// [`UnixTransport::from_stream`] — peer identity is resolved the
+    /// same way over the same fd. The caller is responsible for
+    /// asserting the fd's address family (`AF_UNIX`); see
+    /// [`crate::rpc::RpcSession::from_preconnected_fd`].
+    pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
+        Self::from_stream(UnixStream::from(fd))
     }
 
     /// Connect to a listening Unix socket at `path` (client side).
@@ -510,6 +523,37 @@ mod tests {
         drop(b);
         // First recv sees EOF -> clean PeerClosed (T1.5).
         assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+    }
+
+    /// Subplan 2-13 A0.2: adopt one half of a `socketpair` via
+    /// `from_owned_fd` and verify it framed-roundtrips against the other
+    /// half (`from_stream`). Exercises the `IAccessor::addConnection`-
+    /// style "we hand the transport a connected fd, not a path" entry
+    /// point without touching the filesystem.
+    #[test]
+    fn unix_from_owned_fd_roundtrip() {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+        // `rustix::net::socketpair` already returns `(OwnedFd, OwnedFd)`
+        // (rustix 1.1 `net/socketpair.rs`), so no rebind is needed.
+        let (a, b) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::empty(),
+            None,
+        )
+        .expect("socketpair");
+        let client = UnixTransport::from_owned_fd(a).expect("adopt a");
+        let server = UnixTransport::from_owned_fd(b).expect("adopt b");
+        let payload = b"hello-accessor".to_vec();
+        let client = Arc::new(client);
+        let sender = {
+            let c = client.clone();
+            let p = payload.clone();
+            std::thread::spawn(move || c.send_frame(&p).unwrap())
+        };
+        assert_eq!(server.recv_frame().expect("recv"), payload);
+        sender.join().unwrap();
     }
 
     #[test]

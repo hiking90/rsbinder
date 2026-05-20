@@ -387,6 +387,7 @@ fn concurrent_calls_single_shared_session() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // AC-3.2 (as written: "8 client threads on the SAME session").
@@ -423,10 +424,7 @@ fn concurrent_calls_single_shared_session() {
         "shared-session concurrency must make progress, not deadlock ({:?})",
         t0.elapsed()
     );
-
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- AC-3.3 multi-session isolation --------------------------------
@@ -437,6 +435,7 @@ fn concurrent_clients_isolated_sessions() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // 8 client threads, each its own connection (independent session +
@@ -457,10 +456,7 @@ fn concurrent_clients_isolated_sessions() {
     for h in handles {
         h.join().expect("client thread");
     }
-
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- 2-10: opt-in server-side connection admission bound -----------
@@ -482,6 +478,7 @@ fn max_connections_admission_bound() {
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     server.set_max_connections(2);
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // Two long-lived sessions occupy both worker slots: each get_root
@@ -532,9 +529,7 @@ fn max_connections_admission_bound() {
 
     drop(c2);
     drop(c4);
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- AC-3.5 oneway FIFO + non-blocking send ------------------------
@@ -546,6 +541,7 @@ fn oneway_fifo_and_nonblocking() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -575,10 +571,7 @@ fn oneway_fifo_and_nonblocking() {
         oneway_elapsed < Duration::from_secs(5),
         "oneway sends should not block per-call (took {oneway_elapsed:?})"
     );
-
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- AC-3.6 nested server→client callback --------------------------
@@ -589,6 +582,7 @@ fn nested_callback_no_deadlock() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -607,10 +601,7 @@ fn nested_callback_no_deadlock() {
     for _ in 0..50 {
         assert_eq!(root.roundtrip(&cb).unwrap(), "rt:ping");
     }
-
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- AC-3.8 timeout (hung server) ----------------------------------
@@ -621,6 +612,7 @@ fn client_timeout_on_hung_server() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -636,10 +628,7 @@ fn client_timeout_on_hung_server() {
         t0.elapsed() < Duration::from_secs(2),
         "must return promptly on timeout, not block for the full 5s"
     );
-
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
+    // _cu handles teardown.
 }
 
 // ---- 2-5b / G4(a): opt-in android-13+ versioned-wire profile -------
@@ -673,6 +662,7 @@ fn android13plus_profile_e2e() {
         server.set_max_threads(2);
         server.set_root(make_service(counter.clone()));
         let bg = server.run_background();
+        let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
 
         // Client opts into android-13+; the handshake negotiates
@@ -729,13 +719,9 @@ fn android13plus_profile_e2e() {
 
         drop(root);
         drop(client);
-        server.shutdown();
-        let _ = bg.join();
-        // Reap the per-connection session worker too (Drop/shutdown
-        // only join the accept loop); the worker has already drained on
-        // the client drop above, so this just collects its handle.
-        server.join_workers();
-        let _ = std::fs::remove_file(&path);
+        // _cu (per-iteration) handles teardown — `let _cu = ServeCleanup::new(...)`
+        // is dropped here as the for-loop body scope ends, in the same
+        // order the explicit shutdown/join/remove_file ran before.
     }
 }
 
@@ -916,8 +902,23 @@ fn a0b_multi_connection_shared_session() {
     //     (attach works — shown above — + F4 no premature teardown on
     //     partial loss, shown here) so its mutant gate stays clean.
     drop(c2);
-    // Give the server's #2 worker time to drain (live_conns 2→1).
-    std::thread::sleep(Duration::from_millis(50));
+    // **Deterministic** wait for the server's attached worker to
+    // exit (`serve_blocking_on` → `live_conns.fetch_sub`), replacing
+    // the prior `sleep(50ms)` heuristic that raced scheduler jitter
+    // under CI load. `session_live_conns` reads the F4 ledger
+    // directly: after `c2` drop the attached worker observes the
+    // peer-close and `fetch_sub`s 2→1; once we see 1 the partial-loss
+    // path is fully reaped and the *next* liveness check
+    // (`get_session_id` below) probes a stable state.
+    let sid1_arr: [u8; 32] = sid1
+        .as_slice()
+        .try_into()
+        .expect("32-byte session id (AOSP kSessionIdBytes)");
+    assert!(
+        poll_until(|| server.session_live_conns(&sid1_arr) == Some(1)),
+        "F4 partial-loss reap: server's attached worker must have \
+         decremented live_conns 2→1 within budget"
+    );
     assert_eq!(
         c1.get_session_id().expect("get_session_id #1 post-partial"),
         sid1,
@@ -1652,37 +1653,35 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
     use rsbinder::rpc::PeerIdentity;
 
     // (1) Rejecting hook ⇒ connection refused, no RPC exchanged.
-    let path = tmp_sock("authz_no");
-    let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
-    server.set_authorizer(|_peer| false);
-    let bg = server.run_background();
-    wait_for_sock(&path);
     {
+        let path = tmp_sock("authz_no");
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server.set_authorizer(|_peer| false);
+        let bg = server.run_background();
+        let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+        wait_for_sock(&path);
         let client = RpcSession::setup_unix_client(&path).expect("connect");
         client.set_timeout(Some(Duration::from_secs(3)));
         assert!(
             client.get_root().is_err(),
             "a rejecting authorizer must close the connection (zero RPC bytes)"
         );
+        // _cu (scope-end) handles teardown.
     }
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
 
     // (2) Accepting hook (inspects the real PeerIdentity) ⇒ transparent.
-    let path = tmp_sock("authz_yes");
-    let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
-    server.set_authorizer(|peer| matches!(peer, PeerIdentity::Local { .. }));
-    let bg = server.run_background();
-    wait_for_sock(&path);
     {
+        let path = tmp_sock("authz_yes");
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server.set_authorizer(|peer| matches!(peer, PeerIdentity::Local { .. }));
+        let bg = server.run_background();
+        let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+        wait_for_sock(&path);
         let client = RpcSession::setup_unix_client(&path).expect("connect");
         let root = EchoProxy(client.get_root().expect("get_root (authorized)"));
         assert_eq!(root.echo("authorized").unwrap(), "authorized");
+        // _cu (scope-end) handles teardown.
     }
-    server.shutdown();
-    let _ = bg.join();
-    let _ = std::fs::remove_file(&path);
 }

@@ -14,6 +14,10 @@ license = { workspace = true }
 #   cargo run -p example-hello --features rpc --bin rpc_hello_service
 #   cargo run -p example-hello --features rpc --bin rpc_hello_client
 rpc = ["rsbinder/rpc"]
+# Subplan 2-13 — opt in to the android-16 accessor bridge symbols
+# (`hub::android_16::resolve_accessor`); only used by the STAGE3
+# interop client.
+android_16 = ["rsbinder/android_16"]
 
 [[bin]]
 name = "rpc_hello_service"
@@ -28,6 +32,16 @@ required-features = ["rpc"]
 [[bin]]
 name = "g4b_interop_server"
 required-features = ["rpc"]
+
+# Subplan 2-13 D.8 STAGE3 — rsbinder side of the IAccessor bridge
+# real-libbinder interop. Cross-compile with
+#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#       --features rpc,android_16 --bin rpc_accessor_interop_client
+# and run on the android-16 emulator alongside the C++ launcher
+# (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_stage3.sh.
+[[bin]]
+name = "rpc_accessor_interop_client"
+required-features = ["rpc", "android_16"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }

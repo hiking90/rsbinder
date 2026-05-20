@@ -31,7 +31,7 @@ use crate::error::{Result, StatusCode};
 use crate::native::Binder;
 use crate::parcel::Parcel;
 
-use super::session::RpcSession;
+use super::session::{RpcSession, RpcSessionId, SharedSession};
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 
 /// Built-in directory interface descriptor + its single transaction.
@@ -146,7 +146,11 @@ pub struct RpcServer {
     /// the AC-12.0b mutant (attach → fresh session = pre-A0b code) is
     /// observably caught (`attached_count` stays 0, the 2nd connection
     /// can't reach the founding connection's binder).
-    sessions: Mutex<HashMap<[u8; 32], std::sync::Weak<crate::rpc::session::SharedSession>>>,
+    /// `RpcSessionId` keys (R2 newtype) — type-explicit that the
+    /// 32-byte map key is an *attach capability* (subplan 2-12 A0b),
+    /// not just an opaque hash. Internal-only; public APIs continue
+    /// to take `&[u8]` / `[u8; 32]` for compatibility.
+    sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<SharedSession>>>,
     /// A0a/A0b observability (also the AC-12.0b mutant gate). Plain
     /// atomics off the per-transaction path — zero-cost on the default
     /// (empty-id) flow. `session_registered` = new-session mints;
@@ -338,7 +342,7 @@ impl RpcServer {
     /// id (new-session / empty-id accept path). Stored as a `Weak` so a
     /// fully-torn-down session does not pin memory and its id, if later
     /// echoed, resolves to "unknown".
-    fn register_session(&self, id: [u8; 32], shared: &Arc<crate::rpc::session::SharedSession>) {
+    fn register_session(&self, id: RpcSessionId, shared: &Arc<SharedSession>) {
         let mut map = self.sessions.lock().expect("sessions poisoned");
         // Opportunistically prune fully-dead sessions so the map is
         // bounded by *live* sessions, not cumulative over the server's
@@ -359,7 +363,7 @@ impl RpcServer {
     /// `remove` and the founding worker's `live_conns.fetch_sub` is
     /// closed by [`SharedSession::try_bump_live_conns`] at the attach
     /// side, not by an identity check here.
-    fn unregister_session(&self, id: &[u8; 32]) {
+    fn unregister_session(&self, id: &RpcSessionId) {
         self.sessions.lock().expect("sessions poisoned").remove(id);
     }
 
@@ -367,8 +371,8 @@ impl RpcServer {
     /// (Phase A0b id-demux). `None` for any non-32-byte id (AOSP
     /// `kSessionIdBytes == 32`), an unknown id, or a stale `Weak`
     /// (session fully torn down) — all of which the caller rejects.
-    fn resolve_session(&self, id: &[u8]) -> Option<Arc<crate::rpc::session::SharedSession>> {
-        let key = <[u8; 32]>::try_from(id).ok()?;
+    fn resolve_session(&self, id: &[u8]) -> Option<Arc<SharedSession>> {
+        let key = RpcSessionId::try_from_slice(id)?;
         self.sessions
             .lock()
             .expect("sessions poisoned")
@@ -413,6 +417,24 @@ impl RpcServer {
             .filter_map(std::sync::Weak::upgrade)
             .collect();
         sessions.iter().map(|s| s.local_node_count()).sum()
+    }
+
+    /// F4 deterministic teardown witness: live connection count of the
+    /// session keyed by `id`. `None` ⇒ no live session with that id
+    /// (fully torn down or never registered). Lets tests `poll_until`
+    /// for the server-side `serve_blocking_on` exit hook (which
+    /// `live_conns.fetch_sub`s) without the prior `sleep(N ms)`
+    /// heuristic that raced scheduler jitter.
+    pub fn session_live_conns(&self, id: &[u8; 32]) -> Option<usize> {
+        // Public API keeps the raw-byte shape (R2 internal-only
+        // newtype); wrap inline for the map lookup.
+        let key = RpcSessionId::new(*id);
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .map(|s| s.live_conn_count())
     }
 
     /// Serve one already-connected transport on its own worker thread
@@ -488,7 +510,7 @@ impl RpcServer {
                             fd_unix,
                             None,
                         );
-                        let id = session.session_id();
+                        let id = RpcSessionId::new(session.session_id());
                         server.register_session(id, &session.shared());
                         server.configure_session(&session);
                         if let Err(e) = session.serve_blocking() {

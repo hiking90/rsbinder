@@ -13,6 +13,38 @@ pub use android::os::IServiceManager::{
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
+/// Subplan 2-13 A.4: bridge the `Service::Accessor` arm of
+/// `getService2`/`checkService2` into a `ServiceWithMetadata` whose
+/// `service` is the RPC root pinned by an owning [`RpcSession`].
+///
+/// Optional Accessor arm: an Accessor binder is **only** consumable via
+/// the RPC stack, so a build without the `rpc` feature falls back to
+/// the historical "log + None" behavior — byte-unchanged for that
+/// build (V1).
+#[cfg(feature = "rpc")]
+fn resolve_accessor_arm(
+    name: &str,
+    accessor: Option<crate::SIBinder>,
+) -> Option<android::os::ServiceWithMetadata::ServiceWithMetadata> {
+    let Some(accessor) = accessor else {
+        log::warn!("Service {name} returned a null Accessor binder");
+        return None;
+    };
+    super::accessor_16::resolve_accessor(name, accessor)
+}
+
+#[cfg(not(feature = "rpc"))]
+fn resolve_accessor_arm(
+    name: &str,
+    _accessor: Option<crate::SIBinder>,
+) -> Option<android::os::ServiceWithMetadata::ServiceWithMetadata> {
+    log::warn!(
+        "Service {name} is an Accessor but rsbinder was built without the \
+         `rpc` feature; cannot bridge to RPC root"
+    );
+    None
+}
+
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
 pub fn get_service(
@@ -22,9 +54,8 @@ pub fn get_service(
     match sm.getService2(name) {
         Ok(service) => match service {
             android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
-            android::os::Service::Service::Accessor(_accessor) => {
-                log::warn!("Service {name} is an Accessor, not a ServiceWithMetadata");
-                None
+            android::os::Service::Service::Accessor(accessor) => {
+                resolve_accessor_arm(name, accessor)
             }
         },
         Err(err) => {
@@ -44,9 +75,8 @@ pub fn check_service(
     match sm.checkService2(name) {
         Ok(service) => match service {
             android::os::Service::Service::ServiceWithMetadata(service) => Some(service),
-            android::os::Service::Service::Accessor(_accessor) => {
-                log::warn!("Service {name} is an Accessor, not a ServiceWithMetadata");
-                None
+            android::os::Service::Service::Accessor(accessor) => {
+                resolve_accessor_arm(name, accessor)
             }
         },
         Err(err) => {
