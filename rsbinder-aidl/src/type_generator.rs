@@ -363,9 +363,9 @@ impl TypeGenerator {
         let type_name = self.array_type_name(&array_info.value_type);
 
         let value_str = if is_struct {
-            if self.is_nullable && Self::is_aidl_nullable(&array_info.value_type) {
-                format!("Option<{type_name}>")
-            } else if !Self::can_be_defaulted(&array_info.value_type, is_struct) {
+            if (self.is_nullable && Self::is_aidl_nullable(&array_info.value_type))
+                || !Self::can_be_defaulted(&array_info.value_type, is_struct)
+            {
                 format!("Option<{type_name}>")
             } else {
                 type_name
