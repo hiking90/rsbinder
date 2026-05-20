@@ -17,8 +17,8 @@
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use super::fd_mode::FileDescriptorTransportMode;
@@ -32,11 +32,18 @@ use super::state::RpcState;
 use super::transport::RpcTransport;
 use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 use super::wire_android13::{
-    client_connect, read_aosp_message, read_aosp_message_with_fds, server_accept,
+    client_connect_with_id, read_aosp_message, read_aosp_message_with_fds, server_accept,
     write_aosp_message, write_aosp_message_with_fds, Android13PlusCodec, RawTransportIo,
     A13_ADDR_LEN, FD_MODE_NONE, FD_MODE_UNIX, PROTOCOL_V1, PROTOCOL_V2,
 };
 use super::{RpcError, RpcResult};
+
+/// Result of the android-13+ server accept handshake (Phase A0b): the
+/// (unconsumed) transport plus the negotiated codec, the client's
+/// requested FD mode, and the client-supplied `session_id`. Named to
+/// keep [`RpcSession::android13plus_accept_handshake`] readable
+/// (clippy `type_complexity`).
+type Android13PlusAccept = (Box<dyn RpcTransport>, Android13PlusCodec, u8, Vec<u8>);
 
 /// Which RPC wire profile a session speaks.
 ///
@@ -161,34 +168,26 @@ fn read_addr(p: &mut Parcel) -> Result<RpcAddress> {
     Ok(RpcAddress::from_wire_bytes(bytes))
 }
 
-/// A per-session opaque 32-byte id (AOSP `kSessionIdBytes`). The
-/// content is opaque to the protocol — AOSP fills it from a CSPRNG and
-/// only ever *compares* it; rsbinder's single-connection model never
-/// re-presents it, so a process-/time-/address-mixed value is
-/// sufficient and, crucially, **global-free** (P6 — no `static`
-/// counter, so the `rpc_stack_has_no_globals` gate stays clean).
+/// A per-session opaque 32-byte id (AOSP `kSessionIdBytes`). AOSP fills
+/// it from a CSPRNG and rsbinder must do the same: subplan 2-12 A0b
+/// made the id a **capability for attach** — a 2nd connection that
+/// echoes this id is bound to the *same* `SharedSession`
+/// (`state`/`root`/cached proxies), so a predictable id would be a
+/// session-hijack primitive for any same-host peer reachable on the
+/// UDS. **Global-free** (P6 — no `static` counter); the underlying
+/// `getrandom` is a stateless syscall (`getrandom(2)` on Linux,
+/// `SecRandomCopyBytes` on macOS), so the `rpc_stack_has_no_globals`
+/// gate stays clean.
 fn gen_rpc_session_id() -> [u8; 32] {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // Mix in this thread's id (a fresh server worker per accepted
-    // connection) so two sessions created within the same clock tick
-    // still differ.
-    let tid: u64 = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::thread::current().id().hash(&mut h);
-        h.finish()
-    };
-    // Fold the full 128-bit nanos (both halves) into the mix word so
-    // it depends on the high bits too — the id is opaque (AOSP only
-    // `memcmp`s it), this just avoids a silent low-64 truncation.
-    let nanos_mix = (nanos ^ (nanos >> 64)) as u64;
     let mut id = [0u8; 32];
-    id[0..16].copy_from_slice(&nanos.to_le_bytes());
-    id[16..24].copy_from_slice(&tid.to_le_bytes());
-    id[24..32].copy_from_slice(&(nanos_mix ^ tid ^ 0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    // `getrandom` only fails on platforms without a working CSPRNG —
+    // not a runtime condition rsbinder can recover from, and the only
+    // sensible action is to refuse to start the RPC session rather
+    // than mint a predictable id. Surface the underlying error in the
+    // panic message (`getrandom::Error: Display`) for diagnostics —
+    // an `.expect(&'static str)` would lose it.
+    getrandom::getrandom(&mut id)
+        .unwrap_or_else(|e| panic!("CSPRNG getrandom failed for RPC session id: {e}"));
     id
 }
 
@@ -266,67 +265,153 @@ impl Drop for NestedDeadlineGuard<'_> {
 }
 
 thread_local! {
-    /// Addresses of the `RpcSessionInner`s whose connection *this
-    /// thread* is currently driving (outermost `client_transact` /
-    /// `serve_once`). It lets a same-thread **nested** call (a server
-    /// handler calling back while a transaction is in flight — AC-3.6)
-    /// bypass the per-connection lock instead of self-deadlocking on
-    /// it.
+    /// `(session_ptr, slot_id)` pairs this thread is currently driving
+    /// (outermost `client_transact` / `serve_once_on_slot`). Lets a
+    /// same-thread **nested** call (a server handler calling back
+    /// while a transaction is in flight — AC-3.6 / F8) re-enter the
+    /// **same slot** the inbound transact arrived on, rather than
+    /// either self-deadlocking on its `exclusive_tid` or routing the
+    /// callback over a *different* available slot (which would break
+    /// AOSP's `exclusiveIncoming->allowNested` ordering guarantee).
+    /// **Phase A rekey** (was a plain `Vec<usize>` of inner pointers
+    /// — pre-pool, where a session had a single connection so the
+    /// inner pointer was the slot key).
     ///
-    /// This is a per-thread *recursion marker*, **not** session or
-    /// protocol state (P6): it holds no node / address / ref-count
-    /// data — those stay per-session in [`RpcState`]. It mirrors
-    /// kernel binder's thread-local `IPCThreadState`. Documented P6
-    /// exception in the `rpc_stack_has_no_globals` gate.
-    static DRIVING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread *recursion marker*, **not** session/protocol state
+    /// (P6): it holds no node / address / ref-count data — those stay
+    /// per-session in [`RpcState`]. It mirrors kernel binder's
+    /// thread-local `IPCThreadState`. Documented P6 exception in the
+    /// `rpc_stack_has_no_globals` gate.
+    static DRIVING: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard for the per-session connection-driver lock with
-/// same-thread reentrancy bypass (see [`RpcSessionInner::enter_connection`]).
+/// AOSP `RpcConnection::exclusiveTid` equivalent — `std::thread::
+/// ThreadId` (`Copy + Eq`, opaque, P6-friendly: NO process global, NO
+/// extra thread_local needed beyond `std`'s own thread bookkeeping).
+type Tid = std::thread::ThreadId;
+
+#[inline]
+fn current_tid() -> Tid {
+    std::thread::current().id()
+}
+
+/// **Phase A**: one connection slot of an `RpcSessionInner`'s pool —
+/// the rsbinder equivalent of AOSP `RpcSession::RpcConnection`.
+struct ConnSlot {
+    /// The connection's transport. `Box<dyn RpcTransport>` — the trait
+    /// object lives on the heap at a stable address; pushing into the
+    /// owning `Vec<ConnSlot>` moves the [`Box`] (a fat pointer) but
+    /// never the heap object, so a `*const (dyn RpcTransport)`
+    /// captured at [`RpcSessionInner::find_conn`] time stays valid
+    /// while the slot exists (Phase A never removes slots — only
+    /// `RpcSessionInner` teardown drops the `Vec`, which happens after
+    /// all serve workers and outstanding guards are gone).
+    transport: Box<dyn RpcTransport>,
+    /// AOSP `RpcConnection::exclusiveTid`: thread currently driving
+    /// this slot, or `None` if available. [`find_conn`] picks the
+    /// first available; pool exhaustion **blocks on the session's
+    /// `Condvar`** (AOSP `mAvailableConnectionCv`) — never a busy
+    /// try-loop (F2).
+    exclusive_tid: Option<Tid>,
+    /// AOSP `RpcConnection::allowNested`: whether a same-thread nested
+    /// `find_conn` (a server handler calling back into the peer while
+    /// the inbound transact is in flight — AC-3.6) may re-enter THIS
+    /// slot. Phase A keeps this `true` for every slot; Phase C's
+    /// oneway Option-2 would set `false` on the oneway-pinned slot
+    /// (F8). Reentrancy itself is mediated by the [`DRIVING`]
+    /// thread-local keyed by `(session_ptr, slot_id)`.
+    #[allow(dead_code)] // populated for AOSP fidelity, consumed by Phase C oneway Option-2
+    allow_nested: bool,
+    /// Monotonic local id (the [`DRIVING`] reentrancy key + the
+    /// server-worker handle). Stable for the slot's life because Phase
+    /// A never removes a slot from the `Vec`.
+    id: u64,
+}
+
+/// **Phase A**: the session's connection pool + its monotonic slot-id
+/// counter. Behind the single per-session `Mutex` paired with the
+/// `Condvar` on [`RpcSessionInner`] — *not* N independent mutexes (F2:
+/// AOSP `RpcSession::mMutex` + `mAvailableConnectionCv`).
+struct ConnState {
+    slots: Vec<ConnSlot>,
+    next_slot_id: u64,
+}
+
+/// RAII guard for one selected connection slot (Phase A). Built by
+/// [`RpcSessionInner::find_conn`]. Holds the slot exclusive_tid==this
+/// thread (unless reentrant) and a stable `*const (dyn RpcTransport)`
+/// captured under the slots lock so subsequent `send_msg`/`recv_msg`
+/// do **no** locking — concurrent client transacts on *other* slots
+/// run unimpeded (AC-12.1). On drop: clears `exclusive_tid` (unless
+/// reentrant), pops the [`DRIVING`] marker, and notifies one waiter.
 struct ConnGuard<'a> {
-    _lock: Option<std::sync::MutexGuard<'a, ()>>,
-    key: usize,
-    pushed: bool,
+    inner: &'a RpcSessionInner,
+    slot_id: u64,
+    /// Stable for this guard's lifetime: see [`ConnSlot::transport`]
+    /// safety note. Never null. `!Send`/`!Sync` by default (raw ptr) —
+    /// the guard is single-thread by design (lives on the calling
+    /// stack frame of `client_transact` / `serve_once_on_slot` / …).
+    transport_ptr: *const dyn RpcTransport,
+    /// `true` ⇒ same-thread nested call reused this slot via
+    /// [`DRIVING`]; drop must NOT release `exclusive_tid` (the outer
+    /// frame still holds it).
+    reentrant: bool,
+}
+
+impl ConnGuard<'_> {
+    /// Borrow the selected slot's transport. Stable for the guard's
+    /// lifetime.
+    #[inline]
+    fn transport(&self) -> &dyn RpcTransport {
+        // SAFETY: see `ConnSlot::transport` and `ConnGuard::transport_ptr`
+        // — the heap object behind the Box is stable while the slot
+        // exists, and the guard's lifetime is bounded by the slot's
+        // exclusive ownership (Phase A never removes slots in flight).
+        unsafe { &*self.transport_ptr }
+    }
 }
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
-        if self.pushed {
-            DRIVING.with(|d| {
-                let mut v = d.borrow_mut();
-                if let Some(pos) = v.iter().rposition(|&k| k == self.key) {
-                    v.remove(pos);
-                }
-            });
+        let key = (self.inner as *const _ as usize, self.slot_id);
+        DRIVING.with(|d| {
+            let mut v = d.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|&k| k == key) {
+                v.remove(pos);
+            }
+        });
+        if !self.reentrant {
+            // Release exclusive ownership and wake exactly one
+            // `find_conn` waiter (AOSP `notify_one`). If there's no
+            // waiter, the wake is a no-op; we don't `notify_all`
+            // because only one waiter can claim a single freed slot
+            // (the others would just `wait` again — thundering-herd).
+            let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
+            if let Some(s) = st.slots.iter_mut().find(|s| s.id == self.slot_id) {
+                s.exclusive_tid = None;
+            }
+            drop(st);
+            self.inner.slot_cv.notify_one();
         }
-        // `_lock` (if held) releases here, after the marker is popped.
     }
 }
 
-/// Shared session state. Held behind `Arc`; never global (P6).
-pub struct RpcSessionInner {
-    transport: Box<dyn RpcTransport>,
-    /// Wire profile: R34 (default, byte-unchanged) or the opt-in
-    /// android-13+ versioned wire (G4(a)). Fixed for the session's
-    /// lifetime — the android-13+ codec version is finalized by the
-    /// connection handshake *before* the session is constructed, so no
-    /// interior mutability is needed.
-    profile: WireProfile,
-    /// Serializes connection *driving* across threads. One
-    /// `RpcSession` connection is driven by a single logical role;
-    /// `RpcSession` is `Clone` + `Send`/`Sync`, so a generated `Bp*`
-    /// proxy shared across threads would otherwise let two
-    /// `client_transact`s interleave the framed stream or
-    /// cross-deliver replies (the r34 wire has no request/response
-    /// correlation id — Major-2 / AC-3.2). Concurrent calls are
-    /// serialized here; parallelism comes from *multiple connections*
-    /// (the documented model). Same-thread nested calls (AC-3.6)
-    /// bypass it via the `DRIVING` marker.
-    conn_lock: Mutex<()>,
+/// **Subplan 2-12 Phase A0b**: the state shared by *all connections of
+/// one logical session* (AOSP `RpcSession` shares this across its
+/// `mOutgoing`/`mIncoming` connections). One per session, behind `Arc`;
+/// never global (P6). Default single-connection sessions own exactly
+/// one of these with `live_conns == 1` ⇒ behavior is byte-identical to
+/// the pre-A0b single-`transport` `RpcSessionInner` (the `Arc`
+/// indirection is the only structural change; the wire is unchanged).
+/// The server attaches a 2nd+ connection to a *pre-existing* instance
+/// (id-demux), so a binder published over one connection is reachable
+/// over another (shared `state`/`root`). `pub(crate)` only so
+/// [`super::RpcServer`] can keep a [`std::sync::Weak`] of it in its
+/// id→session registry — an opaque handle, not public API.
+pub(crate) struct SharedSession {
     state: Mutex<RpcState>,
     async_counter: AtomicU64,
     root: Mutex<Option<SIBinder>>,
-    self_weak: Mutex<Weak<RpcSessionInner>>,
     /// Max-threads value advertised to the peer on `GET_MAX_THREADS`
     /// (server side) — subplan 2-3 negotiation.
     max_threads: AtomicU32,
@@ -340,14 +425,137 @@ pub struct RpcSessionInner {
     fd_mode: Mutex<crate::rpc::FileDescriptorTransportMode>,
     /// Server role: does this endpoint advertise `Unix` FD support on
     /// `GET_FD_MODE`. Default false.
-    fd_unix_supported: std::sync::atomic::AtomicBool,
+    fd_unix_supported: AtomicBool,
     /// Opaque 32-byte session id returned by the `GET_SESSION_ID`
     /// special transact. AOSP `RpcServer` assigns a random
     /// `kSessionIdBytes == 32` id; the libbinder client reads it with
     /// `Parcel::readByteVector` and would `BAD_VALUE` on any other size
     /// (G4(b): real-peer-validated). Per-session, never global (P6) —
-    /// generated global-free in [`RpcSession::with_profile`].
+    /// generated global-free in [`RpcSession::with_profile`]. Shared
+    /// across the session's connections (A0b: an attached 2nd
+    /// connection reports the *same* id).
     rpc_session_id: [u8; 32],
+    /// **F4 (Phase A0b)**: number of live connections driving this
+    /// session. Starts at 1 (the founding connection); the server's
+    /// id-demux attach bumps it. `serve_blocking` decrements on exit
+    /// and fires the session obituaries **only** on the 1→0 edge (full
+    /// session teardown) — never on a *partial* connection loss, which
+    /// would otherwise deliver a spurious `binder_died` to the peer
+    /// while other connections of the session are still live.
+    live_conns: AtomicUsize,
+    /// Idempotency latch for the above (a race between the last two
+    /// connections tearing down must still send obituaries exactly
+    /// once).
+    obituary_sent: AtomicBool,
+}
+
+impl SharedSession {
+    /// Live local-node count of this (possibly multi-connection)
+    /// session's shared `RpcState` — Phase A F7 leak observability
+    /// (the AOSP `timesSent` books must net to 0 nodes once every
+    /// proxy is dropped). Used by [`super::RpcServer`]'s test helper.
+    pub(crate) fn local_node_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("rpc state poisoned")
+            .local_node_count()
+    }
+
+    /// **F4 anti-resurrection primitive.** Atomically add one to
+    /// `live_conns` *if* the session is still alive. Returns `false`
+    /// when the session is already torn down — `obituary_sent` is set,
+    /// or `live_conns` has reached 0 (the founding worker raced past
+    /// `live_conns.fetch_sub` between `resolve_session.upgrade()` and
+    /// this call). Without this gate the attaching connection would
+    /// resurrect a dead session whose obituaries already fired,
+    /// silently losing `binder_died` for any `DeathRecipient` linked
+    /// through the attached connection.
+    ///
+    /// **CAS-loop rather than optimistic-bump-then-rollback**: an
+    /// earlier "fetch_add → if (prev==0 || obituary_sent) fetch_sub"
+    /// shape closed the *single-attacker* race but had a real
+    /// **multi-attacker** hole — two concurrent attackers A and B both
+    /// bumping after the founding `fetch_sub`'d to 0 produces the
+    /// linearization
+    /// ```text
+    /// founding fetch_sub  1→0  (was_last=true)
+    /// A fetch_add         0→1  (A sees prev=0 → will roll back)
+    /// B fetch_add         1→2  (B sees prev=1, obituary_sent still
+    ///                           false → returns true and attaches!)
+    /// A fetch_sub         2→1  (A's rollback)
+    /// founding CAS obituary_sent false→true  → fires
+    /// final: live_conns=1, obituary_sent=true ⇒ B silently in a dead
+    ///        session, its DeathRecipients never get binder_died
+    /// ```
+    /// because B sees the inflated `prev` from A's bump before A
+    /// rolls back. A value-decision CAS loop closes this: every bump
+    /// is conditional on the *value* of `live_conns`, so `0` is never
+    /// transiently visible as `≥ 1` to a subsequent attacker, and any
+    /// CAS racing the founding's `fetch_sub` either succeeds on a
+    /// still-positive count (founding then observes `prev > 1` and
+    /// doesn't fire) or fails and retries against the 0 it left.
+    pub(crate) fn try_bump_live_conns(&self) -> bool {
+        let mut cur = self.live_conns.load(Ordering::SeqCst);
+        loop {
+            if cur == 0 || self.obituary_sent.load(Ordering::SeqCst) {
+                return false;
+            }
+            match self.live_conns.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+/// **Phase A**: one `RpcSessionInner` per logical session, owning a
+/// **pool** of [`ConnSlot`]s (AOSP `RpcSession`'s `mOutgoing`/
+/// `mIncoming` connections collapsed into one Vec — Phase A keeps a
+/// single duplex pool; F8's `allow_nested` per-slot is the lever for
+/// finer separation). [`find_conn`](RpcSessionInner::find_conn)
+/// selects an available slot for outgoing calls (AC-12.1 distribution,
+/// plus nested-pin for AC-3.6/AC-12.2 / F8); server workers serve a
+/// specific slot via [`serve_blocking_on`](RpcSession::serve_blocking_on)
+/// (their inbound connection). Default single-connection sessions own
+/// one slot, so `find_conn` is a no-wait single-slot pick and the pre-A
+/// `enter_connection` semantics are byte-identical (T1-1/AC-3.2).
+pub struct RpcSessionInner {
+    /// AOSP `RpcSession::mMutex` — the session's *single* connection
+    /// pool lock, paired with [`slot_cv`](RpcSessionInner::slot_cv).
+    /// Held briefly to pick a slot ([`find_conn`]); released for the
+    /// duration of the chosen slot's send/recv so concurrent
+    /// `find_conn`s on **other** slots run unblocked (AC-12.1). **Not
+    /// N independent mutexes** (F2): a single per-session mutex +
+    /// condvar is the AOSP-faithful selection primitive.
+    conn_state: Mutex<ConnState>,
+    /// AOSP `RpcSession::mAvailableConnectionCv`: woken on slot release
+    /// and on slot addition. `find_conn` `wait`s here when the pool is
+    /// exhausted — **block-and-wait, never busy try-loop** (F2).
+    slot_cv: Condvar,
+    /// Wire profile: R34 (default, byte-unchanged) or the opt-in
+    /// android-13+ versioned wire (G4(a)). Fixed for the session — all
+    /// slots in one session speak the same profile (AOSP requires the
+    /// negotiated version match across a session; attach paths reject
+    /// a profile-mismatch — see [`add_incoming_slot`]).
+    profile: WireProfile,
+    self_weak: Mutex<Weak<RpcSessionInner>>,
+    /// Session-wide state shared across this session's slots **and**
+    /// (server-side A0b residual) across multiple `RpcSessionInner`
+    /// instances bound to the same session id: the current
+    /// `serve_connection` attach arm builds a fresh `RpcSessionInner`
+    /// per accepted connection and points its `shared` `Arc` at the
+    /// founding session's `SharedSession`. The forward-looking F8
+    /// "1 inner / session" refactor folds those N inners into one
+    /// pool of slots, at which point the `Arc` indirection across
+    /// inners goes away — but `live_conns`/`obituary_sent`/
+    /// `local_node_count`/`rpc_session_id` will continue to live in
+    /// `SharedSession` so the F4/F7 invariants don't move.
+    shared: Arc<SharedSession>,
 }
 
 /// The [`RpcParcelOps`] implementation bound to one session.
@@ -365,31 +573,150 @@ impl RpcParcelOps for SessionParcelOps {
 }
 
 impl RpcSessionInner {
-    /// Acquire the per-connection driver lock — unless *this thread* is
-    /// already driving *this* session (a nested in-flight call:
-    /// AC-3.6), in which case re-locking would self-deadlock so we
-    /// bypass and let the outer frame's lock cover the nested traffic
-    /// (same thread ⇒ still strictly FIFO on the connection). Across
-    /// *different* threads the lock fully serializes connection driving
-    /// (Major-2 / AC-3.2). The guard releases the lock and pops the
-    /// recursion marker on every exit (return / `?` / panic).
-    fn enter_connection(&self) -> ConnGuard<'_> {
-        let key = self as *const RpcSessionInner as usize;
-        let reentrant = DRIVING.with(|d| d.borrow().contains(&key));
-        if reentrant {
-            ConnGuard {
-                _lock: None,
-                key,
-                pushed: false,
+    /// AOSP `RpcSession::ExclusiveConnection::find` (Phase A). Selects
+    /// **a** connection slot for this thread to drive (outgoing
+    /// `client_transact` / `send_dec_strong`) — returning a
+    /// [`ConnGuard`] that owns the slot until drop. Order (AOSP-
+    /// faithful):
+    ///
+    ///  1. **Reentrant pin** — if this thread is already driving a
+    ///     slot of *this* session (the `DRIVING` marker matches), the
+    ///     nested call **re-enters that slot** (AC-3.6 / F8: a server
+    ///     handler's outbound callback returns on the inbound socket;
+    ///     a same-thread recursive `client_transact` reuses the outer
+    ///     slot). No `conn_state` lock — the outer frame holds the
+    ///     slot.
+    ///  2. **Exclusive** — a slot whose `exclusive_tid == this tid`
+    ///     (defensive: should be covered by 1).
+    ///  3. **First available** — the first slot with `exclusive_tid ==
+    ///     None`. Claim it (`exclusive_tid = this tid`), push the
+    ///     `DRIVING` marker so any same-thread nested call re-enters
+    ///     here, return the guard.
+    ///  4. **Pool exhausted** — `wait` on `slot_cv` (released on slot
+    ///     drop OR `add_*_slot`). **Block-and-wait, never busy
+    ///     try-loop** (F2).
+    ///
+    /// Single-slot default (the pre-A path): step 3 always succeeds
+    /// without `wait`; the `DRIVING`-keyed reentrancy bypass collapses
+    /// to today's `enter_connection` semantics — byte-identical (no
+    /// wire effect, T1-1/AC-3.2 preserved).
+    fn find_conn(&self, oneway: bool) -> ConnGuard<'_> {
+        let tid = current_tid();
+        let sess_ptr = self as *const RpcSessionInner as usize;
+        // (1) Reentrant: a slot of this session is already driven by
+        //     this thread (innermost first — `rposition`).
+        if let Some(slot_id) = DRIVING.with(|d| {
+            d.borrow()
+                .iter()
+                .rev()
+                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
+        }) {
+            let transport_ptr = {
+                let st = self.conn_state.lock().expect("conn_state poisoned");
+                st.slots
+                    .iter()
+                    .find(|s| s.id == slot_id)
+                    .map(|s| &*s.transport as *const _)
+                    .expect("DRIVING slot present")
+            };
+            return ConnGuard {
+                inner: self,
+                slot_id,
+                transport_ptr,
+                reentrant: true,
+            };
+        }
+        // **Phase A — oneway Option-1 (F5/F6 trade-off recorded).**
+        // Pin all top-level oneway sends to the founding slot so
+        // per-object oneway ordering is preserved by single-slot
+        // in-order delivery (the existing single-connection FIFO
+        // semantics extended to multi-outgoing). The cost is a head-
+        // of-line block: a slow oneway handler at the peer stalls
+        // every other oneway through the same slot (AOSP's per-node
+        // `asyncNumber`+`asyncTodo` priority replay — Option-2 — would
+        // avoid this, deferred to Phase C). Twoways still distribute
+        // (AC-12.1). Nested oneway inside a twoway dispatch hits the
+        // reentrant pin above and reuses the inbound slot — F8.
+        if oneway {
+            return self.find_conn_pinned(RpcSession::FOUNDING_SLOT_ID);
+        }
+        // (2)(3)(4) Acquire the pool lock and pick or wait.
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        loop {
+            // (2) Defensive exclusive match (shouldn't fire if (1) is correct).
+            // (3) First available.
+            if let Some(s) = st
+                .slots
+                .iter_mut()
+                .find(|s| s.exclusive_tid == Some(tid) || s.exclusive_tid.is_none())
+            {
+                s.exclusive_tid = Some(tid);
+                let slot_id = s.id;
+                let transport_ptr: *const dyn RpcTransport = &*s.transport;
+                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+                return ConnGuard {
+                    inner: self,
+                    slot_id,
+                    transport_ptr,
+                    reentrant: false,
+                };
             }
-        } else {
-            let lock = self.conn_lock.lock().expect("conn_lock poisoned");
-            DRIVING.with(|d| d.borrow_mut().push(key));
-            ConnGuard {
-                _lock: Some(lock),
-                key,
-                pushed: true,
+            // (4) Pool exhausted — wait. The `Condvar` is woken on
+            //     slot release (ConnGuard drop) or slot addition
+            //     (`add_*_slot`). Spurious wakes loop back to scan.
+            st = self.slot_cv.wait(st).expect("slot_cv poisoned");
+        }
+    }
+
+    /// Same as [`find_conn`] but pins to a **specific** slot id (used
+    /// by the server worker's `serve_blocking_on(slot_id)`): the
+    /// worker drives its assigned inbound slot, not "any available".
+    /// Waits on the condvar if the slot is held by another thread
+    /// (shouldn't happen in the normal accept-then-serve flow — the
+    /// freshly-added slot is unclaimed). Same reentrant-pin path as
+    /// `find_conn` so a nested call inside dispatch re-uses this slot.
+    fn find_conn_pinned(&self, want_slot_id: u64) -> ConnGuard<'_> {
+        let tid = current_tid();
+        let sess_ptr = self as *const RpcSessionInner as usize;
+        // Reentrant on the same slot.
+        if DRIVING.with(|d| {
+            d.borrow()
+                .iter()
+                .any(|&(sp, sid)| sp == sess_ptr && sid == want_slot_id)
+        }) {
+            let transport_ptr = {
+                let st = self.conn_state.lock().expect("conn_state poisoned");
+                st.slots
+                    .iter()
+                    .find(|s| s.id == want_slot_id)
+                    .map(|s| &*s.transport as *const _)
+                    .expect("pinned slot present")
+            };
+            return ConnGuard {
+                inner: self,
+                slot_id: want_slot_id,
+                transport_ptr,
+                reentrant: true,
+            };
+        }
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        loop {
+            let target = st.slots.iter_mut().find(|s| s.id == want_slot_id);
+            let Some(slot) = target else {
+                panic!("find_conn_pinned: slot id {want_slot_id} removed from pool");
+            };
+            if slot.exclusive_tid.is_none() || slot.exclusive_tid == Some(tid) {
+                slot.exclusive_tid = Some(tid);
+                let transport_ptr: *const dyn RpcTransport = &*slot.transport;
+                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, want_slot_id)));
+                return ConnGuard {
+                    inner: self,
+                    slot_id: want_slot_id,
+                    transport_ptr,
+                    reentrant: false,
+                };
             }
+            st = self.slot_cv.wait(st).expect("slot_cv poisoned");
         }
     }
 
@@ -399,8 +726,48 @@ impl RpcSessionInner {
         ))
     }
 
+    /// **Phase A**: append a new connection slot. Notifies `slot_cv`
+    /// (a `find_conn` waiter blocked on "any available" can wake).
+    /// Does NOT touch `live_conns` — that bookkeeping is the caller's
+    /// (server-incoming bumps it via
+    /// [`SharedSession::try_bump_live_conns`]; client-outgoing doesn't,
+    /// since outgoing slots aren't serve-driven on the client side).
+    ///
+    /// Uses `notify_all` (not `notify_one`, which `ConnGuard::drop`
+    /// can safely use because it only ever releases the *one* slot
+    /// the dropping guard owned): a freshly-pushed slot satisfies
+    /// `find_conn`'s "any available" waiters but NOT
+    /// `find_conn_pinned(other_id)` waiters, and `std::Condvar` makes
+    /// no FIFO guarantees — `notify_one` could wake a pinned-elsewhere
+    /// waiter and starve the any-available ones the new slot was
+    /// actually for. The thundering-herd cost is bounded by waiter
+    /// count and is zero on the default single-slot path (no waiters
+    /// at all), so the trade favors mixed-waiter correctness.
+    fn add_slot_inner(&self, transport: Box<dyn RpcTransport>) -> u64 {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        let id = st.next_slot_id;
+        st.next_slot_id += 1;
+        st.slots.push(ConnSlot {
+            transport,
+            exclusive_tid: None,
+            allow_nested: true,
+            id,
+        });
+        drop(st);
+        self.slot_cv.notify_all();
+        id
+    }
+
+    /// **Phase A — client multi-outgoing**: append an *outgoing*
+    /// connection slot (no `live_conns` bump — client outgoing slots
+    /// are not serve-driven). See
+    /// [`RpcSession::add_outgoing_connection_android13plus`].
+    fn add_outgoing_slot(&self, transport: Box<dyn RpcTransport>) -> u64 {
+        self.add_slot_inner(transport)
+    }
+
     pub(crate) fn fd_mode(&self) -> FileDescriptorTransportMode {
-        *self.fd_mode.lock().expect("fd_mode poisoned")
+        *self.shared.fd_mode.lock().expect("fd_mode poisoned")
     }
 
     /// Whether an RPC parcel built for this session records FD object
@@ -413,10 +780,16 @@ impl RpcSessionInner {
         self.profile.records_fd_positions()
     }
 
-    /// Send one wire frame. Only a `Unix`-mode connection routes fds
-    /// via `SCM_RIGHTS`; the default (`None`) uses the unchanged
-    /// framed send and never carries fds (AC-7.1 bit-identical).
-    fn send_msg(&self, frame: &[u8], fds: &[OwnedFd]) -> RpcResult<()> {
+    /// Send one wire frame on `transport` (the slot picked by
+    /// [`find_conn`]). Only a `Unix`-mode connection routes fds via
+    /// `SCM_RIGHTS`; the default (`None`) uses the unchanged framed
+    /// send and never carries fds (AC-7.1 bit-identical).
+    fn send_msg(
+        &self,
+        transport: &dyn RpcTransport,
+        frame: &[u8],
+        fds: &[OwnedFd],
+    ) -> RpcResult<()> {
         if self.profile.aosp_framing() {
             // android-13+: the real AOSP wire has **no** length prefix —
             // write `frame` (= the codec's `[RpcWireHeader|body]`) raw
@@ -428,28 +801,29 @@ impl RpcSessionInner {
             // R34/v0/`None`, byte-identical).
             if self.fd_mode() == FileDescriptorTransportMode::Unix {
                 let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
-                return write_aosp_message_with_fds(self.transport.as_ref(), frame, &borrowed);
+                return write_aosp_message_with_fds(transport, frame, &borrowed);
             }
             debug_assert!(
                 fds.is_empty(),
                 "non-Unix android-13+ session must not carry fds"
             );
             let _ = fds; // release: `debug_assert!` is compiled out, so `fds` is otherwise unused
-            let mut io = RawTransportIo(self.transport.as_ref());
+            let mut io = RawTransportIo(transport);
             return write_aosp_message(&mut io, frame);
         }
         if self.fd_mode() == FileDescriptorTransportMode::Unix {
             let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
-            self.transport.send_frame_with_fds(frame, &borrowed)
+            transport.send_frame_with_fds(frame, &borrowed)
         } else {
-            self.transport.send_frame(frame)
+            transport.send_frame(frame)
         }
     }
 
-    /// Receive one wire frame (+ any `SCM_RIGHTS` fds in `Unix` mode).
-    /// A connection never mixes the `Read` and `recvmsg` paths because
-    /// the mode is fixed by negotiation before any RPC traffic.
-    fn recv_msg(&self) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
+    /// Receive one wire frame on `transport` (+ any `SCM_RIGHTS` fds
+    /// in `Unix` mode). A connection never mixes the `Read` and
+    /// `recvmsg` paths because the mode is fixed by negotiation before
+    /// any RPC traffic.
+    fn recv_msg(&self, transport: &dyn RpcTransport) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
         if self.profile.aosp_framing() {
             // android-13+: read `RpcWireHeader` then exactly `bodySize`
             // bytes (capped vs `MAX_FRAME_LEN` — V4); a clean EOF before
@@ -460,16 +834,16 @@ impl RpcSessionInner {
             // `SCM_RIGHTS` fds across the header+body reads; otherwise no
             // out-of-band fds (no-FD scope, byte-identical).
             if self.fd_mode() == FileDescriptorTransportMode::Unix {
-                return read_aosp_message_with_fds(self.transport.as_ref());
+                return read_aosp_message_with_fds(transport);
             }
-            let mut io = RawTransportIo(self.transport.as_ref());
+            let mut io = RawTransportIo(transport);
             let frame = read_aosp_message(&mut io)?;
             return Ok((frame, Vec::new()));
         }
         if self.fd_mode() == FileDescriptorTransportMode::Unix {
-            self.transport.recv_frame_with_fds()
+            transport.recv_frame_with_fds()
         } else {
-            Ok((self.transport.recv_frame()?, Vec::new()))
+            Ok((transport.recv_frame()?, Vec::new()))
         }
     }
 
@@ -522,7 +896,8 @@ impl RpcSessionInner {
                     rp.address()
                 } else {
                     // A local object leaving this process.
-                    self.state
+                    self.shared
+                        .state
                         .lock()
                         .expect("rpc state poisoned")
                         .on_binder_leaving(b)
@@ -592,6 +967,7 @@ impl RpcSessionInner {
         // An address that is one of *our* local nodes means the object
         // is coming home — return the original local binder.
         if let Some(local) = self
+            .shared
             .state
             .lock()
             .expect("rpc state poisoned")
@@ -600,13 +976,38 @@ impl RpcSessionInner {
             return Ok(Some(local));
         }
         let weak = self.self_weak();
-        let sib = self
-            .state
-            .lock()
-            .expect("rpc state poisoned")
-            .remote_proxy(addr, || {
+        // Explicit inner block: the `MutexGuard` is bound to `st` and
+        // dropped at the closing `}`, **before** the F7 excess
+        // `DEC_STRONG` send below. This makes the no-I/O-under-the-
+        // state-lock invariant structural (rather than relying on
+        // Rust's temporary-scope inference for an unbound `lock()`
+        // chain, which a future refactor could silently break — e.g.,
+        // re-pulling the `lock()` out into a `let g = ...` would extend
+        // the guard's lifetime past the `if excess` send, violating
+        // R1-analog: no I/O / no callback under a `Mutex` lock the
+        // recv loop also touches).
+        let (sib, excess) = {
+            let mut st = self.shared.state.lock().expect("rpc state poisoned");
+            st.remote_proxy(addr, || {
                 SIBinder::new(Arc::new(RpcProxy::new(addr, weak))).expect("SIBinder::new(RpcProxy)")
-            });
+            })
+        };
+        if excess {
+            // Phase A **F7** / AOSP `flushExcessBinderRefs`: a duplicate
+            // receipt of a binder we already proxy. The sender bumped
+            // its `timesSent` for this send, but our deduped proxy
+            // `DEC_STRONG`s only once (at its drop); return the owed
+            // reference now so the books net to one DEC per send (no
+            // leak — AC-2.5). Best-effort, exactly like
+            // `RpcProxy::drop`'s DEC: a dead session just means the
+            // peer is already gone. On the server dispatch path this
+            // runs while this thread already drives the connection
+            // (`DRIVING`), so `send_dec_strong`'s `enter_connection`
+            // is a reentrant bypass — the DEC is an ordinary
+            // standalone frame the peer's recv loop applies
+            // independently (the documented "interleaved DEC_STRONG").
+            let _ = self.send_dec_strong(addr);
+        }
         Ok(Some(sib))
     }
 
@@ -620,13 +1021,18 @@ impl RpcSessionInner {
         data: &Parcel,
         flags: u32,
     ) -> Result<Option<Parcel>> {
-        // Serialize this outbound call against any concurrent
-        // client_transact/serve on a shared session; a same-thread
-        // nested call (server callback) bypasses it (AC-3.2 / AC-3.6).
-        let _conn = self.enter_connection();
+        // **Phase A**: pick a connection slot via the AOSP-faithful
+        // `ExclusiveConnection` selector. Same-thread nested calls
+        // (server callback while a transact is in flight — AC-3.6 /
+        // F8) re-enter the slot already driven by this thread (the
+        // `DRIVING` marker); otherwise we claim an available slot, or
+        // `wait` on `slot_cv` if the pool is exhausted. Concurrent
+        // transacts on *other* slots run unblocked (AC-12.1).
         let oneway = (flags & FLAG_ONEWAY) != 0;
+        let conn = self.find_conn(oneway);
+        let transport = conn.transport();
         let async_number = if oneway {
-            self.async_counter.fetch_add(1, Ordering::SeqCst)
+            self.shared.async_counter.fetch_add(1, Ordering::SeqCst)
         } else {
             0
         };
@@ -645,7 +1051,7 @@ impl RpcSessionInner {
         let frame = self.profile.codec().encode_transact(&txn)?;
         // Out-of-band fds collected while serializing the request
         // (empty unless `Unix` fd-mode — subplan 2-7).
-        self.send_msg(&frame, data.rpc_out_fds())?;
+        self.send_msg(transport, &frame, data.rpc_out_fds())?;
         if oneway {
             return Ok(None);
         }
@@ -653,10 +1059,10 @@ impl RpcSessionInner {
         // of the reply wait only. `ReplyDeadlineGuard` clears the sticky
         // `SO_RCVTIMEO` on every exit (return / `?` / panic) so it never
         // leaks onto the next call or a later recv on this connection.
-        let deadline = *self.timeout.lock().expect("timeout poisoned");
-        let _deadline_guard = ReplyDeadlineGuard::arm(self.transport.as_ref(), deadline)?;
+        let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
+        let _deadline_guard = ReplyDeadlineGuard::arm(transport, deadline)?;
         loop {
-            let (frame, in_fds) = self.recv_msg()?;
+            let (frame, in_fds) = self.recv_msg(transport)?;
             match self.profile.codec().decode_message(&frame)? {
                 WireMessage::Reply(WireReply {
                     status,
@@ -679,7 +1085,8 @@ impl RpcSessionInner {
                     return Ok(Some(reply));
                 }
                 WireMessage::DecStrong(a) => {
-                    self.state
+                    self.shared
+                        .state
                         .lock()
                         .expect("rpc state poisoned")
                         .dec_strong_local(&a);
@@ -695,7 +1102,7 @@ impl RpcSessionInner {
                     // continued wait *symmetrically via Drop* — a `?` /
                     // panic out of `dispatch_transact` can no longer
                     // leave the timeout desynchronized (T1-2).
-                    let _restore = NestedDeadlineGuard::lift(self.transport.as_ref(), deadline)?;
+                    let _restore = NestedDeadlineGuard::lift(transport, deadline)?;
                     self.dispatch_transact(t, in_fds)?;
                 }
             }
@@ -703,17 +1110,24 @@ impl RpcSessionInner {
     }
 
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress) -> Result<()> {
-        // `RpcProxy::drop` can fire this from any thread; serialize the
-        // frame against an in-flight transaction (bypassed when the
-        // dropping thread is itself the connection driver).
-        let _conn = self.enter_connection();
+        // `RpcProxy::drop` (best-effort) and `read_binder`'s F7
+        // excess-flush call this from arbitrary threads/contexts.
+        // `find_conn` picks an available slot (or — if this thread is
+        // already driving one of the session's slots — reuses it via
+        // `DRIVING`, the documented "interleaved DEC_STRONG" path).
+        // `DEC_STRONG` is a control message, not a user oneway —
+        // `oneway=false` so it joins the twoway distribution (any
+        // available slot), avoiding contention on the oneway-pinned
+        // founding slot.
+        let conn = self.find_conn(false);
         let frame = self.profile.codec().encode_dec_strong(&addr);
-        self.send_msg(&frame, &[])?;
+        self.send_msg(conn.transport(), &frame, &[])?;
         Ok(())
     }
 
     pub(crate) fn forget_remote_if(&self, addr: &RpcAddress, who: *const ()) {
-        self.state
+        self.shared
+            .state
             .lock()
             .expect("rpc state poisoned")
             .forget_remote_if(addr, who);
@@ -730,6 +1144,7 @@ impl RpcSessionInner {
     /// the serve loop ends) is harmless.
     pub(crate) fn send_session_obituaries(&self) {
         let snapshot = self
+            .shared
             .state
             .lock()
             .expect("rpc state poisoned")
@@ -762,7 +1177,13 @@ impl RpcSessionInner {
             data: data.to_vec(),
             object_positions: object_positions.to_vec(),
         })?;
-        Ok(self.send_msg(&frame, fds)?)
+        // **Phase A**: reuse this thread's already-driven slot (the
+        // inbound dispatch slot — `DRIVING` reentrant pin via
+        // `find_conn`). For an outermost server reply
+        // (`serve_once_on_slot` pinned the slot before dispatch) this
+        // is the same slot the request arrived on.
+        let conn = self.find_conn(false);
+        Ok(self.send_msg(conn.transport(), &frame, fds)?)
     }
 
     /// Dispatch one inbound `TRANSACT` (server role, or a nested
@@ -775,6 +1196,7 @@ impl RpcSessionInner {
             return self.serve_special(&t, oneway);
         }
         let target = self
+            .shared
             .state
             .lock()
             .expect("rpc state poisoned")
@@ -861,13 +1283,15 @@ impl RpcSessionInner {
         }
     }
 
-    /// Handle one inbound message. `Ok(false)` ⇒ peer closed (stop).
-    fn serve_once(&self) -> Result<bool> {
-        // The server worker owns the connection while it serves one
-        // message; a nested outbound callback from the handler runs on
-        // this same thread and bypasses the lock (AC-3.6).
-        let _conn = self.enter_connection();
-        let (frame, in_fds) = match self.recv_msg() {
+    /// Handle one inbound message on the pinned **slot** (a server
+    /// worker drives a specific accepted connection's slot — Phase A;
+    /// nested outbound callbacks from the handler reuse this same slot
+    /// via the `DRIVING` marker, AC-3.6/F8).
+    /// `Ok(false)` ⇒ peer closed (stop).
+    fn serve_once_on_slot(&self, slot_id: u64) -> Result<bool> {
+        let conn = self.find_conn_pinned(slot_id);
+        let transport = conn.transport();
+        let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
             Err(RpcError::PeerClosed) => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -878,7 +1302,8 @@ impl RpcSessionInner {
                 Ok(true)
             }
             WireMessage::DecStrong(a) => {
-                self.state
+                self.shared
+                    .state
                     .lock()
                     .expect("rpc state poisoned")
                     .dec_strong_local(&a);
@@ -901,7 +1326,7 @@ impl RpcSessionInner {
         }
         match SpecialTransaction::from_code(t.code) {
             Some(SpecialTransaction::GetRoot) => {
-                let root = self.root.lock().expect("root poisoned").clone();
+                let root = self.shared.root.lock().expect("root poisoned").clone();
                 let mut reply = Parcel::new();
                 reply.attach_rpc_ops(self.parcel_ops());
                 // SIBinder::serialize → RPC branch → write_binder.
@@ -914,7 +1339,7 @@ impl RpcSessionInner {
                 self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_object_positions(), &[])
             }
             Some(SpecialTransaction::GetMaxThreads) => {
-                let n = self.max_threads.load(Ordering::SeqCst) as i32;
+                let n = self.shared.max_threads.load(Ordering::SeqCst) as i32;
                 let mut reply = Parcel::new();
                 reply.write(&n)?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
@@ -929,7 +1354,7 @@ impl RpcSessionInner {
                 // (Was a bare `i32` ⇒ libbinder `BAD_VALUE` — found by
                 // the real-peer round-trip, G4(b).)
                 let mut reply = Parcel::new();
-                reply.write(&self.rpc_session_id[..])?;
+                reply.write(&self.shared.rpc_session_id[..])?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetFdMode) => {
@@ -951,7 +1376,7 @@ impl RpcSessionInner {
                         false
                     }
                 };
-                let agreed = if want_unix && self.fd_unix_supported.load(Ordering::SeqCst) {
+                let agreed = if want_unix && self.shared.fd_unix_supported.load(Ordering::SeqCst) {
                     FileDescriptorTransportMode::Unix
                 } else {
                     FileDescriptorTransportMode::None
@@ -966,7 +1391,7 @@ impl RpcSessionInner {
                 )?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])?;
                 // Switch AFTER the reply is on the wire (None-mode).
-                *self.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+                *self.shared.fd_mode.lock().expect("fd_mode poisoned") = agreed;
                 Ok(())
             }
             None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[], &[]),
@@ -1000,23 +1425,158 @@ impl RpcSession {
         space: AddressSpace,
         profile: WireProfile,
     ) -> RpcSession {
-        let inner = Arc::new(RpcSessionInner {
-            transport,
-            profile,
-            conn_lock: Mutex::new(()),
+        Self::with_shared(transport, profile, Self::fresh_shared(space))
+    }
+
+    /// A brand-new session's shared state (`live_conns == 1`, the
+    /// founding connection — Phase A0b F4). The default
+    /// single-connection path uses exactly one of these, so its
+    /// behavior is byte-identical to the pre-A0b single-`transport`
+    /// `RpcSessionInner`.
+    fn fresh_shared(space: AddressSpace) -> Arc<SharedSession> {
+        Arc::new(SharedSession {
             state: Mutex::new(RpcState::new(space)),
             async_counter: AtomicU64::new(0),
             root: Mutex::new(None),
-            self_weak: Mutex::new(Weak::new()),
             max_threads: AtomicU32::new(1),
             negotiated: AtomicU32::new(0),
             timeout: Mutex::new(None),
             fd_mode: Mutex::new(FileDescriptorTransportMode::None),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id(),
+            live_conns: AtomicUsize::new(1),
+            obituary_sent: AtomicBool::new(false),
+        })
+    }
+
+    /// Wrap `transport` as a connection of an **existing**
+    /// [`SharedSession`] (Phase A0b: the server's id-demux attaches a
+    /// 2nd+ connection here instead of minting a fresh session, so a
+    /// binder published over another connection is reachable — shared
+    /// `state`/`root`/`rpc_session_id`). Bumps the session's live
+    /// connection count (F4). [`with_profile`](RpcSession::with_profile)
+    /// is exactly this with a brand-new `SharedSession`
+    /// (`live_conns == 1`) ⇒ the default single-connection path is
+    /// byte-identical.
+    fn with_shared(
+        transport: Box<dyn RpcTransport>,
+        profile: WireProfile,
+        shared: Arc<SharedSession>,
+    ) -> RpcSession {
+        // **Phase A**: the founding slot of this session's pool. id=1
+        // (slot ids are monotonic from 1; 0 is reserved as a "no slot"
+        // sentinel for future use). Default single-connection sessions
+        // never add more slots ⇒ `find_conn` is a no-wait single-slot
+        // pick ⇒ pre-A `enter_connection` byte-identical.
+        let founding = ConnSlot {
+            transport,
+            exclusive_tid: None,
+            allow_nested: true,
+            id: 1,
+        };
+        let inner = Arc::new(RpcSessionInner {
+            conn_state: Mutex::new(ConnState {
+                slots: vec![founding],
+                next_slot_id: 2,
+            }),
+            slot_cv: Condvar::new(),
+            profile,
+            self_weak: Mutex::new(Weak::new()),
+            shared,
         });
         *inner.self_weak.lock().expect("self_weak") = Arc::downgrade(&inner);
         RpcSession { inner }
+    }
+
+    /// Id of the founding (first) slot — Phase A.  All non-attach
+    /// `serve_blocking` callers (the default single-connection path)
+    /// drive this slot.
+    pub(crate) const FOUNDING_SLOT_ID: u64 = 1;
+
+    /// **Phase A — reserved for the server-side unification next
+    /// increment.** Adds a freshly-accepted `transport` as a new
+    /// incoming slot of this session's pool (the call the unified-
+    /// model server will make on attach instead of building a new
+    /// `RpcSessionInner` sharing a `SharedSession`). Bumps
+    /// `live_conns` for **F4** via the anti-resurrection primitive —
+    /// returns `Err(StatusCode::DeadObject)` when the session is
+    /// already torn down (obituary already fired) so the caller
+    /// rejects the attach instead of silently resurrecting a dead
+    /// session.
+    #[allow(dead_code)] // wired up by the next Phase A increment (server-side unification)
+    pub(crate) fn add_incoming_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
+        if !self.inner.shared.try_bump_live_conns() {
+            return Err(StatusCode::DeadObject);
+        }
+        Ok(self.inner.add_slot_inner(transport))
+    }
+
+    /// The shared session state of this connection (Phase A0b). The
+    /// server registers a [`std::sync::Weak`] of this under the 32-byte
+    /// session id; on an id-echoing 2nd connection it resolves it and
+    /// passes it to [`RpcSession::from_android13plus`] so the new
+    /// connection shares the same `state`/`root`/`rpc_session_id`.
+    pub(crate) fn shared(&self) -> Arc<SharedSession> {
+        Arc::clone(&self.inner.shared)
+    }
+
+    /// Server (Phase A0b): run **only** the android-13+ accept
+    /// handshake on `transport`, returning the transport (unconsumed)
+    /// plus the negotiated codec, the client's requested FD mode, and
+    /// the client-supplied `session_id`. Splitting the handshake from
+    /// the session build (the A0a "monolithic `server_accept`"
+    /// residual) is what lets the server inspect the id and decide
+    /// **new vs. attach** *before* committing the connection to a
+    /// `SharedSession`.
+    pub(crate) fn android13plus_accept_handshake(
+        transport: Box<dyn RpcTransport>,
+        server_max_version: u32,
+    ) -> Result<Android13PlusAccept> {
+        let (codec, client_fd_mode, client_id) = {
+            let mut io = RawTransportIo(transport.as_ref());
+            server_accept(&mut io, server_max_version).map_err(StatusCode::from)?
+        };
+        Ok((transport, codec, client_fd_mode, client_id))
+    }
+
+    /// Server (Phase A0b): build the accepted connection's session from
+    /// a completed [`android13plus_accept_handshake`](RpcSession::android13plus_accept_handshake).
+    /// `shared = None` ⇒ a brand-new session (the default / new-session
+    /// path, byte-identical to pre-A0b); `shared = Some(existing)` ⇒
+    /// **attach** this connection to a pre-existing session (id-demux),
+    /// so a binder published over the founding connection is reachable
+    /// here (shared `state`/`root`).
+    ///
+    /// **F4 anti-resurrection contract**: the caller MUST gate a
+    /// `Some(shared)` attach through
+    /// [`SharedSession::try_bump_live_conns`] *before* invoking this
+    /// function and reject the connection on `false`. Once
+    /// `live_conns` has been bumped this function takes ownership of
+    /// the bump for the session lifetime (the `serve_blocking_on` exit
+    /// hook does the matching `fetch_sub`). This split lets the
+    /// server's `serve_connection` decide reject-vs-attach atomically
+    /// against the race window between `resolve_session.upgrade()` and
+    /// the founding worker's `live_conns.fetch_sub` (the F4
+    /// resurrection race).
+    pub(crate) fn from_android13plus(
+        transport: Box<dyn RpcTransport>,
+        codec: Android13PlusCodec,
+        client_fd_mode: u8,
+        server_fd_unix: bool,
+        shared: Option<Arc<SharedSession>>,
+    ) -> RpcSession {
+        let negotiated = codec.version();
+        let shared = shared.unwrap_or_else(|| Self::fresh_shared(AddressSpace::Acceptor));
+        let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
+        if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
+            *session
+                .inner
+                .shared
+                .fd_mode
+                .lock()
+                .expect("fd_mode poisoned") = FileDescriptorTransportMode::Unix;
+        }
+        session
     }
 
     /// Client role, **opt-in android-13+ versioned wire** (subplan 2-5b
@@ -1055,6 +1615,37 @@ impl RpcSession {
         max_version: u32,
         fd_mode: FileDescriptorTransportMode,
     ) -> Result<RpcSession> {
+        // Empty id ⇒ request a new session — byte-identical to the
+        // pre-2-12 client handshake.
+        Self::connect_android13plus_fd_with_id(transport, max_version, fd_mode, &[])
+    }
+
+    /// Subplan 2-12 Phase A0a: identical to
+    /// [`connect_android13plus_fd`] but echoes a server-minted 32-byte
+    /// `session_id` in the `RpcConnectionHeader` (AOSP
+    /// `RpcSession::setupClient`: the first connection sends an empty id
+    /// and reads the server-minted one via
+    /// [`RpcSession::get_session_id`], the remaining connections echo
+    /// it). An **empty** `session_id` is byte-for-byte identical to
+    /// [`connect_android13plus_fd`] (additive — the default path is
+    /// unchanged). In A0a the server *rejects* a non-empty (echoed) id
+    /// (the shared-state attach is Phase A0b); this wires + exercises
+    /// the id round-trip and the server's accept-decision routing.
+    pub fn connect_android13plus_fd_with_id(
+        transport: Box<dyn RpcTransport>,
+        max_version: u32,
+        fd_mode: FileDescriptorTransportMode,
+        session_id: &[u8],
+    ) -> Result<RpcSession> {
+        // AOSP `kSessionIdBytes == 32`: only empty (new-session) or
+        // exactly 32 bytes are wire-legal. Validate here so a
+        // misbehaving caller can't trigger the silent `as u16` length-
+        // field truncation in `encode_connection_header` for a 64 KiB+
+        // buffer (the server would then read the declared size's worth
+        // of bytes vs the actual appended bytes ⇒ wire desync).
+        if !(session_id.is_empty() || session_id.len() == 32) {
+            return Err(StatusCode::BadValue);
+        }
         let want_unix = fd_mode == FileDescriptorTransportMode::Unix;
         let hdr_fd_mode = if want_unix {
             FD_MODE_UNIX
@@ -1063,7 +1654,8 @@ impl RpcSession {
         };
         let codec = {
             let mut io = RawTransportIo(transport.as_ref());
-            client_connect(&mut io, max_version, false, hdr_fd_mode).map_err(StatusCode::from)?
+            client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, session_id)
+                .map_err(StatusCode::from)?
         };
         let negotiated = codec.version();
         let session = RpcSession::with_profile(
@@ -1075,8 +1667,12 @@ impl RpcSession {
         // `Unix` when the negotiated wire is v1+ (else stay `None` and
         // any fd write is the AOSP-faithful `BAD_TYPE` reject).
         if want_unix && negotiated >= PROTOCOL_V1 {
-            *session.inner.fd_mode.lock().expect("fd_mode poisoned") =
-                FileDescriptorTransportMode::Unix;
+            *session
+                .inner
+                .shared
+                .fd_mode
+                .lock()
+                .expect("fd_mode poisoned") = FileDescriptorTransportMode::Unix;
         }
         Ok(session)
     }
@@ -1097,37 +1693,39 @@ impl RpcSession {
     }
 
     /// Server role, opt-in android-13+ wire **with FD-over-RPC**
-    /// (subplan 2-11 Phase A0). Reads the client's requested FD mode
-    /// from the `RpcConnectionHeader` and, when the client asked for
-    /// `Unix`, this server opted in (`server_fd_unix`,
+    /// (subplan 2-11 Phase A0), accepting one connection as a
+    /// **brand-new session** (no id-demux). Reads the client's
+    /// requested FD mode from the `RpcConnectionHeader` and, when the
+    /// client asked for `Unix`, this server opted in (`server_fd_unix`,
     /// [`super::RpcServer::set_supported_fd_modes`]), **and** the
     /// negotiated wire is v1+ (v0 forbids fd), switches the session to
     /// `Unix`. Lenient: a client/server FD-mode mismatch degrades to
     /// `None` (the fd write then `BAD_TYPE`-rejects) rather than AOSP's
     /// hard session-reject. `server_fd_unix == false` is exactly
     /// [`RpcSession::accept_android13plus`] (byte-identical no-FD path).
+    ///
+    /// This is a thin convenience wrapper over
+    /// [`android13plus_accept_handshake`](RpcSession::android13plus_accept_handshake)
+    /// then [`from_android13plus`](RpcSession::from_android13plus) with
+    /// `shared = None` (the client-supplied id is ignored). The
+    /// multi-connection id-demux (Phase A0b — new vs. attach) lives in
+    /// [`super::RpcServer::serve_connection`], which calls the split
+    /// handshake/build helpers directly; existing single-connection
+    /// callers keep the byte-identical shape here.
     pub fn accept_android13plus_fd(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
         server_fd_unix: bool,
     ) -> Result<RpcSession> {
-        let (codec, client_fd_mode) = {
-            let mut io = RawTransportIo(transport.as_ref());
-            let (codec, fd_mode, _session_id) =
-                server_accept(&mut io, server_max_version).map_err(StatusCode::from)?;
-            (codec, fd_mode)
-        };
-        let negotiated = codec.version();
-        let session = RpcSession::with_profile(
+        let (transport, codec, client_fd_mode, _client_id) =
+            Self::android13plus_accept_handshake(transport, server_max_version)?;
+        Ok(Self::from_android13plus(
             transport,
-            AddressSpace::Acceptor,
-            WireProfile::Android13Plus(codec),
-        );
-        if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
-            *session.inner.fd_mode.lock().expect("fd_mode poisoned") =
-                FileDescriptorTransportMode::Unix;
-        }
-        Ok(session)
+            codec,
+            client_fd_mode,
+            server_fd_unix,
+            None,
+        ))
     }
 
     /// The negotiated android-13+ wire protocol version
@@ -1141,6 +1739,42 @@ impl RpcSession {
         }
     }
 
+    /// This session's opaque 32-byte id (AOSP `RpcSession::mId`,
+    /// `kSessionIdBytes == 32`). On the server side this is the id
+    /// minted at session build and replied by the `GET_SESSION_ID`
+    /// special transact; subplan 2-12 Phase A0a uses it as the
+    /// [`super::RpcServer`] registry key. Per-session, never global
+    /// (P6).
+    pub fn session_id(&self) -> [u8; 32] {
+        self.inner.shared.rpc_session_id
+    }
+
+    /// Client (subplan 2-12 Phase A0a): fetch the server-minted 32-byte
+    /// session id via the `GET_SESSION_ID` special transact. AOSP
+    /// `RpcSession::setupClient` reads this on the first connection and
+    /// echoes it on the remaining ones
+    /// ([`RpcSession::setup_unix_client_android13plus_with_id`]). The
+    /// server already replies it (G4(b) real-peer-validated:
+    /// `writeByteVector(mId)` == the AIDL `byte[]` path); this is the
+    /// missing *client* half.
+    pub fn get_session_id(&self) -> Result<Vec<u8>> {
+        let data = Parcel::new();
+        let mut reply = self
+            .inner
+            .client_transact(
+                RpcAddress::zero(),
+                SpecialTransaction::GetSessionId.code(),
+                &data,
+                0,
+            )?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        // Propagate the parcel-read error as-is (BadValue/BadType from
+        // a malformed wire byte vector is informationally distinct from
+        // a missing reply — squashing to UnexpectedNull would lose that
+        // diagnosis signal in logs).
+        reply.read::<Vec<u8>>()
+    }
+
     /// Server role: advertise that this endpoint will accept the
     /// `Unix` FD-over-RPC mode on `GET_FD_MODE` (subplan 2-7). Default
     /// is *not* advertised, so the FD reject (2-2) is the default
@@ -1148,7 +1782,10 @@ impl RpcSession {
     /// fd methods reject by type regardless).
     pub fn set_supported_fd_modes(&self, modes: &[FileDescriptorTransportMode]) {
         let unix = modes.contains(&FileDescriptorTransportMode::Unix);
-        self.inner.fd_unix_supported.store(unix, Ordering::SeqCst);
+        self.inner
+            .shared
+            .fd_unix_supported
+            .store(unix, Ordering::SeqCst);
     }
 
     /// Client role: negotiate the FD-over-RPC mode (subplan 2-7).
@@ -1178,7 +1815,7 @@ impl RpcSession {
             FileDescriptorTransportMode::None
         };
         // Switch AFTER the reply has been fully read in None-mode.
-        *self.inner.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+        *self.inner.shared.fd_mode.lock().expect("fd_mode poisoned") = agreed;
         Ok(agreed)
     }
 
@@ -1189,7 +1826,7 @@ impl RpcSession {
 
     /// Publish the server's root object (returned by `get_root`).
     pub fn set_root(&self, binder: SIBinder) {
-        *self.inner.root.lock().expect("root poisoned") = Some(binder);
+        *self.inner.shared.root.lock().expect("root poisoned") = Some(binder);
     }
 
     /// Client: fetch the peer's root object as an [`RpcProxy`]-backed
@@ -1223,10 +1860,21 @@ impl RpcSession {
     /// AOSP's `getMaxIncomingThreads() >= 1` requirement for an RPC
     /// `linkToDeath`.
     pub fn serve_blocking(&self) -> Result<()> {
+        self.serve_blocking_on(Self::FOUNDING_SLOT_ID)
+    }
+
+    /// **Phase A**: serve a *specific* slot of the pool until peer
+    /// closes (the server worker's API — each accepted connection's
+    /// worker drives the slot it was added as via
+    /// [`add_incoming_slot`](RpcSession::add_incoming_slot)). The
+    /// default single-connection
+    /// [`serve_blocking`](RpcSession::serve_blocking) is exactly this
+    /// on the founding slot (`FOUNDING_SLOT_ID`).
+    pub fn serve_blocking_on(&self, slot_id: u64) -> Result<()> {
         let result = {
             let mut r = Ok(());
             loop {
-                match self.inner.serve_once() {
+                match self.inner.serve_once_on_slot(slot_id) {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(e) => {
@@ -1237,26 +1885,51 @@ impl RpcSession {
             }
             r
         };
-        self.inner.send_session_obituaries();
+        // Phase A0b **F4**: this connection is finished. Fire the
+        // session obituaries only on the **last** connection's
+        // teardown (full session death) — never on a *partial*
+        // connection loss while other connections of the same session
+        // are still live (that would deliver a spurious `binder_died`
+        // to a peer that can still reach the session over another
+        // connection). `fetch_sub` returns the prior count, so exactly
+        // one caller observes the 1→0 edge; the `obituary_sent` CAS is
+        // an idempotency belt (a degenerate double-serve can't
+        // double-fire). The default single-connection session has
+        // `live_conns == 1`, so this is 1→0 → fire — **byte-identical
+        // death semantics to pre-A0b**.
+        let was_last = self.inner.shared.live_conns.fetch_sub(1, Ordering::SeqCst) == 1;
+        if was_last
+            && self
+                .inner
+                .shared
+                .obituary_sent
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.inner.send_session_obituaries();
+        }
         result
     }
 
     /// Server role: the max-threads value advertised to a client on
     /// `GET_MAX_THREADS` (subplan 2-3 negotiation). Default 1.
     pub fn set_max_threads(&self, n: u32) {
-        self.inner.max_threads.store(n.max(1), Ordering::SeqCst);
+        self.inner
+            .shared
+            .max_threads
+            .store(n.max(1), Ordering::SeqCst);
     }
 
     /// Set the client reply/handshake wait deadline (AC-3.8). `None`
     /// (default) blocks forever.
     pub fn set_timeout(&self, timeout: Option<Duration>) {
-        *self.inner.timeout.lock().expect("timeout poisoned") = timeout;
+        *self.inner.shared.timeout.lock().expect("timeout poisoned") = timeout;
     }
 
     /// `min(local, remote)` worker count established by
     /// [`RpcSession::negotiate`] (0 if not negotiated).
     pub fn negotiated_max_threads(&self) -> u32 {
-        self.inner.negotiated.load(Ordering::SeqCst)
+        self.inner.shared.negotiated.load(Ordering::SeqCst)
     }
 
     /// Client role: exchange `GET_MAX_THREADS` with the server and
@@ -1278,7 +1951,10 @@ impl RpcSession {
             return Err(StatusCode::BadValue);
         }
         let negotiated = local_max.min(remote as u32).max(1);
-        self.inner.negotiated.store(negotiated, Ordering::SeqCst);
+        self.inner
+            .shared
+            .negotiated
+            .store(negotiated, Ordering::SeqCst);
         Ok(negotiated)
     }
 
@@ -1304,6 +1980,87 @@ impl RpcSession {
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 
+    /// Client (subplan 2-12 Phase A0a): connect to a Unix-domain
+    /// android-13+ RPC server **echoing a server-minted 32-byte
+    /// `session_id`**. Flow (AOSP `RpcSession::setupClient`): connect
+    /// the first session with [`setup_unix_client_android13plus`]
+    /// (empty id ⇒ new session), read its id with
+    /// [`RpcSession::get_session_id`], then open the remaining
+    /// connections here echoing that id. An **empty** `session_id` is
+    /// byte-identical to [`setup_unix_client_android13plus`]. (A0a: the
+    /// server rejects the echoed-id connection — the shared-`RpcState`
+    /// attach is Phase A0b.)
+    pub fn setup_unix_client_android13plus_with_id(
+        path: impl AsRef<std::path::Path>,
+        max_version: u32,
+        session_id: &[u8],
+    ) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect(path)?;
+        RpcSession::connect_android13plus_fd_with_id(
+            Box::new(t),
+            max_version,
+            FileDescriptorTransportMode::None,
+            session_id,
+        )
+    }
+
+    /// **Phase A — client multi-outgoing.** Open one *additional*
+    /// outgoing connection to the same android-13+ server session and
+    /// add it as a new slot in this `RpcSession`'s pool (AOSP
+    /// `RpcSession::setupClient` opens N outgoing; `findConnection`
+    /// distributes outgoing calls across them — AC-12.1). Returns the
+    /// new slot id. `session_id` MUST be this session's server-minted
+    /// id (`get_session_id()` on the founding connection) — the server
+    /// id-demuxes the echo onto the same `SharedSession` (A0b), so
+    /// state/root/proxies are shared with the founding connection.
+    /// Profile uniformity is enforced: the additional connection's
+    /// negotiated wire version must equal this session's (else error).
+    ///
+    /// The default single-connection sessions never call this ⇒ the
+    /// pool stays at one slot ⇒ `find_conn` is byte-identical to the
+    /// pre-A `enter_connection` (T1-1/AC-3.2 preserved).
+    pub fn add_outgoing_connection_android13plus(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        max_version: u32,
+        session_id: &[u8],
+    ) -> Result<u64> {
+        // Profile uniformity (AOSP requires same version across a
+        // session). Refuse R34 / a higher caller-supplied `max_version`
+        // **before** the handshake so a mismatch doesn't burn a server
+        // attach + roundtrip; the handshake then runs with the
+        // session's exact version as its ceiling so the server can't
+        // negotiate it down to something incompatible. AOSP A0a
+        // session-id wire constraint: `kSessionIdBytes == 32` (empty
+        // is illegal here because `add_outgoing` is by definition a
+        // 2nd+ connection echoing the founding id) — validate at the
+        // entry to avoid the silent `as u16` length-field truncation
+        // in `encode_connection_header` if a caller passed a 64 KiB+
+        // garbage buffer.
+        if session_id.len() != 32 {
+            return Err(StatusCode::BadValue);
+        }
+        let session_version = match &self.inner.profile {
+            WireProfile::Android13Plus(c) => c.version(),
+            WireProfile::R34(_) => return Err(StatusCode::BadType),
+        };
+        let effective_max = max_version.min(session_version);
+        let t = super::transport::UnixTransport::connect(path)?;
+        let codec = {
+            let mut io = RawTransportIo(&t);
+            client_connect_with_id(&mut io, effective_max, false, FD_MODE_NONE, session_id)
+                .map_err(StatusCode::from)?
+        };
+        if codec.version() != session_version {
+            // Server negotiated below us (older peer than the founding
+            // connection's negotiation). A mixed-version pool would
+            // silently route incompatible wire across one
+            // `RpcSessionInner`; refuse instead.
+            return Err(StatusCode::BadType);
+        }
+        Ok(self.inner.add_outgoing_slot(Box::new(t)))
+    }
+
     /// Client: connect to a Unix-domain android-13+ RPC server **with
     /// FD-over-RPC** opt-in (subplan 2-11 Phase A0). UDS connect + the
     /// AOSP handshake requesting `fd_mode` in the connection header
@@ -1322,6 +2079,7 @@ impl RpcSession {
     /// Test/diagnostic: live local-node count (AC-2.5 leak check).
     pub fn local_node_count(&self) -> usize {
         self.inner
+            .shared
             .state
             .lock()
             .expect("rpc state poisoned")

@@ -1124,6 +1124,7 @@ dependencies = [
  "async-trait",
  "downcast-rs",
  "env_logger",
+ "getrandom 0.2.17",
  "libc",
  "log",
  "loom",

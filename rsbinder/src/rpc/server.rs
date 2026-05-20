@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -125,6 +125,36 @@ pub struct RpcServer {
     /// *enforcement point* the 2-9 §0/G2 gap identified as missing
     /// (`peer_identity()` was computed but read nowhere).
     authorizer: Mutex<Option<Authorizer>>,
+    /// Subplan 2-12 **Phase A0b**: session-id → shared-session registry
+    /// (AOSP `RpcServer::mSessions`). The android-13+ accept handshake
+    /// reads the client's `RpcConnectionHeader.sessionId`:
+    ///  - **empty** id (the default — every pre-2-12 client) ⇒ a
+    ///    brand-new session; its server-minted id is registered here
+    ///    (a [`std::sync::Weak`] of the session's shared state) and is
+    ///    **never looked up** on this path, so the default behavior is
+    ///    byte-for-byte unchanged (purely additive);
+    ///  - **non-empty** id that resolves to a live session ⇒ **attach**
+    ///    this connection to that pre-existing `SharedSession`
+    ///    (id-demux: a binder published over the founding connection is
+    ///    reachable here — shared `state`/`root`);
+    ///  - **non-empty** id that is unknown / stale ⇒ reject (AOSP
+    ///    `ALOGE`+return).
+    ///
+    /// `Weak` so a fully-torn-down session (all connections gone) is
+    /// reclaimable and a later echo of its id is treated as unknown.
+    /// Live (written on every mint, resolved on every non-empty id) —
+    /// the AC-12.0b mutant (attach → fresh session = pre-A0b code) is
+    /// observably caught (`attached_count` stays 0, the 2nd connection
+    /// can't reach the founding connection's binder).
+    sessions: Mutex<HashMap<[u8; 32], std::sync::Weak<crate::rpc::session::SharedSession>>>,
+    /// A0a/A0b observability (also the AC-12.0b mutant gate). Plain
+    /// atomics off the per-transaction path — zero-cost on the default
+    /// (empty-id) flow. `session_registered` = new-session mints;
+    /// `attached_count` = id-demux attaches (Phase A0b); `rejected
+    /// _unknown_id` = non-empty ids that resolved to no live session.
+    session_registered: AtomicUsize,
+    attached_count: AtomicUsize,
+    rejected_unknown_id: AtomicUsize,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -149,6 +179,10 @@ impl RpcServer {
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
             authorizer: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            session_registered: AtomicUsize::new(0),
+            attached_count: AtomicUsize::new(0),
+            rejected_unknown_id: AtomicUsize::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }))
@@ -298,6 +332,89 @@ impl RpcServer {
         session
     }
 
+    // --- Subplan 2-12 Phase A0b: session-id → shared-session registry
+
+    /// Register a newly-minted session's shared state under its 32-byte
+    /// id (new-session / empty-id accept path). Stored as a `Weak` so a
+    /// fully-torn-down session does not pin memory and its id, if later
+    /// echoed, resolves to "unknown".
+    fn register_session(&self, id: [u8; 32], shared: &Arc<crate::rpc::session::SharedSession>) {
+        let mut map = self.sessions.lock().expect("sessions poisoned");
+        // Opportunistically prune fully-dead sessions so the map is
+        // bounded by *live* sessions, not cumulative over the server's
+        // lifetime (random 32-byte ids never collide in practice, so a
+        // dead `Weak` would otherwise linger forever).
+        map.retain(|_, w| w.strong_count() > 0);
+        map.insert(id, Arc::downgrade(shared));
+        drop(map);
+        self.session_registered.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Drop a session's id on full teardown so the map keeps tracking
+    /// **live** sessions (no unbounded growth over a long-lived
+    /// server). Unconditional `remove`: 32-byte CSPRNG ids are
+    /// collision-free in practice, so an entry being removed is always
+    /// the session that just exited (no later same-id session can have
+    /// been minted in the meantime). The F4 race window between this
+    /// `remove` and the founding worker's `live_conns.fetch_sub` is
+    /// closed by [`SharedSession::try_bump_live_conns`] at the attach
+    /// side, not by an identity check here.
+    fn unregister_session(&self, id: &[u8; 32]) {
+        self.sessions.lock().expect("sessions poisoned").remove(id);
+    }
+
+    /// Resolve a client-echoed id to a **live** shared session
+    /// (Phase A0b id-demux). `None` for any non-32-byte id (AOSP
+    /// `kSessionIdBytes == 32`), an unknown id, or a stale `Weak`
+    /// (session fully torn down) — all of which the caller rejects.
+    fn resolve_session(&self, id: &[u8]) -> Option<Arc<crate::rpc::session::SharedSession>> {
+        let key = <[u8; 32]>::try_from(id).ok()?;
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// A0a/A0b observability (and the AC-12.0b mutant gate).
+    /// Respectively: new-session ids registered; **id-demux attaches**
+    /// (Phase A0b — a 2nd+ connection bound to a pre-existing shared
+    /// session); non-empty ids that resolved to no live session and
+    /// were rejected. All zero on the default (empty-id) flow ⇒ a
+    /// no-regression witness.
+    pub fn session_registered_count(&self) -> usize {
+        self.session_registered.load(Ordering::SeqCst)
+    }
+    pub fn attached_count(&self) -> usize {
+        self.attached_count.load(Ordering::SeqCst)
+    }
+    pub fn rejected_unknown_id_count(&self) -> usize {
+        self.rejected_unknown_id.load(Ordering::SeqCst)
+    }
+
+    /// Phase A **F7** leak observability: total live local-node count
+    /// across all currently-live registered sessions (dead `Weak`s
+    /// skipped). The AOSP `timesSent`/`flushExcessBinderRefs` books
+    /// must net to **0** once every client proxy is dropped — a value
+    /// stuck above baseline is the F7 leak the no-excess-DEC mutant
+    /// reintroduces.
+    ///
+    /// Lock ladder: collect the live `Arc<SharedSession>` snapshot
+    /// **first** (releasing the `sessions` mutex), then walk each
+    /// session's `state` mutex. Avoids the nested-lock pattern
+    /// (`sessions` → `state`); a poisoned `state` lock in one session
+    /// no longer poisons `sessions` as a side-effect.
+    pub fn live_session_node_count(&self) -> usize {
+        let sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .expect("sessions poisoned")
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        sessions.iter().map(|s| s.local_node_count()).sum()
+    }
+
     /// Serve one already-connected transport on its own worker thread
     /// (used by the accept loop and by in-memory tests).
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
@@ -340,20 +457,120 @@ impl RpcServer {
                 // the byte-identical no-FD android-13+ path.
                 let fd_unix = server.fd_unix_supported.load(Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    match RpcSession::accept_android13plus_fd(transport, max, fd_unix) {
-                        Ok(session) => {
-                            server.configure_session(&session);
-                            if let Err(e) = session.serve_blocking() {
-                                log::debug!("RPC session ended: {e:?}");
+                    // Subplan 2-12 Phase A0b: split the handshake from
+                    // the session build so the server can read the
+                    // client-supplied `RpcConnectionHeader.sessionId`
+                    // and decide **new-session vs. id-demux attach vs.
+                    // reject** *before* binding the connection to a
+                    // `SharedSession`.
+                    let (transport, codec, client_fd_mode, client_id) =
+                        match RpcSession::android13plus_accept_handshake(transport, max) {
+                            Ok(parts) => parts,
+                            Err(e) => {
+                                // Abnormal interop/security event
+                                // (version mismatch, truncated header,
+                                // hostile peer) — `warn!` not `debug!`.
+                                log::warn!("android-13+ RPC handshake failed: {e:?}");
+                                return;
                             }
+                        };
+                    if client_id.is_empty() {
+                        // Default / new-session path — byte-identical
+                        // to pre-2-12 (empty id ⇒ fresh `SharedSession`,
+                        // `live_conns == 1`). Register a `Weak` of it so
+                        // a later echo of its id can demux-attach; the
+                        // id is *never resolved* on this path, so the
+                        // default behavior is unchanged.
+                        let session = RpcSession::from_android13plus(
+                            transport,
+                            codec,
+                            client_fd_mode,
+                            fd_unix,
+                            None,
+                        );
+                        let id = session.session_id();
+                        server.register_session(id, &session.shared());
+                        server.configure_session(&session);
+                        if let Err(e) = session.serve_blocking() {
+                            log::debug!("RPC session ended: {e:?}");
                         }
-                        Err(e) => {
-                            // Abnormal interop/security event (version
-                            // mismatch, truncated header, hostile peer)
-                            // — not the routine post-handshake
-                            // peer-close drain, so `warn!` not `debug!`.
-                            log::warn!("android-13+ RPC handshake failed: {e:?}")
+                        server.unregister_session(&id);
+                    } else if let Some(shared) = server.resolve_session(&client_id) {
+                        // Phase A0b **id-demux attach**: bind this
+                        // connection to the *pre-existing* session, so a
+                        // binder published over the founding connection
+                        // is reachable here (shared `state`/`root`).
+                        //
+                        // **F4 anti-resurrection gate**: the founding
+                        // worker may have raced past `live_conns 1→0`
+                        // and fired obituaries between
+                        // `resolve_session.upgrade()` and now (the
+                        // founding session's `Arc<SharedSession>` is
+                        // still alive on the founding closure stack, so
+                        // the `Weak::upgrade` succeeded — but the
+                        // session is already dead). `try_bump_live_conns`
+                        // closes that window: on rollback the attach
+                        // path falls through to the unknown-id reject
+                        // arm so the attaching client gets `DeadObject`
+                        // instead of silently joining a session whose
+                        // `binder_died` already fired (or, worse, never
+                        // fires again for this connection's
+                        // `DeathRecipient`s).
+                        if !shared.try_bump_live_conns() {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: session torn down between resolve \
+                                 and attach (F4 race); rejecting"
+                            );
+                            drop(transport);
+                            return;
                         }
+                        // Bump `attached_count` **immediately** after
+                        // the successful live-conns bump so an external
+                        // observer (e.g. AC-12.0b's `poll_until`) never
+                        // sees the intermediate state where
+                        // `live_conns` is incremented but
+                        // `attached_count` isn't. The original ordering
+                        // (`from_android13plus` between the two
+                        // counters) opened a tiny window — harmless
+                        // for current tests but contradicts the
+                        // "attached_count tracks id-demux attaches"
+                        // doc-claim.
+                        server.attached_count.fetch_add(1, Ordering::SeqCst);
+                        // No re-`configure_session`: the founding
+                        // connection already set the session's
+                        // root/max-threads; re-applying would clobber a
+                        // customized session.
+                        let session = RpcSession::from_android13plus(
+                            transport,
+                            codec,
+                            client_fd_mode,
+                            fd_unix,
+                            Some(shared),
+                        );
+                        if let Err(e) = session.serve_blocking() {
+                            log::debug!("RPC attached connection ended: {e:?}");
+                        }
+                        // The founding connection owns
+                        // register/unregister of the id; a stale `Weak`
+                        // is reclaimed by `resolve_session`/`register`
+                        // pruning, so the attached connection need not
+                        // unregister.
+                    } else {
+                        // Non-empty id resolving to no live session
+                        // (unknown / stale / non-32-byte) ⇒ reject
+                        // (AOSP `ALOGE`+return). The handshake already
+                        // completed (rsbinder's accept is split only at
+                        // the *build* level, not the wire level — a
+                        // documented A0a/A0b residual); dropping
+                        // `transport` closes the socket and the
+                        // client's next op is `DeadObject`.
+                        server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                        log::warn!(
+                            "android-13+ RPC: client supplied an unknown/stale \
+                             session id; rejecting connection"
+                        );
+                        drop(transport);
                     }
                 })
             }

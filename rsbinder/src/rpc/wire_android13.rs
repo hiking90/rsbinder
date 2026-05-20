@@ -856,10 +856,28 @@ pub fn client_connect<S: Read + Write>(
     incoming: bool,
     fd_mode: u8,
 ) -> RpcResult<Android13PlusCodec> {
+    // Empty id ⇒ request a new session — byte-identical to the
+    // pre-2-12 wire (the `session_id` slot already existed).
+    client_connect_with_id(stream, max_version, incoming, fd_mode, &[])
+}
+
+/// Subplan 2-12 Phase A0a: like [`client_connect`] but echoes a
+/// server-minted 32-byte `session_id` in the `RpcConnectionHeader`
+/// (AOSP `RpcSession::setupClient`: the first connection sends an empty
+/// id and reads the server-minted one; the remaining connections echo
+/// it). An **empty** `session_id` is byte-for-byte identical to
+/// [`client_connect`] (additive: the default path is unchanged).
+pub fn client_connect_with_id<S: Read + Write>(
+    stream: &mut S,
+    max_version: u32,
+    incoming: bool,
+    fd_mode: u8,
+    session_id: &[u8],
+) -> RpcResult<Android13PlusCodec> {
     let hdr_codec = Android13PlusCodec::with_version(max_version)?;
     write_all_raw(
         stream,
-        &hdr_codec.encode_connection_header(incoming, fd_mode, &[]),
+        &hdr_codec.encode_connection_header(incoming, fd_mode, session_id),
     )?;
     write_all_raw(stream, &hdr_codec.encode_connection_init())?;
     let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;

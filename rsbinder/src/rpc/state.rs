@@ -10,13 +10,30 @@
 //! sessions never share an address space and the RPC test suite is
 //! parallel-safe by construction (unlike the kernel binder singleton).
 //!
-//! Ref-count model (single-session loopback, 2-2 scope): a local object
-//! gets one address by *identity* (`Arc` pointer dedup); the entry's
-//! strong count starts at 1 and is decremented by a `DEC_STRONG`
-//! command — when it reaches 0 the entry (and its strong `SIBinder`) is
-//! dropped, so no leak (AC-2.5). The proxy side dedups one `RpcProxy`
-//! per address and sends exactly one `DEC_STRONG` when that proxy's
-//! last `Arc` drops.
+//! Ref-count model (AOSP `RpcState` `BinderNode::timesSent` /
+//! `flushExcessBinderRefs` — subplan 2-12 Phase A **F7**): a local
+//! object gets one address by *identity* (`Arc` pointer dedup, so the
+//! same object always marshals to the same address), but the entry's
+//! strong count is **`timesSent`**: it starts at 1 on the first send
+//! and is **incremented on every subsequent send** (each flatten to
+//! the peer is one reference the peer will eventually `DEC_STRONG`).
+//! Each inbound `DEC_STRONG` decrements it; the entry (and its strong
+//! `SIBinder`) is dropped at 0, so there is no leak (AC-2.5).
+//!
+//! The peer dedups one `RpcProxy` per address. To keep the books
+//! balanced when it *receives the same binder more than once* while a
+//! proxy is still live, it owes the sender one `DEC_STRONG` per excess
+//! receipt — the rsbinder equivalent of AOSP `flushExcessBinderRefs`
+//! ([`RpcState::remote_proxy`] reports the excess; the session sends
+//! the `DEC_STRONG` **outside** the state lock — see
+//! `RpcSessionInner::read_binder`). Net: exactly one `DEC_STRONG` per
+//! send ⇒ balanced ⇒ no leak whether the binder is sent N× to one
+//! peer (dedup + N−1 excess DECs + 1 drop DEC) **or** once to each of
+//! N independent peer connections sharing a session (Phase A0b: N
+//! sends, N drop DECs). Before F7 the count was pinned at 1 by
+//! identity, which silently broke the latter (the first connection's
+//! proxy drop freed the node ⇒ the sibling connection's proxy
+//! `DeadObject`).
 
 use std::collections::HashMap;
 use std::sync::{self, Arc};
@@ -72,15 +89,24 @@ impl RpcState {
     }
 
     /// Register a local object leaving this process and return its
-    /// session-stable address (android `onBinderLeaving`). Idempotent
-    /// by object identity: sending the same object twice reuses the
-    /// address and does not double the strong count (object-identity
-    /// semantics — sufficient and correct for single-session loopback,
-    /// AC-2.5).
+    /// session-stable address (android `onBinderLeaving`). The address
+    /// is idempotent by object identity (same object ⇒ same address),
+    /// but the strong count is AOSP `timesSent`: **+1 on every send**
+    /// (Phase A F7). The first send creates the node at `strong = 1`; a
+    /// re-send of the same object reuses the address and **increments**
+    /// `strong` (the peer will `DEC_STRONG` once per receipt — directly
+    /// at proxy drop, or as an `flushExcessBinderRefs` excess DEC if it
+    /// dedups; see the module doc). Pre-F7 this branch returned without
+    /// bumping, which under Phase A0b multi-connection let the first
+    /// connection's DEC free a node still referenced over a sibling
+    /// connection (`DeadObject`).
     pub fn on_binder_leaving(&mut self, binder: &SIBinder) -> RpcAddress {
         let ptr = binder_ptr(binder);
-        if let Some(addr) = self.local_by_ptr.get(&ptr) {
-            return *addr;
+        if let Some(&addr) = self.local_by_ptr.get(&ptr) {
+            if let Some(node) = self.local_nodes.get_mut(&addr) {
+                node.strong += 1;
+            }
+            return addr;
         }
         let addr = RpcAddress::unique(&mut self.addr_counter, self.space);
         self.local_nodes.insert(
@@ -118,19 +144,31 @@ impl RpcState {
 
     /// Get or create the deduped remote-proxy `SIBinder` for `addr`.
     /// `make` is only called when there is no live proxy yet.
-    pub fn remote_proxy<F>(&mut self, addr: RpcAddress, make: F) -> SIBinder
+    ///
+    /// Returns `(proxy, excess)`. `excess == true` means a still-live
+    /// proxy for `addr` was reused — i.e. this is a **duplicate
+    /// receipt** of a binder we already proxy. Because the sender bumps
+    /// its `timesSent` on every send ([`on_binder_leaving`]) but our
+    /// one deduped proxy only `DEC_STRONG`s once at its drop, the
+    /// caller owes the sender one excess `DEC_STRONG` for this receipt
+    /// (AOSP `flushExcessBinderRefs`). The caller must send it
+    /// **outside** the `RpcState` lock (no I/O under the lock — see
+    /// `RpcSessionInner::read_binder`). A fresh / re-minted proxy
+    /// (dead `Weak`) is **not** excess: it is the single proxy that
+    /// will itself `DEC_STRONG` at drop.
+    pub fn remote_proxy<F>(&mut self, addr: RpcAddress, make: F) -> (SIBinder, bool)
     where
         F: FnOnce() -> SIBinder,
     {
         if let Some(weak) = self.remote_proxies.get(&addr) {
             if let Some(arc) = weak.upgrade() {
-                return SIBinder::from_arc(arc);
+                return (SIBinder::from_arc(arc), true);
             }
         }
         let sib = make();
         self.remote_proxies
             .insert(addr, Arc::downgrade(sib.as_arc()));
-        sib
+        (sib, false)
     }
 
     /// Forget the remote-proxy table entry for `addr`, but **only if
@@ -292,23 +330,29 @@ mod tests {
         // (cached `Weak` now dead) — but P1's `Drop` has not yet run.
         let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let p1 = Arc::as_ptr(sib1.as_arc()) as *const ();
-        let got1 = st.remote_proxy(addr, || sib1.clone());
+        let (got1, ex1) = st.remote_proxy(addr, || sib1.clone());
+        assert!(!ex1, "first receipt mints a proxy — not an excess");
         drop(got1);
         drop(sib1);
 
         // Concurrent re-resolve: another `read_binder` for the SAME
         // address sees the dead `Weak` and mints + re-caches P2.
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let got2 = st.remote_proxy(addr, || sib2.clone());
+        let (got2, ex2) = st.remote_proxy(addr, || sib2.clone());
+        assert!(!ex2, "dead-Weak ⇒ re-mint, not an excess receipt");
         let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
 
         // P1's delayed `Drop` now runs `forget_remote_if(addr, P1)`.
         // The old unconditional remove would evict the live P2 slot.
         st.forget_remote_if(&addr, p1);
-        let again = st.remote_proxy(addr, || panic!("must dedup to P2, not re-make"));
+        let (again, ex_again) = st.remote_proxy(addr, || panic!("must dedup to P2, not re-make"));
         assert!(
             Arc::ptr_eq(again.as_arc(), got2.as_arc()),
             "stale P1 Drop must not split the per-address dedup (AC-2.5/P5)"
+        );
+        assert!(
+            ex_again,
+            "reusing the live P2 is a duplicate receipt (excess)"
         );
 
         // The genuinely-current proxy's Drop *does* evict.
@@ -318,7 +362,7 @@ mod tests {
         st.forget_remote_if(&addr, p2);
         let sib3 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let mut remade = false;
-        let _p3 = st.remote_proxy(addr, || {
+        let (_p3, ex3) = st.remote_proxy(addr, || {
             remade = true;
             sib3.clone()
         });
@@ -326,5 +370,58 @@ mod tests {
             remade,
             "after identity-checked forget, the address re-mints"
         );
+        assert!(!ex3, "re-mint after forget is a fresh proxy — not excess");
+    }
+
+    /// **Phase A F7** balance (state level): the AOSP
+    /// `timesSent`/`flushExcessBinderRefs` accounting nets to exactly
+    /// one `DEC_STRONG` per send, so the node is freed (no leak —
+    /// AC-2.5) in both shapes the model must support.
+    #[test]
+    fn f7_timessent_balance_no_leak() {
+        // (a) Same object sent N× to *one* peer that dedups to one
+        //     proxy: server strong = N (timesSent); peer owes N−1
+        //     excess DECs + 1 at proxy drop = N.
+        let mut srv = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = srv.on_binder_leaving(&b);
+        let a2 = srv.on_binder_leaving(&b);
+        let a3 = srv.on_binder_leaving(&b);
+        assert_eq!((a, a), (a2, a3), "identity ⇒ same address on re-send");
+        assert_eq!(srv.local_node_count(), 1, "one node, strong = timesSent");
+        // Peer side: 3 receipts of the same addr, proxy stays live ⇒
+        // receipts 2 and 3 are excess (2 flush DECs); proxy drop = 1.
+        let mut peer = RpcState::new(AddressSpace::Initiator);
+        let pb = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let (_p, e1) = peer.remote_proxy(a, || pb.clone());
+        let (_p2, e2) = peer.remote_proxy(a, || pb.clone());
+        let (_p3, e3) = peer.remote_proxy(a, || pb.clone());
+        assert_eq!(
+            (e1, e2, e3),
+            (false, true, true),
+            "1st mints; 2nd/3rd are excess receipts (owe a flush DEC)"
+        );
+        // 2 excess DECs + 1 proxy-drop DEC = 3 = timesSent ⇒ freed.
+        assert!(!srv.dec_strong_local(&a));
+        assert!(!srv.dec_strong_local(&a));
+        assert!(srv.dec_strong_local(&a), "3rd DEC frees the node");
+        assert_eq!(srv.local_node_count(), 0, "no leak (AC-2.5)");
+
+        // (b) Same object sent once to each of 2 *independent* peer
+        //     connections sharing one server session (Phase A0b): 2
+        //     sends ⇒ strong 2; each peer's lone proxy DECs once ⇒ 2.
+        //     Pre-F7 this freed the node on the *first* DEC (the F7
+        //     bug); now the sibling survives until the 2nd.
+        let mut s = RpcState::new(AddressSpace::Acceptor);
+        let o = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let x = s.on_binder_leaving(&o); // conn #1 send
+        let _ = s.on_binder_leaving(&o); // conn #2 send (timesSent ⇒ 2)
+        assert!(
+            !s.dec_strong_local(&x),
+            "conn #1 proxy drop must NOT free a node conn #2 still holds (F7)"
+        );
+        assert!(s.lookup_local(&x).is_some(), "sibling still reachable");
+        assert!(s.dec_strong_local(&x), "conn #2 proxy drop frees it");
+        assert_eq!(s.local_node_count(), 0, "no leak");
     }
 }
