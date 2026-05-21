@@ -715,7 +715,7 @@ impl Generator {
                     generator.init_value(
                         constant.const_expr.as_ref(),
                         InitParam::builder().with_const(true),
-                    ),
+                    )?,
                 ));
             }
 
@@ -898,7 +898,7 @@ pub mod {mod} {{
                             generator.init_value(
                                 var.const_expr.as_ref(),
                                 InitParam::builder().with_const(true),
-                            ),
+                            )?,
                         ));
                     } else {
                         let init_value = match generator.value_type {
@@ -915,7 +915,7 @@ pub mod {mod} {{
                                     .with_const(false)
                                     .with_vintf(is_vintf)
                                     .with_crate_name(self.get_crate_name()),
-                            ),
+                            )?,
                         ))
                     }
                 } else {
@@ -959,50 +959,25 @@ pub mod {mod} {{
             return;
         }
 
-        let mut enum_val: i64 = 0;
+        let enum_type = decl.namespace.to_string(Namespace::AIDL);
+        let lookup_decl = parser::LookupDecl {
+            decl: parser::Declaration::Enum(decl.clone()),
+            ns: decl.namespace.clone(),
+            name: Namespace::new(&enum_type, Namespace::AIDL),
+        };
 
         for enumerator in &decl.enumerator_list {
             let member_name = &enumerator.identifier;
-
-            if let Some(const_expr) = &enumerator.const_expr {
-                // Try to compute the value, but handle cases where it might reference other enum members
-                let computed_val = match const_expr.calculate() {
-                    Ok(calculated) => match calculated.value {
-                        crate::const_expr::ValueType::Name(_) => {
-                            // This is an unresolved reference, use current enum_val as fallback
-                            enum_val
-                        }
-                        _ => calculated.to_i64().unwrap_or(enum_val),
-                    },
-                    Err(_) => enum_val,
-                };
-
+            if let Some(expr) =
+                parser::enum_member_const_expr_from_lookup(&lookup_decl, member_name)
+            {
                 parser::register_symbol(
                     member_name,
-                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
-                        enum_name: decl.name.clone(),
-                        member_name: member_name.to_string(),
-                        value: computed_val,
-                    }),
+                    expr,
                     parser::SymbolType::EnumMember,
-                    Some(&decl.name),
-                );
-
-                enum_val = computed_val;
-            } else {
-                parser::register_symbol(
-                    member_name,
-                    crate::const_expr::ConstExpr::new(crate::const_expr::ValueType::Reference {
-                        enum_name: decl.name.clone(),
-                        member_name: member_name.to_string(),
-                        value: enum_val,
-                    }),
-                    parser::SymbolType::EnumMember,
-                    Some(&decl.name),
+                    Some(&enum_type),
                 );
             }
-
-            enum_val += 1;
         }
     }
 
@@ -1019,16 +994,19 @@ pub mod {mod} {{
         // First pass: register all enum members with their names for resolution
         Self::register_enum_members(decl);
 
-        // Second pass: resolve all values now that all members are registered
-        let mut enum_val: i64 = 0;
+        let lookup_decl = parser::LookupDecl {
+            decl: parser::Declaration::Enum(decl.clone()),
+            ns: decl.namespace.clone(),
+            name: Namespace::new(&decl.namespace.to_string(Namespace::AIDL), Namespace::AIDL),
+        };
+
+        // Second pass: render the values resolved by the shared enum member path.
         for enumerator in &decl.enumerator_list {
-            if let Some(const_expr) = &enumerator.const_expr {
-                if let Some(val) = const_expr.calculate().ok().and_then(|c| c.to_i64().ok()) {
-                    enum_val = val;
-                }
+            if let Some(expr) =
+                parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
+            {
+                members.push((enumerator.identifier.to_owned(), expr.to_i64().unwrap_or(0)));
             }
-            members.push((enumerator.identifier.to_owned(), enum_val));
-            enum_val += 1;
         }
 
         let mut context = self.new_context();
@@ -1078,7 +1056,7 @@ pub mod {mod} {{
                         generator.init_value(
                             var.const_expr.as_ref(),
                             InitParam::builder().with_const(true),
-                        ),
+                        )?,
                     ));
                 } else {
                     members.push((

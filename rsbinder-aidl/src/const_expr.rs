@@ -156,6 +156,8 @@ pub enum ValueType {
     Holder,
     UserDefined(String),
     Reference {
+        // Full AIDL enum type. Short enum names can collide across packages.
+        enum_type: String,
         enum_name: String,
         member_name: String,
         value: i64,
@@ -413,6 +415,7 @@ impl ValueType {
             ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
             ValueType::Name(_) => self.to_value_string(),
             ValueType::Reference {
+                enum_type,
                 enum_name,
                 member_name,
                 value,
@@ -422,7 +425,7 @@ impl ValueType {
                     format!("{}", value)
                 } else {
                     // Use proper namespace resolution for cross-package enum references
-                    match parser::lookup_decl_from_name(enum_name, crate::Namespace::AIDL) {
+                    match parser::lookup_decl_from_name(enum_type, crate::Namespace::AIDL) {
                         Some(lookup_decl) => {
                             let curr_ns = parser::current_namespace();
                             let ns = curr_ns.relative_mod(&lookup_decl.ns);

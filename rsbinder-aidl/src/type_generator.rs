@@ -221,6 +221,18 @@ impl TypeGenerator {
         }
     }
 
+    fn is_interface(value_type: &ValueType) -> bool {
+        match value_type {
+            ValueType::UserDefined(name) => {
+                matches!(
+                    lookup_decl_from_name(name, crate::Namespace::AIDL),
+                    Some(lookup_decl) if matches!(lookup_decl.decl, Declaration::Interface(_))
+                )
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_variable_array(&self) -> bool {
         if matches!(self.value_type, ValueType::Array(_)) {
             let sub_type = self.array_types.first().expect("array_types is empty.");
@@ -235,14 +247,23 @@ impl TypeGenerator {
     pub fn can_be_defaulted(value_type: &ValueType, is_struct: bool) -> bool {
         if is_struct {
             Self::is_primitive(value_type)
-                || matches!(
-                    value_type,
+                || match value_type {
                     ValueType::String(_)
-                        | ValueType::Array(_)
-                        | ValueType::Map(_, _)
-                        | ValueType::Holder
-                        | ValueType::UserDefined(_)
-                )
+                    | ValueType::Array(_)
+                    | ValueType::Map(_, _)
+                    | ValueType::Holder => true,
+                    ValueType::UserDefined(name) => {
+                        match lookup_decl_from_name(name, crate::Namespace::AIDL) {
+                            // Strong<dyn IFoo> has no sensible Default, so struct
+                            // interface fields must be represented as Option<Strong<_>>.
+                            Some(lookup_decl) => {
+                                !matches!(lookup_decl.decl, Declaration::Interface(_))
+                            }
+                            None => true,
+                        }
+                    }
+                    _ => false,
+                }
         } else {
             Self::is_primitive(value_type)
                 || match value_type {
@@ -342,7 +363,9 @@ impl TypeGenerator {
         let type_name = self.array_type_name(&array_info.value_type);
 
         let value_str = if is_struct {
-            if self.is_nullable && Self::is_aidl_nullable(&array_info.value_type) {
+            if (self.is_nullable && Self::is_aidl_nullable(&array_info.value_type))
+                || !Self::can_be_defaulted(&array_info.value_type, is_struct)
+            {
                 format!("Option<{type_name}>")
             } else {
                 type_name
@@ -416,7 +439,9 @@ impl TypeGenerator {
             Direction::Inout => {
                 if self.is_nullable {
                     format!("Vec<Option<{type_name}>>")
-                } else if Self::can_be_defaulted(&sub_type.value_type, true) {
+                } else if Self::can_be_defaulted(&sub_type.value_type, true)
+                    || Self::is_interface(&sub_type.value_type)
+                {
                     format!("Vec<{type_name}>")
                 } else {
                     format!("Vec<Option<{type_name}>>")
@@ -682,26 +707,202 @@ impl TypeGenerator {
         }
     }
 
-    pub(crate) fn init_value(&self, const_expr: Option<&ConstExpr>, param: InitParam) -> String {
-        match const_expr {
+    fn enum_lookup(&self) -> Option<LookupDecl> {
+        let ValueType::UserDefined(name) = &self.value_type else {
+            return None;
+        };
+
+        let lookup_decl = lookup_decl_from_name(name, crate::Namespace::AIDL)?;
+        if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
+            Some(lookup_decl)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_enum_reference_for_target(expr: &ConstExpr, target_enum: &str) -> ConstExpr {
+        match &expr.value {
+            ValueType::Name(name) => {
+                parser::name_to_enum_member_const_expr(name, Some(target_enum))
+                    .unwrap_or_else(|| expr.clone())
+            }
+            ValueType::Array(values) => ConstExpr::new(ValueType::Array(
+                values
+                    .iter()
+                    .map(|value| Self::resolve_enum_reference_for_target(value, target_enum))
+                    .collect(),
+            )),
+            ValueType::Expr { lhs, operator, rhs } => ConstExpr::new(ValueType::Expr {
+                lhs: Box::new(Self::resolve_enum_reference_for_target(lhs, target_enum)),
+                operator: operator.clone(),
+                rhs: Box::new(Self::resolve_enum_reference_for_target(rhs, target_enum)),
+            }),
+            ValueType::Unary { operator, expr } => ConstExpr::new(ValueType::Unary {
+                operator: operator.clone(),
+                expr: Box::new(Self::resolve_enum_reference_for_target(expr, target_enum)),
+            }),
+            _ => expr.clone(),
+        }
+    }
+
+    fn validate_enum_value(
+        &self,
+        expr: &ConstExpr,
+        target_lookup: &LookupDecl,
+    ) -> Result<ConstExpr, AidlError> {
+        let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
+        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
+        let calculated = resolved
+            .calculate()
+            .map_err(|e| make_type_error(e.message, self.type_span))?;
+
+        match &calculated.value {
+            ValueType::Reference { enum_type, .. } => {
+                // Same member names are common across enums; ensure a default
+                // belongs to the field's enum family before rendering Rust.
+                if enum_type != &target_enum {
+                    return Err(make_type_error(
+                        format!(
+                            "enum default value {} does not match target enum {}",
+                            calculated.to_value_string(),
+                            target_enum
+                        ),
+                        self.type_span,
+                    ));
+                }
+
+                Ok(calculated)
+            }
+            ValueType::Name(name) => Err(make_type_error(
+                format!(
+                    "unresolved enum default value {} for target enum {}",
+                    name, target_enum
+                ),
+                self.type_span,
+            )),
+            _ => Err(make_type_error(
+                format!(
+                    "enum default value {} is not a member of target enum {}",
+                    calculated.to_value_string(),
+                    target_enum
+                ),
+                self.type_span,
+            )),
+        }
+    }
+
+    fn init_enum_value(
+        &self,
+        expr: &ConstExpr,
+        target_lookup: &LookupDecl,
+        param: InitParam,
+    ) -> Result<String, AidlError> {
+        let calculated = self.validate_enum_value(expr, target_lookup)?;
+        Ok(calculated
+            .value
+            .to_init(param.with_fixed_array(false).with_nullable(false)))
+    }
+
+    fn init_enum_array_value(
+        &self,
+        expr: &ConstExpr,
+        target_lookup: &LookupDecl,
+        param: InitParam,
+        is_fixed_array: bool,
+        is_nullable: bool,
+    ) -> Result<String, AidlError> {
+        let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
+        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
+        let calculated = resolved
+            .calculate()
+            .map_err(|e| make_type_error(e.message, self.type_span))?;
+
+        let ValueType::Array(values) = calculated.value else {
+            return Err(make_type_error(
+                format!(
+                    "enum array default value {} is not an array",
+                    calculated.to_value_string()
+                ),
+                self.type_span,
+            ));
+        };
+
+        let mut enum_values = Vec::new();
+        for value in values {
+            enum_values.push(self.validate_enum_value(&value, target_lookup)?);
+        }
+
+        Ok(ValueType::Array(enum_values).to_init(
+            param
+                .with_fixed_array(is_fixed_array)
+                .with_nullable(is_nullable),
+        ))
+    }
+
+    fn init_array_value(
+        expr: &ConstExpr,
+        array_info: &ArrayInfo,
+        param: InitParam,
+        is_nullable: bool,
+    ) -> String {
+        match expr
+            .calculate()
+            .and_then(|c| c.convert_to(&array_info.value_type))
+        {
+            Ok(converted) => converted.value.to_init(
+                param
+                    .with_fixed_array(array_info.is_fixed())
+                    .with_nullable(is_nullable),
+            ),
+            Err(_) => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
+        }
+    }
+
+    pub(crate) fn init_value(
+        &self,
+        const_expr: Option<&ConstExpr>,
+        param: InitParam,
+    ) -> Result<String, AidlError> {
+        let init_value = match const_expr {
             Some(expr) => {
                 let init_str = if let ValueType::Array(_) = self.value_type {
                     let array_info = self.array_types.first().unwrap();
                     let is_nullable =
                         self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
-                    match expr
-                        .calculate()
-                        .and_then(|c| c.convert_to(&array_info.value_type))
-                    {
-                        Ok(converted) => converted.value.to_init(
-                            param
-                                .with_fixed_array(array_info.is_fixed())
-                                .with_nullable(is_nullable),
-                        ),
-                        Err(_) => ValueType::Void
-                            .to_init(param.with_fixed_array(false).with_nullable(false)),
+                    if let ValueType::UserDefined(name) = &array_info.value_type {
+                        if let Some(lookup_decl) =
+                            lookup_decl_from_name(name, crate::Namespace::AIDL)
+                        {
+                            if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
+                                self.init_enum_array_value(
+                                    expr,
+                                    &lookup_decl,
+                                    param,
+                                    array_info.is_fixed(),
+                                    is_nullable,
+                                )?
+                            } else {
+                                Self::init_array_value(expr, array_info, param, is_nullable)
+                            }
+                        } else {
+                            Self::init_array_value(expr, array_info, param, is_nullable)
+                        }
+                    } else {
+                        Self::init_array_value(expr, array_info, param, is_nullable)
                     }
                 } else {
+                    if let Some(enum_lookup) = self.enum_lookup() {
+                        return self
+                            .init_enum_value(expr, &enum_lookup, param)
+                            .map(|init_str| {
+                                if self.is_nullable {
+                                    format!("Some({init_str})")
+                                } else {
+                                    init_str
+                                }
+                            });
+                    }
+
                     match expr.calculate() {
                         Ok(calculated) => {
                             // Check if we have an enum reference and target is a primitive type
@@ -739,7 +940,9 @@ impl TypeGenerator {
                 }
             }
             None => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
-        }
+        };
+
+        Ok(init_value)
     }
 }
 
