@@ -714,3 +714,123 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+// PR #121 — parcelable with a non-null interface field.
+//
+// Pre-#121 generated `pub r#op: rsbinder::Strong<dyn IFoo>` for this field,
+// which fails to compile because `Strong<_>` has no `Default` impl (verified
+// against master prior to PR #121 — produced exactly that non-compiling
+// output). PR #121 now wraps interface fields in `Option<>`, matching AOSP
+// `aidl_to_rust.cpp` `TypeNeedsOption` for PARCELABLE_FIELD storage.
+//
+// Note: the AIDL non-null contract is NOT enforced at the Rust type level
+// — a caller can send `None` and the peer will reject at unmarshal time.
+// This mirrors AOSP's Rust backend behavior.
+#[test]
+fn test_pr121_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Error>> {
+    let gen = rsbinder_aidl::Generator::new(false, false);
+
+    let doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "Holder.aidl",
+        r#"
+        package test.iface;
+
+        interface IFoo {
+            void noop();
+        }
+
+        parcelable Holder {
+            IFoo op;
+        }
+    "#,
+    ))?;
+
+    let res = gen.document(&doc)?;
+    let output = &res.1;
+
+    let holder_field = output.lines().find(|l| l.contains("r#op:")).unwrap_or("");
+    assert!(
+        holder_field.contains("Option<rsbinder::Strong<dyn super::IFoo::IFoo>>"),
+        "non-null interface field must be Option<Strong<dyn _>>, got: {}",
+        holder_field
+    );
+
+    // And the default impl must compile (Option's Default is None).
+    assert!(
+        output.contains("r#op: Default::default()"),
+        "Default impl must use Default::default() for the Option field, got:\n{}",
+        output
+    );
+
+    Ok(())
+}
+
+// PR #121 — cross-enum mismatch is rejected.
+//
+// Pre-#121, a parcelable `HardwareAuthenticatorType` field defaulting to
+// `Digest.NONE` silently generated `super::Digest::Digest::NONE` — a wrong-
+// type initializer that would only be caught by rustc compiling the
+// generated code (or might compile accidentally if both enums share the
+// same backing and the value coerces). PR #121's `validate_enum_value`
+// now rejects this at AIDL-parse time with a clear diagnostic.
+//
+// AOSP `aidl_to_rust.cpp:89-93` silently re-targets `Bar.X` for a `Foo`
+// field to `Foo::X` (using only the suffix). rsbinder is intentionally
+// stricter; real AIDL never writes this pattern, so this test also
+// documents the divergence rather than guarding a common case.
+#[test]
+fn test_pr121_cross_enum_mismatch_is_rejected() -> Result<(), Box<dyn Error>> {
+    let gen = rsbinder_aidl::Generator::new(false, false);
+
+    let digest_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "Digest.aidl",
+        r#"
+        package keymint;
+
+        @Backing(type="int")
+        enum Digest {
+            NONE = 7,
+        }
+    "#,
+    ))?;
+
+    let auth_type_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "HardwareAuthenticatorType.aidl",
+        r#"
+        package keymint;
+
+        @Backing(type="int")
+        enum HardwareAuthenticatorType {
+            NONE = 0,
+        }
+    "#,
+    ))?;
+
+    let parcelable_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
+        "BadSpec.aidl",
+        r#"
+        package keymint;
+
+        import keymint.Digest;
+        import keymint.HardwareAuthenticatorType;
+
+        parcelable BadSpec {
+            HardwareAuthenticatorType authenticatorType = Digest.NONE;
+        }
+    "#,
+    ))?;
+
+    let _ = gen.document(&digest_doc)?;
+    let _ = gen.document(&auth_type_doc)?;
+    let result = gen.document(&parcelable_doc);
+
+    let err = result.expect_err("cross-enum mismatch must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not match target enum") || msg.contains("HardwareAuthenticatorType"),
+        "error must mention the target-enum mismatch, got: {}",
+        msg
+    );
+
+    Ok(())
+}
