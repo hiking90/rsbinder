@@ -1,29 +1,34 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-14 (A0.1): the *register*-side companion to 2-13's
-//! [`accessor_16`](super::accessor_16) consume-side bridge. This module
-//! defines the building blocks rsbinder needs to **vend** an
-//! `IAccessor` binder — the enum describing the socket address a
-//! `LocalAccessor` will hand to a client and the closure type that maps
-//! an instance name to such an address.
-//!
-//! The actual `LocalAccessor` `BnAccessor` implementation and the
-//! process-local `add_accessor_provider` registry land in subsequent
-//! commits (A0.3 / A.4); this commit is the typed plumbing they will
-//! share.
+//! Register side of the RPC Accessor bridge — the AOSP `createAccessor` /
+//! `addAccessorProvider` analogue in pure Rust. Lets a process **vend**
+//! an `IAccessor` binder without going through the system service
+//! manager: a [`LocalAccessor`] implements `BnAccessor`, a
+//! provider closure maps an instance name to an [`AccessorSockAddr`],
+//! and `addConnection()` opens a connected socket whose `OwnedFd` rides
+//! back over the kernel binder reply. The consume side
+//! ([`accessor_16`](super::accessor_16)) then performs the v2/v1
+//! handshake against that fd.
 //!
 //! Cross-platform: the [`Unix`](AccessorSockAddr::Unix) variant is
-//! always present so macOS host hermetic tests (subplan 2-14 D.8.a) can
-//! exercise the register-side path without `rpc-vsock` /
-//! `rpc-tcp-debug` features. `Vsock`/`Inet` variants are present in the
-//! type at all times for ABI stability; whether they can be
-//! *connected* is a runtime check inside the future
-//! `connect_*_owned_fd` helpers (A0.2) — feature-disabled variants
-//! map to `ERROR_UNSUPPORTED_SOCKET_FAMILY` so an instance configured
-//! for a backend the binary wasn't built with surfaces as the same
-//! AOSP-faithful service-specific error a wrong-family `addConnection`
-//! returns.
+//! always present so macOS host hermetic tests can exercise the
+//! register-side path without `rpc-vsock` / `rpc-tcp-debug` features.
+//! `Vsock`/`Inet` variants are present in the type at all times for ABI
+//! stability; whether they can be *connected* is a runtime check
+//! inside the [`AccessorSockAddr::connect_owned_fd`] family of helpers
+//! — feature-disabled variants map to `ERROR_UNSUPPORTED_SOCKET_FAMILY`
+//! so an instance configured for a backend the binary wasn't built with
+//! surfaces as the same AOSP-faithful service-specific error a
+//! wrong-family `addConnection` returns.
+//!
+//! ## Implementation history
+//!
+//! Originally landed under plan 2-14 (phases A0.1 / A0.2 / A0.3 / A.4 /
+//! A.5) with the D.9 STAGE3 real-libbinder gate as the non-negotiable
+//! validation against android-16 emulator. Plan references are
+//! preserved in commit messages and the long-form plan doc; user-facing
+//! docstrings here describe the AOSP analogue, not the plan tag.
 
 #![cfg(feature = "rpc")]
 

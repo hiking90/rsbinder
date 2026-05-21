@@ -57,7 +57,7 @@ fn root() -> SIBinder {
 // ---- AC-6.3: generated stub e2e over each transport -----------------
 
 fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
-    let server = RpcSession::new(server_t, AddressSpace::Acceptor);
+    let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(root());
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
@@ -65,7 +65,7 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     });
 
     {
-        let client = RpcSession::new(client_t, AddressSpace::Initiator);
+        let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
         let sib = client.get_root().expect("get_root");
 
         // The single generated stub: `try_from` → `Proxy::from_binder`

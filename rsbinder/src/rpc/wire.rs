@@ -292,10 +292,20 @@ impl WireCodec for R34Codec {
     }
 
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
-        if buf.len() < 4 {
-            return Err(RpcError::Protocol("session preamble < 4 bytes"));
-        }
-        Ok(i32::from_le_bytes(buf[..4].try_into().unwrap()))
+        // m4 fix (review 2026-05-21): strict-equal. The R34 preamble is
+        // exactly a bare `int32` (4 B); `encode_session_preamble` emits
+        // exactly 4 B; `decode_message` enforces frame-size-exact on
+        // every other path. Without `!= 4`, a peer that sends 5+ bytes
+        // would have the trailing slop silently consumed by the next
+        // recv, and an empty buf or a 2-byte stub would not be
+        // distinguished from a peer that didn't speak the preamble at
+        // all. The fuzz target's `input.len().min(4)` slice still hits
+        // this fn with len ≤ 4, so the only behavior change is
+        // rejecting genuinely malformed input.
+        let arr: [u8; 4] = buf
+            .try_into()
+            .map_err(|_| RpcError::Protocol("session preamble must be exactly 4 bytes"))?;
+        Ok(i32::from_le_bytes(arr))
     }
 }
 

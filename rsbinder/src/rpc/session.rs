@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -222,17 +223,20 @@ impl std::fmt::Debug for RpcSessionId {
 /// **Global-free** (P6 — no `static` counter); `getrandom` is a
 /// stateless syscall (`getrandom(2)` on Linux, `SecRandomCopyBytes`
 /// on macOS), so the `rpc_stack_has_no_globals` gate stays clean.
-fn gen_rpc_session_id() -> RpcSessionId {
+fn gen_rpc_session_id() -> RpcResult<RpcSessionId> {
     let mut id = [0u8; 32];
-    // `getrandom` only fails on platforms without a working CSPRNG —
-    // not a runtime condition rsbinder can recover from, and the only
-    // sensible action is to refuse to start the RPC session rather
-    // than mint a predictable id. Surface the underlying error in the
-    // panic message (`getrandom::Error: Display`) for diagnostics —
-    // an `.expect(&'static str)` would lose it.
-    getrandom::getrandom(&mut id)
-        .unwrap_or_else(|e| panic!("CSPRNG getrandom failed for RPC session id: {e}"));
-    RpcSessionId::new(id)
+    // M5 fix (review 2026-05-21): surface a `getrandom` failure as a
+    // recoverable `RpcError::Io` instead of panicking out of a public
+    // constructor. `getrandom(2)` *can* fail in early-boot containers
+    // (`EAGAIN`/`EINTR` mapping in the `getrandom` crate), and prior
+    // to this the panic unwound through `RpcSession::new`'s
+    // infallible signature with no way for callers to handle.
+    getrandom::getrandom(&mut id).map_err(|e| {
+        RpcError::Io(std::io::Error::other(
+            format!("CSPRNG getrandom failed for RPC session id: {e}"),
+        ))
+    })?;
+    Ok(RpcSessionId::new(id))
 }
 
 /// RAII clear for the `client_transact` reply read-deadline (AC-3.8).
@@ -281,6 +285,18 @@ impl Drop for ReplyDeadlineGuard<'_> {
 /// an early `?`/panic out of `dispatch_transact` can never leave the
 /// sticky `SO_RCVTIMEO` desynchronized for the rest of the reply loop
 /// (the pre-T1-2 manual clear/re-arm pair could).
+///
+/// **Cross-session escape (M4 caveat, review 2026-05-21)**: this guard
+/// lifts only the *outer* transport's deadline. A user handler that
+/// — during a same-thread nested dispatch — issues an outbound
+/// transact on a *different* `RpcSession` will block on **that
+/// session's** own deadline (or block forever if that session has
+/// none). If the inner session's peer never replies, this guard's
+/// `Drop` cannot restore the outer deadline until `dispatch_transact`
+/// returns, so the outer caller also hangs indefinitely. Callers
+/// driving multi-session relay logic should set a deadline on every
+/// session they may transact through (`set_timeout(Some(d))`), not
+/// only on the outer one. Same-session nested dispatch is unaffected.
 struct NestedDeadlineGuard<'a> {
     transport: &'a dyn RpcTransport,
     restore: Option<Duration>,
@@ -604,6 +620,14 @@ pub struct RpcSessionInner {
     /// a profile-mismatch — see [`add_incoming_slot`]).
     profile: WireProfile,
     self_weak: Mutex<Weak<RpcSessionInner>>,
+    /// C1 fix (review 2026-05-21): non-blocking `DEC_STRONG` hand-off.
+    /// `RpcProxy::drop` enqueues here and returns immediately; a
+    /// dedicated reaper thread (spawned in [`with_shared`]) drains the
+    /// queue and runs the blocking `find_conn` + `send_msg` off the
+    /// user thread. Inner drop closes the channel ⇒ reaper exits via
+    /// `recv` error; in-flight enqueues drain naturally (mpsc holds
+    /// queued items until the receiver consumes them).
+    dec_strong_tx: mpsc::Sender<RpcAddress>,
     /// Session-wide state shared across this session's slots **and**
     /// (server-side A0b residual) across multiple `RpcSessionInner`
     /// instances bound to the same session id: the current
@@ -741,6 +765,31 @@ impl RpcSessionInner {
             //     (`add_*_slot`). Spurious wakes loop back to scan.
             st = self.slot_cv.wait(st).expect("slot_cv poisoned");
         }
+    }
+
+    /// C1 fix (review 2026-05-21): non-blocking variant of [`find_conn`]
+    /// for `RpcProxy::drop`'s fast path. Returns `None` instead of
+    /// waiting on `slot_cv` when the pool has no free slot. Does NOT
+    /// touch the reentrant `DRIVING` short-circuit (callers in Drop
+    /// context are by definition not the slot's driver).
+    fn try_find_conn(&self) -> Option<ConnGuard<'_>> {
+        let tid = current_tid();
+        let sess_ptr = self as *const RpcSessionInner as usize;
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        let s = st
+            .slots
+            .iter_mut()
+            .find(|s| s.exclusive_tid == Some(tid) || s.exclusive_tid.is_none())?;
+        s.exclusive_tid = Some(tid);
+        let slot_id = s.id;
+        let transport = Arc::clone(&s.transport);
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        Some(ConnGuard {
+            inner: self,
+            slot_id,
+            transport,
+            reentrant: false,
+        })
     }
 
     /// Same as [`find_conn`] but pins to a **specific** slot id. Used
@@ -1282,6 +1331,47 @@ impl RpcSessionInner {
         }
     }
 
+    /// C1 fix (review 2026-05-21): two-tier `DEC_STRONG` hand-off for
+    /// `RpcProxy::drop`. Drop runs on arbitrary user threads that may
+    /// not be driving a slot of this session — without this guard,
+    /// `send_dec_strong`'s `find_conn(false)` would `cv.wait` on slot
+    /// availability and a hung peer would block the user's `Drop`
+    /// indefinitely.
+    ///
+    /// **Fast path** (no contention): try a non-blocking slot acquire
+    /// via [`try_find_conn`]. The default single-slot session in steady
+    /// state has no contention, so this succeeds immediately and the
+    /// send happens *synchronously* — preserving the byte-and-timing
+    /// ordering AC-2.5 relies on (drop → next ordered round-trip ⇒
+    /// peer has processed DEC_STRONG before the next reply).
+    ///
+    /// **Slow path** (every slot busy): enqueue so Drop returns
+    /// immediately. The dedicated reaper thread (spawned in
+    /// [`with_shared`]) drains the queue and performs the blocking
+    /// send off the user thread. AOSP `RpcSession`'s outgoing
+    /// `sendDecStrongToTarget` is itself synchronous — this two-tier
+    /// shape matches the *user-observable* behavior (sync when
+    /// possible) without paying the hang risk in the contention case.
+    ///
+    /// Send failures are silent — same as the original
+    /// `RpcProxy::drop` semantics (a dead session ⇒ peer
+    /// observationally gone, AOSP parity).
+    pub(crate) fn queue_dec_strong(&self, addr: RpcAddress) {
+        if self.shared.obituary_sent.load(Ordering::Acquire) {
+            return;
+        }
+        // Fast path: synchronous send when a slot is immediately
+        // available. Preserves AC-2.5's FIFO observable timing.
+        if let Some(conn) = self.try_find_conn() {
+            let frame = self.profile.codec().encode_dec_strong(&addr);
+            let _ = self.send_msg(conn.transport(), &frame, &[]);
+            return;
+        }
+        // Slow path: pool is fully exclusive (every slot mid-transact
+        // by a different thread). Hand off to the reaper.
+        let _ = self.dec_strong_tx.send(addr);
+    }
+
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress) -> Result<()> {
         // `RpcProxy::drop` (best-effort) and `read_binder`'s F7
         // excess-flush call this from arbitrary threads/contexts.
@@ -1600,7 +1690,15 @@ impl RpcSession {
     /// the side that connected, [`AddressSpace::Acceptor`] for the
     /// side that accepted (so the two peers never mint colliding
     /// addresses on the shared connection).
-    pub fn new(transport: Box<dyn RpcTransport>, space: AddressSpace) -> RpcSession {
+    /// **M5 fix (review 2026-05-21, breaking API)**: now returns
+    /// `Result` so a `getrandom` failure surfaces as `RpcError::Io`
+    /// instead of panicking out of an infallible constructor. The
+    /// only realistic failure path is early-boot containers without a
+    /// working CSPRNG.
+    pub fn new(
+        transport: Box<dyn RpcTransport>,
+        space: AddressSpace,
+    ) -> RpcResult<RpcSession> {
         // Default = android-12 r34, byte-unchanged.
         RpcSession::with_profile(transport, space, WireProfile::R34(R34Codec))
     }
@@ -1613,8 +1711,12 @@ impl RpcSession {
         transport: Box<dyn RpcTransport>,
         space: AddressSpace,
         profile: WireProfile,
-    ) -> RpcSession {
-        Self::with_shared(transport, profile, Self::fresh_shared(space))
+    ) -> RpcResult<RpcSession> {
+        Ok(Self::with_shared(
+            transport,
+            profile,
+            Self::fresh_shared(space)?,
+        ))
     }
 
     /// A brand-new session's shared state (`live_conns == 1`, the
@@ -1622,8 +1724,8 @@ impl RpcSession {
     /// single-connection path uses exactly one of these, so its
     /// behavior is byte-identical to the pre-A0b single-`transport`
     /// `RpcSessionInner`.
-    fn fresh_shared(space: AddressSpace) -> Arc<SharedSession> {
-        Arc::new(SharedSession {
+    fn fresh_shared(space: AddressSpace) -> RpcResult<Arc<SharedSession>> {
+        Ok(Arc::new(SharedSession {
             state: Mutex::new(RpcState::new(space)),
             async_counter: AtomicU64::new(0),
             root: Mutex::new(None),
@@ -1632,10 +1734,10 @@ impl RpcSession {
             timeout: Mutex::new(None),
             fd_mode: Mutex::new(FileDescriptorTransportMode::None),
             fd_unix_supported: AtomicBool::new(false),
-            rpc_session_id: gen_rpc_session_id(),
+            rpc_session_id: gen_rpc_session_id()?,
             live_conns: AtomicUsize::new(1),
             obituary_sent: AtomicBool::new(false),
-        })
+        }))
     }
 
     /// Wrap `transport` as a connection of an **existing**
@@ -1665,6 +1767,7 @@ impl RpcSession {
             allow_nested: true,
             id: 1,
         };
+        let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
         let inner = Arc::new(RpcSessionInner {
             conn_state: Mutex::new(ConnState {
                 slots: vec![founding],
@@ -1674,8 +1777,17 @@ impl RpcSession {
             profile,
             self_weak: Mutex::new(Weak::new()),
             shared,
+            dec_strong_tx,
         });
         *inner.self_weak.lock().expect("self_weak") = Arc::downgrade(&inner);
+        // C1 fix: reaper thread for non-blocking `DEC_STRONG` from
+        // `RpcProxy::drop`. Detached — `with_shared` is on the user
+        // thread, so we never block its return; inner drop closes the
+        // channel and the reaper exits naturally.
+        let weak_for_reaper = Arc::downgrade(&inner);
+        let _ = std::thread::Builder::new()
+            .name("rsbinder-rpc-reaper".into())
+            .spawn(move || reaper_loop(weak_for_reaper, dec_strong_rx));
         RpcSession { inner }
     }
 
@@ -1767,9 +1879,12 @@ impl RpcSession {
         client_fd_mode: u8,
         server_fd_unix: bool,
         shared: Option<Arc<SharedSession>>,
-    ) -> RpcSession {
+    ) -> RpcResult<RpcSession> {
         let negotiated = codec.version();
-        let shared = shared.unwrap_or_else(|| Self::fresh_shared(AddressSpace::Acceptor));
+        let shared = match shared {
+            Some(s) => s,
+            None => Self::fresh_shared(AddressSpace::Acceptor)?,
+        };
         let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
         if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
             *session
@@ -1779,7 +1894,7 @@ impl RpcSession {
                 .lock()
                 .expect("fd_mode poisoned") = FileDescriptorTransportMode::Unix;
         }
-        session
+        Ok(session)
     }
 
     /// Client role, **opt-in android-13+ versioned wire** (subplan 2-5b
@@ -1865,7 +1980,8 @@ impl RpcSession {
             transport,
             AddressSpace::Initiator,
             WireProfile::Android13Plus(codec),
-        );
+        )
+        .map_err(StatusCode::from)?;
         // v0 (android-13) category-forbids fd-over-RPC; only commit to
         // `Unix` when the negotiated wire is v1+ (else stay `None` and
         // any fd write is the AOSP-faithful `BAD_TYPE` reject).
@@ -1922,13 +2038,14 @@ impl RpcSession {
     ) -> Result<RpcSession> {
         let (transport, codec, client_fd_mode, _client_id) =
             Self::android13plus_accept_handshake(transport, server_max_version)?;
-        Ok(Self::from_android13plus(
+        Self::from_android13plus(
             transport,
             codec,
             client_fd_mode,
             server_fd_unix,
             None,
-        ))
+        )
+        .map_err(StatusCode::from)
     }
 
     /// The negotiated android-13+ wire protocol version
@@ -2131,6 +2248,19 @@ impl RpcSession {
 
     /// Server role: the max-threads value advertised to a client on
     /// `GET_MAX_THREADS` (subplan 2-3 negotiation). Default 1.
+    ///
+    /// **`n ≥ 2` (multi-connection sessions, plan 2-12) is
+    /// EXPERIMENTAL**: hermetic rsbinder↔rsbinder only. The AC-12.6
+    /// real-libbinder gate (2026-05-21) failed under concurrent
+    /// twoway dispatch — libbinder emits
+    /// `RpcState: Expecting 20 but got 0 bytes for RpcWireReply.
+    /// Terminating!` and the session dies. Default `n == 1` is the
+    /// fully-supported single-connection path
+    /// (2-1…2-11 / 2-13 / 2-14 STAGE3 all validated against real
+    /// libbinder). See [`super::RpcServer::set_max_threads`] for the
+    /// server-side wrapper carrying the same warning.
+    ///
+    /// M6 fix (review 2026-05-21).
     pub fn set_max_threads(&self, n: u32) {
         self.inner
             .shared
@@ -2181,7 +2311,7 @@ impl RpcSession {
     /// caller that negotiates does so with exactly one packet (AC-3.4).
     pub fn setup_unix_client(path: impl AsRef<std::path::Path>) -> Result<RpcSession> {
         let t = super::transport::UnixTransport::connect(path)?;
-        Ok(RpcSession::new(Box::new(t), AddressSpace::Initiator))
+        RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
     }
 
     /// Client: connect to a Unix-domain RPC server speaking the
@@ -2397,6 +2527,33 @@ impl RpcSession {
             .lock()
             .expect("rpc state poisoned")
             .local_node_count()
+    }
+}
+
+/// C1 fix (review 2026-05-21): reaper for `RpcProxy::drop`'s deferred
+/// `DEC_STRONG` sends. Owns a [`Weak<RpcSessionInner>`] so it never
+/// keeps the session alive; the inner's [`Drop`] closes the channel
+/// and the reaper exits via `recv`'s `Err`. Drains any queued addrs
+/// before exiting (mpsc preserves buffered items past sender drop).
+///
+/// Sends are best-effort — the original `RpcProxy::drop` semantics
+/// (a dead session ⇒ silent no-op, AOSP parity) are preserved here.
+fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<RpcAddress>) {
+    while let Ok(addr) = rx.recv() {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if inner.shared.obituary_sent.load(Ordering::Acquire) {
+            continue;
+        }
+        // `find_conn(false)` may briefly wait on `slot_cv` if the pool
+        // is exhausted, but the *user* `Drop` already returned — this
+        // wait is contained to the dedicated reaper thread.
+        let conn = inner.find_conn(false);
+        let frame = inner.profile.codec().encode_dec_strong(&addr);
+        let _ = inner.send_msg(conn.transport(), &frame, &[]);
+        drop(conn);
+        drop(inner);
     }
 }
 

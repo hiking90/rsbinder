@@ -381,11 +381,11 @@ impl RpcServer {
 
     /// Build a per-connection r34 session sharing this server's root +
     /// negotiated max-threads (its `RpcState` is fresh — P6 isolation).
-    fn make_session(&self, transport: Box<dyn RpcTransport>) -> RpcSession {
+    fn make_session(&self, transport: Box<dyn RpcTransport>) -> super::RpcResult<RpcSession> {
         // The server accepted this connection ⇒ Acceptor subspace.
-        let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor);
+        let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor)?;
         self.configure_session(&session);
-        session
+        Ok(session)
     }
 
     // --- Subplan 2-12 Phase A0b: session-id → shared-session registry
@@ -581,13 +581,21 @@ impl RpcServer {
                         // when the last `Arc<RpcSessionInner>` drops,
                         // the registry's `Weak` goes stale and the
                         // next `register_session` prunes it.
-                        let session = RpcSession::from_android13plus(
+                        let session = match RpcSession::from_android13plus(
                             transport,
                             codec,
                             client_fd_mode,
                             fd_unix,
                             None,
-                        );
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    "android-13+ RPC: from_android13plus failed: {e:?}"
+                                );
+                                return;
+                            }
+                        };
                         let id = RpcSessionId::new(session.session_id());
                         server.register_session(id, &session.inner_arc());
                         server.configure_session(&session);
@@ -755,7 +763,13 @@ impl RpcServer {
             None => {
                 // r34 (default) — unchanged: session built here, served
                 // on the worker.
-                let session = self.make_session(transport);
+                let session = match self.make_session(transport) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("RPC r34: make_session failed: {e:?}");
+                        return;
+                    }
+                };
                 std::thread::spawn(move || {
                     if let Err(e) = session.serve_blocking() {
                         log::debug!("RPC session ended: {e:?}");
@@ -873,6 +887,27 @@ impl RpcServer {
 }
 
 impl Drop for RpcServer {
+    /// `Drop` is best-effort: it flips the `shutdown` flag (which the
+    /// accept loop polls each tick) and removes the bound socket
+    /// file. It does **not** join in-flight session workers — they
+    /// drain on peer close.
+    ///
+    /// **M9 caveat (review 2026-05-21)**: each `serve_connection`
+    /// worker closure captures `Arc::clone(self)` for the duration of
+    /// the session (so it can call `server.shutdown.load(…)`,
+    /// `server.register_session(…)`, etc.). For a *hung* peer that
+    /// never closes the connection, the worker holds a strong
+    /// reference indefinitely — the last external `Arc<RpcServer>`
+    /// going out of scope does **not** trigger this `Drop` until the
+    /// worker also releases its clone (peer close, kernel reset,
+    /// etc.). For deterministic teardown call
+    /// [`RpcServer::shutdown`] **and** [`RpcServer::join_workers`]
+    /// explicitly, or impose a `set_read_timeout` so a stalled peer
+    /// surfaces as a worker-loop error instead of an indefinite
+    /// hold. Closing socket-level paths so the kernel times out the
+    /// peer is also sufficient. (A full fix to use `Weak<Self>` plus
+    /// periodic upgrade-checks in worker hot paths is plan-out-of-
+    /// scope refactoring — see review report M9.)
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Best-effort socket file cleanup; never panic in Drop.

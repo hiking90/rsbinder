@@ -79,7 +79,22 @@ impl RpcProxy {
         let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
             // All `obituary_sent` reads/writes that race `link`/`unlink`
             // happen under this write lock (kernel parity: `mLock`).
-            let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+            //
+            // M18 fix (review 2026-05-21): a poisoned recipients lock
+            // means a prior panic on this proxy's death pathway —
+            // log + return best-effort instead of panicking the serve
+            // loop. (`link_to_death`/`unlink_to_death` surface poison
+            // as `StatusCode::DeadObject` via `?`.)
+            let mut recipients = match self.recipients.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    log::error!(
+                        "RPC obituary skipped: recipients lock poisoned for addr {:?}",
+                        self.addr
+                    );
+                    return;
+                }
+            };
             if self.obituary_sent.load(Ordering::Relaxed) {
                 return;
             }
@@ -139,8 +154,15 @@ impl RpcProxy {
     /// not a defect — `first write wins` additionally protects an
     /// in-use proxy from a later differing cast (the second
     /// `from_binder`'s descriptor check then returns `None`).
-    pub fn stamp_descriptor(&self, descriptor: &str) {
-        let _ = self.descriptor.set(descriptor.to_string());
+    ///
+    /// **Return**: `true` if this call wrote the descriptor, `false`
+    /// if it was already stamped (M20 fix — review 2026-05-21:
+    /// surfacing the `OnceLock::set` result lets a caller distinguish
+    /// fresh-stamp from already-stamped without an extra
+    /// `descriptor()` round-trip. Existing callers (generator
+    /// `from_binder`) can keep ignoring the result with `let _ = …`).
+    pub fn stamp_descriptor(&self, descriptor: &str) -> bool {
+        self.descriptor.set(descriptor.to_string()).is_ok()
     }
 
     /// The stamped descriptor, or `""` if not yet stamped (a proxy
@@ -213,8 +235,16 @@ impl Drop for RpcProxy {
         // peer to drop its strong ref (AC-2.5). Best-effort — never
         // panic in Drop, and a dead session simply means the peer is
         // already gone.
+        //
+        // **C1 fix (review 2026-05-21)**: `queue_dec_strong` is a
+        // non-blocking mpsc enqueue handled by the session's reaper
+        // thread. The previous synchronous `send_dec_strong` here
+        // called `find_conn(false)`, which on a single-slot session
+        // (default `N==1`) `cv.wait`s if another thread already drives
+        // the slot — a Drop on an unrelated worker would block the
+        // user's hot path for the full peer round-trip.
         if let Some(inner) = self.session.upgrade() {
-            let _ = inner.send_dec_strong(self.addr);
+            inner.queue_dec_strong(self.addr);
             // Identity-checked: if this proxy's `Arc` already hit 0 and
             // a concurrent `read_binder` re-cached a fresh live proxy
             // for the same address, this stale `Drop` must NOT evict
@@ -245,7 +275,14 @@ impl IBinder for RpcProxy {
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
-        let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+        let mut recipients = self.recipients.write().map_err(|_| {
+                // M18 fix (review 2026-05-21): a poisoned recipients
+                // lock means a prior panic on this proxy's death
+                // pathway. Surface as `DeadObject` so a caller can
+                // recover (e.g. drop the binder, re-establish) rather
+                // than panicking out of a public `IBinder` method.
+                StatusCode::DeadObject
+            })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
             // Connection already dropped — AOSP returns DEAD_OBJECT.
             return Err(StatusCode::DeadObject);
@@ -258,7 +295,14 @@ impl IBinder for RpcProxy {
     /// — kernel `removeAt(i)` parity, *not* `retain`, so a duplicate
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        let mut recipients = self.recipients.write().expect("recipients lock poisoned");
+        let mut recipients = self.recipients.write().map_err(|_| {
+                // M18 fix (review 2026-05-21): a poisoned recipients
+                // lock means a prior panic on this proxy's death
+                // pathway. Surface as `DeadObject` so a caller can
+                // recover (e.g. drop the binder, re-establish) rather
+                // than panicking out of a public `IBinder` method.
+                StatusCode::DeadObject
+            })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }

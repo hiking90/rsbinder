@@ -145,7 +145,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     let server = thread::spawn(move || {
         let (tcp, _) = listener.accept().expect("accept");
         let t = TlsTransport::accept(tcp, srv_cfg).expect("server handshake");
-        let session = RpcSession::new(Box::new(t), AddressSpace::Acceptor);
+        let session = RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
         session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
             PingSvc,
         )))));
@@ -164,7 +164,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
         other => panic!("expected Certificate peer id, got {other}"),
     }
 
-    let client = RpcSession::new(Box::new(client_t), AddressSpace::Initiator);
+    let client = RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root over TLS");
     assert_eq!(ping_via(&root, "hello").unwrap(), "pong:hello");
     assert_eq!(ping_via(&root, "").unwrap(), "pong:");

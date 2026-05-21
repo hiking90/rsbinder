@@ -260,7 +260,7 @@ fn fd_rejected_without_mutual_opt_in() {
 #[test]
 fn fd_rejected_on_non_uds_transport() {
     let (a, b) = MemTransport::pair();
-    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor);
+    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_supported_fd_modes(&[FdMode::Unix]);
     server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
     let srv = server.clone();
@@ -268,7 +268,7 @@ fn fd_rejected_on_non_uds_transport() {
         let _ = srv.serve_blocking();
     });
 
-    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator);
+    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
     // Negotiation itself succeeds logically (both "support" Unix), but
     // the mem transport's fd methods reject by type, so no fd is ever
     // transferred and the call fails cleanly.

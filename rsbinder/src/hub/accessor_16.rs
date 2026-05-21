@@ -73,19 +73,23 @@ pub(crate) struct AccessorRoot {
     /// an `Arc<RpcProxy>` (one of two: the other is cached inside
     /// `RpcSessionInner.state` and dies with the session).
     inner: SIBinder,
-    /// Strong handle to the RPC session. Drops *after* `inner` thanks
-    /// to declaration order, so the inner `RpcProxy::drop` still finds
-    /// a live session to send `DEC_STRONG` through (best-effort —
-    /// `RpcProxy` tolerates a dead session).
-    _session: RpcSession,
+    /// **Load-bearing**: drops *after* `inner` (Rust drops fields in
+    /// declaration order). The reverse — `session` first — kills the
+    /// `RpcSessionInner` before the inner `RpcProxy::drop` can fire,
+    /// so the proxy's `queue_dec_strong` silent-skips on the dead
+    /// session and the peer leaks a strong ref until its own
+    /// teardown. The field is technically "unused" in code (Rust
+    /// would let it be renamed `_session` to suppress that lint), but
+    /// the underscore convention falsely suggests it's removable —
+    /// hence the explicit allow attribute. **Reorder = wire
+    /// regression**. (M13 fix — review 2026-05-21.)
+    #[allow(dead_code)]
+    session: RpcSession,
 }
 
 impl AccessorRoot {
     fn into_sibinder(inner: SIBinder, session: RpcSession) -> Result<SIBinder> {
-        SIBinder::new(Arc::new(AccessorRoot {
-            inner,
-            _session: session,
-        }))
+        SIBinder::new(Arc::new(AccessorRoot { inner, session }))
     }
 
     fn inner_binder(&self) -> &dyn IBinder {

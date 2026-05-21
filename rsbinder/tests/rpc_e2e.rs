@@ -277,7 +277,7 @@ fn make_root() -> SIBinder {
 /// Run the full scenario over a connected transport pair. Returns the
 /// server session so the caller can assert AC-2.5 node accounting.
 fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
-    let server = RpcSession::new(server_t, AddressSpace::Acceptor);
+    let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(make_root());
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
@@ -285,7 +285,7 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
     });
 
     {
-        let client = RpcSession::new(client_t, AddressSpace::Initiator);
+        let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
         let root = SmokeProxy(client.get_root().expect("get_root"));
 
         // AC-2.4: scalar + string round-trip, exact values.
@@ -348,13 +348,13 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
     use rsbinder::RemoteProxy;
 
     let (a, b) = MemTransport::pair();
-    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor);
+    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(make_root());
     let h = thread::spawn(move || {
         let _ = server.serve_blocking();
     });
 
-    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator);
+    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root");
 
     // Generalized dispatch: not `as_proxy()` (kernel-only), but

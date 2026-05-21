@@ -187,12 +187,19 @@ int main(int argc, char** argv) {
     //    a server-side wait, exiting only when the service appears
     //    (matches the 2-13 D.8 launcher's `addService → wait` ordering
     //    on the rsbinder client side — symmetric here).
-    AIBinder* accessor = AServiceManager_waitForService(instance);
-    if (!accessor) {
+    AIBinder* accessor_raw = AServiceManager_waitForService(instance);
+    if (!accessor_raw) {
         fprintf(stderr, "[cpp-client] AServiceManager_waitForService(%s) returned null\n",
                 instance);
         return 1;
     }
+    // M16 fix (review 2026-05-21): RAII for the `accessor` binder.
+    // Previously every early return after this point had to remember
+    // an explicit `AIBinder_decStrong(accessor)`; the unique_ptr makes
+    // cleanup automatic and symmetric with the normal-exit path.
+    auto accessor_owner = std::unique_ptr<AIBinder, decltype(&AIBinder_decStrong)>(
+            accessor_raw, AIBinder_decStrong);
+    AIBinder* accessor = accessor_owner.get();
     fprintf(stderr, "[cpp-client] obtained IAccessor binder\n");
 
     // 2) Associate the AIBinder with a class carrying the IAccessor
@@ -254,26 +261,32 @@ int main(int argc, char** argv) {
     // 4) Wrap the fd in a preconnected ARpcSession. The session is the
     //    real-libbinder consumer of the v2 handshake initiated by
     //    rsbinder's `RpcServer::set_android13plus(2)`.
-    ARpcSession* session = ARpcSession_new();
-    if (!session) {
+    ARpcSession* session_raw = ARpcSession_new();
+    if (!session_raw) {
         fprintf(stderr, "[cpp-client] ARpcSession_new failed\n");
         close(pfd);
         return 9;
     }
+    // M16 RAII (review 2026-05-21).
+    auto session_owner = std::unique_ptr<ARpcSession, decltype(&ARpcSession_free)>(
+            session_raw, ARpcSession_free);
+    ARpcSession* session = session_owner.get();
     // Single-connection session — matches rsbinder server's
     // `set_max_threads(1)` (one outgoing connection per session).
     ARpcSession_setMaxIncomingThreads(session, 0);
     ARpcSession_setMaxOutgoingConnections(session, 1);
 
     PreconnectedFd pfd_state{.fd = pfd};
-    AIBinder* root = ARpcSession_setupPreconnectedClient(
+    AIBinder* root_raw = ARpcSession_setupPreconnectedClient(
             session, request_preconnected_fd, &pfd_state, delete_preconnected_fd);
-    if (!root) {
+    if (!root_raw) {
         fprintf(stderr, "[cpp-client] setupPreconnectedClient returned null (handshake failed)\n");
         if (pfd_state.fd >= 0) close(pfd_state.fd);
-        ARpcSession_free(session);
         return 10;
     }
+    auto root_owner = std::unique_ptr<AIBinder, decltype(&AIBinder_decStrong)>(
+            root_raw, AIBinder_decStrong);
+    AIBinder* root = root_owner.get();
     fprintf(stderr, "[cpp-client] RPC root acquired via preconnected fd\n");
 
     // 5) Associate the root with the IInterop class so we can transact
@@ -282,14 +295,10 @@ int main(int argc, char** argv) {
             kRootDescriptor, null_on_create, null_on_destroy, null_on_transact);
     if (!interop_clazz) {
         fprintf(stderr, "[cpp-client] AIBinder_Class_define(IInterop) failed\n");
-        AIBinder_decStrong(root);
-        ARpcSession_free(session);
         return 11;
     }
     if (!AIBinder_associateClass(root, interop_clazz)) {
         fprintf(stderr, "[cpp-client] AIBinder_associateClass(IInterop) failed\n");
-        AIBinder_decStrong(root);
-        ARpcSession_free(session);
         return 12;
     }
 
@@ -304,15 +313,11 @@ int main(int argc, char** argv) {
         rc = AIBinder_prepareTransaction(root, &ein.p);
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] prepareTransaction(TX_ECHO): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 13;
         }
         rc = AParcel_writeString(ein.p, echo_arg, (int32_t)strlen(echo_arg));
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] writeString(TX_ECHO arg): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 14;
         }
         OutParcel eout;
@@ -320,24 +325,18 @@ int main(int argc, char** argv) {
         ein.p = nullptr;
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] transact(TX_ECHO): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 15;
         }
         AStatusOwned st;
         rc = AParcel_readStatusHeader(eout.p, &st.s);
         if (rc != STATUS_OK || !AStatus_isOk(st.s)) {
             fprintf(stderr, "[cpp-client] TX_ECHO non-OK Status\n");
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 16;
         }
         std::string echoed;
         rc = AParcel_readString(eout.p, &echoed, read_string_into);
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] readString(TX_ECHO reply): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 17;
         }
         // Drop the NDK allocator's trailing NUL (matches 2-13 D.8
@@ -347,8 +346,6 @@ int main(int argc, char** argv) {
         if (echoed != echo_arg) {
             fprintf(stderr, "[cpp-client] TX_ECHO mismatch: got %.*s, want %s\n",
                     (int)echoed.size(), echoed.data(), echo_arg);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 18;
         }
     }
@@ -362,8 +359,6 @@ int main(int argc, char** argv) {
         rc = AIBinder_prepareTransaction(root, &min.p);
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] prepareTransaction(TX_GIVE_MARKER): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 19;
         }
         OutParcel mout;
@@ -371,24 +366,18 @@ int main(int argc, char** argv) {
         min.p = nullptr;
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] transact(TX_GIVE_MARKER): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 20;
         }
         AStatusOwned st;
         rc = AParcel_readStatusHeader(mout.p, &st.s);
         if (rc != STATUS_OK || !AStatus_isOk(st.s)) {
             fprintf(stderr, "[cpp-client] TX_GIVE_MARKER non-OK Status\n");
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 21;
         }
         std::string marker;
         rc = AParcel_readString(mout.p, &marker, read_string_into);
         if (rc != STATUS_OK) {
             fprintf(stderr, "[cpp-client] readString(TX_GIVE_MARKER reply): %d\n", rc);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 22;
         }
         if (!marker.empty() && marker.back() == '\0') marker.pop_back();
@@ -397,16 +386,13 @@ int main(int argc, char** argv) {
         if (marker != kExpectedMarker) {
             fprintf(stderr, "[cpp-client] TX_GIVE_MARKER mismatch: got %.*s, want %s\n",
                     (int)marker.size(), marker.data(), kExpectedMarker);
-            AIBinder_decStrong(root);
-            ARpcSession_free(session);
             return 23;
         }
     }
 
     printf("STAGE3 PASS — real libbinder client ↔ rsbinder server full transact\n");
     fflush(stdout);
-    AIBinder_decStrong(root);
-    ARpcSession_free(session);
-    AIBinder_decStrong(accessor);
+    // M16 RAII: `accessor_owner`/`session_owner`/`root_owner` clean up
+    // automatically on return.
     return 0;
 }

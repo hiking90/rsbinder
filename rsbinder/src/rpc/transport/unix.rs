@@ -20,8 +20,12 @@ use super::{read_frame, write_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Max fds a single RPC frame may carry (DoS bound — plan 2-7.d /
-/// AC-7.5). Well under the kernel `SCM_MAX_FD` (253).
-const MAX_FDS_PER_FRAME: usize = 64;
+/// AC-7.5). Well under the kernel `SCM_MAX_FD` (253). `pub(crate)`
+/// so the wire codec layer (`wire_android13::read_aosp_message_with_fds`)
+/// can enforce the *per-message* cap when accumulating across the
+/// multiple `recvmsg`s that read one message body (C3 fix —
+/// review 2026-05-21).
+pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
 /// A framed transport over a connected Unix domain socket.
 pub struct UnixTransport {
@@ -288,13 +292,19 @@ impl RpcTransport for UnixTransport {
                 let ok = anc.push(SendAncillaryMessage::ScmRights(fds));
                 debug_assert!(ok, "cmsg_space sized for exactly these fds");
             }
-            let n = rustix::net::sendmsg(
+            let n = match rustix::net::sendmsg(
                 &self.stream,
                 &[IoSlice::new(&buf[sent..])],
                 &mut anc,
                 SendFlags::empty(),
-            )
-            .map_err(std::io::Error::from)?;
+            ) {
+                Ok(n) => n,
+                // M10 fix (review 2026-05-21): EINTR is benign — retry
+                // the syscall. Symmetric with `read_header`/`read_body`
+                // in transport/mod.rs.
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            };
             if n == 0 {
                 return Err(RpcError::PeerClosed);
             }
@@ -322,13 +332,19 @@ impl RpcTransport for UnixTransport {
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         let mut anc = RecvAncillaryBuffer::new(&mut space);
-        let r = rustix::net::recvmsg(
-            &self.stream,
-            &mut [IoSliceMut::new(buf)],
-            &mut anc,
-            RecvFlags::empty(),
-        )
-        .map_err(std::io::Error::from)?;
+        let r = loop {
+            match rustix::net::recvmsg(
+                &self.stream,
+                &mut [IoSliceMut::new(buf)],
+                &mut anc,
+                RecvFlags::empty(),
+            ) {
+                Ok(r) => break r,
+                // M10 fix: EINTR retry, symmetric with read_header.
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        };
         for msg in anc.drain() {
             if let RecvAncillaryMessage::ScmRights(iter) = msg {
                 for fd in iter {
@@ -394,13 +410,17 @@ impl RpcTransport for UnixTransport {
                 let ok = anc.push(SendAncillaryMessage::ScmRights(fds));
                 debug_assert!(ok, "cmsg_space sized for exactly these fds");
             }
-            let n = rustix::net::sendmsg(
+            let n = match rustix::net::sendmsg(
                 &self.stream,
                 &[IoSlice::new(&framed[sent..])],
                 &mut anc,
                 SendFlags::empty(),
-            )
-            .map_err(std::io::Error::from)?;
+            ) {
+                Ok(n) => n,
+                // M10 fix: EINTR retry, symmetric with read_header.
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            };
             if n == 0 {
                 return Err(RpcError::PeerClosed);
             }
@@ -442,13 +462,34 @@ impl RpcTransport for UnixTransport {
             // `RecvFlags::CMSG_CLOEXEC` (`MSG_CMSG_CLOEXEC`) is
             // Linux-only; for portability set `FD_CLOEXEC` explicitly
             // on each received fd (plan 2-7.d "received fd O_CLOEXEC").
-            let r = rustix::net::recvmsg(
-                &self.stream,
-                &mut [IoSliceMut::new(&mut tmp)],
-                &mut anc,
-                RecvFlags::empty(),
-            )
-            .map_err(std::io::Error::from)?;
+            let r = loop {
+                match rustix::net::recvmsg(
+                    &self.stream,
+                    &mut [IoSliceMut::new(&mut tmp)],
+                    &mut anc,
+                    RecvFlags::empty(),
+                ) {
+                    Ok(r) => break r,
+                    // M10 fix: EINTR retry.
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => {
+                        // M12 fix (review 2026-05-21): map a read
+                        // deadline to `Timeout` (frame-synchronized,
+                        // nothing consumed) or `Truncated` (mid-frame
+                        // desync) so callers can distinguish — same
+                        // contract as `read_header`/`read_body`.
+                        let io_err = std::io::Error::from(e);
+                        if super::is_timeout(&io_err) {
+                            return Err(if leftover.is_empty() && fds.is_empty() {
+                                RpcError::Timeout
+                            } else {
+                                RpcError::Truncated
+                            });
+                        }
+                        return Err(io_err.into());
+                    }
+                }
+            };
             for msg in anc.drain() {
                 if let RecvAncillaryMessage::ScmRights(iter) = msg {
                     for fd in iter {
@@ -557,8 +598,14 @@ mod tests {
     }
 
     #[test]
-    fn unix_partial_header_then_close_is_truncated_or_closed() {
-        // Send a lone (incomplete) length header then close (T1.6).
+    fn unix_partial_header_then_close_is_truncated() {
+        // m8 fix (review 2026-05-21): the spec is deterministic —
+        // 2-of-4 header bytes consumed *then* EOF MUST surface as
+        // `Truncated` (see `read_header` in transport/mod.rs:341 —
+        // `filled == 0` ⇒ `PeerClosed`, `filled > 0` ⇒ `Truncated`).
+        // The kernel does not coalesce these into an immediate EOF,
+        // so the previous permissive `Truncated | PeerClosed`
+        // assertion was masking a real regression class.
         let (a, b) = UnixTransport::pair().expect("socketpair");
         {
             use std::io::Write;
@@ -568,8 +615,8 @@ mod tests {
         drop(a);
         let r = b.recv_frame();
         assert!(
-            matches!(r, Err(RpcError::Truncated) | Err(RpcError::PeerClosed)),
-            "expected Truncated/PeerClosed, got {r:?}"
+            matches!(r, Err(RpcError::Truncated)),
+            "expected Truncated (2-of-4 header consumed before EOF), got {r:?}"
         );
     }
 }

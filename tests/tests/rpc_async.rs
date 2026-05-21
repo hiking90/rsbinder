@@ -88,7 +88,7 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         .expect("tokio runtime");
     let handle = rt.handle().clone();
 
-    let server = RpcSession::new(server_t, AddressSpace::Acceptor);
+    let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(async_root(TokioRuntime(handle.clone())));
     let server_for_thread = server.clone();
     let jh = thread::spawn(move || {
@@ -96,7 +96,7 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     });
 
     // Blocking client bootstrap (one connection, one root).
-    let client = RpcSession::new(client_t, AddressSpace::Initiator);
+    let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
     let sib = client.get_root().expect("get_root");
     let smoke: Strong<dyn IRpcSmokeAsync<Tokio>> = <dyn IRpcSmoke as FromIBinder>::try_from(sib)
         .expect("generated BpRpcSmoke resolves from an RPC binder")

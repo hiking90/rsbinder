@@ -278,6 +278,16 @@ impl Android13PlusCodec {
 
     /// Build for an explicit negotiated version; rejects an
     /// unsupported one (mirrors `setProtocolVersion`).
+    ///
+    /// **`RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL` (`0xF000_0000`) is
+    /// stored verbatim**. AOSP `RpcState::validateProtocolVersion` and
+    /// `RpcSession::setProtocolVersionInternal` (android-16.0.0_r4)
+    /// store the sentinel as-is, advertise it on the wire, and drive
+    /// v1+ framing from it (because `version >= PROTOCOL_V1` holds for
+    /// `0xF000_0000`). rsbinder mirrors that exactly — do **not**
+    /// normalize EXPERIMENTAL to `SUPPORTED_MAX_VERSION` (the
+    /// 2026-05-21 review's M7 finding is retracted by AOSP cross-check;
+    /// see review report meta evaluation).
     pub fn with_version(version: u32) -> RpcResult<Self> {
         if !is_supported_protocol_version(version) {
             return Err(RpcError::Protocol("unsupported RPC wire protocol version"));
@@ -290,12 +300,26 @@ impl Android13PlusCodec {
         self.version
     }
 
-    fn header(command: u32, body_size: usize) -> [u8; WIRE_HEADER_LEN] {
+    fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
+        // M1 fix (review 2026-05-21): encoder/decoder symmetry. The
+        // decoder rejects `body_size > MAX_FRAME_LEN` at every entry
+        // (see `decode_message`, `read_aosp_message`,
+        // `write_aosp_message`); without this guard the encoder would
+        // silently truncate a `body_size > u32::MAX` via `as u32` on
+        // 64-bit hosts, emitting a header whose `bodySize` disagrees
+        // with the actual payload — a peer reading per `bodySize`
+        // would misframe the next message.
+        if body_size > MAX_FRAME_LEN {
+            return Err(RpcError::FrameTooLarge {
+                declared: body_size,
+                max: MAX_FRAME_LEN,
+            });
+        }
         let mut h = [0u8; WIRE_HEADER_LEN];
         h[0..4].copy_from_slice(&command.to_le_bytes());
         h[4..8].copy_from_slice(&(body_size as u32).to_le_bytes());
         // reserved[2] stays zero.
-        h
+        Ok(h)
     }
 
     /// Project rsbinder's 32-byte [`RpcAddress`] onto the android-13+
@@ -362,7 +386,18 @@ impl Android13PlusCodec {
         incoming: bool,
         fd_mode: u8,
         session_id: &[u8],
-    ) -> Vec<u8> {
+    ) -> RpcResult<Vec<u8>> {
+        // M2 fix (review 2026-05-21): explicit `u16` bound on
+        // `sessionIdSize`. AOSP `RpcConnectionHeader.sessionIdSize` is
+        // a `uint16_t`; rsbinder's session ids are 32 B (the canonical
+        // path), but this is a `pub fn` and a caller passing a 64 KiB+
+        // slice would previously wrap the on-wire size while the full
+        // body was still appended — a peer reading per `sessionIdSize`
+        // would misframe the following message.
+        let id_size: u16 = session_id
+            .len()
+            .try_into()
+            .map_err(|_| RpcError::Protocol("session_id length exceeds u16"))?;
         let mut out = Vec::with_capacity(A13_CONN_HEADER_LEN + session_id.len());
         out.extend_from_slice(&self.version.to_le_bytes()); // u32 version
         out.push(if incoming { CONN_OPTION_INCOMING } else { 0 }); // u8 options
@@ -372,9 +407,9 @@ impl Android13PlusCodec {
             out.push(fd_mode); // u8 fileDescriptorTransportMode
             out.extend_from_slice(&[0u8; 8]); // u8 reserved[8]
         }
-        out.extend_from_slice(&(session_id.len() as u16).to_le_bytes()); // u16 sessionIdSize
+        out.extend_from_slice(&id_size.to_le_bytes()); // u16 sessionIdSize
         out.extend_from_slice(session_id);
-        out
+        Ok(out)
     }
 
     /// Parse an `RpcConnectionHeader`; returns `(version, options,
@@ -386,6 +421,12 @@ impl Android13PlusCodec {
         let version = rd_u32(buf, 0)?;
         let options = buf[4];
         let fd_mode = if version == PROTOCOL_V0 { 0 } else { buf[5] };
+        // M8 fix (review 2026-05-21): symmetric with `server_accept`.
+        if !matches!(fd_mode, FD_MODE_NONE | FD_MODE_UNIX | FD_MODE_TRUSTY) {
+            return Err(RpcError::Protocol(
+                "unknown RpcConnectionHeader.fileDescriptorTransportMode",
+            ));
+        }
         let id_size = u16::from_le_bytes([buf[14], buf[15]]) as usize;
         let end = A13_CONN_HEADER_LEN
             .checked_add(id_size)
@@ -518,8 +559,9 @@ impl WireCodec for Android13PlusCodec {
             0
         };
         let body_len = A13_TXN_FIXED_LEN + txn.data.len() + table_bytes;
+        let header = Self::header(CMD_TRANSACT, body_len)?;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len));
+        out.extend_from_slice(&header);
         out.extend_from_slice(&Self::encode_addr(&txn.address)); // 8
         out.extend_from_slice(&txn.code.to_le_bytes()); // 4
         out.extend_from_slice(&txn.flags.to_le_bytes()); // 4
@@ -543,8 +585,9 @@ impl WireCodec for Android13PlusCodec {
             0
         };
         let body_len = fixed + reply.data.len() + table_bytes;
+        let header = Self::header(CMD_REPLY, body_len)?;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_REPLY, body_len));
+        out.extend_from_slice(&header);
         out.extend_from_slice(&reply.status.to_le_bytes()); // i32 status
         if self.version != PROTOCOL_V0 {
             out.extend_from_slice(&(reply.data.len() as u32).to_le_bytes()); // parcelDataSize
@@ -557,8 +600,12 @@ impl WireCodec for Android13PlusCodec {
     fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8> {
         // RpcDecStrong { addr(8); u32 amount; u32 reserved } — 16 B,
         // unchanged v0↔v1. rsbinder sends one decrement per drop.
+        // `A13_DEC_STRONG_LEN` is a const ≪ `MAX_FRAME_LEN`, so the
+        // M1 guard inside `Self::header` is structurally satisfied.
+        let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
+            .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + A13_DEC_STRONG_LEN);
-        out.extend_from_slice(&Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN));
+        out.extend_from_slice(&header);
         out.extend_from_slice(&Self::encode_addr(addr)); // 8
         out.extend_from_slice(&1u32.to_le_bytes()); // amount
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
@@ -651,6 +698,8 @@ impl WireCodec for Android13PlusCodec {
     }
 
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8> {
+        // Empty `session_id` ⇒ M2's `u16` bound is structurally
+        // satisfied; the inner `expect` can never fire.
         // android-13+ replaced the bare int32 preamble with the
         // versioned RpcConnectionHeader. rsbinder only opens a new
         // session here (session_id == RPC_SESSION_ID_NEW) and defaults
@@ -658,6 +707,7 @@ impl WireCodec for Android13PlusCodec {
         // / "cci") uses the inherent methods.
         let _ = session_id;
         self.encode_connection_header(false, FD_MODE_NONE, &[])
+            .expect("preamble passes empty session_id ⇒ M2 u16 bound trivially satisfied")
     }
 
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
@@ -803,6 +853,20 @@ pub fn read_aosp_message_with_fds(
         while got < want {
             let (n, mut more) = t.recv_raw_with_fds(&mut buf[got..])?;
             fds.append(&mut more);
+            // C3 fix (review 2026-05-21): enforce the per-message
+            // `MAX_FDS_PER_FRAME` cap *across* the multiple recvmsgs
+            // that read one message. The transport's per-call cap
+            // (`recv_raw_with_fds` rejects > 64 per single recvmsg)
+            // is per-recvmsg, not per-message — without this
+            // accumulator-side check, a hostile peer that fragments
+            // a message across N recvmsgs each carrying 64 fds would
+            // accumulate 64·N ancillary fds and walk the process
+            // toward `RLIMIT_NOFILE`. Plan 2-7.d / AC-7.5 DoS bound.
+            if fds.len() > super::transport::unix::MAX_FDS_PER_FRAME {
+                return Err(RpcError::Protocol(
+                    "RPC message exceeded MAX_FDS_PER_FRAME (ancillary fd budget)",
+                ));
+            }
             if n == 0 {
                 return Err(if total_read == 0 {
                     RpcError::PeerClosed
@@ -875,10 +939,8 @@ pub fn client_connect_with_id<S: Read + Write>(
     session_id: &[u8],
 ) -> RpcResult<Android13PlusCodec> {
     let hdr_codec = Android13PlusCodec::with_version(max_version)?;
-    write_all_raw(
-        stream,
-        &hdr_codec.encode_connection_header(incoming, fd_mode, session_id),
-    )?;
+    let header = hdr_codec.encode_connection_header(incoming, fd_mode, session_id)?;
+    write_all_raw(stream, &header)?;
     write_all_raw(stream, &hdr_codec.encode_connection_init())?;
     let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;
     let negotiated = hdr_codec.decode_new_session_response(&resp)?;
@@ -918,6 +980,16 @@ pub fn server_accept<S: Read + Write>(
     } else {
         head[5]
     };
+    // M8 fix (review 2026-05-21): reject out-of-enum
+    // `RpcConnectionHeader.fileDescriptorTransportMode`. AOSP defines
+    // the field as an enum {NONE, UNIX, TRUSTY}; an unknown value is
+    // malformed input that must not flow to downstream consumers as a
+    // u8 caller has to re-validate.
+    if !matches!(fd_mode, FD_MODE_NONE | FD_MODE_UNIX | FD_MODE_TRUSTY) {
+        return Err(RpcError::Protocol(
+            "unknown RpcConnectionHeader.fileDescriptorTransportMode",
+        ));
+    }
     // min(serverMax, callerMax) — and it must be one we implement.
     let negotiated = client_version.min(server_max_version);
     let codec = Android13PlusCodec::with_version(negotiated)?;
@@ -1083,15 +1155,21 @@ mod tests {
         }
 
         // Connection header: v0 has reserved[9]; v1 has fdMode@5.
-        let h0 = c0.encode_connection_header(false, FD_MODE_UNIX, &[]);
+        let h0 = c0
+            .encode_connection_header(false, FD_MODE_UNIX, &[])
+            .unwrap();
         assert_eq!(h0.len(), A13_CONN_HEADER_LEN);
         assert_eq!(&h0[0..4], &0u32.to_le_bytes()); // version 0
         assert_eq!(h0[5], 0, "v0 byte 5 is reserved, not fdMode");
-        let h1 = c1.encode_connection_header(false, FD_MODE_UNIX, &[]);
+        let h1 = c1
+            .encode_connection_header(false, FD_MODE_UNIX, &[])
+            .unwrap();
         assert_eq!(&h1[0..4], &1u32.to_le_bytes()); // version 1
         assert_eq!(h1[5], FD_MODE_UNIX, "v1 fileDescriptorTransportMode");
         assert_eq!(&h1[14..16], &0u16.to_le_bytes()); // sessionIdSize = 0
-        let h1i = c1.encode_connection_header(true, FD_MODE_NONE, &[]);
+        let h1i = c1
+            .encode_connection_header(true, FD_MODE_NONE, &[])
+            .unwrap();
         assert_eq!(h1i[4], CONN_OPTION_INCOMING);
         assert_eq!(
             c1.decode_connection_header(&h1).unwrap(),

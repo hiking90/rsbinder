@@ -30,7 +30,7 @@ mod mem;
 mod tcp_debug;
 #[cfg(feature = "rpc-tls")]
 mod tls;
-mod unix;
+pub(crate) mod unix;
 #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 mod vsock;
 

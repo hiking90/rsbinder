@@ -18,7 +18,6 @@
 //! `VMADDR_CID_LOCAL`), per the plan's V6 environment gate.
 
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::Mutex;
 
 use vsock::{VsockAddr, VsockStream};
 
@@ -26,10 +25,16 @@ use super::{read_frame, write_frame, PeerIdentity, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
+///
+/// **M11 fix (review 2026-05-21)**: lock-free, full-duplex. `vsock`
+/// 0.5+ implements `impl Read for &VsockStream` and `impl Write for
+/// &VsockStream`, mirroring `UnixStream`, so a shared `&self` can
+/// `send_frame` while another thread `recv_frame`s without serializing
+/// through a `Mutex`. The trait doc on [`RpcTransport`] requires
+/// concurrent send+recv, which the previous `Mutex<VsockStream>`
+/// violated.
 pub struct VsockTransport {
-    // One thread per connection in the RPC model — a `Mutex` keeps
-    // `&self` without needing a duplex split.
-    stream: Mutex<VsockStream>,
+    stream: VsockStream,
     peer: PeerIdentity,
     desc: String,
 }
@@ -68,23 +73,22 @@ impl VsockTransport {
             Ok(a) => format!("vsock:cid={},port={}", a.cid(), a.port()),
             Err(_) => "vsock".to_string(),
         };
-        Ok(VsockTransport {
-            stream: Mutex::new(stream),
-            peer,
-            desc,
-        })
+        Ok(VsockTransport { stream, peer, desc })
     }
 }
 
 impl RpcTransport for VsockTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        let mut s = self.stream.lock().expect("vsock poisoned");
-        write_frame(&mut *s, buf)
+        // `&VsockStream: Write` (vsock 0.5+), so a shared `&self` can
+        // send while another thread receives — same lock-free duplex
+        // pattern as `UnixTransport`.
+        let mut w = &self.stream;
+        write_frame(&mut w, buf)
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        let mut s = self.stream.lock().expect("vsock poisoned");
-        read_frame(&mut *s)
+        let mut r = &self.stream;
+        read_frame(&mut r)
     }
 
     fn peer_identity(&self) -> PeerIdentity {
@@ -96,10 +100,7 @@ impl RpcTransport for VsockTransport {
     }
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
-        self.stream
-            .lock()
-            .expect("vsock poisoned")
-            .set_read_timeout(timeout)?;
+        self.stream.set_read_timeout(timeout)?;
         Ok(())
     }
 }

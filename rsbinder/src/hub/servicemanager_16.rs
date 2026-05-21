@@ -58,20 +58,36 @@ fn resolve_accessor_arm(
 ///
 /// AOSP's `Tag::accessor` arm is a *separate* path (for the rare case
 /// where servicemanager itself returns a VINTF `<accessor>` binder)
-/// and **does not** consult `getInjectedAccessor`. rsbinder mirrors
-/// that split here: the fallback fires when (a) the
-/// `ServiceWithMetadata` arm's inner binder is `None` (the common "no
-/// entry" signal) or (b) the `Accessor` arm fails to resolve
-/// (defensive). The bridge from the returned `IAccessor` SIBinder to
-/// an `RpcSession` root is the same Phase 2-13 helper
-/// [`super::accessor_16::resolve_accessor`], so the *consume*-side
-/// validation contract (instance-name match, `addConnection`/
-/// `getInstanceName` round-trip, fd adopt, v2/v1 handshake, root) is
-/// shared byte-for-byte between both paths.
+/// and **does not** consult `getInjectedAccessor`.
 ///
-/// `cfg(feature = "rpc")` gate matches the consume-side
-/// [`resolve_accessor_arm`] — the `rpc`-OFF build keeps the historical
-/// "log + None" behavior byte-unchanged.
+/// **M15 caveat (review 2026-05-21)**: rsbinder *intentionally departs*
+/// from that AOSP policy: the `Accessor` arm here calls
+/// `try_process_local_fallback` on miss. The rationale is defensive
+/// — a peer-supplied accessor whose `getInstanceName` doesn't match
+/// the requested name (mis-routing or impersonation) shouldn't
+/// shadow a locally-registered provider. This is a hardening choice,
+/// not an AOSP-faithfulness defect: rsbinder accepts a slightly
+/// broader resolution surface in exchange for closing a class of
+/// silent failures. If strict AOSP parity is required, gate this
+/// `or_else` behind a future opt-out flag.
+///
+/// The fallback fires when (a) the `ServiceWithMetadata` arm's inner
+/// binder is `None` (the common "no entry" signal) or (b) the
+/// `Accessor` arm fails to resolve (M15-defensive). The bridge from
+/// the returned `IAccessor` SIBinder to an `RpcSession` root is the
+/// same Phase 2-13 helper [`super::accessor_16::resolve_accessor`].
+///
+/// **M21 cfg-gate clarification (review 2026-05-21)**:
+/// `try_process_local_fallback` carries a `cfg(feature = "rpc")`
+/// gate, but `dispatch_typed_service` itself is cfg-free.
+/// `rpc`-OFF builds reach the `swm.service.is_none()` arm and call
+/// the **no-op stub**, which returns `None`, so the `or(Some(swm))`
+/// falls back to the original null `swm` — the same `None`-inside
+/// `swm` a pre-2-14 build would have returned (callers map it to
+/// `NameNotFound` identically). The end-to-end *result* is byte-
+/// unchanged; the *call shape* differs (a no-op stub is now invoked).
+/// "byte-unchanged" here therefore means "observable result unchanged",
+/// not "no extra function frame in the call stack".
 #[cfg(feature = "rpc")]
 fn try_process_local_fallback(
     name: &str,
@@ -290,6 +306,43 @@ mod tests {
         add_accessor_provider(HashSet::from([instance.to_owned()]), provider).expect("registry add")
     }
 
+    /// M14 fix (review 2026-05-21): wrap the provider closure with an
+    /// observable side effect so a mutant removing the
+    /// `dispatch_typed_service → try_process_local_fallback` call
+    /// flips the test red. Returns the `(handle, called)` pair —
+    /// `called.load(SeqCst)` asserts the dispatcher actually reached
+    /// the process-local fallback registry.
+    fn register_observing_provider(
+        instance: &str,
+    ) -> (
+        super::super::accessor_register::AccessorProviderHandle,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let path = PathBuf::from(format!(
+            "/tmp/rsb-dispatch-typed-test-{}-unused.sock",
+            std::process::id()
+        ));
+        let want = instance.to_owned();
+        let called_for_closure = std::sync::Arc::clone(&called);
+        let provider: AccessorProviderFn = Box::new(move |n: &str| {
+            called_for_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+            if n == want {
+                let addr_provider: AccessorAddrProvider = Box::new({
+                    let p = path.clone();
+                    move |_| Ok(AccessorSockAddr::Unix(p.clone()))
+                });
+                Some(create_accessor(n, addr_provider))
+            } else {
+                None
+            }
+        });
+        let handle = add_accessor_provider(HashSet::from([instance.to_owned()]), provider)
+            .expect("registry add");
+        (handle, called)
+    }
+
     /// **AOSP-faithful arm**: `Tag::serviceWithMetadata` with null
     /// inner ⇒ `dispatch_typed_service` MUST consult the process-local
     /// fallback (matches `BackendUnifiedServiceManager::toBinderService`
@@ -316,18 +369,17 @@ mod tests {
 
         // Now register a provider and re-dispatch — the fallback must
         // surface the registered Accessor's resolved root.
-        let _handle = register_dummy_provider(&instance);
-        let out = dispatch_typed_service(&instance, synth_null_swm())
+        // **M14 mutant gate**: `called` flips iff the dispatcher
+        // actually walked into `try_process_local_fallback` →
+        // registry lookup → our provider closure.
+        let (_handle, called) = register_observing_provider(&instance);
+        let _out = dispatch_typed_service(&instance, synth_null_swm())
             .expect("registered provider must yield a SWM");
-        // `resolve_via_process_local` would have called `resolve_accessor`
-        // → `addConnection` → preconnected RPC root. The fake provider's
-        // path doesn't accept, so the bridge yields `None` and we fall
-        // back to the original null SWM. The *load-bearing assertion*
-        // is that `dispatch_typed_service` reached
-        // `try_process_local_fallback` at all — covered by the
-        // `_handle` keeping the entry alive AND the fact that we
-        // didn't get a panic / error from the dispatcher.
-        let _ = out;
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "dispatch_typed_service(swm.service=None) must invoke try_process_local_fallback \
+             — a mutant that removes the fallback call leaves `called == false`"
+        );
     }
 
     /// `Tag::accessor` with a null inner binder ⇒ same fallback path
@@ -349,14 +401,19 @@ mod tests {
             "Accessor(None) with no fallback provider must return None"
         );
 
-        let _handle = register_dummy_provider(&instance);
+        let (_handle, called) = register_observing_provider(&instance);
         let null_accessor = android::os::Service::Service::Accessor(None);
         // With a registered provider, dispatch_typed_service tries the
         // Accessor arm first (null ⇒ resolve_accessor_arm returns None),
         // then falls back. The fallback's full bridge may not connect
-        // (fake path); the assertion above already pins that the
-        // dispatcher reaches the fallback.
+        // (fake path) — the **M14 mutant gate** below is that the
+        // provider closure was invoked, proving the `or_else` fired.
         let _ = dispatch_typed_service(&instance, null_accessor);
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "dispatch_typed_service(Accessor(None)) must `or_else` into try_process_local_fallback \
+             — a mutant that removes the `or_else` leaves `called == false`"
+        );
     }
 
     /// `ServiceWithMetadata` with a non-null inner binder MUST be

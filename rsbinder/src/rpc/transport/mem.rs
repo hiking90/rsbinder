@@ -19,8 +19,14 @@ use super::{PeerIdentity, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// An in-process, in-memory framed transport endpoint.
+///
+/// **m14 fix (review 2026-05-21)**: `tx: Sender<…>` (no `Mutex`).
+/// `mpsc::Sender` is `Sync + Clone` and `Sender::send` takes `&self`,
+/// so wrapping it in a `Mutex` only serialized unrelated senders
+/// without protecting anything. `Receiver` stays under `Mutex` (it is
+/// `!Sync`).
 pub struct MemTransport {
-    tx: Mutex<Sender<Vec<u8>>>,
+    tx: Sender<Vec<u8>>,
     rx: Mutex<Receiver<Vec<u8>>>,
     peer: PeerIdentity,
     desc: &'static str,
@@ -37,14 +43,14 @@ impl MemTransport {
         let peer = self_identity();
         (
             MemTransport {
-                tx: Mutex::new(a_tx),
+                tx: a_tx,
                 rx: Mutex::new(b_rx),
                 peer: peer.clone(),
                 desc: "mem",
                 timeout: Mutex::new(None),
             },
             MemTransport {
-                tx: Mutex::new(b_tx),
+                tx: b_tx,
                 rx: Mutex::new(a_rx),
                 peer,
                 desc: "mem",
@@ -67,12 +73,8 @@ pub(crate) fn self_identity() -> PeerIdentity {
 impl RpcTransport for MemTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
         // A channel send only fails once the peer's receiver is
-        // dropped — i.e. the peer is gone.
-        self.tx
-            .lock()
-            .expect("mem tx poisoned")
-            .send(buf.to_vec())
-            .map_err(|_| RpcError::PeerClosed)
+        // dropped — i.e. the peer is gone. Lock-free (`Sender: Sync`).
+        self.tx.send(buf.to_vec()).map_err(|_| RpcError::PeerClosed)
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
