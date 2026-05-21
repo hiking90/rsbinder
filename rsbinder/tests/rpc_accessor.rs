@@ -418,6 +418,157 @@ fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
     }
 }
 
+// ---- Subplan 2-14 A.5 e2e: process-local AccessorProvider fallback ----
+
+use rsbinder::hub::android_16::{
+    add_accessor_provider, create_accessor, resolve_via_process_local, AccessorAddrProvider,
+    AccessorProviderFn, AccessorSockAddr,
+};
+use std::collections::HashSet;
+
+/// 2-14 A.5: end-to-end from `add_accessor_provider` registration
+/// to `resolve_via_process_local` returning an `RpcSession` root that
+/// echoes. Drives the full A.4 + A.5 chain on top of A0.1–A0.3:
+///
+/// 1. Spin up an `RpcServer` (background) serving `EchoSvc` as root.
+/// 2. Register a `LocalAccessor` (via `create_accessor`) under a
+///    unique instance name through `add_accessor_provider`.
+/// 3. Call `resolve_via_process_local(name)` — A.5's public entrypoint
+///    (`getInjectedAccessor` + `Service::accessor → toBinder` AOSP
+///    combined). Asserts:
+///    * lookup hits the registered provider (the registry is global,
+///      but the instance name is process+line-scoped so no
+///      cross-test collision),
+///    * 2-13 `resolve_accessor` runs cleanly against the live RPC
+///      server: instance-name validation passes, `addConnection`
+///      yields a connected fd, `from_preconnected_fd` handshakes v2,
+///      `get_root()` returns the echo binder,
+///    * a full `TX_ECHO` round-trip succeeds (so the registered
+///      provider's `AccessorAddrProvider` closure was actually called
+///      with the right path).
+///
+/// Mutant gate: removing the `or_else(|| try_process_local_fallback)`
+/// from `hub::servicemanager_16::get_service` (the *consume*-side
+/// wire-up) wouldn't break this test, because the test calls
+/// `resolve_via_process_local` directly — that wire-up is exercised
+/// by [`process_local_fallback_takes_priority_when_accessor_arm_is_none`]
+/// below.
+#[test]
+fn process_local_provider_resolves_root_via_resolve_helper() {
+    let server = EchoServerGuard::start("a5-helper");
+
+    // Unique instance name per test (process-id + line for cross-test
+    // safety; the registry is process-wide static).
+    let instance = format!("rsb.test.a5.helper.{}.{}", std::process::id(), line!());
+
+    // `LocalAccessor` whose `addr_provider` always hands back the
+    // RpcServer's listening UDS path. Registered under `instance` via
+    // the A.4 process-local registry.
+    let server_path = server.path.clone();
+    let provider: AccessorProviderFn = {
+        let want = instance.clone();
+        Box::new(move |name: &str| {
+            if name == want {
+                let addr_provider: AccessorAddrProvider = Box::new({
+                    let p = server_path.clone();
+                    move |_| Ok(AccessorSockAddr::Unix(p.clone()))
+                });
+                Some(create_accessor(name, addr_provider))
+            } else {
+                None
+            }
+        })
+    };
+    let provider_handle =
+        add_accessor_provider(HashSet::from([instance.clone()]), provider).expect("registry add");
+
+    // A.5 public entrypoint — combined `getInjectedAccessor` +
+    // `toBinder` path.
+    let swm = resolve_via_process_local(&instance).expect("process-local fallback yields root SWM");
+    assert!(!swm.r#isLazyService, "RPC root is never a LazyService");
+    let root = swm.r#service.expect("RPC root binder");
+
+    // Full transact round-trip: the registered provider's
+    // `addr_provider` closure was hit, `LocalAccessor::addConnection`
+    // connected to the RpcServer's listener, and the resulting RPC
+    // root services TX_ECHO.
+    assert_eq!(
+        rpc_echo(&root, "a5-hello").unwrap(),
+        "a5-hello",
+        "round-trip via process-local provider must echo"
+    );
+    assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+    drop(provider_handle);
+}
+
+/// 2-14 A.5 primitive gate: `resolve_via_process_local` keys lookups
+/// **strictly** by instance name — unregistered names yield `None`
+/// (not a phantom binder), and a sibling registration must not leak
+/// into unrelated names. This is the contract the
+/// `hub::servicemanager_16::dispatch_typed_service` fallback (Phase
+/// 2-14 A.5) relies on; the dispatcher's own routing is exercised by
+/// the unit tests in [`hub::servicemanager_16::tests`].
+///
+/// **Mutant gate**: a provider that returns `Some(_)` for every name
+/// (or a registry that ignores its instance set) would resurrect the
+/// `unknown` lookup ⇒ the `is_none()` assertions below fail.
+#[test]
+fn resolve_via_process_local_keys_strictly_by_instance_name() {
+    let server = EchoServerGuard::start("a5-fallback");
+    let unknown = format!(
+        "rsb.test.a5.unregistered.{}.{}",
+        std::process::id(),
+        line!()
+    );
+    // Sanity: an instance no provider ever claimed yields `None` (not
+    // a phantom binder), so the fallback path in `get_service` is
+    // genuinely None when the registry is empty for `name`.
+    assert!(
+        resolve_via_process_local(&unknown).is_none(),
+        "unregistered name must not yield a phantom binder"
+    );
+
+    // Now register a provider for a *different* instance and verify
+    // the fallback dispatches *only* to the registered name — proving
+    // the registry's `instance` keying is honored end-to-end (an
+    // overly-eager provider that returns `Some(_)` for every name
+    // would silently shadow legitimate misses).
+    let target = format!("rsb.test.a5.targeted.{}.{}", std::process::id(), line!());
+    let server_path = server.path.clone();
+    let provider: AccessorProviderFn = {
+        let want = target.clone();
+        Box::new(move |name: &str| {
+            if name == want {
+                let addr_provider: AccessorAddrProvider = Box::new({
+                    let p = server_path.clone();
+                    move |_| Ok(AccessorSockAddr::Unix(p.clone()))
+                });
+                Some(create_accessor(name, addr_provider))
+            } else {
+                None
+            }
+        })
+    };
+    // RAII handle — name-prefixed (not `_h`) so a future refactor that
+    // accidentally rebinds to `_` (immediate drop = unregister) is
+    // visible at the patch site instead of silently breaking the
+    // assertions below.
+    let provider_handle =
+        add_accessor_provider(HashSet::from([target.clone()]), provider).expect("registry add");
+
+    // Unregistered name still None after registration of a sibling.
+    assert!(
+        resolve_via_process_local(&unknown).is_none(),
+        "registered sibling must not leak into unrelated names"
+    );
+    // Target name resolves.
+    assert!(
+        resolve_via_process_local(&target).is_some(),
+        "registered name must resolve"
+    );
+    drop(provider_handle);
+}
+
 // ---- AC-13.3 sanity: accessor_error_name surface lock ---------------
 
 #[test]

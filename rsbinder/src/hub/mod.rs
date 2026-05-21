@@ -85,6 +85,14 @@ pub mod android_14 {
 
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_16;
+/// Subplan 2-14: register-side companion to [`accessor_16`]. Defines
+/// `AccessorSockAddr` + `AccessorAddrProvider` (A0.1), `LocalAccessor`
+/// (A0.3), the `add_accessor_provider` / `create_accessor` /
+/// `remove_accessor_provider` process-local registry (A.4), and the
+/// `resolve_via_process_local` fallback helper (A.5). Same
+/// `cfg(feature = "rpc")` gate as the consume side.
+#[cfg(feature = "rpc")]
+pub(crate) mod accessor_register;
 mod servicemanager_16;
 pub mod android_16 {
     /// Subplan 2-13 B.6: expose the deterministic error-name decoder
@@ -97,6 +105,13 @@ pub mod android_16 {
         ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
         ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
         ERROR_UNSUPPORTED_SOCKET_FAMILY,
+    };
+    /// Subplan 2-14 register-side public surface (A0.1–A0.3 + A.4 + A.5).
+    #[cfg(feature = "rpc")]
+    pub use super::accessor_register::{
+        add_accessor_provider, create_accessor, remove_accessor_provider,
+        resolve_via_process_local, AccessorAddrProvider, AccessorConnectError, AccessorProviderFn,
+        AccessorProviderHandle, AccessorSockAddr, LocalAccessor,
     };
     pub use super::servicemanager_16::*;
 }

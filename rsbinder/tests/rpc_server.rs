@@ -794,6 +794,13 @@ fn a0b_multi_connection_shared_session() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1); // opt in to the versioned wire
+                                 // Phase B.1 (AC-12.4): `set_max_threads` is now the advertised
+                                 // *and* enforced per-session incoming-slot cap. This test exercises
+                                 // founding + one attached connection ⇒ explicit opt-in at 2 slots
+                                 // (default 1 ⇒ founding-only). AOSP-faithful: AC-12.0b is fundamentally
+                                 // a multi-conn scenario, so AOSP `setMaxIncomingThreads(2)` is its
+                                 // natural setup step.
+    server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -935,6 +942,202 @@ fn a0b_multi_connection_shared_session() {
     // a panic above no longer leaks worker threads + socket file.
 }
 
+/// **AC-12.F8** (subplan 2-12 Phase A4 — server-side unification of
+/// `RpcSessionInner` into a single inner per session; see
+/// `plans/2-12-multi-connection-per-session.md` §2 Phase A4 / §6).
+///
+/// The post-A0b residual was that the *server* still built one
+/// `RpcSessionInner` per accepted connection (sharing only the
+/// `SharedSession`), so `state.remote_proxies`-cached `RpcProxy.weak:
+/// Weak<RpcSessionInner>` pointed to the *first* worker's inner. A
+/// later worker unmarshaling the same client binder hit the cache and
+/// inherited that other inner — its nested `proxy.transact`
+/// `find_conn`ed inside the other worker's slot pool, not its own:
+/// cross-slot aliasing (F8). Phase A4 collapses N inners into 1 (slots
+/// in one pool); every cached `RpcProxy.weak` now points to the only
+/// inner, and any server worker's nested `proxy.transact` `find_conn`s
+/// **inside its own pool**.
+///
+/// Witness via the *founding inner*'s slot count: after Phase A4 an
+/// id-echoing attached connection adds a *slot* to that inner, so
+/// `session_slot_count(sid) == Some(2)`. The F8 mutant (== pre-A4
+/// code: server attach arm builds `from_android13plus(.., Some(shared))`
+/// = a fresh inner sharing only `SharedSession`) leaves the founding
+/// inner with its single founding slot ⇒ `Some(1)` — the assertion
+/// fails. This is what makes Phase A4 load-bearing rather than a
+/// no-op refactor.
+///
+/// AC-12.0b still asserts the *attach* itself (shared `SharedSession`
+/// id round-trip + `attached_count == 1` + F4 partial-loss survival);
+/// this test layers Phase A4's structural shape on top of that
+/// without re-asserting the A0b contract.
+#[test]
+fn ac_12_f8_attach_unifies_to_single_inner() {
+    let path = tmp_sock("ac12f8");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Phase B.1: opt into 2 incoming slots (default 1 ⇒ founding-only).
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // Founding connection (#1): empty id ⇒ new session, one slot.
+    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ #1");
+    let _root1 = EchoProxy(c1.get_root().expect("get_root #1"));
+    let sid = c1.get_session_id().expect("get_session_id #1");
+    let sid_arr: [u8; 32] = sid
+        .as_slice()
+        .try_into()
+        .expect("32-byte session id (AOSP kSessionIdBytes)");
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(1),
+        "founding-only ⇒ single slot in the founding inner"
+    );
+
+    // Attached connection (#2): echo #1's id ⇒ Phase A4 attach arm
+    // adds a *slot* to the founding inner (rather than building a
+    // fresh inner sharing only SharedSession — the F8 mutant).
+    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
+        .expect("a13+ #2 (attach)");
+    // Bound without the conventional `_` prefix — `root2` is moved into
+    // an explicit `drop(...)` below to trigger the F4 partial-loss
+    // reap; an underscore-prefix would have read as "intentionally
+    // unused" and hidden that load-bearing drop.
+    let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
+    assert!(
+        poll_until(|| server.attached_count() == 1),
+        "echo-id connection took the id-demux ATTACH path (A0b)"
+    );
+    // Phase A4 contract: the attached connection is a *slot on the
+    // founding inner*, so the inner's slot pool now has 2 slots.
+    // F8 mutant — each connection has its own inner with one slot —
+    // would leave the founding inner at slot_count == 1.
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
+        "Phase A4: attached connection adds a slot to the founding inner \
+         (mutant: fresh-inner-on-attach leaves slot_count == 1)"
+    );
+
+    // Partial-loss reaping (re-uses the existing F4 ledger): drop the
+    // attached and verify the founding inner's slot pool shrinks back
+    // to 1, then the founding-only state survives.
+    drop(root2);
+    drop(c2);
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(1)),
+        "remove_slot on attached worker exit shrinks the pool back to 1"
+    );
+    assert_eq!(
+        c1.get_session_id().expect("get_session_id #1 post-partial"),
+        sid,
+        "founding still alive and on the same shared session (F4)"
+    );
+}
+
+/// **AC-12.4 (Phase B.1 — `setMaxIncomingThreads` cap + negotiate
+/// reflection; see `plans/2-12-multi-connection-per-session.md` §2
+/// Phase B / §3 AC-12.4).** Phase B.1 unifies `set_max_threads(N)`'s
+/// two meanings — advertise + enforce: the server attach arm refuses
+/// an id-echoing connection when adding it would push `slot_count() >
+/// max_threads_value()`. Default 1 ⇒ founding-only; multi-conn
+/// callers opt in via explicit `set_max_threads(N >= 2)`.
+///
+/// Mutant gate (== pre-B.1 / advertise-only): cap check absent ⇒
+/// 3rd attach silently succeeds and `session_slot_count(sid) ==
+/// Some(3) > set_max_threads(2)` ⇒ the cap assertion fails (and the
+/// `rejected_unknown_id_count` witness stays at 0).
+///
+/// Sub-AC (b): `GetMaxThreads` returns the same `max_threads_value()`
+/// (advertise == enforce), so a client's `negotiate(local_max)`
+/// records `min(local_max, server_cap)` — verified at the wire by
+/// querying `negotiated_max_threads()` after a single
+/// `GetMaxThreads` round-trip.
+///
+/// Sub-AC (c — `shutdown` gate): documented at the *code* level only
+/// — the attach arm shows `if server.shutdown.load() { reject }`. A
+/// deterministic e2e trigger needs an accept-pass / handshake-stall /
+/// late-shutdown race that current test scaffolding does not bound;
+/// kept as a §7.3 FOLLOWUP (test scaffolding, not a B.1 deferral —
+/// the *behavior* is already in code and falls inside the
+/// rejected_unknown_id observability).
+#[test]
+fn ac_12_4_set_max_threads_caps_incoming_slots() {
+    let path = tmp_sock("ac124");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // Founding (#1) + attached (#2): both under the cap.
+    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ #1");
+    let _r1 = EchoProxy(c1.get_root().expect("get_root #1"));
+    let sid = c1.get_session_id().expect("get_session_id #1");
+    let sid_arr: [u8; 32] = sid
+        .as_slice()
+        .try_into()
+        .expect("32-byte session id (AOSP kSessionIdBytes)");
+    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
+        .expect("a13+ #2 (attach within cap)");
+    let _r2 = EchoProxy(c2.get_root().expect("get_root #2"));
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
+        "2 slots after founding + attached (cap = 2)"
+    );
+    let rejected_before = server.rejected_unknown_id_count();
+
+    // 3rd attach with the same session id ⇒ would push slot_count to
+    // 3 > max_threads(2) ⇒ refused at the attach arm (Phase B.1 cap).
+    let c3 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
+        .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
+    c3.set_timeout(Some(Duration::from_secs(3)));
+    let err = c3
+        .get_root()
+        .expect_err("3rd attach must be rejected by the per-session cap");
+    assert!(
+        matches!(
+            err,
+            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
+        ),
+        "cap-reject surfaces as the same reject set as unknown-id reject \
+         (post-handshake socket close), got {err:?}"
+    );
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
+        "cap-reject increments the `rejected_unknown_id` observability counter"
+    );
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(2),
+        "founding inner's slot pool stays at the cap (no overshoot — \
+         a B.1 mutant would have let this reach Some(3))"
+    );
+
+    // Sub-AC (b): negotiate reflects the server's advertised + enforced
+    // value. Client opts into local_max=4; server advertises 2 ⇒
+    // negotiated = min(4, 2) = 2. (Wire-level: a single GetMaxThreads
+    // round-trip, AC-3.4.) The advertise == enforce equation is exactly
+    // what makes the cap observable to a well-behaved client *without*
+    // needing to learn `rejected_unknown_id_count` out-of-band.
+    let negotiated = c1.negotiate(4).expect("negotiate");
+    assert_eq!(
+        negotiated, 2,
+        "negotiate(local=4) records min(local, server_cap=2) = 2"
+    );
+    assert_eq!(
+        c1.negotiated_max_threads(),
+        2,
+        "negotiated_max_threads() reflects the same cap"
+    );
+}
+
 /// **Phase A F7** (the AC-12.0b residual, now fixed). With a shared
 /// `RpcState` (A0b id-demux), two **independent** client sessions each
 /// hold their own proxy to the *same* server root. Pre-F7 the server
@@ -956,6 +1159,8 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // Phase B.1: opt into 2 incoming slots (founding + attached).
+    server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -1105,6 +1310,10 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let path = tmp_sock("a1pool");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // Phase B.1: AC-12.1 wires founding + one attached outgoing-echo
+    // ⇒ 2 incoming slots at the server. Default cap = 1 would reject
+    // the attach, defeating the pool-distribution scenario.
+    server.set_max_threads(2);
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -1165,6 +1374,9 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     let path = tmp_sock("a1exh");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // Phase B.1: 2 incoming slots (founding + attached); 3 client
+    // threads observe the cv-wait band.
+    server.set_max_threads(2);
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -1253,6 +1465,8 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let slow_entered = Arc::new(AtomicBool::new(false));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // Phase B.1: 2 incoming slots (founding + forced slot-2 echo).
+    server.set_max_threads(2);
     server.set_root(make_service_with_slow_signal(
         Arc::new(AtomicI64::new(0)),
         Arc::clone(&slow_entered),
@@ -1334,6 +1548,8 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // Phase B.1: founding + one outgoing-echo ⇒ 2 incoming slots.
+    server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());

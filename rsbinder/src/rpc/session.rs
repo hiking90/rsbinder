@@ -342,15 +342,15 @@ fn current_tid() -> Tid {
 /// **Phase A**: one connection slot of an `RpcSessionInner`'s pool —
 /// the rsbinder equivalent of AOSP `RpcSession::RpcConnection`.
 struct ConnSlot {
-    /// The connection's transport. `Box<dyn RpcTransport>` — the trait
-    /// object lives on the heap at a stable address; pushing into the
-    /// owning `Vec<ConnSlot>` moves the [`Box`] (a fat pointer) but
-    /// never the heap object, so a `*const (dyn RpcTransport)`
-    /// captured at [`RpcSessionInner::find_conn`] time stays valid
-    /// while the slot exists (Phase A never removes slots — only
-    /// `RpcSessionInner` teardown drops the `Vec`, which happens after
-    /// all serve workers and outstanding guards are gone).
-    transport: Box<dyn RpcTransport>,
+    /// The connection's transport, held as `Arc<dyn RpcTransport>` so a
+    /// [`ConnGuard`] holding an `Arc::clone` keeps the heap object
+    /// alive even if [`remove_slot`](RpcSessionInner::remove_slot)
+    /// drops this slot from the pool while the guard is in flight.
+    /// The pre-Phase-A4 invariant ("Phase A never removes slots") was
+    /// retired when [`remove_slot`] was introduced (F8 founding-not-
+    /// special teardown); refcounting via `Arc` is the replacement
+    /// liveness guarantee.
+    transport: Arc<dyn RpcTransport>,
     /// AOSP `RpcConnection::exclusiveTid`: thread currently driving
     /// this slot, or `None` if available. [`find_conn`] picks the
     /// first available; pool exhaustion **blocks on the session's
@@ -367,8 +367,9 @@ struct ConnSlot {
     #[allow(dead_code)] // populated for AOSP fidelity, consumed by Phase C oneway Option-2
     allow_nested: bool,
     /// Monotonic local id (the [`DRIVING`] reentrancy key + the
-    /// server-worker handle). Stable for the slot's life because Phase
-    /// A never removes a slot from the `Vec`.
+    /// server-worker handle). Stable for the slot's life — Phase A4
+    /// [`remove_slot`](RpcSessionInner::remove_slot) drops the slot
+    /// only on its own worker's exit, never re-using an id.
     id: u64,
 }
 
@@ -383,19 +384,21 @@ struct ConnState {
 
 /// RAII guard for one selected connection slot (Phase A). Built by
 /// [`RpcSessionInner::find_conn`]. Holds the slot exclusive_tid==this
-/// thread (unless reentrant) and a stable `*const (dyn RpcTransport)`
-/// captured under the slots lock so subsequent `send_msg`/`recv_msg`
-/// do **no** locking — concurrent client transacts on *other* slots
-/// run unimpeded (AC-12.1). On drop: clears `exclusive_tid` (unless
-/// reentrant), pops the [`DRIVING`] marker, and notifies one waiter.
+/// thread (unless reentrant) and an `Arc::clone` of the slot's
+/// transport so subsequent `send_msg`/`recv_msg` do **no** locking —
+/// concurrent client transacts on *other* slots run unimpeded
+/// (AC-12.1). On drop: clears `exclusive_tid` (unless reentrant),
+/// pops the [`DRIVING`] marker, and notifies waiters.
 struct ConnGuard<'a> {
     inner: &'a RpcSessionInner,
     slot_id: u64,
-    /// Stable for this guard's lifetime: see [`ConnSlot::transport`]
-    /// safety note. Never null. `!Send`/`!Sync` by default (raw ptr) —
-    /// the guard is single-thread by design (lives on the calling
-    /// stack frame of `client_transact` / `serve_once_on_slot` / …).
-    transport_ptr: *const dyn RpcTransport,
+    /// `Arc::clone` of the chosen slot's transport. Pins the heap
+    /// object alive for the guard's lifetime even if
+    /// [`remove_slot`](RpcSessionInner::remove_slot) concurrently
+    /// retires the slot from the pool — the underlying `Box`-equivalent
+    /// allocation is only freed when the last `Arc` (slot Vec entry +
+    /// any live guard) drops.
+    transport: Arc<dyn RpcTransport>,
     /// `true` ⇒ same-thread nested call reused this slot via
     /// [`DRIVING`]; drop must NOT release `exclusive_tid` (the outer
     /// frame still holds it).
@@ -404,14 +407,10 @@ struct ConnGuard<'a> {
 
 impl ConnGuard<'_> {
     /// Borrow the selected slot's transport. Stable for the guard's
-    /// lifetime.
+    /// lifetime via the held `Arc::clone`.
     #[inline]
     fn transport(&self) -> &dyn RpcTransport {
-        // SAFETY: see `ConnSlot::transport` and `ConnGuard::transport_ptr`
-        // — the heap object behind the Box is stable while the slot
-        // exists, and the guard's lifetime is bounded by the slot's
-        // exclusive ownership (Phase A never removes slots in flight).
-        unsafe { &*self.transport_ptr }
+        &*self.transport
     }
 }
 
@@ -425,17 +424,22 @@ impl Drop for ConnGuard<'_> {
             }
         });
         if !self.reentrant {
-            // Release exclusive ownership and wake exactly one
-            // `find_conn` waiter (AOSP `notify_one`). If there's no
-            // waiter, the wake is a no-op; we don't `notify_all`
-            // because only one waiter can claim a single freed slot
-            // (the others would just `wait` again — thundering-herd).
+            // Release exclusive ownership and wake waiters. We use
+            // `notify_all` to match [`add_slot_inner`] / [`remove_slot`]:
+            // a slot release benefits (a) `find_conn` any-available
+            // waiters and (b) `find_conn_pinned(self.slot_id)` waiters,
+            // but is irrelevant to `find_conn_pinned(other_id)`
+            // waiters. `std::Condvar` makes no FIFO guarantee, so
+            // `notify_one` could pick a pinned-elsewhere waiter that
+            // then re-`wait`s — leaving the actually-relevant waiter
+            // asleep. The thundering-herd cost is bounded by waiter
+            // count (and is zero on the default single-slot path).
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
             if let Some(s) = st.slots.iter_mut().find(|s| s.id == self.slot_id) {
                 s.exclusive_tid = None;
             }
             drop(st);
-            self.inner.slot_cv.notify_one();
+            self.inner.slot_cv.notify_all();
         }
     }
 }
@@ -667,18 +671,18 @@ impl RpcSessionInner {
                 .rev()
                 .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
         }) {
-            let transport_ptr = {
+            let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
                 st.slots
                     .iter()
                     .find(|s| s.id == slot_id)
-                    .map(|s| &*s.transport as *const _)
+                    .map(|s| Arc::clone(&s.transport))
                     .expect("DRIVING slot present")
             };
             return ConnGuard {
                 inner: self,
                 slot_id,
-                transport_ptr,
+                transport,
                 reentrant: true,
             };
         }
@@ -693,8 +697,23 @@ impl RpcSessionInner {
         // avoid this, deferred to Phase C). Twoways still distribute
         // (AC-12.1). Nested oneway inside a twoway dispatch hits the
         // reentrant pin above and reuses the inbound slot — F8.
+        //
+        // **Founding-gone fallback**: when the founding slot has been
+        // retired (its worker exited and `remove_slot(1)` ran) but the
+        // session is still alive via attached slots, `find_conn_pinned`
+        // returns `DeadObject`. Degrade to twoway-style distribution
+        // across the remaining slots — per-object oneway FIFO is no
+        // longer preserved (documented HOL trade-off), but the
+        // alternative (panic out of library code) is strictly worse.
         if oneway {
-            return self.find_conn_pinned(RpcSession::FOUNDING_SLOT_ID);
+            if let Ok(g) = self.find_conn_pinned(RpcSession::FOUNDING_SLOT_ID) {
+                return g;
+            }
+            log::debug!(
+                "find_conn(oneway=true): founding slot retired; falling back to \
+                 any-available — per-object oneway FIFO may be reordered"
+            );
+            // fall through to (2)/(3)/(4) below.
         }
         // (2)(3)(4) Acquire the pool lock and pick or wait.
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
@@ -708,12 +727,12 @@ impl RpcSessionInner {
             {
                 s.exclusive_tid = Some(tid);
                 let slot_id = s.id;
-                let transport_ptr: *const dyn RpcTransport = &*s.transport;
+                let transport = Arc::clone(&s.transport);
                 DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
                 return ConnGuard {
                     inner: self,
                     slot_id,
-                    transport_ptr,
+                    transport,
                     reentrant: false,
                 };
             }
@@ -724,14 +743,26 @@ impl RpcSessionInner {
         }
     }
 
-    /// Same as [`find_conn`] but pins to a **specific** slot id (used
-    /// by the server worker's `serve_blocking_on(slot_id)`): the
-    /// worker drives its assigned inbound slot, not "any available".
-    /// Waits on the condvar if the slot is held by another thread
-    /// (shouldn't happen in the normal accept-then-serve flow — the
-    /// freshly-added slot is unclaimed). Same reentrant-pin path as
-    /// `find_conn` so a nested call inside dispatch re-uses this slot.
-    fn find_conn_pinned(&self, want_slot_id: u64) -> ConnGuard<'_> {
+    /// Same as [`find_conn`] but pins to a **specific** slot id. Used
+    /// by the server worker's `serve_blocking_on(slot_id)` (drives its
+    /// assigned inbound slot, never "any available") and by the
+    /// oneway-pin path in [`find_conn`] (founding-slot FIFO).
+    ///
+    /// Returns `Err(StatusCode::DeadObject)` when `want_slot_id` is
+    /// not present in the pool — this can legitimately happen on the
+    /// oneway pin path when the founding slot's worker has exited and
+    /// `remove_slot(FOUNDING_SLOT_ID)` has run while the session is
+    /// still alive via attached slots. Callers either propagate the
+    /// error (server worker — Phase A4 self-remove makes this
+    /// structurally unreachable from the worker's own pin) or fall
+    /// back (`find_conn` oneway path degrades to any-available).
+    ///
+    /// Waits on the condvar if the slot exists but is held by another
+    /// thread (shouldn't happen in the normal accept-then-serve flow
+    /// — the freshly-added slot is unclaimed). Same reentrant-pin
+    /// path as `find_conn` so a nested call inside dispatch reuses
+    /// this slot.
+    fn find_conn_pinned(&self, want_slot_id: u64) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
         // Reentrant on the same slot.
@@ -740,37 +771,43 @@ impl RpcSessionInner {
                 .iter()
                 .any(|&(sp, sid)| sp == sess_ptr && sid == want_slot_id)
         }) {
-            let transport_ptr = {
+            let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
                 st.slots
                     .iter()
                     .find(|s| s.id == want_slot_id)
-                    .map(|s| &*s.transport as *const _)
+                    .map(|s| Arc::clone(&s.transport))
                     .expect("pinned slot present")
             };
-            return ConnGuard {
+            return Ok(ConnGuard {
                 inner: self,
                 slot_id: want_slot_id,
-                transport_ptr,
+                transport,
                 reentrant: true,
-            };
+            });
         }
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
             let target = st.slots.iter_mut().find(|s| s.id == want_slot_id);
             let Some(slot) = target else {
-                panic!("find_conn_pinned: slot id {want_slot_id} removed from pool");
+                // Phase A4: a slot can be removed when its own worker exits
+                // (`remove_slot` from `serve_blocking_on`). After that the
+                // session may still be alive (other slots), but anyone who
+                // pinned to this specific id (e.g. oneway → founding-slot
+                // pin) must surface a typed error so the caller can fall
+                // back rather than panicking out of library code.
+                return Err(StatusCode::DeadObject);
             };
             if slot.exclusive_tid.is_none() || slot.exclusive_tid == Some(tid) {
                 slot.exclusive_tid = Some(tid);
-                let transport_ptr: *const dyn RpcTransport = &*slot.transport;
+                let transport = Arc::clone(&slot.transport);
                 DRIVING.with(|d| d.borrow_mut().push((sess_ptr, want_slot_id)));
-                return ConnGuard {
+                return Ok(ConnGuard {
                     inner: self,
                     slot_id: want_slot_id,
-                    transport_ptr,
+                    transport,
                     reentrant: false,
-                };
+                });
             }
             st = self.slot_cv.wait(st).expect("slot_cv poisoned");
         }
@@ -789,17 +826,21 @@ impl RpcSessionInner {
     /// [`SharedSession::try_bump_live_conns`]; client-outgoing doesn't,
     /// since outgoing slots aren't serve-driven on the client side).
     ///
-    /// Uses `notify_all` (not `notify_one`, which `ConnGuard::drop`
-    /// can safely use because it only ever releases the *one* slot
-    /// the dropping guard owned): a freshly-pushed slot satisfies
+    /// Uses `notify_all` (same rationale as [`ConnGuard::drop`] and
+    /// [`Self::remove_slot`]): a freshly-pushed slot satisfies
     /// `find_conn`'s "any available" waiters but NOT
     /// `find_conn_pinned(other_id)` waiters, and `std::Condvar` makes
-    /// no FIFO guarantees — `notify_one` could wake a pinned-elsewhere
+    /// no FIFO guarantee, so `notify_one` could wake a pinned-elsewhere
     /// waiter and starve the any-available ones the new slot was
     /// actually for. The thundering-herd cost is bounded by waiter
     /// count and is zero on the default single-slot path (no waiters
     /// at all), so the trade favors mixed-waiter correctness.
     fn add_slot_inner(&self, transport: Box<dyn RpcTransport>) -> u64 {
+        // `Arc::from(Box<dyn T>)` is the stable std conversion that
+        // re-takes the heap allocation under an `Arc` without copying
+        // (impl<T: ?Sized> From<Box<T>> for Arc<T>). The slot holds
+        // the canonical `Arc`; `ConnGuard`s hand out cheap clones.
+        let transport: Arc<dyn RpcTransport> = Arc::from(transport);
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         let id = st.next_slot_id;
         st.next_slot_id += 1;
@@ -820,6 +861,23 @@ impl RpcSessionInner {
     /// [`RpcSession::add_outgoing_connection_android13plus`].
     fn add_outgoing_slot(&self, transport: Box<dyn RpcTransport>) -> u64 {
         self.add_slot_inner(transport)
+    }
+
+    /// **Phase A4 (F8)**: remove a slot from the pool on its worker's
+    /// `serve_blocking_on` exit. Called by the slot's *own* worker
+    /// (self-remove), so `find_conn_pinned(slot_id)`'s
+    /// `panic!("removed from pool")` remains structurally unreachable
+    /// (the slot's exclusive holder is the dropping thread itself; no
+    /// other thread can be pinned on it). `notify_all` so any
+    /// `find_conn` (any-available) waiter re-evaluates against the
+    /// shrunk pool — and any `find_conn_pinned(slot_id)` waiter
+    /// surfaces the structural error (still treated as a should-never
+    /// panic per R4 narrow scope).
+    fn remove_slot(&self, slot_id: u64) {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        st.slots.retain(|s| s.id != slot_id);
+        drop(st);
+        self.slot_cv.notify_all();
     }
 
     pub(crate) fn fd_mode(&self) -> FileDescriptorTransportMode {
@@ -905,6 +963,65 @@ impl RpcSessionInner {
 
     fn self_weak(&self) -> Weak<RpcSessionInner> {
         self.self_weak.lock().expect("self_weak").clone()
+    }
+
+    /// **Phase A4 (F8)**: F7 leak observability delegated to
+    /// [`SharedSession::local_node_count`]. Lets [`super::RpcServer`]
+    /// keep its public `live_session_node_count` API byte-unchanged
+    /// while the registry holds `Weak<RpcSessionInner>` (the F8
+    /// "1 inner / session" handle) rather than `Weak<SharedSession>`.
+    pub(crate) fn local_node_count(&self) -> usize {
+        self.shared.local_node_count()
+    }
+
+    /// **Phase A4 (F8)**: F4 deterministic witness delegated to
+    /// [`SharedSession::live_conn_count`]. Counterpart of
+    /// [`local_node_count`](RpcSessionInner::local_node_count) for
+    /// `RpcServer::session_live_conns`.
+    pub(crate) fn live_conn_count(&self) -> usize {
+        self.shared.live_conn_count()
+    }
+
+    /// **Phase A4 (F8)**: count of slots currently in this session's
+    /// pool — the AC-12.F8 mutant-gate witness. Server-side
+    /// unification means each id-echoing attached connection adds a
+    /// slot to the *founding* inner rather than building a fresh
+    /// inner; the F8 mutant (today's pre-A4 code = build a fresh
+    /// inner per attach) leaves the founding inner at a single slot.
+    /// Used by [`super::RpcServer::session_slot_count`].
+    pub(crate) fn slot_count(&self) -> usize {
+        self.conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .slots
+            .len()
+    }
+
+    /// **Phase B.1**: this session's advertised + enforced max-threads
+    /// value. Set by [`RpcSession::set_max_threads`] (default 1) and
+    /// returned to a client on `GET_MAX_THREADS`. AOSP-faithful
+    /// `setMaxIncomingThreads`: the value is *both* the advertise and
+    /// the **incoming slot cap** — the server attach arm refuses an
+    /// id-echoing connection when adding it would push
+    /// `slot_count() > max_threads_value()`. Default 1 ⇒ founding-only
+    /// (multi-conn callers must explicitly `set_max_threads(N >= 2)`).
+    pub(crate) fn max_threads_value(&self) -> u32 {
+        // `Relaxed` is sufficient: this atomic is a single-cell config
+        // value (set by `RpcSession::set_max_threads` before any
+        // accept/attach takes place; `std::thread::spawn` then provides
+        // the happens-before for worker threads). No multi-atomic
+        // ordering pair to maintain — the prior `SeqCst` was overkill.
+        self.shared.max_threads.load(Ordering::Relaxed)
+    }
+
+    /// **Phase A4 (F8)**: the negotiated wire protocol version of this
+    /// session, or `None` for R34. The server attach arm uses this to
+    /// reject an id-echoing 2nd+ connection whose handshake settled on
+    /// a different version than the founding inner — profile is
+    /// immutable across a session, so any mismatch is a malformed
+    /// peer.
+    pub(crate) fn wire_protocol_version(&self) -> Option<u32> {
+        self.profile.wire_version()
     }
 
     /// Profile-aware in-parcel binder address (the `flattenBinder` /
@@ -1168,6 +1285,17 @@ impl RpcSessionInner {
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress) -> Result<()> {
         // `RpcProxy::drop` (best-effort) and `read_binder`'s F7
         // excess-flush call this from arbitrary threads/contexts.
+        // **Phase A4 (F8) shutdown guard**: once the session's
+        // obituary has fired, the peer is gone *and* the slot pool
+        // has either started shrinking via `remove_slot` or already
+        // emptied — `find_conn` on an empty pool would `cv.wait`
+        // forever (no `add_slot` can race past F4
+        // `try_bump_live_conns`). Skip best-effort. AOSP parity: a
+        // remote `DEC_STRONG` on a dead session is observationally
+        // no-op (the peer's `RpcState` is gone).
+        if self.shared.obituary_sent.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // `find_conn` picks an available slot (or — if this thread is
         // already driving one of the session's slots — reuses it via
         // `DRIVING`, the documented "interleaved DEC_STRONG" path).
@@ -1345,7 +1473,12 @@ impl RpcSessionInner {
     /// via the `DRIVING` marker, AC-3.6/F8).
     /// `Ok(false)` ⇒ peer closed (stop).
     fn serve_once_on_slot(&self, slot_id: u64) -> Result<bool> {
-        let conn = self.find_conn_pinned(slot_id);
+        // The worker drives its own slot — pinning to it must succeed
+        // (the slot was just added by `add_incoming_slot`/etc. and
+        // hasn't been removed yet because `remove_slot` only runs from
+        // this very call's `serve_blocking_on` exit). A `DeadObject`
+        // here would be a structural bug, propagated so the worker exits.
+        let conn = self.find_conn_pinned(slot_id)?;
         let transport = conn.transport();
         let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
@@ -1523,9 +1656,11 @@ impl RpcSession {
         // (slot ids are monotonic from 1; 0 is reserved as a "no slot"
         // sentinel for future use). Default single-connection sessions
         // never add more slots ⇒ `find_conn` is a no-wait single-slot
-        // pick ⇒ pre-A `enter_connection` byte-identical.
+        // pick ⇒ pre-A `enter_connection` byte-identical. The slot
+        // owns its transport via `Arc<dyn RpcTransport>` — see
+        // [`ConnSlot::transport`] for why.
         let founding = ConnSlot {
-            transport,
+            transport: Arc::from(transport),
             exclusive_tid: None,
             allow_nested: true,
             id: 1,
@@ -1549,17 +1684,19 @@ impl RpcSession {
     /// drive this slot.
     pub(crate) const FOUNDING_SLOT_ID: u64 = 1;
 
-    /// **Phase A — reserved for the server-side unification next
-    /// increment.** Adds a freshly-accepted `transport` as a new
-    /// incoming slot of this session's pool (the call the unified-
-    /// model server will make on attach instead of building a new
-    /// `RpcSessionInner` sharing a `SharedSession`). Bumps
-    /// `live_conns` for **F4** via the anti-resurrection primitive —
-    /// returns `Err(StatusCode::DeadObject)` when the session is
-    /// already torn down (obituary already fired) so the caller
-    /// rejects the attach instead of silently resurrecting a dead
-    /// session.
-    #[allow(dead_code)] // wired up by the next Phase A increment (server-side unification)
+    /// **Phase A4 (F8 — server-side unification).** Adds a freshly-
+    /// accepted `transport` as a new incoming slot of this session's
+    /// pool. The unified-model server attach arm calls this on the
+    /// *founding* `Arc<RpcSessionInner>` (resolved from its 32-byte
+    /// session id) instead of building a new `RpcSessionInner` sharing
+    /// a `SharedSession` — so `state.remote_proxies`-cached `RpcProxy`s
+    /// all point to the *single* session inner and a server worker's
+    /// nested `proxy.transact` `find_conn`s within its own slot pool
+    /// (no cross-slot aliasing of the F8 hazard). Bumps `live_conns`
+    /// for **F4** via the anti-resurrection primitive — returns
+    /// `Err(StatusCode::DeadObject)` when the session is already torn
+    /// down (obituary already fired) so the caller rejects the attach
+    /// instead of silently resurrecting a dead session.
     pub(crate) fn add_incoming_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
         if !self.inner.shared.try_bump_live_conns() {
             return Err(StatusCode::DeadObject);
@@ -1567,13 +1704,23 @@ impl RpcSession {
         Ok(self.inner.add_slot_inner(transport))
     }
 
-    /// The shared session state of this connection (Phase A0b). The
-    /// server registers a [`std::sync::Weak`] of this under the 32-byte
-    /// session id; on an id-echoing 2nd connection it resolves it and
-    /// passes it to [`RpcSession::from_android13plus`] so the new
-    /// connection shares the same `state`/`root`/`rpc_session_id`.
-    pub(crate) fn shared(&self) -> Arc<SharedSession> {
-        Arc::clone(&self.inner.shared)
+    /// **Phase A4 (F8)**: this session's full inner state — including
+    /// the *connection slot pool* and the wire profile, not just
+    /// [`SharedSession`]. The unified-model server attach path stores
+    /// `Weak` of this in `RpcServer.sessions` so an id-echoing 2nd+
+    /// connection [`add_incoming_slot`](RpcSession::add_incoming_slot)s
+    /// onto the founding inner — a single `RpcSessionInner` per
+    /// session, server-side unification of the F8 hazard.
+    pub(crate) fn inner_arc(&self) -> Arc<RpcSessionInner> {
+        Arc::clone(&self.inner)
+    }
+
+    /// **Phase A4 (F8)**: wrap a resolved founding inner (from
+    /// `RpcServer.sessions`) as an `RpcSession` so the attaching server
+    /// worker can call [`serve_blocking_on`](RpcSession::serve_blocking_on)
+    /// — symmetric to the founding worker's API surface.
+    pub(crate) fn wrap_inner(inner: Arc<RpcSessionInner>) -> Self {
+        RpcSession { inner }
     }
 
     /// Server (Phase A0b): run **only** the android-13+ accept
@@ -1967,6 +2114,18 @@ impl RpcSession {
         {
             self.inner.send_session_obituaries();
         }
+        // Phase A4 (F8): drop this worker's slot from the pool **after**
+        // the F4 fetch_sub / obituary so a concurrent `RpcProxy::drop`'s
+        // best-effort `send_dec_strong` sees either (i) the slot still
+        // present (`find_conn` picks it, send returns `PeerClosed`,
+        // best-effort path Err — no deadlock) or (ii) `obituary_sent =
+        // true` (the dedicated `send_dec_strong` early-out below
+        // short-circuits, skipping `find_conn` entirely). Removing the
+        // slot *before* the obituary opened a window where a stale
+        // proxy drop would find an empty pool and block forever on
+        // `slot_cv` (no add_slot can race the obituary thanks to F4
+        // `try_bump_live_conns`).
+        self.inner.remove_slot(slot_id);
         result
     }
 

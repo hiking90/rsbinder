@@ -31,7 +31,7 @@ use crate::error::{Result, StatusCode};
 use crate::native::Binder;
 use crate::parcel::Parcel;
 
-use super::session::{RpcSession, RpcSessionId, SharedSession};
+use super::session::{RpcSession, RpcSessionId, RpcSessionInner};
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 
 /// Built-in directory interface descriptor + its single transaction.
@@ -150,7 +150,17 @@ pub struct RpcServer {
     /// 32-byte map key is an *attach capability* (subplan 2-12 A0b),
     /// not just an opaque hash. Internal-only; public APIs continue
     /// to take `&[u8]` / `[u8; 32]` for compatibility.
-    sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<SharedSession>>>,
+    /// Phase A4 (F8) **server-side unification**: was
+    /// `Weak<SharedSession>` (A0b). Now holds a `Weak` of the founding
+    /// `RpcSessionInner` itself so id-echoing attaches add a slot onto
+    /// the *single* inner via [`RpcSession::add_incoming_slot`] —
+    /// `state.remote_proxies`-cached `RpcProxy`s' `Weak<RpcSessionInner>`
+    /// then point to the only inner and any server worker's nested
+    /// `proxy.transact` `find_conn`s stay within its own slot pool
+    /// (no cross-slot aliasing of the F8 hazard). The public API
+    /// (`live_session_node_count`/`session_live_conns`) is byte-
+    /// unchanged via `RpcSessionInner` delegate methods.
+    sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<RpcSessionInner>>>,
     /// A0a/A0b observability (also the AC-12.0b mutant gate). Plain
     /// atomics off the per-transaction path — zero-cost on the default
     /// (empty-id) flow. `session_registered` = new-session mints;
@@ -212,12 +222,54 @@ impl RpcServer {
         Ok(())
     }
 
-    /// Advertised max-threads (negotiation, AC-3.4). Default 1.
+    /// Advertised + enforced max-threads per session (AOSP-faithful
+    /// `setMaxIncomingThreads`, Phase B.1; AC-3.4 / AC-12.4). Default 1.
     ///
-    /// This is **only** the value advertised to clients on
-    /// `GET_MAX_THREADS`; it does *not* bound server-side resources.
-    /// To cap concurrent connection workers use
-    /// [`set_max_connections`](RpcServer::set_max_connections).
+    /// The value is **both** the advertise returned to a client on
+    /// `GET_MAX_THREADS` **and** the per-session incoming-slot cap
+    /// enforced at attach time: the server attach arm refuses an
+    /// id-echoing connection when adding it would push the founding
+    /// inner's `slot_count() > max_threads_value()`. Default 1 ⇒
+    /// founding-only (multi-conn callers must explicitly
+    /// `set_max_threads(N >= 2)` to opt into N incoming slots per
+    /// session).
+    ///
+    /// Distinct from [`set_max_connections`](RpcServer::set_max_connections)
+    /// (Phase 2-10), which caps *concurrent connection-worker threads*
+    /// across the **whole server**; this caps *incoming slots* within a
+    /// **single session**. Both are additive — when both are active,
+    /// the tighter cap wins.
+    ///
+    /// # ⚠ Experimental for `N ≥ 2` (real-libbinder interop not yet verified)
+    ///
+    /// **`N == 1` (default) is fully supported and validated against real
+    /// android-13/14/15/16 libbinder peers** (single-connection sessions,
+    /// the only RPC mode rsbinder has shipped through plans 2-1 … 2-11 /
+    /// 2-13 / 2-14 STAGE3 gates).
+    ///
+    /// **`N ≥ 2` (multi-connection sessions, plan 2-12) is EXPERIMENTAL**:
+    /// hermetic rsbinder↔rsbinder tests pass (Phase A0a/A0b/A/B.1/F7/F8 —
+    /// `rpc_server` 22/0), but **the non-negotiable real-libbinder gate
+    /// AC-12.6 has NOT yet passed** — see plan
+    /// [`2-12-multi-connection-per-session.md`](../../../plans/2-12-multi-connection-per-session.md)
+    /// §3 / [`RPC_STATUS.md`](../../../RPC_STATUS.md). A focused 2026-05-21
+    /// investigation against real libbinder on the android-16 emulator
+    /// (`example-hello/cpp/run_stage3_multiconn.sh`) found that:
+    ///
+    ///  * rsbinder server's wire bytes are **byte-correct** under
+    ///    concurrent multi-conn dispatch (hex-dump verified, no
+    ///    interleaving — each slot has its own transport).
+    ///  * a process-wide server-side send mutex **does not** fix the
+    ///    failure, ruling out wire-level interleaving.
+    ///  * yet libbinder logs `RpcState: Expecting 20 but got 0 bytes for
+    ///    RpcWireReply. Terminating!` and the session dies; root cause
+    ///    (libbinder bug vs rsbinder non-wire protocol nuance) is
+    ///    undiagnosed in this iteration.
+    ///
+    /// **Treat `N ≥ 2` as rsbinder↔rsbinder hermetic only until AC-12.6
+    /// passes against real libbinder.** Production code that wants to
+    /// interoperate with a real android libbinder peer should stay on the
+    /// default `N == 1` (single-connection session, fully validated).
     pub fn set_max_threads(&self, n: u32) {
         *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
     }
@@ -338,40 +390,35 @@ impl RpcServer {
 
     // --- Subplan 2-12 Phase A0b: session-id → shared-session registry
 
-    /// Register a newly-minted session's shared state under its 32-byte
-    /// id (new-session / empty-id accept path). Stored as a `Weak` so a
-    /// fully-torn-down session does not pin memory and its id, if later
-    /// echoed, resolves to "unknown".
-    fn register_session(&self, id: RpcSessionId, shared: &Arc<SharedSession>) {
+    /// Register a newly-minted session's founding `RpcSessionInner`
+    /// under its 32-byte id (new-session / empty-id accept path). Stored
+    /// as a `Weak` so a fully-torn-down session (last slot exit drops
+    /// the `Arc<RpcSessionInner>`) does not pin memory, and its id, if
+    /// later echoed, resolves to "unknown". Phase A4 (F8) widened this
+    /// from `Weak<SharedSession>` to `Weak<RpcSessionInner>` so the
+    /// attach path adds a slot onto the founding inner directly.
+    fn register_session(&self, id: RpcSessionId, inner: &Arc<RpcSessionInner>) {
         let mut map = self.sessions.lock().expect("sessions poisoned");
         // Opportunistically prune fully-dead sessions so the map is
         // bounded by *live* sessions, not cumulative over the server's
         // lifetime (random 32-byte ids never collide in practice, so a
-        // dead `Weak` would otherwise linger forever).
+        // dead `Weak` would otherwise linger forever). Phase A4 (F8)
+        // makes explicit `unregister_session` unnecessary — the
+        // founding worker's exit is no longer the session's death (any
+        // *last* slot exit is), so prune-on-register suffices.
         map.retain(|_, w| w.strong_count() > 0);
-        map.insert(id, Arc::downgrade(shared));
+        map.insert(id, Arc::downgrade(inner));
         drop(map);
         self.session_registered.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Drop a session's id on full teardown so the map keeps tracking
-    /// **live** sessions (no unbounded growth over a long-lived
-    /// server). Unconditional `remove`: 32-byte CSPRNG ids are
-    /// collision-free in practice, so an entry being removed is always
-    /// the session that just exited (no later same-id session can have
-    /// been minted in the meantime). The F4 race window between this
-    /// `remove` and the founding worker's `live_conns.fetch_sub` is
-    /// closed by [`SharedSession::try_bump_live_conns`] at the attach
-    /// side, not by an identity check here.
-    fn unregister_session(&self, id: &RpcSessionId) {
-        self.sessions.lock().expect("sessions poisoned").remove(id);
-    }
-
-    /// Resolve a client-echoed id to a **live** shared session
-    /// (Phase A0b id-demux). `None` for any non-32-byte id (AOSP
+    /// Resolve a client-echoed id to a **live** founding inner
+    /// (Phase A0b id-demux, widened by Phase A4 / F8 to return the
+    /// `RpcSessionInner` so the attach path can `add_incoming_slot` on
+    /// it directly). `None` for any non-32-byte id (AOSP
     /// `kSessionIdBytes == 32`), an unknown id, or a stale `Weak`
     /// (session fully torn down) — all of which the caller rejects.
-    fn resolve_session(&self, id: &[u8]) -> Option<Arc<SharedSession>> {
+    fn resolve_session(&self, id: &[u8]) -> Option<Arc<RpcSessionInner>> {
         let key = RpcSessionId::try_from_slice(id)?;
         self.sessions
             .lock()
@@ -403,11 +450,14 @@ impl RpcServer {
     /// stuck above baseline is the F7 leak the no-excess-DEC mutant
     /// reintroduces.
     ///
-    /// Lock ladder: collect the live `Arc<SharedSession>` snapshot
+    /// Lock ladder: collect the live `Arc<RpcSessionInner>` snapshot
     /// **first** (releasing the `sessions` mutex), then walk each
-    /// session's `state` mutex. Avoids the nested-lock pattern
-    /// (`sessions` → `state`); a poisoned `state` lock in one session
-    /// no longer poisons `sessions` as a side-effect.
+    /// session's `state` mutex (via the inner's
+    /// [`local_node_count`](RpcSessionInner::local_node_count) delegate
+    /// — Phase A4 (F8) keeps this public surface byte-unchanged).
+    /// Avoids the nested-lock pattern (`sessions` → `state`); a
+    /// poisoned `state` lock in one session no longer poisons
+    /// `sessions` as a side-effect.
     pub fn live_session_node_count(&self) -> usize {
         let sessions: Vec<_> = self
             .sessions
@@ -435,6 +485,25 @@ impl RpcServer {
             .get(&key)
             .and_then(std::sync::Weak::upgrade)
             .map(|s| s.live_conn_count())
+    }
+
+    /// **Phase A4 (F8)** mutant-gate witness: count of slots in the
+    /// founding `RpcSessionInner`'s pool for the session keyed by `id`.
+    /// `None` ⇒ no live session with that id. After Phase A4 each
+    /// id-echoing attached connection adds a slot here (single inner
+    /// per session, AC-12.F8); the F8 *mutant* (today's pre-A4 code,
+    /// which builds a fresh inner per attached connection sharing only
+    /// `SharedSession`) leaves the founding inner at one slot, so a
+    /// test that establishes (founding + attached = 2) and asserts
+    /// `Some(2)` here is satisfied only by the unified topology.
+    pub fn session_slot_count(&self, id: &[u8; 32]) -> Option<usize> {
+        let key = RpcSessionId::new(*id);
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .map(|s| s.slot_count())
     }
 
     /// Serve one already-connected transport on its own worker thread
@@ -499,10 +568,19 @@ impl RpcServer {
                     if client_id.is_empty() {
                         // Default / new-session path — byte-identical
                         // to pre-2-12 (empty id ⇒ fresh `SharedSession`,
-                        // `live_conns == 1`). Register a `Weak` of it so
-                        // a later echo of its id can demux-attach; the
-                        // id is *never resolved* on this path, so the
-                        // default behavior is unchanged.
+                        // `live_conns == 1`, one slot). Register a
+                        // `Weak<RpcSessionInner>` so a later echo of
+                        // its id can demux-attach onto this *founding
+                        // inner* (Phase A4 / F8: one inner per
+                        // session). The id is *never resolved* on this
+                        // path, so the default behavior is unchanged.
+                        //
+                        // Phase A4 (F8): no `unregister_session` on
+                        // exit — the founding worker is no longer the
+                        // session's death (any *last* slot exit is);
+                        // when the last `Arc<RpcSessionInner>` drops,
+                        // the registry's `Weak` goes stale and the
+                        // next `register_session` prunes it.
                         let session = RpcSession::from_android13plus(
                             transport,
                             codec,
@@ -511,73 +589,151 @@ impl RpcServer {
                             None,
                         );
                         let id = RpcSessionId::new(session.session_id());
-                        server.register_session(id, &session.shared());
+                        server.register_session(id, &session.inner_arc());
                         server.configure_session(&session);
                         if let Err(e) = session.serve_blocking() {
                             log::debug!("RPC session ended: {e:?}");
                         }
-                        server.unregister_session(&id);
-                    } else if let Some(shared) = server.resolve_session(&client_id) {
-                        // Phase A0b **id-demux attach**: bind this
-                        // connection to the *pre-existing* session, so a
-                        // binder published over the founding connection
-                        // is reachable here (shared `state`/`root`).
+                    } else if let Some(inner) = server.resolve_session(&client_id) {
+                        // Phase A4 (F8) **server-side unification**:
+                        // attach this connection as a new *slot* on the
+                        // founding `RpcSessionInner` (resolved from the
+                        // session id), not as a separate inner sharing
+                        // a `SharedSession`. One inner per session ⇒
+                        // every cached `RpcProxy.weak: Weak<RpcSessionInner>`
+                        // points to the only inner, so any server
+                        // worker's nested `proxy.transact` `find_conn`s
+                        // stay within its own slot pool (no cross-slot
+                        // aliasing of the F8 hazard).
                         //
-                        // **F4 anti-resurrection gate**: the founding
-                        // worker may have raced past `live_conns 1→0`
-                        // and fired obituaries between
-                        // `resolve_session.upgrade()` and now (the
-                        // founding session's `Arc<SharedSession>` is
-                        // still alive on the founding closure stack, so
-                        // the `Weak::upgrade` succeeded — but the
-                        // session is already dead). `try_bump_live_conns`
-                        // closes that window: on rollback the attach
-                        // path falls through to the unknown-id reject
-                        // arm so the attaching client gets `DeadObject`
-                        // instead of silently joining a session whose
-                        // `binder_died` already fired (or, worse, never
-                        // fires again for this connection's
-                        // `DeathRecipient`s).
-                        if !shared.try_bump_live_conns() {
+                        // **Profile uniformity gate** (Phase A4): the
+                        // session's wire profile is set at the
+                        // founding handshake and is immutable; an
+                        // id-echoing 2nd+ connection whose handshake
+                        // negotiated a different version is a
+                        // malformed peer (or a hostile attempt to
+                        // mix-and-match codecs on one session) — refuse
+                        // before its bytes touch the session. R34
+                        // sessions are never registered in `sessions`
+                        // (the registry is populated only inside this
+                        // `Some(max) =>` branch, not the r34 arm below),
+                        // so `inner.wire_protocol_version()` is always
+                        // `Some(_)` here and this comparison reduces to
+                        // "founding vs attaching negotiated version
+                        // must match".
+                        if inner.wire_protocol_version() != Some(codec.version()) {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(
-                                "android-13+ RPC: session torn down between resolve \
-                                 and attach (F4 race); rejecting"
+                                "android-13+ RPC: attach codec version {} ≠ \
+                                 founding inner version {:?}; rejecting",
+                                codec.version(),
+                                inner.wire_protocol_version()
                             );
                             drop(transport);
                             return;
                         }
-                        // Bump `attached_count` **immediately** after
-                        // the successful live-conns bump so an external
-                        // observer (e.g. AC-12.0b's `poll_until`) never
-                        // sees the intermediate state where
-                        // `live_conns` is incremented but
-                        // `attached_count` isn't. The original ordering
-                        // (`from_android13plus` between the two
-                        // counters) opened a tiny window — harmless
-                        // for current tests but contradicts the
-                        // "attached_count tracks id-demux attaches"
-                        // doc-claim.
+                        // **Phase B.1 shutdown gate**: refuse attaches
+                        // once the server is shutting down (clean
+                        // teardown semantics — a late-arriving
+                        // id-echoing client must not be allowed to
+                        // hook onto a session whose worker pool is
+                        // already winding down). The `shutdown` flag
+                        // is what `RpcServer::run` polls each accept
+                        // tick (line ~657 below); checking it here
+                        // closes the small window where the accept
+                        // succeeded but the server transitioned to
+                        // shutdown between accept and attach.
+                        if server.shutdown.load(Ordering::SeqCst) {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!("android-13+ RPC: attach after server shutdown; rejecting");
+                            drop(transport);
+                            return;
+                        }
+                        // **Phase B.1 incoming slot cap** (AOSP-faithful
+                        // `setMaxIncomingThreads`): refuse the attach
+                        // when adding it would push `slot_count()` past
+                        // the founding inner's advertised
+                        // `max_threads_value()`. Default = 1 ⇒
+                        // founding-only; multi-conn callers must
+                        // explicitly `set_max_threads(N >= 2)` to opt
+                        // into N incoming slots per session. AOSP
+                        // `GetMaxThreads` returns the same value, so
+                        // the wire advertisement and the server-side
+                        // enforcement match exactly.
+                        //
+                        // Race: this check and the subsequent
+                        // `add_incoming_slot` are two separate critical
+                        // sections (each takes `conn_state.lock()` and
+                        // releases it), so N concurrent attach workers
+                        // can ALL pass the cap check and then ALL push
+                        // — `slot_count` may transiently overshoot
+                        // `max_threads` by up to (N − 1), bounded only
+                        // by the number of concurrent attach workers
+                        // (which 2-10's `set_max_connections` accept
+                        // cap limits; default unlimited). For Phase
+                        // B.1 this is acceptable — tightening to a
+                        // single critical section that combines check
+                        // + push (or a check-and-increment atomic) is
+                        // §7.3 R-future (the same atomic that an R1
+                        // `SessionLifecycle` enum naturally folds into).
+                        let cap = inner.max_threads_value() as usize;
+                        if inner.slot_count() >= cap {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: attach refused (incoming slot \
+                                 cap reached: slot_count={}, max_threads={})",
+                                inner.slot_count(),
+                                cap
+                            );
+                            drop(transport);
+                            return;
+                        }
+                        // **F4 anti-resurrection gate + slot add** —
+                        // atomic via `add_incoming_slot`, which gates
+                        // on `try_bump_live_conns` *and* enqueues the
+                        // slot in one critical section (no double-bump
+                        // race). `Err(DeadObject)` ⇒ the founding (or
+                        // any previously-attached) worker raced past
+                        // `live_conns 1→0` and fired obituaries between
+                        // `resolve_session.upgrade()` and now — refuse
+                        // so the attaching client gets `DeadObject`
+                        // instead of silently joining a session whose
+                        // `binder_died` already fired (or, worse, never
+                        // fires again for this connection's
+                        // `DeathRecipient`s).
+                        let session = RpcSession::wrap_inner(inner);
+                        let slot_id = match session.add_incoming_slot(transport) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                log::warn!(
+                                    "android-13+ RPC: session torn down between \
+                                     resolve and attach (F4 race); rejecting"
+                                );
+                                return;
+                            }
+                        };
+                        // Bump `attached_count` *after* the successful
+                        // `add_incoming_slot` so an external observer
+                        // never sees the intermediate state where
+                        // `attached_count` is incremented but the slot
+                        // never made it into the pool. (R2 ordering
+                        // residual — F8 collapses the prior pre-bump
+                        // → from_android13plus → counter sequence into
+                        // a single atomic.)
                         server.attached_count.fetch_add(1, Ordering::SeqCst);
                         // No re-`configure_session`: the founding
                         // connection already set the session's
                         // root/max-threads; re-applying would clobber a
                         // customized session.
-                        let session = RpcSession::from_android13plus(
-                            transport,
-                            codec,
-                            client_fd_mode,
-                            fd_unix,
-                            Some(shared),
-                        );
-                        if let Err(e) = session.serve_blocking() {
+                        if let Err(e) = session.serve_blocking_on(slot_id) {
                             log::debug!("RPC attached connection ended: {e:?}");
                         }
-                        // The founding connection owns
-                        // register/unregister of the id; a stale `Weak`
-                        // is reclaimed by `resolve_session`/`register`
-                        // pruning, so the attached connection need not
-                        // unregister.
+                        // The founding connection owns registration of
+                        // the id; a stale `Weak` is reclaimed by
+                        // `register_session`'s prune-on-insert when a
+                        // later session is registered. Phase A4 (F8)
+                        // dropped explicit `unregister_session`.
                     } else {
                         // Non-empty id resolving to no live session
                         // (unknown / stale / non-32-byte) ⇒ reject

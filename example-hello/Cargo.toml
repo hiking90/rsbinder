@@ -27,12 +27,6 @@ required-features = ["rpc"]
 name = "rpc_hello_client"
 required-features = ["rpc"]
 
-# G4(b)-v0 live-interop harness (rsbinder side); pairs with a real
-# android libbinder `RpcPreconnectedClient` on the Android 13 emulator.
-[[bin]]
-name = "g4b_interop_server"
-required-features = ["rpc"]
-
 # Subplan 2-13 D.8 STAGE3 — rsbinder side of the IAccessor bridge
 # real-libbinder interop. Cross-compile with
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
@@ -42,6 +36,33 @@ required-features = ["rpc"]
 [[bin]]
 name = "rpc_accessor_interop_client"
 required-features = ["rpc", "android_16"]
+
+# Subplan 2-14 D.9 STAGE3 — rsbinder server side of the IAccessor
+# *register*-side real-libbinder interop (the role-inverse of 2-13 D.8).
+# rsbinder vends an IAccessor via `LocalAccessor` + `RpcServer`; a real
+# libbinder C client calls `addConnection()` over kernel binder, then
+# drives an RPC root over the preconnected fd. Cross-compile with
+#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#       --features rpc,android_16 --bin rpc_accessor_register_interop_server
+# and run on the android-16 emulator alongside the C++ launcher
+# (`cpp/rpc_accessor_register_interop_launcher.cpp`). See
+# cpp/run_stage3_register.sh.
+[[bin]]
+name = "rpc_accessor_register_interop_server"
+required-features = ["rpc", "android_16"]
+
+# Subplan 2-12 Phase D / AC-12.6 — rsbinder side of the multi-
+# connection-per-session real-libbinder interop gate. Pairs with
+# cpp/rpc_multiconn_interop_launcher (a real libbinder client built
+# with `ARpcSession_setMaxOutgoingConnections(2) + setMaxIncoming
+# Threads(2)`). Cross-compile with
+#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#       --features rpc --bin rpc_multiconn_interop_server
+# and run on the android-16 emulator alongside cpp/run_stage3_
+# multiconn.sh.
+[[bin]]
+name = "rpc_multiconn_interop_server"
+required-features = ["rpc"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }

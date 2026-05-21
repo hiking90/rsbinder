@@ -10,3 +10,10 @@ book/build/
 
 # Local development plans (not tracked)
 plans/
+
+# example-hello STAGE3 harness build outputs (compiled NDK launchers —
+# the .cpp source IS tracked; the cross-compiled aarch64 ELF beside it
+# is a build artifact of cpp/run_stage3*.sh, regenerated on demand).
+/example-hello/cpp/rpc_accessor_interop_launcher
+/example-hello/cpp/rpc_accessor_register_interop_launcher
+/example-hello/cpp/rpc_multiconn_interop_launcher
