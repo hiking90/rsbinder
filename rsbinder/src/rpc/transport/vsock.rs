@@ -1,7 +1,10 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! vsock transport (subplan 2-4 track V) — **Linux only**.
+//! vsock transport (subplan 2-4 track V) — **Linux / Android** (the
+//! `vsock` crate's `AF_VSOCK` impl covers both `target_os = "linux"` and
+//! `"android"`; Android is the Virtualization Framework / Microdroid pVM
+//! host↔guest target — subplan 2-15).
 //!
 //! Trust boundary: hypervisor VM isolation (plan §5). Plaintext is
 //! *correct* here, exactly as for `unix` on a single host. The peer

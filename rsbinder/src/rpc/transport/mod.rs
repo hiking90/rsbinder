@@ -31,7 +31,7 @@ mod tcp_debug;
 #[cfg(feature = "rpc-tls")]
 mod tls;
 pub(crate) mod unix;
-#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+#[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
 mod vsock;
 
 pub use mem::MemTransport;
@@ -40,7 +40,7 @@ pub use tcp_debug::{insecure_warning_emitted, TcpDebugTransport};
 #[cfg(feature = "rpc-tls")]
 pub use tls::TlsTransport;
 pub use unix::UnixTransport;
-#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+#[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
 pub use vsock::VsockTransport;
 
 /// Hard cap on a single decoded frame.

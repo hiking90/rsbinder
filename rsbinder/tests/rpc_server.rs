@@ -725,6 +725,134 @@ fn android13plus_profile_e2e() {
     }
 }
 
+/// **2-15 AC-15.3 / 2-15.0 PoC** — the decoupled `TlsTransport`
+/// (`Mutex<Connection>` + lock-free stream, subplan 2-15 §2.0) driving
+/// the **android-13+ profile over TLS**, hermetic rsbinder↔rsbinder.
+/// Mirrors `android13plus_profile_e2e` (version negotiation v0/v1/v2 +
+/// mismatch, echo, 300-oneway FIFO, **nested server→client callback**)
+/// but the transport is TLS over TCP instead of a plain `UnixTransport`
+/// — the keystone gate that the decomposed structure achieves
+/// full-duplex (the nested callback) without the blocking-while-holding
+/// deadlock a single coupled `StreamOwned`-Mutex would cause.
+#[cfg(feature = "rpc-tls")]
+#[test]
+fn tls_android13plus_nested_callback_e2e() {
+    use std::io::BufReader;
+    use std::net::TcpListener;
+
+    use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use rsbinder::rpc::transport::TlsTransport;
+
+    const CA: &str = include_str!("tls_fixtures/ca.crt");
+    const SRV_CRT: &str = include_str!("tls_fixtures/srv.crt");
+    const SRV_KEY: &str = include_str!("tls_fixtures/srv.key");
+
+    fn certs(pem: &str) -> Vec<CertificateDer<'static>> {
+        rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
+            .collect::<std::result::Result<_, _>>()
+            .expect("parse certs")
+    }
+    fn key(pem: &str) -> PrivateKeyDer<'static> {
+        rustls_pemfile::private_key(&mut BufReader::new(pem.as_bytes()))
+            .expect("parse key")
+            .expect("a key")
+    }
+    let srv_cfg = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs(SRV_CRT), key(SRV_KEY))
+            .expect("server config"),
+    );
+    let cli_cfg = {
+        let mut roots = RootCertStore::empty();
+        for c in certs(CA) {
+            roots.add(c).expect("add ca");
+        }
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    };
+
+    for (smax, cmax, expect) in [
+        (0u32, 0u32, 0u32),
+        (1, 1, 1),
+        (2, 2, 2),
+        (2, 1, 1),
+        (1, 2, 1),
+        (2, 0, 0),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicI64::new(0));
+        let srv_cfg = Arc::clone(&srv_cfg);
+
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let t = TlsTransport::accept(tcp, srv_cfg).expect("server TLS handshake");
+            let session = RpcSession::accept_android13plus(Box::new(t), smax)
+                .expect("server android-13+ accept");
+            session.set_root(make_service(counter));
+            let _ = session.serve_blocking();
+        });
+
+        // Exercises the 2-15.5 convenience constructor (TCP-connect +
+        // TLS-handshake + android-13+ handshake in one call).
+        let client = RpcSession::setup_tcp_client_tls_android13plus(
+            addr,
+            "localhost",
+            Arc::clone(&cli_cfg),
+            cmax,
+        )
+        .expect("setup_tcp_client_tls_android13plus");
+        assert_eq!(
+            client.wire_protocol_version(),
+            Some(expect),
+            "negotiated min({cmax},{smax}) over TLS"
+        );
+
+        let root = EchoProxy(client.get_root().expect("get_root over TLS"));
+        assert_eq!(root.echo("hi tls a13+").unwrap(), "hi tls a13+");
+        assert_eq!(root.echo("").unwrap(), "");
+        for i in 0..30 {
+            assert_eq!(
+                root.echo(&format!("v{expect}-{i}")).unwrap(),
+                format!("v{expect}-{i}")
+            );
+        }
+
+        // Oneway FIFO over TLS+android-13+ wire.
+        let n = 300;
+        for _ in 0..n {
+            root.bump().expect("oneway bump over TLS");
+        }
+        let mut last = root.count().unwrap();
+        for _ in 0..200 {
+            if last == n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            last = root.count().unwrap();
+        }
+        assert_eq!(last, n, "oneway FIFO over TLS android-13+ wire");
+
+        // The keystone: nested server→client callback over one TLS
+        // connection must not deadlock (full-duplex via the decomposed
+        // Mutex<Connection> + lock-free stream).
+        let cb = make_service(Arc::new(AtomicI64::new(0)));
+        assert_eq!(root.roundtrip(&cb).expect("nested over TLS"), "rt:ping");
+        for _ in 0..20 {
+            assert_eq!(root.roundtrip(&cb).unwrap(), "rt:ping");
+        }
+
+        drop(root);
+        drop(client);
+        server.join().unwrap();
+    }
+}
+
 /// The default r34 profile must report **no** android-13+ wire version
 /// (the new accessor's R34 arm) — locks "opt-in only; default
 /// byte-unchanged".

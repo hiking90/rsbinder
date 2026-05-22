@@ -276,13 +276,13 @@ impl IBinder for RpcProxy {
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
         let mut recipients = self.recipients.write().map_err(|_| {
-                // M18 fix (review 2026-05-21): a poisoned recipients
-                // lock means a prior panic on this proxy's death
-                // pathway. Surface as `DeadObject` so a caller can
-                // recover (e.g. drop the binder, re-establish) rather
-                // than panicking out of a public `IBinder` method.
-                StatusCode::DeadObject
-            })?;
+            // M18 fix (review 2026-05-21): a poisoned recipients
+            // lock means a prior panic on this proxy's death
+            // pathway. Surface as `DeadObject` so a caller can
+            // recover (e.g. drop the binder, re-establish) rather
+            // than panicking out of a public `IBinder` method.
+            StatusCode::DeadObject
+        })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
             // Connection already dropped — AOSP returns DEAD_OBJECT.
             return Err(StatusCode::DeadObject);
@@ -296,13 +296,13 @@ impl IBinder for RpcProxy {
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         let mut recipients = self.recipients.write().map_err(|_| {
-                // M18 fix (review 2026-05-21): a poisoned recipients
-                // lock means a prior panic on this proxy's death
-                // pathway. Surface as `DeadObject` so a caller can
-                // recover (e.g. drop the binder, re-establish) rather
-                // than panicking out of a public `IBinder` method.
-                StatusCode::DeadObject
-            })?;
+            // M18 fix (review 2026-05-21): a poisoned recipients
+            // lock means a prior panic on this proxy's death
+            // pathway. Surface as `DeadObject` so a caller can
+            // recover (e.g. drop the binder, re-establish) rather
+            // than panicking out of a public `IBinder` method.
+            StatusCode::DeadObject
+        })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }

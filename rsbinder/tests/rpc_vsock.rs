@@ -93,7 +93,8 @@ fn vsock_loopback_e2e() {
     let server = thread::spawn(move || {
         let (stream, _addr) = listener.accept().expect("vsock accept");
         let t = VsockTransport::from_stream(stream).expect("server transport");
-        let session = RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
+        let session =
+            RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
         session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
             PingSvc,
         )))));
@@ -106,7 +107,8 @@ fn vsock_loopback_e2e() {
         PeerIdentity::Vsock { cid } => assert_eq!(cid, VMADDR_CID_LOCAL),
         other => panic!("expected Vsock peer id, got {other}"),
     }
-    let client = RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let client =
+        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root over vsock");
     assert_eq!(ping_via(&root, "hi").unwrap(), "pong:hi");
     drop(root);

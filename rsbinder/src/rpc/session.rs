@@ -232,9 +232,9 @@ fn gen_rpc_session_id() -> RpcResult<RpcSessionId> {
     // to this the panic unwound through `RpcSession::new`'s
     // infallible signature with no way for callers to handle.
     getrandom::getrandom(&mut id).map_err(|e| {
-        RpcError::Io(std::io::Error::other(
-            format!("CSPRNG getrandom failed for RPC session id: {e}"),
-        ))
+        RpcError::Io(std::io::Error::other(format!(
+            "CSPRNG getrandom failed for RPC session id: {e}"
+        )))
     })?;
     Ok(RpcSessionId::new(id))
 }
@@ -1695,10 +1695,7 @@ impl RpcSession {
     /// instead of panicking out of an infallible constructor. The
     /// only realistic failure path is early-boot containers without a
     /// working CSPRNG.
-    pub fn new(
-        transport: Box<dyn RpcTransport>,
-        space: AddressSpace,
-    ) -> RpcResult<RpcSession> {
+    pub fn new(transport: Box<dyn RpcTransport>, space: AddressSpace) -> RpcResult<RpcSession> {
         // Default = android-12 r34, byte-unchanged.
         RpcSession::with_profile(transport, space, WireProfile::R34(R34Codec))
     }
@@ -2038,14 +2035,8 @@ impl RpcSession {
     ) -> Result<RpcSession> {
         let (transport, codec, client_fd_mode, _client_id) =
             Self::android13plus_accept_handshake(transport, server_max_version)?;
-        Self::from_android13plus(
-            transport,
-            codec,
-            client_fd_mode,
-            server_fd_unix,
-            None,
-        )
-        .map_err(StatusCode::from)
+        Self::from_android13plus(transport, codec, client_fd_mode, server_fd_unix, None)
+            .map_err(StatusCode::from)
     }
 
     /// The negotiated android-13+ wire protocol version
@@ -2328,6 +2319,52 @@ impl RpcSession {
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 
+    /// Client: connect to a **TCP** RPC server over **TLS** (subplan
+    /// 2-15), R34 wire. Establishes the TCP connection, completes the
+    /// TLS handshake to `server_name` (verified per `config` — a
+    /// bad/untrusted server certificate fails **here**, before any RPC
+    /// payload byte is exchanged), then builds an R34 session. The
+    /// android-13+ variant is
+    /// [`setup_tcp_client_tls_android13plus`](RpcSession::setup_tcp_client_tls_android13plus).
+    ///
+    /// `config` is the caller's `rustls::ClientConfig` (roots / client
+    /// cert / verification policy) — rsbinder never invents crypto
+    /// (plan §5). For a non-TCP stream (a preconnected `unix`/`vsock`
+    /// fd) build the transport directly with
+    /// [`TlsTransport::connect_stream`](super::transport::TlsTransport::connect_stream)
+    /// and pass it to [`RpcSession::new`].
+    #[cfg(feature = "rpc-tls")]
+    pub fn setup_tcp_client_tls(
+        addr: impl std::net::ToSocketAddrs,
+        server_name: &str,
+        config: std::sync::Arc<rustls::ClientConfig>,
+    ) -> Result<RpcSession> {
+        let tcp = std::net::TcpStream::connect(addr)?;
+        let t = super::transport::TlsTransport::connect(tcp, server_name, config)
+            .map_err(StatusCode::from)?;
+        RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
+    }
+
+    /// Client: connect to a **TCP** RPC server over **TLS** speaking the
+    /// **android-13+ versioned wire** (subplan 2-15 / 2-5b). TCP-connects,
+    /// TLS-handshakes to `server_name` per `config` (a bad cert fails
+    /// before any RPC byte), then runs the AOSP android-13+ handshake via
+    /// [`RpcSession::connect_android13plus`] negotiating
+    /// `min(max_version, server_max)`. The R34 variant is
+    /// [`setup_tcp_client_tls`](RpcSession::setup_tcp_client_tls).
+    #[cfg(feature = "rpc-tls")]
+    pub fn setup_tcp_client_tls_android13plus(
+        addr: impl std::net::ToSocketAddrs,
+        server_name: &str,
+        config: std::sync::Arc<rustls::ClientConfig>,
+        max_version: u32,
+    ) -> Result<RpcSession> {
+        let tcp = std::net::TcpStream::connect(addr)?;
+        let t = super::transport::TlsTransport::connect(tcp, server_name, config)
+            .map_err(StatusCode::from)?;
+        RpcSession::connect_android13plus(Box::new(t), max_version)
+    }
+
     /// Client (subplan 2-12 Phase A0a): connect to a Unix-domain
     /// android-13+ RPC server **echoing a server-minted 32-byte
     /// `session_id`**. Flow (AOSP `RpcSession::setupClient`): connect
@@ -2489,7 +2526,7 @@ impl RpcSession {
             rustix::net::AddressFamily::UNIX => {
                 Box::new(super::transport::UnixTransport::from_owned_fd(fd)?)
             }
-            #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             rustix::net::AddressFamily::VSOCK => {
                 Box::new(super::transport::VsockTransport::from_owned_fd(fd)?)
             }

@@ -590,9 +590,7 @@ impl RpcServer {
                         ) {
                             Ok(s) => s,
                             Err(e) => {
-                                log::warn!(
-                                    "android-13+ RPC: from_android13plus failed: {e:?}"
-                                );
+                                log::warn!("android-13+ RPC: from_android13plus failed: {e:?}");
                                 return;
                             }
                         };

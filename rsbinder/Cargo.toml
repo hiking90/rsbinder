@@ -33,9 +33,11 @@ rpc = ["rustix/net", "dep:getrandom"]
 # absent from a plain `rpc` build. See plan/2-1 §2-1.f2 / AC-1.8.
 rpc-tcp-debug = ["rpc"]
 # vsock backend (subplan 2-4 track V). host↔VM, trust = hypervisor VM
-# isolation. **Linux-only** (the `vsock` crate is Linux-specific);
-# enabling this on a non-Linux target is unsupported. Zero cost when
-# off (optional dep). See plan/2-4-vsock-tls.md.
+# isolation. **Linux / Android** (the `vsock` crate's `AF_VSOCK` impl
+# covers both `target_os = "linux"` and `"android"`; the source is
+# gated to those — Android is the Virtualization Framework / Microdroid
+# target, subplan 2-15). The transport code is cfg'd out on other
+# targets. Zero cost when off (optional dep). See plan/2-4-vsock-tls.md.
 rpc-vsock = ["rpc", "dep:vsock"]
 # TLS backend over rustls (subplan 2-4 track T) for untrusted
 # channels. Zero cost when off (optional deps). rsbinder never
