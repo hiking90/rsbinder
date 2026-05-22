@@ -870,91 +870,79 @@ impl TypeGenerator {
         }
     }
 
+    /// Renders the initializer for an array-typed field/const default.
+    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
+    /// applied by `init_value`.
+    fn init_array_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
+        let array_info = self.array_types.first().expect("array_types is empty.");
+        let is_nullable = self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
+
+        if let ValueType::UserDefined(name) = &array_info.value_type {
+            if let Some(lookup_decl) = lookup_decl_from_name(name, crate::Namespace::AIDL) {
+                if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
+                    return self.init_enum_array_value(
+                        expr,
+                        &lookup_decl,
+                        param,
+                        array_info.is_fixed(),
+                        is_nullable,
+                    );
+                }
+            }
+        }
+        Ok(Self::init_array_value(expr, array_info, param, is_nullable))
+    }
+
+    /// Renders the initializer for a scalar (non-array) field/const default.
+    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
+    /// applied by `init_value`. Enum-typed targets are always primitive and
+    /// thus never nullable, so the wrap is a no-op for them.
+    fn init_scalar_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
+        if let Some(enum_lookup) = self.enum_lookup() {
+            return self.init_enum_value(expr, &enum_lookup, param);
+        }
+
+        let scalar_param = param.with_fixed_array(false).with_nullable(false);
+        Ok(match expr.calculate() {
+            Ok(calculated) => match &calculated.value {
+                // An enum reference whose target is the enum type keeps the
+                // symbolic member; a primitive target (e.g. int) takes its value.
+                ValueType::Reference { value, .. } => {
+                    if matches!(&self.value_type, ValueType::UserDefined(_)) {
+                        calculated.value.to_init(scalar_param)
+                    } else {
+                        ValueType::Int64(*value).to_init(scalar_param)
+                    }
+                }
+                _ => match calculated.convert_to(&self.value_type) {
+                    Ok(converted) => converted.value.to_init(scalar_param),
+                    Err(_) => calculated.value.to_init(scalar_param),
+                },
+            },
+            Err(_) => ValueType::Void.to_init(scalar_param),
+        })
+    }
+
     pub(crate) fn init_value(
         &self,
         const_expr: Option<&ConstExpr>,
         param: InitParam,
     ) -> Result<String, AidlError> {
-        let init_value = match const_expr {
-            Some(expr) => {
-                let init_str = if let ValueType::Array(_) = self.value_type {
-                    let array_info = self.array_types.first().unwrap();
-                    let is_nullable =
-                        self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
-                    if let ValueType::UserDefined(name) = &array_info.value_type {
-                        if let Some(lookup_decl) =
-                            lookup_decl_from_name(name, crate::Namespace::AIDL)
-                        {
-                            if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
-                                self.init_enum_array_value(
-                                    expr,
-                                    &lookup_decl,
-                                    param,
-                                    array_info.is_fixed(),
-                                    is_nullable,
-                                )?
-                            } else {
-                                Self::init_array_value(expr, array_info, param, is_nullable)
-                            }
-                        } else {
-                            Self::init_array_value(expr, array_info, param, is_nullable)
-                        }
-                    } else {
-                        Self::init_array_value(expr, array_info, param, is_nullable)
-                    }
-                } else {
-                    if let Some(enum_lookup) = self.enum_lookup() {
-                        return self
-                            .init_enum_value(expr, &enum_lookup, param)
-                            .map(|init_str| {
-                                if self.is_nullable {
-                                    format!("Some({init_str})")
-                                } else {
-                                    init_str
-                                }
-                            });
-                    }
-
-                    match expr.calculate() {
-                        Ok(calculated) => {
-                            // Check if we have an enum reference and target is a primitive type
-                            if let ValueType::Reference { value, .. } = &calculated.value {
-                                if matches!(&self.value_type, ValueType::UserDefined(_)) {
-                                    // Target is an enum type, preserve enum reference
-                                    calculated
-                                        .value
-                                        .to_init(param.with_fixed_array(false).with_nullable(false))
-                                } else {
-                                    // Target is a primitive type (e.g., int), use numeric value
-                                    ValueType::Int64(*value)
-                                        .to_init(param.with_fixed_array(false).with_nullable(false))
-                                }
-                            } else {
-                                // Normal processing for non-enum references
-                                match calculated.convert_to(&self.value_type) {
-                                    Ok(converted) => converted.value.to_init(
-                                        param.with_fixed_array(false).with_nullable(false),
-                                    ),
-                                    Err(_) => calculated.value.to_init(
-                                        param.with_fixed_array(false).with_nullable(false),
-                                    ),
-                                }
-                            }
-                        }
-                        Err(_) => ValueType::Void
-                            .to_init(param.with_fixed_array(false).with_nullable(false)),
-                    }
-                };
-                if self.is_nullable {
-                    format!("Some({init_str})")
-                } else {
-                    init_str
-                }
-            }
-            None => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
+        let Some(expr) = const_expr else {
+            return Ok(ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)));
         };
 
-        Ok(init_value)
+        let init_str = if matches!(self.value_type, ValueType::Array(_)) {
+            self.init_array_branch(expr, param)?
+        } else {
+            self.init_scalar_branch(expr, param)?
+        };
+
+        Ok(if self.is_nullable {
+            format!("Some({init_str})")
+        } else {
+            init_str
+        })
     }
 }
 

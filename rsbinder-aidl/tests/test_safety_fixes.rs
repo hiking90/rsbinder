@@ -283,3 +283,27 @@ fn test_unknown_type_is_diagnostic_not_panic() {
         "expected UnknownType diagnostic, got: {msg}"
     );
 }
+
+#[test]
+fn test_enum_array_default_initializers() {
+    // Characterization: no golden test covered `init_enum_array_value` (enum
+    // array field defaults). Pins both the non-nullable and nullable forms so
+    // the init_value extraction cannot silently change them.
+    let input = r##"
+        package test.enumarr;
+        enum Color { RED = 0, GREEN = 1, BLUE = 2 }
+        parcelable Palette {
+            Color[] colors = { Color.RED, Color.BLUE };
+            @nullable Color[] maybeColors = { Color.GREEN };
+        }
+    "##;
+    let out = test_aidl_generation(input).expect("generation should succeed");
+    assert!(
+        out.contains("r#colors: vec![super::Color::Color::RED,super::Color::Color::BLUE,],"),
+        "non-nullable enum array default mismatch, got:\n{out}"
+    );
+    assert!(
+        out.contains("r#maybeColors: Some(vec![super::Color::Color::GREEN,]),"),
+        "nullable enum array default mismatch, got:\n{out}"
+    );
+}
