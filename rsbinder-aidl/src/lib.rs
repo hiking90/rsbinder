@@ -339,7 +339,14 @@ impl Builder {
                     })?;
 
                     for entry in entries {
-                        let path = entry.unwrap().path();
+                        let path = entry
+                            .map_err(|err| {
+                                std::io::Error::new(
+                                    err.kind(),
+                                    format!("parse_sources: dir entry in {path:?} failed: {err}"),
+                                )
+                            })?
+                            .path();
                         if path.is_dir()
                             || (path.is_file() && path.extension().unwrap_or_default() == "aidl")
                         {

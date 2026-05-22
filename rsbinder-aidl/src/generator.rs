@@ -418,21 +418,6 @@ fn template() -> &'static tera::Tera {
     })
 }
 
-// lazy_static! {
-//     pub static ref TEMPLATES: Tera = {
-//         let mut tera = Tera::default();
-//         tera.add_raw_template("enum", ENUM_TEMPLATE)
-//             .expect("Failed to add enum template");
-//         tera.add_raw_template("union", UNION_TEMPLATE)
-//             .expect("Failed to add union template");
-//         tera.add_raw_template("parcelable", PARCELABLE_TEMPLATE)
-//             .expect("Failed to add parcelable template");
-//         tera.add_raw_template("interface", INTERFACE_TEMPLATE)
-//             .expect("Failed to add interface template");
-//         tera
-//     };
-// }
-
 #[derive(Serialize, Deserialize, Debug)]
 struct FnMembers {
     identifier: String,
@@ -460,10 +445,10 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
     let mut transaction_write = Vec::new();
     let mut transaction_params = String::new();
     let mut read_onto_params = Vec::new();
-    // let is_nullable = parser::check_annotation_list(&method.annotation_list, parser::AnnotationType::IsNullable).0;
 
     for arg in &method.arg_list {
         let generator = arg.to_generator()?;
+        generator.ensure_resolvable()?;
 
         let type_decl_for_func = generator.type_decl_for_func()?;
 
@@ -534,21 +519,18 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
         transaction_params
     };
 
-    let generator = if parser::check_annotation_list(
-        &method.annotation_list,
-        parser::AnnotationType::IsNullable,
-    )
-    .0
-    {
-        let nullable_span = method
-            .annotation_list
-            .iter()
-            .find(|a| a.annotation == "@nullable")
-            .and_then(|a| a.annotation_span);
-        method.r#type.to_generator()?.nullable_at(nullable_span)?
-    } else {
-        method.r#type.to_generator()?
-    };
+    let generator =
+        if parser::has_annotation(&method.annotation_list, parser::AnnotationType::IsNullable) {
+            let nullable_span = method
+                .annotation_list
+                .iter()
+                .find(|a| a.annotation == "@nullable")
+                .and_then(|a| a.annotation_span);
+            method.r#type.to_generator()?.nullable_at(nullable_span)?
+        } else {
+            method.r#type.to_generator()?
+        };
+    generator.ensure_resolvable()?;
 
     let return_type = generator.type_declaration(false);
     let transaction_has_return = return_type != "()";
@@ -570,6 +552,90 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
         transaction_code: method.intvalue.unwrap_or(0) as u32,
         has_explicit_code: method.intvalue.is_some(),
     })
+}
+
+/// Enforces AOSP's transaction-code rules for an interface's methods, before
+/// any code is emitted: explicit codes are all-or-nothing, and when present
+/// they must be non-negative, within `u32` range, and unique. Each violation
+/// becomes a `SemanticError` pointing at the offending span. Methods with
+/// implicit codes are numbered positionally by the template, so they need no
+/// validation here.
+fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlError> {
+    let explicit_count = decl
+        .method_list
+        .iter()
+        .filter(|m| m.intvalue.is_some())
+        .count();
+
+    if explicit_count == 0 {
+        return Ok(());
+    }
+
+    let source_name = parser::current_source_name();
+    let source_text = parser::current_source_text();
+    let span_of = |span: Option<(usize, usize)>| {
+        let (start, end) = span.unwrap_or((0, 0));
+        SourceSpan::new(start.into(), end - start)
+    };
+
+    // AOSP rule: explicit transaction codes are all-or-nothing.
+    if explicit_count < decl.method_list.len() {
+        return Err(SemanticError::MixedTransactionIds {
+            interface: decl.name.clone(),
+            src: NamedSource::new(&source_name, source_text.clone()),
+            span: span_of(decl.name_span),
+        }
+        .into());
+    }
+
+    // Detect negative, overflowing, or duplicate transaction codes.
+    let mut seen: std::collections::HashMap<i64, (String, Option<(usize, usize)>)> =
+        std::collections::HashMap::new();
+    for method in decl.method_list.iter() {
+        let Some(code) = method.intvalue else {
+            continue;
+        };
+        if code < 0 {
+            return Err(SemanticError::NegativeTransactionCode {
+                interface: decl.name.clone(),
+                method: method.identifier.clone(),
+                code,
+                src: NamedSource::new(&source_name, source_text.clone()),
+                span: span_of(method.intvalue_span),
+            }
+            .into());
+        }
+        if code > u32::MAX as i64 {
+            return Err(SemanticError::TransactionCodeOverflow {
+                interface: decl.name.clone(),
+                method: method.identifier.clone(),
+                code,
+                src: NamedSource::new(&source_name, source_text.clone()),
+                span: span_of(method.intvalue_span),
+            }
+            .into());
+        }
+        if let Some((prev_name, prev_span)) =
+            seen.insert(code, (method.identifier.clone(), method.identifier_span))
+        {
+            return Err(SemanticError::DuplicateTransactionCode {
+                interface: decl.name.clone(),
+                method1: prev_name,
+                method2: method.identifier.clone(),
+                code,
+                src: NamedSource::new(&source_name, source_text.clone()),
+                span: span_of(prev_span),
+                related: vec![DuplicateCodeRelated {
+                    method: method.identifier.clone(),
+                    src: NamedSource::new(&source_name, source_text.clone()),
+                    span: span_of(method.identifier_span),
+                }],
+            }
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 pub struct Generator {
@@ -680,13 +746,11 @@ impl Generator {
         let mut decl = arg_decl.clone();
 
         let is_empty =
-            parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly)
-                .0;
-        let is_vintf = parser::check_annotation_list(
+            parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly);
+        let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        )
-        .0;
+        );
 
         decl.pre_process();
 
@@ -709,6 +773,7 @@ impl Generator {
             // Second pass: process constants with resolved values
             for constant in decl.constant_list.iter() {
                 let generator = constant.r#type.to_generator()?;
+                generator.ensure_resolvable()?;
                 const_members.push((
                     constant.const_identifier(),
                     generator.const_type_decl()?,
@@ -719,83 +784,7 @@ impl Generator {
                 ));
             }
 
-            // === Transaction code validation (before fn_members loop) ===
-            {
-                let explicit_count = decl
-                    .method_list
-                    .iter()
-                    .filter(|m| m.intvalue.is_some())
-                    .count();
-
-                let source_name = parser::current_source_name();
-                let source_text = parser::current_source_text();
-
-                // AOSP rule: all-or-nothing
-                if explicit_count > 0 && explicit_count < decl.method_list.len() {
-                    let (span_start, span_end) = decl.name_span.unwrap_or((0, 0));
-                    return Err(SemanticError::MixedTransactionIds {
-                        interface: decl.name.clone(),
-                        src: NamedSource::new(&source_name, source_text.clone()),
-                        span: SourceSpan::new(span_start.into(), span_end - span_start),
-                    }
-                    .into());
-                }
-
-                if explicit_count > 0 {
-                    // Detect duplicate transaction codes
-                    let mut seen: std::collections::HashMap<i64, (String, Option<(usize, usize)>)> =
-                        std::collections::HashMap::new();
-                    for method in decl.method_list.iter() {
-                        if let Some(code) = method.intvalue {
-                            if code < 0 {
-                                let (span_start, span_end) = method.intvalue_span.unwrap_or((0, 0));
-                                return Err(SemanticError::NegativeTransactionCode {
-                                    interface: decl.name.clone(),
-                                    method: method.identifier.clone(),
-                                    code,
-                                    src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
-                                }
-                                .into());
-                            }
-                            if code > u32::MAX as i64 {
-                                let (span_start, span_end) = method.intvalue_span.unwrap_or((0, 0));
-                                return Err(SemanticError::TransactionCodeOverflow {
-                                    interface: decl.name.clone(),
-                                    method: method.identifier.clone(),
-                                    code,
-                                    src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
-                                }
-                                .into());
-                            }
-                            if let Some((prev_name, prev_span)) = seen
-                                .insert(code, (method.identifier.clone(), method.identifier_span))
-                            {
-                                let (span_start, span_end) = prev_span.unwrap_or((0, 0));
-                                let (rel_start, rel_end) = method.identifier_span.unwrap_or((0, 0));
-                                return Err(SemanticError::DuplicateTransactionCode {
-                                    interface: decl.name.clone(),
-                                    method1: prev_name.clone(),
-                                    method2: method.identifier.clone(),
-                                    code,
-                                    src: NamedSource::new(&source_name, source_text.clone()),
-                                    span: SourceSpan::new(span_start.into(), span_end - span_start),
-                                    related: vec![DuplicateCodeRelated {
-                                        method: method.identifier.clone(),
-                                        src: NamedSource::new(&source_name, source_text.clone()),
-                                        span: SourceSpan::new(
-                                            rel_start.into(),
-                                            rel_end - rel_start,
-                                        ),
-                                    }],
-                                }
-                                .into());
-                            }
-                        }
-                    }
-                }
-            }
+            validate_transaction_codes(&decl)?;
 
             for method in decl.method_list.iter() {
                 fn_members.push(make_fn_member(method)?);
@@ -823,9 +812,12 @@ impl Generator {
         context.insert("enabled_async", &enabled_async);
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = template().render("interface", &context).map_err(|e| {
-            std::io::Error::other(format!("Failed to render interface template: {e}"))
-        })?;
+        let rendered =
+            template()
+                .render("interface", &context)
+                .map_err(|e| AidlError::Template {
+                    message: format!("Failed to render interface template: {e}"),
+                })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -838,15 +830,13 @@ impl Generator {
         let mut is_empty = false;
         let mut decl = arg_decl.clone();
 
-        let is_vintf = parser::check_annotation_list(
+        let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        )
-        .0;
+        );
 
-        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
-        {
-            println!("Parcelable {} is only used for Java.", decl.name);
+        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
+            eprintln!("Parcelable {} is only used for Java.", decl.name);
             is_empty = true;
             // return Ok(String::new())
         }
@@ -862,7 +852,7 @@ pub mod {mod} {{
         }
 
         if !decl.cpp_header.is_empty() {
-            println!(
+            eprintln!(
                 "cpp_header {} for Parcelable {} is not supported.",
                 decl.cpp_header, decl.name
             );
@@ -870,7 +860,7 @@ pub mod {mod} {{
             // return Ok(String::new())
         }
         if !decl.ndk_header.is_empty() {
-            println!(
+            eprintln!(
                 "ndk_header {} for Parcelable {} is not supported.",
                 decl.ndk_header, decl.name
             );
@@ -882,14 +872,14 @@ pub mod {mod} {{
 
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
-        let mut declations = Vec::new();
+        let mut declarations = Vec::new();
 
         if !is_empty {
             // Parse struct variables only.
             for decl in &decl.members {
                 if let Some(var) = decl.is_variable() {
-                    println!("Parcelable variable: {var:?}");
                     let generator = var.r#type.to_generator()?;
+                    generator.ensure_resolvable()?;
 
                     if var.constant {
                         constant_members.push((
@@ -919,12 +909,12 @@ pub mod {mod} {{
                         ))
                     }
                 } else {
-                    declations.push(decl.clone());
+                    declarations.push(decl.clone());
                 }
             }
         }
 
-        let nested = &self.declarations(&declations, indent + 1)?;
+        let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
@@ -932,30 +922,25 @@ pub mod {mod} {{
 
         context.insert("mod", &decl.name);
         context.insert("name", &decl.name);
-        context.insert(
-            "derive",
-            &parser::check_annotation_list(
-                &decl.annotation_list,
-                parser::AnnotationType::RustDerive,
-            )
-            .1,
-        );
+        context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
         context.insert("namespace", &namespace);
         context.insert("members", &members);
         context.insert("const_members", &constant_members);
         context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);
 
-        let rendered = template().render("parcelable", &context).map_err(|e| {
-            std::io::Error::other(format!("Failed to render parcelable template: {e}"))
-        })?;
+        let rendered =
+            template()
+                .render("parcelable", &context)
+                .map_err(|e| AidlError::Template {
+                    message: format!("Failed to render parcelable template: {e}"),
+                })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
 
     fn register_enum_members(decl: &parser::EnumDecl) {
-        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
-        {
+        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
             return;
         }
 
@@ -982,8 +967,7 @@ pub mod {mod} {{
     }
 
     fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, AidlError> {
-        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
-        {
+        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
             return Ok(String::new());
         }
 
@@ -1025,22 +1009,22 @@ pub mod {mod} {{
 
         let rendered = template()
             .render("enum", &context)
-            .map_err(|e| std::io::Error::other(format!("Failed to render enum template: {e}")))?;
+            .map_err(|e| AidlError::Template {
+                message: format!("Failed to render enum template: {e}"),
+            })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
 
     fn decl_union(&self, decl: &parser::UnionDecl, indent: usize) -> Result<String, AidlError> {
-        if parser::check_annotation_list(&decl.annotation_list, parser::AnnotationType::JavaOnly).0
-        {
+        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
             return Ok(String::new());
         }
 
-        let is_vintf = parser::check_annotation_list(
+        let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        )
-        .0;
+        );
 
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
@@ -1049,6 +1033,7 @@ pub mod {mod} {{
         for member in &decl.members {
             if let parser::Declaration::Variable(var) = member {
                 let generator = var.r#type.to_generator()?;
+                generator.ensure_resolvable()?;
                 if var.constant {
                     constant_members.push((
                         var.const_identifier(),
@@ -1079,14 +1064,7 @@ pub mod {mod} {{
 
         context.insert("mod", &decl.name);
         context.insert("union_name", &decl.name);
-        context.insert(
-            "derive",
-            &parser::check_annotation_list(
-                &decl.annotation_list,
-                parser::AnnotationType::RustDerive,
-            )
-            .1,
-        );
+        context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
         context.insert("namespace", &namespace);
         context.insert("members", &members);
         context.insert("const_members", &constant_members);
@@ -1095,7 +1073,9 @@ pub mod {mod} {{
 
         let rendered = template()
             .render("union", &context)
-            .map_err(|e| std::io::Error::other(format!("Failed to render union template: {e}")))?;
+            .map_err(|e| AidlError::Template {
+                message: format!("Failed to render union template: {e}"),
+            })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }

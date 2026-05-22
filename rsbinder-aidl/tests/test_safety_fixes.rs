@@ -234,3 +234,52 @@ fn test_android_keymint_style_simplified() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[test]
+fn test_char_escape_sequences_decoded() -> Result<(), Box<dyn Error>> {
+    // `'\n'` must decode to the newline code point, not the literal char 'n'
+    // (regression: the parser returned the post-backslash char verbatim).
+    let input = r##"
+        package test.ch;
+
+        interface IFoo {
+            const char NL = '\n';
+            const char TAB = '\t';
+            const char A = 'A';
+        }
+    "##;
+
+    let output = test_aidl_generation(input)?;
+    assert!(
+        output.contains("r#NL: u16 = '\\n' as u16"),
+        "newline escape not decoded, got: {output}"
+    );
+    assert!(
+        output.contains("r#TAB: u16 = '\\t' as u16"),
+        "tab escape not decoded, got: {output}"
+    );
+    assert!(output.contains("r#A: u16 = 'A' as u16"));
+    Ok(())
+}
+
+#[test]
+fn test_unknown_type_is_diagnostic_not_panic() {
+    // A parcelable field referencing an undefined type previously panicked deep
+    // in code generation (`make_user_defined_type_name(...).expect()`). It must
+    // now surface as a `ResolutionError::UnknownType` diagnostic instead.
+    let input = r##"
+        package test.unknown;
+
+        parcelable Foo {
+            ThisTypeIsNotDefinedAnywhere field;
+        }
+    "##;
+
+    let result = test_aidl_generation(input);
+    let err = result.expect_err("undefined type must produce an error, not succeed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown type") && msg.contains("ThisTypeIsNotDefinedAnywhere"),
+        "expected UnknownType diagnostic, got: {msg}"
+    );
+}

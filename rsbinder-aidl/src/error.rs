@@ -27,6 +27,11 @@ pub enum AidlError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// A tera template failed to render — a code-generator failure, not I/O.
+    #[error("template render error: {message}")]
+    #[diagnostic(code(aidl::template_error))]
+    Template { message: String },
+
     /// Aggregates multiple errors when processing several AIDL files
     #[error("{} error(s) occurred during AIDL compilation", errors.len())]
     #[diagnostic(code(aidl::multiple_errors))]

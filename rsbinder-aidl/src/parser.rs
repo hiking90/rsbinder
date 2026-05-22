@@ -696,27 +696,8 @@ impl Arg {
             .identifier(&self.identifier))
     }
 
-    // fn arg_identifier(&self) -> String {
-    //     format!("_arg_{}", self.identifier)
-    // }
-
-    // pub fn to_string(&self, is_nullable: bool) -> (String, String, String, String) {
-    //     let param = self.arg_identifier();
-    //     let mut type_cast = self.r#type.type_cast();
-    //     let type_cloned = type_cast.clone();
-    //     type_cast.set_fn_nullable(is_nullable);
-    //     let def_arg = type_cast.fn_def_arg(&self.direction);
-    //     let arg = format!("{}: {}",
-    //         param.clone(), def_arg);
-    //     (param, arg, def_arg, type_cloned.return_type())
-    // }
-
     pub fn is_mutable(&self) -> bool {
-        match self.direction {
-            Direction::Inout | Direction::Out => true,
-            Direction::In => false,
-            _ => false,
-        }
+        matches!(self.direction, Direction::Inout | Direction::Out)
     }
 }
 
@@ -821,20 +802,6 @@ pub enum Generic {
     },
 }
 
-// fn generic_type_args_to_string(args: &[Type]) -> String {
-//     let mut args_str = String::new();
-
-//     args.iter().for_each(|t| {
-//         let mut cast = t.type_cast();
-//         cast.set_generic(true);
-
-//         args_str.push_str(", ");
-//         args_str.push_str(&cast.member_type());
-//     });
-
-//     args_str[2..].into()
-// }
-
 impl Generic {
     pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
         let generator = match self {
@@ -885,41 +852,34 @@ impl Type {
 pub enum AnnotationType {
     IsNullable,
     JavaOnly,
-    RustDerive,
     VintfStability,
 }
 
-pub fn check_annotation_list(
-    annotation_list: &Vec<Annotation>,
-    query_type: AnnotationType,
-) -> (bool, String) {
+/// Returns whether the annotation list contains the queried annotation.
+pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType) -> bool {
+    annotation_list.iter().any(|annotation| match query_type {
+        AnnotationType::VintfStability => annotation.annotation == "@VintfStability",
+        AnnotationType::IsNullable => annotation.annotation == "@nullable",
+        AnnotationType::JavaOnly => annotation.annotation.starts_with("@JavaOnly"),
+    })
+}
+
+/// Collects the enabled `@RustDerive(...)` trait names as a comma-separated
+/// list (e.g. `"Clone,PartialEq"`), or an empty string when the annotation is
+/// absent. The result is interpolated directly into the generated `#[derive]`.
+pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     for annotation in annotation_list {
-        match query_type {
-            AnnotationType::VintfStability if annotation.annotation == "@VintfStability" => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::IsNullable if annotation.annotation == "@nullable" => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::RustDerive if annotation.annotation == "@RustDerive" => {
-                let mut derives = Vec::new();
-
-                for param in &annotation.parameter_list {
-                    if param.const_expr.to_bool().unwrap_or(false) {
-                        derives.push(param.identifier.to_owned())
-                    }
-                }
-
-                return (true, derives.join(","));
-            }
-            _ => {}
+        if annotation.annotation == "@RustDerive" {
+            return annotation
+                .parameter_list
+                .iter()
+                .filter(|param| param.const_expr.to_bool().unwrap_or(false))
+                .map(|param| param.identifier.to_owned())
+                .collect::<Vec<_>>()
+                .join(",");
         }
     }
-
-    (false, "".to_owned())
+    String::new()
 }
 
 pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
@@ -1167,20 +1127,40 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
         }
 
         Rule::CHARVALUE => {
-            let mut found = false;
-            let mut has_backslash = false;
-            for ch in pair.as_str().chars() {
-                if !found && ch == '\'' {
-                    found = true;
-                } else if found {
-                    if !has_backslash && ch == '\\' {
-                        has_backslash = true;
-                    } else {
-                        return Ok(ConstExpr::new(ValueType::Char(ch)));
-                    }
+            let span = pair.as_span();
+            let (start, end) = (span.start(), span.end());
+            // The lexer always matches a quote-delimited `'X'` or `'\X'`.
+            let inner = pair
+                .as_str()
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .ok_or_else(|| make_parse_error("malformed char literal", start, end))?;
+
+            let ch = if let Some(escaped) = inner.strip_prefix('\\') {
+                let esc = escaped
+                    .chars()
+                    .next()
+                    .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
+                // Map the common C/AIDL escape sequences to their actual code
+                // points; previously the escaped char was returned verbatim
+                // (e.g. `'\n'` yielded 'n' instead of newline).
+                match esc {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    other => other,
                 }
-            }
-            unreachable!()
+            } else {
+                inner
+                    .chars()
+                    .next()
+                    .ok_or_else(|| make_parse_error("empty char literal", start, end))?
+            };
+            Ok(ConstExpr::new(ValueType::Char(ch)))
         }
 
         Rule::expression => parse_expression(pair.clone().into_inner()),

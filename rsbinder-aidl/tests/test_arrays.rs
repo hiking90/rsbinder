@@ -34,6 +34,9 @@ interface ITestService {
     @nullable int[] RepeatNullableIntArray(in @nullable int[] input);
     void FillOutStructuredParcelable(inout StructuredParcelable parcel);
 }
+parcelable StructuredParcelable {
+    int value;
+}
         "##,
         r##"
 pub mod ITestService {
@@ -42,7 +45,7 @@ pub mod ITestService {
         fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>>;
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>>;
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()>;
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()>;
         fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
@@ -57,7 +60,7 @@ pub mod ITestService {
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
     }
@@ -113,12 +116,12 @@ pub mod ITestService {
             let _aidl_return: Option<Vec<i32>> = _aidl_reply.read()?;
             Ok(_aidl_return)
         }
-        fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(_arg_parcel)?;
             Ok(data)
         }
-        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<()> {
+        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<()> {
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#FillOutStructuredParcelable(_arg_parcel);
@@ -142,7 +145,7 @@ pub mod ITestService {
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
             let _aidl_data = self.build_parcel_FillOutStructuredParcelable(_arg_parcel)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
@@ -155,7 +158,7 @@ pub mod ITestService {
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
             self.0.r#RepeatNullableIntArray(_arg_input)
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut rsbinder::Strong<dyn StructuredParcelable>) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
             self.0.r#FillOutStructuredParcelable(_arg_parcel)
         }
     }
@@ -194,7 +197,7 @@ pub mod ITestService {
                 Ok(())
             }
             transactions::r#FillOutStructuredParcelable => {
-                let mut _arg_parcel: rsbinder::Strong<dyn StructuredParcelable> = _reader.read()?;
+                let mut _arg_parcel: super::StructuredParcelable::StructuredParcelable = _reader.read()?;
                 let _aidl_return = _service.r#FillOutStructuredParcelable(&mut _arg_parcel);
                 match &_aidl_return {
                     Ok(_aidl_return) => {
@@ -209,6 +212,39 @@ pub mod ITestService {
             }
             _ => Err(rsbinder::StatusCode::UnknownTransaction),
         }
+    }
+}
+pub mod StructuredParcelable {
+    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #[derive(Debug)]
+    pub struct StructuredParcelable {
+        pub r#value: i32,
+    }
+    impl Default for StructuredParcelable {
+        fn default() -> Self {
+            Self {
+                r#value: Default::default(),
+            }
+        }
+    }
+    impl rsbinder::Parcelable for StructuredParcelable {
+        fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_write(|_sub_parcel| {
+                _sub_parcel.write(&self.r#value)?;
+                Ok(())
+            })
+        }
+        fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+            _parcel.sized_read(|_sub_parcel| {
+                self.r#value = _sub_parcel.read()?;
+                Ok(())
+            })
+        }
+    }
+    rsbinder::impl_serialize_for_parcelable!(StructuredParcelable);
+    rsbinder::impl_deserialize_for_parcelable!(StructuredParcelable);
+    impl rsbinder::ParcelableMetadata for StructuredParcelable {
+        fn descriptor() -> &'static str { "android.aidl.fixedsizearray.StructuredParcelable" }
     }
 }
         "##,

@@ -6,10 +6,13 @@ use std::sync::OnceLock;
 use miette::{NamedSource, SourceSpan};
 
 use crate::const_expr::{ConstExpr, InitParam, ValueType};
-use crate::error::{AidlError, SemanticError};
+use crate::error::{AidlError, ResolutionError, SemanticError};
 use crate::parser::{self, *};
 
-fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
+/// Resolves the current source name/span into the `(NamedSource, SourceSpan)`
+/// pair every type-level diagnostic needs, falling back to a placeholder
+/// filename when no source context is active (e.g. unit tests).
+fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
     let filename = parser::current_source_name();
     let source = parser::current_source_text();
     let (start, end) = span.unwrap_or((0, 0));
@@ -18,17 +21,25 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
     } else {
         filename
     };
+    (
+        NamedSource::new(src_name, source),
+        SourceSpan::new(start.into(), end.saturating_sub(start)),
+    )
+}
+
+fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
+    let (src, span) = diagnostic_source(span);
     AidlError::from(SemanticError::InvalidOperation {
         message: message.into(),
-        src: NamedSource::new(src_name, source),
-        span: SourceSpan::new(start.into(), end.saturating_sub(start)),
+        src,
+        span,
     })
 }
 
 static CRATE_NAME: OnceLock<String> = OnceLock::new();
 
-pub fn crate_name() -> String {
-    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).clone()
+pub fn crate_name() -> &'static str {
+    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).as_str()
 }
 
 pub fn set_crate_support(support: bool) {
@@ -112,25 +123,13 @@ impl TypeGenerator {
                     ))
                 }
             },
-            // "Map" => {
-            //     is_primitive = false;
-            //     is_map = true;
-            //     ("HashMap".to_owned(), ValueType::Map())
-            // }
             "FileDescriptor" => {
-                let filename = parser::current_source_name();
-                let source = parser::current_source_text();
-                let (start, end) = aidl_type.name_span.unwrap_or((0, 0));
-                let src_name = if filename.is_empty() {
-                    "<type_generator>".to_string()
-                } else {
-                    filename
-                };
+                let (src, span) = diagnostic_source(aidl_type.name_span);
                 return Err(AidlError::from(SemanticError::UnsupportedType {
                     type_name: "FileDescriptor".to_string(),
                     help: Some("Use ParcelFileDescriptor instead".to_string()),
-                    src: NamedSource::new(src_name, source),
-                    span: SourceSpan::new(start.into(), end.saturating_sub(start)),
+                    src,
+                    span,
                 }));
             }
             "ParcelFileDescriptor" => ValueType::FileDescriptor,
@@ -155,7 +154,7 @@ impl TypeGenerator {
             this = this.array(&_type.array_types);
         }
 
-        if check_annotation_list(&_type.annotation_list, AnnotationType::IsNullable).0 {
+        if has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
             let nullable_span = _type
                 .annotation_list
                 .iter()
@@ -165,6 +164,43 @@ impl TypeGenerator {
         } else {
             Ok(this)
         }
+    }
+
+    /// Verify that every user-defined type this generator references resolves
+    /// to a known declaration in the current namespace context.
+    ///
+    /// Downstream string builders (`make_user_defined_type_name`) assume
+    /// resolution always succeeds and `expect()` otherwise; calling this at each
+    /// type-construction site turns an undefined type into a proper
+    /// `ResolutionError::UnknownType` diagnostic instead of a panic. Must be
+    /// invoked while the owning declaration's `NamespaceGuard` is active.
+    pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
+        let check = |value_type: &ValueType| -> Result<(), AidlError> {
+            if let ValueType::UserDefined(name) = value_type {
+                // `lookup_decl_from_name` falls back to the *current* namespace's
+                // own declaration when nothing matches, so an undefined type does
+                // not return `None`; confirm the resolved declaration's simple
+                // name actually equals the requested one to detect that case.
+                let requested = name.rsplit('.').next().unwrap_or(name.as_str());
+                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL)
+                    .filter(|lookup_decl| lookup_decl.decl.name() == requested);
+                if resolved.is_none() {
+                    let (src, span) = diagnostic_source(self.type_span);
+                    return Err(AidlError::from(ResolutionError::UnknownType {
+                        name: name.clone(),
+                        src,
+                        span,
+                    }));
+                }
+            }
+            Ok(())
+        };
+
+        check(&self.value_type)?;
+        for array_info in &self.array_types {
+            check(&array_info.value_type)?;
+        }
+        Ok(())
     }
 
     fn is_aidl_nullable(value_type: &ValueType) -> bool {
@@ -392,30 +428,13 @@ impl TypeGenerator {
     }
 
     fn list_type_decl_fixed(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
+        // A fixed-size array's wrapping is direction-independent: only
+        // nullability decides whether it is wrapped in `Option<_>`.
         let fixed_array = self.make_fixed_array(array_info, is_struct);
-
-        match self.direction {
-            Direction::Out => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
-            Direction::Inout => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
-            _ => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
+        if self.is_nullable {
+            format!("Option<{fixed_array}>")
+        } else {
+            fixed_array
         }
     }
 
@@ -514,14 +533,7 @@ impl TypeGenerator {
         let fixed_array = self.make_fixed_array(array_info, false);
 
         match self.direction {
-            Direction::Out => {
-                if self.is_nullable {
-                    format!("&mut Option<{fixed_array}>")
-                } else {
-                    format!("&mut {fixed_array}")
-                }
-            }
-            Direction::Inout => {
+            Direction::Out | Direction::Inout => {
                 if self.is_nullable {
                     format!("&mut Option<{fixed_array}>")
                 } else {

@@ -37,11 +37,15 @@ macro_rules! arithmetic_bit_op {
     }
 }
 
+// `$int_op` performs the i64 arithmetic (AOSP aidl wraps two's-complement for
+// `+`/`-`/`*`; `/`/`%` are checked so divide-by-zero and `INT_MIN / -1` become a
+// diagnostic instead of a panic). `$float_op` is the plain operator for f32/f64.
 macro_rules! arithmetic_basic_op {
-    ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
+    ($lhs:expr, $int_op:expr, $float_op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
             let lhs = $lhs.convert_to($promoted)?;
             let rhs = $rhs.convert_to($promoted)?;
+            let int_op = $int_op;
 
             match $promoted {
                 ValueType::Void => Ok(ConstExpr::default()),
@@ -50,25 +54,25 @@ macro_rules! arithmetic_basic_op {
                     Ok(ConstExpr::new(ValueType::String(value)))
                 }
                 ValueType::Byte(_) => {
-                    Ok(ConstExpr::new(ValueType::Byte((lhs.to_i64()? $op rhs.to_i64()?) as u8 as _)))
+                    Ok(ConstExpr::new(ValueType::Byte(int_op(lhs.to_i64()?, rhs.to_i64()?)? as u8 as _)))
                 }
                 ValueType::Int32(_) => {
-                    Ok(ConstExpr::new(ValueType::Int32((lhs.to_i64()? $op rhs.to_i64()?) as i32 as _)))
+                    Ok(ConstExpr::new(ValueType::Int32(int_op(lhs.to_i64()?, rhs.to_i64()?)? as i32 as _)))
                 }
                 ValueType::Int64(_) => {
-                    Ok(ConstExpr::new(ValueType::Int64((lhs.to_i64()? $op rhs.to_i64()?) as _)))
+                    Ok(ConstExpr::new(ValueType::Int64(int_op(lhs.to_i64()?, rhs.to_i64()?)? as _)))
                 }
                 ValueType::Float(_) => {
-                    Ok(ConstExpr::new(ValueType::Float((lhs.to_f64()? $op rhs.to_f64()?) as f32 as _)))
+                    Ok(ConstExpr::new(ValueType::Float((lhs.to_f64()? $float_op rhs.to_f64()?) as f32 as _)))
                 }
                 ValueType::Double(_) => {
-                    Ok(ConstExpr::new(ValueType::Double((lhs.to_f64()? $op rhs.to_f64()?) as _)))
+                    Ok(ConstExpr::new(ValueType::Double((lhs.to_f64()? $float_op rhs.to_f64()?) as _)))
                 }
                 ValueType::Bool(_) => {
-                    Ok(ConstExpr::new(ValueType::Bool((lhs.to_i64()? $op rhs.to_i64()?) != 0)))
+                    Ok(ConstExpr::new(ValueType::Bool(int_op(lhs.to_i64()?, rhs.to_i64()?)? != 0)))
                 }
                 ValueType::Reference { .. } => {
-                    Ok(ConstExpr::new(ValueType::Int64((lhs.to_i64()? $op rhs.to_i64()?) as _)))
+                    Ok(ConstExpr::new(ValueType::Int64(int_op(lhs.to_i64()?, rhs.to_i64()?)? as _)))
                 }
                 _ => {
                     Err(ConstExprError::new(format!(
@@ -173,13 +177,6 @@ impl ValueType {
             rhs: Box::new(ConstExpr::new(rhs)),
         }
     }
-
-    // fn new_unary(operator: &str, expr: ValueType) -> ValueType {
-    //     ValueType::Unary{
-    //         operator: operator.into(),
-    //         expr: Box::new(ConstExpr::new(expr)),
-    //     }
-    // }
 
     pub fn is_primitive(&self) -> bool {
         matches!(
@@ -466,7 +463,6 @@ impl ValueType {
                 res
             }
             ValueType::Holder => {
-                println!("Init Holder: {param:?}");
                 if param.is_vintf {
                     format!(
                         "{}::ParcelableHolder::new({}::Stability::Vintf)",
@@ -607,11 +603,39 @@ impl ValueType {
                     ))),
                 }
             }
-            "+" => arithmetic_basic_op!(lhs, +, rhs, "+", &promoted),
-            "-" => arithmetic_basic_op!(lhs, -, rhs, "-", &promoted),
-            "*" => arithmetic_basic_op!(lhs, *, rhs, "*", &promoted),
-            "/" => arithmetic_basic_op!(lhs, /, rhs, "/", &promoted),
-            "%" => arithmetic_basic_op!(lhs, %, rhs, "%", &promoted),
+            "+" => arithmetic_basic_op!(
+                lhs,
+                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_add(b)) },
+                +, rhs, "+", &promoted
+            ),
+            "-" => arithmetic_basic_op!(
+                lhs,
+                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_sub(b)) },
+                -, rhs, "-", &promoted
+            ),
+            "*" => arithmetic_basic_op!(
+                lhs,
+                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_mul(b)) },
+                *, rhs, "*", &promoted
+            ),
+            "/" => arithmetic_basic_op!(
+                lhs,
+                |a: i64, b: i64| -> Result<i64, ConstExprError> {
+                    a.checked_div(b).ok_or_else(|| {
+                        ConstExprError::new("division by zero or overflow in constant expression")
+                    })
+                },
+                /, rhs, "/", &promoted
+            ),
+            "%" => arithmetic_basic_op!(
+                lhs,
+                |a: i64, b: i64| -> Result<i64, ConstExprError> {
+                    a.checked_rem(b).ok_or_else(|| {
+                        ConstExprError::new("modulo by zero or overflow in constant expression")
+                    })
+                },
+                %, rhs, "%", &promoted
+            ),
             _ => unreachable!(),
         }
     }
@@ -830,15 +854,20 @@ impl ConstExpr {
                 ValueType::Float(_) => {
                     Ok(ConstExpr::new(ValueType::Float(self.to_f64()? as f32 as _)))
                 }
-                ValueType::Double(_) => Ok(ConstExpr::new(ValueType::Float(self.to_f64()?))),
+                ValueType::Double(_) => Ok(ConstExpr::new(ValueType::Double(self.to_f64()?))),
                 ValueType::Bool(_) => Ok(ConstExpr::new(ValueType::Bool(self.to_bool()?))),
                 ValueType::Char(_) => {
-                    let ch = self.to_i64()? as u32;
-                    if let Some(ch) = char::from_u32(ch) {
-                        Ok(Self::new(ValueType::Char(ch as _)))
-                    } else {
-                        Err(ConstExprError::new(format!("0x{ch:x} is invalid unicode")))
-                    }
+                    // `u32::try_from` rejects negatives; `char::from_u32` rejects
+                    // surrogates and values above U+10FFFF. Avoids the `as u32`
+                    // truncation that silently wrapped out-of-range code points.
+                    let raw = self.to_i64()?;
+                    let ch = u32::try_from(raw)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            ConstExprError::new(format!("{raw} is not a valid char code point"))
+                        })?;
+                    Ok(Self::new(ValueType::Char(ch)))
                 }
                 ValueType::UserDefined(_) | ValueType::Reference { .. } => Ok(self.clone()),
                 _ => Err(ConstExprError::new(format!(
@@ -904,67 +933,35 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_const_expr_name() {
-    //     let mut dict = HashMap::new();
-    //     dict.insert("DUMP_FLAG_PRIORITY_CRITICAL".to_owned(),
-    //         ConstExpr::new(
-    //             ValueType::new_expr(
-    //                 ValueType::Int32(1),
-    //                 "<<",
-    //                 ValueType::Int32(0),
-    //             )
-    //         )
-    //     );
+    #[test]
+    fn test_division_by_zero_is_error_not_panic() {
+        let expr = ValueType::new_expr(ValueType::Int32(1), "/", ValueType::Int32(0));
+        assert!(expr.calculate().is_err());
 
-    //     dict.insert("DUMP_FLAG_PRIORITY_HIGH".to_owned(),
-    //         ConstExpr::new(
-    //             ValueType::new_expr(
-    //                 ValueType::Int32(1),
-    //                 "<<",
-    //                 ValueType::Int32(1),
-    //             )
-    //         )
-    //     );
+        let expr = ValueType::new_expr(ValueType::Int32(5), "%", ValueType::Int32(0));
+        assert!(expr.calculate().is_err());
+    }
 
-    //     dict.insert("DUMP_FLAG_PRIORITY_NORMAL".to_owned(),
-    //         ConstExpr::new(
-    //             ValueType::new_expr(
-    //                 ValueType::Int32(1),
-    //                 "<<",
-    //                 ValueType::Int32(2),
-    //             )
-    //         )
-    //     );
+    #[test]
+    fn test_integer_overflow_wraps_not_panic() {
+        // i64::MAX + 1 must wrap to i64::MIN (two's-complement) rather than panic.
+        let expr = ValueType::new_expr(ValueType::Int64(i64::MAX), "+", ValueType::Int64(1));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int64(i64::MIN))
+        );
+    }
 
-    //     dict.insert("DUMP_FLAG_PRIORITY_DEFAULT".to_owned(),
-    //         ConstExpr::new(
-    //             ValueType::new_expr(
-    //                 ValueType::Int32(1),
-    //                 "<<",
-    //                 ValueType::Int32(3),
-    //             )
-    //         )
-    //     );
-
-    //     let expr = ConstExpr::new(
-    //         ValueType::new_expr(
-    //             ValueType::Name("DUMP_FLAG_PRIORITY_CRITICAL".into()),
-    //             "|",
-    //             ValueType::new_expr(
-    //                 ValueType::Name("DUMP_FLAG_PRIORITY_HIGH".into()),
-    //                 "|",
-    //                 ValueType::new_expr(
-    //                     ValueType::Name("DUMP_FLAG_PRIORITY_NORMAL".into()),
-    //                     "|",
-    //                     ValueType::Name("DUMP_FLAG_PRIORITY_DEFAULT".into()),
-    //                 )
-    //             ),
-    //         )
-    //     );
-
-    //     assert_eq!(expr.calculate(), ConstExpr::new(ValueType::Int32(15)));
-    // }
+    #[test]
+    fn test_double_conversion_preserves_f64_precision() {
+        // 0.1 + 0.2 is not exactly representable in f32; converting to Double must
+        // keep the full f64 value (regression: the Double arm built a Float/f32).
+        let value = 0.1_f64 + 0.2_f64;
+        let converted = ConstExpr::new(ValueType::Double(value))
+            .convert_to(&ValueType::Double(0.0))
+            .unwrap();
+        assert_eq!(converted, ConstExpr::new(ValueType::Double(value)));
+    }
 
     // 4.3g: Array.to_bool() returns Err (not panic)
     #[test]
