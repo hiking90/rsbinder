@@ -52,12 +52,17 @@ find the service.
 
 ### Registration Rules
 
-The service manager enforces several constraints on service names:
+The service manager enforces several constraints on service names. These
+checks are applied **by the service manager process** (`rsb_hub` on Linux,
+`servicemanager` on Android) — the `rsbinder` library itself does not validate
+the name on the client side, so the failure surfaces as a `Status` error from
+the IPC call rather than a local compile-time or pre-flight check.
 
 - **Maximum length**: 127 characters. Names of 128 characters or longer are
   rejected.
 - **Allowed characters**: Alphanumeric characters, dots (`.`), underscores
-  (`_`), and hyphens (`-`). Special characters such as `$` are not allowed.
+  (`_`), hyphens (`-`), and forward slashes (`/`). Special characters such as
+  `$` are not allowed.
 - **Non-empty**: An empty string is rejected.
 - **Overwrite permitted**: Registering a service with a name that is already
   in use replaces the previous registration.
@@ -213,9 +218,10 @@ if declared {
 }
 ```
 
-On Linux with `rsb_hub`, this typically returns `false` because there is no
-VINTF manifest. On Android, it reflects the device's hardware interface
-declarations.
+On Linux with `rsb_hub`, this **always** returns `false` because `rsb_hub`
+has no VINTF parser and no manifest concept ([rsb_hub.rs](https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/src/bin/rsb_hub.rs)
+implements `isDeclared` as `Ok(false)`). On Android, it reflects the device's
+hardware interface declarations.
 
 ## Debug Information
 
@@ -254,12 +260,27 @@ Android's native `servicemanager`:
 | **Death notifications** | Supported                               | Supported                               |
 
 On Android, rsbinder automatically detects the SDK version and uses the
-appropriate service manager protocol (Android 10 through 16). Android 10
-falls back to the legacy C `IServiceManager` and therefore lacks
-`is_declared`, service notification callbacks, and `get_service_debug_info`
-— those entry points return `false` or `StatusCode::UnknownTransaction`.
-On Linux, rsbinder always uses the Android 16 protocol, which is what
-`rsb_hub` implements.
+appropriate service manager protocol (Android 10 through 16). The per-version
+API availability matrix:
+
+| API                                | Android 10 | Android 11 | Android 12+ |
+|------------------------------------|:---------:|:---------:|:-----------:|
+| `get_service` / `check_service`    |     ✓     |     ✓     |      ✓      |
+| `add_service`                      |     ✓     |     ✓     |      ✓      |
+| `list_services`                    |     ✓     |     ✓     |      ✓      |
+| `is_declared`                      |   false   |     ✓     |      ✓      |
+| `register_for_notifications`       |     ✗     |     ✓     |      ✓      |
+| `unregister_for_notifications`     |     ✗     |     ✓     |      ✓      |
+| `get_service_debug_info`           |     ✗     |     ✗     |      ✓      |
+
+Where ✗ means the call returns `StatusCode::UnknownTransaction` (or `false`
+for the `bool`-returning `is_declared`) because the underlying server protocol
+predates the API. Android 10 falls back to the legacy C `IServiceManager`,
+which only learned the AIDL-based interface in Android 11; `get_service_debug_info`
+was added in Android 12. On Linux, rsbinder always uses the Android 16
+protocol — what `rsb_hub` implements — so every row in the Android 12+
+column applies, with the caveat that `is_declared` is *always* `false` on
+Linux (no VINTF manifest).
 
 ## Using the ServiceManager Object Directly
 
@@ -270,7 +291,10 @@ you can obtain the `ServiceManager` instance directly:
 ```rust
 use rsbinder::hub;
 
-let sm = hub::default();
+// `hub::default()` returns `Result<Arc<ServiceManager>, StatusCode>` because
+// initialization can fail (e.g., binder device unavailable, unsupported SDK).
+// Propagate the error with `?` or handle it with `match`.
+let sm = hub::default()?;
 
 // Use methods on the ServiceManager instance
 let service = sm.get_service("com.example.myservice");

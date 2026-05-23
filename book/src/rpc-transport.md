@@ -135,6 +135,34 @@ returns either the kernel handle or the RPC proxy depending on what
 the `SIBinder` came from. **One AIDL stub, two stacks** — there is no
 separate "RPC client API" you need to learn.
 
+### Multiple named services on one server
+
+`RpcServer::set_root` publishes a single root binder. If you need to
+expose **multiple** named services on the same socket — the moral
+equivalent of the kernel-binder `hub::add_service(name, …)` flow — use
+[`RpcServer::add_service`] instead. The first call automatically turns
+the root into a built-in service directory, so clients reach each
+service by name through [`RpcSession::get_service`]:
+
+```rust
+// Server
+let server = RpcServer::setup_unix_server(SOCKET)?;
+server.add_service("hello", BnHello::new_binder(IHelloService).as_binder())?;
+server.add_service("echo",  BnEcho::new_binder(IEchoService).as_binder())?;
+server.run()?;
+
+// Client
+let session = RpcSession::setup_unix_client(SOCKET)?;
+let hello: Strong<dyn IHello> =
+    <dyn IHello as FromIBinder>::try_from(session.get_service("hello")?)?;
+let echo: Strong<dyn IEcho> =
+    <dyn IEcho  as FromIBinder>::try_from(session.get_service("echo")?)?;
+```
+
+Mixing `set_root` with `add_service` on the same server is **not**
+supported — `add_service` rebuilds the root each call to keep the set
+consistent. Pick one publishing model per server.
+
 ## Wire-protocol profiles
 
 rsbinder speaks **two** RPC wire profiles, chosen at connect time:
@@ -209,6 +237,8 @@ let config = Arc::new(
         .with_no_client_auth(),
 );
 
+// Third argument must be `Arc<rustls::ClientConfig>` — `setup_tcp_client_tls`
+// takes the config by shared ownership so it can be cloned per connection.
 let session = RpcSession::setup_tcp_client_tls(
     "binder.example.com:9999",
     "binder.example.com",
@@ -293,6 +323,13 @@ the default. See the rustdoc on
 [`RpcServer::set_max_threads`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_threads)
 for the current status.
 
+`set_max_threads` caps *incoming slots per session*. To cap
+*server-wide concurrent connections* — for example to bound the
+worker-thread fan-out regardless of how many sessions a single client
+opens — use
+[`RpcServer::set_max_connections(N)`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_connections)
+(default: unlimited). Both knobs are independent and additive.
+
 ## Bridging RPC and the service manager: the Accessor pattern
 
 Android 16 introduced `IAccessor` — a kernel-binder interface whose
@@ -322,7 +359,14 @@ rsbinder implements **both sides** of this pattern:
   ```rust
   use rsbinder::hub::{self, android_16::{create_accessor, AccessorSockAddr}};
   use rsbinder::rpc::RpcServer;
+  use rsbinder::ProcessState;
   use std::path::PathBuf;
+
+  // 0. The kernel-binder side needs ProcessState to publish the
+  //    accessor through the system service manager. The RPC server
+  //    itself does NOT (it runs entirely in user space).
+  ProcessState::init_default()?;
+  ProcessState::start_thread_pool();
 
   // 1. Run a regular RPC server on a UDS.
   let sock = PathBuf::from("/data/local/tmp/my.sock");
@@ -339,7 +383,8 @@ rsbinder implements **both sides** of this pattern:
   }));
   hub::add_service("my.service", accessor)?;
 
-  // 3. The kernel-binder side still needs ProcessState.
+  // 3. Block on the kernel binder thread pool so the accessor stays
+  //    reachable for the lifetime of the process.
   ProcessState::join_thread_pool()?;
   ```
 

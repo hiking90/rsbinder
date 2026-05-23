@@ -35,6 +35,14 @@ $ touch aidl/hello/IHello.aidl
 ```
 The reason for creating an additional **hello** folder is to create a namespace for the **hello** package.
 
+> **Directory ↔ package mapping.** The folder name under `aidl/` **must
+> match** the `package` declaration at the top of the `.aidl` file. So
+> `aidl/hello/IHello.aidl` requires `package hello;` (below), and the
+> generated Rust path is `crate::hello::IHello::IHello`. A nested
+> package like `package com.example.hello;` would need
+> `aidl/com/example/hello/IHello.aidl`. This mirrors Android's AIDL
+> convention.
+
 Create the `aidl/hello/IHello.aidl` file with the following contents:
 ```aidl
 package hello;

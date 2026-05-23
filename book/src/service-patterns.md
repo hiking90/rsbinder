@@ -65,7 +65,9 @@ the standard pattern based on the project's test service implementation:
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize ProcessState. This opens the Binder device and configures
     // the process for Binder IPC. Must be called before any Binder operations.
-    ProcessState::init_default();
+    // `init_default()` returns `Result<&'static ProcessState, ...>`; use `?`
+    // to surface device-open or initialization failures.
+    ProcessState::init_default()?;
 
     // Start additional threads for handling concurrent Binder transactions.
     // Optional but recommended for services that handle multiple clients.

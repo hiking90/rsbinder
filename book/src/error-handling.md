@@ -19,6 +19,16 @@ pub type Result<T> = std::result::Result<T, Status>;
 
 This is a standard `Result` whose error variant is a `Status`.
 
+> **Note — two `Result` aliases coexist in `rsbinder`.** AIDL methods use
+> `rsbinder::status::Result<T> = Result<T, Status>` (rich error with exception
+> code + optional message), but several library-level APIs (`Interface::dump`,
+> `hub::default`, `hub::register_for_notifications`, `hub::get_service_debug_info`)
+> use the plain `rsbinder::Result<T> = Result<T, StatusCode>` re-exported from
+> [`rsbinder::error`](https://docs.rs/rsbinder/latest/rsbinder/error/index.html).
+> Because `StatusCode` implements `From<StatusCode> for Status`, propagating
+> with `?` from a `Result<_, StatusCode>` into an AIDL method body (which
+> returns `Result<_, Status>`) works transparently.
+
 ### `StatusCode`
 
 `StatusCode` represents low-level transport errors that occur before or during

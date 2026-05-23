@@ -98,4 +98,22 @@ pattern (Android 16+) publishes an `IAccessor` binder over kernel
 binder whose `addConnection()` hands the client a connected RPC
 socket fd.
 
+### Coexistence rules
+
+If a single process uses **both** stacks (the Accessor pattern is the
+canonical example):
+
+- **Kernel-binder side** requires `ProcessState::init_default()` (or
+  `init(path, max_threads)`) and typically `start_thread_pool()` /
+  `join_thread_pool()`. This is global per-process state and lives in
+  the `rsbinder` core.
+- **RPC side** is fully independent — `RpcServer` / `RpcSession` open
+  their own sockets and run their own accept/worker threads. They do
+  **not** touch `ProcessState`, `rsb_hub`, or `/dev/binder`.
+- A pure-RPC process omits the kernel-binder initialization entirely;
+  a pure-kernel process omits the RPC code path entirely (and doesn't
+  even need the `rpc` Cargo feature). Mixing the two costs only what
+  each side already costs in isolation — there is no shared singleton
+  between them.
+
 See [RPC Transport](./rpc-transport.md) for the full story.
