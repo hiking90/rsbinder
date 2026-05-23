@@ -13,12 +13,12 @@
 
 #![cfg(feature = "rpc-tls")]
 
-use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread;
 
+use rsbinder::rpc::rustls::pki_types::pem::PemObject;
 use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rsbinder::rpc::transport::TlsTransport;
@@ -38,14 +38,12 @@ const ROGUE_CRT: &str = include_str!("tls_fixtures/rogue.crt");
 const ROGUE_KEY: &str = include_str!("tls_fixtures/rogue.key");
 
 fn certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<std::result::Result<_, _>>()
         .expect("parse certs")
 }
 fn key(pem: &str) -> PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut BufReader::new(pem.as_bytes()))
-        .expect("parse key")
-        .expect("a key")
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
 }
 
 fn server_config(cert_pem: &str, key_pem: &str) -> Arc<ServerConfig> {

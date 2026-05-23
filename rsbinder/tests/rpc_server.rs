@@ -737,9 +737,9 @@ fn android13plus_profile_e2e() {
 #[cfg(feature = "rpc-tls")]
 #[test]
 fn tls_android13plus_nested_callback_e2e() {
-    use std::io::BufReader;
     use std::net::TcpListener;
 
+    use rsbinder::rpc::rustls::pki_types::pem::PemObject;
     use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
     use rsbinder::rpc::transport::TlsTransport;
@@ -749,14 +749,12 @@ fn tls_android13plus_nested_callback_e2e() {
     const SRV_KEY: &str = include_str!("tls_fixtures/srv.key");
 
     fn certs(pem: &str) -> Vec<CertificateDer<'static>> {
-        rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
+        CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<std::result::Result<_, _>>()
             .expect("parse certs")
     }
     fn key(pem: &str) -> PrivateKeyDer<'static> {
-        rustls_pemfile::private_key(&mut BufReader::new(pem.as_bytes()))
-            .expect("parse key")
-            .expect("a key")
+        PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("parse key")
     }
     let srv_cfg = Arc::new(
         ServerConfig::builder()
