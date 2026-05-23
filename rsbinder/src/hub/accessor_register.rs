@@ -177,7 +177,7 @@ fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, Accesso
     use std::os::unix::net::UnixStream;
     match UnixStream::connect(path) {
         Ok(stream) => Ok(OwnedFd::from(stream)),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES)) => {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
         // `socket(2)` and `connect(2)` failures both surface as
@@ -210,7 +210,7 @@ fn connect_vsock_owned_fd(
             let raw = stream.into_raw_fd();
             Ok(unsafe { OwnedFd::from_raw_fd(raw) })
         }
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES)) => {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
         Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
@@ -232,7 +232,7 @@ fn connect_inet_owned_fd(addr: SocketAddrV4) -> std::result::Result<OwnedFd, Acc
     use std::net::TcpStream;
     match TcpStream::connect(addr) {
         Ok(stream) => Ok(OwnedFd::from(stream)),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES)) => {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
         Err(e) => Err(AccessorConnectError::ConnectFailed(e)),

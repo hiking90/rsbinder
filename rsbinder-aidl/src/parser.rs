@@ -257,6 +257,19 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
         None
     })?;
 
+    // Synthetic union-tag enums (`EnumDecl::tag_of_union`) record the
+    // parent union's namespace as their codegen-effective module path
+    // — the `Tag` struct is a sibling inside `mod <Union>`, not its
+    // own `mod Tag`, so the default `<ns>::<name>` doubling needs to
+    // resolve against the union's ns to emit `<Union>::Tag` instead
+    // of `<Union>::Tag::Tag`.
+    let effective_ns = match &decl {
+        Declaration::Enum(e) if e.tag_of_union.is_some() => {
+            e.tag_of_union.clone().expect("checked Some above")
+        }
+        _ => ns,
+    };
+
     // leave max 2 items because the other items are for name space.
     if namespace.ns.len() > 2 {
         namespace.ns.drain(0..namespace.ns.len() - 2);
@@ -264,7 +277,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
 
     Some(LookupDecl {
         decl,
-        ns,
+        ns: effective_ns,
         name: namespace,
     })
 }
@@ -1667,6 +1680,19 @@ pub struct EnumDecl {
     pub name_span: Option<(usize, usize)>,
     pub enumerator_list: Vec<Enumerator>,
     pub members: Vec<Declaration>,
+    /// Synthetic marker: AIDL gives every `union Foo { ... }` an implicit
+    /// nested `Tag` enum (one variant per field) that downstream types
+    /// may reference as `Foo.Tag`. `calculate_namespace` injects such a
+    /// stub `EnumDecl` into `DECLARATION_MAP` so `Foo.Tag` resolves like
+    /// any other user-defined type; `tag_of_union` then stores the
+    /// parent union's full namespace so `lookup_decl_from_name` can
+    /// hand that namespace back as the codegen-effective module path
+    /// (the `Tag` struct lives *inside* `mod Foo`, sibling to the union
+    /// enum, so the standard `<ns>::<name>` doubling would emit
+    /// `Foo::Tag::Tag` — using the union ns yields `Foo::Tag`). The
+    /// runtime `Tag` struct itself is emitted by the union template in
+    /// [`crate::generator`], not from this stub.
+    pub tag_of_union: Option<Namespace>,
 }
 
 fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, AidlError> {
@@ -1811,6 +1837,30 @@ fn calculate_namespace(
             .borrow_mut()
             .insert(namespace.clone(), document_context.clone());
     });
+
+    // Implicit nested `Tag` enum for unions (AIDL semantics). The
+    // union codegen template already emits a `Tag` struct inside the
+    // union's module; this stub `EnumDecl` exists only so that other
+    // declarations can name-resolve `<Union>.Tag` as a user-defined
+    // type. See `EnumDecl::tag_of_union` for the codegen interplay.
+    if matches!(decl, Declaration::Union(_)) {
+        let mut tag_ns = namespace.clone();
+        tag_ns.push("Tag");
+        let tag_enum = Declaration::Enum(EnumDecl {
+            namespace: tag_ns.clone(),
+            name: "Tag".into(),
+            tag_of_union: Some(namespace.clone()),
+            ..Default::default()
+        });
+        DECLARATION_MAP.with(|hashmap| {
+            hashmap.borrow_mut().insert(tag_ns.clone(), tag_enum);
+        });
+        DECLARATION_DOCUMENT_MAP.with(|hashmap| {
+            hashmap
+                .borrow_mut()
+                .insert(tag_ns, document_context.clone());
+        });
+    }
 
     for decl in decl.members_mut() {
         calculate_namespace(decl, namespace.clone(), document_context);
