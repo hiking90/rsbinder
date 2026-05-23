@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "example-hello"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "downcast-rs",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "convert_case",
  "miette",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tools"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anstyle",
  "clap",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "tests"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "env_logger",
