@@ -194,6 +194,19 @@ pub enum SemanticError {
         #[label("'{direction}' cannot apply to {type_kind}")]
         span: SourceSpan,
     },
+
+    #[error("invalid backing type: {type_name}")]
+    #[diagnostic(
+        code(aidl::invalid_backing_type),
+        help("@Backing(type=...) must be one of: byte, int, long")
+    )]
+    InvalidBackingType {
+        type_name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("'{type_name}' is not a valid enum backing type")]
+        span: SourceSpan,
+    },
 }
 
 /// Auxiliary diagnostic for marking the second conflicting location in

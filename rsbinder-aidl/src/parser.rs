@@ -918,9 +918,20 @@ pub fn get_backing_type(
         if annotation.annotation == "@Backing" {
             for param in &annotation.parameter_list {
                 if param.identifier == "type" {
+                    let type_name: String =
+                        param.const_expr.to_value_string().trim_matches('"').into();
+
+                    // AOSP allows only {byte, int, long} as enum backing types.
+                    // See aidl_language.cpp::AidlEnumDeclaration::Autofill().
+                    if !matches!(type_name.as_str(), "byte" | "int" | "long") {
+                        return Err(make_invalid_backing_type_error(
+                            type_name,
+                            annotation.annotation_span.or(name_span),
+                        ));
+                    }
+
                     return type_generator::TypeGenerator::new(&NonArrayType {
-                        // The cstr is enclosed in quotes.
-                        name: param.const_expr.to_value_string().trim_matches('"').into(),
+                        name: type_name,
                         generic: None,
                         name_span,
                     });
@@ -934,6 +945,19 @@ pub fn get_backing_type(
         name: "byte".into(),
         generic: None,
         name_span: None,
+    })
+}
+
+/// Builds an `InvalidBackingType` diagnostic from the active source context.
+/// Mirrors `make_parse_error` for the semantic-error family.
+fn make_invalid_backing_type_error(type_name: String, span: Option<(usize, usize)>) -> AidlError {
+    let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
+    let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
+    let (start, end) = span.unwrap_or((0, 0));
+    AidlError::from(crate::error::SemanticError::InvalidBackingType {
+        type_name,
+        src: miette::NamedSource::new(filename, source),
+        span: miette::SourceSpan::new(start.into(), end.saturating_sub(start)),
     })
 }
 
@@ -1215,13 +1239,15 @@ fn parse_parameter_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Param
 }
 
 fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, AidlError> {
+    // `annotation_span` is set by the caller (`parse_annotation_list`) from the
+    // outer `annotation` rule's pair span so the diagnostic label naturally
+    // covers the whole `@Foo(...)` form, including parens that pest's child
+    // rules (ANNOTATION / const_expr / parameter_list) do not span.
     let mut annotation = Annotation::default();
     for pair in pairs {
         match pair.as_rule() {
             Rule::ANNOTATION => {
-                let span = pair.as_span();
                 annotation.annotation = pair.as_str().into();
-                annotation.annotation_span = Some((span.start(), span.end()));
             }
 
             Rule::const_expr => {
@@ -1244,7 +1270,12 @@ fn parse_annotation_list(
 ) -> Result<Vec<Annotation>, AidlError> {
     let mut annotation_list = Vec::new();
     for pair in pairs {
-        annotation_list.push(parse_annotation(pair.into_inner())?);
+        // Capture the outer `annotation` rule's span (covers `@Foo(...)` or
+        // bare `@Foo`) before descending into the inner pairs.
+        let span = pair.as_span();
+        let mut annotation = parse_annotation(pair.into_inner())?;
+        annotation.annotation_span = Some((span.start(), span.end()));
+        annotation_list.push(annotation);
     }
 
     Ok(annotation_list)

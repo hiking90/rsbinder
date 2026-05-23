@@ -417,27 +417,116 @@ fn test_inout_string_span_points_to_inout_keyword() {
     }
 }
 
-// ── EnumDecl.name_span location verification ─────────────────────────────────
+// ── @Backing(type=...) validation (AOSP allowlist: byte/int/long) ────────────
 
-// verify that an invalid backing type error points to the enum name
-#[test]
-fn test_enum_bad_backing_span_points_to_enum_name() {
-    let input = "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1 }";
+/// Helper: assert that `input` produces an InvalidBackingType diagnostic whose
+/// label points exactly at the supplied `expected_annotation` source text.
+fn assert_invalid_backing_type(input: &str, expected_type_name: &str, expected_annotation: &str) {
     let err = expect_generation_error(input, "test.aidl");
-    if let AidlError::Semantic(se) = &err {
-        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
-            let offset = span.offset();
-            let len = span.len();
-            assert!(len > 0, "span should have non-zero length");
-            let spanned_text = &input[offset..offset + len];
-            assert_eq!(
-                spanned_text, "MyEnum",
-                "span should point to enum name 'MyEnum', got: '{spanned_text}'"
-            );
-        } else {
-            panic!("Expected InvalidOperation, got: {err}");
-        }
-    } else {
+    let AidlError::Semantic(se) = &err else {
         panic!("Expected Semantic error, got: {err}");
+    };
+    let SemanticError::InvalidBackingType {
+        type_name, span, ..
+    } = se.as_ref()
+    else {
+        panic!("Expected InvalidBackingType, got: {err}");
+    };
+    assert_eq!(type_name, expected_type_name);
+
+    let offset = span.offset();
+    let len = span.len();
+    assert!(len > 0, "span should have non-zero length");
+    let spanned_text = &input[offset..offset + len];
+    assert_eq!(
+        spanned_text, expected_annotation,
+        "span should cover the @Backing annotation, got: '{spanned_text}'"
+    );
+
+    // diagnostic code should be the dedicated one (not the generic invalid_operation)
+    assert_eq!(se.code().unwrap().to_string(), "aidl::invalid_backing_type");
+    // help text must enumerate the allowed AOSP backing types
+    let help = se.help().map(|h| h.to_string()).unwrap_or_default();
+    assert!(
+        help.contains("byte") && help.contains("int") && help.contains("long"),
+        "help should list allowed backing types, got: {help}"
+    );
+}
+
+#[test]
+fn test_invalid_backing_type_unknown_identifier() {
+    assert_invalid_backing_type(
+        "package foo;\n@Backing(type=\"NotAType\")\nenum MyEnum { V1 = 1 }",
+        "NotAType",
+        "@Backing(type=\"NotAType\")",
+    );
+}
+
+#[test]
+fn test_invalid_backing_type_string() {
+    // String is a real AIDL/Rust type but not a valid enum backing per AOSP.
+    assert_invalid_backing_type(
+        "package foo;\n@Backing(type=\"String\")\nenum MyEnum { V1 = 1 }",
+        "String",
+        "@Backing(type=\"String\")",
+    );
+}
+
+#[test]
+fn test_invalid_backing_type_common_typo() {
+    // 'integer' is a frequent typo for 'int' — the diagnostic must catch it.
+    assert_invalid_backing_type(
+        "package foo;\n@Backing(type=\"integer\")\nenum MyEnum { V1 = 1 }",
+        "integer",
+        "@Backing(type=\"integer\")",
+    );
+}
+
+#[test]
+fn test_invalid_backing_type_char_rejected() {
+    // 'char' is a valid AIDL type but AOSP rejects it as enum backing.
+    assert_invalid_backing_type(
+        "package foo;\n@Backing(type=\"char\")\nenum MyEnum { V1 = 1 }",
+        "char",
+        "@Backing(type=\"char\")",
+    );
+}
+
+#[test]
+fn test_invalid_backing_type_list_replaces_old_invalid_operation() {
+    // Prior behaviour: List backing hit TypeGenerator's "List must have
+    // Generic Type" arm and surfaced as InvalidOperation. The dedicated
+    // InvalidBackingType validation runs first, so List is now reported
+    // with the AOSP-faithful diagnostic instead.
+    assert_invalid_backing_type(
+        "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1 }",
+        "List",
+        "@Backing(type=\"List\")",
+    );
+}
+
+#[test]
+fn test_valid_backing_types_generate_successfully() {
+    for ty in ["byte", "int", "long"] {
+        let input = format!("package foo;\n@Backing(type=\"{ty}\")\nenum MyEnum {{ V1 = 1 }}");
+        let ctx = SourceContext::new("test.aidl", &input);
+        let doc = parse_document(&ctx).expect("parse");
+        let gen = Generator::new(false, false);
+        let result = gen.document(&doc);
+        assert!(
+            result.is_ok(),
+            "@Backing(type=\"{ty}\") should generate successfully, got: {:?}",
+            result.err()
+        );
     }
+}
+
+#[test]
+fn test_no_backing_annotation_defaults_to_byte() {
+    // The implicit-byte default must not regress into the new validator.
+    let input = "package foo;\nenum MyEnum { V1 = 1 }";
+    let ctx = SourceContext::new("test.aidl", input);
+    let doc = parse_document(&ctx).expect("parse");
+    let gen = Generator::new(false, false);
+    assert!(gen.document(&doc).is_ok());
 }
