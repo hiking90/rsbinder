@@ -154,9 +154,21 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        // The `Slice` variant already holds a `&'static mut [T]` —
+        // exclusive, mutable, and granted by the constructor
+        // (`from_raw_parts_mut`, only called on a kernel-supplied
+        // transaction buffer the driver explicitly allows the
+        // userspace to modify in place, e.g. for FD-cookie / handle
+        // patches inside `Parcel::append_from`). The previous
+        // `panic!()` arm was a latent crash: it would have fired on
+        // any `append_from` of a kernel-incoming parcel whose
+        // destination was Slice-backed, since `objects.as_mut_slice()`
+        // and `data.as_mut_slice()` flow through this method. Mirror
+        // the `as_slice` arm and just hand the slice back; the
+        // compiler reborrows it to the lifetime of `&mut self`.
         match self {
             ParcelData::Vec(v) => v.as_mut_slice(),
-            ParcelData::Slice(_) => panic!("ParcelData::Slice can't support as_mut_slice()."),
+            ParcelData::Slice(s) => s,
         }
     }
 
@@ -1296,6 +1308,40 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn parcel_data_slice_as_mut_slice_round_trips() {
+        // The `Slice` variant carries a `&'static mut [T]` produced
+        // by `ParcelData::from_raw_parts_mut`, which is the
+        // kernel-buffer adoption path (`Parcel::from_ipc_parts`
+        // family). Pre-fix this method panicked unconditionally on
+        // that arm — a latent crash on `Parcel::append_from` of any
+        // kernel-incoming parcel whose destination was Slice-backed.
+        // This regression guard mirrors the `as_slice` symmetry: a
+        // write through `as_mut_slice` is observable on the next
+        // `as_slice` read.
+        //
+        // SAFETY: `Box::leak` hands ownership to the test binary's
+        // process-lifetime arena, so the pointer + length below
+        // satisfy `from_raw_parts_mut`'s "valid, exclusively-owned,
+        // `'static`" contract for the rest of the run.
+        let leaked: &'static mut [u8] =
+            Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
+        let ptr = leaked.as_mut_ptr();
+        let len = leaked.len();
+        let mut pd: super::ParcelData<u8> =
+            unsafe { super::ParcelData::from_raw_parts_mut(ptr, len) };
+
+        let slice = pd.as_mut_slice();
+        assert_eq!(slice, &mut [0u8, 1, 2, 3][..]);
+        slice[0] = 99;
+        slice[3] = 200;
+
+        // Round-trip through the immutable view: writes survived,
+        // proving the returned `&mut [T]` actually aliases the
+        // underlying storage (not a copy).
+        assert_eq!(pd.as_slice(), &[99u8, 1, 2, 200][..]);
+    }
 
     #[test]
     fn checked_array_layout_normal_case() {
