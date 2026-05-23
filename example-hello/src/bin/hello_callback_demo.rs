@@ -34,9 +34,7 @@
 use std::time::Instant;
 
 use example_hello::*;
-use rsbinder::hub::android_16::android::os::IClientCallback::{
-    BnClientCallback, IClientCallback,
-};
+use rsbinder::hub::android_16::android::os::IClientCallback::{BnClientCallback, IClientCallback};
 use rsbinder::hub::android_16::IServiceManager;
 use rsbinder::*;
 
