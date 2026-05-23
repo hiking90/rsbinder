@@ -72,13 +72,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let callback = BnClientCallback::new_binder(MyClientCallback { start });
 
-    // `hub::default()` returns the version-dispatching enum; on Linux
-    // / non-Android the only active arm is `Android16` (see
-    // `rsbinder/src/hub/mod.rs`'s cfg-gated enum). Reach into the
-    // BpServiceManager directly to call the AIDL `registerClientCallback`
-    // method — it isn't surfaced as a hub-level convenience function.
+    // `hub::default()` returns the version-dispatching enum. On
+    // non-Android the only active arm is `Android16` (cfg-gated enum
+    // in `rsbinder/src/hub/mod.rs`) → the match is single-arm
+    // exhaustive. On Android the older SDK variants (`Android10`–
+    // `Android14`) also compile in, requiring the `cfg`-gated
+    // catch-all. The non-Android single-arm form trips
+    // `clippy::infallible_destructuring_match` (suggests `let
+    // X(bp) = ...`), but that alternative trips
+    // `irrefutable_let_patterns` for the same reason — neither lint
+    // can accommodate both targets, so we allow the destructuring-
+    // match lint only where it fires. We reach into the
+    // `BpServiceManager` directly because `registerClientCallback`
+    // isn't surfaced as a hub-level convenience function.
     let sm = hub::default()?;
-    let hub::ServiceManager::Android16(bp) = &*sm;
+    #[cfg_attr(
+        not(target_os = "android"),
+        allow(clippy::infallible_destructuring_match)
+    )]
+    let bp = match &*sm {
+        hub::ServiceManager::Android16(bp) => bp,
+        #[cfg(target_os = "android")]
+        _ => {
+            return Err(
+                "hello_callback_demo expects the Android 16 ServiceManager variant \
+                 (Linux default, or an Android target whose detected SDK is 36)"
+                    .into(),
+            );
+        }
+    };
     bp.registerClientCallback(SERVICE_NAME, &service_binder, &callback)
         .map_err(|e| format!("registerClientCallback failed: {e:?}"))?;
     println!(
