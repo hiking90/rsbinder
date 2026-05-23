@@ -512,14 +512,25 @@ impl IServiceManager for ServiceManager {
         }
     }
 
+    /// rsb_hub has no static service declaration system on Linux —
+    /// AOSP's servicemanager answers this from VINTF manifests
+    /// (`/system/etc/vintf/...`, `/system_ext/etc/vintf/...`), which
+    /// are an Android-specific build artifact with no equivalent on a
+    /// plain Linux host. Returning `false` is the truthful answer:
+    /// "no, this name has no pre-declared availability — fall back to
+    /// dynamic lookup via `getService`/`checkService`". Vendors that
+    /// need VINTF-equivalent declaration semantics should layer that
+    /// on top in their own service-manager (or run rsb_hub on a host
+    /// that ships VINTF files plus a parser, which is out of scope
+    /// here).
     fn isDeclared(&self, _arg_name: &str) -> rsbinder::status::Result<bool> {
-        // TODO: Implement this
-        log::warn!("isDeclared is not implemented");
         Ok(false)
     }
 
+    /// See [`isDeclared`](Self::isDeclared) — same VINTF-on-Linux
+    /// rationale. An empty `Vec` reports "no declared instances for
+    /// this interface" which on a VINTF-free system is always true.
     fn getDeclaredInstances(&self, _arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
-        log::warn!("getDeclaredInstances is not implemented");
         Ok(vec![])
     }
 
@@ -528,13 +539,21 @@ impl IServiceManager for ServiceManager {
         Ok(None)
     }
 
+    /// AOSP's servicemanager surfaces the VINTF `<ip>`+`<port>` of an
+    /// AIDL service for inet-style RPC accessor connection info (see
+    /// `getVintfConnectionInfo` in `frameworks/native/cmds/servicemanager/
+    /// ServiceManager.cpp`). rsb_hub has no VINTF infrastructure on
+    /// Linux, so the only honest reply is `None` — callers should
+    /// either go through an `IAccessor` they obtained out-of-band
+    /// (e.g., via the consume-side accessor arm of `getService2` +
+    /// process-local `add_accessor_provider`) or fall back to a
+    /// vendor-supplied lookup. Same design choice as [`isDeclared`](Self::isDeclared).
     fn getConnectionInfo(
         &self,
         _arg_name: &str,
     ) -> rsbinder::status::Result<
         Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
     > {
-        log::warn!("getConnectionInfo is not implemented");
         Ok(None)
     }
 
