@@ -162,6 +162,12 @@ mod sys;
 /// Thread-local binder state
 pub mod thread_state;
 
+/// RPC transport (binder-over-socket) — a separate stack from the
+/// kernel binder path. Present only with the `rpc` feature. See
+/// `plan/2-rpc-transport.md`.
+#[cfg(feature = "rpc")]
+pub mod rpc;
+
 /// Service hub and manager implementations
 pub mod hub;
 /// Async runtime implementations

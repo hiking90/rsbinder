@@ -27,6 +27,11 @@ pub enum AidlError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// A tera template failed to render — a code-generator failure, not I/O.
+    #[error("template render error: {message}")]
+    #[diagnostic(code(aidl::template_error))]
+    Template { message: String },
+
     /// Aggregates multiple errors when processing several AIDL files
     #[error("{} error(s) occurred during AIDL compilation", errors.len())]
     #[diagnostic(code(aidl::multiple_errors))]
@@ -174,6 +179,32 @@ pub enum SemanticError {
         #[source_code]
         src: NamedSource<String>,
         #[label("here")]
+        span: SourceSpan,
+    },
+
+    #[error("invalid operation: Primitive types and String cannot be an out or inout parameter")]
+    #[diagnostic(code(aidl::invalid_direction))]
+    DirectionPrimitive {
+        direction: String,
+        type_kind: String,
+        #[help]
+        help: Option<String>,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("'{direction}' cannot apply to {type_kind}")]
+        span: SourceSpan,
+    },
+
+    #[error("invalid backing type: {type_name}")]
+    #[diagnostic(
+        code(aidl::invalid_backing_type),
+        help("@Backing(type=...) must be one of: byte, int, long")
+    )]
+    InvalidBackingType {
+        type_name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("'{type_name}' is not a valid enum backing type")]
         span: SourceSpan,
     },
 }

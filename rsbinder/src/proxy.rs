@@ -181,7 +181,30 @@ impl ProxyHandle {
 
         Ok(data)
     }
+}
 
+// Subplan 2-6: the kernel proxy implements the generalized
+// `RemoteProxy` trait by **delegating to its unchanged inherent
+// methods**. The inherent `submit_transact`/`prepare_transact` are
+// untouched, so existing generated `Bp*` code (which still calls them
+// via `as_proxy()`) and the kernel proxy's runtime behavior are
+// bit-identical by construction (AC-6.2 — no codegen change for the
+// kernel path).
+impl RemoteProxy for ProxyHandle {
+    fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
+        ProxyHandle::prepare_transact(self, write_header)
+    }
+    fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>> {
+        ProxyHandle::submit_transact(self, code, data, flags)
+    }
+}
+
+impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
         // Mirrors C++ `BpBinder::sendObituary` (BpBinder.cpp:489–528):
         //   1. All `mObitsSent` reads/writes happen under `mLock`.

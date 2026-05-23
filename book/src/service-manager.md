@@ -10,6 +10,14 @@ On Linux, the HUB is provided by the `rsb_hub` binary that ships with the
 `rsbinder-tools` crate. On Android, the system's native `servicemanager`
 fulfills this role, and rsbinder talks to it using the same Binder protocol.
 
+> **Note**: This chapter covers the **kernel-binder** service manager.
+> The [RPC transport](./rpc-transport.md) (binder-over-socket) uses no
+> service manager at all — `RpcServer::set_root` publishes the root
+> binder directly and `RpcSession::get_root` fetches it. The Android
+> 16 **Accessor** pattern bridges the two: a kernel-binder service of
+> type `IAccessor` hands a client an RPC socket fd. See
+> [RPC Transport](./rpc-transport.md#bridging-rpc-and-the-service-manager-the-accessor-pattern).
+
 ## Running the Service Manager (Linux)
 
 Before any service can register or any client can perform lookups, the HUB

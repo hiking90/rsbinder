@@ -257,6 +257,19 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
         None
     })?;
 
+    // Synthetic union-tag enums (`EnumDecl::tag_of_union`) record the
+    // parent union's namespace as their codegen-effective module path
+    // — the `Tag` struct is a sibling inside `mod <Union>`, not its
+    // own `mod Tag`, so the default `<ns>::<name>` doubling needs to
+    // resolve against the union's ns to emit `<Union>::Tag` instead
+    // of `<Union>::Tag::Tag`.
+    let effective_ns = match &decl {
+        Declaration::Enum(e) if e.tag_of_union.is_some() => {
+            e.tag_of_union.clone().expect("checked Some above")
+        }
+        _ => ns,
+    };
+
     // leave max 2 items because the other items are for name space.
     if namespace.ns.len() > 2 {
         namespace.ns.drain(0..namespace.ns.len() - 2);
@@ -264,7 +277,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
 
     Some(LookupDecl {
         decl,
-        ns,
+        ns: effective_ns,
         name: namespace,
     })
 }
@@ -696,27 +709,8 @@ impl Arg {
             .identifier(&self.identifier))
     }
 
-    // fn arg_identifier(&self) -> String {
-    //     format!("_arg_{}", self.identifier)
-    // }
-
-    // pub fn to_string(&self, is_nullable: bool) -> (String, String, String, String) {
-    //     let param = self.arg_identifier();
-    //     let mut type_cast = self.r#type.type_cast();
-    //     let type_cloned = type_cast.clone();
-    //     type_cast.set_fn_nullable(is_nullable);
-    //     let def_arg = type_cast.fn_def_arg(&self.direction);
-    //     let arg = format!("{}: {}",
-    //         param.clone(), def_arg);
-    //     (param, arg, def_arg, type_cloned.return_type())
-    // }
-
     pub fn is_mutable(&self) -> bool {
-        match self.direction {
-            Direction::Inout | Direction::Out => true,
-            Direction::In => false,
-            _ => false,
-        }
+        matches!(self.direction, Direction::Inout | Direction::Out)
     }
 }
 
@@ -821,20 +815,6 @@ pub enum Generic {
     },
 }
 
-// fn generic_type_args_to_string(args: &[Type]) -> String {
-//     let mut args_str = String::new();
-
-//     args.iter().for_each(|t| {
-//         let mut cast = t.type_cast();
-//         cast.set_generic(true);
-
-//         args_str.push_str(", ");
-//         args_str.push_str(&cast.member_type());
-//     });
-
-//     args_str[2..].into()
-// }
-
 impl Generic {
     pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
         let generator = match self {
@@ -885,41 +865,34 @@ impl Type {
 pub enum AnnotationType {
     IsNullable,
     JavaOnly,
-    RustDerive,
     VintfStability,
 }
 
-pub fn check_annotation_list(
-    annotation_list: &Vec<Annotation>,
-    query_type: AnnotationType,
-) -> (bool, String) {
+/// Returns whether the annotation list contains the queried annotation.
+pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType) -> bool {
+    annotation_list.iter().any(|annotation| match query_type {
+        AnnotationType::VintfStability => annotation.annotation == "@VintfStability",
+        AnnotationType::IsNullable => annotation.annotation == "@nullable",
+        AnnotationType::JavaOnly => annotation.annotation.starts_with("@JavaOnly"),
+    })
+}
+
+/// Collects the enabled `@RustDerive(...)` trait names as a comma-separated
+/// list (e.g. `"Clone,PartialEq"`), or an empty string when the annotation is
+/// absent. The result is interpolated directly into the generated `#[derive]`.
+pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     for annotation in annotation_list {
-        match query_type {
-            AnnotationType::VintfStability if annotation.annotation == "@VintfStability" => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::IsNullable if annotation.annotation == "@nullable" => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::JavaOnly if annotation.annotation.starts_with("@JavaOnly") => {
-                return (true, "".to_owned())
-            }
-            AnnotationType::RustDerive if annotation.annotation == "@RustDerive" => {
-                let mut derives = Vec::new();
-
-                for param in &annotation.parameter_list {
-                    if param.const_expr.to_bool().unwrap_or(false) {
-                        derives.push(param.identifier.to_owned())
-                    }
-                }
-
-                return (true, derives.join(","));
-            }
-            _ => {}
+        if annotation.annotation == "@RustDerive" {
+            return annotation
+                .parameter_list
+                .iter()
+                .filter(|param| param.const_expr.to_bool().unwrap_or(false))
+                .map(|param| param.identifier.to_owned())
+                .collect::<Vec<_>>()
+                .join(",");
         }
     }
-
-    (false, "".to_owned())
+    String::new()
 }
 
 pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
@@ -945,9 +918,20 @@ pub fn get_backing_type(
         if annotation.annotation == "@Backing" {
             for param in &annotation.parameter_list {
                 if param.identifier == "type" {
+                    let type_name: String =
+                        param.const_expr.to_value_string().trim_matches('"').into();
+
+                    // AOSP allows only {byte, int, long} as enum backing types.
+                    // See aidl_language.cpp::AidlEnumDeclaration::Autofill().
+                    if !matches!(type_name.as_str(), "byte" | "int" | "long") {
+                        return Err(make_invalid_backing_type_error(
+                            type_name,
+                            annotation.annotation_span.or(name_span),
+                        ));
+                    }
+
                     return type_generator::TypeGenerator::new(&NonArrayType {
-                        // The cstr is enclosed in quotes.
-                        name: param.const_expr.to_value_string().trim_matches('"').into(),
+                        name: type_name,
                         generic: None,
                         name_span,
                     });
@@ -961,6 +945,19 @@ pub fn get_backing_type(
         name: "byte".into(),
         generic: None,
         name_span: None,
+    })
+}
+
+/// Builds an `InvalidBackingType` diagnostic from the active source context.
+/// Mirrors `make_parse_error` for the semantic-error family.
+fn make_invalid_backing_type_error(type_name: String, span: Option<(usize, usize)>) -> AidlError {
+    let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
+    let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
+    let (start, end) = span.unwrap_or((0, 0));
+    AidlError::from(crate::error::SemanticError::InvalidBackingType {
+        type_name,
+        src: miette::NamedSource::new(filename, source),
+        span: miette::SourceSpan::new(start.into(), end.saturating_sub(start)),
     })
 }
 
@@ -1167,20 +1164,40 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
         }
 
         Rule::CHARVALUE => {
-            let mut found = false;
-            let mut has_backslash = false;
-            for ch in pair.as_str().chars() {
-                if !found && ch == '\'' {
-                    found = true;
-                } else if found {
-                    if !has_backslash && ch == '\\' {
-                        has_backslash = true;
-                    } else {
-                        return Ok(ConstExpr::new(ValueType::Char(ch)));
-                    }
+            let span = pair.as_span();
+            let (start, end) = (span.start(), span.end());
+            // The lexer always matches a quote-delimited `'X'` or `'\X'`.
+            let inner = pair
+                .as_str()
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .ok_or_else(|| make_parse_error("malformed char literal", start, end))?;
+
+            let ch = if let Some(escaped) = inner.strip_prefix('\\') {
+                let esc = escaped
+                    .chars()
+                    .next()
+                    .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
+                // Map the common C/AIDL escape sequences to their actual code
+                // points; previously the escaped char was returned verbatim
+                // (e.g. `'\n'` yielded 'n' instead of newline).
+                match esc {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    other => other,
                 }
-            }
-            unreachable!()
+            } else {
+                inner
+                    .chars()
+                    .next()
+                    .ok_or_else(|| make_parse_error("empty char literal", start, end))?
+            };
+            Ok(ConstExpr::new(ValueType::Char(ch)))
         }
 
         Rule::expression => parse_expression(pair.clone().into_inner()),
@@ -1222,13 +1239,15 @@ fn parse_parameter_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Param
 }
 
 fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, AidlError> {
+    // `annotation_span` is set by the caller (`parse_annotation_list`) from the
+    // outer `annotation` rule's pair span so the diagnostic label naturally
+    // covers the whole `@Foo(...)` form, including parens that pest's child
+    // rules (ANNOTATION / const_expr / parameter_list) do not span.
     let mut annotation = Annotation::default();
     for pair in pairs {
         match pair.as_rule() {
             Rule::ANNOTATION => {
-                let span = pair.as_span();
                 annotation.annotation = pair.as_str().into();
-                annotation.annotation_span = Some((span.start(), span.end()));
             }
 
             Rule::const_expr => {
@@ -1251,7 +1270,12 @@ fn parse_annotation_list(
 ) -> Result<Vec<Annotation>, AidlError> {
     let mut annotation_list = Vec::new();
     for pair in pairs {
-        annotation_list.push(parse_annotation(pair.into_inner())?);
+        // Capture the outer `annotation` rule's span (covers `@Foo(...)` or
+        // bare `@Foo`) before descending into the inner pairs.
+        let span = pair.as_span();
+        let mut annotation = parse_annotation(pair.into_inner())?;
+        annotation.annotation_span = Some((span.start(), span.end()));
+        annotation_list.push(annotation);
     }
 
     Ok(annotation_list)
@@ -1687,6 +1711,19 @@ pub struct EnumDecl {
     pub name_span: Option<(usize, usize)>,
     pub enumerator_list: Vec<Enumerator>,
     pub members: Vec<Declaration>,
+    /// Synthetic marker: AIDL gives every `union Foo { ... }` an implicit
+    /// nested `Tag` enum (one variant per field) that downstream types
+    /// may reference as `Foo.Tag`. `calculate_namespace` injects such a
+    /// stub `EnumDecl` into `DECLARATION_MAP` so `Foo.Tag` resolves like
+    /// any other user-defined type; `tag_of_union` then stores the
+    /// parent union's full namespace so `lookup_decl_from_name` can
+    /// hand that namespace back as the codegen-effective module path
+    /// (the `Tag` struct lives *inside* `mod Foo`, sibling to the union
+    /// enum, so the standard `<ns>::<name>` doubling would emit
+    /// `Foo::Tag::Tag` — using the union ns yields `Foo::Tag`). The
+    /// runtime `Tag` struct itself is emitted by the union template in
+    /// [`crate::generator`], not from this stub.
+    pub tag_of_union: Option<Namespace>,
 }
 
 fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, AidlError> {
@@ -1831,6 +1868,30 @@ fn calculate_namespace(
             .borrow_mut()
             .insert(namespace.clone(), document_context.clone());
     });
+
+    // Implicit nested `Tag` enum for unions (AIDL semantics). The
+    // union codegen template already emits a `Tag` struct inside the
+    // union's module; this stub `EnumDecl` exists only so that other
+    // declarations can name-resolve `<Union>.Tag` as a user-defined
+    // type. See `EnumDecl::tag_of_union` for the codegen interplay.
+    if matches!(decl, Declaration::Union(_)) {
+        let mut tag_ns = namespace.clone();
+        tag_ns.push("Tag");
+        let tag_enum = Declaration::Enum(EnumDecl {
+            namespace: tag_ns.clone(),
+            name: "Tag".into(),
+            tag_of_union: Some(namespace.clone()),
+            ..Default::default()
+        });
+        DECLARATION_MAP.with(|hashmap| {
+            hashmap.borrow_mut().insert(tag_ns.clone(), tag_enum);
+        });
+        DECLARATION_DOCUMENT_MAP.with(|hashmap| {
+            hashmap
+                .borrow_mut()
+                .insert(tag_ns, document_context.clone());
+        });
+    }
 
     for decl in decl.members_mut() {
         calculate_namespace(decl, namespace.clone(), document_context);

@@ -365,10 +365,33 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::SIBinder) -> std::option::Option<Self> {
+                // Subplan 2-6.B: an `RpcProxy` resolved from the RPC
+                // wire carries no descriptor (the wire transmits only
+                // an address). Stamp this stub's descriptor onto the
+                // *cached* proxy in place — never a new proxy (that
+                // doubles the DEC_STRONG and splits the dedup cache,
+                // AC-2.5/P5). Done before the descriptor check so it
+                // then passes for RPC too. The shim is gated inside
+                // rsbinder (no-op without `rpc`), so the kernel path
+                // and `rpc`-off builds are byte-unaffected (V1).
+                $crate::__rpc_stamp_descriptor(&binder, $descriptor);
+                // NOTE (RPC type-safety asymmetry): for a kernel
+                // `ProxyHandle` the check below validates the *remote's*
+                // interface (its descriptor comes from the driver). For
+                // a fresh `RpcProxy` the wire carries no descriptor, so
+                // the stamp above just wrote `$descriptor` — this check
+                // is then self-referential and cannot reject a
+                // wrong-interface cast. An `IBar` object cast to
+                // `BpFoo` therefore succeeds here and surfaces only as a
+                // transact-time `StatusCode` (the server rejects the
+                // `IFoo` interface token), not as a `from_binder` `None`.
+                // Inherent to the Android RPC wire; see
+                // `RpcProxy::stamp_descriptor`'s one-address-one-
+                // interface note.
                 if binder.descriptor() != $descriptor {
                     return None
                 }
-                if let Some(_) = binder.as_proxy() {
+                if binder.as_remote().is_some() {
                     Some(Self { binder, $($fname: $finit),* })
                 } else {
                     None

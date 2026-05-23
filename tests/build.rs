@@ -78,4 +78,21 @@ fn main() {
         .output(PathBuf::from("test_aidl.rs"))
         .generate()
         .unwrap();
+
+    // Subplan 2-6.B: test-only fixture for the generated-stub RPC e2e
+    // (`tests/rpc_generated_stub.rs`). This integration-test crate —
+    // not the production `rsbinder` crate — is the home for codegen
+    // that combines `rsbinder-aidl` output with the `rsbinder` runtime.
+    // Gated on this crate's `rpc` feature (off by default; Cargo sets
+    // CARGO_FEATURE_RPC for build scripts when it is active), so the
+    // kernel-binder Android CI build (`cargo test -p tests`) generates
+    // nothing. No crate_support → generated code uses `rsbinder::`
+    // paths so it `include!`s into the integration test.
+    if std::env::var_os("CARGO_FEATURE_RPC").is_some() {
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/rpc_smoke/IRpcSmoke.aidl"))
+            .output(PathBuf::from("rpc_smoke.rs"))
+            .generate()
+            .unwrap();
+    }
 }

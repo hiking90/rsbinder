@@ -47,9 +47,9 @@ fn rt() -> TokioRuntime<tokio::runtime::Handle> {
     TokioRuntime(tokio::runtime::Handle::current())
 }
 
-fn main() {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize Binder -- same as the sync case.
-    ProcessState::init_default();
+    ProcessState::init_default()?;
     ProcessState::start_thread_pool();
 
     // Build a single-threaded Tokio runtime.
@@ -72,6 +72,10 @@ fn main() {
     })
 }
 ```
+
+> `ProcessState::init_default()` returns `Result<&'static ProcessState, …>`,
+> so a `main` that calls it should also return `Result` (or call
+> `.expect()` / `.unwrap()` for the very first line of a quick demo).
 
 There are several things to note here:
 

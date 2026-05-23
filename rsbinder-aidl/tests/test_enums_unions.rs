@@ -393,7 +393,7 @@ pub mod ITestService {
     }
     impl BpTestService {
         fn build_parcel_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_proxy().unwrap().prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(&_arg_token)?;
             Ok(data)
         }
@@ -413,7 +413,7 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
             let _aidl_data = self.build_parcel_RepeatByteEnum(_arg_token)?;
-            let _aidl_reply = self.binder.as_proxy().unwrap().submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }

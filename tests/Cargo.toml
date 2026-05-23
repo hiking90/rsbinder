@@ -7,6 +7,14 @@ license = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# Subplan 2-6.B: off by default so the kernel-binder Android CI build
+# of this crate (`cargo test -p tests`) pulls in zero RPC code. The
+# generated-stub RPC e2e (`tests/rpc_generated_stub.rs`) runs only
+# under `--features rpc` (or `rpc-tcp-debug`).
+[features]
+rpc = ["rsbinder/rpc"]
+rpc-tcp-debug = ["rsbinder/rpc-tcp-debug", "rpc"]
+
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 tokio = { workspace = true }

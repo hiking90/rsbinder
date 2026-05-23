@@ -191,6 +191,49 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         Some(self)
     }
 
+    /// RPC server dispatch (2-2.d2-SRV / AC-2.12). Mirrors the code
+    /// dispatch of `Inner::transact` **minus** the kernel
+    /// `check_interface` call and minus the `reader.set_data_position(0)`
+    /// reset — the RPC adapter has already consumed + validated the RPC
+    /// interface token and positioned `reader` at the arguments. This
+    /// neither calls nor changes `Inner::transact` /
+    /// `thread_state::check_interface`; it is an additive sibling
+    /// entrypoint, so the kernel server path stays bit-identical
+    /// (`Inner::transact` untouched). It calls the same generated,
+    /// transport-neutral `Remotable::on_transact`.
+    #[cfg(feature = "rpc")]
+    fn rpc_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        match code {
+            PING_TRANSACTION => Ok(()),
+            EXTENSION_TRANSACTION => {
+                let ext = self.extension.read().expect("Extension lock poisoned");
+                SerializeOption::serialize_option(ext.as_ref(), reply)?;
+                Ok(())
+            }
+            STOP_RECORDING_TRANSACTION | START_RECORDING_TRANSACTION => {
+                log::error!("recording transactions are not supported over RPC");
+                Err(StatusCode::InvalidOperation)
+            }
+            DEBUG_PID_TRANSACTION => {
+                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
+            }
+            _ => match self.remotable.on_transact(code, reader, reply) {
+                Ok(_) => Ok(()),
+                Err(StatusCode::UnknownTransaction) => {
+                    // Same fallback as `Inner::transact`: handle
+                    // INTERFACE_TRANSACTION etc. via `Inner::on_transact`.
+                    self.on_transact(code, reader, reply)
+                }
+                Err(err) => Err(err),
+            },
+        }
+    }
+
     fn descriptor(&self) -> &str {
         T::descriptor()
     }

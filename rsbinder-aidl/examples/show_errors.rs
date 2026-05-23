@@ -81,9 +81,29 @@ fn main() {
         "interface IFoo {\n    void bar(inout String s);\n}",
     );
 
-    // 10) enum invalid backing type: EnumDecl.name_span → points to the enum name
+    // 10) enum @Backing(type="List"): the dedicated InvalidBackingType
+    //     diagnostic (AOSP allowlist = byte/int/long) catches this before
+    //     it reaches the generic `List must have generic type` arm. The
+    //     label spans the whole `@Backing(...)` annotation so the user
+    //     sees the broken token directly.
     demo_builder(
         "enum_bad_backing",
         "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1, V2 = 2 }",
+    );
+
+    // 11) enum @Backing(type="integer"): a common typo for "int" — the
+    //     same diagnostic guides the user toward the correct spelling
+    //     via the allowlist in the help text.
+    demo_builder(
+        "enum_backing_typo",
+        "package foo;\n@Backing(type=\"integer\")\nenum MyEnum { V1 = 1 }",
+    );
+
+    // 12) Union member whose type is `List` without a generic: confirms
+    //     member-level errors point at the offending member type (not at
+    //     the union name) — the correct behaviour for union scopes.
+    demo_builder(
+        "union_member_list_no_generic",
+        "package foo;\nunion MyUnion {\n    List items;\n    int n;\n}",
     );
 }

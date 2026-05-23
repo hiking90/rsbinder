@@ -38,4 +38,17 @@ fn main() {
         .set_crate_support(true)
         .generate()
         .unwrap();
+
+    // 2-13 A0.1: `IServiceManager.aidl` does not import `IAccessor`, so
+    // the `Service.accessor` union arm surfaces as an unbound `IBinder`.
+    // Compile `IAccessor` separately so the accessor-bridge resolve path
+    // (`hub::android_16::resolve_accessor`) can call
+    // `addConnection()`/`getInstanceName()` via the generated proxy.
+    // `ParcelFileDescriptor` is already vendored in the rsbinder runtime.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/16/android/os/IAccessor.aidl"))
+        .output(PathBuf::from("accessor_16.rs"))
+        .set_crate_support(true)
+        .generate()
+        .unwrap();
 }

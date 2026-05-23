@@ -463,6 +463,15 @@ impl Serialize for SIBinder {
 
 impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
+        // RPC mode: marshal as `RpcAddress` via the attached session
+        // hooks, not `flat_binder_object` (2-2.d2 #1). Kernel path
+        // below is byte-identical when `is_for_rpc == false` (AC-2.9).
+        #[cfg(feature = "rpc")]
+        if parcel.is_for_rpc() {
+            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
+            return ops.write_binder(this, parcel);
+        }
+
         match this {
             Some(binder) => {
                 parcel.write::<flat_binder_object>(&binder.into())?;
@@ -501,6 +510,15 @@ impl Deserialize for SIBinder {
 
 impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
+        // RPC mode: unmarshal from `RpcAddress` via the attached
+        // session hooks (2-2.d2 #2). The kernel `flat_binder_object`
+        // path below is byte-identical when `is_for_rpc == false`.
+        #[cfg(feature = "rpc")]
+        if parcel.is_for_rpc() {
+            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
+            return ops.read_binder(parcel);
+        }
+
         let flat: flat_binder_object = parcel.read()?;
         let stability: i32 = if crate::sdk_at_least(30) {
             parcel.read()?
@@ -725,7 +743,16 @@ pub trait DeserializeArray: Deserialize {
         if len <= 0 {
             return Ok(None);
         }
-        let mut res: Vec<Self> = Vec::with_capacity(len as _);
+        // Cap the *speculative* pre-allocation at the bytes still left
+        // in the parcel: every element consumes >= 1 wire byte, so a
+        // well-formed array of `len` elements always satisfies
+        // `len <= data_avail()` here. This is byte-for-byte identical
+        // for all valid input (incl. every kernel parcel — AC-2.9) and
+        // only stops a hostile `len` (e.g. i32::MAX over RPC) from
+        // forcing a multi-GB allocation before the per-element reads
+        // fail. The loop still pushes exactly `len`, growing on demand.
+        let cap = (len as usize).min(parcel.data_avail());
+        let mut res: Vec<Self> = Vec::with_capacity(cap);
 
         for _ in 0..len {
             res.push(parcel.read()?);

@@ -18,12 +18,12 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.7"
+rsbinder = "0.8"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.7"
+rsbinder-aidl = "0.8"
 ```
 Add rsbinder and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
 
@@ -115,7 +115,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Initialize ProcessState with the default binder path and the default max threads.
     println!("Initializing ProcessState...");
-    ProcessState::init_default();
+    ProcessState::init_default()?;
 
     // Start the thread pool.
     // This is optional. If you don't call this, only one thread will be created to handle the binder transactions.
@@ -170,7 +170,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // Initialize ProcessState with the default binder path and the default max threads.
-    ProcessState::init_default();
+    ProcessState::init_default()?;
 
     println!("list services:");
     // This is an example of how to use service manager.

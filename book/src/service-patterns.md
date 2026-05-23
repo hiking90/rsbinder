@@ -107,7 +107,7 @@ and AIDL trait implementations, and its own registration call:
 
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    ProcessState::init_default();
+    ProcessState::init_default()?;
     ProcessState::start_thread_pool();
 
     // Register the primary test service.
@@ -233,7 +233,7 @@ Clients obtain a typed proxy to a remote service through the `hub` module:
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // ProcessState must be initialized before any Binder operations.
-    ProcessState::init_default();
+    ProcessState::init_default()?;
 
     // Obtain a strongly-typed proxy for the service.
     // hub::get_interface returns a Strong<dyn IMyService> on success.

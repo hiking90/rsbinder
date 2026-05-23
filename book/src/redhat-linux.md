@@ -74,9 +74,13 @@ $ sudo dnf install rpm-build rpm-devel libtool
 $ sudo dnf install kernel-devel kernel-headers
 $ sudo dnf install elfutils-libelf-devel openssl-devel
 
-# Download kernel source matching your running kernel
+# Download kernel source matching your running kernel.
+# Pick the v<major>.x directory that matches your kernel: today this
+# is typically v6.x on Fedora/Stream; older RHEL 8/9 hosts may still
+# be on v5.x or v4.x.
 $ KERNEL_VERSION=$(uname -r | sed 's/\.el.*$//')
-$ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${KERNEL_VERSION}.tar.xz
+$ KERNEL_MAJOR=$(echo $KERNEL_VERSION | cut -d. -f1)
+$ wget https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz
 $ tar -xf linux-${KERNEL_VERSION}.tar.xz
 $ cd linux-${KERNEL_VERSION}
 

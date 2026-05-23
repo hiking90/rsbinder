@@ -6,10 +6,13 @@ use std::sync::OnceLock;
 use miette::{NamedSource, SourceSpan};
 
 use crate::const_expr::{ConstExpr, InitParam, ValueType};
-use crate::error::{AidlError, SemanticError};
+use crate::error::{AidlError, ResolutionError, SemanticError};
 use crate::parser::{self, *};
 
-fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
+/// Resolves the current source name/span into the `(NamedSource, SourceSpan)`
+/// pair every type-level diagnostic needs, falling back to a placeholder
+/// filename when no source context is active (e.g. unit tests).
+fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
     let filename = parser::current_source_name();
     let source = parser::current_source_text();
     let (start, end) = span.unwrap_or((0, 0));
@@ -18,17 +21,25 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
     } else {
         filename
     };
+    (
+        NamedSource::new(src_name, source),
+        SourceSpan::new(start.into(), end.saturating_sub(start)),
+    )
+}
+
+fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
+    let (src, span) = diagnostic_source(span);
     AidlError::from(SemanticError::InvalidOperation {
         message: message.into(),
-        src: NamedSource::new(src_name, source),
-        span: SourceSpan::new(start.into(), end.saturating_sub(start)),
+        src,
+        span,
     })
 }
 
 static CRATE_NAME: OnceLock<String> = OnceLock::new();
 
-pub fn crate_name() -> String {
-    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).clone()
+pub fn crate_name() -> &'static str {
+    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).as_str()
 }
 
 pub fn set_crate_support(support: bool) {
@@ -112,25 +123,13 @@ impl TypeGenerator {
                     ))
                 }
             },
-            // "Map" => {
-            //     is_primitive = false;
-            //     is_map = true;
-            //     ("HashMap".to_owned(), ValueType::Map())
-            // }
             "FileDescriptor" => {
-                let filename = parser::current_source_name();
-                let source = parser::current_source_text();
-                let (start, end) = aidl_type.name_span.unwrap_or((0, 0));
-                let src_name = if filename.is_empty() {
-                    "<type_generator>".to_string()
-                } else {
-                    filename
-                };
+                let (src, span) = diagnostic_source(aidl_type.name_span);
                 return Err(AidlError::from(SemanticError::UnsupportedType {
                     type_name: "FileDescriptor".to_string(),
                     help: Some("Use ParcelFileDescriptor instead".to_string()),
-                    src: NamedSource::new(src_name, source),
-                    span: SourceSpan::new(start.into(), end.saturating_sub(start)),
+                    src,
+                    span,
                 }));
             }
             "ParcelFileDescriptor" => ValueType::FileDescriptor,
@@ -155,7 +154,7 @@ impl TypeGenerator {
             this = this.array(&_type.array_types);
         }
 
-        if check_annotation_list(&_type.annotation_list, AnnotationType::IsNullable).0 {
+        if has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
             let nullable_span = _type
                 .annotation_list
                 .iter()
@@ -165,6 +164,43 @@ impl TypeGenerator {
         } else {
             Ok(this)
         }
+    }
+
+    /// Verify that every user-defined type this generator references resolves
+    /// to a known declaration in the current namespace context.
+    ///
+    /// Downstream string builders (`make_user_defined_type_name`) assume
+    /// resolution always succeeds and `expect()` otherwise; calling this at each
+    /// type-construction site turns an undefined type into a proper
+    /// `ResolutionError::UnknownType` diagnostic instead of a panic. Must be
+    /// invoked while the owning declaration's `NamespaceGuard` is active.
+    pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
+        let check = |value_type: &ValueType| -> Result<(), AidlError> {
+            if let ValueType::UserDefined(name) = value_type {
+                // `lookup_decl_from_name` falls back to the *current* namespace's
+                // own declaration when nothing matches, so an undefined type does
+                // not return `None`; confirm the resolved declaration's simple
+                // name actually equals the requested one to detect that case.
+                let requested = name.rsplit('.').next().unwrap_or(name.as_str());
+                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL)
+                    .filter(|lookup_decl| lookup_decl.decl.name() == requested);
+                if resolved.is_none() {
+                    let (src, span) = diagnostic_source(self.type_span);
+                    return Err(AidlError::from(ResolutionError::UnknownType {
+                        name: name.clone(),
+                        src,
+                        span,
+                    }));
+                }
+            }
+            Ok(())
+        };
+
+        check(&self.value_type)?;
+        for array_info in &self.array_types {
+            check(&array_info.value_type)?;
+        }
+        Ok(())
     }
 
     fn is_aidl_nullable(value_type: &ValueType) -> bool {
@@ -322,10 +358,29 @@ impl TypeGenerator {
             && (Self::is_primitive(&self.value_type)
                 || matches!(self.value_type, ValueType::String(_)))
         {
-            return Err(make_type_error(
-                "Primitive types and String cannot be an out or inout parameter",
-                direction_span.or(self.type_span),
-            ));
+            let direction_str = match direction {
+                Direction::Out => "out",
+                Direction::Inout => "inout",
+                Direction::In | Direction::None => {
+                    unreachable!("direction guarded by matches! above")
+                }
+            };
+            let type_kind = if matches!(self.value_type, ValueType::String(_)) {
+                "String"
+            } else {
+                "a primitive type"
+            };
+            let (src, span) = diagnostic_source(direction_span.or(self.type_span));
+            return Err(AidlError::from(SemanticError::DirectionPrimitive {
+                direction: direction_str.to_string(),
+                type_kind: type_kind.to_string(),
+                help: Some(format!(
+                    "remove '{direction_str}', or change the parameter type to a non-primitive type \
+                     (parcelable, interface, List, etc.)"
+                )),
+                src,
+                span,
+            }));
         }
         self.direction = direction.clone();
         Ok(self)
@@ -392,30 +447,13 @@ impl TypeGenerator {
     }
 
     fn list_type_decl_fixed(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
+        // A fixed-size array's wrapping is direction-independent: only
+        // nullability decides whether it is wrapped in `Option<_>`.
         let fixed_array = self.make_fixed_array(array_info, is_struct);
-
-        match self.direction {
-            Direction::Out => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
-            Direction::Inout => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
-            _ => {
-                if self.is_nullable {
-                    format!("Option<{fixed_array}>")
-                } else {
-                    fixed_array
-                }
-            }
+        if self.is_nullable {
+            format!("Option<{fixed_array}>")
+        } else {
+            fixed_array
         }
     }
 
@@ -514,14 +552,7 @@ impl TypeGenerator {
         let fixed_array = self.make_fixed_array(array_info, false);
 
         match self.direction {
-            Direction::Out => {
-                if self.is_nullable {
-                    format!("&mut Option<{fixed_array}>")
-                } else {
-                    format!("&mut {fixed_array}")
-                }
-            }
-            Direction::Inout => {
+            Direction::Out | Direction::Inout => {
                 if self.is_nullable {
                     format!("&mut Option<{fixed_array}>")
                 } else {
@@ -858,91 +889,79 @@ impl TypeGenerator {
         }
     }
 
+    /// Renders the initializer for an array-typed field/const default.
+    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
+    /// applied by `init_value`.
+    fn init_array_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
+        let array_info = self.array_types.first().expect("array_types is empty.");
+        let is_nullable = self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
+
+        if let ValueType::UserDefined(name) = &array_info.value_type {
+            if let Some(lookup_decl) = lookup_decl_from_name(name, crate::Namespace::AIDL) {
+                if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
+                    return self.init_enum_array_value(
+                        expr,
+                        &lookup_decl,
+                        param,
+                        array_info.is_fixed(),
+                        is_nullable,
+                    );
+                }
+            }
+        }
+        Ok(Self::init_array_value(expr, array_info, param, is_nullable))
+    }
+
+    /// Renders the initializer for a scalar (non-array) field/const default.
+    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
+    /// applied by `init_value`. Enum-typed targets are always primitive and
+    /// thus never nullable, so the wrap is a no-op for them.
+    fn init_scalar_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
+        if let Some(enum_lookup) = self.enum_lookup() {
+            return self.init_enum_value(expr, &enum_lookup, param);
+        }
+
+        let scalar_param = param.with_fixed_array(false).with_nullable(false);
+        Ok(match expr.calculate() {
+            Ok(calculated) => match &calculated.value {
+                // An enum reference whose target is the enum type keeps the
+                // symbolic member; a primitive target (e.g. int) takes its value.
+                ValueType::Reference { value, .. } => {
+                    if matches!(&self.value_type, ValueType::UserDefined(_)) {
+                        calculated.value.to_init(scalar_param)
+                    } else {
+                        ValueType::Int64(*value).to_init(scalar_param)
+                    }
+                }
+                _ => match calculated.convert_to(&self.value_type) {
+                    Ok(converted) => converted.value.to_init(scalar_param),
+                    Err(_) => calculated.value.to_init(scalar_param),
+                },
+            },
+            Err(_) => ValueType::Void.to_init(scalar_param),
+        })
+    }
+
     pub(crate) fn init_value(
         &self,
         const_expr: Option<&ConstExpr>,
         param: InitParam,
     ) -> Result<String, AidlError> {
-        let init_value = match const_expr {
-            Some(expr) => {
-                let init_str = if let ValueType::Array(_) = self.value_type {
-                    let array_info = self.array_types.first().unwrap();
-                    let is_nullable =
-                        self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
-                    if let ValueType::UserDefined(name) = &array_info.value_type {
-                        if let Some(lookup_decl) =
-                            lookup_decl_from_name(name, crate::Namespace::AIDL)
-                        {
-                            if matches!(&lookup_decl.decl, Declaration::Enum(_)) {
-                                self.init_enum_array_value(
-                                    expr,
-                                    &lookup_decl,
-                                    param,
-                                    array_info.is_fixed(),
-                                    is_nullable,
-                                )?
-                            } else {
-                                Self::init_array_value(expr, array_info, param, is_nullable)
-                            }
-                        } else {
-                            Self::init_array_value(expr, array_info, param, is_nullable)
-                        }
-                    } else {
-                        Self::init_array_value(expr, array_info, param, is_nullable)
-                    }
-                } else {
-                    if let Some(enum_lookup) = self.enum_lookup() {
-                        return self
-                            .init_enum_value(expr, &enum_lookup, param)
-                            .map(|init_str| {
-                                if self.is_nullable {
-                                    format!("Some({init_str})")
-                                } else {
-                                    init_str
-                                }
-                            });
-                    }
-
-                    match expr.calculate() {
-                        Ok(calculated) => {
-                            // Check if we have an enum reference and target is a primitive type
-                            if let ValueType::Reference { value, .. } = &calculated.value {
-                                if matches!(&self.value_type, ValueType::UserDefined(_)) {
-                                    // Target is an enum type, preserve enum reference
-                                    calculated
-                                        .value
-                                        .to_init(param.with_fixed_array(false).with_nullable(false))
-                                } else {
-                                    // Target is a primitive type (e.g., int), use numeric value
-                                    ValueType::Int64(*value)
-                                        .to_init(param.with_fixed_array(false).with_nullable(false))
-                                }
-                            } else {
-                                // Normal processing for non-enum references
-                                match calculated.convert_to(&self.value_type) {
-                                    Ok(converted) => converted.value.to_init(
-                                        param.with_fixed_array(false).with_nullable(false),
-                                    ),
-                                    Err(_) => calculated.value.to_init(
-                                        param.with_fixed_array(false).with_nullable(false),
-                                    ),
-                                }
-                            }
-                        }
-                        Err(_) => ValueType::Void
-                            .to_init(param.with_fixed_array(false).with_nullable(false)),
-                    }
-                };
-                if self.is_nullable {
-                    format!("Some({init_str})")
-                } else {
-                    init_str
-                }
-            }
-            None => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
+        let Some(expr) = const_expr else {
+            return Ok(ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)));
         };
 
-        Ok(init_value)
+        let init_str = if matches!(self.value_type, ValueType::Array(_)) {
+            self.init_array_branch(expr, param)?
+        } else {
+            self.init_scalar_branch(expr, param)?
+        };
+
+        Ok(if self.is_nullable {
+            format!("Some({init_str})")
+        } else {
+            init_str
+        })
     }
 }
 

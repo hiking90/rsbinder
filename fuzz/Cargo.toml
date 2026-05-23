@@ -1,0 +1,82 @@
+# cargo-fuzz crate for the RPC transport stack (plan 2 §6.3 / V4).
+#
+# Excluded from the main workspace (see root Cargo.toml `exclude`) — it
+# needs a nightly toolchain + libFuzzer and must not be pulled into a
+# normal `cargo build`/`cargo test`. The *enforceable* adversarial-input
+# gate is the deterministic regression test
+# `rpc::transport::tests::hostile_frame_headers_are_rejected_safely`
+# (runs everywhere); these fuzz targets are the soak supplement.
+#
+# Run (where nightly + libFuzzer are available):
+#   cargo +nightly fuzz run rpc_frame_decode
+[package]
+name = "rsbinder-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rsbinder = { path = "../rsbinder", features = ["rpc", "android_16"] }
+
+[[bin]]
+name = "rpc_frame_decode"
+path = "fuzz_targets/rpc_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_wire_decode"
+path = "fuzz_targets/rpc_wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_address_decode"
+path = "fuzz_targets/rpc_address_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_parcel_rpc_mode"
+path = "fuzz_targets/rpc_parcel_rpc_mode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_session_handshake"
+path = "fuzz_targets/rpc_session_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_fd_ancillary"
+path = "fuzz_targets/rpc_fd_ancillary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_fd_v1_body"
+path = "fuzz_targets/rpc_fd_v1_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_accessor_error"
+path = "fuzz_targets/rpc_accessor_error.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

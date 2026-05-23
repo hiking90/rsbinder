@@ -273,6 +273,31 @@ pub trait IBinder: Any + Send + Sync {
         0
     }
 
+    /// RPC server dispatch entrypoint (subplan 2-2.d2-SRV).
+    ///
+    /// The RPC server adapter calls this *instead of* the kernel
+    /// `Transactable::transact` → `thread_state::check_interface`
+    /// path. `check_interface` reads the kernel transaction header and
+    /// mutates `THREAD_STATE` (strict-mode / work-source) — both
+    /// meaningless for RPC and forbidden to touch (P1). The adapter has
+    /// already consumed + validated the RPC interface token, so this
+    /// just dispatches `code` to the generated, transport-neutral
+    /// `Remotable::on_transact`. Native binders override it; the
+    /// default is "not an RPC dispatch target".
+    ///
+    /// Present only with the `rpc` feature, so the default public API
+    /// surface is unchanged.
+    #[cfg(feature = "rpc")]
+    fn rpc_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        let _ = (code, reader, reply);
+        Err(StatusCode::UnknownTransaction)
+    }
+
     fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
     fn attempt_inc_strong(&self) -> bool;
     fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()>;
@@ -280,12 +305,77 @@ pub trait IBinder: Any + Send + Sync {
     fn dec_weak(&self) -> Result<()>;
 }
 
+/// An outbound-transaction-issuing proxy, abstract over the kernel
+/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks (subplan
+/// 2-6, D1). The AIDL generator emits `as_remote().ok_or(BadType)?`
+/// (subplan 2-6.B) so one generated `Bp*` drives either stack via
+/// this trait + the `<dyn IBinder>::as_remote()` accessor; the
+/// kernel-only `as_proxy()` is retained for any direct callers.
+///
+/// The signatures are exactly `ProxyHandle`'s existing inherent
+/// `prepare_transact`/`submit_transact` — `ProxyHandle` implements
+/// this by **delegating to those unchanged methods**, so the kernel
+/// proxy's runtime behavior is bit-identical by construction (no
+/// codegen change required for the kernel path — AC-6.2).
+pub trait RemoteProxy {
+    /// Allocate the request `Parcel`, optionally writing the AIDL
+    /// interface header.
+    fn prepare_transact(&self, write_header: bool) -> Result<Parcel>;
+    /// Submit the transaction and return the reply (`None` for oneway).
+    fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>>;
+}
+
 impl dyn IBinder {
     /// Convert this binder object into a proxy binder object.
     pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
     }
+
+    /// Generalized proxy dispatch (subplan 2-6): a kernel
+    /// [`proxy::ProxyHandle`] **or** (with the `rpc` feature) an
+    /// [`rpc::RpcProxy`](crate::rpc::RpcProxy), as a single
+    /// [`RemoteProxy`] trait object. Lets one generated `Bp*` stub
+    /// call either stack. `as_proxy()` is retained unchanged so the
+    /// existing generated kernel code keeps working verbatim.
+    pub fn as_remote(&self) -> Option<&dyn RemoteProxy> {
+        if let Some(p) = self.as_any().downcast_ref::<proxy::ProxyHandle>() {
+            return Some(p as &dyn RemoteProxy);
+        }
+        #[cfg(feature = "rpc")]
+        if let Some(p) = self.as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            return Some(p as &dyn RemoteProxy);
+        }
+        None
+    }
 }
+
+/// Subplan 2-6.B: stamp the generated stub's interface descriptor
+/// onto an `RpcProxy` resolved from the RPC wire (the wire carries
+/// only an address, so such a proxy starts descriptor-less). A
+/// `#[doc(hidden)]` shim the generated `from_binder` calls
+/// unconditionally — the feature gate lives **here**, resolved
+/// against rsbinder's own `rpc` feature, not in the `macro_rules!`
+/// (where `cfg(feature = "rpc")` would wrongly resolve against the
+/// *consumer* crate). The non-`rpc` build is a zero-cost no-op, so
+/// the kernel path and `rpc`-off consumers stay byte-unaffected (V1).
+#[doc(hidden)]
+#[cfg(feature = "rpc")]
+pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
+    if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+        rp.stamp_descriptor(descriptor);
+    }
+}
+
+/// No-op shim (see the `rpc`-gated variant): keeps the generated
+/// `from_binder` compiling identically with or without `rpc`.
+#[doc(hidden)]
+#[cfg(not(feature = "rpc"))]
+pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
 
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

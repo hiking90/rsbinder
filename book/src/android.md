@@ -29,7 +29,7 @@ In your `Cargo.toml`, specify the Android versions you want to support:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.7", features = ["android_14_plus"] }
+rsbinder = { version = "0.8", features = ["android_14_plus"] }
 ```
 
 Available feature combinations:
@@ -76,7 +76,7 @@ On Android, the binder device files are already created and managed by the syste
 
 ```rust
 // Connect to the default system binder (/dev/binder)
-ProcessState::init("/dev/binder", 0);
+ProcessState::init("/dev/binder", 0)?;
 ```
 
 Android provides several binder devices for different purposes:

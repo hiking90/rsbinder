@@ -71,6 +71,18 @@ impl Namespace {
     }
 }
 
+/// Fully-qualified AIDL type names that the AOSP toolchain treats as
+/// **framework-builtin primitives** rather than user-defined parcelables —
+/// they are backed by the rsbinder runtime (`type_generator` maps them
+/// to native Rust types), so `import` statements for them do not need a
+/// resolvable `.aidl` source file alongside the vendored AOSP `.aidl`s.
+///
+/// Only fully-qualified names listed here are exempted; any unknown
+/// import still surfaces as `ResolutionError::ImportNotFound`.
+pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
+    matches!(fqcn, "android.os.ParcelFileDescriptor")
+}
+
 pub fn indent_space(step: usize) -> String {
     let indent = "    ";
     let mut ret = String::new();
@@ -269,6 +281,17 @@ impl Builder {
                             }
 
                             for import in doc.imports.values() {
+                                // Framework-builtin types have no standalone
+                                // `.aidl` source in AOSP (the AIDL toolchain
+                                // resolves them as primitives backed by the
+                                // runtime crate). Skip resolution so e.g.
+                                // `android/os/IAccessor.aidl`'s import of
+                                // `android.os.ParcelFileDescriptor` does not
+                                // demand a stub file alongside the vendored
+                                // AOSP sources.
+                                if is_builtin_aidl_type(import) {
+                                    continue;
+                                }
                                 let rel_path =
                                     PathBuf::from(import.replace('.', "/")).with_extension("aidl");
                                 let mut found = false;
@@ -316,7 +339,14 @@ impl Builder {
                     })?;
 
                     for entry in entries {
-                        let path = entry.unwrap().path();
+                        let path = entry
+                            .map_err(|err| {
+                                std::io::Error::new(
+                                    err.kind(),
+                                    format!("parse_sources: dir entry in {path:?} failed: {err}"),
+                                )
+                            })?
+                            .path();
                         if path.is_dir()
                             || (path.is_file() && path.extension().unwrap_or_default() == "aidl")
                         {

@@ -9,6 +9,10 @@ members = [
     "example-hello",
 ]
 
+# The cargo-fuzz crate needs a nightly toolchain + libFuzzer; keep it
+# out of normal `cargo build`/`test`. See fuzz/Cargo.toml.
+exclude = ["fuzz"]
+
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
