@@ -961,10 +961,9 @@ fn test_default_impl() {
     assert_eq!(result, Ok(EXPECTED_RETURN_VALUE));
 }
 
-// Not supported version and hash yet.
-/*
 #[test]
 fn test_versioned_interface_version() {
+    init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
         hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
@@ -975,14 +974,17 @@ fn test_versioned_interface_version() {
 
 #[test]
 fn test_versioned_interface_hash() {
+    init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
         hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let hash = service.getInterfaceHash();
-    assert_eq!(hash.as_ref().map(String::as_str), Ok("9e7be1859820c59d9d55dd133e71a3687b5d2e5b"));
+    assert_eq!(
+        hash.as_ref().map(String::as_str),
+        Ok("9e7be1859820c59d9d55dd133e71a3687b5d2e5b")
+    );
 }
-*/
 
 #[test]
 fn test_versioned_known_union_field_is_ok() {
