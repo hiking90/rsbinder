@@ -175,10 +175,18 @@ impl flat_binder_object {
 
 const SCHED_NORMAL: u32 = 0;
 const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT: u32 = 9;
+/// 2-bit field for the scheduling policy embedded in `flat_binder_object.flags`.
+/// The AOSP-canonical post-shift mask is `FLAT_BINDER_FLAG_SCHED_POLICY_MASK = 0x600`
+/// (= this value `<< FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT`); the constant here is
+/// the pre-shift value mask used to clamp callers (`policy` must be 0..=3).
+/// Naming `_VALUE_MASK` (rather than `_MASK`) avoids colliding with the post-shift
+/// `_MASK` in AOSP `binder.h`. CODE_REVIEW_RECOMMENDATIONS #6.
+const FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK: u32 = 0x3;
 
 fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
     (priority & FLAT_BINDER_FLAG_PRIORITY_MASK)
-        | ((policy & 3) << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
+        | ((policy & FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK)
+            << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
 impl From<&SIBinder> for flat_binder_object {
