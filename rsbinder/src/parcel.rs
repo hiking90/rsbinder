@@ -46,6 +46,41 @@ pub(crate) fn pad_size(len: usize) -> usize {
     (len + 3) & (!3)
 }
 
+/// Compute `(size, padded)` for a wire-encoded array of `len` elements
+/// each of `elem_size` bytes, returning `BadValue` if either
+/// calculation would overflow `usize`.
+///
+/// Used by `Parcel::read_array` / `Parcel::read_array_char` to keep
+/// 32-bit targets (armv7 Android, i686 Linux) safe from a hostile
+/// `len * size_of::<D>()` wrap that the subsequent
+/// `padded > data_avail()` check would otherwise miss — the wrap-to-
+/// small `size` would let the call through to
+/// `Vec::with_capacity(len)` and abort with a capacity-overflow panic
+/// (i.e. a remote DoS via parcel input).
+///
+/// Caller must have validated `len >= 1` already; passing `len < 1`
+/// is a programming error (the result `size` would be `0` which is
+/// indistinguishable from a wrapped-to-zero overflow, so we reject
+/// it as `BadValue` via the `debug_assert!`).
+///
+/// On 64-bit `usize` no realistic `i32` `len` and `elem_size` (which
+/// for any Rust type is at most `isize::MAX = 2^63 - 1`) can make
+/// the multiplication overflow — the worst-case product is far
+/// below `usize::MAX`. The protection is purely 32-bit-target
+/// hardening; the 64-bit codepath is byte-identical to the unchecked
+/// arithmetic.
+#[inline]
+pub(crate) fn checked_array_layout(len: i32, elem_size: usize) -> Result<(usize, usize)> {
+    debug_assert!(len >= 1, "checked_array_layout: caller must validate len >= 1");
+    let size = (len as usize)
+        .checked_mul(elem_size)
+        .ok_or(StatusCode::BadValue)?;
+    // `pad_size` itself can overflow at `size + 3`, so go through
+    // `checked_add` rather than reusing it directly.
+    let padded = size.checked_add(3).ok_or(StatusCode::BadValue)? & !3;
+    Ok((size, padded))
+}
+
 pub(crate) trait CharType: Clone {
     type Output;
     fn as_i32(&self) -> i32;
@@ -740,8 +775,15 @@ impl Parcel {
             return Ok(None);
         }
 
-        let size = len as usize * std::mem::size_of::<D>();
-        let padded = pad_size(size);
+        // Checked arithmetic — protects 32-bit `usize` targets (armv7
+        // Android, i686 Linux) from a hostile `len * size_of::<D>()`
+        // wrapping past `usize::MAX`. Without these guards, a wrap-to-
+        // small `size` would sail past the `padded > data_avail()`
+        // check below and only fail later inside `Vec::with_capacity`
+        // (capacity-overflow panic = DoS). On 64-bit `usize` the
+        // multiplication is mathematically incapable of overflowing
+        // for any `i32` `len`, so the new path is identical there.
+        let (size, padded) = checked_array_layout(len, std::mem::size_of::<D>())?;
 
         if padded > self.data_avail() {
             log::error!(
@@ -793,8 +835,13 @@ impl Parcel {
             return Ok(None);
         }
 
-        let size = len as usize * 4;
-        let padded = pad_size(size);
+        // See `read_array` — checked arithmetic guards 32-bit `usize`
+        // against a hostile `len` wrapping past `usize::MAX` before
+        // the `padded > data_avail()` check can catch it. Wire
+        // element size is always 4 (i32) for the char-array codecs,
+        // matching the `let size = len * 4` shape that lived here
+        // before this hardening.
+        let (size, padded) = checked_array_layout(len, std::mem::size_of::<i32>())?;
 
         if padded > self.data_avail() {
             log::error!(
@@ -1249,6 +1296,83 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn checked_array_layout_normal_case() {
+        // 10 × 4-byte ints — exact pad alignment.
+        let (size, padded) = super::checked_array_layout(10, 4).unwrap();
+        assert_eq!((size, padded), (40, 40));
+        // 3 × 5-byte elements — pad_size((3*5) + 3) & !3 = 16.
+        let (size, padded) = super::checked_array_layout(3, 5).unwrap();
+        assert_eq!((size, padded), (15, 16));
+    }
+
+    #[test]
+    fn checked_array_layout_rejects_size_mul_overflow() {
+        // `i32::MAX × usize::MAX` overflows on every target — covers
+        // the 32-bit DoS surface the helper exists to seal. (The
+        // direct `Parcel::read_array` callers can't actually hit
+        // this on 64-bit since `size_of::<D>()` for any real Rust
+        // type is bounded by `isize::MAX`, but the helper itself is
+        // generic over `elem_size: usize`.)
+        assert_eq!(
+            super::checked_array_layout(i32::MAX, usize::MAX),
+            Err(StatusCode::BadValue)
+        );
+    }
+
+    #[test]
+    fn checked_array_layout_rejects_pad_overflow() {
+        // `size + 3` itself overflows `usize` when `size > usize::MAX - 3`.
+        // Hand-craft an `elem_size` that makes the multiplication land
+        // exactly at `usize::MAX` so `pad_size` is the failing arm.
+        assert_eq!(
+            super::checked_array_layout(1, usize::MAX),
+            Err(StatusCode::BadValue)
+        );
+        // Same surface via the `len`-side product.
+        assert_eq!(
+            super::checked_array_layout(7, usize::MAX / 3),
+            Err(StatusCode::BadValue)
+        );
+    }
+
+    #[test]
+    fn checked_array_layout_64bit_no_op_for_i32_max() {
+        // The whole point: on a 64-bit `usize`, no realistic
+        // `(i32::MAX, size_of::<D>())` can overflow. Regression
+        // guard so the helper never starts gating valid 64-bit
+        // inputs (which would silently break every kernel/RPC array
+        // path).
+        let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
+        assert_eq!(size, (i32::MAX as usize) * 4);
+        assert_eq!(padded, super::pad_size(size));
+    }
+
+    #[test]
+    fn read_array_rejects_hostile_len_gracefully() {
+        // A parcel whose data only encodes the length — no actual
+        // array body — with a `len` far larger than `data_avail()`.
+        // Pre-hardening this could panic in `Vec::with_capacity` on
+        // 32-bit; post-hardening it returns `Err(_)` on every target.
+        let mut parcel = Parcel::new();
+        parcel.write::<i32>(&1_000_000_000).unwrap();
+        parcel.set_data_position(0);
+        let r = parcel.read_array::<i32>();
+        assert!(r.is_err(), "expected Err, got {r:?}");
+    }
+
+    #[test]
+    fn read_array_char_rejects_hostile_len_gracefully() {
+        // Same shape as `read_array_rejects_hostile_len_gracefully`
+        // but exercises the char-array variant — both call into
+        // `checked_array_layout`.
+        let mut parcel = Parcel::new();
+        parcel.write::<i32>(&1_000_000_000).unwrap();
+        parcel.set_data_position(0);
+        let r = parcel.read_array_char::<u16>();
+        assert!(r.is_err(), "expected Err, got {r:?}");
+    }
 
     #[test]
     fn test_primitives() -> Result<()> {
