@@ -2123,8 +2123,7 @@ fn test_wibinder_upgrade_after_obituary() {
     // poll preserves that regression-detection intent while matching
     // the real semantic: *eventually after obituary + last user Strong
     // drop*, upgrade reports DeadObject.
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         match weak.upgrade() {
             Err(rsbinder::StatusCode::DeadObject) => break,
