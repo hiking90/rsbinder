@@ -18,6 +18,17 @@ struct Service {
     guarentee_client: bool,
     _debug_pid: u32,
     context: rsbinder::thread_state::CallingContext,
+    /// Plan 2-14 B.6: descriptor-based accessor marking. Set at
+    /// `addService` time by checking whether `binder.descriptor()`
+    /// equals `"android.os.IAccessor"`. AOSP's servicemanager
+    /// distinguishes accessors via VINTF `<accessor>` entries; without
+    /// VINTF, descriptor inspection is the closest semantic equivalent
+    /// (the binder itself self-identifies as `IAccessor`). When `true`,
+    /// `getService2`/`checkService2` (B.7) wraps the binder in
+    /// `Service::Accessor(Some(binder))` instead of
+    /// `Service::ServiceWithMetadata`, so the consume-side accessor
+    /// arm in `rsbinder::hub::servicemanager_16` picks it up.
+    is_accessor: bool,
 }
 
 impl Service {
@@ -188,11 +199,17 @@ impl Inner {
         Ok(has_clients)
     }
 
+    /// Look up a registered service by name. Returns `Some((binder,
+    /// is_accessor))` if registered — the `is_accessor` flag is the
+    /// one stamped at `addService` time (plan 2-14 B.6), used by
+    /// `getService2`/`checkService2` (B.7) to choose between
+    /// `Service::Accessor(Some(_))` and `Service::ServiceWithMetadata`.
+    /// Callers that only need the binder can `.map(|(b, _)| b)`.
     fn try_get_binder(
         &mut self,
         name: &str,
         _start_if_not_found: bool,
-    ) -> rsbinder::status::Result<Option<SIBinder>> {
+    ) -> rsbinder::status::Result<Option<(SIBinder, bool)>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
             service
         } else {
@@ -200,6 +217,7 @@ impl Inner {
         };
 
         let out = service.binder.clone();
+        let is_accessor = service.is_accessor;
         service.guarentee_client = true;
         self.handle_service_client_callback(2 /* sm + transaction */, name, false)?;
 
@@ -207,7 +225,7 @@ impl Inner {
             service.guarentee_client = true;
         }
 
-        Ok(Some(out))
+        Ok(Some((out, is_accessor)))
     }
 
     fn remove_registration_callback(
@@ -300,9 +318,42 @@ impl ServiceManager {
 
 impl Interface for ServiceManager {}
 
+/// Plan 2-14 B.7: convert a `Inner::try_get_binder` lookup result
+/// into the `Service` union arm shape returned by
+/// `getService2`/`checkService2`. Routes `is_accessor=true`
+/// registrations to `Service::Accessor(Some(_))` and regular services
+/// to `Service::ServiceWithMetadata`; the `None` arm preserves the
+/// prior placeholder behavior so the consume-side accessor arm + the
+/// process-local fallback in `rsbinder::hub::servicemanager_16` can
+/// still pick up locally-registered providers when servicemanager has
+/// no binder under this name.
+fn classify_for_service_union(
+    lookup: Option<(SIBinder, bool)>,
+) -> hub::android_16::android::os::Service::Service {
+    use hub::android_16::android::os::{Service, ServiceWithMetadata};
+    match lookup {
+        Some((binder, true)) => Service::Service::Accessor(Some(binder)),
+        Some((binder, false)) => {
+            Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
+                service: Some(binder),
+                isLazyService: false,
+            })
+        }
+        None => Service::Service::Accessor(None),
+    }
+}
+
 impl IServiceManager for ServiceManager {
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
-        self.inner.lock().unwrap().try_get_binder(name, false)
+        // `getService` (the legacy non-`Service`-union API) does not
+        // need the accessor flag — callers that want accessor routing
+        // go through `getService2`/`checkService2` below.
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .try_get_binder(name, false)?
+            .map(|(b, _)| b))
     }
 
     fn addService(
@@ -333,6 +384,20 @@ impl IServiceManager for ServiceManager {
             }
         }
 
+        // Plan 2-14 B.6: detect `IAccessor` binders by their interface
+        // descriptor at registration. The string matches the AOSP-stable
+        // `android.os.IAccessor` AIDL declaration (also used by the
+        // generated `BpAccessor`/`BnAccessor` stubs in
+        // `hub::accessor_16`). `SIBinder::descriptor()` is a cheap
+        // accessor — for native binders it is a compile-time constant,
+        // for proxies it is the cached result of the
+        // `INTERFACE_TRANSACTION` issued at proxy construction (see
+        // `query_local_interface` in `rsbinder::thread_state`).
+        // Hardcoding the string (instead of pulling the `IAccessor`
+        // symbol) keeps rsb_hub buildable without the `rpc` feature; the
+        // contract is byte-stable AOSP AIDL.
+        let is_accessor = service.descriptor() == "android.os.IAccessor";
+
         inner.add_service(
             name,
             Service {
@@ -343,6 +408,7 @@ impl IServiceManager for ServiceManager {
                 guarentee_client: false,
                 _debug_pid: 0,
                 context: rsbinder::thread_state::CallingContext::default(),
+                is_accessor,
             },
         )?;
 
@@ -370,7 +436,14 @@ impl IServiceManager for ServiceManager {
     }
 
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
-        self.inner.lock().unwrap().try_get_binder(name, false)
+        // See note on `getService` — accessor routing lives in
+        // `checkService2`; this legacy form just hands back the binder.
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .try_get_binder(name, false)?
+            .map(|(b, _)| b))
     }
 
     fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
@@ -602,54 +675,21 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
-        match self.inner.lock().unwrap().try_get_binder(name, false)? {
-            Some(binder) => {
-                // Create ServiceWithMetadata
-                let service_with_metadata =
-                    hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
-                        service: Some(binder),
-                        isLazyService: false, // Default to false for Linux implementation
-                    };
-                Ok(
-                    hub::android_16::android::os::Service::Service::ServiceWithMetadata(
-                        service_with_metadata,
-                    ),
-                )
-            }
-            None => {
-                // Return accessor variant with None for non-existent services
-                Ok(hub::android_16::android::os::Service::Service::Accessor(
-                    None,
-                ))
-            }
-        }
+        // Routing logic (Plan 2-14 B.7) lives in
+        // `classify_for_service_union` so `checkService2` stays
+        // byte-identical without re-stating the match arms.
+        let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
+        Ok(classify_for_service_union(lookup))
     }
 
     fn checkService2(
         &self,
         name: &str,
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
-        match self.inner.lock().unwrap().try_get_binder(name, false)? {
-            Some(binder) => {
-                // Create ServiceWithMetadata
-                let service_with_metadata =
-                    hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
-                        service: Some(binder),
-                        isLazyService: false, // Default to false for Linux implementation
-                    };
-                Ok(
-                    hub::android_16::android::os::Service::Service::ServiceWithMetadata(
-                        service_with_metadata,
-                    ),
-                )
-            }
-            None => {
-                // Return accessor variant with None for non-existent services
-                Ok(hub::android_16::android::os::Service::Service::Accessor(
-                    None,
-                ))
-            }
-        }
+        // See `getService2` — both surface the same Plan 2-14 B.7
+        // routing through `classify_for_service_union`.
+        let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
+        Ok(classify_for_service_union(lookup))
     }
 
     fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::status::Result<Vec<String>> {

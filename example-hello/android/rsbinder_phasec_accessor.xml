@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Plan 2-14 Phase C — rsbinder VINTF accessor entry.
+
+     AOSP-faithful: when servicemanager (with this manifest loaded)
+     receives `getService("rsbinder.test.accessor.IInterop/default")`,
+     it consults the `<accessor>` element to find the IAccessor binder
+     registered under `android.os.IAccessor/IInterop/default`, and
+     returns `Service::Accessor(Some(binder))` to the caller. The
+     consume-side `BackendUnifiedServiceManager` then auto-bridges
+     through `IAccessor::addConnection` to the RPC root — no manual
+     `BpAccessor::from_binder` dance like the 2-13 D.8 bypass.
+
+     This is the minimal-viable form: a single test interface. The
+     vm_accessor canonical example
+     (packages/modules/Virtualization/tests/vm_accessor/apex/) lives
+     inside an APEX with init.rc lazy-launch; here we install the
+     manifest directly to /system_ext/etc/vintf/manifest/ on an
+     emulator booted with `-writable-system` (or via a userdebug
+     vendor build for real device deployment).
+
+     Naming convention:
+       <name>       = AIDL package          = "rsbinder.test.accessor"
+       <fqname>     = Interface/instance    = "IInterop/default"
+       <accessor>   = Accessor binder name  = "android.os.IAccessor/IInterop/default"
+     Clients then request `rsbinder.test.accessor.IInterop/default`.
+-->
+<manifest version="1.0" type="framework">
+    <hal format="aidl">
+        <name>rsbinder.test.accessor</name>
+        <version>1</version>
+        <fqname>IInterop/default</fqname>
+        <accessor>android.os.IAccessor/IInterop/default</accessor>
+    </hal>
+</manifest>
