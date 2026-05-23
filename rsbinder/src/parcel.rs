@@ -71,7 +71,10 @@ pub(crate) fn pad_size(len: usize) -> usize {
 /// arithmetic.
 #[inline]
 pub(crate) fn checked_array_layout(len: i32, elem_size: usize) -> Result<(usize, usize)> {
-    debug_assert!(len >= 1, "checked_array_layout: caller must validate len >= 1");
+    debug_assert!(
+        len >= 1,
+        "checked_array_layout: caller must validate len >= 1"
+    );
     let size = (len as usize)
         .checked_mul(elem_size)
         .ok_or(StatusCode::BadValue)?;
@@ -1325,8 +1328,7 @@ mod tests {
         // process-lifetime arena, so the pointer + length below
         // satisfy `from_raw_parts_mut`'s "valid, exclusively-owned,
         // `'static`" contract for the rest of the run.
-        let leaked: &'static mut [u8] =
-            Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
+        let leaked: &'static mut [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
         let ptr = leaked.as_mut_ptr();
         let len = leaked.len();
         let mut pd: super::ParcelData<u8> =

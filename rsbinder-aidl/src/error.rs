@@ -181,6 +181,19 @@ pub enum SemanticError {
         #[label("here")]
         span: SourceSpan,
     },
+
+    #[error("invalid operation: Primitive types and String cannot be an out or inout parameter")]
+    #[diagnostic(code(aidl::invalid_direction))]
+    DirectionPrimitive {
+        direction: String,
+        type_kind: String,
+        #[help]
+        help: Option<String>,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("'{direction}' cannot apply to {type_kind}")]
+        span: SourceSpan,
+    },
 }
 
 /// Auxiliary diagnostic for marking the second conflicting location in

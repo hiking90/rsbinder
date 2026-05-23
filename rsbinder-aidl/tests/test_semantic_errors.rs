@@ -351,7 +351,14 @@ fn test_out_primitive_span_points_to_out_keyword() {
     let input = "interface IFoo {\n    void foo(out int x);\n}";
     let err = expect_generation_error(input, "test.aidl");
     if let AidlError::Semantic(se) = &err {
-        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
+        if let SemanticError::DirectionPrimitive {
+            span,
+            direction,
+            type_kind,
+            help,
+            ..
+        } = se.as_ref()
+        {
             let offset = span.offset();
             let len = span.len();
             assert!(len > 0, "span should have non-zero length");
@@ -360,8 +367,14 @@ fn test_out_primitive_span_points_to_out_keyword() {
                 spanned_text, "out",
                 "span should point to 'out' keyword, got: '{spanned_text}'"
             );
+            assert_eq!(direction, "out");
+            assert_eq!(type_kind, "a primitive type");
+            assert!(
+                help.as_deref().unwrap_or("").contains("remove 'out'"),
+                "help should suggest removing the 'out' keyword, got: {help:?}"
+            );
         } else {
-            panic!("Expected InvalidOperation, got: {err}");
+            panic!("Expected DirectionPrimitive, got: {err}");
         }
     } else {
         panic!("Expected Semantic error, got: {err}");
@@ -374,7 +387,14 @@ fn test_inout_string_span_points_to_inout_keyword() {
     let input = "interface IFoo {\n    void bar(inout String s);\n}";
     let err = expect_generation_error(input, "test.aidl");
     if let AidlError::Semantic(se) = &err {
-        if let SemanticError::InvalidOperation { span, .. } = se.as_ref() {
+        if let SemanticError::DirectionPrimitive {
+            span,
+            direction,
+            type_kind,
+            help,
+            ..
+        } = se.as_ref()
+        {
             let offset = span.offset();
             let len = span.len();
             assert!(len > 0, "span should have non-zero length");
@@ -383,8 +403,14 @@ fn test_inout_string_span_points_to_inout_keyword() {
                 spanned_text, "inout",
                 "span should point to 'inout' keyword, got: '{spanned_text}'"
             );
+            assert_eq!(direction, "inout");
+            assert_eq!(type_kind, "String");
+            assert!(
+                help.as_deref().unwrap_or("").contains("remove 'inout'"),
+                "help should suggest removing the 'inout' keyword, got: {help:?}"
+            );
         } else {
-            panic!("Expected InvalidOperation, got: {err}");
+            panic!("Expected DirectionPrimitive, got: {err}");
         }
     } else {
         panic!("Expected Semantic error, got: {err}");

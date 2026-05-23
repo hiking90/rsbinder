@@ -358,10 +358,29 @@ impl TypeGenerator {
             && (Self::is_primitive(&self.value_type)
                 || matches!(self.value_type, ValueType::String(_)))
         {
-            return Err(make_type_error(
-                "Primitive types and String cannot be an out or inout parameter",
-                direction_span.or(self.type_span),
-            ));
+            let direction_str = match direction {
+                Direction::Out => "out",
+                Direction::Inout => "inout",
+                Direction::In | Direction::None => {
+                    unreachable!("direction guarded by matches! above")
+                }
+            };
+            let type_kind = if matches!(self.value_type, ValueType::String(_)) {
+                "String"
+            } else {
+                "a primitive type"
+            };
+            let (src, span) = diagnostic_source(direction_span.or(self.type_span));
+            return Err(AidlError::from(SemanticError::DirectionPrimitive {
+                direction: direction_str.to_string(),
+                type_kind: type_kind.to_string(),
+                help: Some(format!(
+                    "remove '{direction_str}', or change the parameter type to a non-primitive type \
+                     (parcelable, interface, List, etc.)"
+                )),
+                src,
+                span,
+            }));
         }
         self.direction = direction.clone();
         Ok(self)
