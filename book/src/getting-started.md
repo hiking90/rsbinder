@@ -35,17 +35,32 @@ If you are new to Binder IPC, we recommend following this learning path:
    - **[Error Handling](./error-handling.md)** - Error types and handling strategies
    - **[Service Manager (HUB)](./service-manager.md)** - Service registration and discovery
 
-6. **Platform-specific Setup** - Choose your target platform:
+6. **[RPC Transport](./rpc-transport.md)** - Binder-over-socket:
+   - The opt-in second stack that runs on Linux, Android, and macOS
+   - Unix-domain sockets, vsock, or TLS instead of `/dev/binder`
+   - Same generated AIDL stubs as the kernel-binder path
+
+7. **Platform-specific Setup** - Choose your target platform:
    - **[Linux Setup](./enable-binder-for-linux.md)** - For Linux development
    - **[Android Development](./android.md)** - For Android integration
 
 ## Platform Requirements
 
-**rsbinder** requires a Linux kernel with Binder IPC support. It runs on:
-- **Linux**: Requires kernel 4.17+ with binderfs enabled (disabled by default in most distributions)
-- **Android**: Binder is available natively; no kernel modification needed
+**rsbinder** ships two parallel stacks — pick by platform and use case:
 
-> **Note**: macOS and Windows are **not supported** as runtime environments. You can use macOS for cross-compiling to Android targets, but running Binder services requires Linux.
+- **Kernel binder** (the default in this guide): Linux 4.17+ with
+  binderfs enabled, or Android. Talks to the kernel binder driver
+  through `/dev/binderfs/binder` (Linux) or `/dev/binder` (Android).
+- **RPC transport** (binder-over-socket, opt-in via the `rpc`
+  feature): pure user-space, no kernel binder driver. Runs on
+  **Linux, Android, and macOS** over Unix-domain sockets, vsock, or
+  TLS. See the [RPC Transport](./rpc-transport.md) chapter.
+
+> **Windows**: not supported on either stack.
+>
+> **macOS**: kernel binder is not supported (no kernel driver), but
+> the RPC transport works natively — useful for developing and
+> testing RPC services on a macOS workstation without a Linux VM.
 
 ## Quick Start Checklist
 

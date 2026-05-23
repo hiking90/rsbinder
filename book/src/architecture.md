@@ -61,3 +61,41 @@ flowchart BT
     - Handles service registration, discovery, and lifecycle management.
     - Provides APIs for listing services, checking service status, and notifications.
 
+## The RPC transport (a separate, opt-in stack)
+
+The diagram above describes the **kernel binder** path. rsbinder also
+ships a second, independent stack — **RPC transport** — that delivers
+the same generated AIDL stubs over a socket instead of the kernel
+binder driver:
+
+```text
+   ┌──────────┐       AIDL stub        ┌──────────┐
+   │  Client  │ ─── try_from(root) ──▶ │  Server  │
+   └────┬─────┘                        └────┬─────┘
+        │                                   │
+   RpcSession                          RpcServer
+   .setup_unix_client()           .setup_unix_server(path)
+   .get_root()                    .set_root(BnFoo)
+        │                                   │
+        └──── UDS / vsock / TLS socket ─────┘
+```
+
+Key contrasts with the kernel-binder diagram:
+
+- **No service manager.** The server publishes a single *root* binder
+  via `RpcServer::set_root`; clients fetch it through
+  `RpcSession::get_root`. (Multiple named services on one server are
+  available via `RpcServer::add_service`.)
+- **No kernel driver.** `ProcessState`, `rsb_hub`, and
+  `/dev/binderfs/binder` are not involved at all. A pure-RPC process
+  needs none of them.
+- **Cross-host / cross-VM by design.** Sockets reach further than
+  `/dev/binder` does — Linux ↔ macOS, host ↔ VM (vsock), or
+  authenticated peers across a network (TLS).
+
+Both stacks coexist in the same process — for example, the **Accessor**
+pattern (Android 16+) publishes an `IAccessor` binder over kernel
+binder whose `addConnection()` hands the client a connected RPC
+socket fd.
+
+See [RPC Transport](./rpc-transport.md) for the full story.

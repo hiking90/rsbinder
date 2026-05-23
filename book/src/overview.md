@@ -7,6 +7,16 @@ Binder IPC is an object-oriented IPC (Inter-Process Communication) mechanism tha
 
 However, since it is rarely used outside of Android, it is disabled by default in most Linux distributions.
 
+**rsbinder ships two parallel stacks:**
+
+1. The traditional **kernel binder** path through `/dev/binder` /
+   `/dev/binderfs/binder`, which most of this guide covers.
+2. An **RPC transport** (binder-over-socket) — AOSP's
+   `RpcServer`/`RpcSession` analogue, pure user-space, no kernel
+   driver. Drives the same generated AIDL stubs over Unix-domain
+   sockets, vsock, or TLS, and runs on Linux, Android, **and macOS**.
+   See [RPC Transport](./rpc-transport.md).
+
 ## Crates
 
 **rsbinder** offers the following crates:
@@ -23,8 +33,9 @@ However, since it is rarely used outside of Android, it is disabled by default i
 - **Efficient**: Binder IPC is designed for high performance and low overhead with efficient data serialization.
 - **Secure**: Binder IPC provides strong security features to prevent unauthorized access and tampering.
 - **Versatile**: Binder IPC can be used for a variety of purposes, including remote procedure calls, data sharing, and event notification.
-- **Cross-platform**: Works on both Android and Linux environments.
+- **Cross-platform**: Works on Linux and Android (kernel binder), plus macOS (RPC transport only).
 - **Async/Sync Support**: Supports both synchronous and asynchronous programming models with optional tokio runtime integration.
+- **Two transport stacks**: Kernel binder for on-device IPC, and an opt-in RPC transport (Unix sockets, vsock, or TLS) for cross-process, cross-VM, or cross-host binder calls — both stacks share the same AIDL-generated code.
 
 ## Core Components
 

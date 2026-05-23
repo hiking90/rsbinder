@@ -71,7 +71,7 @@ In your Rust code, use `ProcessState::init()` instead of `ProcessState::init_def
 
 ```rust
 // Use a custom binder device path
-ProcessState::init("/dev/binderfs/custom_binder", 0);
+ProcessState::init("/dev/binderfs/custom_binder", 0)?;
 ```
 
 > **Important**: The service manager, service, and client must all use the **same binder device path**.
@@ -81,12 +81,12 @@ Add the following configuration to your Cargo.toml file:
 
 ```toml
 [dependencies]
-rsbinder = "0.7"
+rsbinder = "0.8"
 async-trait = "0.1"
 env_logger = "0.11"  # Optional: for logging
 
 [build-dependencies]
-rsbinder-aidl = "0.7"
+rsbinder-aidl = "0.8"
 ```
 
 ### Feature Flags
@@ -94,16 +94,19 @@ rsbinder-aidl = "0.7"
 
 ```toml
 [dependencies]
-rsbinder = "0.7"  # Default: includes tokio async runtime
+rsbinder = "0.8"  # Default: includes tokio async runtime
 # or
-rsbinder = { version = "0.7", features = ["async"] }  # Async trait support without tokio — use your own async runtime
+rsbinder = { version = "0.8", features = ["async"] }  # Async trait support without tokio — use your own async runtime
 # or
-rsbinder = { version = "0.7", default-features = false }  # Synchronous only (no async support)
+rsbinder = { version = "0.8", default-features = false }  # Synchronous only (no async support)
+# or — opt in to the binder-over-socket stack (see RPC Transport chapter)
+rsbinder = { version = "0.8", features = ["rpc"] }
 ```
 
 Available features:
 - `tokio` (default): Full tokio async runtime support (includes `async` feature)
 - `async`: Async trait support without tokio runtime — use this when integrating with a different async runtime
+- `rpc`: Enable the RPC transport (binder-over-socket). Add `rpc-vsock`, `rpc-tls`, or `rpc-tcp-debug` to bundle the matching backend. See [RPC Transport](./rpc-transport.md).
 - `android_*`: Android version compatibility flags (see [Android Development](./android.md))
 
 ### Crate Purposes:
