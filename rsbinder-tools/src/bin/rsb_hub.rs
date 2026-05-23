@@ -8,15 +8,14 @@ use rsbinder::*;
 use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Mutex},
+    time::Duration,
 };
 
 struct Service {
     binder: SIBinder,
-    _allow_isolated: bool,
     dump_priority: i32,
     has_clients: bool,
-    guarentee_client: bool,
-    _debug_pid: u32,
+    guarantee_client: bool,
     context: rsbinder::thread_state::CallingContext,
     /// Plan 2-14 B.6: descriptor-based accessor marking. Set at
     /// `addService` time by checking whether `binder.descriptor()`
@@ -29,16 +28,6 @@ struct Service {
     /// `Service::ServiceWithMetadata`, so the consume-side accessor
     /// arm in `rsbinder::hub::servicemanager_16` picks it up.
     is_accessor: bool,
-}
-
-impl Service {
-    fn _get_node_strong_ref_count(&self) -> usize {
-        unimplemented!("get_node_strong_ref_count")
-    }
-
-    fn _try_start_service(&self) -> rsbinder::Result<SIBinder> {
-        unimplemented!("try_start_service")
-    }
 }
 
 struct DeathRecipientWrapper(mpsc::Sender<rsbinder::WIBinder>);
@@ -65,6 +54,24 @@ struct Inner {
 }
 
 impl Inner {
+    /// "Known clients" subtraction passed to
+    /// [`Inner::handle_service_client_callback`] from **on-demand**
+    /// callsites (`addService`, `tryGetBinder`, `registerClientCallback`,
+    /// `tryUnregisterService`). The active binder transaction holds one
+    /// ref + servicemanager holds one ref ⇒ `2`. Matches AOSP
+    /// `ServiceManager.cpp:1109` (`constexpr size_t kKnownClients = 2`).
+    const KNOWN_CLIENTS_ON_DEMAND: usize = 2;
+
+    /// "Known clients" subtraction passed from the **periodic poller**
+    /// ([`ServiceManager::run_client_callback_poller`]). The poller runs
+    /// outside any binder transaction, so only servicemanager's own ref
+    /// counts as "known" ⇒ `1`. Matches AOSP `ServiceManager.cpp:985`
+    /// (`handleClientCallbacks` body: `handleServiceClientCallback(1
+    /// /* sm has one refcount */, name, true)`). Using `2` here would
+    /// under-count, masking the presence of a single real client and
+    /// firing spurious `onClients(false)` notifications.
+    const KNOWN_CLIENTS_PERIODIC: usize = 1;
+
     fn new(death_sender: mpsc::Sender<rsbinder::WIBinder>) -> Self {
         Self {
             death_recipient: Arc::new(DeathRecipientWrapper(death_sender)),
@@ -95,10 +102,16 @@ impl Inner {
         };
 
         if service.has_clients == has_clients {
+            // AOSP's servicemanager treats this with `CHECK_NE` (process
+            // abort) — same invariant ("we only notify on state
+            // transitions"), but losing the SM kills the whole machine
+            // on Linux too. Demote to a loud error + no-op; the only
+            // visible consequence of a spurious duplicate is a missed
+            // diagnostic, not corrupted state.
             log::error!(
-                "send_client_callback_notification called with the same state {has_clients} when {context}"
+                "send_client_callback_notification called with the same state {has_clients} when {context} — ignored"
             );
-            std::process::abort()
+            return;
         }
 
         log::info!(
@@ -144,9 +157,17 @@ impl Inner {
             return Ok(true);
         };
 
-        let count = match rsbinder::ProcessState::as_self()
-            .strong_ref_count_for_node(service.binder.as_proxy().expect("Service must be a proxy"))
-        {
+        // `strong_ref_count_for_node` is a kernel-binder ioctl over a
+        // `ProxyHandle`; it has no analogue for native (Bn*) services
+        // hosted in this process, since the kernel never sees their
+        // refcount. AOSP's servicemanager can't be queried for its own
+        // refcount either; we mirror that by reporting `has_clients =
+        // true` (the safe over-estimate that suppresses spurious
+        // `onClients(false)` notifications).
+        let Some(proxy) = service.binder.as_proxy() else {
+            return Ok(true);
+        };
+        let count = match rsbinder::ProcessState::as_self().strong_ref_count_for_node(proxy) {
             Ok(count) => count,
             Err(e) => {
                 log::error!("Failed to get strong ref count for {service_name}: {e:?}");
@@ -158,7 +179,7 @@ impl Inner {
         // To avoid the borrow checker, we need to get the value of has_clients
         let mut has_clients = service.has_clients;
 
-        if service.guarentee_client {
+        if service.guarantee_client {
             if !has_clients && !has_kernel_reported_clients {
                 self.send_client_callback_notification(
                     service_name,
@@ -168,8 +189,16 @@ impl Inner {
             }
 
             if let Some(service) = self.name_to_service.get_mut(service_name) {
-                // guarantee is temporary
                 service.has_clients = true;
+                // Guarantee is temporary — fired (or skipped) above; reset so
+                // subsequent (periodic-poll or on-demand) entries don't
+                // re-trigger the "guaranteed in use" branch every call.
+                // Mirrors AOSP `ServiceManager.cpp:1012`. Without this
+                // reset the 5s poller ping-pongs onClients(true/false)
+                // every cycle for any service that ever guaranteed a
+                // client (i.e., that anyone ever called `tryGetBinder`
+                // on), defeating the lazy-service contract.
+                service.guarantee_client = false;
                 has_clients = true;
             }
         }
@@ -218,11 +247,11 @@ impl Inner {
 
         let out = service.binder.clone();
         let is_accessor = service.is_accessor;
-        service.guarentee_client = true;
-        self.handle_service_client_callback(2 /* sm + transaction */, name, false)?;
+        service.guarantee_client = true;
+        self.handle_service_client_callback(Self::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
 
         if let Some(service) = self.name_to_service.get_mut(name) {
-            service.guarentee_client = true;
+            service.guarantee_client = true;
         }
 
         Ok(Some((out, is_accessor)))
@@ -273,23 +302,98 @@ impl ServiceManager {
         };
 
         this.run_death_receiver(death_receiver);
+        this.run_client_callback_poller();
 
         this
     }
 
     fn run_death_receiver(&self, death_receiver: mpsc::Receiver<rsbinder::WIBinder>) {
         let inner_clone = Arc::clone(&self.inner);
-        std::thread::spawn(move || {
-            for who in death_receiver {
-                let mut inner = inner_clone.lock().unwrap();
+        let spawn_result = std::thread::Builder::new()
+            .name("rsb_hub:death".to_owned())
+            .spawn(move || {
+                for who in death_receiver {
+                    let mut inner = inner_clone.lock().unwrap();
 
-                inner
-                    .name_to_service
-                    .retain(|_, service| !(SIBinder::downgrade(&service.binder) == who));
+                    inner
+                        .name_to_service
+                        .retain(|_, service| !(SIBinder::downgrade(&service.binder) == who));
 
-                inner.remove_registration_callback(None, &who);
-            }
-        });
+                    inner.remove_registration_callback(None, &who);
+                }
+            });
+        if let Err(e) = spawn_result {
+            log::error!("Failed to spawn death receiver thread: {e}");
+        }
+    }
+
+    /// AOSP parity: mirror of `ClientCallbackCallback`
+    /// (`frameworks/native/cmds/servicemanager/main.cpp:91-144`) — on a
+    /// 5-second cadence, walk every registered service and call
+    /// [`Inner::handle_service_client_callback`] with
+    /// `is_called_on_interval = true`.
+    ///
+    /// Without this, lazy services never receive the `onClients(false)`
+    /// notification that tells them to shut down: the on-demand
+    /// callsites scattered through `addService` / `try_get_binder` /
+    /// `registerClientCallback` all pass `is_called_on_interval =
+    /// false`, which by design short-circuits the "no clients" arm at
+    /// [`Inner::handle_service_client_callback`] (the comment at the
+    /// `is_called_on_interval` branch documents the contract).
+    ///
+    /// The poller holds a `Weak<Mutex<Inner>>` and exits when the
+    /// upgrade fails (i.e., the owning [`ServiceManager`] is dropped).
+    /// In production the SM lives for the whole process lifetime, so
+    /// the exit branch is primarily a test-cleanup convenience; in
+    /// tests it lets the thread die without an extra shutdown channel.
+    fn run_client_callback_poller(&self) {
+        /// 5-second cadence matches AOSP `kClientCallbackCheckInterval`
+        /// (`main.cpp:103-112` — timerfd interval). The per-call
+        /// "known clients" subtraction is [`Inner::KNOWN_CLIENTS_PERIODIC`]
+        /// (= 1, matches AOSP `ServiceManager.cpp:985`), distinct from
+        /// the on-demand callsites' [`Inner::KNOWN_CLIENTS_ON_DEMAND`]
+        /// (= 2) because the poller runs outside any binder transaction.
+        const INTERVAL: Duration = Duration::from_secs(5);
+
+        let inner_weak = Arc::downgrade(&self.inner);
+        let spawn_result = std::thread::Builder::new()
+            .name("rsb_hub:cbpoll".to_owned())
+            .spawn(move || loop {
+                std::thread::sleep(INTERVAL);
+
+                let Some(inner_arc) = inner_weak.upgrade() else {
+                    log::debug!("client callback poller exiting (ServiceManager dropped)");
+                    return;
+                };
+
+                let mut inner = match inner_arc.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        log::error!(
+                            "client callback poller: Inner mutex poisoned by another thread, exiting"
+                        );
+                        return;
+                    }
+                };
+
+                // Snapshot the names before iterating so we don't hold a
+                // borrow into `name_to_service` across calls that may
+                // mutate it (e.g., `send_client_callback_notification`
+                // writing back `service.has_clients`). The map is small
+                // (one entry per registered service) — a transient `Vec`
+                // is cheaper than the alternative refactor.
+                let names: Vec<String> = inner.name_to_service.keys().cloned().collect();
+                for name in &names {
+                    if let Err(e) =
+                        inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_PERIODIC, name, true)
+                    {
+                        log::error!("client callback poll failed for {name}: {e:?}");
+                    }
+                }
+            });
+        if let Err(e) = spawn_result {
+            log::error!("Failed to spawn client callback poller thread: {e}");
+        }
     }
 
     fn is_valid_service_name(name: &str) -> bool {
@@ -344,10 +448,17 @@ fn classify_for_service_union(
 }
 
 impl IServiceManager for ServiceManager {
+    /// Linux note: this is semantically equivalent to
+    /// [`checkService`](Self::checkService). AOSP's servicemanager
+    /// distinguishes the two — `getService` calls `tryGetBinder(name,
+    /// /*startIfNotFound=*/true)` and triggers a lazy-service start via
+    /// `ctl.interface_start_<name>` init property — but lazy service
+    /// activation depends on Android's init system and has no
+    /// equivalent on a plain Linux host. The `start_if_not_found`
+    /// argument is therefore hardcoded to `false`. Accessor routing for
+    /// callers that want it lives in
+    /// [`getService2`](Self::getService2)/[`checkService2`](Self::checkService2).
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
-        // `getService` (the legacy non-`Service`-union API) does not
-        // need the accessor flag — callers that want accessor routing
-        // go through `getService2`/`checkService2` below.
         Ok(self
             .inner
             .lock()
@@ -398,15 +509,18 @@ impl IServiceManager for ServiceManager {
         // contract is byte-stable AOSP AIDL.
         let is_accessor = service.descriptor() == "android.os.IAccessor";
 
+        // `allowIsolated` is accepted by AIDL for AOSP source
+        // compatibility but unused on Linux — there is no isolated-app
+        // sandbox UID range to gate on.
+        let _ = allowIsolated;
+
         inner.add_service(
             name,
             Service {
                 binder: service.clone(),
-                _allow_isolated: allowIsolated,
                 dump_priority: dumpPriority,
                 has_clients: prev_clients,
-                guarentee_client: false,
-                _debug_pid: 0,
+                guarantee_client: false,
                 context: rsbinder::thread_state::CallingContext::default(),
                 is_accessor,
             },
@@ -414,13 +528,13 @@ impl IServiceManager for ServiceManager {
 
         if inner.name_to_registration_callbacks.contains_key(name) {
             if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarentee_client = true;
+                service.guarantee_client = true;
             }
 
-            inner.handle_service_client_callback(2, name, false)?;
+            inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
 
             if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarentee_client = true;
+                service.guarantee_client = true;
             }
 
             let callbacks = inner
@@ -435,9 +549,11 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
+    /// Linux note: identical to [`getService`](Self::getService) —
+    /// `start_if_not_found` is always `false` on this implementation
+    /// (no lazy-service infrastructure). See `getService`'s rustdoc for
+    /// the rationale.
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
-        // See note on `getService` — accessor routing lives in
-        // `checkService2`; this legacy form just hands back the binder.
         Ok(self
             .inner
             .lock()
@@ -534,8 +650,13 @@ impl IServiceManager for ServiceManager {
         Ok(vec![])
     }
 
+    /// APEX (Android Pony EXpress) is an Android-only packaging
+    /// system; there is no equivalent on a plain Linux host. Returning
+    /// `None` truthfully reports "no APEX governs this service". Demoted
+    /// to `debug` because under steady-state load every `getService`
+    /// caller that asks may hit this — `warn` would flood the log.
     fn updatableViaApex(&self, _arg_name: &str) -> rsbinder::status::Result<Option<String>> {
-        log::warn!("updatableViaApex is not implemented");
+        log::debug!("updatableViaApex is not implemented on Linux (APEX is Android-only)");
         Ok(None)
     }
 
@@ -608,7 +729,7 @@ impl IServiceManager for ServiceManager {
             .or_default()
             .push(arg_callback.clone());
 
-        inner.handle_service_client_callback(2 /* sm + transaction */, name, false)?;
+        inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
 
         Ok(())
     }
@@ -646,7 +767,7 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
         }
 
-        if service.guarentee_client {
+        if service.guarantee_client {
             let msg = format!(
                 "{context:?} Tried to unregister {name}, but there is about to be a client."
             );
@@ -654,12 +775,25 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::IllegalState, msg.as_str()).into());
         }
 
-        let res = inner.handle_service_client_callback(2, name, false);
-        if res.is_err() {
+        // AOSP `ServiceManager.cpp:1111` checks the *return value*
+        // (`bool` → "this service has clients, refuse to unregister").
+        // The earlier port checked `res.is_err()` instead — but
+        // `handle_service_client_callback` never returns `Err` in
+        // current rsbinder (all "can't determine" paths fall back to
+        // `Ok(true)`), so the refusal branch was dead and every
+        // unregister request silently succeeded even with live clients.
+        // `unwrap_or(true)` is defensive — if a future change makes
+        // `Err` reachable, we conservatively treat it as "clients
+        // present" (matches AOSP `ServiceManager.cpp:1001` `if (count
+        // == -1) return true;`).
+        let has_clients = inner
+            .handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)
+            .unwrap_or(true);
+        if has_clients {
             let msg = format!("{context:?} Tried to unregister {name}, but there are clients.");
             log::warn!("{}", &msg);
             if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarentee_client = true;
+                service.guarantee_client = true;
             }
             return Err((ExceptionCode::IllegalState, msg.as_str()).into());
         }
@@ -711,8 +845,11 @@ impl IServiceManager for ServiceManager {
         Ok(classify_for_service_union(lookup))
     }
 
+    /// See [`updatableViaApex`](Self::updatableViaApex) — same
+    /// APEX-on-Linux rationale, same demoted log level. An empty `Vec`
+    /// is the truthful "no APEX-updatable services" answer.
     fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::status::Result<Vec<String>> {
-        log::warn!("getUpdatableNames is not implemented for Linux target");
+        log::debug!("getUpdatableNames is not implemented on Linux (APEX is Android-only)");
         Ok(vec![])
     }
 }
@@ -771,7 +908,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_valid_service_name() {
+    fn test_is_valid_service_name_accepts_valid() {
         assert!(ServiceManager::is_valid_service_name("test"));
         assert!(ServiceManager::is_valid_service_name("test-"));
         assert!(ServiceManager::is_valid_service_name("test_"));
@@ -780,5 +917,50 @@ mod tests {
         assert!(ServiceManager::is_valid_service_name("test0"));
         assert!(ServiceManager::is_valid_service_name("test1"));
         assert!(ServiceManager::is_valid_service_name("TEST2"));
+        // 127-char boundary — the inclusive upper bound.
+        let max_len = "a".repeat(127);
+        assert!(ServiceManager::is_valid_service_name(&max_len));
+        // The legacy AOSP service names that motivate the
+        // permitted-charset list — all should pass.
+        assert!(ServiceManager::is_valid_service_name(
+            "android.os.IServiceManager"
+        ));
+        assert!(ServiceManager::is_valid_service_name(
+            "android.hardware.audio.IDevice/default"
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_service_name_rejects_empty() {
+        assert!(!ServiceManager::is_valid_service_name(""));
+    }
+
+    #[test]
+    fn test_is_valid_service_name_rejects_too_long() {
+        // Just past the 127-char bound.
+        let too_long = "a".repeat(128);
+        assert!(!ServiceManager::is_valid_service_name(&too_long));
+        let way_too_long = "a".repeat(1024);
+        assert!(!ServiceManager::is_valid_service_name(&way_too_long));
+    }
+
+    #[test]
+    fn test_is_valid_service_name_rejects_disallowed_chars() {
+        // Whitespace.
+        assert!(!ServiceManager::is_valid_service_name("test name"));
+        assert!(!ServiceManager::is_valid_service_name("test\tname"));
+        assert!(!ServiceManager::is_valid_service_name("test\nname"));
+        // ASCII punctuation outside the `_-./` allowlist.
+        assert!(!ServiceManager::is_valid_service_name("test:name"));
+        assert!(!ServiceManager::is_valid_service_name("test,name"));
+        assert!(!ServiceManager::is_valid_service_name("test@name"));
+        assert!(!ServiceManager::is_valid_service_name("test+name"));
+        assert!(!ServiceManager::is_valid_service_name("test*name"));
+        assert!(!ServiceManager::is_valid_service_name("test\\name"));
+        // Control / NUL.
+        assert!(!ServiceManager::is_valid_service_name("test\0name"));
+        // Non-ASCII (Unicode lowercase letters not in `[a-z]`).
+        assert!(!ServiceManager::is_valid_service_name("테스트"));
+        assert!(!ServiceManager::is_valid_service_name("café"));
     }
 }
