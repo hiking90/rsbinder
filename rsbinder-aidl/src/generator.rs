@@ -160,11 +160,35 @@ pub mod {{mod}} {
     {%- for member in const_members %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
+    {%- if version %}
+    /// Stable-AIDL interface version. Echoed verbatim through
+    /// `getInterfaceVersion()`. Matches AOSP `aidl --version N`.
+    pub const VERSION: i32 = {{ version }};
+    {%- endif %}
+    {%- if hash %}
+    /// Stable-AIDL frozen-API hash. Echoed verbatim through
+    /// `getInterfaceHash()`. Matches AOSP `aidl --hash <s>`; the generator
+    /// does not validate it against the AIDL contents (freeze workflow's
+    /// responsibility).
+    pub const HASH: &str = "{{ hash }}";
+    {%- endif %}
     pub trait {{name}}: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
         {%- endfor %}
+        {%- if version %}
+        // Server-side default returns the module's VERSION constant.
+        // `Bp{{name}}` overrides this with a cache+transact pattern.
+        fn r#getInterfaceVersion(&self) -> {{crate}}::status::Result<i32> {
+            Ok(VERSION)
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::status::Result<String> {
+            Ok(HASH.into())
+        }
+        {%- endif %}
         fn getDefaultImpl() -> Option<{{ name }}DefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
@@ -251,6 +275,15 @@ pub mod {{mod}} {
         {%- set_global counter = counter + 1 %}
         {%- endif %}
         {%- endfor %}
+        {%- if version %}
+        // AOSP stable-AIDL meta transactions; offsets match
+        // `system/tools/aidl/include/aidl/transaction_ids.h`:
+        // kLastCallTransaction (0x00ffffff) - kFirstCallTransaction (1).
+        pub(crate) const r#getInterfaceVersion: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + 16777214;
+        {%- endif %}
+        {%- if hash %}
+        pub(crate) const r#getInterfaceHash: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + 16777213;
+        {%- endif %}
     }
     pub type {{ name }}DefaultRef = std::sync::Arc<dyn {{ name }}Default>;
     static DEFAULT_IMPL: std::sync::OnceLock<{{ name }}DefaultRef> = std::sync::OnceLock::new();
@@ -263,7 +296,18 @@ pub mod {{mod}} {
                 r#async: {{ name }}AsyncService,
                 {%- endif %}
             },
+            {%- if version or hash %}
+            proxy: {{ bp_name }} {
+                {%- if version %}
+                cached_version: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1){% if hash %},{% endif %}
+                {%- endif %}
+                {%- if hash %}
+                cached_hash: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None)
+                {%- endif %}
+            },
+            {%- else %}
             proxy: {{ bp_name }},
+            {%- endif %}
             {%- if enabled_async %}
             r#async: {{ name }}Async,
             {%- endif %}
@@ -308,6 +352,34 @@ pub mod {{mod}} {
             {%- endif %}
         }
         {%- endfor %}
+        {%- if version %}
+        fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            Ok(data)
+        }
+        fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<i32> {
+            let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
+            let _status = _aidl_reply.read::<{{crate}}::Status>()?;
+            if !_status.is_ok() { return Err(_status); }
+            let _aidl_return: i32 = _aidl_reply.read()?;
+            self.cached_version.store(_aidl_return, std::sync::atomic::Ordering::Relaxed);
+            Ok(_aidl_return)
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            Ok(data)
+        }
+        fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<String> {
+            let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
+            let _status = _aidl_reply.read::<{{crate}}::Status>()?;
+            if !_status.is_ok() { return Err(_status); }
+            let _aidl_return: String = _aidl_reply.read()?;
+            *self.cached_hash.lock().unwrap() = Some(_aidl_return.clone());
+            Ok(_aidl_return)
+        }
+        {%- endif %}
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
@@ -321,6 +393,28 @@ pub mod {{mod}} {
             {%- endif %}
         }
         {%- endfor %}
+        {%- if version %}
+        fn r#getInterfaceVersion(&self) -> {{crate}}::status::Result<i32> {
+            let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
+            if _aidl_version != -1 { return Ok(_aidl_version); }
+            let _aidl_data = self.build_parcel_getInterfaceVersion()?;
+            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            self.read_response_getInterfaceVersion(_aidl_reply)
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::status::Result<String> {
+            {
+                let _aidl_hash_lock = self.cached_hash.lock().unwrap();
+                if let Some(ref _aidl_hash) = *_aidl_hash_lock {
+                    return Ok(_aidl_hash.clone());
+                }
+            }
+            let _aidl_data = self.build_parcel_getInterfaceHash()?;
+            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            self.read_response_getInterfaceHash(_aidl_reply)
+        }
+        {%- endif %}
     }
     {%- if enabled_async %}
     impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
@@ -392,6 +486,36 @@ pub mod {{mod}} {
                 Ok(())
             }
         {%- endfor %}
+        {%- if version %}
+            transactions::r#getInterfaceVersion => {
+                let _aidl_return = _service.r#getInterfaceVersion();
+                match &_aidl_return {
+                    Ok(_aidl_return) => {
+                        _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
+                        _reply.write(_aidl_return)?;
+                    }
+                    Err(_aidl_status) => {
+                        _reply.write(_aidl_status)?;
+                    }
+                }
+                Ok(())
+            }
+        {%- endif %}
+        {%- if hash %}
+            transactions::r#getInterfaceHash => {
+                let _aidl_return = _service.r#getInterfaceHash();
+                match &_aidl_return {
+                    Ok(_aidl_return) => {
+                        _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
+                        _reply.write(_aidl_return)?;
+                    }
+                    Err(_aidl_status) => {
+                        _reply.write(_aidl_status)?;
+                    }
+                }
+                Ok(())
+            }
+        {%- endif %}
             _ => Err({{crate}}::StatusCode::UnknownTransaction),
         }
     }
@@ -641,6 +765,17 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
 pub struct Generator {
     enabled_async: bool,
     is_crate: bool,
+    /// Stable-AIDL `--version N` equivalent. When `Some`, the interface
+    /// template emits `pub const VERSION`, the two synthetic meta
+    /// transactions (`getInterfaceVersion` / `getInterfaceHash`), and the
+    /// proxy-side cache plumbing. `None` ⇒ wire-byte-identical to the
+    /// pre-versioning generator output.
+    version: Option<i32>,
+    /// Stable-AIDL `--hash <s>` equivalent. Echoed verbatim through the
+    /// generated `getInterfaceHash()` method; generator does not compute
+    /// or validate it. Independent of `version` — set either, both, or
+    /// neither (matches AOSP's per-flag conditional).
+    hash: Option<String>,
 }
 
 impl Generator {
@@ -648,7 +783,21 @@ impl Generator {
         Self {
             enabled_async,
             is_crate,
+            version: None,
+            hash: None,
         }
+    }
+
+    /// Per-source version/hash metadata, mirroring AOSP `aidl --version N
+    /// --hash <s>` flags. Pass `None` for either to suppress the
+    /// corresponding emission (matches AOSP's per-flag conditional).
+    ///
+    /// Crate-internal: the public entry points are [`crate::Builder::version`]
+    /// and [`crate::Builder::hash`], which route through this method.
+    pub(crate) fn with_version_meta(mut self, version: Option<i32>, hash: Option<String>) -> Self {
+        self.version = version;
+        self.hash = hash;
+        self
     }
 
     fn get_crate_name(&self) -> &str {
@@ -811,6 +960,12 @@ impl Generator {
         context.insert("nested", &nested.trim());
         context.insert("enabled_async", &enabled_async);
         context.insert("is_vintf", &is_vintf);
+        // Stable-AIDL `getInterfaceVersion`/`getInterfaceHash` plumbing.
+        // `version` and `hash` are independent — INTERFACE_TEMPLATE emits
+        // each only if its key is set, matching AOSP's per-flag conditional.
+        // Both missing ⇒ wire byte-identical to the pre-versioning generator.
+        context.insert("version", &self.version);
+        context.insert("hash", &self.hash);
 
         let rendered =
             template()

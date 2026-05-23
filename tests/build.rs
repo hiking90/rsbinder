@@ -74,6 +74,12 @@ fn main() {
         .source(PathBuf::from(
             "aidl/android/aidl/versioned/tests/IFooInterface.aidl",
         ))
+        // Stable-AIDL meta methods: version + frozen-API hash.
+        // The hash literal matches AOSP's `aidl_api/aidl-test-versioned-interface/1/.hash`
+        // (second/legacy line). Generator echoes both values verbatim — see
+        // `getInterfaceVersion()`/`getInterfaceHash()` in the generated `BpFooInterface`.
+        .version(1)
+        .hash("9e7be1859820c59d9d55dd133e71a3687b5d2e5b")
         .source(PathBuf::from("aidl/android/aidl/tests/sm/IFoo.aidl"))
         .output(PathBuf::from("test_aidl.rs"))
         .generate()

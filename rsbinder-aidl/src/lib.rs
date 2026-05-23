@@ -4,7 +4,7 @@
 // extern crate lazy_static;
 
 use miette::{NamedSource, SourceSpan};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::mem::take;
 use std::path::{Path, PathBuf};
@@ -106,6 +106,18 @@ pub fn add_indent(step: usize, source: &str) -> String {
     content
 }
 
+/// Per-source frozen-API metadata, populated by [`Builder::version`] /
+/// [`Builder::hash`]. Mirrors AOSP `aidl --version N --hash <s>` semantics:
+/// the version int and hash string are echoed verbatim through the
+/// generated `getInterfaceVersion()` / `getInterfaceHash()` meta methods —
+/// the generator does not compute or validate either value (AIDL API
+/// snapshot freeze is a separate workflow).
+#[derive(Default, Clone, Debug)]
+struct VersionMeta {
+    version: Option<i32>,
+    hash: Option<String>,
+}
+
 pub struct Builder {
     sources: Vec<PathBuf>,
     includes: Vec<PathBuf>,
@@ -113,6 +125,10 @@ pub struct Builder {
     output: PathBuf,
     enabled_async: bool,
     is_crate: bool,
+    /// Per-source version/hash overrides. Keyed by the source path passed
+    /// to [`Builder::source`]. [`Builder::version`] and [`Builder::hash`]
+    /// apply to the most recently added source.
+    version_meta: HashMap<PathBuf, VersionMeta>,
 }
 
 impl Default for Builder {
@@ -131,11 +147,54 @@ impl Builder {
             output: "rsbinder_generated_aidl.rs".into(),
             enabled_async: cfg!(feature = "async"),
             is_crate: false,
+            version_meta: HashMap::new(),
         }
     }
 
     pub fn source(mut self, source: impl AsRef<Path>) -> Self {
         self.sources.push(source.as_ref().into());
+        self
+    }
+
+    /// Stamp the **most recently added** source with an interface version,
+    /// equivalent to AOSP `aidl --version N`. Causes the generator to emit
+    /// `pub const VERSION: i32 = N;` plus a synthetic `getInterfaceVersion()`
+    /// meta method (transaction code `FIRST_CALL_TRANSACTION + 0xFFFFFE`)
+    /// for every interface declared in that source. Pair with
+    /// [`Builder::hash`] to also emit `getInterfaceHash()`.
+    ///
+    /// Panics if no source has been added yet or if `v <= 0` (matches
+    /// AOSP `aidl.cpp:615` which silently ignores non-positive versions —
+    /// surfacing it here as an explicit failure avoids the silent-no-op
+    /// trap that Tera's falsy-`0` semantics would otherwise create).
+    pub fn version(mut self, v: i32) -> Self {
+        assert!(
+            v > 0,
+            "Builder::version: N must be > 0; omit the call for unversioned interfaces"
+        );
+        let last = self
+            .sources
+            .last()
+            .cloned()
+            .expect("Builder::version() called before any source()");
+        self.version_meta.entry(last).or_default().version = Some(v);
+        self
+    }
+
+    /// Stamp the **most recently added** source with an interface hash,
+    /// equivalent to AOSP `aidl --hash <s>`. The string is echoed verbatim
+    /// through the generated `getInterfaceHash()` meta method — generator
+    /// does not validate it against the AIDL contents (AIDL API snapshot
+    /// freeze is a separate workflow).
+    ///
+    /// Panics if no source has been added yet.
+    pub fn hash(mut self, h: impl Into<String>) -> Self {
+        let last = self
+            .sources
+            .last()
+            .cloned()
+            .expect("Builder::hash() called before any source()");
+        self.version_meta.entry(last).or_default().hash = Some(h.into());
         self
     }
 
@@ -385,7 +444,17 @@ impl Builder {
             // Re-establish the source context so that semantic errors generated
             // during code generation can reference the correct file name and source text.
             let _guard = parser::SourceGuard::new(&document.2.filename, &document.2.source);
-            let gen = generator::Generator::new(self.enabled_async, self.is_crate);
+            // Look up per-source version/hash. Document filename matches
+            // the path passed to `.source()` (see `parse_file`), so a
+            // PathBuf key roundtrips. Imported sources picked up during
+            // resolution have no entry and fall through to `None`.
+            let meta = self
+                .version_meta
+                .get(&PathBuf::from(&document.2.filename))
+                .cloned()
+                .unwrap_or_default();
+            let gen = generator::Generator::new(self.enabled_async, self.is_crate)
+                .with_version_meta(meta.version, meta.hash);
             match gen.document(&document.1) {
                 Ok(package) => {
                     package_list.push((package.0, package.1, document.0.clone()));
