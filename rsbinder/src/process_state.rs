@@ -1510,14 +1510,25 @@ mod tests {
     #[test]
     #[serial_test::serial(binder)]
     fn test_process_state_start_thread_pool() {
+        // `kernel_started_threads` is a process-wide `AtomicUsize` that
+        // also tracks kernel-driven `BR_SPAWN_LOOPER` events from prior
+        // tests in the same process, so we can't assert an absolute
+        // value of 1. Instead we capture the pre-state and assert the
+        // contract `start_thread_pool` actually promises: on the first
+        // call it flips `thread_pool_started` and spawns exactly one
+        // pooled thread; subsequent calls are no-ops.
         assert_process_state_initialized();
+        let process = ProcessState::as_self();
+        let was_started = process.thread_pool_started.load(Ordering::SeqCst);
+        let before = process.kernel_started_threads.load(Ordering::SeqCst);
         ProcessState::start_thread_pool();
-        assert_eq!(
-            ProcessState::as_self()
-                .kernel_started_threads
-                .load(Ordering::SeqCst),
-            1
-        );
+        assert!(process.thread_pool_started.load(Ordering::SeqCst));
+        let after = process.kernel_started_threads.load(Ordering::SeqCst);
+        if was_started {
+            assert_eq!(after, before);
+        } else {
+            assert_eq!(after, before + 1);
+        }
     }
 
     /// Minimal `IBinder` impl for the `published_natives` bookkeeping
