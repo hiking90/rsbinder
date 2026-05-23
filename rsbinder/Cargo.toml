@@ -93,9 +93,6 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 [dev-dependencies]
 env_logger = { workspace = true }
 serial_test = { workspace = true }
-# PEM parsing for the `rpc-tls` e2e test only (tiny, no crypto). The
-# test itself is `#![cfg(feature = "rpc-tls")]`.
-rustls-pemfile = "2"
 
 # loom is only used by tests gated on `--cfg loom`. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
