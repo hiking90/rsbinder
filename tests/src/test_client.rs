@@ -2103,19 +2103,40 @@ fn test_wibinder_upgrade_after_obituary() {
     // not strictly required for the assertion below, but cleaner.
     drop(recipient);
 
-    // Drop our last Strong<dyn ITestService>; the obituary already
-    // removed the cache entry, so the underlying `Arc<ProxyHandle>`
-    // is now the only thing keeping the inner Arc alive. After this
-    // drop it goes to 0.
+    // Drop our last user-held Strong<dyn ITestService>; the obituary
+    // already removed the cache entry, so once the binder worker
+    // thread retires its `send_obituary_for_handle` dispatch frame
+    // (which holds two stack-local strong refs on the inner
+    // `Arc<ProxyHandle>` — see process_state.rs:`send_obituary_for_handle`
+    // — for the duration of `arc.send_obituary(&who)`), the strong
+    // count goes to 0 and `weak.upgrade()` is required to return
+    // `Err(DeadObject)`.
     drop(test_service);
 
-    // `upgrade()` MUST return Err(DeadObject) now. Pre-PR this
-    // assertion would not have been reachable (upgrade always Ok).
-    match weak.upgrade() {
-        Err(rsbinder::StatusCode::DeadObject) => {}
-        Err(other) => panic!("expected DeadObject, got {other:?}"),
-        Ok(_) => {
-            panic!("regression: WIBinder::upgrade() succeeded after obituary + last Strong drop")
+    // `upgrade()` must eventually return `Err(DeadObject)`. We poll
+    // with a deadline rather than asserting on the first call because
+    // reading "died\n" only proves the worker has entered the dispatch
+    // loop — at that instant the worker still holds `arc` + `sibinder`
+    // on its stack, so `sync::Weak::upgrade` (the fast path in
+    // `WIBinder::upgrade`) can still observe a positive strong count.
+    // Pre-PR this branch was unreachable (upgrade always Ok); the
+    // poll preserves that regression-detection intent while matching
+    // the real semantic: *eventually after obituary + last user Strong
+    // drop*, upgrade reports DeadObject.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match weak.upgrade() {
+            Err(rsbinder::StatusCode::DeadObject) => break,
+            Err(other) => panic!("expected DeadObject, got {other:?}"),
+            Ok(_) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "regression: WIBinder::upgrade() still succeeded 2s after \
+                         obituary + last Strong drop"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
 }

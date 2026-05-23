@@ -307,7 +307,23 @@ pub struct ProcessState {
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
     thread_pool_seq: AtomicUsize,
+    /// Counts pooled-thread spawns driven by kernel `BR_SPAWN_LOOPER`
+    /// commands — i.e. `spawn_pooled_thread(is_main = false)` from
+    /// [`thread_state::join_thread_pool`]. Incremented asynchronously
+    /// by binder worker threads at any time after they start running,
+    /// so it is **not** a deterministic indicator of any particular
+    /// caller's effect. Use [`Self::main_thread_spawned`] when you
+    /// need to observe the spawn driven by `start_thread_pool` itself.
     kernel_started_threads: AtomicUsize,
+    /// Counts pooled-thread spawns driven by [`Self::start_thread_pool`]
+    /// — i.e. `spawn_pooled_thread(is_main = true)`. The
+    /// `thread_pool_started` CAS in `start_thread_pool` admits at most
+    /// one successful spawn for the process lifetime, so this counter
+    /// is monotonic `0 → 1`. Split from `kernel_started_threads` so
+    /// tests can verify the `start_thread_pool` spawn contract without
+    /// racing kernel-driven `BR_SPAWN_LOOPER` spawns from prior
+    /// serial-test workers that stay alive in the process.
+    main_thread_spawned: AtomicUsize,
     pub(crate) current_threads: AtomicUsize,
 }
 
@@ -411,6 +427,7 @@ impl ProcessState {
             thread_pool_started: AtomicBool::new(false),
             thread_pool_seq: AtomicUsize::new(1),
             kernel_started_threads: AtomicUsize::new(0),
+            main_thread_spawned: AtomicUsize::new(0),
             current_threads: AtomicUsize::new(0),
         })
     }
@@ -1198,7 +1215,15 @@ impl ProcessState {
                 .name(name)
                 .spawn(move || thread_state::join_thread_pool(is_main));
 
-            self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
+            // Account into the per-origin counter so tests can verify
+            // the `start_thread_pool` spawn contract without racing
+            // kernel-driven `BR_SPAWN_LOOPER` spawns. See the field
+            // docs on `main_thread_spawned` / `kernel_started_threads`.
+            if is_main {
+                self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
+            }
         }
         // TODO: if startThreadPool is called on another thread after the process
         // starts up, the kernel might think that it already requested those
@@ -1510,20 +1535,25 @@ mod tests {
     #[test]
     #[serial_test::serial(binder)]
     fn test_process_state_start_thread_pool() {
-        // `kernel_started_threads` is a process-wide `AtomicUsize` that
-        // also tracks kernel-driven `BR_SPAWN_LOOPER` events from prior
-        // tests in the same process, so we can't assert an absolute
-        // value of 1. Instead we capture the pre-state and assert the
-        // contract `start_thread_pool` actually promises: on the first
-        // call it flips `thread_pool_started` and spawns exactly one
-        // pooled thread; subsequent calls are no-ops.
+        // Observe `main_thread_spawned` — incremented **only** by
+        // `spawn_pooled_thread(is_main = true)`, whose sole caller is
+        // `start_thread_pool`. Kernel-driven `BR_SPAWN_LOOPER` spawns
+        // go to `kernel_started_threads` and never touch this counter,
+        // so the assertion is race-free against leftover worker
+        // threads from prior `serial(binder)` tests that stay alive in
+        // the process and may receive `BR_SPAWN_LOOPER` at any time.
+        //
+        // The contract: the first `start_thread_pool` call flips
+        // `thread_pool_started` and increments `main_thread_spawned`
+        // exactly once; subsequent calls are no-ops (CAS rejects
+        // re-entry).
         assert_process_state_initialized();
         let process = ProcessState::as_self();
         let was_started = process.thread_pool_started.load(Ordering::SeqCst);
-        let before = process.kernel_started_threads.load(Ordering::SeqCst);
+        let before = process.main_thread_spawned.load(Ordering::SeqCst);
         ProcessState::start_thread_pool();
         assert!(process.thread_pool_started.load(Ordering::SeqCst));
-        let after = process.kernel_started_threads.load(Ordering::SeqCst);
+        let after = process.main_thread_spawned.load(Ordering::SeqCst);
         if was_started {
             assert_eq!(after, before);
         } else {
