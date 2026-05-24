@@ -11,6 +11,10 @@ book/build/
 # Local development plans (not tracked)
 plans/
 
+# Claude Code workspace (per-user, not tracked)
+CLAUDE.md
+.claude/
+
 # example-hello STAGE3 harness build outputs (compiled NDK launchers —
 # the .cpp source IS tracked; the cross-compiled aarch64 ELF beside it
 # is a build artifact of cpp/run_stage3*.sh, regenerated on demand).
