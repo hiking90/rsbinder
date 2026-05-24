@@ -27,6 +27,43 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  semver_checks:
+    # Pre-merge guard against accidental public-API breakage on the path
+    # to 1.0. Runs only on PRs (where the base commit is well-defined);
+    # `push`/`schedule` skip this job. Non-blocking: a true breaking
+    # change can still be merged when intentional, but it must be
+    # acknowledged in the PR — the failed check makes the diff visible
+    # in the review surface. See workstream A-1 of the comprehensive
+    # review.
+    name: SemVer Checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check semver (rsbinder + rsbinder-aidl)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          # The two published library crates whose public API stability
+          # matters to downstream consumers. `rsbinder-tools` is binaries
+          # only, no library surface.
+          package: rsbinder,rsbinder-aidl
+          # `default` profile already exercises the common surface; the
+          # RPC stack has its own dedicated stability discussion (see
+          # RpcServer::set_max_threads rustdoc) and is checked under
+          # `rpc` features by the next step.
+          feature-group: default-features
+      - name: Check semver (rsbinder w/ rpc features)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: rsbinder
+          feature-group: only-explicit-features
+          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,rpc-experimental-multiconn
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -80,17 +117,36 @@ jobs:
       # runs on a plain runner, unlike the kernel-binder matrix in
       # integration-test.yml. This job is the missing CI enforcement
       # of the plan's V1/V4/V5 gates for the RPC stack (T3).
-      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls)
+      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls / experimental-multiconn)
         run: |
           cargo build -p rsbinder
           cargo build -p rsbinder --features rpc
           cargo build -p rsbinder --features rpc-tcp-debug
           cargo build -p rsbinder --features rpc-tls
-      - name: RPC unit + e2e (rsbinder, hermetic)
+          cargo build -p rsbinder --features rpc-experimental-multiconn
+      - name: RPC unit + e2e (rsbinder, hermetic — default build, multi-conn fns cfg-gated out)
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
           cargo test -p rsbinder --features rpc-tls --test rpc_tls
+      - name: AC-12.x experimental multi-conn (hermetic, plan 2-12)
+        # Phase 2-12 multi-connection-per-session tests are cfg-gated to
+        # `rpc-experimental-multiconn` because the attach arm clamps the
+        # slot cap to 1 on default builds (real-libbinder interop gate
+        # AC-12.6 not yet passed — see `RpcServer::set_max_threads`
+        # rustdoc and plan/2-12-multi-connection-per-session.md §3).
+        # This job is the hermetic enforcement gate for that path: the
+        # 8 multi-conn fns in `rpc_server.rs` only compile + run here.
+        run: |
+          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
+      - name: RPC accessor (hermetic, requires android_16 — gap-fill)
+        # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
+        # "android_16"))]`; without `android_16` the file compiles to
+        # zero tests, which is why it wasn't covered by the default
+        # `--features rpc` step. Single-conn throughout (no slot-cap
+        # interaction), so default-features cover it fully.
+        run: |
+          cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: Generated-stub e2e (tests crate)
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub

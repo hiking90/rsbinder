@@ -159,12 +159,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(&sock_path);
     let server: Arc<RpcServer> = RpcServer::setup_unix_server(&sock_path)?;
     server.set_android13plus(max_version);
-    // Server-side incoming-slot cap (advertised on `GET_MAX_THREADS`).
-    // `1` keeps this server in single-incoming-connection mode; the
-    // libbinder client independently caps its outgoing connections via
-    // `ARpcSession_setMaxOutgoingConnections` (set to 1 in the
-    // launcher), so the wire pair stays single-connection end-to-end.
-    server.set_max_threads(1);
     server.set_root(Interface::as_binder(&Binder::new(Interop)));
     let _bg = server.run_background();
 

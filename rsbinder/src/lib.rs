@@ -174,17 +174,49 @@ pub mod hub;
 #[cfg(feature = "async")]
 mod rt;
 
-pub use binder::*;
+// Explicit re-exports: glob re-exports would silently leak every
+// newly-added `pub` item in these modules, defeating semver review.
+// Items kept out of the crate root must be reached via
+// `rsbinder::<module>::<item>`.
+
+// From `binder` — core binder identity, transaction codes, traits.
+pub use binder::{
+    DeathRecipient, FromIBinder, IBinder, Interface, Remotable, RemoteProxy, SIBinder, Stability,
+    Strong, ToAsyncInterface, ToSyncInterface, Transactable, TransactionCode, TransactionFlags,
+    WIBinder, Weak, DEBUG_PID_TRANSACTION, DUMP_TRANSACTION, EXTENSION_TRANSACTION,
+    FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF, FLAG_ONEWAY, FLAG_PRIVATE_LOCAL, FLAG_PRIVATE_VENDOR,
+    INTERFACE_HEADER, INTERFACE_TRANSACTION, LAST_CALL_TRANSACTION, LIKE_TRANSACTION,
+    PING_TRANSACTION, SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION,
+    START_RECORDING_TRANSACTION, STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION,
+    TWEET_TRANSACTION,
+};
+// `declare_binder_interface!` expands to `$crate::__rpc_stamp_descriptor(...)`
+// in consumer crates, so this helper must stay reachable at the crate root.
+#[doc(hidden)]
+pub use binder::__rpc_stamp_descriptor;
+
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
-pub use native::*;
+
+// From `native` — server-side binder construction.
+pub use native::{is_handling_transaction, Binder, BinderFeatures};
+
 pub use parcel::Parcel;
-pub use parcelable::*;
+
+// From `parcelable` — (de)serialization trait stack.
+pub use parcelable::{
+    Deserialize, DeserializeArray, DeserializeOption, Parcelable, ParcelableMetadata, Serialize,
+    SerializeArray, SerializeOption, NON_NULL_PARCELABLE_FLAG, NULL_PARCELABLE_FLAG,
+};
+
 pub use parcelable_holder::ParcelableHolder;
 pub use process_state::ProcessState;
-pub use proxy::*;
+
+// From `proxy` — client-side handle types.
+pub use proxy::{Proxy, ProxyHandle};
+
 #[cfg(feature = "tokio")]
 pub use rt::*;
 pub use status::{ExceptionCode, Status};

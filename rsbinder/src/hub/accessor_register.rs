@@ -30,7 +30,8 @@
 //! preserved in commit messages and the long-form plan doc; user-facing
 //! docstrings here describe the AOSP analogue, not the plan tag.
 
-#![cfg(feature = "rpc")]
+// cfg lives on the mod decl in super — duplicating here trips
+// clippy::duplicated_attributes.
 
 use std::io;
 use std::net::SocketAddrV4;

@@ -33,7 +33,8 @@
 //! `OnceLock<Mutex<Vec<RpcSession>>>` (P6 would forbid it); the session
 //! lives exactly as long as the wrapper the caller holds.
 
-#![cfg(feature = "rpc")]
+// cfg lives on the mod decl in super — duplicating here trips
+// clippy::duplicated_attributes.
 
 use std::any::Any;
 use std::mem::ManuallyDrop;

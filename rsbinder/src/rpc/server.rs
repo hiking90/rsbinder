@@ -222,54 +222,51 @@ impl RpcServer {
         Ok(())
     }
 
-    /// Advertised + enforced max-threads per session (AOSP-faithful
+    /// Set the advertised max-threads value (AOSP-faithful
     /// `setMaxIncomingThreads`, Phase B.1; AC-3.4 / AC-12.4). Default 1.
     ///
-    /// The value is **both** the advertise returned to a client on
-    /// `GET_MAX_THREADS` **and** the per-session incoming-slot cap
-    /// enforced at attach time: the server attach arm refuses an
-    /// id-echoing connection when adding it would push the founding
-    /// inner's `slot_count() > max_threads_value()`. Default 1 ⇒
-    /// founding-only (multi-conn callers must explicitly
-    /// `set_max_threads(N >= 2)` to opt into N incoming slots per
-    /// session).
+    /// `n` has **two distinct roles**, deliberately decoupled:
+    ///
+    /// 1. **Advertised value** (always in effect). Returned verbatim to a
+    ///    client on `GET_MAX_THREADS`, so a peer's `negotiate(local_max)`
+    ///    sees `min(local_max, n)`. AOSP-compatible regardless of build
+    ///    features.
+    /// 2. **Incoming-slot cap > 1** (`rpc-experimental-multiconn` feature
+    ///    only). On default builds the attach arm clamps the effective
+    ///    slot cap to **1** even when `n >= 2`, so id-echoing attach
+    ///    attempts past the founding slot are refused with
+    ///    `rejected_unknown_id`. Enabling the
+    ///    `rpc-experimental-multiconn` Cargo feature lifts the clamp and
+    ///    lets the cap take `n` verbatim, which is what the multi-conn
+    ///    hermetic suite exercises.
+    ///
+    /// This split is why `set_max_threads(N)` is **always callable** —
+    /// AOSP libbinder peers that expect a specific advertised value can
+    /// interoperate on default builds, while the unverified multi-conn
+    /// attach path stays behind an explicit opt-in.
     ///
     /// Distinct from [`set_max_connections`](RpcServer::set_max_connections)
     /// (Phase 2-10), which caps *concurrent connection-worker threads*
     /// across the **whole server**; this caps *incoming slots* within a
-    /// **single session**. Both are additive — when both are active,
-    /// the tighter cap wins.
+    /// **single session**. Both are additive — when both are active, the
+    /// tighter cap wins.
     ///
-    /// # ⚠ Experimental for `N ≥ 2` (real-libbinder interop not yet verified)
+    /// # ⚠ Why the slot-cap effect is gated
     ///
     /// **`N == 1` (default) is fully supported and validated against real
     /// android-13/14/15/16 libbinder peers** (single-connection sessions,
     /// the only RPC mode rsbinder has shipped through plans 2-1 … 2-11 /
     /// 2-13 / 2-14 STAGE3 gates).
     ///
-    /// **`N ≥ 2` (multi-connection sessions, plan 2-12) is EXPERIMENTAL**:
-    /// hermetic rsbinder↔rsbinder tests pass (Phase A0a/A0b/A/B.1/F7/F8 —
-    /// `rpc_server` 22/0), but **the non-negotiable real-libbinder gate
-    /// AC-12.6 has NOT yet passed** — see plan
-    /// [`2-12-multi-connection-per-session.md`](../../../plans/2-12-multi-connection-per-session.md)
-    /// §3 / [`RPC_STATUS.md`](../../../RPC_STATUS.md). A focused 2026-05-21
-    /// investigation against real libbinder on the android-16 emulator
-    /// (`example-hello/cpp/run_stage3_multiconn.sh`) found that:
+    /// **`N >= 2` slot-cap (multi-connection sessions) is EXPERIMENTAL**:
+    /// hermetic rsbinder↔rsbinder passes, but the real-libbinder gate
+    /// (AC-12.6) has not. Production code interoperating with a real
+    /// libbinder peer should stay on default builds — the AOSP-compatible
+    /// advertise side is unchanged either way.
     ///
-    ///  * rsbinder server's wire bytes are **byte-correct** under
-    ///    concurrent multi-conn dispatch (hex-dump verified, no
-    ///    interleaving — each slot has its own transport).
-    ///  * a process-wide server-side send mutex **does not** fix the
-    ///    failure, ruling out wire-level interleaving.
-    ///  * yet libbinder logs `RpcState: Expecting 20 but got 0 bytes for
-    ///    RpcWireReply. Terminating!` and the session dies; root cause
-    ///    (libbinder bug vs rsbinder non-wire protocol nuance) is
-    ///    undiagnosed in this iteration.
-    ///
-    /// **Treat `N ≥ 2` as rsbinder↔rsbinder hermetic only until AC-12.6
-    /// passes against real libbinder.** Production code that wants to
-    /// interoperate with a real android libbinder peer should stay on the
-    /// default `N == 1` (single-connection session, fully validated).
+    /// Status, root-cause investigation, and feature opt-in: see
+    /// [`RPC_STATUS.md`](../../../RPC_STATUS.md) and
+    /// [`plan/2-12-multi-connection-per-session.md`](../../../plans/2-12-multi-connection-per-session.md) §3.
     pub fn set_max_threads(&self, n: u32) {
         *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
     }
@@ -655,34 +652,28 @@ impl RpcServer {
                             drop(transport);
                             return;
                         }
-                        // **Phase B.1 incoming slot cap** (AOSP-faithful
-                        // `setMaxIncomingThreads`): refuse the attach
-                        // when adding it would push `slot_count()` past
-                        // the founding inner's advertised
-                        // `max_threads_value()`. Default = 1 ⇒
-                        // founding-only; multi-conn callers must
-                        // explicitly `set_max_threads(N >= 2)` to opt
-                        // into N incoming slots per session. AOSP
-                        // `GetMaxThreads` returns the same value, so
-                        // the wire advertisement and the server-side
-                        // enforcement match exactly.
+                        // AOSP-faithful `setMaxIncomingThreads` cap; see
+                        // `RpcServer::set_max_threads` rustdoc for the
+                        // advertise vs. slot-cap split.
                         //
                         // Race: this check and the subsequent
                         // `add_incoming_slot` are two separate critical
-                        // sections (each takes `conn_state.lock()` and
-                        // releases it), so N concurrent attach workers
-                        // can ALL pass the cap check and then ALL push
-                        // — `slot_count` may transiently overshoot
-                        // `max_threads` by up to (N − 1), bounded only
-                        // by the number of concurrent attach workers
-                        // (which 2-10's `set_max_connections` accept
-                        // cap limits; default unlimited). For Phase
-                        // B.1 this is acceptable — tightening to a
-                        // single critical section that combines check
-                        // + push (or a check-and-increment atomic) is
-                        // §7.3 R-future (the same atomic that an R1
-                        // `SessionLifecycle` enum naturally folds into).
-                        let cap = inner.max_threads_value() as usize;
+                        // sections, so concurrent attach workers can
+                        // transiently overshoot `cap` by up to (N − 1),
+                        // bounded by `set_max_connections` (default
+                        // unlimited). Tightening to a check-and-increment
+                        // atomic is §7.3 R-future.
+                        let cap = {
+                            let stored = inner.max_threads_value() as usize;
+                            #[cfg(feature = "rpc-experimental-multiconn")]
+                            {
+                                stored
+                            }
+                            #[cfg(not(feature = "rpc-experimental-multiconn"))]
+                            {
+                                stored.min(1)
+                            }
+                        };
                         if inner.slot_count() >= cap {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(

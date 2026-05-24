@@ -2237,22 +2237,17 @@ impl RpcSession {
         result
     }
 
-    /// Server role: the max-threads value advertised to a client on
-    /// `GET_MAX_THREADS` (subplan 2-3 negotiation). Default 1.
+    /// Internal: set this session's advertised max-threads value
+    /// (server role). Called by [`super::RpcServer::configure_session`]
+    /// per accepted connection — external callers go through
+    /// [`super::RpcServer::set_max_threads`], which owns the public
+    /// advertise/slot-cap contract and its EXPERIMENTAL multi-conn note.
     ///
-    /// **`n ≥ 2` (multi-connection sessions, plan 2-12) is
-    /// EXPERIMENTAL**: hermetic rsbinder↔rsbinder only. The AC-12.6
-    /// real-libbinder gate (2026-05-21) failed under concurrent
-    /// twoway dispatch — libbinder emits
-    /// `RpcState: Expecting 20 but got 0 bytes for RpcWireReply.
-    /// Terminating!` and the session dies. Default `n == 1` is the
-    /// fully-supported single-connection path
-    /// (2-1…2-11 / 2-13 / 2-14 STAGE3 all validated against real
-    /// libbinder). See [`super::RpcServer::set_max_threads`] for the
-    /// server-side wrapper carrying the same warning.
-    ///
-    /// M6 fix (review 2026-05-21).
-    pub fn set_max_threads(&self, n: u32) {
+    /// Crate-private since the only caller is the server itself — there
+    /// is no use case for a user-constructed `RpcSession` (always client
+    /// side via `setup_unix_client*` or `from_preconnected_fd`) to set
+    /// the server-only `GET_MAX_THREADS` advertise.
+    pub(crate) fn set_max_threads(&self, n: u32) {
         self.inner
             .shared
             .max_threads
