@@ -31,7 +31,7 @@ For Android developers writing system-level Rust, **rsbinder** is the missing ND
 
 ## Documentation
 
-For a comprehensive guide — architecture, installation, tutorials — see the **[Rsbinder Development Guide](https://hiking90.github.io/rsbinder-book/)**.
+For a comprehensive guide — architecture, installation, tutorials — see the **[Rsbinder Development Guide](https://hiking90.github.io/rsbinder/)**.
 
 The book source lives in [`book/`](book/) and can be built locally with [mdBook](https://github.com/rust-lang/mdBook):
 ```
