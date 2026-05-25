@@ -128,7 +128,7 @@ pub trait RpcTransport: Send + Sync {
     /// has no length prefix (`RpcState::rpcSend` writes the
     /// `RpcWireHeader` + body directly) — the android-13+ profile
     /// (subplan 2-5b / G4) drives framing itself via
-    /// [`wire_android13`](super::super::wire_android13). The default is
+    /// `wire_android13`. The default is
     /// **unsupported**, so `mem`/`tls`/`vsock` stay frame-only *by
     /// type* (no extra code); only `unix` overrides it. The existing
     /// R34 path never calls this — `send_frame`/`recv_frame` are

@@ -590,10 +590,10 @@ impl SharedSession {
 }
 
 /// **Phase A**: one `RpcSessionInner` per logical session, owning a
-/// **pool** of [`ConnSlot`]s (AOSP `RpcSession`'s `mOutgoing`/
+/// **pool** of `ConnSlot`s (AOSP `RpcSession`'s `mOutgoing`/
 /// `mIncoming` connections collapsed into one Vec — Phase A keeps a
 /// single duplex pool; F8's `allow_nested` per-slot is the lever for
-/// finer separation). [`find_conn`](RpcSessionInner::find_conn)
+/// finer separation). `find_conn`
 /// selects an available slot for outgoing calls (AC-12.1 distribution,
 /// plus nested-pin for AC-3.6/AC-12.2 / F8); server workers serve a
 /// specific slot via [`serve_blocking_on`](RpcSession::serve_blocking_on)
@@ -1936,13 +1936,13 @@ impl RpcSession {
     }
 
     /// Subplan 2-12 Phase A0a: identical to
-    /// [`connect_android13plus_fd`] but echoes a server-minted 32-byte
+    /// `connect_android13plus_fd` but echoes a server-minted 32-byte
     /// `session_id` in the `RpcConnectionHeader` (AOSP
     /// `RpcSession::setupClient`: the first connection sends an empty id
     /// and reads the server-minted one via
     /// [`RpcSession::get_session_id`], the remaining connections echo
     /// it). An **empty** `session_id` is byte-for-byte identical to
-    /// [`connect_android13plus_fd`] (additive — the default path is
+    /// `connect_android13plus_fd` (additive — the default path is
     /// unchanged). In A0a the server *rejects* a non-empty (echoed) id
     /// (the shared-state attach is Phase A0b); this wires + exercises
     /// the id round-trip and the server's accept-decision routing.
@@ -2021,8 +2021,8 @@ impl RpcSession {
     /// [`RpcSession::accept_android13plus`] (byte-identical no-FD path).
     ///
     /// This is a thin convenience wrapper over
-    /// [`android13plus_accept_handshake`](RpcSession::android13plus_accept_handshake)
-    /// then [`from_android13plus`](RpcSession::from_android13plus) with
+    /// `android13plus_accept_handshake`
+    /// then `from_android13plus` with
     /// `shared = None` (the client-supplied id is ignored). The
     /// multi-connection id-demux (Phase A0b — new vs. attach) lives in
     /// [`super::RpcServer::serve_connection`], which calls the split
@@ -2180,7 +2180,7 @@ impl RpcSession {
     /// **Phase A**: serve a *specific* slot of the pool until peer
     /// closes (the server worker's API — each accepted connection's
     /// worker drives the slot it was added as via
-    /// [`add_incoming_slot`](RpcSession::add_incoming_slot)). The
+    /// `add_incoming_slot`). The
     /// default single-connection
     /// [`serve_blocking`](RpcSession::serve_blocking) is exactly this
     /// on the founding slot (`FOUNDING_SLOT_ID`).
@@ -2237,22 +2237,17 @@ impl RpcSession {
         result
     }
 
-    /// Server role: the max-threads value advertised to a client on
-    /// `GET_MAX_THREADS` (subplan 2-3 negotiation). Default 1.
+    /// Internal: set this session's advertised max-threads value
+    /// (server role). Called by [`super::RpcServer::configure_session`]
+    /// per accepted connection — external callers go through
+    /// [`super::RpcServer::set_max_threads`], which owns the public
+    /// advertise/slot-cap contract and its EXPERIMENTAL multi-conn note.
     ///
-    /// **`n ≥ 2` (multi-connection sessions, plan 2-12) is
-    /// EXPERIMENTAL**: hermetic rsbinder↔rsbinder only. The AC-12.6
-    /// real-libbinder gate (2026-05-21) failed under concurrent
-    /// twoway dispatch — libbinder emits
-    /// `RpcState: Expecting 20 but got 0 bytes for RpcWireReply.
-    /// Terminating!` and the session dies. Default `n == 1` is the
-    /// fully-supported single-connection path
-    /// (2-1…2-11 / 2-13 / 2-14 STAGE3 all validated against real
-    /// libbinder). See [`super::RpcServer::set_max_threads`] for the
-    /// server-side wrapper carrying the same warning.
-    ///
-    /// M6 fix (review 2026-05-21).
-    pub fn set_max_threads(&self, n: u32) {
+    /// Crate-private since the only caller is the server itself — there
+    /// is no use case for a user-constructed `RpcSession` (always client
+    /// side via `setup_unix_client*` or `from_preconnected_fd`) to set
+    /// the server-only `GET_MAX_THREADS` advertise.
+    pub(crate) fn set_max_threads(&self, n: u32) {
         self.inner
             .shared
             .max_threads
@@ -2368,11 +2363,11 @@ impl RpcSession {
     /// Client (subplan 2-12 Phase A0a): connect to a Unix-domain
     /// android-13+ RPC server **echoing a server-minted 32-byte
     /// `session_id`**. Flow (AOSP `RpcSession::setupClient`): connect
-    /// the first session with [`setup_unix_client_android13plus`]
+    /// the first session with `setup_unix_client_android13plus`
     /// (empty id ⇒ new session), read its id with
     /// [`RpcSession::get_session_id`], then open the remaining
     /// connections here echoing that id. An **empty** `session_id` is
-    /// byte-identical to [`setup_unix_client_android13plus`]. (A0a: the
+    /// byte-identical to `setup_unix_client_android13plus`. (A0a: the
     /// server rejects the echoed-id connection — the shared-`RpcState`
     /// attach is Phase A0b.)
     pub fn setup_unix_client_android13plus_with_id(
@@ -2468,10 +2463,9 @@ impl RpcSession {
     ///
     /// The fd's address family (`SO_DOMAIN`) selects the rsbinder
     /// transport — `AF_UNIX` → [`super::transport::UnixTransport`],
-    /// `AF_VSOCK` → [`super::transport::VsockTransport`] (feature
-    /// `rpc-vsock`, Linux only), `AF_INET`/`AF_INET6` →
-    /// [`super::transport::TcpDebugTransport`] (feature
-    /// `rpc-tcp-debug`). Any other family is rejected as
+    /// `AF_VSOCK` → `VsockTransport` (feature `rpc-vsock`, Linux only),
+    /// `AF_INET`/`AF_INET6` → [`super::transport::TcpDebugTransport`]
+    /// (feature `rpc-tcp-debug`). Any other family is rejected as
     /// [`StatusCode::BadType`], paralleling AOSP's
     /// `IAccessor::ERROR_UNSUPPORTED_SOCKET_FAMILY`. The handshake then
     /// runs through [`RpcSession::connect_android13plus_fd`] with

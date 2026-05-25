@@ -30,7 +30,8 @@
 //! preserved in commit messages and the long-form plan doc; user-facing
 //! docstrings here describe the AOSP analogue, not the plan tag.
 
-#![cfg(feature = "rpc")]
+// cfg lives on the mod decl in super — duplicating here trips
+// clippy::duplicated_attributes.
 
 use std::io;
 use std::net::SocketAddrV4;
@@ -67,7 +68,7 @@ pub enum AccessorSockAddr {
     Vsock { cid: u32, port: u32 },
     /// AF_INET v4 address. Only usable when the binary was built with
     /// the `rpc-tcp-debug` feature (debug builds only — see
-    /// [`crate::rpc::transport::tcp_debug`]); otherwise the connect
+    /// `rpc::transport::tcp_debug`); otherwise the connect
     /// helper returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
     Inet(SocketAddrV4),
 }
@@ -278,7 +279,7 @@ use crate::status::Status;
 ///    [`AccessorSockAddr::connect_owned_fd`] (A0.2)
 ///  * `RpcSocketAddressProvider` ⇒ [`AccessorAddrProvider`] (A0.1)
 ///  * `Status::fromServiceSpecificError(ERROR_*, msg)` ⇒
-///    [`Status::new_service_specific_error_str`] with the matching
+///    `Status::new_service_specific_error_str` with the matching
 ///    `IAccessor::ERROR_*` constant
 ///
 /// Use via [`Self::new_binder`] (the `BnAccessor::new_binder` AIDL

@@ -257,6 +257,27 @@ pub enum ResolutionError {
     },
 }
 
+/// A non-fatal diagnostic emitted during parsing. Surfaces conditions
+/// the generator can safely proceed past but that the user likely
+/// wants to know about — e.g. annotations the rsbinder-aidl frontend
+/// does not recognise. Builders emit these as `cargo:warning=<msg>`
+/// during `Builder::generate()` so they appear inline in cargo output;
+/// embedding crates can also read them directly off the `warnings`
+/// field of the document returned by
+/// [`parse_document`](crate::parse_document).
+#[derive(Debug, Clone)]
+pub struct AidlWarning {
+    pub message: String,
+}
+
+impl AidlWarning {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 /// Lightweight error type used to propagate arithmetic errors from const_expr.rs.
 /// Carries only a message without source location; the caller (parser/generator)
 /// attaches source context and converts it into SemanticError::InvalidOperation.

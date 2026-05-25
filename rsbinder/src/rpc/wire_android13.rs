@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `Android13PlusCodec` — the android-13+ *versioned* RPC wire
-//! (subplan 2-5b), an **additive** [`WireCodec`](super::wire::WireCodec)
-//! behind the same trait as [`R34Codec`](super::wire::R34Codec).
+//! (subplan 2-5b), an **additive** [`super::wire::WireCodec`] impl
+//! behind the same trait as [`super::wire::R34Codec`].
 //! `R34Codec` is byte-unchanged; nothing here touches the kernel path.
 //!
 //! One codec, **version-keyed** — exactly AOSP's own design

@@ -68,7 +68,11 @@ Disabled by default; zero-cost when off. Opt in with cargo features:
 
 Capabilities: FD-over-RPC (`ParcelFileDescriptor`), death notification (session disconnect, AOSP-faithful), Tokio async adapter, `IAccessor` client / server, and `rsb_hub` `addService` accessor auto-detect. See [`book/src/rpc-transport.md`](book/src/rpc-transport.md).
 
-> **Note**: `RpcServer::set_max_threads(N ≥ 2)` (multi-connection) is **experimental / hermetic only** — real-`libbinder` interop is currently single-connection (`N = 1`).
+> **Note**: `RpcServer::set_max_threads(N ≥ 2)` (multi-connection) is **experimental** — it requires the `rpc-experimental-multiconn` Cargo feature and is hermetic-only until the real-`libbinder` interop gate AC-12.6 passes. Default builds clamp the attach-arm slot cap to 1 (single-connection); the advertised `GET_MAX_THREADS` value is unchanged.
+
+### Stability tiers
+
+rsbinder uses a 3-tier model on the path to 1.0 — **Stable** (semver-strict, AOSP-faithful), **Provisional** (signature may tweak in a minor bump; wire format already locked), **Experimental** (opt-in Cargo feature, wire format may change). See [`book/src/stability-tiers.md`](book/src/stability-tiers.md) for the per-API mapping. PRs run `cargo-semver-checks` for both `rsbinder` and `rsbinder-aidl`, so a breaking change to any Stable / Provisional surface is visible on the PR before merge.
 
 Quick try (no kernel config or root):
 ```
@@ -158,6 +162,12 @@ Complete API parity is not a goal — rsbinder's architecture differs from `libb
 
 **Tooling**
 - [ ] (In Progress) Service Manager (**rsb_hub**) for Linux — lazy-service poller and accessor descriptor auto-detect done.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build / test workflow,
+PR checklist, and the project's comment & docstring policy (which
+exempts public API rustdoc from the "one short line max" rule).
 
 ## License
 **rsbinder** is licensed under the **Apache License version 2.0**.

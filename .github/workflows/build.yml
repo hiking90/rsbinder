@@ -27,6 +27,51 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  semver_checks:
+    # Pre-merge guard against accidental public-API breakage on the path
+    # to 1.0. Runs only on PRs (where the base commit is well-defined);
+    # `push`/`schedule` skip this job. Non-blocking: a true breaking
+    # change can still be merged when intentional, but it must be
+    # acknowledged in the PR — the failed check makes the diff visible
+    # in the review surface. See workstream A-1 of the comprehensive
+    # review.
+    name: SemVer Checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check semver (rsbinder + rsbinder-aidl)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          # The two published library crates whose public API stability
+          # matters to downstream consumers. `rsbinder-tools` is binaries
+          # only, no library surface.
+          package: rsbinder,rsbinder-aidl
+          # `default` profile already exercises the common surface; the
+          # RPC stack has its own dedicated stability discussion (see
+          # RpcServer::set_max_threads rustdoc) and is checked under
+          # `rpc` features by the next step.
+          feature-group: default-features
+      - name: Check semver (rsbinder w/ rpc features)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: rsbinder
+          feature-group: only-explicit-features
+          # `async` is added so the published-baseline build can resolve
+          # `crate::BoxFuture` re-exported from `lib.rs` under
+          # `#[cfg(feature = "async")]`. The latest published rsbinder
+          # (currently 0.8.0) emits async-trait references unconditionally
+          # in its generated code — fixed on HEAD via `build.rs` reading
+          # `CARGO_FEATURE_ASYNC`, but the baseline can't be retroactively
+          # patched. Without `async` in the feature set, semver-checks
+          # fails to `cargo doc` the baseline crate.
+          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,rpc-experimental-multiconn,async
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -63,6 +108,15 @@ jobs:
       - name: Check test builds
         run: |
           cargo test --workspace --no-run
+      - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
+        # The `rsbinder-aidl` integration tests — including
+        # `aidl_fixture_sweep` which walks all AOSP `.aidl` fixtures
+        # and gates on `syn::parse_file` of every emitted file plus the
+        # expected-fail allowlist (plan 3 §3 AC-3.1/3.3) — are hermetic
+        # (no /dev/binder, no kernel binder, no servicemanager) and
+        # must run on every PR so codegen regressions are caught
+        # before merge.
+        run: cargo test -p rsbinder-aidl
 
   rpc-suite:
     name: RPC Transport Suite
@@ -80,17 +134,36 @@ jobs:
       # runs on a plain runner, unlike the kernel-binder matrix in
       # integration-test.yml. This job is the missing CI enforcement
       # of the plan's V1/V4/V5 gates for the RPC stack (T3).
-      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls)
+      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls / experimental-multiconn)
         run: |
           cargo build -p rsbinder
           cargo build -p rsbinder --features rpc
           cargo build -p rsbinder --features rpc-tcp-debug
           cargo build -p rsbinder --features rpc-tls
-      - name: RPC unit + e2e (rsbinder, hermetic)
+          cargo build -p rsbinder --features rpc-experimental-multiconn
+      - name: RPC unit + e2e (rsbinder, hermetic — default build, multi-conn fns cfg-gated out)
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
           cargo test -p rsbinder --features rpc-tls --test rpc_tls
+      - name: AC-12.x experimental multi-conn (hermetic, plan 2-12)
+        # Phase 2-12 multi-connection-per-session tests are cfg-gated to
+        # `rpc-experimental-multiconn` because the attach arm clamps the
+        # slot cap to 1 on default builds (real-libbinder interop gate
+        # AC-12.6 not yet passed — see `RpcServer::set_max_threads`
+        # rustdoc and plan/2-12-multi-connection-per-session.md §3).
+        # This job is the hermetic enforcement gate for that path: the
+        # 8 multi-conn fns in `rpc_server.rs` only compile + run here.
+        run: |
+          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
+      - name: RPC accessor (hermetic, requires android_16 — gap-fill)
+        # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
+        # "android_16"))]`; without `android_16` the file compiles to
+        # zero tests, which is why it wasn't covered by the default
+        # `--features rpc` step. Single-conn throughout (no slot-cap
+        # interaction), so default-features cover it fully.
+        run: |
+          cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: Generated-stub e2e (tests crate)
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub
@@ -101,6 +174,46 @@ jobs:
             echo "soak iteration $i"
             cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e || exit 1
           done
+
+  macos-build:
+    # macOS is a first-class target per plan 2-9 (Phase A+B). The
+    # kernel-binder path is Linux/Android-only, so the matrix here is
+    # workspace check + RPC stack (mem/unix/tls backends) — no
+    # binderfs, no servicemanager. Closes the "macOS first-class
+    # advertised, 0 CI jobs" gap from the comprehensive review.
+    name: macOS Build
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace check (all features)
+        run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: ""
+      - name: rsbinder-tools build (rsb_device + rsb_hub compile-only)
+        run: cargo build -p rsbinder-tools --release
+      - name: rsb_device unit (mounts parser)
+        run: cargo test -p rsbinder-tools --bin rsb_device
+      - name: RPC hermetic (default — multi-conn cfg-gated out)
+        run: |
+          cargo test -p rsbinder --features rpc --lib rpc::
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
+          cargo test -p rsbinder --features rpc-tls --test rpc_tls
+          cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
+      - name: RPC hermetic (experimental multi-conn)
+        run: |
+          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
+      - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
+        # See the matching step in `linux-build` — plan 3 AC-3.4
+        # requires the sweep + allowlist gate to run on both Linux and
+        # macOS so codegen regressions can't sneak through the macOS
+        # path either.
+        run: cargo test -p rsbinder-aidl
 
   android-build:
     name: Android Build

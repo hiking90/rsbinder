@@ -309,7 +309,6 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(ver); // versioned AOSP wire
         server.set_supported_fd_modes(&[FdMode::Unix]); // opt in
-        server.set_max_threads(1);
         server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
         let bg = server.run_background();
         wait_sock(&path);

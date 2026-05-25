@@ -54,7 +54,41 @@ thread_local! {
     static CURRENT_SOURCE_NAME: RefCell<String> = RefCell::new(String::new());
     #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT_SOURCE_TEXT: RefCell<String> = RefCell::new(String::new());
+
+    // Non-fatal diagnostics accumulated during the current `parse_document`
+    // call. Drained into `Document::warnings` before parse_document returns.
+    static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
 }
+
+/// AOSP-recognised AIDL annotations (`aidl_language.cpp::AidlAnnotation::AllSchemas()`,
+/// 23 entries as of android-16). Annotations outside this set are
+/// surfaced as `cargo:warning=...` so typos and unsupported annotations
+/// don't silently disappear. Sorted alphabetically for grep-ability.
+const KNOWN_ANNOTATIONS: &[&str] = &[
+    "@Backing",
+    "@Descriptor",
+    "@EnforcePermission",
+    "@FixedSize",
+    "@JavaDefault",
+    "@JavaDelegator",
+    "@JavaDerive",
+    "@JavaOnlyImmutable",
+    "@JavaOnlyStableParcelable",
+    "@JavaPassthrough",
+    "@JavaSuppressLint",
+    "@NdkOnlyStableParcelable",
+    "@PermissionManuallyEnforced",
+    "@PropagateAllowBlocking",
+    "@RequiresNoPermission",
+    "@RustDerive",
+    "@RustOnlyStableParcelable",
+    "@SensitiveData",
+    "@SuppressWarnings",
+    "@UnsupportedAppUsage",
+    "@VintfStability",
+    "@nullable",
+    "@utf8InCpp",
+];
 
 /// Helper that creates a ParseError using the same thread-local source info as SourceGuard.
 fn make_parse_error(message: impl Into<String>, start: usize, end: usize) -> AidlError {
@@ -580,6 +614,11 @@ pub struct Document {
     pub package: Option<String>,
     pub imports: HashMap<String, String>,
     pub decls: Vec<Declaration>,
+    /// Non-fatal diagnostics produced while parsing this document
+    /// (e.g. unknown annotations). [`Builder::generate`](crate::Builder::generate)
+    /// emits each as `cargo:warning=<msg>` so it surfaces in cargo
+    /// output without aborting the build.
+    pub warnings: Vec<crate::error::AidlWarning>,
 }
 
 impl Document {
@@ -588,6 +627,7 @@ impl Document {
             package: None,
             imports: HashMap::new(),
             decls: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -961,6 +1001,67 @@ fn make_invalid_backing_type_error(type_name: String, span: Option<(usize, usize
     })
 }
 
+/// Builds an `InvalidOperation` diagnostic from the active source context.
+fn make_invalid_operation_error(message: String, span: Option<(usize, usize)>) -> AidlError {
+    let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
+    let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
+    let (start, end) = span.unwrap_or((0, 0));
+    AidlError::from(crate::error::SemanticError::InvalidOperation {
+        message,
+        src: miette::NamedSource::new(filename, source),
+        span: miette::SourceSpan::new(start.into(), end.saturating_sub(start)),
+    })
+}
+
+/// Whether a method's return type is the AIDL primitive `void`.
+fn is_void_return(ty: &Type) -> bool {
+    ty.array_types.is_empty() && ty.non_array_type.name == "void"
+}
+
+/// AOSP `aidl_language.cpp:1211` rejects oneway methods that return a
+/// value or carry `out`/`inout` parameters — oneway is fire-and-forget,
+/// so reply data has nowhere to go. Mirror that here so the diagnostic
+/// surfaces at parse time rather than as a confusing codegen / wire
+/// mismatch later. A method is "oneway" if either its own `oneway`
+/// keyword or its enclosing interface's `oneway` keyword is set
+/// (interface-level `oneway` propagates to every method).
+fn validate_oneway_methods(interface: &InterfaceDecl) -> Result<(), AidlError> {
+    let mut errors = Vec::new();
+    for method in &interface.method_list {
+        let is_oneway = interface.oneway || method.oneway;
+        if !is_oneway {
+            continue;
+        }
+        if !is_void_return(&method.r#type) {
+            errors.push(make_invalid_operation_error(
+                format!(
+                    "oneway method '{}' cannot return a value",
+                    method.identifier
+                ),
+                method.identifier_span,
+            ));
+        }
+        for arg in &method.arg_list {
+            let dir = match arg.direction {
+                Direction::Out => "out",
+                Direction::Inout => "inout",
+                _ => continue,
+            };
+            errors.push(make_invalid_operation_error(
+                format!(
+                    "oneway method '{}' cannot have an '{}' parameter",
+                    method.identifier, dir
+                ),
+                arg.direction_span,
+            ));
+        }
+    }
+    match AidlError::collect(errors) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
     let operator = pairs.next().unwrap().as_str().to_owned();
     let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
@@ -1275,6 +1376,17 @@ fn parse_annotation_list(
         let span = pair.as_span();
         let mut annotation = parse_annotation(pair.into_inner())?;
         annotation.annotation_span = Some((span.start(), span.end()));
+
+        if !KNOWN_ANNOTATIONS.contains(&annotation.annotation.as_str()) {
+            let filename = CURRENT_SOURCE_NAME.with(|n| n.borrow().clone());
+            CURRENT_WARNINGS.with(|w| {
+                w.borrow_mut().push(crate::error::AidlWarning::new(format!(
+                    "{}: unknown AIDL annotation '{}' is being ignored",
+                    filename, annotation.annotation
+                )));
+            });
+        }
+
         annotation_list.push(annotation);
     }
 
@@ -1573,6 +1685,8 @@ fn parse_interface_decl(
             _ => unreachable!("Unexpected rule in parse_interface_decl(): {}", pair),
         }
     }
+
+    validate_oneway_methods(&interface)?;
 
     Ok(Declaration::Interface(interface))
 }
@@ -1901,6 +2015,9 @@ fn calculate_namespace(
 pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
     let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
     reset_enum_resolution_state();
+    // Take any leftover warnings from a previous call so this document's
+    // warning set is scoped to its own parse.
+    CURRENT_WARNINGS.with(|w| w.borrow_mut().clear());
     let mut document = Document::new();
 
     match AIDLParser::parse(Rule::document, &ctx.source) {
@@ -1952,6 +2069,10 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
         calculate_namespace(decl, namespace.clone(), &document_context);
     }
 
+    // Drain any non-fatal diagnostics accumulated during this parse so
+    // they travel with the document (and don't leak into the next one).
+    document.warnings = CURRENT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+
     Ok(document)
 }
 
@@ -1970,6 +2091,9 @@ pub fn reset() {
     });
     SYMBOL_TABLE.with(|table| {
         table.borrow_mut().clear();
+    });
+    CURRENT_WARNINGS.with(|w| {
+        w.borrow_mut().clear();
     });
     reset_enum_resolution_state();
 }
