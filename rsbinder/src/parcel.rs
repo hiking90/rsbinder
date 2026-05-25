@@ -128,23 +128,27 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(data)
     }
 
+    /// # Safety
+    ///
+    /// If `data` is non-null, it must be valid for reads and writes of
+    /// `len` `T`-aligned elements, exclusively owned for the lifetime of
+    /// the returned `ParcelData::Slice` (until the surrounding `Parcel`
+    /// is dropped or its `free_buffer` runs). `data == null` with
+    /// `len == 0` is the only well-defined null case.
+    ///
+    /// For an empty IPC parcel the binder driver still allocates a buffer
+    /// and returns its user-space address; that address must be returned
+    /// verbatim in BC_FREE_BUFFER, so we cannot collapse `len == 0` to a
+    /// dangling `&mut []`. Only fall back to `&mut []` when `data` itself
+    /// is null.
     unsafe fn from_raw_parts_mut(data: *mut T, len: usize) -> Self {
-        // For an empty IPC parcel the binder driver still allocates a buffer
-        // and returns its user-space address; that address must be returned
-        // verbatim in BC_FREE_BUFFER, so we cannot collapse `len == 0` to a
-        // dangling `&mut []` (whose `as_ptr()` is `NonNull::dangling()`, e.g.
-        // `0x1` for u8). Doing so causes the kernel to log
-        // `BC_FREE_BUFFER no match for buffer at offset ...` (issue #97).
-        //
-        // `slice::from_raw_parts_mut(data, 0)` is well-defined as long as
-        // `data` is non-null and properly aligned — both of which the binder
-        // ABI guarantees for non-empty replies. Only fall back to `&mut []`
-        // when `data` itself is null, preserving the null-pointer guard
-        // introduced in commit bae39ec.
         ParcelData::Slice(if data.is_null() {
             debug_assert_eq!(len, 0, "non-zero length with null data is invalid");
             &mut []
         } else {
+            // SAFETY: caller upholds the `# Safety` contract — `data` is
+            // non-null, properly aligned, and valid for `len` elements
+            // exclusively owned for the parcel's lifetime.
             unsafe { std::slice::from_raw_parts_mut(data, len) }
         })
     }
@@ -869,6 +873,12 @@ impl Parcel {
 
         let mut result = Vec::with_capacity(len as usize);
         let pos = self.pos;
+        // SAFETY: `parcel` storage is aligned to at least 4 bytes (binder
+        // ABI guarantee, see `Parcel::write_aligned`), and the
+        // `pos..pos + size` slice was just bounds-checked above. `i32`
+        // and `u8` have compatible bit patterns for the values written
+        // here. The `align_to` middle slice is therefore a valid view of
+        // the requested element count.
         let (_, ints, _) = unsafe { self.data.as_slice()[pos..pos + size].align_to::<i32>() };
         for i in ints {
             result.push(D::from(i));
@@ -1614,6 +1624,9 @@ mod tests {
             Ok(())
         }
 
+        // SAFETY: both pointers are null with length 0 — the documented
+        // empty-parcel case for `from_ipc_parts`. No reads or writes
+        // happen against the null pointers in the rest of this test.
         let parcel = unsafe {
             Parcel::from_ipc_parts(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, noop)
         };
