@@ -129,6 +129,16 @@ pub struct Builder {
     /// to [`Builder::source`]. [`Builder::version`] and [`Builder::hash`]
     /// apply to the most recently added source.
     version_meta: HashMap<PathBuf, VersionMeta>,
+    /// Paths recorded during the parse phase for
+    /// `cargo:rerun-if-changed=` emission in [`Builder::generate`].
+    /// Captures every `.aidl` file that contributed to the generated
+    /// output (initial sources + transitively resolved imports) plus
+    /// every directory walked during resolution (user-supplied
+    /// `include_dir`s, source paths that resolve to a directory, and
+    /// package-derived include paths). cargo scans directories
+    /// recursively, so the file-level + dir-level entries together
+    /// trigger reruns on both modifications and additions/removals.
+    dependencies: Vec<PathBuf>,
 }
 
 impl Default for Builder {
@@ -148,6 +158,7 @@ impl Builder {
             enabled_async: cfg!(feature = "async"),
             is_crate: false,
             version_meta: HashMap::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -308,7 +319,11 @@ impl Builder {
     ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
-        let mut includes = take(&mut self.includes).into_iter().collect::<HashSet<_>>();
+        let initial_includes = take(&mut self.includes);
+        for dir in &initial_includes {
+            self.dependencies.push(dir.clone());
+        }
+        let mut includes = initial_includes.into_iter().collect::<HashSet<_>>();
         let mut document_list = Vec::new();
         let mut errors = Vec::new();
 
@@ -331,12 +346,15 @@ impl Builder {
                 if path.is_file() {
                     match Self::parse_file(&path) {
                         Ok((name, doc, ctx)) => {
+                            self.dependencies.push(path.clone());
                             if let Some(dir) = doc
                                 .package
                                 .as_ref()
                                 .and_then(|p| strip_package(path.parent()?, p))
                             {
-                                includes.insert(dir);
+                                if includes.insert(dir.clone()) {
+                                    self.dependencies.push(dir);
+                                }
                             }
 
                             for import in doc.imports.values() {
@@ -390,6 +408,7 @@ impl Builder {
                         }
                     }
                 } else {
+                    self.dependencies.push(path.clone());
                     let entries = fs::read_dir(&path).map_err(|err| {
                         std::io::Error::new(
                             err.kind(),
@@ -428,6 +447,8 @@ impl Builder {
 
     pub fn generate(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
+        self.emit_rerun_if_changed();
+        Self::emit_warnings(&documents);
 
         // 1st pass: pre-register all enum symbols across all documents
         // so that parcelable default values can resolve enum references
@@ -474,6 +495,55 @@ impl Builder {
         fs::write(self.dest_dir.join(&self.output), content)?;
 
         Ok(())
+    }
+
+    /// Return the sorted, deduplicated paths recorded as build-script
+    /// dependencies during the parse phase. Each entry is either a
+    /// `.aidl` file that contributed to the generated output (initial
+    /// sources + transitively resolved imports) or a directory that
+    /// was walked during resolution (user-supplied `include_dir`s,
+    /// [`Builder::source`] paths that resolved to a directory, and
+    /// the `<include>/<package-path>` directory inferred from each
+    /// parsed source's package declaration).
+    ///
+    /// This is the same set [`Builder::generate`] emits as
+    /// `cargo:rerun-if-changed=` lines, exposed as a non-stdout API so
+    /// tests and non-cargo build integrations can inspect dependency
+    /// tracking without capturing stdout.
+    pub fn collect_aidl_dependencies(mut self) -> Result<Vec<PathBuf>, AidlError> {
+        self.parse_sources()?;
+        Ok(self.dedup_dependencies())
+    }
+
+    /// Emit `cargo:rerun-if-changed=<path>` for every recorded
+    /// dependency. cargo disables its default "scan the build script
+    /// crate root" policy as soon as any `rerun-if-changed` line is
+    /// emitted, so this is the sole signal tying `.aidl` edits to
+    /// build-script reruns — `build.rs` itself remains auto-tracked by
+    /// cargo regardless.
+    fn emit_rerun_if_changed(&mut self) {
+        for path in self.dedup_dependencies() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
+    /// Forward parser-emitted [`AidlWarning`](crate::error::AidlWarning)
+    /// diagnostics (e.g. unknown annotations) to cargo as
+    /// `cargo:warning=<msg>` lines so they surface in the build output
+    /// without aborting compilation.
+    fn emit_warnings(documents: &[(String, parser::Document, parser::SourceContext)]) {
+        for (_name, doc, _ctx) in documents {
+            for w in &doc.warnings {
+                println!("cargo:warning={}", w.message);
+            }
+        }
+    }
+
+    fn dedup_dependencies(&mut self) -> Vec<PathBuf> {
+        let mut deps = take(&mut self.dependencies);
+        deps.sort();
+        deps.dedup();
+        deps
     }
 }
 

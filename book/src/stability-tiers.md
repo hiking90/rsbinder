@@ -59,8 +59,26 @@ change without a deprecation cycle.
 |---------|---------|--------|
 | `rpc-tcp-debug` | `TcpDebugTransport` — plain TCP backend | Bring-up / interop only, never production. |
 | `rpc-vsock` | `VsockTransport` — host↔VM | Linux/Android only; loopback testing requires `vsock_loopback.ko`. |
-| `rpc-tls` | TLS over rustls | Single-connection only until the `StreamOwned` refactor (subplan 2-15) lands. |
+| `rpc-tls` | TLS over rustls, socket-orthogonal (tcp / unix / vsock) | Hermetic green; the `StreamOwned` decoupling (plan 2-15) has landed. Real-`libbinder` STAGE3 not yet attempted — stock emulator images ship no `libbinder_tls`. |
 | `rpc-experimental-multiconn` | `RpcServer::set_max_threads(N ≥ 2)` slot-cap > 1 | Hermetic passes; real-`libbinder` interop gate AC-12.6 not yet passed (plan 2-12 §3). Default builds clamp the attach-arm cap to 1 — see `RpcServer::set_max_threads` rustdoc. |
+
+## Non-goals
+
+Surface that rsbinder will not support, even after 1.0. Listed here so
+contributors don't burn cycles implementing something that has already
+been ruled out — and so the AIDL compiler's deliberate rejection of
+these types reads as intentional rather than as a gap.
+
+- **AIDL `Map<K, V>`** — AOSP's own Rust / C++ / NDK backends reject
+  `Map<K, V>` at the language layer
+  (`aidl_language.cpp:1612-1615`: *"Currently, only Java backend
+  supports Map."*), and have done so since 2019. The wire format is
+  built on Java `Parcel`'s runtime type-tag system (`VAL_STRING`,
+  `VAL_INTEGER`, `VAL_MAP`, …) which has no typed-Rust analogue. The
+  rsbinder-aidl frontend therefore emits `unknown type 'Map'` for any
+  `Map<…>` reference — matching AOSP. Use `parcelable` (typed struct),
+  `List<Entry>`, or `ParcelableHolder` instead. Re-examine if AOSP
+  removes the cross-backend block.
 
 ## What this means in practice
 

@@ -100,6 +100,15 @@ jobs:
       - name: Check test builds
         run: |
           cargo test --workspace --no-run
+      - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
+        # The `rsbinder-aidl` integration tests — including
+        # `aidl_fixture_sweep` which walks all AOSP `.aidl` fixtures
+        # and gates on `syn::parse_file` of every emitted file plus the
+        # expected-fail allowlist (plan 3 §3 AC-3.1/3.3) — are hermetic
+        # (no /dev/binder, no kernel binder, no servicemanager) and
+        # must run on every PR so codegen regressions are caught
+        # before merge.
+        run: cargo test -p rsbinder-aidl
 
   rpc-suite:
     name: RPC Transport Suite
@@ -191,6 +200,12 @@ jobs:
       - name: RPC hermetic (experimental multi-conn)
         run: |
           cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
+      - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
+        # See the matching step in `linux-build` — plan 3 AC-3.4
+        # requires the sweep + allowlist gate to run on both Linux and
+        # macOS so codegen regressions can't sneak through the macOS
+        # path either.
+        run: cargo test -p rsbinder-aidl
 
   android-build:
     name: Android Build

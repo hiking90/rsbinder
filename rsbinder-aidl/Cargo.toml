@@ -28,3 +28,4 @@ thiserror = { workspace = true }
 similar = { workspace = true }
 miette = { workspace = true }
 tempfile = "3.27.0"
+syn = { version = "2", features = ["full"] }
