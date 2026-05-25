@@ -62,7 +62,15 @@ jobs:
         with:
           package: rsbinder
           feature-group: only-explicit-features
-          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,rpc-experimental-multiconn
+          # `async` is added so the published-baseline build can resolve
+          # `crate::BoxFuture` re-exported from `lib.rs` under
+          # `#[cfg(feature = "async")]`. The latest published rsbinder
+          # (currently 0.8.0) emits async-trait references unconditionally
+          # in its generated code — fixed on HEAD via `build.rs` reading
+          # `CARGO_FEATURE_ASYNC`, but the baseline can't be retroactively
+          # patched. Without `async` in the feature set, semver-checks
+          # fails to `cargo doc` the baseline crate.
+          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,rpc-experimental-multiconn,async
 
   test:
     name: Test Suite

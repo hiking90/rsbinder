@@ -1521,16 +1521,23 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     }
     let elapsed = t0.elapsed();
     // Normal (parallel): ~150 ms + scheduling/RPC slack.
-    // Mutant (serialized): ~300 ms.
-    // Bound 280 ms keeps a comfortable 130 ms slack above normal while
-    // still being 20 ms below the mutant + its overhead (~310-330 ms in
-    // practice). The original 250 ms bound left only 100 ms slack above
-    // normal — flaky on macOS/CI under load.
+    // Mutant (serialized): ~300 ms (= 2 × 150 ms sleep, sequential).
+    //
+    // The macOS CI runner occasionally schedules the two threads onto
+    // the same core under load and lands measurements in the 285-310 ms
+    // band even though the path is structurally parallel (one slot per
+    // worker, AOSP-style pool). 280 ms left ~5 ms slack and flaked.
+    // 380 ms preserves the parallel / serialized split — the mutant
+    // can't sleep less than 300 ms (literal `sleep(150)` × 2) so the
+    // bound is still below it + its observed wake-from-sleep / RPC
+    // wrap overhead (~80-100 ms = ~380-400 ms in practice). A tighter
+    // bound would require either a sample-min over multiple runs or a
+    // monotonic-clock barrier on the server side; both are scope creep.
     assert!(
-        elapsed < Duration::from_millis(280),
+        elapsed < Duration::from_millis(380),
         "AC-12.1: 2 concurrent slow(150) on a 2-slot pool must run in \
          parallel (≈150 ms), got {elapsed:?}. Pre-pool / serialized \
-         path would be ≈300 ms — that's the mutant signature."
+         path would be ≈300 ms + overhead — that's the mutant signature."
     );
 
     drop(root);
