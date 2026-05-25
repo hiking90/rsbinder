@@ -54,11 +54,18 @@ use crate::rpc::RpcSession;
 include!(concat!(env!("OUT_DIR"), "/accessor_16.rs"));
 
 pub use android::os::IAccessor::{
-    BnAccessor, BpAccessor, IAccessor, IAccessorAsync, IAccessorAsyncService, IAccessorDefault,
-    IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
+    BnAccessor, BpAccessor, IAccessor, IAccessorDefault, IAccessorDefaultRef,
+    ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
     ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
     ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
+// The async-trait variants (`IAccessorAsync`, `IAccessorAsyncService`)
+// are only emitted by the codegen when the runtime crate's `async`
+// feature is on — see [`rsbinder/build.rs`] (`set_async_support`).
+// Re-export them under the same gate so sync-only RPC builds
+// (`--no-default-features --features rpc,...`) compile cleanly.
+#[cfg(feature = "async")]
+pub use android::os::IAccessor::{IAccessorAsync, IAccessorAsyncService};
 
 /// Wrapper `IBinder` that pins the underlying [`RpcSession`] alive for
 /// as long as the user holds the binder returned by the accessor

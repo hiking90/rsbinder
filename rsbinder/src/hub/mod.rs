@@ -234,11 +234,15 @@ pub mod android_16 {
     #[cfg(feature = "rpc")]
     pub use super::accessor_16::{
         __fuzz_accessor_error_decode, accessor_error_name, resolve_accessor, BnAccessor,
-        BpAccessor, IAccessor, IAccessorAsyncService, IAccessorDefault, IAccessorDefaultRef,
+        BpAccessor, IAccessor, IAccessorDefault, IAccessorDefaultRef,
         ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
         ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
         ERROR_UNSUPPORTED_SOCKET_FAMILY,
     };
+    // Async-trait re-export gated on the runtime `async` feature —
+    // mirrors the codegen gate in `accessor_16::pub use ...`.
+    #[cfg(all(feature = "rpc", feature = "async"))]
+    pub use super::accessor_16::IAccessorAsyncService;
     /// Subplan 2-14 register-side public surface (A0.1–A0.3 + A.4 + A.5).
     #[cfg(feature = "rpc")]
     pub use super::accessor_register::{
