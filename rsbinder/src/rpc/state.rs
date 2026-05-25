@@ -148,7 +148,7 @@ impl RpcState {
     /// Returns `(proxy, excess)`. `excess == true` means a still-live
     /// proxy for `addr` was reused — i.e. this is a **duplicate
     /// receipt** of a binder we already proxy. Because the sender bumps
-    /// its `timesSent` on every send ([`on_binder_leaving`]) but our
+    /// its `timesSent` on every send (`on_binder_leaving`) but our
     /// one deduped proxy only `DEC_STRONG`s once at its drop, the
     /// caller owes the sender one excess `DEC_STRONG` for this receipt
     /// (AOSP `flushExcessBinderRefs`). The caller must send it

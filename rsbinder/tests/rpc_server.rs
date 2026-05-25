@@ -1790,6 +1790,9 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
 
 // ---- AC-3.9 P6: no globals anywhere in the RPC stack ---------------
 
+// Source-scan: needs `env!("CARGO_MANIFEST_DIR")/src/rpc/*.rs` at
+// runtime, which is absent on a cross-compiled Android device.
+#[cfg(not(target_os = "android"))]
 #[test]
 fn rpc_stack_has_no_globals() {
     // Static gate (master §6.2 V5 / AC-3.9): the RPC module must not

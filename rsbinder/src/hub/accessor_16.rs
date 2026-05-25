@@ -187,7 +187,7 @@ impl IBinder for AccessorRoot {
 ///    [`accessor_error_name`] in B.6 logging).
 /// 4. `RpcSession::from_preconnected_fd(fd, max_version=2)` —
 ///    android-16 max wire version.
-/// 5. `get_root()` → wrap in [`AccessorRoot`] so the session stays
+/// 5. `get_root()` → wrap in `AccessorRoot` so the session stays
 ///    alive until the caller drops the returned binder.
 ///
 /// Returns `None` on any failure (instance-name mismatch, transport

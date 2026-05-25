@@ -158,6 +158,40 @@ jobs:
             cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e || exit 1
           done
 
+  macos-build:
+    # macOS is a first-class target per plan 2-9 (Phase A+B). The
+    # kernel-binder path is Linux/Android-only, so the matrix here is
+    # workspace check + RPC stack (mem/unix/tls backends) — no
+    # binderfs, no servicemanager. Closes the "macOS first-class
+    # advertised, 0 CI jobs" gap from the comprehensive review.
+    name: macOS Build
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace check (all features)
+        run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: ""
+      - name: rsbinder-tools build (rsb_device + rsb_hub compile-only)
+        run: cargo build -p rsbinder-tools --release
+      - name: rsb_device unit (mounts parser)
+        run: cargo test -p rsbinder-tools --bin rsb_device
+      - name: RPC hermetic (default — multi-conn cfg-gated out)
+        run: |
+          cargo test -p rsbinder --features rpc --lib rpc::
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
+          cargo test -p rsbinder --features rpc-tls --test rpc_tls
+          cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
+      - name: RPC hermetic (experimental multi-conn)
+        run: |
+          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
+
   android-build:
     name: Android Build
     runs-on: ubuntu-latest

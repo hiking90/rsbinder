@@ -347,7 +347,7 @@ impl RpcServer {
     ///
     /// **Sequencing (subplan 2-8 §0.3/§9):** advertising `2` is sound
     /// only because the Parcel binder/FD object-position producer
-    /// (Phase B — [`Parcel::rpc_record_object_position`], the
+    /// (Phase B — `Parcel::rpc_record_object_position`, the
     /// `records_binder_positions`/`records_fd_positions` profile gate)
     /// is compiled in unconditionally here. Were this a Phase-A-only
     /// build, `2` would frame a *binder-bearing* parcel with an empty
@@ -450,7 +450,7 @@ impl RpcServer {
     /// Lock ladder: collect the live `Arc<RpcSessionInner>` snapshot
     /// **first** (releasing the `sessions` mutex), then walk each
     /// session's `state` mutex (via the inner's
-    /// [`local_node_count`](RpcSessionInner::local_node_count) delegate
+    /// `local_node_count` delegate
     /// — Phase A4 (F8) keeps this public surface byte-unchanged).
     /// Avoids the nested-lock pattern (`sessions` → `state`); a
     /// poisoned `state` lock in one session no longer poisons
