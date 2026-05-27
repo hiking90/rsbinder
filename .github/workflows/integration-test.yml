@@ -1,14 +1,30 @@
 name: Integration Test
 
-# Combined Linux + Android integration test suite — manual trigger only.
+# Combined Linux + Android + macOS RPC integration test suite — manual
+# trigger only.
 #
-# Both jobs are cost-sensitive (the Linux binder job builds the workspace and
-# loops cargo test against a live rsb_hub; the Android matrix boots a full
-# emulator per API level). To keep CI minutes predictable, neither runs on
-# push/pull_request — the maintainer dispatches the workflow when integration
-# coverage is wanted (e.g. before cutting a release, or to validate a fix
-# that touches binder/IPC paths). A single dispatch runs both jobs in
-# parallel, which is the "one request runs both tests" entry point.
+# All jobs are cost-sensitive (the Linux binder job builds the workspace
+# and loops cargo test against a live rsb_hub; the Android matrix boots
+# a full emulator per API level; the macOS job runs on a ~10× minute-
+# priced runner). To keep CI minutes predictable, none runs on
+# push/pull_request — the maintainer dispatches the workflow when
+# integration coverage is wanted (e.g. before cutting a release, or to
+# validate a fix that touches binder/IPC/RPC paths). A single dispatch
+# runs all three in parallel, which is the "one request runs all tests"
+# entry point.
+#
+# Scope split with `build.yml`:
+#   * `build.yml` runs hermetic in-process RPC tests once per PR on
+#     Linux + macOS (`rpc::` lib, `rpc_e2e`/`rpc_server`/`rpc_fd`/
+#     `rpc_tls`/`rpc_accessor`). It catches compile + first-shot
+#     correctness regressions on every commit.
+#   * This file's `macos-rpc-test` adds (a) genuine cross-process e2e
+#     via `rpc_hello_service` + `rpc_hello_client` binaries (exercises
+#     fd lifetime, socket cleanup, process-level death — paths the
+#     in-process tests can hide) and (b) a soak loop over the same
+#     hermetic tests to race-mine macOS scheduler/timing flakes (e.g.
+#     AC-12.1 cv-wait `pool_exhausted_condvar_blocks_not_busy_loops`,
+#     which slipped past a single-shot run in PR #133).
 
 on:
   workflow_dispatch:
@@ -25,6 +41,11 @@ on:
         type: boolean
       run_android:
         description: 'Run the Android emulator matrix'
+        required: false
+        default: true
+        type: boolean
+      run_macos:
+        description: 'Run the macOS RPC integration test'
         required: false
         default: true
         type: boolean
@@ -538,3 +559,131 @@ jobs:
           done
         " || echo "Test execution completed with timeout"
         echo "All 20 test iterations attempted on Android API level ${{ matrix.api-level }}"
+
+  # --------------------------------------------------------------------------
+  # macOS RPC integration test — cross-process e2e + hermetic soak
+  # --------------------------------------------------------------------------
+  # macOS is a first-class target per plan 2-9 (Phase A+B). The kernel-binder
+  # path is Linux/Android-only, so this job covers the RPC transport only:
+  #
+  #   (a) Cross-process e2e — spawn `rpc_hello_service` + `rpc_hello_client`
+  #       as separate processes communicating over the Unix-socket RPC
+  #       transport. This exercises fd lifetime, socket cleanup, and
+  #       process-level death semantics that the in-process tests in
+  #       `build.yml`'s `macos-build` job (server + client threads sharing
+  #       one address space) cannot reach.
+  #
+  #   (b) Hermetic soak — re-run the same RPC test set that `macos-build`
+  #       runs once per PR, this time N times in a loop, to race-mine
+  #       macOS-specific scheduler/timing flakes. AC-12.1 cv-wait
+  #       (`pool_exhausted_condvar_blocks_not_busy_loops`) is the
+  #       canonical example: a single shot passed at merge time but
+  #       flaked on PR #133 with ~221 ms scheduling slack vs the ~50-100 ms
+  #       assumed by the bound. The soak is the gate that would have
+  #       caught it before merge.
+  #
+  # Iteration counts are hardcoded (5x per test set), not driven off the
+  # `iterations` workflow input — that input is documented as the Linux
+  # binder loop count and defaults to 100, which on a ~10× priced macOS
+  # runner would blow the cost envelope. The 5x is a starting point and
+  # can be tuned upward if flake rates remain too high.
+  macos-rpc-test:
+    name: macOS RPC Integration Test
+    if: github.actor == github.repository_owner && github.event.inputs.run_macos != 'false'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cross-process RPC binaries (rpc_hello_service + rpc_hello_client)
+        # Both binaries are declared `required-features = ["rpc"]` in
+        # `example-hello/Cargo.toml` and use only `setup_unix_server` /
+        # `setup_unix_client`, which are plan 2-9 Phase A first-class on
+        # macOS (no Android-specific deps).
+        run: |
+          cargo build -p example-hello --features rpc \
+            --bin rpc_hello_service --bin rpc_hello_client
+
+      - name: Cross-process RPC e2e (rpc_hello_service <-> rpc_hello_client x10)
+        run: |
+          # Belt-and-suspenders socket cleanup: the service binary unlinks
+          # the path on startup, but a previous failed run on a warm
+          # runner could leave a stale FD/file behind.
+          rm -f /tmp/rsb_hello_rpc.sock
+          RUST_LOG=info nohup target/debug/rpc_hello_service \
+            > rpc_hello_service.log 2>&1 &
+          echo $! > rpc_hello_service.pid
+          # Wait up to 10 s for the service to bind. `setup_unix_server`
+          # binds synchronously before returning, but `serve_blocking`
+          # then runs on a spawned thread — the listener fd is alive as
+          # soon as the unix socket file is `S_IFSOCK` on disk.
+          for i in $(seq 1 20); do
+            [ -S /tmp/rsb_hello_rpc.sock ] && break
+            sleep 0.5
+          done
+          if [ ! -S /tmp/rsb_hello_rpc.sock ]; then
+            echo "::error::rpc_hello_service did not bind /tmp/rsb_hello_rpc.sock within 10s"
+            cat rpc_hello_service.log
+            exit 1
+          fi
+          # 10 separate client process invocations — each one builds a
+          # fresh `RpcSession`, opens a fresh transport, runs the
+          # transact, and drops everything on exit. This is the cross-
+          # process angle the in-process tests can't reach.
+          for i in $(seq 1 10); do
+            echo "=== client iteration $i / 10 ==="
+            if ! target/debug/rpc_hello_client; then
+              echo "::error::rpc_hello_client failed on iteration $i"
+              cat rpc_hello_service.log
+              exit 1
+            fi
+          done
+
+      - name: Stop rpc_hello_service
+        if: always()
+        run: |
+          [ -f rpc_hello_service.pid ] && kill "$(cat rpc_hello_service.pid)" 2>/dev/null || true
+          rm -f /tmp/rsb_hello_rpc.sock
+
+      - name: Hermetic soak — rpc (default, mem/unix backends) x5
+        run: |
+          for i in $(seq 1 5); do
+            echo "=== rpc default soak iteration $i / 5 ==="
+            cargo test -p rsbinder --features rpc --lib rpc:: || exit 1
+            cargo test -p rsbinder --features rpc \
+              --test rpc_e2e --test rpc_server --test rpc_fd || exit 1
+          done
+
+      - name: Hermetic soak — rpc-tls x5
+        run: |
+          for i in $(seq 1 5); do
+            echo "=== rpc-tls soak iteration $i / 5 ==="
+            cargo test -p rsbinder --features rpc-tls --test rpc_tls || exit 1
+          done
+
+      - name: Hermetic soak — rpc-experimental-multiconn x5 (AC-12.1 timing flake gate)
+        # The multi-conn `rpc_server.rs` tests include the cv-wait timing
+        # band assertions (AC-12.1 family). On macOS-latest under load,
+        # these flake at a low single-shot rate; the 5x soak is the
+        # explicit gate against landing a regression that single-shot
+        # `build.yml` happens to pass.
+        run: |
+          for i in $(seq 1 5); do
+            echo "=== multi-conn soak iteration $i / 5 ==="
+            cargo test -p rsbinder --features rpc-experimental-multiconn \
+              --test rpc_server || exit 1
+          done
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-rpc-logs-${{ github.run_attempt }}
+          path: |
+            rpc_hello_service.log
+          if-no-files-found: ignore
