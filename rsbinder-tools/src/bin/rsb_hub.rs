@@ -761,7 +761,7 @@ impl IServiceManager for ServiceManager {
             return Err((ExceptionCode::Security, msg.as_str()).into());
         }
 
-        if arg_service.clone() != service.binder.clone() {
+        if service.binder != *arg_service {
             let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
             log::warn!("{}", &msg);
             return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
