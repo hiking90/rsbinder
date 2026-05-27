@@ -1183,7 +1183,7 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError
 fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     // println!("parse_factor {:?}", pair);
     match pair.as_rule() {
-        Rule::expression => parse_expression(pair.clone().into_inner()),
+        Rule::expression => parse_expression(pair.into_inner()),
         Rule::unary => parse_unary(pair.into_inner()),
         Rule::value => parse_value(pair.into_inner().next().unwrap()),
         _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
@@ -1200,7 +1200,7 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr,
         | Rule::shift
         | Rule::arith
         | Rule::logical_or
-        | Rule::logical_and => parse_expression(pair.clone().into_inner()),
+        | Rule::logical_and => parse_expression(pair.into_inner()),
         Rule::factor => parse_factor(pair.into_inner().next().unwrap()),
         _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
     }
@@ -1301,7 +1301,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
             Ok(ConstExpr::new(ValueType::Char(ch)))
         }
 
-        Rule::expression => parse_expression(pair.clone().into_inner()),
+        Rule::expression => parse_expression(pair.into_inner()),
 
         Rule::string_expr => parse_string_expr(pair.into_inner()),
 
