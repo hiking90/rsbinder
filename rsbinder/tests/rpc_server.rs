@@ -1595,17 +1595,26 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     // 2 slots, 3 callers ⇒ 2 waves: 200 + 200 = 400 ms minimum (no
     // sub-200 timing because the 3rd MUST wait for a slot).
     //
-    // **Margins (review fix — the prior `slow(120)` + 220-380 ms bound
-    // left only 20 ms below the mutant signature on CI / macOS).**
-    // Normal (2 parallel waves): ~400 ms + RPC/scheduling slack
-    //   (typically ~50-100 ms) ⇒ ~400-500 ms.
+    // Normal (2 parallel waves): ~400 ms + RPC/scheduling slack.
     // Mutant (fully serial, 3 × 200): ~600 ms + slack.
+    //
+    // The mutant signature is the *200 ms gap* between waves and serial,
+    // which is preserved regardless of absolute slack (both arms pay the
+    // same scheduling/RPC overhead). So the bound floats with slack as
+    // long as it stays comfortably below `normal + 200 ms`.
+    //
+    // macOS-latest CI under load measured 621 ms on the parallel path
+    // (~221 ms slack — far above the ~50-100 ms assumed in the original
+    // 550 ms bound). On the same loaded runner a serial mutant would land
+    // at ~821 ms (600 + 221). The 700 ms upper bound therefore: (a) clears
+    // the observed normal max with ~79 ms cushion, and (b) still trips on
+    // any mutant whose slack is ≤ ~100 ms (the common case on Linux CI).
+    // Same `1feaf52` pattern as the sibling pool test.
+    //
     // Lower bound 380 ms rejects anything that finished in *one* wave
-    // (i.e. a 3-slot pool or a non-blocking 3rd caller); upper bound
-    // 550 ms gives the normal path 150 ms headroom while still being
-    // ~50 ms below the mutant.
+    // (i.e. a 3-slot pool or a non-blocking 3rd caller).
     assert!(
-        elapsed >= Duration::from_millis(380) && elapsed < Duration::from_millis(550),
+        elapsed >= Duration::from_millis(380) && elapsed < Duration::from_millis(700),
         "AC-12.1 cv-wait: 3 concurrent slow(200) on 2 slots should be \
          2 parallel waves ≈ 400 ms (got {elapsed:?}); mutant (serial) is ≈600 ms"
     );
