@@ -133,7 +133,9 @@ When `None` is passed over a Binder transaction, a null marker is written to the
 
 ### Heap-Allocated Nullable: @nullable(heap=true)
 
-For recursive or self-referential types, use `@nullable(heap=true)` to wrap the field in a `Box<T>`:
+AOSP AIDL uses `@nullable(heap=true)` to mark fields of recursive or
+self-referential parcelables, so that the C++ and Java backends know to
+allocate the inner value on the heap:
 
 ```aidl
 parcelable RecursiveList {
@@ -142,7 +144,7 @@ parcelable RecursiveList {
 }
 ```
 
-This generates:
+The Rust backend generates:
 
 ```rust
 pub struct RecursiveList {
@@ -151,9 +153,17 @@ pub struct RecursiveList {
 }
 ```
 
-The `Box` indirection is necessary because without it, `RecursiveList` would contain itself directly, making the type infinitely large. The `heap=true` parameter places the inner value on the heap, giving the struct a finite, known size at compile time.
+The `Box` indirection is necessary because without it, `RecursiveList` would contain itself directly, making the type infinitely large.
 
-Use `@nullable(heap=true)` only when you need recursive structures. For non-recursive optional fields, plain `@nullable` is sufficient and avoids the extra heap allocation.
+In rsbinder, the `Box<T>` wrapping is driven by **self-reference detection in
+the code generator**, not by the `heap=true` parameter — the parameter is
+accepted for AOSP-faithful AIDL syntax compatibility but does not itself
+control the wrapping. Whenever a parcelable field references the enclosing
+parcelable's own type, the generator emits `Box<...>` around it to give the
+struct a known size. Keep the `heap=true` form when writing AIDL that must
+also compile under the AOSP toolchain.
+
+For non-recursive optional fields, plain `@nullable` is sufficient and avoids the extra heap allocation.
 
 ## @utf8InCpp
 
@@ -287,7 +297,7 @@ The following table provides a quick reference for all annotations covered in th
 | `@RustDerive` | parcelable, union | Adds `derive` attributes (`Clone`, `Copy`, `PartialEq`) |
 | `@Backing` | enum | Sets the backing integer type (`i8`, `i32`, `i64`) |
 | `@nullable` | field, param, return | Maps to `Option<T>` |
-| `@nullable(heap=true)` | field | Maps to `Option<Box<T>>` for recursive types |
+| `@nullable(heap=true)` | field | AOSP-faithful syntax for recursive fields; rsbinder boxes self-referential fields automatically (parameter accepted but not required) |
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
 | `@VintfStability` | parcelable, interface | Enforces VINTF stability rules |

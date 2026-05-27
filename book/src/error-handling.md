@@ -85,17 +85,21 @@ status.is_ok()               // -> bool
 
 `ExceptionCode` classifies the kind of error:
 
-| Variant                | Meaning                                    |
-|------------------------|--------------------------------------------|
-| `None`                 | No error                                   |
-| `Security`             | Security / permission violation            |
-| `BadParcelable`        | Malformed parcelable data                  |
-| `IllegalArgument`      | Invalid argument provided                  |
-| `NullPointer`          | Unexpected null value                      |
-| `IllegalState`         | Operation invalid for current state        |
-| `UnsupportedOperation` | Requested operation is not supported       |
-| `ServiceSpecific`      | Application-defined error with custom code |
-| `TransactionFailed`    | Low-level transaction failure              |
+| Variant                | Wire value | Meaning                                                        |
+|------------------------|-----------:|----------------------------------------------------------------|
+| `None`                 |          0 | No error                                                       |
+| `Security`             |         -1 | Security / permission violation                                |
+| `BadParcelable`        |         -2 | Malformed parcelable data                                      |
+| `IllegalArgument`      |         -3 | Invalid argument provided                                      |
+| `NullPointer`          |         -4 | Unexpected null value                                          |
+| `IllegalState`         |         -5 | Operation invalid for current state                            |
+| `NetworkMainThread`    |         -6 | Network operation on main thread (Java compatibility)          |
+| `UnsupportedOperation` |         -7 | Requested operation is not supported                           |
+| `ServiceSpecific`      |         -8 | Application-defined error with custom code                     |
+| `Parcelable`           |         -9 | Embedded user parcelable exception (Java compatibility)        |
+| `HasReplyHeader`       |       -128 | Internal: reply parcel carries a header (Java-specific marker) |
+| `TransactionFailed`    |       -129 | Low-level transaction failure                                  |
+| `JustError`            |       -256 | Generic error fallback used internally by the library          |
 
 ## Returning Errors from a Service
 
