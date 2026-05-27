@@ -231,7 +231,7 @@ fn gen_rpc_session_id() -> RpcResult<RpcSessionId> {
     // (`EAGAIN`/`EINTR` mapping in the `getrandom` crate), and prior
     // to this the panic unwound through `RpcSession::new`'s
     // infallible signature with no way for callers to handle.
-    getrandom::getrandom(&mut id).map_err(|e| {
+    getrandom::fill(&mut id).map_err(|e| {
         RpcError::Io(std::io::Error::other(format!(
             "CSPRNG getrandom failed for RPC session id: {e}"
         )))
