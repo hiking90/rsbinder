@@ -137,7 +137,7 @@ When the client passes `None`, the service receives `None` and can return `None`
 
 ## Recursive Structures
 
-AIDL supports self-referential parcelable types using the `@nullable(heap=true)` annotation. This is necessary because a struct that directly contains itself would have infinite size. The `heap=true` attribute causes the field to be wrapped in `Box<T>` in the generated Rust code, which places the recursive field on the heap and gives the type a known size at compile time.
+AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility, but the actual `Box<T>` wrapping is emitted by the code generator whenever a field references the enclosing parcelable's own type — the `heap=true` parameter is not what triggers it.
 
 AIDL definition (from `RecursiveList.aidl` in the test suite):
 
@@ -148,7 +148,7 @@ parcelable RecursiveList {
 }
 ```
 
-This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`. The `@nullable` part makes it `Option`, and `heap=true` makes it `Box`-wrapped. Together they enable a linked-list pattern.
+This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`. The `@nullable` part makes it `Option`, and the self-reference detection adds the `Box` wrapper that gives the type a known size. Together they enable a linked-list pattern.
 
 Rust usage (based on the `test_reverse_recursive_list` test):
 
@@ -175,7 +175,7 @@ for n in 0..10 {
 assert!(current.is_none());
 ```
 
-Without `heap=true`, the compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type. The `Box` indirection solves this by storing the nested value behind a pointer.
+Without the `Box` indirection the Rust compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type. The code generator inserts that indirection automatically whenever it sees a field whose type matches the enclosing parcelable.
 
 ## ExtendableParcelable and ParcelableHolder
 
