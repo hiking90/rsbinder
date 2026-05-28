@@ -376,3 +376,109 @@ fn no_plaintext_network_backend_in_api() {
     // would be the natural place to construct it — its continued
     // absence is the gate. (Compile-time: nothing to call.)
 }
+
+/// **Plan 2-15 E1 — TCP+TLS server e2e via `RpcServer::setup_tcp_server_tls`.**
+/// The pre-E1 TLS tests had to build the server as a manual
+/// `TcpListener` + thread-spawned `RpcSession::new(Acceptor)` because
+/// `RpcServer` was UDS-only. With E1 the server is a real `RpcServer`:
+/// accept loop, worker-thread TLS handshake (so a slow-handshake peer
+/// never stalls accept), authorizer hook (post-handshake peer-id), and
+/// the rest of the `RpcServer` knob set all work unchanged.
+///
+/// **Mutant gate**: dropping the `*server.tls_config.lock() =
+/// Some(config)` line in `setup_tcp_server_tls` (or returning `None`
+/// from `tls_snapshot()`) leaves the worker wrapping the accepted
+/// TcpStream with the plain branch — `RawAccepted::Tcp(_)` then hits
+/// the "plain-text TCP server is not exposed" error, the worker exits
+/// without serving, the client's TLS handshake times out / errors.
+#[test]
+fn setup_tcp_server_tls_e2e() {
+    use rsbinder::rpc::RpcServer;
+
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server =
+        RpcServer::setup_tcp_server_tls("127.0.0.1:0", srv_cfg).expect("setup_tcp_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    let addr = server.tcp_address().expect("tcp_address");
+    // E0 accessor gates: tcp_address Some, path None.
+    assert!(server.path().is_none(), "TCP server has no fs path");
+    let bg = server.run_background();
+
+    // Use the matching one-call client convenience constructor — the
+    // helper itself goes through `setup_tcp_client_tls`'s normal
+    // TCP-connect → TLS-handshake → R34 session path.
+    let client = RpcSession::setup_tcp_client_tls(addr, "localhost", client_config_trusting(CA))
+        .expect("setup_tcp_client_tls");
+    let root = client.get_root().expect("get_root over TCP+TLS server");
+    assert_eq!(ping_via(&root, "e1-tcp").unwrap(), "pong:e1-tcp");
+    assert_eq!(ping_via(&root, "").unwrap(), "pong:");
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+}
+
+/// **Plan 2-15 E1 — UDS+TLS server e2e via `RpcServer::setup_unix_server_tls`.**
+/// TLS is socket-kind-orthogonal (AOSP `RpcTransportCtx::newTransport(fd)`);
+/// the same TLS handshake runs over a UnixStream once `RpcServer` no
+/// longer pins the listener to UDS-without-TLS. Demonstrates the
+/// E0 listener generalization carrying the E1 TLS path through it.
+#[test]
+fn setup_unix_server_tls_e2e() {
+    use rsbinder::rpc::RpcServer;
+
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rsb_rpc_unix_tls_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server = RpcServer::setup_unix_server_tls(&path, srv_cfg).expect("setup_unix_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    assert_eq!(
+        server.path(),
+        Some(path.as_path()),
+        "UDS+TLS server still exposes its fs path"
+    );
+    let bg = server.run_background();
+    // Wait for the socket file to appear (bounded).
+    for _ in 0..400 {
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(path.exists(), "UDS server socket must appear");
+
+    // Client: open the UDS by hand and run the TLS handshake on it
+    // via `TlsTransport::connect_stream` (the socket-kind-orthogonal
+    // client API). The R34 wire then carries the AIDL e2e.
+    let unix_client = UnixStream::connect(&path).expect("unix connect");
+    let client_t = TlsTransport::connect_stream(
+        Box::new(unix_client),
+        "localhost",
+        client_config_trusting(CA),
+    )
+    .expect("client TLS handshake over UDS+TLS server");
+    let client =
+        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let root = client.get_root().expect("get_root over UDS+TLS");
+    assert_eq!(ping_via(&root, "e1-uds").unwrap(), "pong:e1-uds");
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+}

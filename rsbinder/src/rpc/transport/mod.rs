@@ -38,7 +38,7 @@ pub use mem::MemTransport;
 #[cfg(feature = "rpc-tcp-debug")]
 pub use tcp_debug::{insecure_warning_emitted, TcpDebugTransport};
 #[cfg(feature = "rpc-tls")]
-pub use tls::TlsTransport;
+pub use tls::{TlsStream, TlsTransport};
 pub use unix::UnixTransport;
 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
 pub use vsock::VsockTransport;
