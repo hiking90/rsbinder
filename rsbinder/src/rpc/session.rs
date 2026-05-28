@@ -17,12 +17,13 @@
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use super::fd_mode::FileDescriptorTransportMode;
+use super::lifecycle::SessionLifecycle;
 use crate::binder::{SIBinder, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
 use crate::error::{Result, StatusCode};
 use crate::parcel::{Parcel, RpcParcelOps};
@@ -463,8 +464,8 @@ impl Drop for ConnGuard<'_> {
 /// one logical session* (AOSP `RpcSession` shares this across its
 /// `mOutgoing`/`mIncoming` connections). One per session, behind `Arc`;
 /// never global (P6). Default single-connection sessions own exactly
-/// one of these with `live_conns == 1` ⇒ behavior is byte-identical to
-/// the pre-A0b single-`transport` `RpcSessionInner` (the `Arc`
+/// one of these with `lifecycle == Live(1)` ⇒ behavior is byte-identical
+/// to the pre-A0b single-`transport` `RpcSessionInner` (the `Arc`
 /// indirection is the only structural change; the wire is unchanged).
 /// The server attaches a 2nd+ connection to a *pre-existing* instance
 /// (id-demux), so a binder published over one connection is reachable
@@ -498,18 +499,24 @@ pub(crate) struct SharedSession {
     /// connection reports the *same* id). [`RpcSessionId`] newtype
     /// (R2) makes the "attach capability" semantic type-explicit.
     rpc_session_id: RpcSessionId,
-    /// **F4 (Phase A0b)**: number of live connections driving this
-    /// session. Starts at 1 (the founding connection); the server's
-    /// id-demux attach bumps it. `serve_blocking` decrements on exit
-    /// and fires the session obituaries **only** on the 1→0 edge (full
-    /// session teardown) — never on a *partial* connection loss, which
-    /// would otherwise deliver a spurious `binder_died` to the peer
-    /// while other connections of the session are still live.
-    live_conns: AtomicUsize,
-    /// Idempotency latch for the above (a race between the last two
-    /// connections tearing down must still send obituaries exactly
-    /// once).
-    obituary_sent: AtomicBool,
+    /// **F4 (Phase A0b) + §7.3 R1 typed lifecycle.** Atomic-backed
+    /// `Live(n: NonZeroUsize) / Dying / Dead` state machine; replaces
+    /// the prior `live_conns: AtomicUsize` + `obituary_sent: AtomicBool`
+    /// pair. The founding connection starts in `Live(1)`; the server's
+    /// id-demux attach calls
+    /// [`try_bump_live`](super::lifecycle::SessionLifecycle::try_bump_live)
+    /// (CAS-loop — closes the review-R2 multi-attacker hole at the type
+    /// level). `serve_blocking_on` exit calls `drop_connection`; on the
+    /// `1→0` edge (full session teardown) the caller fires the session
+    /// obituaries and then `mark_dead`s. The intermediate `Dying` state
+    /// surfaces as
+    /// [`is_torn_down()`](super::lifecycle::SessionLifecycle::is_torn_down)
+    /// `== true` *before* the obituary completes, so `RpcProxy::drop`
+    /// best-effort reapers skip immediately instead of blocking on an
+    /// empty slot pool — a strict improvement over the prior
+    /// `obituary_sent.load()` (which only flipped after the callback
+    /// returned).
+    lifecycle: SessionLifecycle,
 }
 
 impl SharedSession {
@@ -527,63 +534,21 @@ impl SharedSession {
     /// Current live connection count — the F4 ledger primitive. Used
     /// by tests as a *deterministic* witness that a connection-drop
     /// has been fully reaped by its server worker (`serve_blocking_on`
-    /// exit's `live_conns.fetch_sub`), replacing the prior
-    /// `sleep(50ms)` heuristic in `a0b_multi_connection_shared_session`
-    /// that raced server-scheduler jitter. Always observes the latest
-    /// monotonic value (SeqCst).
+    /// exit's `drop_connection`), replacing the prior `sleep(50ms)`
+    /// heuristic in `a0b_multi_connection_shared_session` that raced
+    /// server-scheduler jitter. `0` in both `Dying` and `Dead`.
     pub(crate) fn live_conn_count(&self) -> usize {
-        self.live_conns.load(Ordering::SeqCst)
+        self.lifecycle.live_count()
     }
 
-    /// **F4 anti-resurrection primitive.** Atomically add one to
-    /// `live_conns` *if* the session is still alive. Returns `false`
-    /// when the session is already torn down — `obituary_sent` is set,
-    /// or `live_conns` has reached 0 (the founding worker raced past
-    /// `live_conns.fetch_sub` between `resolve_session.upgrade()` and
-    /// this call). Without this gate the attaching connection would
-    /// resurrect a dead session whose obituaries already fired,
-    /// silently losing `binder_died` for any `DeathRecipient` linked
-    /// through the attached connection.
-    ///
-    /// **CAS-loop rather than optimistic-bump-then-rollback**: an
-    /// earlier "fetch_add → if (prev==0 || obituary_sent) fetch_sub"
-    /// shape closed the *single-attacker* race but had a real
-    /// **multi-attacker** hole — two concurrent attackers A and B both
-    /// bumping after the founding `fetch_sub`'d to 0 produces the
-    /// linearization
-    /// ```text
-    /// founding fetch_sub  1→0  (was_last=true)
-    /// A fetch_add         0→1  (A sees prev=0 → will roll back)
-    /// B fetch_add         1→2  (B sees prev=1, obituary_sent still
-    ///                           false → returns true and attaches!)
-    /// A fetch_sub         2→1  (A's rollback)
-    /// founding CAS obituary_sent false→true  → fires
-    /// final: live_conns=1, obituary_sent=true ⇒ B silently in a dead
-    ///        session, its DeathRecipients never get binder_died
-    /// ```
-    /// because B sees the inflated `prev` from A's bump before A
-    /// rolls back. A value-decision CAS loop closes this: every bump
-    /// is conditional on the *value* of `live_conns`, so `0` is never
-    /// transiently visible as `≥ 1` to a subsequent attacker, and any
-    /// CAS racing the founding's `fetch_sub` either succeeds on a
-    /// still-positive count (founding then observes `prev > 1` and
-    /// doesn't fire) or fails and retries against the 0 it left.
+    /// **F4 anti-resurrection primitive.** Thin wrapper around
+    /// [`SessionLifecycle::try_bump_live`] — see the type doc on
+    /// [`super::lifecycle::SessionLifecycle`] for the CAS-loop
+    /// rationale (review-R2 multi-attacker hole) and §7.3 R1 (typed
+    /// lifecycle that makes `Dying`/`Dead` unobservable as a transient
+    /// "still Live" state from any other observer).
     pub(crate) fn try_bump_live_conns(&self) -> bool {
-        let mut cur = self.live_conns.load(Ordering::SeqCst);
-        loop {
-            if cur == 0 || self.obituary_sent.load(Ordering::SeqCst) {
-                return false;
-            }
-            match self.live_conns.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => cur = actual,
-            }
-        }
+        self.lifecycle.try_bump_live()
     }
 }
 
@@ -1337,7 +1302,7 @@ impl RpcSessionInner {
     /// `RpcProxy::drop` semantics (a dead session ⇒ peer
     /// observationally gone, AOSP parity).
     pub(crate) fn queue_dec_strong(&self, addr: RpcAddress) {
-        if self.shared.obituary_sent.load(Ordering::Acquire) {
+        if self.shared.lifecycle.is_torn_down() {
             return;
         }
         // Fast path: synchronous send when a slot is immediately
@@ -1355,15 +1320,17 @@ impl RpcSessionInner {
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress) -> Result<()> {
         // `RpcProxy::drop` (best-effort) and `read_binder`'s F7
         // excess-flush call this from arbitrary threads/contexts.
-        // **Phase A4 (F8) shutdown guard**: once the session's
-        // obituary has fired, the peer is gone *and* the slot pool
-        // has either started shrinking via `remove_slot` or already
+        // **Phase A4 (F8) shutdown guard + §7.3 R1**: once the session
+        // leaves `Live` (Dying or Dead), the peer is gone *and* the slot
+        // pool has either started shrinking via `remove_slot` or already
         // emptied — `find_conn` on an empty pool would `cv.wait`
         // forever (no `add_slot` can race past F4
-        // `try_bump_live_conns`). Skip best-effort. AOSP parity: a
-        // remote `DEC_STRONG` on a dead session is observationally
-        // no-op (the peer's `RpcState` is gone).
-        if self.shared.obituary_sent.load(Ordering::Acquire) {
+        // `try_bump_live_conns`). Skip best-effort. R1's typed lifecycle
+        // makes this check observe the `Dying` window *before* the
+        // obituary completes, closing a narrow prior window where this
+        // path could find an empty pool after the founding worker had
+        // started its teardown but before `obituary_sent.load` flipped.
+        if self.shared.lifecycle.is_torn_down() {
             return Ok(());
         }
         // `find_conn` picks an available slot (or — if this thread is
@@ -1751,8 +1718,8 @@ impl RpcSession {
         ))
     }
 
-    /// A brand-new session's shared state (`live_conns == 1`, the
-    /// founding connection — Phase A0b F4). The default
+    /// A brand-new session's shared state (`lifecycle == Live(1)`, the
+    /// founding connection — Phase A0b F4 / §7.3 R1). The default
     /// single-connection path uses exactly one of these, so its
     /// behavior is byte-identical to the pre-A0b single-`transport`
     /// `RpcSessionInner`.
@@ -1766,8 +1733,7 @@ impl RpcSession {
             fd_mode: Mutex::new(FileDescriptorTransportMode::None),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
-            live_conns: AtomicUsize::new(1),
-            obituary_sent: AtomicBool::new(false),
+            lifecycle: SessionLifecycle::new(),
         }))
     }
 
@@ -1850,16 +1816,15 @@ impl RpcSession {
     /// Append a server-side *callback* slot — the wire mirror of the
     /// peer's `mIncoming` (AOSP `RpcServer.cpp`: `addOutgoingConnection
     /// (client, init=true)` for `incoming` headers). Does NOT bump
-    /// `live_conns` (callback slots are not serve-driven; AOSP also
-    /// does not gate session lifetime on `mOutgoing.size()`).
-    /// `Err(DeadObject)` if the session is already torn down.
+    /// the lifecycle count (callback slots are not serve-driven; AOSP
+    /// also does not gate session lifetime on `mOutgoing.size()`).
+    /// `Err(DeadObject)` if the session is already torn down (the §7.3
+    /// R1 lifecycle covers both `Dying` and `Dead` in a single check).
     pub(crate) fn add_callback_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
         // Snapshot gate, not CAS — a concurrent founding death after
         // this read is race-acceptable: the slot sits unused in a
         // dead session and is reclaimed via `Arc<RpcSessionInner>`.
-        if self.inner.shared.live_conn_count() == 0
-            || self.inner.shared.obituary_sent.load(Ordering::Acquire)
-        {
+        if self.inner.shared.lifecycle.is_torn_down() {
             return Err(StatusCode::DeadObject);
         }
         Ok(self.inner.add_slot_inner(transport))
@@ -2253,38 +2218,31 @@ impl RpcSession {
             }
             r
         };
-        // Phase A0b **F4**: this connection is finished. Fire the
-        // session obituaries only on the **last** connection's
-        // teardown (full session death) — never on a *partial*
-        // connection loss while other connections of the same session
-        // are still live (that would deliver a spurious `binder_died`
-        // to a peer that can still reach the session over another
-        // connection). `fetch_sub` returns the prior count, so exactly
-        // one caller observes the 1→0 edge; the `obituary_sent` CAS is
-        // an idempotency belt (a degenerate double-serve can't
-        // double-fire). The default single-connection session has
-        // `live_conns == 1`, so this is 1→0 → fire — **byte-identical
-        // death semantics to pre-A0b**.
-        let was_last = self.inner.shared.live_conns.fetch_sub(1, Ordering::SeqCst) == 1;
-        if was_last
-            && self
-                .inner
-                .shared
-                .obituary_sent
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
+        // Phase A0b **F4** + §7.3 **R1** typed lifecycle: this
+        // connection is finished. Fire the session obituaries only on
+        // the **last** connection's teardown (full session death) —
+        // never on a *partial* connection loss while other connections
+        // of the same session are still live (that would deliver a
+        // spurious `binder_died` to a peer that can still reach the
+        // session over another connection). `drop_connection` returns
+        // `true` for exactly the one caller observing the 1→0 edge
+        // (Live(1) → Dying); on `false` (Live(n>1) → Live(n-1)) other
+        // workers still drive the session. After firing, transition
+        // Dying → Dead via `mark_dead` so subsequent attach attempts
+        // and best-effort `dec_strong` calls see a settled state.
+        if self.inner.shared.lifecycle.drop_connection() {
             self.inner.send_session_obituaries();
+            self.inner.shared.lifecycle.mark_dead();
         }
         // Phase A4 (F8): drop this worker's slot from the pool **after**
-        // the F4 fetch_sub / obituary so a concurrent `RpcProxy::drop`'s
-        // best-effort `send_dec_strong` sees either (i) the slot still
-        // present (`find_conn` picks it, send returns `PeerClosed`,
-        // best-effort path Err — no deadlock) or (ii) `obituary_sent =
-        // true` (the dedicated `send_dec_strong` early-out below
+        // the F4 lifecycle transition + obituary so a concurrent
+        // `RpcProxy::drop`'s best-effort `send_dec_strong` sees either
+        // (i) the slot still present (`find_conn` picks it, send returns
+        // `PeerClosed`, best-effort path Err — no deadlock) or (ii) the
+        // lifecycle in Dying/Dead (the `send_dec_strong` early-out
         // short-circuits, skipping `find_conn` entirely). Removing the
-        // slot *before* the obituary opened a window where a stale
-        // proxy drop would find an empty pool and block forever on
+        // slot *before* the lifecycle transition opened a window where a
+        // stale proxy drop would find an empty pool and block forever on
         // `slot_cv` (no add_slot can race the obituary thanks to F4
         // `try_bump_live_conns`).
         self.inner.remove_slot(slot_id);
@@ -2628,7 +2586,7 @@ fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<RpcAddress>) {
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        if inner.shared.obituary_sent.load(Ordering::Acquire) {
+        if inner.shared.lifecycle.is_torn_down() {
             continue;
         }
         // `find_conn(false)` may briefly wait on `slot_cv` if the

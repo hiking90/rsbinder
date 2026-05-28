@@ -87,6 +87,7 @@
 
 pub mod address;
 pub mod fd_mode;
+pub(crate) mod lifecycle;
 pub mod proxy;
 pub mod server;
 pub mod session;

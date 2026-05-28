@@ -449,7 +449,8 @@ impl RpcServer {
     /// session keyed by `id`. `None` ⇒ no live session with that id
     /// (fully torn down or never registered). Lets tests `poll_until`
     /// for the server-side `serve_blocking_on` exit hook (which
-    /// `live_conns.fetch_sub`s) without the prior `sleep(N ms)`
+    /// transitions the typed `SessionLifecycle` `Live(n) → Live(n-1)`
+    /// or `Live(1) → Dying`; §7.3 R1) without the prior `sleep(N ms)`
     /// heuristic that raced scheduler jitter.
     pub fn session_live_conns(&self, id: &[u8; 32]) -> Option<usize> {
         // Public API keeps the raw-byte shape (R2 internal-only
