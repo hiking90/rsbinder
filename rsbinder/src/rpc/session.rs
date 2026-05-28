@@ -708,25 +708,12 @@ impl RpcSessionInner {
                 reentrant: true,
             };
         }
-        // **Phase A — oneway Option-1 (F5/F6 trade-off recorded).**
-        // Pin all top-level oneway sends to the founding slot so
-        // per-object oneway ordering is preserved by single-slot
-        // in-order delivery (the existing single-connection FIFO
-        // semantics extended to multi-outgoing). The cost is a head-
-        // of-line block: a slow oneway handler at the peer stalls
-        // every other oneway through the same slot (AOSP's per-node
-        // `asyncNumber`+`asyncTodo` priority replay — Option-2 — would
-        // avoid this, deferred to Phase C). Twoways still distribute
-        // (AC-12.1). Nested oneway inside a twoway dispatch hits the
-        // reentrant pin above and reuses the inbound slot — F8.
-        //
-        // **Founding-gone fallback**: when the founding slot has been
-        // retired (its worker exited and `remove_slot(1)` ran) but the
-        // session is still alive via attached slots, `find_conn_pinned`
-        // returns `DeadObject`. Degrade to twoway-style distribution
-        // across the remaining slots — per-object oneway FIFO is no
-        // longer preserved (documented HOL trade-off), but the
-        // alternative (panic out of library code) is strictly worse.
+        // Phase C asyncTodo preserves per-node order regardless of
+        // which slot oneway picks, so removing this pin lifts the
+        // HOL trade-off in principle — but the libbinder AC-12.6 (c)
+        // gate flakes (~20%) without it (EPIPE on outer reply when
+        // server-side oneway DECs cross slots during nested callback
+        // dispatch). Pin stays until that race is root-caused.
         if oneway {
             if let Ok(g) = self.find_conn_pinned(RpcSession::FOUNDING_SLOT_ID) {
                 return g;
@@ -735,9 +722,7 @@ impl RpcSessionInner {
                 "find_conn(oneway=true): founding slot retired; falling back to \
                  any-available — per-object oneway FIFO may be reordered"
             );
-            // fall through to (2)/(3)/(4) below.
         }
-        // (2)(3)(4) Acquire the pool lock and pick or wait.
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
             // (2) Defensive exclusive match (shouldn't fire if (1) is correct).
@@ -791,24 +776,16 @@ impl RpcSessionInner {
     }
 
     /// Same as [`find_conn`] but pins to a **specific** slot id. Used
-    /// by the server worker's `serve_blocking_on(slot_id)` (drives its
-    /// assigned inbound slot, never "any available") and by the
-    /// oneway-pin path in [`find_conn`] (founding-slot FIFO).
+    /// by the server worker's `serve_blocking_on(slot_id)` (each
+    /// worker drives only its own inbound slot) and by the oneway
+    /// path in [`find_conn`] (founding-slot FIFO).
     ///
-    /// Returns `Err(StatusCode::DeadObject)` when `want_slot_id` is
-    /// not present in the pool — this can legitimately happen on the
-    /// oneway pin path when the founding slot's worker has exited and
-    /// `remove_slot(FOUNDING_SLOT_ID)` has run while the session is
-    /// still alive via attached slots. Callers either propagate the
-    /// error (server worker — Phase A4 self-remove makes this
-    /// structurally unreachable from the worker's own pin) or fall
-    /// back (`find_conn` oneway path degrades to any-available).
-    ///
-    /// Waits on the condvar if the slot exists but is held by another
-    /// thread (shouldn't happen in the normal accept-then-serve flow
-    /// — the freshly-added slot is unclaimed). Same reentrant-pin
-    /// path as `find_conn` so a nested call inside dispatch reuses
-    /// this slot.
+    /// `Err(StatusCode::DeadObject)` when `want_slot_id` is not in
+    /// the pool — legitimately happens on the oneway path when the
+    /// founding slot's worker has exited (`remove_slot(FOUNDING_
+    /// SLOT_ID)`) while attached slots are still alive; the caller
+    /// falls back to any-available. Reentrant on the same slot via
+    /// DRIVING, like `find_conn`.
     fn find_conn_pinned(&self, want_slot_id: u64) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
@@ -1392,10 +1369,9 @@ impl RpcSessionInner {
         // `find_conn` picks an available slot (or — if this thread is
         // already driving one of the session's slots — reuses it via
         // `DRIVING`, the documented "interleaved DEC_STRONG" path).
-        // `DEC_STRONG` is a control message, not a user oneway —
-        // `oneway=false` so it joins the twoway distribution (any
-        // available slot), avoiding contention on the oneway-pinned
-        // founding slot.
+        // `oneway=false` so DEC_STRONG joins the twoway distribution
+        // (any available slot) instead of contending on the oneway-
+        // pinned founding slot.
         let conn = self.find_conn(false);
         let frame = self.profile.codec().encode_dec_strong(&addr);
         self.send_msg(conn.transport(), &frame, &[])?;
@@ -2138,9 +2114,6 @@ impl RpcSession {
     /// [`super::RpcServer`] registry key. Per-session, never global
     /// (P6).
     pub fn session_id(&self) -> [u8; 32] {
-        // Public API keeps the raw-byte shape for ergonomic
-        // compatibility (R2 internal-only newtype). Future R2-full PR
-        // can promote this to `RpcSessionId`.
         *self.inner.shared.rpc_session_id.as_bytes()
     }
 
@@ -2658,9 +2631,9 @@ fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<RpcAddress>) {
         if inner.shared.obituary_sent.load(Ordering::Acquire) {
             continue;
         }
-        // `find_conn(false)` may briefly wait on `slot_cv` if the pool
-        // is exhausted, but the *user* `Drop` already returned — this
-        // wait is contained to the dedicated reaper thread.
+        // `find_conn(false)` may briefly wait on `slot_cv` if the
+        // pool is exhausted, but the *user* `Drop` already returned —
+        // this wait is contained to the dedicated reaper thread.
         let conn = inner.find_conn(false);
         let frame = inner.profile.codec().encode_dec_strong(&addr);
         let _ = inner.send_msg(conn.transport(), &frame, &[]);

@@ -1716,35 +1716,20 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     drop(c);
 }
 
-/// **AC-12.3 (Phase A — oneway Option-1)**: on a multi-outgoing
-/// client, all top-level **oneway** sends are pinned to the founding
-/// slot (single-slot in-order delivery preserves the same-object
-/// oneway FIFO from the pre-pool model), while **twoway** sends still
-/// distribute (AC-12.1). 300 oneway bumps interleaved with twoway
-/// echoes — all bumps must arrive (`count == 300`) and the wire on
-/// the founding socket must not corrupt (twoways still round-trip).
-///
-/// **Trade-off recorded (HOL).** Option-1's price is head-of-line
-/// blocking on the oneway-pinned slot — a slow oneway handler at the
-/// peer stalls every other oneway through that slot. AOSP avoids
-/// this via per-`mNodeForAddress` `asyncNumber` + receive-side
-/// `asyncTodo` priority replay (Option-2 — F5/F6), deferred to Phase
-/// C unless AC-12.6's real-libbinder multi-object-oneway gate forces
-/// it.
-///
-/// **Order is not strictly asserted** (atomic counter — order-blind).
-/// A strict-order gate would need a server-side sequence-recorder
-/// (deferred); the per-slot in-order delivery is exercised here by
-/// the count + the parallel twoway round-trips not corrupting the
-/// shared wire.
-
+/// AC-12.3 — on a multi-outgoing client, top-level oneway sends are
+/// pinned to the founding slot (Option-1; Phase C asyncTodo would
+/// permit distribution but unpinning flakes the libbinder AC-12.6
+/// (c) gate ~20% with EPIPE on the nested-callback outer reply when
+/// DECs cross slots). Twoway echoes distribute (AC-12.1). 300 oneway
+/// bumps interleaved with concurrent twoway echoes must all arrive
+/// (`count == 300`) without the founding-slot wire corrupting any
+/// twoway round-trip.
 #[test]
 fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
     let path = tmp_sock("a3one");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: founding + one outgoing-echo ⇒ 2 incoming slots.
     server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
@@ -1756,19 +1741,11 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
     let slot2 = c
         .add_outgoing_connection_android13plus(&path, 1, &sid)
         .expect("slot 2");
-    assert_ne!(
-        slot2, 1,
-        "second slot has a fresh id (founding == 1) — otherwise the \
-         'oneway pinned to founding' geometry collapses"
-    );
+    assert_ne!(slot2, 1, "second slot has a fresh id");
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
     let n = 300i64;
 
-    // Oneway bumps (pinned to slot 1) + concurrent twoway echoes
-    // (distributed). The twoway echoes also exercise the wire on the
-    // founding slot in between oneway sends — any frame interleave
-    // would corrupt them.
     let r1 = Arc::clone(&root);
     let bump_h = std::thread::spawn(move || {
         for _ in 0..n {
@@ -1790,17 +1767,15 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
         h.join().expect("echo thread");
     }
 
-    // Poll for the oneway bumps to drain.
     assert!(
         poll_until(|| root.count().unwrap() == n),
-        "AC-12.3: all oneway bumps delivered (option-1 pin preserves \
-         the per-slot oneway path); last observed count = {}",
+        "AC-12.3: all oneway bumps delivered across the slot pool; \
+         last observed count = {}",
         root.count().unwrap()
     );
 
     drop(root);
     drop(c);
-    // _cu handles teardown.
 }
 
 // ---- AC-3.9 P6: no globals anywhere in the RPC stack ---------------

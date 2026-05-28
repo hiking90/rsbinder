@@ -122,10 +122,13 @@ pub struct RpcState {
     /// does not keep them alive; lets us dedup one `RpcProxy` per
     /// address and observe its last drop.
     remote_proxies: HashMap<RpcAddress, sync::Weak<dyn IBinder>>,
-    /// AOSP `BinderNode::asyncNumber` (client side) — survives proxy
-    /// churn so the per-node monotonic stream is preserved across
-    /// sibling-connection re-resolve (the peer's `asyncTodo` does
-    /// not).
+    /// AOSP `BinderNode::asyncNumber` (client side). Entries are
+    /// dropped together with the proxy slot in `forget_remote_if`
+    /// (peer's `timesSent` also reaches 0 then, so its `BinderNode`
+    /// is GC'd and the counter restart matches). The narrow race —
+    /// DEC still in flight when a sibling connection re-resolves the
+    /// same address — degrades to a single best-effort oneway drop
+    /// on the peer's `Drop(StaleAsyncNumber)` arm.
     remote_send_async_counters: HashMap<RpcAddress, u64>,
     /// Monotonic address allocator (per-session — P6).
     addr_counter: u64,
@@ -256,6 +259,15 @@ impl RpcState {
         if let Some(weak) = self.remote_proxies.get(addr) {
             if weak.as_ptr() as *const () == who {
                 self.remote_proxies.remove(addr);
+                // The proxy that owned this address is gone; the
+                // matching `DEC_STRONG` will be sent shortly. After it
+                // lands, the peer's `BinderNode` either survives (if
+                // `timesSent > 0` on the peer side — we re-resolve and
+                // restart from 0) or is GC'd (counter is irrelevant).
+                // Either way the per-address `async_number` book is
+                // closed for *this* proxy generation; drop it so the
+                // map stays bounded by the live address set.
+                self.remote_send_async_counters.remove(addr);
             }
         }
     }
@@ -567,6 +579,50 @@ mod tests {
             "after identity-checked forget, the address re-mints"
         );
         assert!(!ex3, "re-mint after forget is a fresh proxy — not excess");
+    }
+
+    /// `forget_remote_if` also drops the per-address send counter so
+    /// `remote_send_async_counters` stays bounded by the live address
+    /// set. A fresh re-mint starts the counter back at 0 (matches
+    /// peer's `BinderNode` GC + recreate). The stale-Drop guard from
+    /// `stale_drop_does_not_split_remote_dedup` extends here: an
+    /// identity-mismatched `forget` must NOT evict the live counter.
+    #[test]
+    fn phase_c_forget_remote_if_gcs_send_counter() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let addr = RpcAddress::from_wire_bytes([3u8; 32]);
+
+        let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let (got1, _) = st.remote_proxy(addr, || sib1.clone());
+        let p1 = Arc::as_ptr(got1.as_arc()) as *const ();
+        assert_eq!(st.next_send_async_number(addr), 0);
+        assert_eq!(st.next_send_async_number(addr), 1);
+
+        // Stale-Drop pattern (P2 already re-cached): `forget_remote_if`
+        // is a no-op on identity mismatch, so the counter survives.
+        drop(got1);
+        drop(sib1);
+        let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let (got2, _) = st.remote_proxy(addr, || sib2.clone());
+        let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
+        st.forget_remote_if(&addr, p1);
+        assert_eq!(
+            st.next_send_async_number(addr),
+            2,
+            "stale forget must not evict the live counter"
+        );
+
+        // Genuine `forget`: counter drops + next read auto-creates
+        // (back to 0).
+        drop(got2);
+        drop(sib2);
+        st.forget_remote_if(&addr, p2);
+        assert_eq!(
+            st.next_send_async_number(addr),
+            0,
+            "post-forget counter restarts from 0 (peer's BinderNode \
+             reaches timesSent=0 in lockstep with the matching DEC)"
+        );
     }
 
     /// **Phase A F7** balance (state level): the AOSP
