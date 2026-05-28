@@ -1266,6 +1266,145 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     );
 }
 
+/// **Phase B.2 — AOSP `setupClient` fan-out automation, multi-conn
+/// path.** `RpcSession::setup_unix_client_android13plus_fan_out` does
+/// in one helper what the manual API requires three explicit steps for:
+/// founding connect → `negotiate(local)` → N-1 additional outgoing
+/// `add_outgoing_connection_android13plus`. Witnesses that the helper's
+/// fan-out loop actually mints `N - 1` extras under the server's
+/// `set_max_threads(N)` cap.
+///
+/// **Mutant gate**: skipping the `1..negotiated` loop body (`for _ in
+/// 1..negotiated { … }` ⇒ `for _ in 0..0 { … }` or `unreachable!`)
+/// leaves the founding inner at a single slot ⇒ `session_slot_count`
+/// is `Some(1)` instead of `Some(N)` and this test fails.
+#[test]
+fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
+    let path = tmp_sock("b2fan");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // N = 3 (founding + 2 fan-out attaches). Cap is server-side; the
+    // helper learns it via `negotiate` and mints exactly N - 1 extras.
+    server.set_max_threads(3);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 3)
+        .expect("setupClient fan-out");
+    // `negotiate` was the second step of the helper ⇒ negotiated value
+    // is recorded on the session and equals the fan-out pool size.
+    assert_eq!(
+        client.negotiated_max_threads(),
+        3,
+        "helper performed GET_MAX_THREADS and recorded min(local=3, server=3) = 3"
+    );
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid
+        .as_slice()
+        .try_into()
+        .expect("32-byte session id (AOSP kSessionIdBytes)");
+
+    // Functional gate: the session built by the helper round-trips
+    // through every transport (default outgoing slot picker spreads
+    // calls across the pool).
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    for i in 0..6 {
+        let msg = format!("b2-{i}");
+        assert_eq!(root.echo(&msg).unwrap(), msg, "fan-out echo #{i}");
+    }
+
+    // Mutant-gate witness: server-side, the founding `RpcSessionInner`'s
+    // slot pool holds *all* N connections (founding + N-1 attached).
+    // A mutant that skipped the fan-out leaves this at `Some(1)`.
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(3)),
+        "founding inner's pool has 3 slots (founding + 2 fan-out attaches) — \
+         mutant: helper skipping the fan-out loop leaves this at Some(1)"
+    );
+    assert_eq!(
+        server.attached_count(),
+        2,
+        "exactly 2 id-echoing attaches reached the server-side attach arm"
+    );
+    assert_eq!(
+        server.rejected_unknown_id_count(),
+        0,
+        "fan-out connections all pass under the cap"
+    );
+}
+
+/// **Phase B.2 — single-connection fast path.** `local_max_outgoing ==
+/// 1` (and `0`, normalized) must skip the `GET_MAX_THREADS` round-trip
+/// and the fan-out loop entirely so the wire is bit-identical to the
+/// founding-only helper. A caller paying for the fan-out helper's
+/// convenience on a single-conn session must NOT pay an extra
+/// negotiation packet.
+///
+/// **Mutant gate**: dropping the `if local == 1 { return Ok(session); }`
+/// short-circuit makes the helper run `negotiate(1)` ⇒
+/// `negotiated_max_threads() == 1` instead of `0`.
+#[test]
+fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
+    let path = tmp_sock("b2one");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Server is multi-conn-capable but the client opts out — fan-out
+    // must NOT run regardless.
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 1)
+        .expect("setupClient (single-conn)");
+    // Negotiation skipped ⇒ session.negotiated_max_threads() stays at
+    // its default (0 = "not negotiated"). The byte-identical witness.
+    assert_eq!(
+        client.negotiated_max_threads(),
+        0,
+        "local_max_outgoing == 1 must skip GET_MAX_THREADS entirely \
+         (mutant: dropping the early-return would record 1 here)"
+    );
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    // Server side: exactly one slot (the founding). Mutant: extra
+    // outgoing attaches would push this past 1.
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(1)),
+        "founding-only session has exactly one slot on the server side"
+    );
+    assert_eq!(
+        server.attached_count(),
+        0,
+        "no id-echoing attach reached the server (no fan-out ran)"
+    );
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("b2-one").unwrap(), "b2-one");
+
+    // `local_max_outgoing == 0` is normalized to 1 (a session needs at
+    // least the founding connection). Same byte-identical behavior.
+    let path2 = tmp_sock("b2zero");
+    let server2 = RpcServer::setup_unix_server(&path2).expect("bind");
+    server2.set_android13plus(1);
+    server2.set_max_threads(2);
+    server2.set_root(make_service(counter.clone()));
+    let bg2 = server2.run_background();
+    let _cu2 = ServeCleanup::new(Arc::clone(&server2), bg2, path2.clone());
+    wait_for_sock(&path2);
+    let client_zero = RpcSession::setup_unix_client_android13plus_fan_out(&path2, 1, 0)
+        .expect("local_max_outgoing == 0 normalized to 1");
+    assert_eq!(
+        client_zero.negotiated_max_threads(),
+        0,
+        "0 normalized to 1 ⇒ no negotiation"
+    );
+}
+
 /// **Phase A F7** (the AC-12.0b residual, now fixed). With a shared
 /// `RpcState` (A0b id-demux), two **independent** client sessions each
 /// hold their own proxy to the *same* server root. Pre-F7 the server

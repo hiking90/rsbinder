@@ -2453,6 +2453,80 @@ impl RpcSession {
         Ok(self.inner.add_outgoing_slot(Box::new(t)))
     }
 
+    /// **Subplan 2-12 Phase B.2 — automatic outgoing-pool fan-out.**
+    /// AOSP `RpcSession::setupClient` automation for the path-based
+    /// UDS client (one helper instead of three explicit steps).
+    ///
+    /// Establishes the founding connection (a brand-new session, empty
+    /// session id), runs `GET_MAX_THREADS` and `GET_SESSION_ID` against
+    /// the server, then mints additional outgoing connections to the
+    /// same `path` echoing the server-minted session id, up to
+    /// `N = min(remote_max_threads, local_max_outgoing) - 1` extras.
+    /// The returned `RpcSession` then has a pool of `N` connections,
+    /// matching the size AOSP's
+    /// [`RpcSession::setupClient`](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/RpcSession.cpp;l=483)
+    /// would build for the same `mMaxOutgoingConnections`.
+    ///
+    /// **`local_max_outgoing <= 1`** is the *single-connection* path:
+    /// no `GET_MAX_THREADS` exchange, no fan-out, returned session is
+    /// byte-identical to
+    /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus).
+    /// A `0` is treated as `1` — a session must have at least the
+    /// founding connection to be useful (AOSP rejects 0 as a misuse).
+    ///
+    /// **Profile uniformity** is enforced by the per-connection
+    /// [`add_outgoing_connection_android13plus`](RpcSession::add_outgoing_connection_android13plus)
+    /// (the founding session's negotiated wire version caps every
+    /// additional connection's `max_version`). A fan-out connection
+    /// that the server downgrades below the founding version surfaces
+    /// as `Err(BadType)` and the partially-built session is dropped.
+    /// Rust ownership ≡ AOSP `scope_guard`'s implicit cleanup.
+    ///
+    /// **No retry / no progressive degradation**: a fan-out connect
+    /// failure (e.g. the server's `set_max_threads` is tighter than
+    /// `local_max_outgoing - 1` would imply, so the attach is refused
+    /// past the cap) surfaces as `Err`. A caller that wants a softer
+    /// fallback can use
+    /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus) +
+    /// manual `add_outgoing_connection_android13plus` loop and tolerate
+    /// per-extra failures.
+    pub fn setup_unix_client_android13plus_fan_out(
+        path: impl AsRef<std::path::Path>,
+        max_version: u32,
+        local_max_outgoing: u32,
+    ) -> Result<RpcSession> {
+        // Borrow the path once for the founding connect; clone to
+        // `PathBuf` to drive the fan-out loop without forcing
+        // `impl AsRef<Path> + Clone` on the caller (each
+        // `add_outgoing_connection_android13plus` takes a fresh
+        // `impl AsRef<Path>`).
+        let path: std::path::PathBuf = path.as_ref().to_owned();
+        let session = Self::setup_unix_client_android13plus(&path, max_version)?;
+        let local = local_max_outgoing.max(1);
+        if local == 1 {
+            // Single-connection: skip GET_MAX_THREADS entirely so the
+            // wire is bit-identical to the founding-only helper.
+            return Ok(session);
+        }
+        // `negotiate(local)` exchanges GET_MAX_THREADS, records the
+        // `min(local, remote)` on the session, and returns that exact
+        // value — which is AOSP `setupClient`'s `outgoingConnections`
+        // by construction (it computes the same `min` then mints the
+        // pool against it).
+        let negotiated = session.negotiate(local)?;
+        if negotiated <= 1 {
+            return Ok(session);
+        }
+        let session_id = session.get_session_id()?;
+        // `1..negotiated` ⇒ exactly `negotiated - 1` extras; the
+        // founding connection counts as the first slot. AOSP loop:
+        // `for (i = 0; i + 1 < outgoingConnections; i++)`.
+        for _ in 1..negotiated {
+            session.add_outgoing_connection_android13plus(&path, max_version, &session_id)?;
+        }
+        Ok(session)
+    }
+
     /// Client: connect to a Unix-domain android-13+ RPC server **with
     /// FD-over-RPC** opt-in (subplan 2-11 Phase A0). UDS connect + the
     /// AOSP handshake requesting `fd_mode` in the connection header
