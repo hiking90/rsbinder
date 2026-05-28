@@ -647,7 +647,28 @@ impl RpcSessionInner {
     /// without `wait`; the `DRIVING`-keyed reentrancy bypass collapses
     /// to today's `enter_connection` semantics — byte-identical (no
     /// wire effect, T1-1/AC-3.2 preserved).
-    fn find_conn(&self, oneway: bool) -> ConnGuard<'_> {
+    ///
+    /// **Oneway distribution (Phase C — §7.3 Option-1 pin retired
+    /// 2026-05-28).** Earlier this function took an `oneway: bool` and
+    /// routed top-level oneway sends to a fixed founding slot (the
+    /// Option-1 HOL-trade-off pin recorded in
+    /// [`plans/2-12-multi-connection-per-session.md`](../../plans/2-12-multi-connection-per-session.md)
+    /// §2 Phase A). With Phase C asyncTodo (per-`mNodeForAddress`
+    /// `asyncNumber` send-side + receive-side priority replay) carrying
+    /// the per-object oneway ordering invariant on both ends, the pin
+    /// is *redundant for correctness* and only paid the HOL cost. The
+    /// 2026-05-21 deferral suspected a libbinder `waitForReply`
+    /// cross-slot race with rsbinder server-side DECs, but: (i)
+    /// `send_dec_strong` already calls this with the twoway predicate
+    /// (it joins the twoway distribution), so the pin never affected
+    /// DEC routing; (ii) the AC-12.6 (c) "nested-callback outer reply"
+    /// path is all-twoway — the pin was dead code on that gate; and
+    /// (iii) re-running the experiment fresh shows hermetic
+    /// 100/100 + STAGE3 20/20 PASS with pin removed (the prior 4/5 vs
+    /// 5/5 reading was N=5 noise). Net: signature is now slot-policy-
+    /// invariant; per-object oneway FIFO is the asyncTodo invariant,
+    /// not a slot-selection invariant.
+    fn find_conn(&self) -> ConnGuard<'_> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
         // (1) Reentrant: a slot of this session is already driven by
@@ -672,21 +693,6 @@ impl RpcSessionInner {
                 transport,
                 reentrant: true,
             };
-        }
-        // Phase C asyncTodo preserves per-node order regardless of
-        // which slot oneway picks, so removing this pin lifts the
-        // HOL trade-off in principle — but the libbinder AC-12.6 (c)
-        // gate flakes (~20%) without it (EPIPE on outer reply when
-        // server-side oneway DECs cross slots during nested callback
-        // dispatch). Pin stays until that race is root-caused.
-        if oneway {
-            if let Ok(g) = self.find_conn_pinned(RpcSession::FOUNDING_SLOT_ID) {
-                return g;
-            }
-            log::debug!(
-                "find_conn(oneway=true): founding slot retired; falling back to \
-                 any-available — per-object oneway FIFO may be reordered"
-            );
         }
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
@@ -1191,7 +1197,7 @@ impl RpcSessionInner {
         // `wait` on `slot_cv` if the pool is exhausted. Concurrent
         // transacts on *other* slots run unblocked (AC-12.1).
         let oneway = (flags & FLAG_ONEWAY) != 0;
-        let conn = self.find_conn(oneway);
+        let conn = self.find_conn();
         let transport = conn.transport();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = if oneway {
@@ -1279,7 +1285,7 @@ impl RpcSessionInner {
     /// C1 fix (review 2026-05-21): two-tier `DEC_STRONG` hand-off for
     /// `RpcProxy::drop`. Drop runs on arbitrary user threads that may
     /// not be driving a slot of this session — without this guard,
-    /// `send_dec_strong`'s `find_conn(false)` would `cv.wait` on slot
+    /// `send_dec_strong`'s `find_conn` would `cv.wait` on slot
     /// availability and a hung peer would block the user's `Drop`
     /// indefinitely.
     ///
@@ -1336,10 +1342,7 @@ impl RpcSessionInner {
         // `find_conn` picks an available slot (or — if this thread is
         // already driving one of the session's slots — reuses it via
         // `DRIVING`, the documented "interleaved DEC_STRONG" path).
-        // `oneway=false` so DEC_STRONG joins the twoway distribution
-        // (any available slot) instead of contending on the oneway-
-        // pinned founding slot.
-        let conn = self.find_conn(false);
+        let conn = self.find_conn();
         let frame = self.profile.codec().encode_dec_strong(&addr);
         self.send_msg(conn.transport(), &frame, &[])?;
         Ok(())
@@ -1402,7 +1405,7 @@ impl RpcSessionInner {
         // `find_conn`). For an outermost server reply
         // (`serve_once_on_slot` pinned the slot before dispatch) this
         // is the same slot the request arrived on.
-        let conn = self.find_conn(false);
+        let conn = self.find_conn();
         Ok(self.send_msg(conn.transport(), &frame, fds)?)
     }
 
@@ -2663,10 +2666,10 @@ fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<RpcAddress>) {
         if inner.shared.lifecycle.is_torn_down() {
             continue;
         }
-        // `find_conn(false)` may briefly wait on `slot_cv` if the
-        // pool is exhausted, but the *user* `Drop` already returned —
-        // this wait is contained to the dedicated reaper thread.
-        let conn = inner.find_conn(false);
+        // `find_conn` may briefly wait on `slot_cv` if the pool is
+        // exhausted, but the *user* `Drop` already returned — this
+        // wait is contained to the dedicated reaper thread.
+        let conn = inner.find_conn();
         let frame = inner.profile.codec().encode_dec_strong(&addr);
         let _ = inner.send_msg(conn.transport(), &frame, &[]);
         drop(conn);

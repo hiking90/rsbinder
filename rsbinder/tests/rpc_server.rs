@@ -1405,6 +1405,131 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     );
 }
 
+/// **§7.3 #2 — shutdown-reject e2e scaffolding** (the deferred Phase
+/// B.1 Sub-AC (c)). The android-13+ attach arm sits past a successful
+/// handshake but before the per-slot enqueue; in production the
+/// `shutdown.load()` gate at that point sees a *sub-microsecond*
+/// window between an accepted late attach and a concurrent
+/// `server.shutdown()`, so prior tests verified the branch by code
+/// inspection + the `rejected_unknown_id_count` observability only.
+///
+/// The `__set_attach_shutdown_probe` `#[doc(hidden)]` hook
+/// (§6.4 #2's test-only barrier) makes the window deterministic: it
+/// fires after the codec check passes and *before* `shutdown.load()`,
+/// so the test can park the worker, flip `server.shutdown()`, then
+/// release the worker. The worker re-reads the now-true flag and
+/// takes the reject branch — exactly the production semantics, with
+/// no scheduler-luck dependency.
+///
+/// **Mutant gate**: removing the `if server.shutdown.load() {
+/// reject }` line at the outgoing-attach arm leaves the worker
+/// proceeding to `add_incoming_slot` after the barrier returns, so
+/// `rejected_unknown_id_count` does NOT increment (the assertion
+/// below fails) and the attach `get_root()` would succeed (also
+/// flagged). Reverting just the assertion-side checks would still
+/// fail the rejected-count delta — both arms catch the regression.
+#[test]
+fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
+    let path = tmp_sock("shutgate");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // 2 = founding + 1 attached. The cap is irrelevant to the
+    // shutdown gate (which fires *before* the cap check), but
+    // staying within it avoids confounding the reject-set: the only
+    // increment of `rejected_unknown_id` we want to observe is the
+    // shutdown-arm one.
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // Founding session — kept alive (`c1` not dropped) so the
+    // registry still resolves `sid` when the attach worker hits the
+    // arm. Were c1 dropped here, the founding inner would die, the
+    // attach would hit the "unknown/stale" arm, and the shutdown
+    // gate would never be tested.
+    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ founding connect");
+    let sid = c1.get_session_id().expect("get_session_id founding");
+
+    // Two channels form the barrier. The probe sends "handshake
+    // done" on the first call, then blocks on `release_rx`. The
+    // test waits for the signal, flips `shutdown`, then releases.
+    let (hs_done_tx, hs_done_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // Wrap `release_rx` in an `Option` so the *first* probe fire
+    // takes it; any later fire (no-op once the test is done) sees
+    // `None` and drops through. The whole closure must be `Fn`
+    // (not `FnOnce`), hence the `Mutex<Option<Receiver>>` shape.
+    let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    server.__set_attach_shutdown_probe({
+        let release_rx = Arc::clone(&release_rx);
+        let hs_done_tx = hs_done_tx.clone();
+        move || {
+            let _ = hs_done_tx.send(());
+            if let Some(rx) = release_rx.lock().expect("release_rx poisoned").take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
+    });
+    let rejected_before = server.rejected_unknown_id_count();
+
+    // Run the attach in a background thread — its `get_root` would
+    // block on the parked worker otherwise.
+    let attach_path = path.clone();
+    let attach_sid = sid.clone();
+    let attach_handle = std::thread::spawn(move || -> std::result::Result<(), StatusCode> {
+        let c2 = RpcSession::setup_unix_client_android13plus_with_id(&attach_path, 1, &attach_sid)
+            .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
+        c2.set_timeout(Some(Duration::from_secs(3)));
+        c2.get_root().map(|_| ())
+    });
+
+    // Wait for the attach worker to reach the barrier.
+    hs_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("attach worker should reach the shutdown barrier");
+
+    // Flip shutdown *while* the worker is parked at the probe.
+    server.shutdown();
+
+    // Release the worker — it re-reads `shutdown.load() == true`
+    // and takes the reject branch (drops the transport).
+    let _ = release_tx.send(());
+
+    let attach_result = attach_handle
+        .join()
+        .expect("attach thread should not panic");
+    let err = attach_result.expect_err("attach during shutdown must be rejected (mutant: success)");
+    assert!(
+        matches!(
+            err,
+            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
+        ),
+        "shutdown-reject surfaces as the same reject set as cap/unknown-id reject \
+         (post-handshake socket close), got {err:?}"
+    );
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
+        "shutdown-reject increments the `rejected_unknown_id` observability counter \
+         (mutant: removing `if server.shutdown.load() {{ reject }}` leaves this flat)"
+    );
+    // Founding inner's slot pool stayed at 1 — the rejected attach
+    // never reached `add_incoming_slot` (otherwise this would be
+    // `Some(2)`, a second mutant-catch axis independent of the
+    // counter delta above).
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(1),
+        "shutdown-rejected attach did not enqueue a slot (mutant: would reach Some(2))"
+    );
+    // (`c1` lives to function exit by lexical scope — see its
+    // binding-site comment for why the founding inner must stay
+    // registered for the whole attach attempt.)
+}
+
 /// **Phase A F7** (the AC-12.0b residual, now fixed). With a shared
 /// `RpcState` (A0b id-demux), two **independent** client sessions each
 /// hold their own proxy to the *same* server root. Pre-F7 the server
@@ -1855,16 +1980,33 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     drop(c);
 }
 
-/// AC-12.3 — on a multi-outgoing client, top-level oneway sends are
-/// pinned to the founding slot (Option-1; Phase C asyncTodo would
-/// permit distribution but unpinning flakes the libbinder AC-12.6
-/// (c) gate ~20% with EPIPE on the nested-callback outer reply when
-/// DECs cross slots). Twoway echoes distribute (AC-12.1). 300 oneway
-/// bumps interleaved with concurrent twoway echoes must all arrive
-/// (`count == 300`) without the founding-slot wire corrupting any
-/// twoway round-trip.
+/// AC-12.3 — on a multi-outgoing client, oneway FIFO must hold under
+/// twoway interleave regardless of which slot each oneway rode. With
+/// §7.3 Option-1 founding-pin retired (2026-05-28), top-level oneway
+/// `find_conn` no longer routes to slot 1 — the per-`mNodeForAddress`
+/// `asyncNumber` send-side + receive-side `asyncTodo` priority replay
+/// (Phase C, [state.rs](../src/rpc/state.rs)) is what carries the per-
+/// object oneway ordering invariant on both ends; the pin was a HOL
+/// trade-off, not a correctness invariant. The 2026-05-21 deferral
+/// suspected a libbinder `waitForReply` cross-slot race, but
+/// re-running the experiment fresh shows 100/100 hermetic + 20/20
+/// STAGE3 PASS without the pin (the prior 4/5 reading was N=5 noise;
+/// see [plans/2-12 §7.3](../../plans/2-12-multi-connection-per-session.md)).
+///
+/// What this test gates: 300 oneway bumps interleaved with concurrent
+/// twoway echoes across an outgoing slot pool of size 2 all arrive
+/// (`count == 300`) with no wire corruption between the oneway and
+/// twoway frames. The pin-specific mutant gate (re-add the founding
+/// pin) is gone — pin re-introduction is a HOL throughput regression,
+/// not a correctness one — so this test's standing mutant gate is
+/// Phase C asyncTodo deletion (covered as a unit gate at
+/// [`rpc::state::tests`](../src/rpc/state.rs)
+/// `phase_c_out_of_order_drains_in_order_via_async_todo`) plus
+/// STAGE3 (b) for the live libbinder round-robin path:
+/// [`rpc::state::tests::phase_c_out_of_order_enqueues_then_drains_in_priority_order`](../src/rpc/state.rs#L747)
+/// and `phase_c_send_async_number_is_per_address_monotonic`.
 #[test]
-fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
+fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let path = tmp_sock("a3one");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");

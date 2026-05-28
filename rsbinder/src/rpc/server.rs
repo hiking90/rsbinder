@@ -34,7 +34,7 @@ use crate::native::Binder;
 use crate::parcel::Parcel;
 
 use super::session::{RpcSession, RpcSessionId, RpcSessionInner};
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
 use super::transport::VsockTransport;
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 #[cfg(feature = "rpc-tls")]
@@ -65,7 +65,7 @@ type TlsServerConfigCell = Mutex<Option<Arc<rustls::ServerConfig>>>;
 /// reached only through [`setup_tcp_server_tls`](RpcServer::setup_tcp_server_tls).
 enum ServerListener {
     Unix(UnixListener),
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock(vsock::VsockListener),
     #[cfg(feature = "rpc-tls")]
     Tcp(TcpListener),
@@ -78,7 +78,7 @@ enum ServerListener {
 /// of the listener fd itself).
 enum BindAddress {
     Unix(PathBuf),
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock {
         cid: u32,
         port: u32,
@@ -98,7 +98,7 @@ enum BindAddress {
 /// [`RpcServer::set_max_connections`](RpcServer::set_max_connections).
 enum RawAccepted {
     Unix(UnixStream),
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock(vsock::VsockStream),
     #[cfg(feature = "rpc-tls")]
     Tcp(TcpStream),
@@ -111,7 +111,7 @@ impl ServerListener {
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
         match self {
             ServerListener::Unix(l) => l.set_nonblocking(on),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             ServerListener::Vsock(l) => l.set_nonblocking(on),
             #[cfg(feature = "rpc-tls")]
             ServerListener::Tcp(l) => l.set_nonblocking(on),
@@ -133,7 +133,7 @@ impl ServerListener {
                 stream.set_nonblocking(false)?;
                 Ok(RawAccepted::Unix(stream))
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             ServerListener::Vsock(l) => {
                 let (stream, _addr) = l.accept()?;
                 stream.set_nonblocking(false)?;
@@ -171,7 +171,7 @@ impl RawAccepted {
         if let Some(cfg) = tls_config {
             let stream: Box<dyn TlsStream> = match self {
                 RawAccepted::Unix(s) => Box::new(s),
-                #[cfg(any(target_os = "linux", target_os = "android"))]
+                #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
                 RawAccepted::Vsock(s) => Box::new(s),
                 RawAccepted::Tcp(s) => Box::new(s),
             };
@@ -190,7 +190,7 @@ impl RawAccepted {
     fn into_native_transport(self) -> RpcResult<Box<dyn RpcTransport>> {
         match self {
             RawAccepted::Unix(s) => Ok(Box::new(UnixTransport::from_stream(s)?)),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             RawAccepted::Vsock(s) => Ok(Box::new(VsockTransport::from_stream(s)?)),
             #[cfg(feature = "rpc-tls")]
             RawAccepted::Tcp(_) => Err(super::RpcError::Protocol(
@@ -305,6 +305,23 @@ pub struct RpcServer {
     /// *enforcement point* the 2-9 §0/G2 gap identified as missing
     /// (`peer_identity()` was computed but read nowhere).
     authorizer: Mutex<Option<Authorizer>>,
+    /// **Plan 2-12 §7.3 #2 — shutdown-reject e2e scaffolding hook**
+    /// (`#[doc(hidden)]`, test-only). When set, the closure runs on the
+    /// android-13+ attach arm *between* a successful handshake and the
+    /// `server.shutdown.load()` gate (the very race window §6.4 #2
+    /// flagged as un-bound by code observability alone). An integration
+    /// test acquires the worker at this barrier, calls
+    /// [`shutdown`](RpcServer::shutdown), then releases the worker so it
+    /// re-reads the now-true flag and takes the reject branch — turning
+    /// the otherwise sub-microsecond window into a deterministic test
+    /// point. `None` default ⇒ no invocation, byte-identical to the
+    /// pre-hook attach path. `Arc<dyn Fn>` so the closure is cloned out
+    /// of the lock and invoked **lock-free** (same discipline as
+    /// `authorizer` — re-entrant calls into `server` from the probe do
+    /// not self-deadlock). Same `__`-prefix unstable-API discipline as
+    /// `__fuzz_decode_rpc_parcel`; not part of the supported API.
+    #[doc(hidden)]
+    attach_shutdown_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Subplan 2-12 **Phase A0b**: session-id → shared-session registry
     /// (AOSP `RpcServer::mSessions`). The android-13+ accept handshake
     /// reads the client's `RpcConnectionHeader.sessionId`:
@@ -384,7 +401,7 @@ impl RpcServer {
     /// **Cleanup**: vsock has no filesystem entry, so `Drop` only flips
     /// the shutdown flag (the kernel reclaims the `(cid, port)` on the
     /// listener fd close).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     pub fn setup_vsock_server(cid: u32, port: u32) -> Result<Arc<RpcServer>> {
         let listener = vsock::VsockListener::bind_with_cid_port(cid, port).map_err(|e| {
             log::warn!("VsockListener::bind_with_cid_port({cid}, {port}) failed: {e}");
@@ -412,6 +429,7 @@ impl RpcServer {
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
             authorizer: Mutex::new(None),
+            attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             session_registered: AtomicUsize::new(0),
             attached_count: AtomicUsize::new(0),
@@ -468,7 +486,11 @@ impl RpcServer {
     /// server-side `rustls::ServerConfig`. The 1-tier Android AVF /
     /// Microdroid pVM target — vsock for the host↔guest socket plane,
     /// TLS for the crypto plane.
-    #[cfg(all(feature = "rpc-tls", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        feature = "rpc-tls",
+        feature = "rpc-vsock",
+        any(target_os = "linux", target_os = "android")
+    ))]
     pub fn setup_vsock_server_tls(
         cid: u32,
         port: u32,
@@ -589,6 +611,43 @@ impl RpcServer {
         F: Fn(&PeerIdentity) -> bool + Send + Sync + 'static,
     {
         *self.authorizer.lock().expect("authorizer poisoned") = Some(Arc::new(f));
+    }
+
+    /// **Plan 2-12 §7.3 #2 — shutdown-reject e2e scaffolding (test-only,
+    /// `#[doc(hidden)]`).** Install a barrier the android-13+ attach
+    /// worker invokes *after* a successful handshake and *before* the
+    /// `shutdown` gate read, turning the production race window (§6.4
+    /// #2) into a deterministic test point. The closure runs lock-free
+    /// (cloned out of the field's mutex first), so it may re-enter
+    /// `server` without self-deadlock. `None` (default, no
+    /// `__set_attach_shutdown_probe` call) = byte-identical to the
+    /// pre-hook attach path. Same `__`-prefix unstable-API discipline
+    /// as `__fuzz_decode_rpc_parcel`; not part of the supported API
+    /// surface.
+    #[doc(hidden)]
+    pub fn __set_attach_shutdown_probe<F>(&self, f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .attach_shutdown_probe
+            .lock()
+            .expect("attach_shutdown_probe poisoned") = Some(Arc::new(f));
+    }
+
+    /// Run the `#[doc(hidden)]` attach-shutdown probe (no-op when
+    /// unset). Clones the `Arc<dyn Fn>` out of the mutex first so the
+    /// closure runs **lock-free** (the closure may re-enter `server`
+    /// without self-deadlock — same discipline as `authorizer`).
+    fn run_attach_shutdown_probe(&self) {
+        let probe = self
+            .attach_shutdown_probe
+            .lock()
+            .expect("attach_shutdown_probe poisoned")
+            .clone();
+        if let Some(p) = probe {
+            p();
+        }
     }
 
     /// Advertise the FD-over-RPC modes this server will accept
@@ -906,6 +965,10 @@ impl RpcServer {
                                 drop(transport);
                                 return;
                             }
+                            // §7.3 #2 — shutdown-reject e2e scaffolding
+                            // (see `__set_attach_shutdown_probe`). No-op
+                            // unless a test installed a barrier.
+                            server.run_attach_shutdown_probe();
                             if server.shutdown.load(Ordering::SeqCst) {
                                 server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                                 log::warn!(
@@ -976,6 +1039,13 @@ impl RpcServer {
                         drop(transport);
                         return;
                     }
+                    // §7.3 #2 — shutdown-reject e2e scaffolding
+                    // (see `__set_attach_shutdown_probe`). No-op
+                    // unless a test installed a barrier; the
+                    // production race window §6.4 #2 flagged sits
+                    // exactly between this point and the `load`
+                    // below.
+                    server.run_attach_shutdown_probe();
                     // **Phase B.1 shutdown gate**: refuse attaches
                     // once the server is shutting down (clean
                     // teardown semantics — a late-arriving
@@ -1159,7 +1229,7 @@ impl RpcServer {
     pub fn path(&self) -> Option<&Path> {
         match &self.bind {
             BindAddress::Unix(p) => Some(p.as_path()),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
@@ -1169,7 +1239,7 @@ impl RpcServer {
     /// **Plan 2-15 E2** — bound vsock address for a vsock server.
     /// `None` for other backends. Available only on platforms where the
     /// vsock backend is compiled in (Linux / Android).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     pub fn vsock_address(&self) -> Option<(u32, u32)> {
         match &self.bind {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
@@ -1188,7 +1258,7 @@ impl RpcServer {
         match &self.bind {
             BindAddress::Tcp(addr) => Some(*addr),
             BindAddress::Unix(_) => None,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
         }
     }
@@ -1225,7 +1295,7 @@ impl Drop for RpcServer {
                 // on the same path doesn't see a stale ENOENT/EADDRINUSE.
                 let _ = std::fs::remove_file(p);
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
                 // vsock has no filesystem entry; the kernel reclaims the
                 // (cid, port) when the listener fd is closed (the
