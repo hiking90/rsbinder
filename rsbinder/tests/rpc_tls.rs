@@ -421,6 +421,95 @@ fn setup_tcp_server_tls_e2e() {
     let _ = bg.join();
 }
 
+/// **Plan 2-15 F (AC-15.2) — vsock × TLS hermetic e2e**, server built
+/// via `RpcServer::setup_vsock_server_tls`, client TLS-wraps a raw
+/// vsock stream with `TlsTransport::connect_stream`. The 1st-class
+/// Android AVF / Microdroid pVM scenario (vsock socket plane + TLS
+/// crypto plane), now end-to-end through the public `RpcServer` API.
+///
+/// **Environment gate** — `#[ignore]` so default `cargo test`
+/// (CI / macOS) never runs it. Loopback vsock requires the Linux
+/// `vsock_loopback` kernel module (`sudo modprobe vsock_loopback` on a
+/// host with no peer VM); a peer-VM environment skips the modprobe
+/// step. CI does not load kernel modules, so this is hermetic-by-
+/// `#[ignore]`; the canonical verification surface is the REMOTE_LINUX
+/// box per memory.
+///
+/// **Compile gate** — `target_os = "linux"` plus the `rpc-vsock` and
+/// `rpc-tls` features. macOS host compiles this file out of this test
+/// (the `rpc-tls` `#![cfg]` at the top of the file keeps the build
+/// graph clean elsewhere).
+#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn vsock_tls_loopback_e2e() {
+    use rsbinder::rpc::transport::VsockTransport;
+    use rsbinder::rpc::RpcServer;
+    use vsock::VMADDR_CID_LOCAL;
+
+    // Arbitrary unused port; mirrors `tests/rpc_vsock.rs` choice +
+    // bumped one digit so a left-behind no-TLS server (the other test)
+    // doesn't `EADDRINUSE` this one in a back-to-back run.
+    const TLS_TEST_PORT: u32 = 0x52_43;
+
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server = RpcServer::setup_vsock_server_tls(VMADDR_CID_LOCAL, TLS_TEST_PORT, srv_cfg)
+        .expect("setup_vsock_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    assert_eq!(
+        server.vsock_address(),
+        Some((VMADDR_CID_LOCAL, TLS_TEST_PORT))
+    );
+    assert!(server.path().is_none(), "vsock+TLS server has no fs path");
+    let bg = server.run_background();
+
+    // Client: vsock connect → TLS handshake over the raw vsock stream.
+    // No client-side `setup_vsock_client_tls` convenience function yet
+    // (a separate small follow-up); the underlying composition is one
+    // line per AOSP `RpcTransportCtx::newTransport(fd)` (socket-kind-
+    // orthogonal TLS).
+    //
+    // `VsockTransport::connect` returns an `RpcTransport` already, but
+    // here we need the raw `VsockStream` so the TLS handshake runs
+    // *over* it (not as the framing transport itself). Build the
+    // stream by hand — `vsock::VsockStream::connect` matches the
+    // existing `VsockTransport::connect` body.
+    let vsock_stream =
+        vsock::VsockStream::connect(&vsock::VsockAddr::new(VMADDR_CID_LOCAL, TLS_TEST_PORT))
+            .expect("client vsock connect");
+    let client_t = TlsTransport::connect_stream(
+        Box::new(vsock_stream),
+        "localhost",
+        client_config_trusting(CA),
+    )
+    .expect("client TLS handshake over vsock");
+    // AC-4.4 over vsock+TLS: peer identity is the leaf-cert fingerprint
+    // (not `Vsock { cid }` — that's the `VsockTransport` plain identity,
+    // here the TLS layer overrides).
+    match client_t.peer_identity() {
+        PeerIdentity::Certificate(c) => assert_eq!(c.fingerprint().len(), 32),
+        other => panic!("expected Certificate peer id over vsock+TLS, got {other}"),
+    }
+    let client =
+        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let root = client.get_root().expect("get_root over vsock+TLS");
+    assert_eq!(ping_via(&root, "vsock-tls").unwrap(), "pong:vsock-tls");
+    assert_eq!(ping_via(&root, "").unwrap(), "pong:");
+
+    // Silence the `VsockTransport` import on Linux builds where it's
+    // not referenced (we only use it as a type-witness that the vsock
+    // client transport exists; the actual client builds the stream by
+    // hand to keep the TLS wrap explicit).
+    let _: fn(u32, u32) -> _ = VsockTransport::connect;
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+}
+
 /// **Plan 2-15 E1 — UDS+TLS server e2e via `RpcServer::setup_unix_server_tls`.**
 /// TLS is socket-kind-orthogonal (AOSP `RpcTransportCtx::newTransport(fd)`);
 /// the same TLS handshake runs over a UnixStream once `RpcServer` no
