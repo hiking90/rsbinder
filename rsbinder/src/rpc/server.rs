@@ -225,48 +225,27 @@ impl RpcServer {
     /// Set the advertised max-threads value (AOSP-faithful
     /// `setMaxIncomingThreads`, Phase B.1; AC-3.4 / AC-12.4). Default 1.
     ///
-    /// `n` has **two distinct roles**, deliberately decoupled:
+    /// `n` has two roles, both always in effect:
     ///
-    /// 1. **Advertised value** (always in effect). Returned verbatim to a
-    ///    client on `GET_MAX_THREADS`, so a peer's `negotiate(local_max)`
-    ///    sees `min(local_max, n)`. AOSP-compatible regardless of build
-    ///    features.
-    /// 2. **Incoming-slot cap > 1** (`rpc-experimental-multiconn` feature
-    ///    only). On default builds the attach arm clamps the effective
-    ///    slot cap to **1** even when `n >= 2`, so id-echoing attach
-    ///    attempts past the founding slot are refused with
-    ///    `rejected_unknown_id`. Enabling the
-    ///    `rpc-experimental-multiconn` Cargo feature lifts the clamp and
-    ///    lets the cap take `n` verbatim, which is what the multi-conn
-    ///    hermetic suite exercises.
-    ///
-    /// This split is why `set_max_threads(N)` is **always callable** —
-    /// AOSP libbinder peers that expect a specific advertised value can
-    /// interoperate on default builds, while the unverified multi-conn
-    /// attach path stays behind an explicit opt-in.
+    /// 1. **Advertised value**. Returned verbatim to a client on
+    ///    `GET_MAX_THREADS`, so a peer's `negotiate(local_max)` sees
+    ///    `min(local_max, n)`. AOSP-compatible.
+    /// 2. **Incoming-slot cap**. The attach arm refuses id-echoing
+    ///    attach attempts past `n` with `rejected_unknown_id` —
+    ///    AOSP-faithful `setMaxIncomingThreads` (`RpcServer.cpp`
+    ///    `session->setMaxIncomingThreads(server->mMaxThreads)`).
     ///
     /// Distinct from [`set_max_connections`](RpcServer::set_max_connections)
     /// (Phase 2-10), which caps *concurrent connection-worker threads*
-    /// across the **whole server**; this caps *incoming slots* within a
-    /// **single session**. Both are additive — when both are active, the
-    /// tighter cap wins.
+    /// across the **whole server**; this caps *incoming slots* within
+    /// a **single session**. Both are additive — when both are active,
+    /// the tighter cap wins.
     ///
-    /// # ⚠ Why the slot-cap effect is gated
-    ///
-    /// **`N == 1` (default) is fully supported and validated against real
-    /// android-13/14/15/16 libbinder peers** (single-connection sessions,
-    /// the only RPC mode rsbinder has shipped through plans 2-1 … 2-11 /
-    /// 2-13 / 2-14 STAGE3 gates).
-    ///
-    /// **`N >= 2` slot-cap (multi-connection sessions) is EXPERIMENTAL**:
-    /// hermetic rsbinder↔rsbinder passes, but the real-libbinder gate
-    /// (AC-12.6) has not. Production code interoperating with a real
-    /// libbinder peer should stay on default builds — the AOSP-compatible
-    /// advertise side is unchanged either way.
-    ///
-    /// Status, root-cause investigation, and feature opt-in: see
-    /// [`RPC_STATUS.md`](../../../RPC_STATUS.md) and
-    /// [`plan/2-12-multi-connection-per-session.md`](../../../plans/2-12-multi-connection-per-session.md) §3.
+    /// `N == 1` (default, single-connection) and `N >= 2` (multi-
+    /// connection-per-session) are both validated against real
+    /// android-13/14/15/16 libbinder peers. See
+    /// [`plan/2-12`](../../../plans/2-12-multi-connection-per-session.md)
+    /// for the AC-12.6 (a)/(b)/(c) evidence.
     pub fn set_max_threads(&self, n: u32) {
         *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
     }
@@ -545,13 +524,10 @@ impl RpcServer {
                 // the byte-identical no-FD android-13+ path.
                 let fd_unix = server.fd_unix_supported.load(Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    // Subplan 2-12 Phase A0b: split the handshake from
-                    // the session build so the server can read the
-                    // client-supplied `RpcConnectionHeader.sessionId`
-                    // and decide **new-session vs. id-demux attach vs.
-                    // reject** *before* binding the connection to a
-                    // `SharedSession`.
-                    let (transport, codec, client_fd_mode, client_id) =
+                    // Split handshake from build so we can branch on
+                    // the client-supplied session id (new vs attach vs
+                    // reject) and direction (outgoing vs incoming).
+                    let (transport, codec, client_fd_mode, client_id, incoming) =
                         match RpcSession::android13plus_accept_handshake(transport, max) {
                             Ok(parts) => parts,
                             Err(e) => {
@@ -562,22 +538,62 @@ impl RpcServer {
                                 return;
                             }
                         };
+                    if incoming {
+                        // Attach + incoming (`server_accept` already
+                        // rejected new + incoming): resolve the
+                        // session, register a callback slot, and exit
+                        // the worker. The slot lives in the pool for
+                        // server→client sends; there is no read loop
+                        // because client→server traffic only uses
+                        // outgoing connections (per AOSP
+                        // `RpcSession::mConnections.mOutgoing`).
+                        match server.resolve_session(&client_id) {
+                            Some(inner) => {
+                                if inner.wire_protocol_version() != Some(codec.version()) {
+                                    server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                    log::warn!(
+                                        "android-13+ RPC: incoming attach codec version {} \
+                                         ≠ founding inner version {:?}; rejecting",
+                                        codec.version(),
+                                        inner.wire_protocol_version()
+                                    );
+                                    drop(transport);
+                                    return;
+                                }
+                                if server.shutdown.load(Ordering::SeqCst) {
+                                    server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                    log::warn!(
+                                        "android-13+ RPC: incoming attach after server \
+                                         shutdown; rejecting"
+                                    );
+                                    drop(transport);
+                                    return;
+                                }
+                                let session = RpcSession::wrap_inner(inner);
+                                if let Err(e) = session.add_callback_slot(transport) {
+                                    server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                    log::warn!(
+                                        "android-13+ RPC: incoming attach raced session \
+                                         teardown; rejecting: {e:?}"
+                                    );
+                                }
+                            }
+                            None => {
+                                server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                log::warn!(
+                                    "android-13+ RPC: incoming connection supplied an \
+                                     unknown/stale session id; rejecting"
+                                );
+                                drop(transport);
+                            }
+                        }
+                        return;
+                    }
                     if client_id.is_empty() {
-                        // Default / new-session path — byte-identical
-                        // to pre-2-12 (empty id ⇒ fresh `SharedSession`,
-                        // `live_conns == 1`, one slot). Register a
-                        // `Weak<RpcSessionInner>` so a later echo of
-                        // its id can demux-attach onto this *founding
-                        // inner* (Phase A4 / F8: one inner per
-                        // session). The id is *never resolved* on this
-                        // path, so the default behavior is unchanged.
-                        //
-                        // Phase A4 (F8): no `unregister_session` on
-                        // exit — the founding worker is no longer the
-                        // session's death (any *last* slot exit is);
-                        // when the last `Arc<RpcSessionInner>` drops,
-                        // the registry's `Weak` goes stale and the
-                        // next `register_session` prunes it.
+                        // New session: mint, register, serve. Registry
+                        // entry is `Weak`; reclaimed by the next
+                        // `register_session` prune when the founding
+                        // `Arc<RpcSessionInner>` is dropped.
                         let session = match RpcSession::from_android13plus(
                             transport,
                             codec,
@@ -598,32 +614,11 @@ impl RpcServer {
                             log::debug!("RPC session ended: {e:?}");
                         }
                     } else if let Some(inner) = server.resolve_session(&client_id) {
-                        // Phase A4 (F8) **server-side unification**:
-                        // attach this connection as a new *slot* on the
-                        // founding `RpcSessionInner` (resolved from the
-                        // session id), not as a separate inner sharing
-                        // a `SharedSession`. One inner per session ⇒
-                        // every cached `RpcProxy.weak: Weak<RpcSessionInner>`
-                        // points to the only inner, so any server
-                        // worker's nested `proxy.transact` `find_conn`s
-                        // stay within its own slot pool (no cross-slot
-                        // aliasing of the F8 hazard).
-                        //
-                        // **Profile uniformity gate** (Phase A4): the
-                        // session's wire profile is set at the
-                        // founding handshake and is immutable; an
-                        // id-echoing 2nd+ connection whose handshake
-                        // negotiated a different version is a
-                        // malformed peer (or a hostile attempt to
-                        // mix-and-match codecs on one session) — refuse
-                        // before its bytes touch the session. R34
-                        // sessions are never registered in `sessions`
-                        // (the registry is populated only inside this
-                        // `Some(max) =>` branch, not the r34 arm below),
-                        // so `inner.wire_protocol_version()` is always
-                        // `Some(_)` here and this comparison reduces to
-                        // "founding vs attaching negotiated version
-                        // must match".
+                        // Attach: add a slot on the founding inner so
+                        // proxy-cache + slot-pool stay unified (the
+                        // F8-avoidance invariant). Reject on profile
+                        // mismatch — codec version is immutable for
+                        // the session.
                         if inner.wire_protocol_version() != Some(codec.version()) {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(
@@ -663,17 +658,7 @@ impl RpcServer {
                         // bounded by `set_max_connections` (default
                         // unlimited). Tightening to a check-and-increment
                         // atomic is §7.3 R-future.
-                        let cap = {
-                            let stored = inner.max_threads_value() as usize;
-                            #[cfg(feature = "rpc-experimental-multiconn")]
-                            {
-                                stored
-                            }
-                            #[cfg(not(feature = "rpc-experimental-multiconn"))]
-                            {
-                                stored.min(1)
-                            }
-                        };
+                        let cap = inner.max_threads_value() as usize;
                         if inner.slot_count() >= cap {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(
@@ -685,61 +670,29 @@ impl RpcServer {
                             drop(transport);
                             return;
                         }
-                        // **F4 anti-resurrection gate + slot add** —
-                        // atomic via `add_incoming_slot`, which gates
-                        // on `try_bump_live_conns` *and* enqueues the
-                        // slot in one critical section (no double-bump
-                        // race). `Err(DeadObject)` ⇒ the founding (or
-                        // any previously-attached) worker raced past
-                        // `live_conns 1→0` and fired obituaries between
-                        // `resolve_session.upgrade()` and now — refuse
-                        // so the attaching client gets `DeadObject`
-                        // instead of silently joining a session whose
-                        // `binder_died` already fired (or, worse, never
-                        // fires again for this connection's
-                        // `DeathRecipient`s).
+                        // `add_incoming_slot` atomically combines the
+                        // F4 anti-resurrection gate (`try_bump_live_
+                        // conns`) with the slot enqueue.
                         let session = RpcSession::wrap_inner(inner);
                         let slot_id = match session.add_incoming_slot(transport) {
                             Ok(id) => id,
-                            Err(_) => {
+                            Err(e) => {
                                 server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                                 log::warn!(
                                     "android-13+ RPC: session torn down between \
-                                     resolve and attach (F4 race); rejecting"
+                                     resolve and attach (F4 race); rejecting: {e:?}"
                                 );
                                 return;
                             }
                         };
-                        // Bump `attached_count` *after* the successful
-                        // `add_incoming_slot` so an external observer
-                        // never sees the intermediate state where
-                        // `attached_count` is incremented but the slot
-                        // never made it into the pool. (R2 ordering
-                        // residual — F8 collapses the prior pre-bump
-                        // → from_android13plus → counter sequence into
-                        // a single atomic.)
+                        // Bump *after* `add_incoming_slot` succeeded
+                        // so external observers never see a count for
+                        // a slot that never reached the pool.
                         server.attached_count.fetch_add(1, Ordering::SeqCst);
-                        // No re-`configure_session`: the founding
-                        // connection already set the session's
-                        // root/max-threads; re-applying would clobber a
-                        // customized session.
                         if let Err(e) = session.serve_blocking_on(slot_id) {
                             log::debug!("RPC attached connection ended: {e:?}");
                         }
-                        // The founding connection owns registration of
-                        // the id; a stale `Weak` is reclaimed by
-                        // `register_session`'s prune-on-insert when a
-                        // later session is registered. Phase A4 (F8)
-                        // dropped explicit `unregister_session`.
                     } else {
-                        // Non-empty id resolving to no live session
-                        // (unknown / stale / non-32-byte) ⇒ reject
-                        // (AOSP `ALOGE`+return). The handshake already
-                        // completed (rsbinder's accept is split only at
-                        // the *build* level, not the wire level — a
-                        // documented A0a/A0b residual); dropping
-                        // `transport` closes the socket and the
-                        // client's next op is `DeadObject`.
                         server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                         log::warn!(
                             "android-13+ RPC: client supplied an unknown/stale \

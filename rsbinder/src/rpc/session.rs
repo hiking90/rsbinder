@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
@@ -39,12 +39,11 @@ use super::wire_android13::{
 };
 use super::{RpcError, RpcResult};
 
-/// Result of the android-13+ server accept handshake (Phase A0b): the
-/// (unconsumed) transport plus the negotiated codec, the client's
-/// requested FD mode, and the client-supplied `session_id`. Named to
-/// keep [`RpcSession::android13plus_accept_handshake`] readable
-/// (clippy `type_complexity`).
-type Android13PlusAccept = (Box<dyn RpcTransport>, Android13PlusCodec, u8, Vec<u8>);
+/// Result of the android-13+ server accept handshake: the unconsumed
+/// transport plus the negotiated codec, the client's requested FD
+/// mode, the client-supplied `session_id`, and the
+/// `RPC_CONNECTION_OPTION_INCOMING` flag.
+type Android13PlusAccept = (Box<dyn RpcTransport>, Android13PlusCodec, u8, Vec<u8>, bool);
 
 /// Which RPC wire profile a session speaks.
 ///
@@ -474,7 +473,6 @@ impl Drop for ConnGuard<'_> {
 /// id→session registry — an opaque handle, not public API.
 pub(crate) struct SharedSession {
     state: Mutex<RpcState>,
-    async_counter: AtomicU64,
     root: Mutex<Option<SIBinder>>,
     /// Max-threads value advertised to the peer on `GET_MAX_THREADS`
     /// (server side) — subplan 2-3 negotiation.
@@ -1253,8 +1251,13 @@ impl RpcSessionInner {
         let oneway = (flags & FLAG_ONEWAY) != 0;
         let conn = self.find_conn(oneway);
         let transport = conn.transport();
+        // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = if oneway {
-            self.shared.async_counter.fetch_add(1, Ordering::SeqCst)
+            self.shared
+                .state
+                .lock()
+                .expect("rpc state poisoned")
+                .next_send_async_number(addr)
         } else {
             0
         };
@@ -1469,6 +1472,63 @@ impl RpcSessionInner {
         if t.address.is_zero() {
             return self.serve_special(&t, oneway);
         }
+        if oneway {
+            self.dispatch_oneway_ordered(t, in_fds)
+        } else {
+            self.execute_dispatched(t, in_fds, false)
+        }
+    }
+
+    /// Gate an inbound oneway through the target node's `asyncTodo`
+    /// priority queue (AOSP `RpcState::processTransactInternal` 1093–
+    /// 1133 enqueue + 1247–1278 drain). The state lock is released
+    /// before dispatch so a nested callback re-entry can reacquire it.
+    fn dispatch_oneway_ordered(&self, t: WireTransaction, in_fds: Vec<OwnedFd>) -> Result<()> {
+        let addr = t.address;
+        let wire_async = t.async_number;
+        let mut next = {
+            let mut state = self.shared.state.lock().expect("rpc state poisoned");
+            match state.dispatch_async_or_enqueue(addr, wire_async, t, in_fds) {
+                super::state::AsyncDecision::Dispatch(t, fds) => Some((t, fds)),
+                super::state::AsyncDecision::Enqueued => {
+                    log::trace!(
+                        "RPC oneway parked: addr={:?} async#={} (out of order)",
+                        addr,
+                        wire_async
+                    );
+                    None
+                }
+                super::state::AsyncDecision::Drop(reason) => {
+                    log::debug!(
+                        "RPC oneway dropped: addr={:?} async#={} reason={:?}",
+                        addr,
+                        wire_async,
+                        reason
+                    );
+                    None
+                }
+            }
+        };
+        while let Some((t, fds)) = next {
+            self.execute_dispatched(t, fds, true)?;
+            next = {
+                let mut state = self.shared.state.lock().expect("rpc state poisoned");
+                state.advance_and_pop_async(addr)
+            };
+        }
+        Ok(())
+    }
+
+    /// Run the local dispatch (lookup target + INTERFACE/PING shortcut
+    /// for twoway + `rpc_transact` + reply / oneway-log). Shared body
+    /// of both the twoway and oneway dispatch paths — the asyncTodo
+    /// gating in `dispatch_oneway_ordered` is layered *above* this.
+    fn execute_dispatched(
+        &self,
+        t: WireTransaction,
+        in_fds: Vec<OwnedFd>,
+        oneway: bool,
+    ) -> Result<()> {
         let target = self
             .shared
             .state
@@ -1477,9 +1537,8 @@ impl RpcSessionInner {
             .lookup_local(&t.address);
         let Some(target) = target else {
             if oneway {
-                // Oneway is best-effort by definition, but a drop to a
-                // GC'd/unknown address is otherwise indistinguishable
-                // from delivery — log it for diagnosability (Minor-2).
+                // Best-effort drop; visible only if F7's `dec_strong_local`
+                // ran between the asyncTodo gate and now.
                 log::debug!(
                     "RPC oneway to unknown/released address {:?} dropped",
                     t.address
@@ -1724,7 +1783,6 @@ impl RpcSession {
     fn fresh_shared(space: AddressSpace) -> RpcResult<Arc<SharedSession>> {
         Ok(Arc::new(SharedSession {
             state: Mutex::new(RpcState::new(space)),
-            async_counter: AtomicU64::new(0),
             root: Mutex::new(None),
             max_threads: AtomicU32::new(1),
             negotiated: AtomicU32::new(0),
@@ -1813,6 +1871,24 @@ impl RpcSession {
         Ok(self.inner.add_slot_inner(transport))
     }
 
+    /// Append a server-side *callback* slot — the wire mirror of the
+    /// peer's `mIncoming` (AOSP `RpcServer.cpp`: `addOutgoingConnection
+    /// (client, init=true)` for `incoming` headers). Does NOT bump
+    /// `live_conns` (callback slots are not serve-driven; AOSP also
+    /// does not gate session lifetime on `mOutgoing.size()`).
+    /// `Err(DeadObject)` if the session is already torn down.
+    pub(crate) fn add_callback_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
+        // Snapshot gate, not CAS — a concurrent founding death after
+        // this read is race-acceptable: the slot sits unused in a
+        // dead session and is reclaimed via `Arc<RpcSessionInner>`.
+        if self.inner.shared.live_conn_count() == 0
+            || self.inner.shared.obituary_sent.load(Ordering::Acquire)
+        {
+            return Err(StatusCode::DeadObject);
+        }
+        Ok(self.inner.add_slot_inner(transport))
+    }
+
     /// **Phase A4 (F8)**: this session's full inner state — including
     /// the *connection slot pool* and the wire profile, not just
     /// [`SharedSession`]. The unified-model server attach path stores
@@ -1844,11 +1920,11 @@ impl RpcSession {
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
     ) -> Result<Android13PlusAccept> {
-        let (codec, client_fd_mode, client_id) = {
+        let (codec, client_fd_mode, client_id, incoming) = {
             let mut io = RawTransportIo(transport.as_ref());
             server_accept(&mut io, server_max_version).map_err(StatusCode::from)?
         };
-        Ok((transport, codec, client_fd_mode, client_id))
+        Ok((transport, codec, client_fd_mode, client_id, incoming))
     }
 
     /// Server (Phase A0b): build the accepted connection's session from
@@ -2033,8 +2109,13 @@ impl RpcSession {
         server_max_version: u32,
         server_fd_unix: bool,
     ) -> Result<RpcSession> {
-        let (transport, codec, client_fd_mode, _client_id) =
+        let (transport, codec, client_fd_mode, _client_id, incoming) =
             Self::android13plus_accept_handshake(transport, server_max_version)?;
+        // This wrapper has no callback-slot path; incoming-direction
+        // attaches go through `super::RpcServer::serve_connection`.
+        if incoming {
+            return Err(StatusCode::BadType);
+        }
         Self::from_android13plus(transport, codec, client_fd_mode, server_fd_unix, None)
             .map_err(StatusCode::from)
     }

@@ -35,12 +35,65 @@
 //! proxy drop freed the node ⇒ the sibling connection's proxy
 //! `DeadObject`).
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::os::fd::OwnedFd;
 use std::sync::{self, Arc};
 
 use crate::binder::{IBinder, SIBinder};
 
 use super::address::{AddressSpace, RpcAddress};
+use super::wire::WireTransaction;
+
+/// Per-node `asyncTodo` queue entry. `Ord` by `async_number` so a
+/// `BinaryHeap<Reverse<AsyncTodo>>` gives min-heap top-is-smallest
+/// (AOSP `BinderNode::AsyncTodo` `operator<` uses the same trick).
+struct AsyncTodo {
+    async_number: u64,
+    transaction: WireTransaction,
+    in_fds: Vec<OwnedFd>,
+}
+
+impl PartialEq for AsyncTodo {
+    fn eq(&self, other: &Self) -> bool {
+        self.async_number == other.async_number
+    }
+}
+impl Eq for AsyncTodo {}
+impl PartialOrd for AsyncTodo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for AsyncTodo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.async_number.cmp(&other.async_number)
+    }
+}
+
+/// Why an inbound oneway was dropped (no dispatch, no enqueue) so
+/// callers can log / meter the two cases separately.
+#[derive(Debug, Clone, Copy)]
+pub enum DropReason {
+    /// `mNodeForAddress.find` miss — peer addressed a binder we have
+    /// never published or have already released. Benign for oneway.
+    UnknownAddress,
+    /// `wire_async < node.asyncNumber` — duplicate / replay / peer
+    /// bug; AOSP-divergent (AOSP terminates the session here).
+    StaleAsyncNumber,
+}
+
+/// Outcome of [`RpcState::dispatch_async_or_enqueue`] for an inbound
+/// oneway. Caller dispatches the [`AsyncDecision::Dispatch`] variant
+/// outside the state lock, then calls
+/// [`RpcState::advance_and_pop_async`] to advance the per-node counter
+/// and drain newly-eligible queued entries.
+#[derive(Debug)]
+pub enum AsyncDecision {
+    Dispatch(WireTransaction, Vec<OwnedFd>),
+    Enqueued,
+    Drop(DropReason),
+}
 
 /// A local object exposed to the peer under [`RpcAddress`].
 struct LocalNode {
@@ -48,6 +101,12 @@ struct LocalNode {
     binder: SIBinder,
     /// RPC strong count the peer holds (0 ⇒ drop the node).
     strong: i64,
+    /// AOSP `BinderNode::asyncNumber` (server side) — per-node, not
+    /// session-global.
+    next_async_number: u64,
+    /// AOSP `BinderNode::asyncTodo` — min-heap (via `Reverse`) of
+    /// out-of-order inbound oneway transactions.
+    async_todo: BinaryHeap<Reverse<AsyncTodo>>,
 }
 
 /// Per-session object/address table. Owned by `RpcSessionInner` behind
@@ -63,6 +122,11 @@ pub struct RpcState {
     /// does not keep them alive; lets us dedup one `RpcProxy` per
     /// address and observe its last drop.
     remote_proxies: HashMap<RpcAddress, sync::Weak<dyn IBinder>>,
+    /// AOSP `BinderNode::asyncNumber` (client side) — survives proxy
+    /// churn so the per-node monotonic stream is preserved across
+    /// sibling-connection re-resolve (the peer's `asyncTodo` does
+    /// not).
+    remote_send_async_counters: HashMap<RpcAddress, u64>,
     /// Monotonic address allocator (per-session — P6).
     addr_counter: u64,
     /// This endpoint's address subspace (initiator vs acceptor) so the
@@ -83,6 +147,7 @@ impl RpcState {
             local_nodes: HashMap::new(),
             local_by_ptr: HashMap::new(),
             remote_proxies: HashMap::new(),
+            remote_send_async_counters: HashMap::new(),
             addr_counter: 0,
             space,
         }
@@ -114,6 +179,8 @@ impl RpcState {
             LocalNode {
                 binder: binder.clone(),
                 strong: 1,
+                next_async_number: 0,
+                async_todo: BinaryHeap::new(),
             },
         );
         self.local_by_ptr.insert(ptr, addr);
@@ -211,6 +278,135 @@ impl RpcState {
             .filter_map(sync::Weak::upgrade)
             .collect()
     }
+
+    /// **Phase C (Option-2)** — post-increment the per-remote-address
+    /// send-side `async_number` (AOSP `nodeProgressAsyncNumber` on the
+    /// send path). Returns the value to stamp on the outgoing wire.
+    /// Auto-creates the counter at `0` if unseen. Decoupled from
+    /// `remote_proxies` so the counter survives a proxy `Drop` + re-
+    /// resolve on a sibling connection (Phase A0b multi-conn): the
+    /// peer's `BinderNode` is still alive (`timesSent > 0` on any
+    /// active connection), and resetting our counter would replay
+    /// numbers the peer's `asyncTodo` already processed — stalling
+    /// the per-node monotonic-stream contract forever.
+    ///
+    /// Overflow: u64 wrap means a session issued 2^64 oneways to one
+    /// node, effectively unreachable; AOSP `nodeProgressAsyncNumber`
+    /// returns `false` and tears down the session at overflow. We
+    /// match by wrapping + logging (rsbinder has no `shutdownAndWait`
+    /// equivalent on this path; the peer will surface as a protocol
+    /// error on the duplicate).
+    pub fn next_send_async_number(&mut self, addr: RpcAddress) -> u64 {
+        let counter = self.remote_send_async_counters.entry(addr).or_insert(0);
+        let n = *counter;
+        *counter = n.wrapping_add(1);
+        if *counter == 0 {
+            warn_async_wrap(&addr);
+        }
+        n
+    }
+
+    /// **Phase C** — decide whether to dispatch an inbound oneway now
+    /// or park it. Pass the wire `async_number` and the transaction
+    /// body / fds (moved in; given back in [`AsyncDecision::Dispatch`]
+    /// or owned by the heap on [`AsyncDecision::Enqueued`]). Twoway
+    /// transactions never reach this method.
+    ///
+    /// AOSP `RpcState::processTransactInternal` lines 1093–1133.
+    pub fn dispatch_async_or_enqueue(
+        &mut self,
+        addr: RpcAddress,
+        wire_async: u64,
+        txn: WireTransaction,
+        in_fds: Vec<OwnedFd>,
+    ) -> AsyncDecision {
+        let Some(node) = self.local_nodes.get_mut(&addr) else {
+            return AsyncDecision::Drop(DropReason::UnknownAddress);
+        };
+        if wire_async == node.next_async_number {
+            AsyncDecision::Dispatch(txn, in_fds)
+        } else if wire_async > node.next_async_number {
+            node.async_todo.push(Reverse(AsyncTodo {
+                async_number: wire_async,
+                transaction: txn,
+                in_fds,
+            }));
+            AsyncDecision::Enqueued
+        } else {
+            AsyncDecision::Drop(DropReason::StaleAsyncNumber)
+        }
+    }
+
+    /// **Phase C** — after a successful dispatch (by the caller) of
+    /// the previously-returned [`AsyncDecision::Dispatch`], advance
+    /// the per-node counter and pop the next eligible queued entry
+    /// (if its `async_number` matches the now-advanced counter). The
+    /// caller calls this in a loop until it returns `None`, then
+    /// stops draining. Each pop dispatches outside the state lock.
+    ///
+    /// AOSP `RpcState::processTransactInternal` lines 1247–1278 (the
+    /// `goto processTransactInternalTailCall` loop).
+    pub fn advance_and_pop_async(
+        &mut self,
+        addr: RpcAddress,
+    ) -> Option<(WireTransaction, Vec<OwnedFd>)> {
+        let node = self.local_nodes.get_mut(&addr)?;
+        node.next_async_number = node.next_async_number.wrapping_add(1);
+        if node.next_async_number == 0 {
+            warn_async_wrap(&addr);
+        }
+        // Drop heap entries from a hostile/buggy peer that retried below
+        // the expected number (AOSP-divergent — AOSP terminates the
+        // session; we treat them as best-effort oneway loss).
+        while let Some(Reverse(top)) = node.async_todo.peek() {
+            if top.async_number >= node.next_async_number {
+                break;
+            }
+            node.async_todo.pop();
+        }
+        if let Some(Reverse(top)) = node.async_todo.peek() {
+            if top.async_number == node.next_async_number {
+                let Reverse(todo) = node.async_todo.pop().expect("peek-pop");
+                return Some((todo.transaction, todo.in_fds));
+            }
+        }
+        None
+    }
+
+    /// Test/diagnostic: depth of the `async_todo` queue for a given
+    /// local address (0 if no node). Used by Phase C unit tests to
+    /// assert the parking behavior + drain.
+    #[cfg(test)]
+    pub(crate) fn async_todo_len(&self, addr: &RpcAddress) -> usize {
+        self.local_nodes
+            .get(addr)
+            .map(|n| n.async_todo.len())
+            .unwrap_or(0)
+    }
+
+    /// Test/diagnostic: current `next_async_number` for a local node
+    /// (0 if no node) — used by Phase C unit tests to verify the
+    /// counter advances exactly per dispatched oneway.
+    #[cfg(test)]
+    pub(crate) fn next_async_number(&self, addr: &RpcAddress) -> u64 {
+        self.local_nodes
+            .get(addr)
+            .map(|n| n.next_async_number)
+            .unwrap_or(0)
+    }
+}
+
+/// Shared by send-side post-increment and receive-side advance: the
+/// per-node `async_number` is a `u64`, so wrap is "issued 2^64 oneways
+/// to one node" — effectively unreachable. AOSP's
+/// `nodeProgressAsyncNumber` returns `false` and tears down the
+/// session at overflow; rsbinder has no equivalent kill switch on this
+/// path, so we log + let the peer surface it as a duplicate.
+fn warn_async_wrap(addr: &RpcAddress) {
+    log::warn!(
+        "RPC: per-address async_number wrapped at u64::MAX for {addr:?} — \
+         AOSP-divergent (AOSP terminates the session)."
+    );
 }
 
 #[cfg(test)]
@@ -423,5 +619,215 @@ mod tests {
         assert!(s.lookup_local(&x).is_some(), "sibling still reachable");
         assert!(s.dec_strong_local(&x), "conn #2 proxy drop frees it");
         assert_eq!(s.local_node_count(), 0, "no leak");
+    }
+
+    fn mk_txn(addr: RpcAddress, async_n: u64) -> WireTransaction {
+        WireTransaction {
+            address: addr,
+            code: 1,
+            flags: crate::binder::FLAG_ONEWAY,
+            async_number: async_n,
+            data: vec![],
+            object_positions: vec![],
+        }
+    }
+
+    /// **Phase C (Option-2) — send side**: per-remote-address counter
+    /// post-increments on every `next_send_async_number(addr)`, with
+    /// addresses tracked independently. Reset is impossible by design
+    /// (the peer's `BinderNode::asyncNumber` lives across our proxy
+    /// churn — see the field doc).
+    #[test]
+    fn phase_c_send_async_number_is_per_address_monotonic() {
+        let mut st = RpcState::new(AddressSpace::Initiator);
+        let a = RpcAddress::from_wire_bytes([1u8; 32]);
+        let b = RpcAddress::from_wire_bytes([2u8; 32]);
+        assert_eq!(st.next_send_async_number(a), 0);
+        assert_eq!(st.next_send_async_number(a), 1);
+        assert_eq!(
+            st.next_send_async_number(b),
+            0,
+            "per-address — b starts at 0"
+        );
+        assert_eq!(st.next_send_async_number(a), 2);
+        assert_eq!(st.next_send_async_number(b), 1);
+    }
+
+    /// **Phase C — receive side, in-order**: wire `async_number`
+    /// matches the per-node `next_async_number` ⇒ dispatch
+    /// immediately. The advance + queue drain runs in a separate call
+    /// (the dispatch happens *outside* the state lock).
+    #[test]
+    fn phase_c_in_order_dispatches_and_advances_counter() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b);
+        assert_eq!(st.next_async_number(&a), 0);
+        for i in 0..5u64 {
+            let txn = mk_txn(a, i);
+            match st.dispatch_async_or_enqueue(a, i, txn, vec![]) {
+                AsyncDecision::Dispatch(t, _) => assert_eq!(t.async_number, i),
+                other => panic!("in-order async_number {i} must dispatch, got {other:?}"),
+            }
+            assert_eq!(st.async_todo_len(&a), 0, "in-order ⇒ never enqueued");
+            assert!(
+                st.advance_and_pop_async(a).is_none(),
+                "queue empty ⇒ drain returns None"
+            );
+            assert_eq!(st.next_async_number(&a), i + 1);
+        }
+    }
+
+    /// **Phase C — receive side, out-of-order**: wire `async_number`
+    /// ahead of expected ⇒ parked. When the matching expected arrives,
+    /// dispatch advances the counter and the drain loop pops the
+    /// parked entries in priority order until a gap appears. This is
+    /// the AOSP `RpcState::processTransactInternal` lines 1093–1133
+    /// (enqueue) + 1247–1278 (drain) behaviour, and the exact thing
+    /// that makes libbinder's round-robin `mOutgoing` oneway
+    /// distribution preserve per-node order on the rsbinder server
+    /// (AC-12.6 (b) — Phase D failed pre-Phase-C with `log 10/20`).
+    #[test]
+    fn phase_c_out_of_order_enqueues_then_drains_in_priority_order() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b);
+
+        // Wire arrival: 2, 4, 1, 3, 0 (libbinder round-robin against
+        // 2 outgoing slots delivers this kind of interleave). Expected
+        // dispatch order: 0, 1, 2, 3, 4 (per-node monotonic).
+        for arrival_async in [2u64, 4, 1, 3, 0] {
+            let txn = mk_txn(a, arrival_async);
+            let decision = st.dispatch_async_or_enqueue(a, arrival_async, txn, vec![]);
+            if arrival_async == 0 {
+                // Last to arrive: 0 matches expected, so it dispatches.
+                match decision {
+                    AsyncDecision::Dispatch(t, _) => assert_eq!(t.async_number, 0),
+                    _ => panic!("arrival 0 must dispatch"),
+                }
+                break;
+            } else {
+                assert!(
+                    matches!(decision, AsyncDecision::Enqueued),
+                    "out-of-order arrival {arrival_async} must enqueue (expected was 0)"
+                );
+            }
+        }
+        // After dispatching 0, the queue must drain 1, 2, 3, 4 in
+        // strict order via advance_and_pop_async.
+        assert_eq!(st.async_todo_len(&a), 4, "1, 2, 3, 4 parked");
+        let mut dispatched = vec![0u64];
+        while let Some((t, _)) = st.advance_and_pop_async(a) {
+            dispatched.push(t.async_number);
+        }
+        assert_eq!(
+            dispatched,
+            vec![0, 1, 2, 3, 4],
+            "per-node monotonic dispatch despite wire reorder"
+        );
+        assert_eq!(st.async_todo_len(&a), 0, "drained");
+        // After draining 4 (the last one), counter still advances
+        // once for the dispatch of 4 — so expected is now 5.
+        assert_eq!(st.next_async_number(&a), 5);
+    }
+
+    /// **Phase C — unknown address**: AOSP `RpcState` only enqueues if
+    /// `mNodeForAddress.find(addr)` succeeds; rsbinder must mirror
+    /// that or unknown-address oneway would leak into the queue
+    /// forever. Returns [`AsyncDecision::Drop`] so the caller logs +
+    /// drops (oneway is best-effort).
+    #[test]
+    fn phase_c_unknown_address_drops_not_enqueues() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let unknown = RpcAddress::from_wire_bytes([9u8; 32]);
+        let txn = mk_txn(unknown, 0);
+        assert!(matches!(
+            st.dispatch_async_or_enqueue(unknown, 0, txn, vec![]),
+            AsyncDecision::Drop(DropReason::UnknownAddress)
+        ));
+        // `advance_and_pop_async` on an unknown address is a no-op
+        // (would otherwise underflow / spuriously advance a future
+        // node minted at the same address — but addresses are
+        // monotonic so the latter cannot happen).
+        assert!(st.advance_and_pop_async(unknown).is_none());
+    }
+
+    /// **Phase C — stale receive**: a `wire_async < next_async_number`
+    /// arrival (peer replay / buggy retry) returns
+    /// [`DropReason::StaleAsyncNumber`] without touching the queue;
+    /// any heap entry already below the expected number is drained on
+    /// the next `advance_and_pop_async` (so a hostile peer cannot OOM
+    /// us by spamming stale futures).
+    #[test]
+    fn phase_c_stale_arrival_drops_and_heap_drains_below_expected() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b);
+
+        // Advance expected to 3 by dispatching 0,1,2 in order.
+        for i in 0..3u64 {
+            let txn = mk_txn(a, i);
+            assert!(matches!(
+                st.dispatch_async_or_enqueue(a, i, txn, vec![]),
+                AsyncDecision::Dispatch(_, _)
+            ));
+            let _ = st.advance_and_pop_async(a);
+        }
+        assert_eq!(st.next_async_number(&a), 3);
+
+        // Now a stale arrival (1 < 3) reports the reason and does not
+        // enqueue.
+        let txn = mk_txn(a, 1);
+        assert!(matches!(
+            st.dispatch_async_or_enqueue(a, 1, txn, vec![]),
+            AsyncDecision::Drop(DropReason::StaleAsyncNumber)
+        ));
+        assert_eq!(st.async_todo_len(&a), 0);
+
+        // Heap stale-drain: inject a future arrival, advance past it,
+        // then verify the next pop sees the heap empty (the stale
+        // entry was reaped, not blocking).
+        let txn5 = mk_txn(a, 5);
+        let _ = st.dispatch_async_or_enqueue(a, 5, txn5, vec![]);
+        assert_eq!(st.async_todo_len(&a), 1);
+        // Dispatch a matching 3 + 4 to advance past 5's predecessor.
+        let _ = st.dispatch_async_or_enqueue(a, 3, mk_txn(a, 3), vec![]);
+        let _ = st.advance_and_pop_async(a); // expected → 4
+        let _ = st.dispatch_async_or_enqueue(a, 4, mk_txn(a, 4), vec![]);
+        let _ = st.advance_and_pop_async(a); // expected → 5; pops the parked 5.
+        assert_eq!(st.async_todo_len(&a), 0);
+        assert_eq!(st.next_async_number(&a), 5);
+    }
+
+    /// **Phase C — multi-node independence**: each `LocalNode` has its
+    /// own `next_async_number` + `async_todo`, so a stalled queue on
+    /// node A must not block dispatch on node B.
+    #[test]
+    fn phase_c_per_node_independence() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let b2 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a1 = st.on_binder_leaving(&b1);
+        let a2 = st.on_binder_leaving(&b2);
+
+        // Node a1: arrival 1 enqueued (expected 0).
+        let txn = mk_txn(a1, 1);
+        assert!(matches!(
+            st.dispatch_async_or_enqueue(a1, 1, txn, vec![]),
+            AsyncDecision::Enqueued
+        ));
+        assert_eq!(st.async_todo_len(&a1), 1);
+        // Node a2: independent counter at 0 ⇒ arrival 0 dispatches
+        // even though a1 is blocked.
+        let txn = mk_txn(a2, 0);
+        match st.dispatch_async_or_enqueue(a2, 0, txn, vec![]) {
+            AsyncDecision::Dispatch(t, _) => assert_eq!(t.async_number, 0),
+            _ => panic!("a2 must dispatch independently of a1's stalled queue"),
+        }
+        assert_eq!(st.async_todo_len(&a2), 0);
+        // Counters are truly independent.
+        assert_eq!(st.next_async_number(&a1), 0, "a1 not yet advanced");
+        assert!(st.advance_and_pop_async(a2).is_none());
+        assert_eq!(st.next_async_number(&a2), 1);
     }
 }

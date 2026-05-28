@@ -599,10 +599,9 @@ impl Drop for AccessorProviderHandle {
 /// `Service::Accessor(None)` / `ServiceWithMetadata(None)` they were
 /// trying to backfill).
 ///
-/// Phase A.5 will call this from `hub::get_service`'s servicemanager
-/// fallback arm; the function is `pub(crate)` here so the only
-/// consumers are inside the crate (Phase A.5 + hermetic A.5 tests).
-#[allow(dead_code)] // wired up in Phase A.5 (`hub::get_service` fallback)
+/// Consumed by [`resolve_via_process_local`] (the A.5 fallback the
+/// public `hub::get_service` arm uses) and by the hermetic A.5 tests.
+/// `pub(crate)` keeps all callers inside the crate.
 pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBinder> {
     // Snapshot of `Arc<AccessorProviderFn>` for entries that include
     // `name`. We deliberately keep `Arc` instead of `Weak` here so the

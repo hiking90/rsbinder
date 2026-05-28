@@ -1,7 +1,13 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// #![allow(clippy::missing_const_for_fn)]
+// Clippy's `missing_const_for_thread_local` is a false positive for our
+// `HashMap` / `HashSet` / `Document` (transitively HashMap) initializers
+// — they are not `const fn` (need `RandomState` at runtime), so the
+// suggested `const { ... }` wrap fails with E0015. The lint fires against
+// the whole `thread_local!` block, and neither macro-invocation-level nor
+// per-static `#[allow]` reaches that scope, so suppression is file-scope.
+#![allow(clippy::missing_const_for_thread_local)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -27,21 +33,15 @@ pub enum SymbolType {
 }
 
 #[derive(Debug, Clone)]
-pub struct Symbol {
-    #[allow(dead_code)]
-    pub name: String,
+pub(crate) struct Symbol {
     pub value: crate::const_expr::ConstExpr,
-    #[allow(dead_code)]
     pub symbol_type: SymbolType,
-    #[allow(dead_code)]
-    pub namespace: Option<String>,
 }
 
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     static DECLARATION_DOCUMENT_MAP: RefCell<HashMap<Namespace, DocumentContext>> = RefCell::new(HashMap::new());
-    #[allow(clippy::missing_const_for_thread_local)]
-    static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
+    static NAMESPACE_STACK: RefCell<Vec<Namespace>> = const { RefCell::new(Vec::new()) };
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
 
     // Universal Symbol Table - supports all types of named constants
@@ -50,10 +50,8 @@ thread_local! {
     static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
     // Filename and source text of the source currently being parsed (used for error message generation)
-    #[allow(clippy::missing_const_for_thread_local)]
-    static CURRENT_SOURCE_NAME: RefCell<String> = RefCell::new(String::new());
-    #[allow(clippy::missing_const_for_thread_local)]
-    static CURRENT_SOURCE_TEXT: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_SOURCE_NAME: RefCell<String> = const { RefCell::new(String::new()) };
+    static CURRENT_SOURCE_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
 
     // Non-fatal diagnostics accumulated during the current `parse_document`
     // call. Drained into `Document::warnings` before parse_document returns.
@@ -501,12 +499,7 @@ pub fn register_symbol(
     symbol_type: SymbolType,
     namespace: Option<&str>,
 ) {
-    let symbol = Symbol {
-        name: name.to_string(),
-        value,
-        symbol_type,
-        namespace: namespace.map(|s| s.to_string()),
-    };
+    let symbol = Symbol { value, symbol_type };
 
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();

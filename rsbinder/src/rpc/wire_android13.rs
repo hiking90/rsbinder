@@ -910,10 +910,6 @@ pub fn read_aosp_message_with_fds(
 ///    AOSP reads this *after* sending `"cci"` (`setupClient` order).
 ///
 /// Returns the [`Android13PlusCodec`] for the **negotiated** version.
-///
-/// (rsbinder originally had steps 2/3 inverted *and* the `"cci"`
-/// direction reversed — symmetric with its own `server_accept`, so the
-/// hermetic e2e could not catch it; the real-libbinder round-trip did.)
 pub fn client_connect<S: Read + Write>(
     stream: &mut S,
     max_version: u32,
@@ -931,6 +927,37 @@ pub fn client_connect<S: Read + Write>(
 /// id and reads the server-minted one; the remaining connections echo
 /// it). An **empty** `session_id` is byte-for-byte identical to
 /// [`client_connect`] (additive: the default path is unchanged).
+///
+/// **Wire is the mirror of [`server_accept`] across the 4 (new vs.
+/// attach) × (outgoing vs. incoming) cells (AOSP `RpcSession.cpp`
+/// `initAndAddConnection` + `setupClient` + `addOutgoing/Incoming
+/// Connection`):**
+///
+/// 1. write `RpcConnectionHeader` (`max_version`, optional `INCOMING`
+///    bit, optional 32-byte session id);
+/// 2. **direction-aware `"cci"` exchange**:
+///    - **outgoing**: client writes `"cci"` (`addOutgoingConnection
+///      (init=true)` → `sendConnectionInit`);
+///    - **incoming**: client reads `"cci"` (`addIncomingConnection` →
+///      `preJoinSetup` → `readConnectionInit`).
+/// 3. **new session only** (empty `session_id`, outgoing only — the
+///    AOSP `RpcSession::setupClient` outer flow reads
+///    `RpcNewSessionResponse` after the first `connectAndInit({},
+///    false)`): client reads `RpcNewSessionResponse`. Attach (echoed
+///    id) does NOT read one (AOSP attaches don't get a new-session
+///    response — the founding connection already pinned the version).
+///
+/// Returns the [`Android13PlusCodec`] for the version this connection
+/// negotiated: for a new session, the server-confirmed `min(max,
+/// server_max)`; for an attach, `max_version` itself. Attach trusts
+/// the founding session's pinned version because the wire carries no
+/// per-connection version on attach (AOSP same: `RpcServer.cpp` only
+/// writes `RpcNewSessionResponse` for `requestingNewSession`). The
+/// caller enforces uniformity by clamping `max_version =
+/// min(caller_max, session_version)` *before* the handshake (see
+/// [`RpcSession::add_outgoing_connection_android13plus`]); a peer
+/// running a different actual version on an id-echoing attach is an
+/// unverifiable wire condition on both sides.
 pub fn client_connect_with_id<S: Read + Write>(
     stream: &mut S,
     max_version: u32,
@@ -941,34 +968,66 @@ pub fn client_connect_with_id<S: Read + Write>(
     let hdr_codec = Android13PlusCodec::with_version(max_version)?;
     let header = hdr_codec.encode_connection_header(incoming, fd_mode, session_id)?;
     write_all_raw(stream, &header)?;
-    write_all_raw(stream, &hdr_codec.encode_connection_init())?;
-    let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;
-    let negotiated = hdr_codec.decode_new_session_response(&resp)?;
-    Android13PlusCodec::with_version(negotiated)
+    let requesting_new_session = session_id.is_empty();
+    if incoming {
+        // attach + incoming (new + incoming is rejected server-side):
+        // client reads server-sent init okay.
+        let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
+        hdr_codec.decode_connection_init(&init)?;
+    } else {
+        // outgoing (both new and attach): client writes init.
+        write_all_raw(stream, &hdr_codec.encode_connection_init())?;
+    }
+    if requesting_new_session {
+        let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;
+        let negotiated = hdr_codec.decode_new_session_response(&resp)?;
+        if negotiated == hdr_codec.version() {
+            Ok(hdr_codec)
+        } else {
+            Android13PlusCodec::with_version(negotiated)
+        }
+    } else {
+        // Attach: no NewSessionResponse on the wire (AOSP same).
+        Ok(hdr_codec)
+    }
 }
 
-/// Server side of the android-13+ connection handshake (new session).
+/// Server side of the android-13+ connection handshake.
 ///
-/// **Wire order is byte-exact to AOSP `RpcServer::establishConnection`
-/// + `RpcSession::preJoinSetup` (android-13.0.0_r84):**
+/// Wire order is byte-exact to AOSP `RpcServer::establishConnection`
+/// (and `RpcSession::preJoinSetup` / `addOutgoingConnection(init=true)`)
+/// in android-16.0.0_r4 across the 4 cells of `(new vs attach)` ×
+/// `(outgoing vs incoming)`:
 ///
-/// 1. read `RpcConnectionHeader` (+ variable session id);
-/// 2. write `RpcNewSessionResponse` (`min(server_max, client_max)`) —
-///    AOSP writes this immediately after the header for a new session
-///    (`establishConnection`);
-/// 3. read + validate the client's `RpcOutgoingConnectionInit`
-///    (`"cci"`) — AOSP reads it on the per-connection serving setup
-///    (`preJoinSetup` → `RpcState::readConnectionInit`).
+/// 1. read `RpcConnectionHeader` (+ variable session id) — parse the
+///    `RPC_CONNECTION_OPTION_INCOMING` bit at `head[4]`.
+/// 2. **new session only** (empty session id): write
+///    `RpcNewSessionResponse` (`min(server_max, client_max)`). AOSP
+///    only writes this for `requestingNewSession` (`RpcServer.cpp`
+///    `if (requestingNewSession)`); attach echoes don't get one.
+/// 3. **direction-aware `"cci"` exchange**:
+///    - **outgoing-from-client** (server reads transacts from the
+///      client on this slot): server **reads** the client's
+///      `RpcOutgoingConnectionInit` (`preJoinSetup` →
+///      `readConnectionInit`).
+///    - **incoming-from-client** (server *sends* callbacks /
+///      `DEC_STRONG` to the client on this slot): server **writes**
+///      `"cci"` (`RpcServer.cpp` calls `addOutgoingConnection(client,
+///      true /*init*/)` for `incoming` → `sendConnectionInit`).
+/// 4. **new + incoming** is rejected (`RpcServer.cpp`: *"Cannot create
+///    a new session with an incoming connection, would leak"*).
 ///
 /// Returns the negotiated [`Android13PlusCodec`] plus the client's
-/// requested FD mode and session-id.
+/// requested FD mode, session-id, and incoming flag.
 pub fn server_accept<S: Read + Write>(
     stream: &mut S,
     server_max_version: u32,
-) -> RpcResult<(Android13PlusCodec, u8, Vec<u8>)> {
+) -> RpcResult<(Android13PlusCodec, u8, Vec<u8>, bool)> {
     // Fixed 16-byte header first, then the variable session id.
     let head = read_exact_raw(stream, A13_CONN_HEADER_LEN)?;
     let client_version = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+    let options = head[4];
+    let incoming = (options & CONN_OPTION_INCOMING) != 0;
     let id_size = u16::from_le_bytes([head[14], head[15]]) as usize;
     let session_id = if id_size > 0 {
         read_exact_raw(stream, id_size)?
@@ -993,10 +1052,29 @@ pub fn server_accept<S: Read + Write>(
     // min(serverMax, callerMax) — and it must be one we implement.
     let negotiated = client_version.min(server_max_version);
     let codec = Android13PlusCodec::with_version(negotiated)?;
-    write_all_raw(stream, &codec.encode_new_session_response(negotiated))?;
-    let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
-    codec.decode_connection_init(&init)?;
-    Ok((codec, fd_mode, session_id))
+    let requesting_new_session = session_id.is_empty();
+    // AOSP order (`RpcServer.cpp` lines 488-507 then 530-534): for any
+    // `requesting_new_session` header the response is written first;
+    // the incoming-direction "would leak" reject happens *after*.
+    if requesting_new_session {
+        write_all_raw(stream, &codec.encode_new_session_response(negotiated))?;
+    }
+    if requesting_new_session && incoming {
+        return Err(RpcError::Protocol(
+            "new-session request set RPC_CONNECTION_OPTION_INCOMING",
+        ));
+    }
+    if incoming {
+        // attach + incoming: server-driven send of the init okay
+        // (`addOutgoingConnection(init=true)`).
+        write_all_raw(stream, &codec.encode_connection_init())?;
+    } else {
+        // outgoing-from-client (both new and attach): server reads the
+        // client's init (`preJoinSetup` → `readConnectionInit`).
+        let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
+        codec.decode_connection_init(&init)?;
+    }
+    Ok((codec, fd_mode, session_id, incoming))
 }
 
 fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
@@ -1428,9 +1506,11 @@ mod tests {
             let (mut c, mut s) = UnixStream::pair().expect("socketpair");
 
             let srv = thread::spawn(move || -> u32 {
-                let (codec, fd_mode, sid) = server_accept(&mut s, smax).expect("server_accept");
+                let (codec, fd_mode, sid, incoming) =
+                    server_accept(&mut s, smax).expect("server_accept");
                 assert_eq!(fd_mode, FD_MODE_NONE);
                 assert!(sid.is_empty(), "new-session ⇒ empty session id");
+                assert!(!incoming, "new-session is always outgoing");
 
                 // Read the client's GET_ROOT TRANSACT (AOSP framing).
                 let raw = read_aosp_message(&mut s).expect("read transact");
@@ -1521,9 +1601,10 @@ mod tests {
 
             let srv = thread::spawn(move || -> u32 {
                 let mut io = RawTransportIo(&b);
-                let (codec, fd, sid) = server_accept(&mut io, 2).expect("server_accept");
+                let (codec, fd, sid, incoming) = server_accept(&mut io, 2).expect("server_accept");
                 assert_eq!(fd, FD_MODE_NONE);
                 assert!(sid.is_empty());
+                assert!(!incoming);
                 let raw = read_aosp_message(&mut io).expect("read transact");
                 match codec.decode_message(&raw).expect("decode") {
                     WireMessage::Transact(t) => assert_eq!(t.code, 0),
@@ -1576,6 +1657,113 @@ mod tests {
         let (m, _m2) = crate::rpc::transport::MemTransport::pair();
         assert!(m.send_raw(b"x").is_err(), "mem has no raw byte access");
         assert!(m.recv_raw(&mut [0u8; 4]).is_err());
+    }
+
+    /// Attach handshake (non-empty session id) is byte-exact to AOSP
+    /// `RpcSession::initAndAddConnection` + `RpcServer::establish
+    /// Connection`: no `RpcNewSessionResponse` on the wire, "cci"
+    /// direction follows the `RPC_CONNECTION_OPTION_INCOMING` bit.
+    /// The mutant catch — server spuriously writing `RpcNewSession
+    /// Response` on attach + client spuriously reading it — would be
+    /// invisible to a success-only assertion (both sides write+read
+    /// 8 stale bytes in lockstep) but surfaces here as leftover bytes
+    /// after both shutdown their write halves.
+    #[test]
+    fn android13plus_attach_handshake_wire_byte_exact() {
+        use std::io::Read;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let session_id = [0x42u8; 32];
+
+        for (incoming, version) in [
+            (false, PROTOCOL_V0),
+            (false, PROTOCOL_V1),
+            (false, PROTOCOL_V2),
+            (true, PROTOCOL_V0),
+            (true, PROTOCOL_V1),
+            (true, PROTOCOL_V2),
+        ] {
+            let (mut c, mut s) = UnixStream::pair().expect("pair");
+            let sid = session_id;
+            let srv = thread::spawn(move || -> (u32, bool, Vec<u8>, Vec<u8>) {
+                let (codec, _fd, got_sid, srv_incoming) =
+                    server_accept(&mut s, version).expect("server_accept");
+                s.shutdown(Shutdown::Write).expect("srv shutdown w");
+                let mut leftover = Vec::new();
+                s.read_to_end(&mut leftover).expect("srv read_to_end");
+                (codec.version(), srv_incoming, got_sid, leftover)
+            });
+
+            let codec = client_connect_with_id(&mut c, version, incoming, FD_MODE_NONE, &sid)
+                .expect("client_connect_with_id");
+            c.shutdown(Shutdown::Write).expect("cli shutdown w");
+            let mut client_leftover = Vec::new();
+            c.read_to_end(&mut client_leftover)
+                .expect("cli read_to_end");
+            assert!(
+                client_leftover.is_empty(),
+                "(attach, incoming={incoming}, v={version}): server wrote {} unexpected \
+                 byte(s) after handshake — regression of NewSessionResponse-on-attach",
+                client_leftover.len()
+            );
+
+            let (sv, sincoming, ssid, srv_leftover) = srv.join().expect("srv");
+            assert_eq!(sv, version);
+            assert_eq!(sincoming, incoming);
+            assert_eq!(ssid, sid.to_vec());
+            assert_eq!(codec.version(), version);
+            assert!(
+                srv_leftover.is_empty(),
+                "(attach, incoming={incoming}, v={version}): client wrote {} unexpected \
+                 byte(s) after handshake",
+                srv_leftover.len()
+            );
+        }
+    }
+
+    /// AOSP-faithful: `RpcServer.cpp` writes `RpcNewSessionResponse`
+    /// for *any* `requestingNewSession` header (line 494-506), *then*
+    /// at line 530-534 rejects the incoming-direction request because
+    /// "Cannot create a new session with an incoming connection,
+    /// would leak". The client therefore sees the response on the
+    /// wire before EOF — this test pins both the rejection and the
+    /// wire order.
+    #[test]
+    fn android13plus_new_session_incoming_rejected() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut c, mut s) = UnixStream::pair().expect("pair");
+        let srv = thread::spawn(move || -> RpcResult<_> {
+            let result = server_accept(&mut s, PROTOCOL_V1);
+            drop(s);
+            result
+        });
+
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V1).unwrap();
+        let header = codec
+            .encode_connection_header(true, FD_MODE_NONE, &[])
+            .unwrap();
+        write_all_raw(&mut c, &header).expect("write header");
+
+        let r = srv.join().expect("srv");
+        assert!(
+            matches!(r, Err(RpcError::Protocol(_))),
+            "server must reject new-session + incoming, got {r:?}"
+        );
+
+        let mut buf = Vec::new();
+        c.read_to_end(&mut buf).expect("read response + EOF");
+        assert_eq!(
+            buf.len(),
+            A13_NEW_SESSION_RESP_LEN,
+            "AOSP order: write RpcNewSessionResponse, then close on \
+             incoming. Got {} bytes: {buf:?}",
+            buf.len()
+        );
     }
 
     // ===== subplan 2-8 — android-16 RPC wire v2 (Phase A) ==========

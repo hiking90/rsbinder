@@ -914,12 +914,6 @@ fn r34_profile_reports_no_wire_version() {
 /// `SharedSession` ⇒ `c2.get_session_id() != sid1` ⇒ the shared-id
 /// assertion fails. That is what makes the demux load-bearing rather
 /// than the dead plumbing F1/F9 warn about.
-// EXPERIMENTAL multi-conn (plan 2-12 / AC-12.6): gated to the
-// `rpc-experimental-multiconn` feature so the default build leaves
-// the unverified attach path clamped to slot-cap 1 (see
-// `RpcServer::set_max_threads` rustdoc). Hermetic green either way
-// when the feature is on.
-#[cfg(feature = "rpc-experimental-multiconn")]
 #[test]
 fn a0b_multi_connection_shared_session() {
     let path = tmp_sock("a0b");
@@ -1103,7 +1097,7 @@ fn a0b_multi_connection_shared_session() {
 /// id round-trip + `attached_count == 1` + F4 partial-loss survival);
 /// this test layers Phase A4's structural shape on top of that
 /// without re-asserting the A0b contract.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn ac_12_f8_attach_unifies_to_single_inner() {
     let path = tmp_sock("ac12f8");
@@ -1197,7 +1191,7 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
 /// kept as a §7.3 FOLLOWUP (test scaffolding, not a B.1 deferral —
 /// the *behavior* is already in code and falls inside the
 /// rejected_unknown_id observability).
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let path = tmp_sock("ac124");
@@ -1287,49 +1281,6 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
 /// **Mutant gate (== pre-F7 code)**: revert `on_binder_leaving`'s
 /// `timesSent` bump (strong stays 1). Then dropping `root1` frees the
 /// shared node and `root2.echo()` is `DeadObject` ⇒ this fails.
-/// Default-build counterpart of `ac_12_4_set_max_threads_caps_incoming_slots`:
-/// sibling attach is refused via `rejected_unknown_id` and the
-/// `negotiate(local)` advertise side stays `min(local, stored)` unchanged.
-#[cfg(not(feature = "rpc-experimental-multiconn"))]
-#[test]
-fn default_build_clamps_slot_cap_despite_advertise_two() {
-    let path = tmp_sock("dflt_cap");
-    let counter = Arc::new(AtomicI64::new(0));
-    let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_android13plus(1);
-    server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
-    let bg = server.run_background();
-    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
-    wait_for_sock(&path);
-
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ founding");
-    let _r1 = EchoProxy(c1.get_root().expect("get_root founding"));
-    let sid = c1.get_session_id().expect("get_session_id founding");
-    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
-    assert_eq!(server.session_slot_count(&sid_arr), Some(1));
-
-    let rejected_before = server.rejected_unknown_id_count();
-
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("handshake completes (reject is post-handshake)");
-    c2.set_timeout(Some(Duration::from_secs(3)));
-    let err = c2.get_root().expect_err("sibling attach refused");
-    assert!(matches!(
-        err,
-        StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
-    ));
-    assert!(poll_until(
-        || server.rejected_unknown_id_count() == rejected_before + 1
-    ));
-    assert_eq!(server.session_slot_count(&sid_arr), Some(1));
-
-    let negotiated = c1.negotiate(4).expect("negotiate");
-    assert_eq!(negotiated, 2);
-    assert_eq!(c1.negotiated_max_threads(), 2);
-}
-
-#[cfg(feature = "rpc-experimental-multiconn")]
 #[test]
 fn f7_shared_node_survives_sibling_proxy_drop() {
     let path = tmp_sock("f7");
@@ -1482,7 +1433,7 @@ fn f7_excess_receipt_no_leak_single_client() {
 /// **Mutant gates (verified in separate runs)**: `find_conn` always
 /// returning slot 1 OR `find_conn`'s "first available" check ignoring
 /// `exclusive_tid` would re-serialize ⇒ elapsed > 250 ms.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let path = tmp_sock("a1pool");
@@ -1554,7 +1505,7 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
 /// returning prematurely without re-check) would either deadlock or
 /// race-corrupt the wire. We assert the timing band and rely on the
 /// transact correctness as the secondary signal.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_exhausted_condvar_blocks_not_busy_loops() {
     let path = tmp_sock("a1exh");
@@ -1647,7 +1598,7 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
 /// as the *next* Phase-A increment. The scoped single-thread test
 /// here exercises the slot-pin without triggering the aliasing
 /// (only slot 2 unmarshals the cb).
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let path = tmp_sock("a2pin");
@@ -1717,6 +1668,54 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     // _cu handles teardown.
 }
 
+/// AC-12.2-extended — two client threads make concurrent
+/// `roundtrip(cb)` calls; each server worker must see a *distinct*
+/// `RpcProxy`-backed nested send (Phase A4 / F8 — one inner per
+/// session, slots in one pool). F8 mutant (N-inner / 1-shared
+/// hybrid): the two workers' `state.remote_proxies` would hand out
+/// `RpcProxy`s whose `Weak<RpcSessionInner>` pointed to different
+/// inners; the 2nd worker's nested `proxy.transact` would `find_conn`
+/// against the 1st worker's slot pool and deadlock or interleave.
+/// `set_timeout(3s)` bounds that deadlock so the mutant surfaces as a
+/// test failure rather than CI hang.
+#[test]
+fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
+    let path = tmp_sock("a2ext");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    c.set_timeout(Some(Duration::from_secs(3)));
+    let sid = c.get_session_id().expect("get_session_id");
+    let slot2 = c
+        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .expect("slot 2");
+    assert_ne!(slot2, 1, "second slot has a fresh id");
+
+    let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
+    let cb_a = make_service(Arc::new(AtomicI64::new(0)));
+    let cb_b = make_service(Arc::new(AtomicI64::new(0)));
+
+    let r1 = Arc::clone(&root);
+    let cba = cb_a.clone();
+    let h1 = std::thread::spawn(move || r1.roundtrip(&cba).expect("rt thread 1"));
+    let r2 = Arc::clone(&root);
+    let cbb = cb_b.clone();
+    let h2 = std::thread::spawn(move || r2.roundtrip(&cbb).expect("rt thread 2"));
+
+    assert_eq!(h1.join().expect("join 1"), "rt:ping");
+    assert_eq!(h2.join().expect("join 2"), "rt:ping");
+
+    drop(root);
+    drop(c);
+}
+
 /// **AC-12.3 (Phase A — oneway Option-1)**: on a multi-outgoing
 /// client, all top-level **oneway** sends are pinned to the founding
 /// slot (single-slot in-order delivery preserves the same-object
@@ -1738,7 +1737,7 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
 /// (deferred); the per-slot in-order delivery is exercised here by
 /// the count + the parallel twoway round-trips not corrupting the
 /// shared wire.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
     let path = tmp_sock("a3one");
