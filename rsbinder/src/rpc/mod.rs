@@ -204,6 +204,22 @@ impl From<std::io::Error> for RpcError {
     }
 }
 
+impl From<RpcError> for std::io::Error {
+    /// Boundary projection back to `std::io::Error` for callers that
+    /// hold an `io::Result<_>` accumulator (the accept-loop dispatch in
+    /// `RpcServer::run` is the motivating site — its `accept_transport`
+    /// helper must surface a `from_stream`-side `RpcError` through the
+    /// same `io::ErrorKind` matching as the underlying `accept()`).
+    /// `RpcError::Io` round-trips the original `io::Error` unchanged;
+    /// other variants are wrapped with [`std::io::ErrorKind::Other`].
+    fn from(e: RpcError) -> Self {
+        match e {
+            RpcError::Io(io) => io,
+            other => std::io::Error::other(format!("{other}")),
+        }
+    }
+}
+
 impl From<RpcError> for crate::StatusCode {
     /// Boundary projection used when an RPC failure must surface through
     /// `rsbinder::Result`. Specific, actionable mappings where they

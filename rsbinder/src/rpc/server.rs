@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -32,7 +32,76 @@ use crate::native::Binder;
 use crate::parcel::Parcel;
 
 use super::session::{RpcSession, RpcSessionId, RpcSessionInner};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::transport::VsockTransport;
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
+
+/// **Plan 2-15 E0/E2** — backend-agnostic listener kind for [`RpcServer`].
+/// The accept loop in [`RpcServer::run`] holds one of these and the
+/// `accept_transport` helper hides the per-backend stream type behind a
+/// `Box<dyn RpcTransport>`, so the worker dispatch path is byte-identical
+/// across UDS / vsock / (future TLS-wrapping factories). Default
+/// `setup_unix_server` callers stay on the `Unix` variant, so the wire
+/// is byte-unchanged on that path.
+enum ServerListener {
+    Unix(UnixListener),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Vsock(vsock::VsockListener),
+}
+
+/// **Plan 2-15 E0** — backend-agnostic bind metadata, replacing the prior
+/// `path: PathBuf` UDS-only field. `Drop` branches on this for the
+/// per-backend cleanup: `Unix` removes the socket file, `Vsock` has no
+/// filesystem cleanup (the kernel reclaims the (cid,port) on `Drop` of
+/// the listener fd itself).
+enum BindAddress {
+    Unix(PathBuf),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Vsock {
+        cid: u32,
+        port: u32,
+    },
+}
+
+impl ServerListener {
+    /// Set the listener to non-blocking so the accept loop can poll
+    /// `shutdown`. The `vsock` crate exposes `set_nonblocking` on
+    /// `VsockListener` mirroring `UnixListener`'s std API.
+    fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+        match self {
+            ServerListener::Unix(l) => l.set_nonblocking(on),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ServerListener::Vsock(l) => l.set_nonblocking(on),
+        }
+    }
+
+    /// Per-backend accept: dispatches to the right `accept()`, sets the
+    /// accepted stream blocking (the worker's `recv_frame` is blocking),
+    /// and boxes it as `RpcTransport` so the caller's loop is
+    /// backend-agnostic.
+    fn accept_transport(&self) -> std::io::Result<Box<dyn RpcTransport>> {
+        match self {
+            ServerListener::Unix(l) => {
+                let (stream, _addr) = l.accept()?;
+                // The listener is non-blocking so the accept loop can
+                // poll `shutdown`; the accepted connection must be
+                // blocking for the worker's `recv_frame`.
+                stream.set_nonblocking(false)?;
+                let t = UnixTransport::from_stream(stream).map_err(std::io::Error::from)?;
+                Ok(Box::new(t))
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ServerListener::Vsock(l) => {
+                let (stream, _addr) = l.accept()?;
+                // Mirror the UDS path: non-blocking listener for shutdown
+                // polling, blocking accepted stream for the worker.
+                stream.set_nonblocking(false)?;
+                let t = VsockTransport::from_stream(stream).map_err(std::io::Error::from)?;
+                Ok(Box::new(t))
+            }
+        }
+    }
+}
 
 /// Built-in directory interface descriptor + its single transaction.
 const DIRECTORY_DESC: &str = "rsbinder.rpc.IServiceDirectory";
@@ -81,10 +150,15 @@ impl Remotable for ServiceDirectory {
 /// cloned out of the lock and invoked lock-free.
 type Authorizer = Arc<dyn Fn(&PeerIdentity) -> bool + Send + Sync>;
 
-/// A Unix-domain RPC server.
+/// An RPC server. Backend is chosen by the constructor:
+/// [`setup_unix_server`](RpcServer::setup_unix_server) (UDS, default) or
+/// [`setup_vsock_server`](RpcServer::setup_vsock_server) (Linux/Android,
+/// AVF / Microdroid). The accept loop + worker dispatch are
+/// backend-agnostic — every accepted connection becomes one `RpcSession`
+/// on a worker thread regardless of backend.
 pub struct RpcServer {
-    listener: UnixListener,
-    path: PathBuf,
+    listener: ServerListener,
+    bind: BindAddress,
     root: Mutex<Option<SIBinder>>,
     named: Mutex<HashMap<String, SIBinder>>,
     max_threads: Mutex<u32>,
@@ -181,11 +255,48 @@ impl RpcServer {
         let _ = std::fs::remove_file(&path);
         // `StatusCode: From<std::io::Error>` — `?` converts directly.
         let listener = UnixListener::bind(&path)?;
+        let listener = ServerListener::Unix(listener);
         // Non-blocking accept so the loop can observe `shutdown`.
         listener.set_nonblocking(true)?;
-        Ok(Arc::new(RpcServer {
+        Ok(Self::wrap(listener, BindAddress::Unix(path)))
+    }
+
+    /// **Plan 2-15 E2** — Bind + listen on a vsock `(cid, port)`. The
+    /// returned `RpcServer` is otherwise identical to one built by
+    /// [`setup_unix_server`](RpcServer::setup_unix_server): accept loop,
+    /// authorizer hook, max-threads cap, session registry, and the
+    /// android-13+ wire negotiation all run unchanged.
+    ///
+    /// **Address-family note**: vsock is Linux-kernel-only, and the
+    /// `vsock` crate marks its types `cfg(any(target_os = "linux",
+    /// target_os = "android"))`. Use `vsock::VMADDR_CID_LOCAL` for
+    /// loopback (the `vsock_loopback` kernel module must be loaded on a
+    /// host where there is no VM peer). For Android Virtualization
+    /// Framework / Microdroid pVM scenarios the cid is the
+    /// guest-assigned id.
+    ///
+    /// **Cleanup**: vsock has no filesystem entry, so `Drop` only flips
+    /// the shutdown flag (the kernel reclaims the `(cid, port)` on the
+    /// listener fd close).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_vsock_server(cid: u32, port: u32) -> Result<Arc<RpcServer>> {
+        let listener = vsock::VsockListener::bind_with_cid_port(cid, port).map_err(|e| {
+            log::warn!("VsockListener::bind_with_cid_port({cid}, {port}) failed: {e}");
+            crate::StatusCode::from(e)
+        })?;
+        let listener = ServerListener::Vsock(listener);
+        listener.set_nonblocking(true)?;
+        Ok(Self::wrap(listener, BindAddress::Vsock { cid, port }))
+    }
+
+    /// Backend-agnostic `RpcServer` construction (E0). Both
+    /// [`setup_unix_server`](Self::setup_unix_server) and
+    /// [`setup_vsock_server`](Self::setup_vsock_server) funnel through
+    /// here so the field set stays in one place.
+    fn wrap(listener: ServerListener, bind: BindAddress) -> Arc<RpcServer> {
+        Arc::new(RpcServer {
             listener,
-            path,
+            bind,
             root: Mutex::new(None),
             named: Mutex::new(HashMap::new()),
             max_threads: Mutex::new(1),
@@ -199,7 +310,7 @@ impl RpcServer {
             rejected_unknown_id: AtomicUsize::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
-        }))
+        })
     }
 
     /// Publish the single root object (android `setRootObject`).
@@ -755,14 +866,12 @@ impl RpcServer {
                     continue;
                 }
             }
-            match self.listener.accept() {
-                Ok((stream, _addr)) => {
-                    // The listener is non-blocking so the accept loop
-                    // can poll `shutdown`; accepted connections must be
-                    // blocking for the worker's `recv_frame`.
-                    stream.set_nonblocking(false)?;
-                    let t = UnixTransport::from_stream(stream)?;
-                    self.serve_connection(Box::new(t));
+            match self.listener.accept_transport() {
+                Ok(t) => {
+                    // `accept_transport` already sets the accepted
+                    // stream blocking and boxes it as `RpcTransport`
+                    // (E0 backend-agnostic dispatch).
+                    self.serve_connection(t);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Listener is non-blocking only so we can poll
@@ -823,9 +932,26 @@ impl RpcServer {
         }
     }
 
-    /// The bound socket path.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
+    /// The bound socket path for a Unix-domain server. `None` for other
+    /// backends (vsock, future TLS-wrapping factories) — the listener
+    /// has no filesystem entry to expose.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.bind {
+            BindAddress::Unix(p) => Some(p.as_path()),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            BindAddress::Vsock { .. } => None,
+        }
+    }
+
+    /// **Plan 2-15 E2** — bound vsock address for a vsock server.
+    /// `None` for other backends. Available only on platforms where the
+    /// vsock backend is compiled in (Linux / Android).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn vsock_address(&self) -> Option<(u32, u32)> {
+        match &self.bind {
+            BindAddress::Vsock { cid, port } => Some((*cid, *port)),
+            BindAddress::Unix(_) => None,
+        }
     }
 }
 
@@ -853,8 +979,21 @@ impl Drop for RpcServer {
     /// scope refactoring — see review report M9.)
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Best-effort socket file cleanup; never panic in Drop.
-        let _ = std::fs::remove_file(&self.path);
+        // Best-effort backend-specific cleanup; never panic in Drop.
+        match &self.bind {
+            BindAddress::Unix(p) => {
+                // Remove the UDS file so a follow-up `setup_unix_server`
+                // on the same path doesn't see a stale ENOENT/EADDRINUSE.
+                let _ = std::fs::remove_file(p);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            BindAddress::Vsock { .. } => {
+                // vsock has no filesystem entry; the kernel reclaims the
+                // (cid, port) when the listener fd is closed (the
+                // listener is owned by `self.listener` so Drop closes it
+                // for us — no explicit step needed).
+            }
+        }
     }
 }
 

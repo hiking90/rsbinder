@@ -1,9 +1,9 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-4 track V: vsock backend e2e — **Linux-only, `#[ignore]`
-//! by default** (plan V6 environment gate: needs a peer VM or the
-//! `vsock_loopback` kernel module + `VMADDR_CID_LOCAL`).
+//! Subplan 2-4 track V + **Plan 2-15 E2**: vsock backend e2e — **Linux-
+//! only, `#[ignore]` by default** (plan V6 environment gate: needs a
+//! peer VM or the `vsock_loopback` kernel module + `VMADDR_CID_LOCAL`).
 //!
 //! Run manually on a suitable Linux host with:
 //! ```text
@@ -14,13 +14,21 @@
 //! Demonstrates AC-4.1 (the 2-2/2-3 core runs unmodified with the
 //! transport swapped to vsock), AC-4.2 (host↔guest value round-trip),
 //! AC-4.3 (`PeerIdentity::Vsock{cid}`, never mis-reported as `Local`).
+//!
+//! **E2 cleanup**: the original e2e built a raw `VsockListener` +
+//! thread-spawned `RpcSession::new(..)` server **outside** `RpcServer`
+//! to work around the (pre-E0) `RpcServer.listener: UnixListener` lock-
+//! in. With E0+E2 (`RpcServer::setup_vsock_server`) that workaround is
+//! gone — the server is built with the same factory + `run_background`
+//! pattern as the UDS e2e suite. The raw `VsockListener` path is no
+//! longer exercised here, but the underlying `VsockTransport::from_stream`
+//! / `VsockTransport::connect` still are (one through the server's
+//! accept loop, the other through the test's client construction).
 
 #![cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 
-use std::thread;
-
 use rsbinder::rpc::transport::VsockTransport;
-use rsbinder::rpc::{AddressSpace, PeerIdentity, RpcSession, RpcTransport};
+use rsbinder::rpc::{PeerIdentity, RpcServer, RpcSession, RpcTransport};
 use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
     FIRST_CALL_TRANSACTION,
@@ -82,24 +90,28 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// AC-4.1/4.2/4.3 over loopback vsock (`VMADDR_CID_LOCAL`).
+/// AC-4.1/4.2/4.3 over loopback vsock (`VMADDR_CID_LOCAL`) — server
+/// built with **Plan 2-15 E2** `RpcServer::setup_vsock_server`.
+///
+/// Server-side: the same factory + `run_background` shape used by the
+/// UDS e2e suite — backend swap is the only difference. Client-side:
+/// `VsockTransport::connect` (unchanged) so the `PeerIdentity::Vsock`
+/// assertion (AC-4.3) keeps its original wire-level reach.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_loopback_e2e() {
-    use vsock::{VsockListener, VMADDR_CID_LOCAL};
+    use vsock::VMADDR_CID_LOCAL;
 
-    let listener =
-        VsockListener::bind_with_cid_port(VMADDR_CID_LOCAL, TEST_PORT).expect("vsock bind");
-    let server = thread::spawn(move || {
-        let (stream, _addr) = listener.accept().expect("vsock accept");
-        let t = VsockTransport::from_stream(stream).expect("server transport");
-        let session =
-            RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
-        session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-            PingSvc,
-        )))));
-        let _ = session.serve_blocking();
-    });
+    // E2: same `RpcServer` API as UDS, vsock-backed listener.
+    let server =
+        RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, TEST_PORT).expect("setup_vsock_server");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    // E0 accessor gates: vsock_address `Some`, fs path `None`.
+    assert_eq!(server.vsock_address(), Some((VMADDR_CID_LOCAL, TEST_PORT)));
+    assert_eq!(server.path(), None, "vsock server has no filesystem entry");
+    let bg = server.run_background();
 
     let client_t = VsockTransport::connect(VMADDR_CID_LOCAL, TEST_PORT).expect("client connect");
     // AC-4.3: identity is Vsock{cid}, never Local.
@@ -107,11 +119,14 @@ fn vsock_loopback_e2e() {
         PeerIdentity::Vsock { cid } => assert_eq!(cid, VMADDR_CID_LOCAL),
         other => panic!("expected Vsock peer id, got {other}"),
     }
-    let client =
-        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let client = RpcSession::new(Box::new(client_t), rsbinder::rpc::AddressSpace::Initiator)
+        .expect("RpcSession::new");
     let root = client.get_root().expect("get_root over vsock");
     assert_eq!(ping_via(&root, "hi").unwrap(), "pong:hi");
+
+    // Teardown — explicit shutdown + bg.join (same shape as UDS tests).
     drop(root);
     drop(client);
-    server.join().unwrap();
+    server.shutdown();
+    let _ = bg.join();
 }
