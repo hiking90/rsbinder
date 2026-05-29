@@ -32,7 +32,7 @@ required-features = ["rpc"]
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
 #       --features rpc,android_16 --bin rpc_accessor_interop_client
 # and run on the android-16 emulator alongside the C++ launcher
-# (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_stage3.sh.
+# (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_rpc_accessor_interop.sh.
 [[bin]]
 name = "rpc_accessor_interop_client"
 required-features = ["rpc", "android_16"]
@@ -46,7 +46,7 @@ required-features = ["rpc", "android_16"]
 #       --features rpc,android_16 --bin rpc_accessor_register_interop_server
 # and run on the android-16 emulator alongside the C++ launcher
 # (`cpp/rpc_accessor_register_interop_launcher.cpp`). See
-# cpp/run_stage3_register.sh.
+# cpp/run_rpc_accessor_register_interop.sh.
 [[bin]]
 name = "rpc_accessor_register_interop_server"
 required-features = ["rpc", "android_16"]
@@ -58,8 +58,8 @@ required-features = ["rpc", "android_16"]
 # Threads(1)`). Cross-compile with
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
 #       --features rpc --bin rpc_multiconn_interop_server
-# and run on the android-16 emulator alongside cpp/run_stage3_
-# multiconn.sh. AC-12.6 (a) twoway + (b) oneway both PASS post-
+# and run on the android-16 emulator alongside
+# cpp/run_rpc_multiconn_interop.sh. AC-12.6 (a) twoway + (b) oneway both PASS post-
 # Phase C (2026-05-28); the prior EXPERIMENTAL gate was removed.
 [[bin]]
 name = "rpc_multiconn_interop_server"
@@ -69,6 +69,8 @@ required-features = ["rpc"]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 env_logger = { workspace = true }
 async-trait = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+libc = { workspace = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

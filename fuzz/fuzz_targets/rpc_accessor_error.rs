@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fuzz target (subplan 2-13 B.6 / V4): arbitrary bytes → AOSP
+//! Fuzz target: arbitrary bytes → AOSP
 //! `IAccessor::ERROR_*` decode. Property: no panic / OOM / hang; any
 //! unknown code falls through to the `"unknown"` log hint, never an
 //! authoritative-looking symbol. The enforceable regression is the

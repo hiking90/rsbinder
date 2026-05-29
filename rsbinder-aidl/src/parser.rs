@@ -433,7 +433,11 @@ pub(crate) fn enum_member_const_expr_from_lookup(
             break;
         }
 
-        enum_val += 1;
+        // `wrapping_add` matches AOSP's C++ wraparound semantics and avoids
+        // a debug-build panic / release silent overflow when an enumerator
+        // carries an explicit `i64::MAX` value followed by an auto-increment
+        // member.
+        enum_val = enum_val.wrapping_add(1);
     }
 
     ENUM_RESOLUTION_STACK.with(|stack| {
@@ -928,6 +932,111 @@ pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     String::new()
 }
 
+/// Parsed AOSP `@EnforcePermission` annotation. Mirrors the three forms
+/// `aidl_language.cpp::AidlAnnotation::EnforceExpression()` accepts:
+/// `@EnforcePermission("X")` / `@EnforcePermission(value = "X")` =
+/// [`EnforcePermissionExpr::Single`], `@EnforcePermission(allOf = {...})`
+/// = [`EnforcePermissionExpr::AllOf`], `@EnforcePermission(anyOf = {...})`
+/// = [`EnforcePermissionExpr::AnyOf`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnforcePermissionExpr {
+    Single(String),
+    AllOf(Vec<String>),
+    AnyOf(Vec<String>),
+}
+
+/// Walks an `Annotation::const_expr` (or array element) and returns the
+/// owned string when the value is `ValueType::String(_)`. The pest
+/// grammar already strips the surrounding double quotes, so no
+/// `trim_matches('"')` is required.
+fn const_expr_as_string(expr: &ConstExpr) -> Option<String> {
+    if let crate::const_expr::ValueType::String(ref s) = expr.value {
+        Some(s.clone())
+    } else {
+        None
+    }
+}
+
+/// Walks an `Annotation::const_expr` representing an AIDL string-array
+/// literal (`{"A", "B"}`) and returns the contained strings. Returns
+/// `None` for non-array values or arrays containing non-string elements
+/// — both are AOSP-rejected per
+/// `aidl_language.cpp::AidlAnnotation::CheckValid()`.
+fn const_expr_as_string_array(expr: &ConstExpr) -> Option<Vec<String>> {
+    let crate::const_expr::ValueType::Array(items) = &expr.value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(const_expr_as_string(item)?);
+    }
+    Some(out)
+}
+
+/// Extracts a parsed `@EnforcePermission(...)` from a method's annotation
+/// list, or `None` when the annotation is absent or syntactically
+/// malformed (no `value`/`allOf`/`anyOf` recognized — already surfaced by
+/// `parse_annotation_list`'s unknown-annotation warning path).
+///
+/// AOSP schema reference: `aidl_language.cpp:211-214` declares
+/// `EnforcePermission` with `{{"value", kStringType}, {"anyOf",
+/// kStringArrayType}, {"allOf", kStringArrayType}}` — exactly the three
+/// forms decoded here.
+pub fn enforce_permission_from_annotation_list(
+    annotation_list: &[Annotation],
+    method_name: &str,
+) -> Result<Option<EnforcePermissionExpr>, crate::error::AidlError> {
+    for annotation in annotation_list {
+        if annotation.annotation != "@EnforcePermission" {
+            continue;
+        }
+
+        // Shorthand `@EnforcePermission("X")`: AIDL grammar parses the
+        // bare positional argument into `annotation.const_expr` rather
+        // than `parameter_list`.
+        if let Some(c) = &annotation.const_expr {
+            if let Some(s) = const_expr_as_string(c) {
+                return Ok(Some(EnforcePermissionExpr::Single(s)));
+            }
+        }
+
+        // Named-parameter forms — match the AOSP schema's three keys.
+        for param in &annotation.parameter_list {
+            match param.identifier.as_str() {
+                "value" => {
+                    if let Some(s) = const_expr_as_string(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::Single(s)));
+                    }
+                }
+                "allOf" => {
+                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::AllOf(items)));
+                    }
+                }
+                "anyOf" => {
+                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::AnyOf(items)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // `@EnforcePermission` annotation present but no recognized
+        // argument form matched. Refuse to emit an unguarded Bn —
+        // AOSP rejects this at build time too.
+        let (start, end) = annotation.annotation_span.unwrap_or((0, 0));
+        return Err(crate::error::AidlError::Semantic(Box::new(
+            crate::error::SemanticError::MalformedEnforcePermission {
+                method: method_name.to_string(),
+                src: miette::NamedSource::new(current_source_name(), current_source_text()),
+                span: (start, end.saturating_sub(start)).into(),
+            },
+        )));
+    }
+    Ok(None)
+}
+
 pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
     for annotation in annotation_list {
         if annotation.annotation == "@Descriptor" {
@@ -1273,8 +1382,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                     .next()
                     .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
                 // Map the common C/AIDL escape sequences to their actual code
-                // points; previously the escaped char was returned verbatim
-                // (e.g. `'\n'` yielded 'n' instead of newline).
+                // points (e.g. `'\n'` becomes newline, not the literal 'n').
                 match esc {
                     'n' => '\n',
                     't' => '\t',

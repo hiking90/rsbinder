@@ -4,7 +4,7 @@
 //! Fuzz target: arbitrary bytes + a hostile object-position table
 //! through the **v1+ AOSP-shape** RPC FD decode
 //! (`[not-null|hasComm|TYPE|idx]` + strict `binary_search`), no
-//! received fds (subplan 2-11 Phase B / V4). Property: no panic / UB /
+//! received fds. Property: no panic / UB /
 //! fd leak — a forged/unsorted/absent position, wrong `TYPE`, non-zero
 //! `hasComm`, or dangling index is a clean `Err`.
 

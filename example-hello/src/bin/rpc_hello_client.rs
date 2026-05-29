@@ -4,7 +4,7 @@
 //! RPC variant of `hello_client` — connects to `rpc_hello_service`
 //! over a Unix-domain socket and calls the **same generated `IHello`
 //! proxy**. The generated stub resolves the RPC binder through
-//! `as_remote()` (Plan 2-6.B single-stub): the call site is identical
+//! `as_remote()` (single-stub): the call site is identical
 //! to the kernel path — there is no RPC-specific proxy and no service
 //! manager (the root object comes straight off the session).
 //!

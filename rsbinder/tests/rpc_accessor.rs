@@ -1,20 +1,17 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-13 D.7 — STAGE1 hermetic end-to-end: drive the
+//! Hermetic end-to-end: drive the
 //! `IAccessor → addConnection() → preconnected-fd RpcSession →
 //! getRootObject()` bridge entirely in-process against an rsbinder
-//! `MockAccessor` and an rsbinder `RpcServer`. Exercises A0.1–A0.3 +
-//! A.4 + A.5 + B.6.
+//! `MockAccessor` and an rsbinder `RpcServer`.
 //!
-//! Plan §3 calls this "hermetic ⇒ symmetric": this binary green is the
-//! AC-13.1/13.2/13.3 gate. The non-negotiable real-libbinder gate is
-//! D.8 (separate harness, android-16 emulator) and is *not* in this
-//! file's scope; see [plans/2-13-rpc-accessor.md](
-//! ../../plans/2-13-rpc-accessor.md) §3 STAGE3.
+//! Hermetic ⇒ symmetric: this binary green is the in-process gate. The
+//! non-negotiable real-libbinder gate runs against the android-16
+//! emulator in a separate harness and is *not* in this file's scope.
 //!
-//! Separate test binary (master §6): no shared process with the kernel
-//! binder unit tests. P6: each test owns its own server + sessions ⇒
+//! Separate test binary: no shared process with the kernel
+//! binder unit tests. Each test owns its own server + sessions ⇒
 //! parallel-safe.
 
 #![cfg(all(feature = "rpc", feature = "android_16"))]
@@ -97,7 +94,7 @@ fn make_echo(calls: Arc<AtomicI64>) -> SIBinder {
 
 /// What the Accessor reports on `getInstanceName()`. Tests can lie
 /// (return a different name than the looked-up service) to drive the
-/// `validateAccessor` rejection path (AC-13.3).
+/// `validateAccessor` rejection path.
 struct MockAccessor {
     /// Server-side socket path; `addConnection()` opens a fresh
     /// `UnixStream::connect()` to it on every call (the AOSP shape:
@@ -109,7 +106,7 @@ struct MockAccessor {
     name: String,
     /// Optional override returning a synthetic
     /// `ServiceSpecificError(code)` from `addConnection()` — exercises
-    /// the B.6 decode + reject path.
+    /// the decode + reject path.
     add_connection_error: Option<i32>,
     /// Bumped on every `addConnection()` so a test can assert the
     /// bridge made exactly one connection attempt (or none, for a
@@ -242,7 +239,7 @@ fn rpc_echo(root: &SIBinder, s: &str) -> Result<String> {
     reply.read::<String>()
 }
 
-// ---- AC-13.1 / 13.2: happy path -------------------------------------
+// ---- happy path -----------------------------------------------------
 
 #[test]
 fn accessor_arm_resolves_root_and_echoes() {
@@ -257,7 +254,7 @@ fn accessor_arm_resolves_root_and_echoes() {
         nonblocking: false,
     });
 
-    // AC-13.2 contract: a `Service::Accessor` arm resolves to
+    // Contract: a `Service::Accessor` arm resolves to
     // `ServiceWithMetadata { service: Some(rpc_root), isLazyService: false }`.
     let swm = resolve_accessor("test.echo", accessor).expect("bridge resolves");
     assert!(!swm.r#isLazyService);
@@ -280,7 +277,7 @@ fn accessor_arm_resolves_root_and_echoes() {
     drop(root);
 }
 
-// ---- AC-13.3 (mutant 1): instance-name mismatch reject --------------
+// ---- mutant 1: instance-name mismatch reject ------------------------
 
 #[test]
 fn accessor_instance_name_mismatch_rejects() {
@@ -310,7 +307,7 @@ fn accessor_instance_name_mismatch_rejects() {
     );
 }
 
-// ---- AC-13.3 (mutant 2): addConnection ServiceSpecificError decode --
+// ---- mutant 2: addConnection ServiceSpecificError decode ------------
 
 #[test]
 fn accessor_add_connection_service_specific_error_rejects_and_logs() {
@@ -336,7 +333,7 @@ fn accessor_add_connection_service_specific_error_rejects_and_logs() {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // Symbolic name lookup must round-trip — the deterministic
-        // gate for B.6 (the log line is what an operator sees).
+        // gate (the log line is what an operator sees).
         let name = accessor_error_name(code);
         assert!(
             name.starts_with("ERROR_"),
@@ -345,7 +342,7 @@ fn accessor_add_connection_service_specific_error_rejects_and_logs() {
     }
 }
 
-// ---- AC-13.3 + A.5: session lifetime — root stays usable, then dies --
+// ---- session lifetime — root stays usable, then dies ----------------
 
 #[test]
 fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
@@ -378,7 +375,7 @@ fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
     // that's an internal detail. The test merely asserts no panic.
 }
 
-// ---- D.8 STAGE3 regression gate: non-blocking preconnected fd -------
+// ---- STAGE3 regression gate: non-blocking preconnected fd -----------
 
 /// AOSP `singleSocketConnection` (frameworks/native/libs/binder/
 /// RpcSession.cpp:614, android-16.0.0_r4) opens its preconnected
@@ -388,7 +385,7 @@ fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
 /// the `RpcNewSessionResponse` via `read_exact_raw` which assumes
 /// `read` blocks); without explicit `O_NONBLOCK` clear in
 /// `from_preconnected_fd`, the handshake's first `read()` returns
-/// `EAGAIN` and tears the connection down — which D.8 STAGE3 caught
+/// `EAGAIN` and tears the connection down — which STAGE3 interop caught
 /// against the real android-16 emulator. This test is the hermetic
 /// regression gate so a future refactor that removes the
 /// `O_NONBLOCK` clear in [`RpcSession::from_preconnected_fd`] fails
@@ -418,7 +415,7 @@ fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
     }
 }
 
-// ---- Subplan 2-14 A.5 e2e: process-local AccessorProvider fallback ----
+// ---- process-local AccessorProvider fallback e2e --------------------
 
 use rsbinder::hub::android_16::{
     add_accessor_provider, create_accessor, resolve_via_process_local, AccessorAddrProvider,
@@ -426,20 +423,20 @@ use rsbinder::hub::android_16::{
 };
 use std::collections::HashSet;
 
-/// 2-14 A.5: end-to-end from `add_accessor_provider` registration
+/// End-to-end from `add_accessor_provider` registration
 /// to `resolve_via_process_local` returning an `RpcSession` root that
-/// echoes. Drives the full A.4 + A.5 chain on top of A0.1–A0.3:
+/// echoes:
 ///
 /// 1. Spin up an `RpcServer` (background) serving `EchoSvc` as root.
 /// 2. Register a `LocalAccessor` (via `create_accessor`) under a
 ///    unique instance name through `add_accessor_provider`.
-/// 3. Call `resolve_via_process_local(name)` — A.5's public entrypoint
+/// 3. Call `resolve_via_process_local(name)` — the public entrypoint
 ///    (`getInjectedAccessor` + `Service::accessor → toBinder` AOSP
 ///    combined). Asserts:
 ///    * lookup hits the registered provider (the registry is global,
 ///      but the instance name is process+line-scoped so no
 ///      cross-test collision),
-///    * 2-13 `resolve_accessor` runs cleanly against the live RPC
+///    * `resolve_accessor` runs cleanly against the live RPC
 ///      server: instance-name validation passes, `addConnection`
 ///      yields a connected fd, `from_preconnected_fd` handshakes v2,
 ///      `get_root()` returns the echo binder,
@@ -463,7 +460,7 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
 
     // `LocalAccessor` whose `addr_provider` always hands back the
     // RpcServer's listening UDS path. Registered under `instance` via
-    // the A.4 process-local registry.
+    // the process-local registry.
     let server_path = server.path.clone();
     let provider: AccessorProviderFn = {
         let want = instance.clone();
@@ -482,7 +479,7 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     let provider_handle =
         add_accessor_provider(HashSet::from([instance.clone()]), provider).expect("registry add");
 
-    // A.5 public entrypoint — combined `getInjectedAccessor` +
+    // Public entrypoint — combined `getInjectedAccessor` +
     // `toBinder` path.
     let swm = resolve_via_process_local(&instance).expect("process-local fallback yields root SWM");
     assert!(!swm.r#isLazyService, "RPC root is never a LazyService");
@@ -501,13 +498,13 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     drop(provider_handle);
 }
 
-/// 2-14 A.5 primitive gate: `resolve_via_process_local` keys lookups
+/// `resolve_via_process_local` keys lookups
 /// **strictly** by instance name — unregistered names yield `None`
 /// (not a phantom binder), and a sibling registration must not leak
 /// into unrelated names. This is the contract the
-/// `hub::servicemanager_16::dispatch_typed_service` fallback (Phase
-/// 2-14 A.5) relies on; the dispatcher's own routing is exercised by
-/// the unit tests in [`hub::servicemanager_16::tests`].
+/// `hub::servicemanager_16::dispatch_typed_service` fallback relies on;
+/// the dispatcher's own routing is exercised by the unit tests in
+/// [`hub::servicemanager_16::tests`].
 ///
 /// **Mutant gate**: a provider that returns `Some(_)` for every name
 /// (or a registry that ignores its instance set) would resurrect the
@@ -569,7 +566,7 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
     drop(provider_handle);
 }
 
-// ---- AC-13.3 sanity: accessor_error_name surface lock ---------------
+// ---- sanity: accessor_error_name surface lock -----------------------
 
 #[test]
 fn accessor_error_name_unknown_codes_safe() {
@@ -582,7 +579,7 @@ fn accessor_error_name_unknown_codes_safe() {
     assert_eq!(accessor_error_name(42), "unknown");
     assert_eq!(accessor_error_name(-1), "unknown");
     // Ensure the re-export path through `hub::android_16` matches the
-    // module-local one (B.6 surface lock).
+    // module-local one (surface lock).
     assert_eq!(
         a16::accessor_error_name(0),
         "ERROR_CONNECTION_INFO_NOT_FOUND"

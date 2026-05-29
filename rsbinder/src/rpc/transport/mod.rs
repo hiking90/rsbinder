@@ -1,24 +1,24 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transport abstraction for the RPC stack (subplan 2-1).
+//! Transport abstraction for the RPC stack.
 //!
 //! A [`RpcTransport`] carries **length-framed byte messages** for one
 //! RPC connection and reports the [`PeerIdentity`] of the other end.
 //! The implementation *defines the trust boundary*: a `unix` socket
-//! trusts filesystem permissions + `SO_PEERCRED`; `vsock` (2-4) trusts
-//! hypervisor VM isolation; `tls` (2-4) trusts a certificate; the gated
+//! trusts filesystem permissions + `SO_PEERCRED`; `vsock` trusts
+//! hypervisor VM isolation; `tls` trusts a certificate; the gated
 //! `tcp_debug` backend trusts **nothing** and is debug/interop only.
 //!
 //! Framing is the transport's responsibility (not the wire codec's), so
-//! the 2-2 wire layer can think purely in whole messages. Stream
-//! backends (`unix`, `tcp_debug`) share the length-prefix helpers in
-//! this module; the in-process `mem` backend frames implicitly (one
-//! channel message == one frame).
+//! the wire layer can think purely in whole messages. Stream backends
+//! (`unix`, `tcp_debug`) share the length-prefix helpers in this
+//! module; the in-process `mem` backend frames implicitly (one channel
+//! message == one frame).
 //!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
-//! without changing this trait — see subplan 2-3 §7-2.
+//! without changing this trait.
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -47,8 +47,8 @@ pub use vsock::VsockTransport;
 ///
 /// A length header declaring more than this is rejected **before any
 /// allocation** — an adversarial peer cannot trigger an OOM by claiming
-/// a huge body (V4 / AC-1.8 / plan 2-1 §6.3). 64 MiB is far above any
-/// legitimate binder transaction yet bounded.
+/// a huge body. 64 MiB is far above any legitimate binder transaction
+/// yet bounded.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// One RPC connection: framed byte transport + peer identity.
@@ -56,9 +56,8 @@ pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// Synchronous and blocking. `&self` (not `&mut self`) so a session can
 /// hold one transport and use it from a sender thread and a receiver
 /// thread concurrently — full-duplex sockets and the `mem` channel pair
-/// both support that without a deadlock (AC-1.4). Implementations must
-/// keep `send_frame`/`recv_frame` independently callable from two
-/// threads.
+/// both support that without a deadlock. Implementations must keep
+/// `send_frame`/`recv_frame` independently callable from two threads.
 pub trait RpcTransport: Send + Sync {
     /// Send exactly one logical frame. The implementation guarantees
     /// framing (length prefix or channel message boundary).
@@ -86,7 +85,7 @@ pub trait RpcTransport: Send + Sync {
     fn describe(&self) -> &str;
 
     /// Set a read deadline for subsequent [`RpcTransport::recv_frame`]
-    /// calls (subplan 2-3). `None` clears it (fully blocking). The
+    /// calls. `None` clears it (fully blocking). The
     /// default is a no-op for backends with no read-timeout notion;
     /// `unix` / `mem` / `tcp_debug` override it. A deadline that
     /// elapses with **nothing consumed** surfaces as
@@ -96,13 +95,13 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
-    /// Send one frame plus passed file descriptors out-of-band
-    /// (subplan 2-7, opt-in `FileDescriptorTransportMode::Unix`).
+    /// Send one frame plus passed file descriptors out-of-band (opt-in
+    /// `FileDescriptorTransportMode::Unix`).
     ///
     /// The **default rejects any fd** — so `mem`/`vsock`/`tls` are
-    /// fd-incapable *by type*, with no extra code (plan 2-7 §4). Only
-    /// `unix` overrides this with `SCM_RIGHTS`. An empty `fds` slice
-    /// falls back to the plain framed send.
+    /// fd-incapable *by type*, with no extra code. Only `unix` overrides
+    /// this with `SCM_RIGHTS`. An empty `fds` slice falls back to the
+    /// plain framed send.
     fn send_frame_with_fds(
         &self,
         buf: &[u8],
@@ -117,22 +116,20 @@ pub trait RpcTransport: Send + Sync {
         }
     }
 
-    /// Receive one frame plus any out-of-band file descriptors
-    /// (subplan 2-7). Default: never yields fds (the plain framed
-    /// recv); only `unix` overrides with `SCM_RIGHTS`.
+    /// Receive one frame plus any out-of-band file descriptors.
+    /// Default: never yields fds (the plain framed recv); only `unix`
+    /// overrides with `SCM_RIGHTS`.
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_frame()?, Vec::new()))
     }
 
     /// Send raw bytes with **no framing**. The real android RPC wire
     /// has no length prefix (`RpcState::rpcSend` writes the
-    /// `RpcWireHeader` + body directly) — the android-13+ profile
-    /// (subplan 2-5b / G4) drives framing itself via
-    /// `wire_android13`. The default is
-    /// **unsupported**, so `mem`/`tls`/`vsock` stay frame-only *by
-    /// type* (no extra code); only `unix` overrides it. The existing
-    /// R34 path never calls this — `send_frame`/`recv_frame` are
-    /// byte-unchanged.
+    /// `RpcWireHeader` + body directly) — the android-13+ profile drives
+    /// framing itself via `wire_android13`. The default is
+    /// **unsupported**, so `mem`/`tls`/`vsock` stay frame-only *by type*
+    /// (no extra code); only `unix` overrides it. The existing R34 path
+    /// never calls this — `send_frame`/`recv_frame` are byte-unchanged.
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
@@ -145,9 +142,9 @@ pub trait RpcTransport: Send + Sync {
     }
 
     /// Send raw bytes with **no framing**, passing `fds` out-of-band via
-    /// `SCM_RIGHTS` (subplan 2-11 Phase A0 — the android-13+ v1+
-    /// `Unix` FD-over-RPC path). This is [`RpcTransport::send_raw`] +
-    /// the ancillary channel of [`RpcTransport::send_frame_with_fds`],
+    /// `SCM_RIGHTS` (the android-13+ v1+ `Unix` FD-over-RPC path). This
+    /// is [`RpcTransport::send_raw`] + the ancillary channel of
+    /// [`RpcTransport::send_frame_with_fds`],
     /// minus the length prefix: the real android RPC wire has none
     /// (`RpcWireHeader.bodySize` is authoritative) and AOSP rides the
     /// fds on the **first** `sendmsg` of the message
@@ -166,8 +163,8 @@ pub trait RpcTransport: Send + Sync {
     }
 
     /// Read up to `buf.len()` raw bytes (one `recvmsg`; `Ok((0, _))` =
-    /// peer closed) plus any `SCM_RIGHTS` fds delivered with them
-    /// (subplan 2-11 Phase A0). Pairs with
+    /// peer closed) plus any `SCM_RIGHTS` fds delivered with them.
+    /// Pairs with
     /// [`RpcTransport::send_raw_with_fds`]; received fds are
     /// `O_CLOEXEC`. AOSP accumulates ancillary fds across the
     /// `recvmsg`s that read one message
@@ -181,8 +178,8 @@ pub trait RpcTransport: Send + Sync {
 
 /// Identity of the peer on the other end of a [`RpcTransport`].
 ///
-/// `#[non_exhaustive]`: subplan 2-4 adds `Certificate(..)` (TLS) and
-/// `Vsock { cid }` variants. Matching code must keep a wildcard arm.
+/// `#[non_exhaustive]`: matching code must keep a wildcard arm, since
+/// further variants may be added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PeerIdentity {
@@ -197,13 +194,13 @@ pub enum PeerIdentity {
     },
     /// A vsock peer, identified by its context id. **Not an ACL
     /// basis** — `cid` is a routing address, and the trust boundary is
-    /// hypervisor VM isolation (subplan 2-4 R1). Logged with the cid.
+    /// hypervisor VM isolation. Logged with the cid.
     Vsock {
         /// vsock context id of the peer VM/host.
         cid: u32,
     },
-    /// A TLS peer authenticated by its leaf certificate (subplan 2-4
-    /// track T). The trust boundary is the certificate chain.
+    /// A TLS peer authenticated by its leaf certificate. The trust
+    /// boundary is the certificate chain.
     Certificate(CertId),
     /// No identity is available. **ACL is not possible** against an
     /// anonymous peer; this must be surfaced in logs and never treated
@@ -211,9 +208,9 @@ pub enum PeerIdentity {
     Anonymous,
 }
 
-/// Identity extracted from a peer's TLS leaf certificate (subplan
-/// 2-4 track T). Carries the subject and a SHA-256 fingerprint; ACL
-/// is the caller's responsibility on top of this.
+/// Identity extracted from a peer's TLS leaf certificate. Carries the
+/// subject and a SHA-256 fingerprint; ACL is the caller's
+/// responsibility on top of this.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CertId {
     subject: String,
@@ -353,7 +350,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             // A read deadline that elapses with nothing consumed is a
             // clean Timeout (stream still frame-synchronized); mid-
-            // header it is a desync → Truncated (2-3 §timeout).
+            // header it is a desync → Truncated.
             Err(e) if is_timeout(&e) => {
                 return Err(if filled == 0 {
                     RpcError::Timeout
@@ -407,8 +404,8 @@ pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
 }
 
 /// Decode-only entrypoint for the `rpc_frame_decode` fuzz target and
-/// the deterministic adversarial-input regression tests (plan 2-1
-/// §6.3). Feeds arbitrary bytes through the same deframing path
+/// the deterministic adversarial-input regression tests. Feeds
+/// arbitrary bytes through the same deframing path
 /// `recv_frame` uses. `#[doc(hidden)]`: not part of the supported API
 /// surface (and absent entirely without the `rpc` feature).
 #[doc(hidden)]
@@ -441,7 +438,7 @@ mod tests {
         assert_eq!(read_frame(&mut cur).unwrap(), b"second");
     }
 
-    /// T1.7 deterministic adversarial cases — must reject without
+    /// Deterministic adversarial cases — must reject without
     /// allocating, panicking, or looping (mirrors the fuzz target).
     #[test]
     fn hostile_frame_headers_are_rejected_safely() {

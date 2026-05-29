@@ -51,6 +51,21 @@ pub const FLAG_CLEAR_BUF: TransactionFlags = sys::transaction_flags_TF_CLEAR_BUF
 /// Set to the vendor flag if we are building for the VNDK, 0 otherwise
 pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
 pub const FLAG_PRIVATE_VENDOR: TransactionFlags = FLAG_PRIVATE_LOCAL;
+/// `TF_UPDATE_TXN` (0x40). Set together with
+/// [`FLAG_ONEWAY`] on a `transact()` to ask the Android 12+ driver to
+/// replace any pending async transaction with the same `(target, code)`
+/// instead of queueing both. Use for idempotent updates (notification
+/// state, location sample) where only the freshest value matters; the
+/// driver rejects `TF_UPDATE_TXN` without `TF_ONE_WAY` (EINVAL).
+pub const FLAG_UPDATE_TXN: TransactionFlags = sys::transaction_flags_TF_UPDATE_TXN;
+/// `TF_COLLECT_NOTED_APP_OPS` (0x80). Strictly a
+/// libbinder-level flag — the kernel binder driver itself never reads
+/// it. Asks the server runtime to prepend a noted-AppOps blob (under
+/// `EX_HAS_NOTED_APPOPS_REPLY_HEADER = -127`) to the reply parcel; the
+/// client side transparently skips the header during exception decode
+/// (see `Status::deserialize`).
+pub const FLAG_COLLECT_NOTED_APP_OPS: TransactionFlags =
+    sys::transaction_flags_TF_COLLECT_NOTED_APP_OPS;
 
 const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
     ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
@@ -258,10 +273,9 @@ pub trait IBinder: Any + Send + Sync {
     /// Calling this on a **proxy** (client-side `ProxyHandle`) is a
     /// programming error — a proxy has no way to inform the remote
     /// service of the new extension, so the call would only mutate
-    /// the local cache and (after PR #104's §4 scope-down) silently
-    /// pin an unrelated `Arc<dyn IBinder>` for the parent's lifetime.
-    /// `ProxyHandle::set_extension` therefore rejects with
-    /// `InvalidOperation`.
+    /// the local cache and silently pin an unrelated `Arc<dyn IBinder>`
+    /// for the parent's lifetime. `ProxyHandle::set_extension` therefore
+    /// rejects with `InvalidOperation`.
     fn set_extension(&self, _extension: &SIBinder) -> Result<()> {
         Err(StatusCode::InvalidOperation)
     }
@@ -273,13 +287,63 @@ pub trait IBinder: Any + Send + Sync {
         0
     }
 
-    /// RPC server dispatch entrypoint (subplan 2-2.d2-SRV).
+    /// Runtime stability downgrade to
+    /// [`Stability::System`] (AOSP [`Stability::forceDowngradeToSystemStability`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Stability.cpp;l=41) equivalent).
+    ///
+    /// Only meaningful on native binders ([`crate::Binder<T>`]); proxies and
+    /// the default-impl trait objects return `Err(StatusCode::InvalidOperation)`.
+    ///
+    /// **Parceled guard.** Returns `Err(StatusCode::InvalidOperation)` once
+    /// the binder has been written to a parcel (i.e. transferred via IPC).
+    /// Mirror of AOSP [`BBinder::setParceled`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=722)
+    /// — see [`Self::set_parceled`].
+    fn force_downgrade_to_system_stability(&self) -> Result<()> {
+        Err(StatusCode::InvalidOperation)
+    }
+
+    /// Runtime stability downgrade to
+    /// [`Stability::Vendor`] (AOSP [`Stability::forceDowngradeToVendorStability`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Stability.cpp;l=45) equivalent).
+    ///
+    /// See [`Self::force_downgrade_to_system_stability`] for the parceled
+    /// guard contract.
+    fn force_downgrade_to_vendor_stability(&self) -> Result<()> {
+        Err(StatusCode::InvalidOperation)
+    }
+
+    /// Runtime mark this binder as
+    /// [`Stability::Vintf`] (AOSP [`Stability::markVintf`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Stability.cpp;l=54) equivalent).
+    ///
+    /// Typically the AIDL generator emits this for an interface annotated
+    /// `@VintfStability`; reach for the runtime API only when the generator
+    /// path is unavailable (handwritten binders).
+    ///
+    /// See [`Self::force_downgrade_to_system_stability`] for the parceled
+    /// guard contract.
+    fn mark_vintf(&self) -> Result<()> {
+        Err(StatusCode::InvalidOperation)
+    }
+
+    /// Observability hook: has this binder already been
+    /// written to a parcel (and therefore frozen against mutation)?
+    /// Default: `false`. Native binders override with the underlying
+    /// `AtomicBool` load. AOSP [`BBinder::wasParceled`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=721) equivalent.
+    fn was_parceled(&self) -> bool {
+        false
+    }
+
+    /// Internal mark-as-parceled hook, invoked by the
+    /// parcel layer the first time this binder is serialized. Default is a
+    /// no-op (proxies and test mocks are not subject to the parceled
+    /// guard). AOSP [`BBinder::setParceled`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=725) equivalent.
+    fn set_parceled(&self) {}
+
+    /// RPC server dispatch entrypoint.
     ///
     /// The RPC server adapter calls this *instead of* the kernel
     /// `Transactable::transact` → `thread_state::check_interface`
     /// path. `check_interface` reads the kernel transaction header and
     /// mutates `THREAD_STATE` (strict-mode / work-source) — both
-    /// meaningless for RPC and forbidden to touch (P1). The adapter has
+    /// meaningless for RPC and forbidden to touch. The adapter has
     /// already consumed + validated the RPC interface token, so this
     /// just dispatches `code` to the generated, transport-neutral
     /// `Remotable::on_transact`. Native binders override it; the
@@ -306,17 +370,17 @@ pub trait IBinder: Any + Send + Sync {
 }
 
 /// An outbound-transaction-issuing proxy, abstract over the kernel
-/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks (subplan
-/// 2-6, D1). The AIDL generator emits `as_remote().ok_or(BadType)?`
-/// (subplan 2-6.B) so one generated `Bp*` drives either stack via
-/// this trait + the `<dyn IBinder>::as_remote()` accessor; the
-/// kernel-only `as_proxy()` is retained for any direct callers.
+/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks. The AIDL
+/// generator emits `as_remote().ok_or(BadType)?` so one generated
+/// `Bp*` drives either stack via this trait + the
+/// `<dyn IBinder>::as_remote()` accessor; the kernel-only `as_proxy()`
+/// is retained for any direct callers.
 ///
 /// The signatures are exactly `ProxyHandle`'s existing inherent
 /// `prepare_transact`/`submit_transact` — `ProxyHandle` implements
 /// this by **delegating to those unchanged methods**, so the kernel
 /// proxy's runtime behavior is bit-identical by construction (no
-/// codegen change required for the kernel path — AC-6.2).
+/// codegen change required for the kernel path).
 pub trait RemoteProxy {
     /// Allocate the request `Parcel`, optionally writing the AIDL
     /// interface header.
@@ -336,7 +400,7 @@ impl dyn IBinder {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
     }
 
-    /// Generalized proxy dispatch (subplan 2-6): a kernel
+    /// Generalized proxy dispatch: a kernel
     /// [`proxy::ProxyHandle`] **or** (with the `rpc` feature) an
     /// [`rpc::RpcProxy`](crate::rpc::RpcProxy), as a single
     /// [`RemoteProxy`] trait object. Lets one generated `Bp*` stub
@@ -354,15 +418,15 @@ impl dyn IBinder {
     }
 }
 
-/// Subplan 2-6.B: stamp the generated stub's interface descriptor
-/// onto an `RpcProxy` resolved from the RPC wire (the wire carries
-/// only an address, so such a proxy starts descriptor-less). A
-/// `#[doc(hidden)]` shim the generated `from_binder` calls
-/// unconditionally — the feature gate lives **here**, resolved
-/// against rsbinder's own `rpc` feature, not in the `macro_rules!`
-/// (where `cfg(feature = "rpc")` would wrongly resolve against the
-/// *consumer* crate). The non-`rpc` build is a zero-cost no-op, so
-/// the kernel path and `rpc`-off consumers stay byte-unaffected (V1).
+/// Stamp the generated stub's interface descriptor onto an `RpcProxy`
+/// resolved from the RPC wire (the wire carries only an address, so
+/// such a proxy starts descriptor-less). A `#[doc(hidden)]` shim the
+/// generated `from_binder` calls unconditionally — the feature gate
+/// lives **here**, resolved against rsbinder's own `rpc` feature, not
+/// in the `macro_rules!` (where `cfg(feature = "rpc")` would wrongly
+/// resolve against the *consumer* crate). The non-`rpc` build is a
+/// zero-cost no-op, so the kernel path and `rpc`-off consumers stay
+/// byte-unaffected.
 #[doc(hidden)]
 #[cfg(feature = "rpc")]
 pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
@@ -666,6 +730,33 @@ impl SIBinder {
     /// Retrieve the stability level of the underlying binder object.
     pub fn stability(&self) -> Stability {
         self.inner.stability()
+    }
+
+    /// Runtime downgrade to [`Stability::System`].
+    ///
+    /// Delegates to [`IBinder::force_downgrade_to_system_stability`]; only
+    /// native binders honor the mutation. Refer to that trait method for the
+    /// parceled-guard contract and the AOSP equivalent.
+    pub fn force_downgrade_to_system_stability(&self) -> Result<()> {
+        self.inner.force_downgrade_to_system_stability()
+    }
+
+    /// Runtime downgrade to [`Stability::Vendor`].
+    /// Delegates to [`IBinder::force_downgrade_to_vendor_stability`].
+    pub fn force_downgrade_to_vendor_stability(&self) -> Result<()> {
+        self.inner.force_downgrade_to_vendor_stability()
+    }
+
+    /// Runtime upgrade/mark as [`Stability::Vintf`].
+    /// Delegates to [`IBinder::mark_vintf`].
+    pub fn mark_vintf(&self) -> Result<()> {
+        self.inner.mark_vintf()
+    }
+
+    /// Has the underlying binder already been serialized
+    /// at least once? Delegates to [`IBinder::was_parceled`].
+    pub fn was_parceled(&self) -> bool {
+        self.inner.was_parceled()
     }
 
     pub(crate) fn increase(&self) -> Result<()> {
@@ -1052,11 +1143,9 @@ mod tests {
         }
     }
 
-    /// Verifies the `WIBinder::upgrade()` semantic correction in this PR:
-    /// the inner reference is now a genuine `sync::Weak<dyn IBinder>`, so
-    /// once the last `Arc<dyn IBinder>` is dropped, `upgrade()` returns
-    /// `Err(StatusCode::DeadObject)` instead of (incorrectly) succeeding
-    /// against a strong-Arc-in-disguise.
+    /// `WIBinder::upgrade()` is genuinely weak: once the last
+    /// `Arc<dyn IBinder>` is dropped, `upgrade()` returns
+    /// `Err(StatusCode::DeadObject)`.
     #[test]
     fn test_wibinder_upgrade_after_strong_drop_returns_dead_object() {
         let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");

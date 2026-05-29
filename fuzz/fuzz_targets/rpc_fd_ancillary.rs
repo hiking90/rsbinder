@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fuzz target: arbitrary bytes → RPC `Unix`-mode FD-table decode with
-//! no received fds (`plan/2-7` §6.3 / V4 / T7.6). Property: no panic /
+//! no received fds. Property: no panic /
 //! UB / fd leak; an OOB or dangling fd-table index is a clean `Err`.
 
 #![no_main]

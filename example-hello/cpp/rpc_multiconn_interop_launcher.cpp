@@ -6,7 +6,7 @@
 //
 // Pairs with `example-hello/src/bin/rpc_multiconn_interop_server`
 // (cross-compiled rsbinder server). The companion bash script
-// `run_stage3_multiconn.sh` automates build + push + run.
+// `run_rpc_multiconn_interop.sh` automates build + push + run.
 //
 // ⚠ **STATUS (2026-05-21): NOT YET PASSING — gate is blocked.** The
 // harness compiles and runs end-to-end, but the (a) concurrent-twoway
@@ -21,7 +21,7 @@
 // or a non-wire protocol nuance rsbinder Phase A misses; investigation
 // is paused pending a deeper libbinder build/instrument session. This
 // launcher stays in tree as the **future-AC-12.6 gate harness**:
-// re-run `run_stage3_multiconn.sh` once the multi-conn root cause is
+// re-run `run_rpc_multiconn_interop.sh` once the multi-conn root cause is
 // known + fixed; the pass criteria below (a)/(b)/(c) and exit-codes
 // stay as the contract.
 //

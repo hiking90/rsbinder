@@ -1,15 +1,15 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `RpcAddress` — RPC object identity (subplan 2-2 S-a).
+//! `RpcAddress` — RPC object identity.
 //!
 //! Mirrors android-12 r34 `RpcWireAddress` (`u8 address[32]`, opaque —
 //! `RpcAddress.h:34` "hide the ABI ... potentially change the size").
 //! This is **not** a u32 kernel handle: the RPC stack has its own
-//! identity space, decoupled from `proxy::ProxyHandle` (P5).
+//! identity space, decoupled from `proxy::ProxyHandle`.
 //!
-//! Allocation is a per-session monotonic counter (plan 2-2.a1: not a
-//! CSPRNG — uniqueness *within a session* is sufficient; android fills
+//! Allocation is a per-session monotonic counter (not a CSPRNG —
+//! uniqueness *within a session* is sufficient; android fills
 //! it from `/dev/urandom` but treats it as opaque, so a counter is
 //! wire-compatible). `zero()` is the reserved address used for the
 //! special server-channel transactions.
@@ -24,7 +24,7 @@ pub(crate) const RPC_ADDR_LEN: usize = 32;
 pub const RPC_SESSION_ID_NEW: i32 = -1;
 
 /// Opaque RPC object address. ABI is hidden: no public field, no public
-/// length constant, `Debug` shows only a short fingerprint (AC-2.1).
+/// length constant, `Debug` shows only a short fingerprint.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RpcAddress {
     bytes: [u8; RPC_ADDR_LEN],
@@ -56,8 +56,8 @@ impl RpcAddress {
     /// `/dev/urandom`; rsbinder instead tags byte 8 with the
     /// allocating role so the initiator's and acceptor's subspaces are
     /// disjoint — uniqueness then holds across the *whole connection*,
-    /// not just one endpoint. The counter is session-owned (P6 — no
-    /// global); the value is never `zero()` (counter ≥ 1).
+    /// not just one endpoint. The counter is session-owned (no global);
+    /// the value is never `zero()` (counter ≥ 1).
     pub fn unique(counter: &mut u64, space: AddressSpace) -> Self {
         *counter = counter.wrapping_add(1);
         let mut bytes = [0u8; RPC_ADDR_LEN];
@@ -124,7 +124,7 @@ pub enum SpecialTransaction {
     GetMaxThreads = 1,
     /// Obtain the server-assigned session id.
     GetSessionId = 2,
-    /// Negotiate the FD-over-RPC mode (subplan 2-7). **Not r34** — an
+    /// Negotiate the FD-over-RPC mode. **Not r34** — an
     /// rsbinder/android-13+ extension sent *only* when a client opts
     /// into FD passing, so the default (`None`) path stays r34-faithful.
     GetFdMode = 3,
@@ -159,8 +159,8 @@ mod tests {
         assert_eq!(RpcAddress::zero().as_wire_bytes(), &[0u8; RPC_ADDR_LEN]);
     }
 
-    /// AC-2.1 / T2.2: 1e6 `unique()` calls in one session collide 0
-    /// times and never equal `zero()`.
+    /// 1e6 `unique()` calls in one session collide 0 times and never
+    /// equal `zero()`.
     #[test]
     fn unique_is_collision_free_and_nonzero() {
         let mut ctr = 0u64;
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn debug_is_fingerprint_only() {
-        // AC-2.1: Debug must not dump the full ABI bytes.
+        // Debug must not dump the full ABI bytes.
         let mut ctr = 0u64;
         let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
         let s = format!("{a:?}");
@@ -204,7 +204,7 @@ mod tests {
             Some(SpecialTransaction::GetSessionId)
         );
         // 0..=2 are the android-12 r34 special codes. Code 3
-        // (`GetFdMode`) is the rsbinder/2-7 extension — explicitly
+        // (`GetFdMode`) is the rsbinder FD-mode extension — explicitly
         // NOT r34, sent only when a client opts into FD passing.
         assert_eq!(
             SpecialTransaction::from_code(3),

@@ -414,10 +414,17 @@ impl DeserializeOption for String {
 
         if (0..i32::MAX).contains(&len) {
             let data = parcel.read_aligned_data((len as usize + 1) * std::mem::size_of::<u16>())?;
-            let res = String::from_utf16(unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u16, len as _)
-            })
-            .map_err(|e| {
+            // `data` is borrowed from the parcel's `Vec<u8>` whose base is
+            // only 1-byte aligned, so reinterpreting it as `&[u16]` via
+            // `from_raw_parts(_ as *const u16, _)` would construct an
+            // under-aligned reference (UB; Miri-detectable). Copy the bytes
+            // into an aligned `Vec<u16>` instead — mirroring the safe
+            // `align_to` idiom used by `read_array_char`.
+            let u16_data: Vec<u16> = data[..len as usize * std::mem::size_of::<u16>()]
+                .chunks_exact(std::mem::size_of::<u16>())
+                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                .collect();
+            let res = String::from_utf16(&u16_data).map_err(|e| {
                 log::error!("Deserialize for Option<String16>: {e}");
                 StatusCode::BadValue
             })?;
@@ -464,8 +471,8 @@ impl Serialize for SIBinder {
 impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         // RPC mode: marshal as `RpcAddress` via the attached session
-        // hooks, not `flat_binder_object` (2-2.d2 #1). Kernel path
-        // below is byte-identical when `is_for_rpc == false` (AC-2.9).
+        // hooks, not `flat_binder_object`. Kernel path below is
+        // byte-identical when `is_for_rpc == false`.
         #[cfg(feature = "rpc")]
         if parcel.is_for_rpc() {
             let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
@@ -478,6 +485,12 @@ impl SerializeOption for SIBinder {
                 if crate::sdk_at_least(30) {
                     parcel.write::<i32>(&binder.stability().into())?;
                 }
+                // Freeze runtime stability mutation once
+                // this binder has crossed the IPC boundary (AOSP
+                // `BBinder::setParceled` equivalent). Default trait impl
+                // is a no-op for proxies — only `Inner<T>` flips its
+                // `AtomicBool`.
+                binder.set_parceled();
                 Ok(())
             }
 
@@ -511,7 +524,7 @@ impl Deserialize for SIBinder {
 impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         // RPC mode: unmarshal from `RpcAddress` via the attached
-        // session hooks (2-2.d2 #2). The kernel `flat_binder_object`
+        // session hooks. The kernel `flat_binder_object`
         // path below is byte-identical when `is_for_rpc == false`.
         #[cfg(feature = "rpc")]
         if parcel.is_for_rpc() {
@@ -747,7 +760,7 @@ pub trait DeserializeArray: Deserialize {
         // in the parcel: every element consumes >= 1 wire byte, so a
         // well-formed array of `len` elements always satisfies
         // `len <= data_avail()` here. This is byte-for-byte identical
-        // for all valid input (incl. every kernel parcel — AC-2.9) and
+        // for all valid input (incl. every kernel parcel) and
         // only stops a hostile `len` (e.g. i32::MAX over RPC) from
         // forcing a multi-GB allocation before the per-element reads
         // fail. The loop still pushes exactly `len`, growing on demand.

@@ -1,15 +1,14 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unix-domain-socket transport (subplan 2-1).
+//! Unix-domain-socket transport.
 //!
 //! Trust boundary: filesystem permissions on the socket path plus
 //! `SO_PEERCRED`. Plaintext is *correct* here — the kernel is the trust
-//! boundary (plan 2 §5, the original cross-domain bridge use case).
+//! boundary (the original cross-domain bridge use case).
 //!
-//! This subplan provides connected-stream wrapping, a `socketpair`
-//! constructor for tests, and a `connect(path)` convenience. The
-//! server-side `bind`/`listen`/`accept` loop is subplan 2-3.
+//! Provides connected-stream wrapping, a `socketpair` constructor for
+//! tests, and a `connect(path)` convenience.
 
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -19,12 +18,11 @@ use std::path::Path;
 use super::{read_frame, write_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
-/// Max fds a single RPC frame may carry (DoS bound — plan 2-7.d /
-/// AC-7.5). Well under the kernel `SCM_MAX_FD` (253). `pub(crate)`
-/// so the wire codec layer (`wire_android13::read_aosp_message_with_fds`)
-/// can enforce the *per-message* cap when accumulating across the
-/// multiple `recvmsg`s that read one message body (C3 fix —
-/// review 2026-05-21).
+/// Max fds a single RPC frame may carry (DoS bound). Well under the
+/// kernel `SCM_MAX_FD` (253). `pub(crate)` so the wire codec layer
+/// (`wire_android13::read_aosp_message_with_fds`) can enforce the
+/// *per-message* cap when accumulating across the multiple `recvmsg`s
+/// that read one message body.
 pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
 /// A framed transport over a connected Unix domain socket.
@@ -35,7 +33,7 @@ pub struct UnixTransport {
     /// Buffered `recvmsg` leftover, used **only** by the
     /// `recv_frame_with_fds` (SCM_RIGHTS) path so a connection in
     /// `Unix` fd-mode never mixes `Read` and `recvmsg` on the same fd.
-    /// The default (no-fd) path is untouched (AC-7.1 bit-identical).
+    /// The default (no-fd) path is untouched (bit-identical).
     fd_recv_buf: std::sync::Mutex<Vec<u8>>,
 }
 
@@ -81,8 +79,8 @@ impl UnixTransport {
         ))
     }
 
-    /// Wrap a preconnected Unix-domain `OwnedFd` (subplan 2-13 A0.2 —
-    /// the `IAccessor::addConnection()` fd-adopt path). `std`'s
+    /// Wrap a preconnected Unix-domain `OwnedFd` (the
+    /// `IAccessor::addConnection()` fd-adopt path). `std`'s
     /// `From<OwnedFd> for UnixStream` is stable cross-platform (Linux +
     /// macOS), and the resulting transport is byte-identical to
     /// [`UnixTransport::from_stream`] — peer identity is resolved the
@@ -94,7 +92,6 @@ impl UnixTransport {
     }
 
     /// Connect to a listening Unix socket at `path` (client side).
-    /// `bind`/`listen`/`accept` is subplan 2-3.
     pub fn connect(path: impl AsRef<Path>) -> RpcResult<Self> {
         // `RpcError: From<std::io::Error>` — `?` does the conversion.
         let stream = UnixStream::connect(path)?;
@@ -105,28 +102,19 @@ impl UnixTransport {
 /// Resolve the peer identity of a connected Unix socket.
 ///
 /// * **Linux**: real `SO_PEERCRED` (the peer's actual uid/pid).
-/// * **macOS / BSD** (subplan 2-9 Phase A): real `getpeereid` (peer
-///   effective uid) + `LOCAL_PEERPID` (peer pid on macOS). This is the
-///   **true peer** for an accepted cross-process socket, and *this
-///   process* for a `socketpair` (correct — both ends are us; Phase
-///   A.0 measured Darwin 25.4: `getpeereid`/`LOCAL_PEERPID` succeed for
-///   both and return self for a socketpair, the real peer for an
-///   accepted fd). A `getpeereid` failure is **never** reported as a
-///   forged `Local`: a same-process / unconnected errno
-///   (`ENOTCONN`/`EINVAL`) falls back to the self identity (still the
-///   correct answer there), any other error to
+/// * **macOS / BSD**: real `getpeereid` (peer effective uid) +
+///   `LOCAL_PEERPID` (peer pid on macOS). This is the **true peer** for
+///   an accepted cross-process socket, and *this process* for a
+///   `socketpair` (correct — both ends are us). A `getpeereid` failure
+///   is **never** reported as a forged `Local`: a same-process /
+///   unconnected errno (`ENOTCONN`/`EINVAL`) falls back to the self
+///   identity (still the correct answer there), any other error to
 ///   [`PeerIdentity::Anonymous`] (no ACL possible — logged loudly).
-///
-/// Before Phase A the non-Linux arm reported the **current process**
-/// for *every* socket — i.e. a server's `peer_identity()` for an
-/// accepted cross-process connection was the *server itself*, an
-/// authoritative-looking forged identity (the §0 contract defect).
 fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     // Android's bionic has no `getpeereid`, but its kernel supports
     // `SO_PEERCRED` exactly like Linux — so android takes the Linux
     // arm (otherwise the `not(target_os="linux")` BSD arm would pull in
-    // `libc::getpeereid` and break the aarch64-linux-android build,
-    // e.g. the subplan 2-8/2-11 emulator interop harness).
+    // `libc::getpeereid` and break the aarch64-linux-android build).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         match rustix::net::sockopt::socket_peercred(stream) {
@@ -150,9 +138,9 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     }
 }
 
-/// macOS/BSD peer resolution — the subplan 2-9 Phase A failure-mode
-/// -driven fallback ladder. `getpeereid` is connect-time
-/// kernel-vouched (the BSD analogue of `SO_PEERCRED`).
+/// macOS/BSD peer resolution — a failure-mode-driven fallback ladder.
+/// `getpeereid` is connect-time kernel-vouched (the BSD analogue of
+/// `SO_PEERCRED`).
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
 fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
     use std::os::fd::AsRawFd;
@@ -172,9 +160,8 @@ fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
             // path. Either way it is the *same process* (there is no
             // remote peer), so the self identity is the correct,
             // non-forged answer and the hermetic socketpair test still
-            // holds on such platforms (Phase A ladder branch 2 —
-            // defensive; not reached on Darwin 25.4, where a
-            // socketpair *does* populate peercred → branch 1 → self).
+            // holds on such platforms (defensive; on macOS a socketpair
+            // *does* populate peercred, so this branch is not reached).
             Some(libc::ENOTCONN) | Some(libc::EINVAL) => super::mem::self_identity(),
             // Any other error: NEVER a forged `Local`. No ACL is
             // possible against an unknown peer — surface it loudly.
@@ -260,8 +247,8 @@ impl RpcTransport for UnixTransport {
         r.read(buf).map_err(RpcError::from)
     }
 
-    /// Raw, **unframed** write + `SCM_RIGHTS` (subplan 2-11 Phase A0:
-    /// the android-13+ v1+ `Unix` FD-over-RPC path). Identical to
+    /// Raw, **unframed** write + `SCM_RIGHTS` (the android-13+ v1+
+    /// `Unix` FD-over-RPC path). Identical to
     /// [`UnixTransport::send_frame_with_fds`] minus the 4-byte length
     /// prefix — the AOSP RPC wire has none. The fds ride the **first**
     /// `sendmsg` (AOSP `RpcTransportRaw::interruptableWriteFully`,
@@ -299,9 +286,7 @@ impl RpcTransport for UnixTransport {
                 SendFlags::empty(),
             ) {
                 Ok(n) => n,
-                // M10 fix (review 2026-05-21): EINTR is benign — retry
-                // the syscall. Symmetric with `read_header`/`read_body`
-                // in transport/mod.rs.
+                // EINTR is benign — retry the syscall.
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
             };
@@ -313,8 +298,8 @@ impl RpcTransport for UnixTransport {
         Ok(())
     }
 
-    /// Raw, **unframed** read (one `recvmsg`) + any `SCM_RIGHTS` fds
-    /// (subplan 2-11 Phase A0). Pairs with
+    /// Raw, **unframed** read (one `recvmsg`) + any `SCM_RIGHTS` fds.
+    /// Pairs with
     /// [`UnixTransport::send_raw_with_fds`]; received fds are
     /// `O_CLOEXEC` (set explicitly — `MSG_CMSG_CLOEXEC` is Linux-only).
     /// `Ok((0, _))` ⇒ peer closed. Unlike
@@ -340,7 +325,7 @@ impl RpcTransport for UnixTransport {
                 RecvFlags::empty(),
             ) {
                 Ok(r) => break r,
-                // M10 fix: EINTR retry, symmetric with read_header.
+                // EINTR retry, symmetric with read_header.
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
             }
@@ -374,7 +359,7 @@ impl RpcTransport for UnixTransport {
     }
 
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band
-    /// via `SCM_RIGHTS` (subplan 2-7, `Unix` fd-mode). The ancillary
+    /// via `SCM_RIGHTS` (`Unix` fd-mode). The ancillary
     /// fds ride the **first** `sendmsg`; remaining bytes (rare — fd
     /// transactions are tiny) follow without ancillary.
     fn send_frame_with_fds(
@@ -417,7 +402,7 @@ impl RpcTransport for UnixTransport {
                 SendFlags::empty(),
             ) {
                 Ok(n) => n,
-                // M10 fix: EINTR retry, symmetric with read_header.
+                // EINTR retry, symmetric with read_header.
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
             };
@@ -461,7 +446,7 @@ impl RpcTransport for UnixTransport {
             let mut anc = RecvAncillaryBuffer::new(&mut space);
             // `RecvFlags::CMSG_CLOEXEC` (`MSG_CMSG_CLOEXEC`) is
             // Linux-only; for portability set `FD_CLOEXEC` explicitly
-            // on each received fd (plan 2-7.d "received fd O_CLOEXEC").
+            // on each received fd.
             let r = loop {
                 match rustix::net::recvmsg(
                     &self.stream,
@@ -470,14 +455,13 @@ impl RpcTransport for UnixTransport {
                     RecvFlags::empty(),
                 ) {
                     Ok(r) => break r,
-                    // M10 fix: EINTR retry.
+                    // EINTR retry.
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(e) => {
-                        // M12 fix (review 2026-05-21): map a read
-                        // deadline to `Timeout` (frame-synchronized,
-                        // nothing consumed) or `Truncated` (mid-frame
-                        // desync) so callers can distinguish — same
-                        // contract as `read_header`/`read_body`.
+                        // Map a read deadline to `Timeout` (frame-
+                        // synchronized, nothing consumed) or `Truncated`
+                        // (mid-frame desync) so callers can distinguish
+                        // — same contract as `read_header`/`read_body`.
                         let io_err = std::io::Error::from(e);
                         if super::is_timeout(&io_err) {
                             return Err(if leftover.is_empty() && fds.is_empty() {
@@ -562,12 +546,12 @@ mod tests {
     fn unix_peer_closed_on_drop() {
         let (a, b) = UnixTransport::pair().expect("socketpair");
         drop(b);
-        // First recv sees EOF -> clean PeerClosed (T1.5).
+        // First recv sees EOF -> clean PeerClosed.
         assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
     }
 
-    /// Subplan 2-13 A0.2: adopt one half of a `socketpair` via
-    /// `from_owned_fd` and verify it framed-roundtrips against the other
+    /// Adopt one half of a `socketpair` via `from_owned_fd` and verify
+    /// it framed-roundtrips against the other
     /// half (`from_stream`). Exercises the `IAccessor::addConnection`-
     /// style "we hand the transport a connected fd, not a path" entry
     /// point without touching the filesystem.
@@ -599,13 +583,11 @@ mod tests {
 
     #[test]
     fn unix_partial_header_then_close_is_truncated() {
-        // m8 fix (review 2026-05-21): the spec is deterministic —
-        // 2-of-4 header bytes consumed *then* EOF MUST surface as
-        // `Truncated` (see `read_header` in transport/mod.rs:341 —
-        // `filled == 0` ⇒ `PeerClosed`, `filled > 0` ⇒ `Truncated`).
-        // The kernel does not coalesce these into an immediate EOF,
-        // so the previous permissive `Truncated | PeerClosed`
-        // assertion was masking a real regression class.
+        // The spec is deterministic — 2-of-4 header bytes consumed
+        // *then* EOF MUST surface as `Truncated` (see `read_header` in
+        // transport/mod.rs: `filled == 0` ⇒ `PeerClosed`, `filled > 0`
+        // ⇒ `Truncated`). The kernel does not coalesce these into an
+        // immediate EOF.
         let (a, b) = UnixTransport::pair().expect("socketpair");
         {
             use std::io::Write;

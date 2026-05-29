@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan 3-1 C.1: AOSP `aidl_language.cpp:1211` rejects oneway methods
+//! AOSP `aidl_language.cpp:1211` rejects oneway methods
 //! that return a value or carry `out`/`inout` parameters. Mirror that
 //! at parse time so the diagnostic surfaces before codegen.
 

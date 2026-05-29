@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan 3: AOSP `.aidl` fixture sweep.
+//! AOSP `.aidl` fixture sweep.
 //!
 //! Walks `tests/aidl/android/aidl/tests/**/*.aidl` (the vendored AOSP
 //! fixture set) and runs each through `Builder::generate()`. Each
@@ -41,15 +41,13 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[
         relative_path: "android/aidl/tests/map/Foo.aidl",
         reason_substr: "unknown type 'Map'",
         rationale: "AOSP Rust/C++/NDK backends reject `Map<K,V>` \
-                    (aidl_language.cpp:1612-1615). Java-only. \
-                    See plans/3-3-map-non-goal.md.",
+                    (aidl_language.cpp:1612-1615). Java-only.",
     },
     ExpectedFailure {
         relative_path: "android/aidl/tests/map/IMapTest.aidl",
         reason_substr: "unknown type 'Map'",
         rationale: "AOSP Rust/C++/NDK backends reject `Map<K,V>` \
-                    (aidl_language.cpp:1612-1615). Java-only. \
-                    See plans/3-3-map-non-goal.md.",
+                    (aidl_language.cpp:1612-1615). Java-only.",
     },
     ExpectedFailure {
         relative_path: "android/aidl/tests/permission/platform/IProtected.aidl",

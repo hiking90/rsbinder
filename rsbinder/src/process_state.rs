@@ -949,8 +949,8 @@ impl ProcessState {
     /// `Parcel::write_object` → `flat_binder_object::acquire` brings it
     /// to 1. The single-statement window between this method returning
     /// and the first `acquire` is the only leak path under
-    /// `Parcel::write_aligned` panics (typically OOM) — see plan §5
-    /// "From<&SIBinder> returning before acquire() is called".
+    /// `Parcel::write_aligned` panics (typically OOM): `From<&SIBinder>`
+    /// returning before `acquire()` is called.
     pub(crate) fn publish_native(&self, arc: Arc<dyn IBinder>) -> u64 {
         // Single write lock for dedup + insert: a read-then-write split
         // would race two concurrent publishes of the same Arc into
@@ -1094,15 +1094,9 @@ impl ProcessState {
             // accept this over a `debug_assert` panic: the race is a
             // property of kernel scheduling, not our bookkeeping, so
             // panicking would fail CI on a legitimate interleaving.
-            // (The OLD fat-pointer encoding hit the same race but
-            // masked it via `RefCounter`'s `INITIAL_STRONG_VALUE`
-            // pattern, which self-corrects the count to its initial
-            // value but silently skips the first/last-ref closures —
-            // equivalently broken in semantics, just lower-noise.)
-            // See plan §5 #7. A future change could move to a
-            // signed counter + dual-direction removal trigger to
-            // bound the drift, but that introduces premature-removal
-            // hazards in multi-pair scenarios; left as a follow-up.
+            // A signed counter + dual-direction removal trigger could
+            // bound the drift, but introduces premature-removal hazards
+            // in multi-pair scenarios; left as a follow-up.
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
             let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;
@@ -1435,7 +1429,7 @@ mod tests {
         );
     }
 
-    /// Plan §5.2 — same-thread re-entrant obituary regression guard.
+    /// Same-thread re-entrant obituary regression guard.
     ///
     /// Reproduces the exact deadlock the P1/P2/P3 split closes:
     /// while the slow path is mid-flight, a `BR_DEAD_BINDER` for the
@@ -1607,7 +1601,7 @@ mod tests {
     }
 
     /// End-to-end of the table-controlled lifecycle that closes the UAF
-    /// window. Mirrors plan §4 "test_native_uaf_window_closed":
+    /// window:
     ///
     ///   1. publish a native binder → entry created, `publish_count = 0`,
     ///      `kernel_refs = 0`, RefCounter floor armed.

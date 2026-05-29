@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan 3-2: `Builder::generate()` emits `cargo:rerun-if-changed=<path>`
+//! `Builder::generate()` emits `cargo:rerun-if-changed=<path>`
 //! for every `.aidl` file and directory that contributes to the
 //! generated output, so cargo reruns the build script when the user
 //! edits a source or imported `.aidl`.

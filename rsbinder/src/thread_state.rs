@@ -76,7 +76,11 @@ thread_local! {
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
 }
 
-const RETURN_STRINGS: [&str; 21] = [
+// Freeze observer BR labels (nr=20/21/22).
+// `BR_TRANSACTION_SEC_CTX` (nr=2) is dispatched by the special-case
+// above `return_to_str`'s indexed lookup, so the nr=20 slot is free
+// for `BR_TRANSACTION_PENDING_FROZEN`.
+const RETURN_STRINGS: [&str; 23] = [
     "BR_ERROR",
     "BR_OK",
     "BR_TRANSACTION",
@@ -97,7 +101,9 @@ const RETURN_STRINGS: [&str; 21] = [
     "BR_FAILED_REPLY",
     "BR_FROZEN_REPLY",
     "BR_ONEWAY_SPAM_SUSPECT",
-    "BR_TRANSACTION_SEC_CTX",
+    "BR_TRANSACTION_PENDING_FROZEN",
+    "BR_FROZEN_BINDER",
+    "BR_CLEAR_FREEZE_NOTIFICATION_DONE",
 ];
 
 fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
@@ -114,7 +120,10 @@ fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
-const COMMAND_STRINGS: [&str; 19] = [
+// Freeze observer BC labels (nr=19/20/21). Used for debug-print
+// symmetry with `RETURN_STRINGS`; the BC send path is not yet wired
+// into `write_command`.
+const COMMAND_STRINGS: [&str; 22] = [
     "BC_TRANSACTION",
     "BC_REPLY",
     "BC_ACQUIRE_RESULT",
@@ -134,6 +143,9 @@ const COMMAND_STRINGS: [&str; 19] = [
     "BC_DEAD_BINDER_DONE",
     "BC_TRANSACTION_SG",
     "BC_REPLY_SG",
+    "BC_REQUEST_FREEZE_NOTIFICATION",
+    "BC_CLEAR_FREEZE_NOTIFICATION",
+    "BC_FREEZE_NOTIFICATION_DONE",
 ];
 
 fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
@@ -158,6 +170,14 @@ struct TransactionState {
     last_transaction_binder_flags: u32,
     work_source: binder::uid_t,
     propagate_work_source: bool,
+    /// AOSP `mHasExplicitIdentity` — `true` after `clear_calling_identity()`
+    /// has overridden the kernel-delivered `calling_uid`/`calling_pid`
+    /// with the current process's own uid/pid. Reset to `false` on every
+    /// new incoming `BR_TRANSACTION` ([IPCThreadState.cpp:1141][1] —
+    /// `mHasExplicitIdentity = false`).
+    ///
+    /// [1]: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/IPCThreadState.cpp
+    has_explicit_identity: bool,
 }
 
 impl TransactionState {
@@ -170,7 +190,52 @@ impl TransactionState {
             last_transaction_binder_flags: data.transaction_data.flags,
             work_source: 0,
             propagate_work_source: false,
+            has_explicit_identity: false,
         }
+    }
+}
+
+/// Pack `(has_explicit, uid, pid)` into the 64-bit AOSP calling-identity
+/// token. Wire-equivalent to `packCallingIdentity` in
+/// `IPCThreadState.cpp:498-511`:
+///
+/// ```text
+/// 32b      |        1b         |         1b            |        30b
+/// uid      | pid sign bit      | hasExplicitIdentity   | pid (rest)
+/// ```
+///
+/// AOSP packs `hasExplicitIdentity` into the 2nd bit from the left of the
+/// lower 32-bit half so that negative PIDs (which use the top sign bit)
+/// can still round-trip. rsbinder uses the exact same layout — although
+/// tokens never go on the wire, AOSP-faithful encoding makes
+/// `clear`/`restore` tokens comparable across implementations and lets
+/// any AOSP regression test against the bit pattern still pass.
+fn pack_calling_identity(has_explicit: bool, uid: binder::uid_t, pid: binder::pid_t) -> i64 {
+    let pid_low = pid as u32;
+    let pid_low = if has_explicit {
+        pid_low | (1 << 30)
+    } else {
+        pid_low & !(1 << 30)
+    };
+    let token = ((uid as u64) << 32) | (pid_low as u64);
+    token as i64
+}
+
+fn unpack_has_explicit_identity(token: i64) -> bool {
+    ((token as i32) & (1 << 30)) != 0
+}
+
+fn unpack_calling_uid(token: i64) -> binder::uid_t {
+    (token >> 32) as binder::uid_t
+}
+
+fn unpack_calling_pid(token: i64) -> binder::pid_t {
+    let encoded = token as i32;
+    if (encoded & (1 << 31)) != 0 {
+        // Negative PID — restore the sign bit overlap with bit 30.
+        (encoded | (1 << 30)) as binder::pid_t
+    } else {
+        (encoded & !(1 << 30)) as binder::pid_t
     }
 }
 
@@ -429,7 +494,41 @@ pub(crate) fn call_restriction() -> CallRestriction {
     THREAD_STATE.with(|thread_state| thread_state.borrow().call_restriction)
 }
 
-pub(crate) fn strict_mode_policy() -> i32 {
+/// Set the per-thread strict-mode policy bits to attach to the next
+/// outgoing transaction header.
+///
+/// The next `Parcel::write_interface_token` (and AIDL-generated client
+/// stubs that call it) prepends the policy as a 32-bit prefix before the
+/// interface header, matching AOSP `Parcel::writeInterfaceToken`
+/// (`frameworks/native/libs/binder/Parcel.cpp`). The server-side
+/// `check_interface` extracts the prefix back into the receiving thread's
+/// state, where it is read by the framework `StrictMode` enforcement
+/// code.
+///
+/// `policy == 0` (default) keeps the wire byte-identical to legacy
+/// behavior. Non-zero values are framework-defined bit flags — opt in
+/// only when interoperating with Android system_server's strict-mode
+/// chain (disk-I/O / network-on-main-thread / etc. policies).
+///
+/// Mirrors AOSP `IPCThreadState::setStrictModePolicy(int32_t)`
+/// (`IPCThreadState.cpp:575`).
+pub fn set_strict_mode_policy(policy: i32) {
+    THREAD_STATE.with(|thread_state| {
+        thread_state.borrow_mut().set_strict_mode_policy(policy);
+    })
+}
+
+/// Read the per-thread strict-mode policy bits.
+///
+/// On a server thread that has just received a `BR_TRANSACTION`, returns
+/// the policy that was attached to the inbound header by the caller's
+/// `Parcel::write_interface_token` (extracted in `check_interface`).
+/// On a client thread, returns whatever was last set by
+/// [`set_strict_mode_policy`] (default `0`).
+///
+/// Mirrors AOSP `IPCThreadState::getStrictModePolicy() const`
+/// (`IPCThreadState.cpp:580`).
+pub fn get_strict_mode_policy() -> i32 {
     THREAD_STATE.with(|thread_state| thread_state.borrow().strict_mode_policy)
 }
 
@@ -1562,6 +1661,332 @@ pub fn is_handling_transaction() -> bool {
     THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.is_some())
 }
 
+/// SELinux security context of the caller for the current in-flight
+/// `BR_TRANSACTION`, when present.
+///
+/// `Some` is only ever returned while the current thread is dispatching a
+/// transaction targeting a binder constructed with
+/// `BinderFeatures { set_requesting_sid: true, .. }`. The kernel then
+/// delivers the request via `BR_TRANSACTION_SEC_CTX` and rsbinder copies
+/// the null-terminated SELinux context (e.g. `u:r:system_server:s0`) into
+/// the returned `CString`.
+///
+/// Returns `None` when:
+/// - The thread is not currently dispatching a binder transaction.
+/// - The transaction was delivered as plain `BR_TRANSACTION` (caller's
+///   binder did not request the security context).
+/// - The transaction came over the RPC transport (RPC has its own
+///   `PeerIdentity` model — see `rsbinder::rpc::PeerIdentity`).
+///
+/// Equivalent to AOSP `IPCThreadState::getCallingSid()` (libbinder
+/// `frameworks/native/libs/binder/IPCThreadState.cpp`) and Android Rust
+/// `libbinder_rs::ThreadState::with_calling_sid` (rsbinder returns an
+/// owned `CString` instead of taking a `&CStr` callback — the kernel
+/// pointer is lazily copied at every call, so leaking is not possible).
+///
+pub fn get_calling_sid() -> Option<CString> {
+    THREAD_STATE.with(|thread_state| {
+        let thread_state = thread_state.borrow();
+        let transaction = thread_state.transaction.as_ref()?;
+        if transaction.calling_sid.is_null() {
+            return None;
+        }
+        // SAFETY: `calling_sid` is a pointer into the kernel-delivered mmap
+        // region for the current BR_TRANSACTION_SEC_CTX (set in
+        // `TransactionState::from_transaction_data`). The kernel guarantees
+        // it points to a null-terminated string that stays valid until we
+        // issue `BC_FREE_BUFFER` for the same transaction — which only
+        // happens after `Transactable::transact` returns, so any caller
+        // observing `is_handling_transaction() == true` may safely read it.
+        Some(unsafe { CStr::from_ptr(transaction.calling_sid as _).to_owned() })
+    })
+}
+
+/// PID of the caller for the current in-flight binder transaction.
+///
+/// Returns the sender PID delivered by the kernel via
+/// `binder_transaction_data.sender_pid` when this thread is dispatching a
+/// `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not handling
+/// a transaction (matches AOSP `IPCThreadState::getCallingPid()` which
+/// returns the saved `mCallingPid` field; the field is zero-initialized
+/// outside a transaction).
+///
+/// Convenience wrapper around `CallingContext::default().pid` for the
+/// common case where only the PID is needed — avoids the
+/// `Option<CString>` allocation of the full context.
+pub fn get_calling_pid() -> binder::pid_t {
+    THREAD_STATE.with(|thread_state| {
+        thread_state
+            .borrow()
+            .transaction
+            .as_ref()
+            .map_or(0, |tr| tr.calling_pid)
+    })
+}
+
+/// UID of the caller for the current in-flight binder transaction.
+///
+/// Returns the sender UID delivered by the kernel via
+/// `binder_transaction_data.sender_euid` when this thread is dispatching
+/// a `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not
+/// handling a transaction (matches AOSP `IPCThreadState::getCallingUid()`
+/// which returns the saved `mCallingUid` field).
+///
+/// Convenience wrapper around `CallingContext::default().uid` for the
+/// common case where only the UID is needed.
+///
+/// Note: this is the *kernel-delivered* sender UID. To temporarily
+/// replace it for a nested outbound call (the AOSP
+/// `clearCallingIdentity` pattern), see [`clear_calling_identity`] and
+/// [`restore_calling_identity`].
+pub fn get_calling_uid() -> binder::uid_t {
+    THREAD_STATE.with(|thread_state| {
+        thread_state
+            .borrow()
+            .transaction
+            .as_ref()
+            .map_or(0, |tr| tr.calling_uid)
+    })
+}
+
+/// AOSP-faithful variant of [`get_calling_uid`]: outside a transaction,
+/// returns the current process's own uid (`getuid(2)`) instead of `0`.
+///
+/// Mirrors AOSP `IPCThreadState::getCallingUid()`, which initializes
+/// `mCallingUid` to `getuid()` rather than zero — observers downstream
+/// (e.g. per-uid accounting in [`crate::proxy_count`]) get the same
+/// attribution they would on real Android.
+pub fn get_calling_uid_or_self() -> binder::uid_t {
+    THREAD_STATE
+        .with(|thread_state| {
+            thread_state
+                .borrow()
+                .transaction
+                .as_ref()
+                .map(|tr| tr.calling_uid)
+        })
+        .unwrap_or_else(|| rustix::process::getuid().as_raw())
+}
+
+/// Temporarily override the kernel-delivered calling identity with the
+/// current process's own uid/pid, and return an opaque token that
+/// [`restore_calling_identity`] uses to reverse the override.
+///
+/// Mirrors AOSP `IPCThreadState::clearCallingIdentity()`
+/// (`frameworks/native/libs/binder/IPCThreadState.cpp:562`). Typical use
+/// is server-side: a transaction handler that needs to make an outgoing
+/// binder call to another service "as itself" rather than as the original
+/// caller, to avoid leaking the caller's privileges into a downstream
+/// permission check (or, conversely, to *deliberately* drop a privileged
+/// caller's identity before delegating).
+///
+/// ```text
+/// // Inside Transactable::transact:
+/// let token = clear_calling_identity();
+/// let result = downstream_service.do_something(...);
+/// restore_calling_identity(token);
+/// ```
+///
+/// The returned token packs `(has_explicit_identity, calling_uid,
+/// calling_pid)` into 64 bits using the AOSP bit layout
+/// (`packCallingIdentity` in IPCThreadState.cpp). The SELinux SID is
+/// **not** preserved — matching the AOSP comment "ignore mCallingSid for
+/// legacy reasons". After [`restore_calling_identity`], `get_calling_sid`
+/// returns `None`.
+///
+/// # Behavior outside a transaction
+///
+/// Returns `0` and is a no-op when not currently dispatching a binder
+/// transaction (no kernel-delivered identity exists to clear). This
+/// differs from AOSP, which stores calling identity in flat
+/// `IPCThreadState` fields that persist between transactions — but the
+/// AOSP user-facing semantics (clear before downstream call, restore
+/// after) match.
+pub fn clear_calling_identity() -> i64 {
+    THREAD_STATE.with(|thread_state| {
+        let mut thread_state = thread_state.borrow_mut();
+        let Some(ref mut tr) = thread_state.transaction else {
+            return 0;
+        };
+        let token = pack_calling_identity(tr.has_explicit_identity, tr.calling_uid, tr.calling_pid);
+        // AOSP `clearCaller()`: replace with own uid/pid, drop SID
+        // ("expensive to lookup"), and stamp explicit-identity.
+        tr.calling_uid = rustix::process::getuid().as_raw();
+        tr.calling_pid = rustix::process::getpid().as_raw_nonzero().get() as _;
+        tr.calling_sid = std::ptr::null();
+        tr.has_explicit_identity = true;
+        token
+    })
+}
+
+/// Reverse a previous [`clear_calling_identity`] by unpacking the token
+/// and writing the saved uid/pid/has_explicit back into the current
+/// transaction's calling identity.
+///
+/// Mirrors AOSP `IPCThreadState::restoreCallingIdentity(int64_t)`
+/// (`IPCThreadState.cpp:645`). The SELinux SID is left as `None` because
+/// the token has no room to preserve it ("not enough data to restore" —
+/// same as AOSP). Callers needing both UID/PID and SID restoration must
+/// save the SID separately before clearing.
+///
+/// # Behavior outside a transaction
+///
+/// No-op when not currently dispatching a transaction (consistent with
+/// [`clear_calling_identity`] returning 0 in that case). The token is
+/// silently discarded — there is no transaction state to write into.
+///
+/// # Token mismatch
+///
+/// rsbinder does **not** validate that `token` came from a matching
+/// `clear_calling_identity()` call on the same thread/transaction — same
+/// trust model as AOSP. Passing a forged or stale token simply sets the
+/// fields to whatever the token decodes to. The `RAII` guard pattern
+/// (caller wraps `clear`/`restore` in a `Drop` impl) is recommended; see
+/// AOSP `IPCThreadState::CallingIdentityScope` for the C++ analogue.
+pub fn restore_calling_identity(token: i64) {
+    THREAD_STATE.with(|thread_state| {
+        let mut thread_state = thread_state.borrow_mut();
+        let Some(ref mut tr) = thread_state.transaction else {
+            return;
+        };
+        tr.calling_uid = unpack_calling_uid(token);
+        tr.calling_pid = unpack_calling_pid(token);
+        tr.has_explicit_identity = unpack_has_explicit_identity(token);
+        tr.calling_sid = std::ptr::null();
+    })
+}
+
+/// Linux scheduler policy of the current thread, as reported by the
+/// kernel via `sched_getscheduler(0)`. Debug helper to confirm that
+/// `FLAT_BINDER_FLAG_INHERIT_RT` actually lifted the worker thread into
+/// SCHED_FIFO / SCHED_RR for the transaction.
+///
+/// Values match `<linux/sched.h>` / `libc::SCHED_*` constants:
+///
+///   * `0` = `SCHED_NORMAL` (a.k.a. `SCHED_OTHER`)
+///   * `1` = `SCHED_FIFO`
+///   * `2` = `SCHED_RR`
+///   * `3` = `SCHED_BATCH`
+///   * `5` = `SCHED_IDLE`
+///   * `6` = `SCHED_DEADLINE`
+///
+/// Linux + Android only — on macOS this returns `Err(InvalidOperation)`
+/// because `SCHED_*` policies are a Linux/Android concept. Inside an
+/// `on_transact` body on Linux/Android, the returned value is the policy
+/// the kernel installed for the binder worker thread before invoking
+/// the handler.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn get_current_scheduler_policy() -> Result<i32> {
+    // SAFETY: FFI to libc::sched_getscheduler. No pointer arguments;
+    // pid=0 means "the current thread" and is always a valid input.
+    // The return value is a plain i32; on -1 the libc errno is set
+    // and the read below is the standard POSIX recovery.
+    let raw = unsafe { libc::sched_getscheduler(0) };
+    if raw < 0 {
+        // POSIX guarantees errno is set when sched_getscheduler
+        // returns -1; the `unwrap_or` fallback below would only fire
+        // on a library or kernel bug, so prefer `EINVAL` over `0`
+        // (which is itself a valid "success" errno and would mislead
+        // the caller).
+        return Err(StatusCode::Errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        ));
+    }
+    Ok(raw)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn get_current_scheduler_policy() -> Result<i32> {
+    Err(StatusCode::InvalidOperation)
+}
+
+/// Last transaction failure detail reported by the kernel binder driver
+/// for the current thread, as returned by `BINDER_GET_EXTENDED_ERROR`
+/// (Android 12 / Linux 5.14+).
+///
+/// Stable Rust mirror of the kernel's `struct binder_extended_error`
+/// (`include/uapi/linux/android/binder.h:302-306` in AOSP /
+/// `external/kernel-headers/.../binder.h`). See [`get_extended_error`]
+/// for retrieval semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtendedError {
+    /// Monotonically increasing per-thread counter. Each fresh failure
+    /// observed by the driver bumps this; `0` means no failure has yet
+    /// been recorded on this thread.
+    pub id: u32,
+    /// The BR_ return code that surfaced the failure
+    /// (typically `BR_FAILED_REPLY`).
+    pub command: u32,
+    /// Negated errno or other driver-specific code (`0` when the driver
+    /// has no additional detail).
+    pub param: i32,
+}
+
+/// Retrieve the kernel-side detail of the most recent transaction
+/// failure on the current thread.
+///
+/// AOSP equivalent: `IPCThreadState::getExtendedError()`
+/// ([IPCThreadState.cpp](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/IPCThreadState.cpp)).
+/// The ioctl was added in Android 12 (S, SDK 31, Linux 5.14+); older
+/// drivers respond `ENOTTY`, surfaced here as
+/// `Err(StatusCode::InvalidOperation)` so callers can fall back to the
+/// bare `StatusCode::FailedTransaction` signal from a failed `transact`.
+///
+/// Typical use pairs with a preceding `transact` that returned
+/// `Err(StatusCode::FailedTransaction)`:
+///
+/// ```ignore
+/// match svc.do_something(...) {
+///     Err(StatusCode::FailedTransaction) => {
+///         if let Ok(ee) = rsbinder::get_extended_error() {
+///             eprintln!("driver detail: cmd={:#x} param={}", ee.command, ee.param);
+///         }
+///     }
+///     _ => {}
+/// }
+/// ```
+///
+/// **Opt-in**: rsbinder does *not* call this automatically from the
+/// `BR_FAILED_REPLY` arm. A no-op for callers that never invoke it.
+pub fn get_extended_error() -> Result<ExtendedError> {
+    let mut ee = binder::binder_extended_error::default();
+    let driver = ProcessState::as_self().driver();
+    crate::sys::binder::get_extended_error(driver.as_ref(), &mut ee).map_err(|errno| {
+        if errno == rustix::io::Errno::NOTTY {
+            // Pre-Android-12 driver — feature unavailable.
+            StatusCode::InvalidOperation
+        } else {
+            StatusCode::Errno(errno.raw_os_error())
+        }
+    })?;
+    Ok(ExtendedError {
+        id: ee.id,
+        command: ee.command,
+        param: ee.param,
+    })
+}
+
+/// Whether [`clear_calling_identity`] has been invoked on the current
+/// in-flight transaction without a matching [`restore_calling_identity`].
+///
+/// Mirrors AOSP `IPCThreadState::hasExplicitIdentity()`
+/// (`IPCThreadState.cpp:571`). Reset to `false` on every new incoming
+/// `BR_TRANSACTION`, matching AOSP's per-transaction lifecycle
+/// (`IPCThreadState.cpp:1141`).
+///
+/// Returns `false` when not currently dispatching a transaction.
+pub fn has_explicit_identity() -> bool {
+    THREAD_STATE.with(|thread_state| {
+        thread_state
+            .borrow()
+            .transaction
+            .as_ref()
+            .is_some_and(|tr| tr.has_explicit_identity)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1609,6 +2034,77 @@ mod tests {
             return_to_str(binder::BR_ONEWAY_SPAM_SUSPECT),
             "BR_ONEWAY_SPAM_SUSPECT"
         );
+        // Freeze-observer BR strings.
+        assert_eq!(
+            return_to_str(binder::BR_TRANSACTION_PENDING_FROZEN),
+            "BR_TRANSACTION_PENDING_FROZEN"
+        );
+        assert_eq!(return_to_str(binder::BR_FROZEN_BINDER), "BR_FROZEN_BINDER");
+        assert_eq!(
+            return_to_str(binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE),
+            "BR_CLEAR_FREEZE_NOTIFICATION_DONE"
+        );
+    }
+
+    /// BR constants match the kernel UAPI
+    /// (`_IO('r', 20)`, `_IOR('r', 21, binder_frozen_state_info)`,
+    /// `_IOR('r', 22, binder_uintptr_t)`). Locking these in here means
+    /// a kernel-header drift would surface as a test failure rather than
+    /// a silent wire mismatch.
+    #[test]
+    fn freeze_observer_br_constants_match_uapi() {
+        // _IO('r', 20)
+        assert_eq!(binder::BR_TRANSACTION_PENDING_FROZEN, 29204);
+        // _IOR('r', 21, binder_frozen_state_info) — sizeof=16
+        assert_eq!(binder::BR_FROZEN_BINDER, 2148561429);
+        // _IOR('r', 22, binder_uintptr_t) — sizeof=8
+        assert_eq!(binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE, 2148037142);
+    }
+
+    /// BC constants match the kernel UAPI
+    /// (`_IOW('c', 19, binder_handle_cookie)`,
+    /// `_IOW('c', 20, binder_handle_cookie)`,
+    /// `_IOW('c', 21, binder_uintptr_t)`).
+    #[test]
+    fn freeze_observer_bc_constants_match_uapi() {
+        // _IOW('c', 19, binder_handle_cookie) — sizeof packed = 12
+        assert_eq!(binder::BC_REQUEST_FREEZE_NOTIFICATION, 1074553619);
+        // _IOW('c', 20, binder_handle_cookie) — sizeof = 12
+        assert_eq!(binder::BC_CLEAR_FREEZE_NOTIFICATION, 1074553620);
+        // _IOW('c', 21, binder_uintptr_t) — sizeof = 8
+        assert_eq!(binder::BC_FREEZE_NOTIFICATION_DONE, 1074291477);
+    }
+
+    /// `binder_frozen_state_info` layout: cookie (u64), is_frozen (u32),
+    /// reserved (u32) = 16 bytes, aligned 8. The `BR_FROZEN_BINDER`
+    /// dispatch reads this via `parcel.read::<binder_frozen_state_info>()`.
+    #[test]
+    fn binder_frozen_state_info_layout() {
+        use crate::sys::binder_frozen_state_info;
+        assert_eq!(std::mem::size_of::<binder_frozen_state_info>(), 16);
+        assert_eq!(std::mem::align_of::<binder_frozen_state_info>(), 8);
+        let s = binder_frozen_state_info::default();
+        assert_eq!(s.cookie, 0);
+        assert_eq!(s.is_frozen, 0);
+        assert_eq!(s.reserved, 0);
+    }
+
+    /// The default arm in `wait_for_response` is untouched: the new
+    /// constants are declared so the strings table can label them, but
+    /// no dispatch path consumes them yet. This is a smoke test — if a
+    /// future change accidentally dispatched the freeze-observer BRs
+    /// before its own arm is in place, the kernel wire would diverge.
+    /// Here we just confirm the constants are visible to user code.
+    #[test]
+    fn freeze_observer_constants_are_pub_for_phase_b() {
+        // If these uses compile, the constants are exposed for a future
+        // dispatch path to consume.
+        let _b1 = binder::BR_TRANSACTION_PENDING_FROZEN;
+        let _b2 = binder::BR_FROZEN_BINDER;
+        let _b3 = binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE;
+        let _c1 = binder::BC_REQUEST_FREEZE_NOTIFICATION;
+        let _c2 = binder::BC_CLEAR_FREEZE_NOTIFICATION;
+        let _c3 = binder::BC_FREEZE_NOTIFICATION_DONE;
     }
 
     #[test]
@@ -1653,6 +2149,19 @@ mod tests {
             "BC_TRANSACTION_SG"
         );
         assert_eq!(command_to_str(binder::BC_REPLY_SG), "BC_REPLY_SG");
+        // Freeze-observer BC strings.
+        assert_eq!(
+            command_to_str(binder::BC_REQUEST_FREEZE_NOTIFICATION),
+            "BC_REQUEST_FREEZE_NOTIFICATION"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_CLEAR_FREEZE_NOTIFICATION),
+            "BC_CLEAR_FREEZE_NOTIFICATION"
+        );
+        assert_eq!(
+            command_to_str(binder::BC_FREEZE_NOTIFICATION_DONE),
+            "BC_FREEZE_NOTIFICATION_DONE"
+        );
     }
 
     /// A panicking `Transactable::transact` must not unwind through
@@ -1742,10 +2251,9 @@ mod tests {
     /// - When obituary errors and pin errors, obituary takes priority
     /// - The kernel handshake (queue + pin) runs whenever queue succeeds
     ///
-    /// These properties protect against the kernel `binder_ref` slot
-    /// leak that motivated the refactor — losing any of them
-    /// re-introduces the leak shape that the previous `?`-based
-    /// implementation exhibited.
+    /// These properties protect against a kernel `binder_ref` slot
+    /// leak: losing any of them (e.g. a naive `?`-based early return on
+    /// the obituary error) re-introduces the leak.
     #[test]
     fn test_drive_dead_binder_handshake_orchestration() {
         use std::cell::RefCell;
@@ -2075,5 +2583,209 @@ mod tests {
         // Both entries must be removed from the published_natives table.
         assert!(process.lookup_native(id_a).is_none());
         assert!(process.lookup_native(id_b).is_none());
+    }
+
+    // ----------------------------------------------------------------
+    // calling-identity + strict-mode public API
+    // ----------------------------------------------------------------
+    //
+    // Helpers below construct a synthetic `TransactionState` directly
+    // and install it into the thread-local `THREAD_STATE.transaction`,
+    // so the public calling-identity functions can be exercised without
+    // a running binder driver.
+
+    /// Install a fake in-flight transaction for the duration of the
+    /// returned guard. On drop, the previous transaction state (usually
+    /// `None`) is restored — keeps tests hermetic against each other
+    /// even though `THREAD_STATE` is per-thread.
+    #[cfg(target_os = "linux")]
+    struct FakeTransactionGuard {
+        previous: Option<TransactionState>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeTransactionGuard {
+        fn install(
+            calling_uid: binder::uid_t,
+            calling_pid: binder::pid_t,
+            calling_sid: *const u8,
+        ) -> Self {
+            let new_state = TransactionState {
+                calling_pid,
+                calling_sid,
+                calling_uid,
+                last_transaction_binder_flags: 0,
+                work_source: 0,
+                propagate_work_source: false,
+                has_explicit_identity: false,
+            };
+            let previous = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.replace(new_state));
+            FakeTransactionGuard { previous }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeTransactionGuard {
+        fn drop(&mut self) {
+            THREAD_STATE.with(|ts| {
+                ts.borrow_mut().transaction = self.previous.take();
+            });
+        }
+    }
+
+    /// With no in-flight transaction, the calling-identity free
+    /// functions return the documented "outside a transaction" values
+    /// (None / 0 / 0) with zero side-effects.
+    ///
+    /// **Linux + binderfs only** — `THREAD_STATE.with(..)` triggers
+    /// `ThreadState::new` which captures the global `ProcessState` driver.
+    /// Same convention as the other binder-driver-bound tests in this
+    /// module (uses `ProcessState::init_default` + `serial(binder)`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn test_get_calling_outside_transaction_returns_defaults() {
+        ProcessState::init_default().expect("init_default");
+        // Discard whatever the prior in-thread test may have left in
+        // `THREAD_STATE.transaction`; `serial(binder)` only serializes
+        // entry, not thread-local state.
+        drop(THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take()));
+        assert!(!is_handling_transaction());
+        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_pid(), 0);
+        assert!(get_calling_sid().is_none());
+        assert!(!has_explicit_identity());
+        // clear/restore are no-ops outside a transaction.
+        assert_eq!(clear_calling_identity(), 0);
+        restore_calling_identity(0xDEAD_BEEF_DEAD_BEEFu64 as i64); // must not panic
+        assert_eq!(get_calling_uid(), 0);
+    }
+
+    /// With a fake transaction installed, the calling-identity getters
+    /// return the kernel-delivered values; the SID is a lazy CString
+    /// copy of the secctx pointer.
+    ///
+    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn test_get_calling_inside_transaction_extracts_fields() {
+        ProcessState::init_default().expect("init_default");
+        let sid_cstring = std::ffi::CString::new("u:r:system_server:s0").unwrap();
+        let _guard = FakeTransactionGuard::install(1000, 9999, sid_cstring.as_ptr() as *const u8);
+
+        assert!(is_handling_transaction());
+        assert_eq!(get_calling_uid(), 1000);
+        assert_eq!(get_calling_pid(), 9999);
+
+        let sid = get_calling_sid().expect("SID present when secctx pointer non-null");
+        assert_eq!(sid.to_str().unwrap(), "u:r:system_server:s0");
+
+        // Each call must allocate a fresh owned CString — the pointer
+        // remains owned by the kernel mmap region, never by us.
+        let sid2 = get_calling_sid().expect("second call also returns Some");
+        assert_eq!(sid, sid2);
+        assert!(!std::ptr::eq(sid.as_ptr(), sid2.as_ptr()));
+    }
+
+    /// When secctx is null (plain `BR_TRANSACTION`, not
+    /// `BR_TRANSACTION_SEC_CTX`), `get_calling_sid` returns None even
+    /// though we're handling a transaction.
+    ///
+    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn test_get_calling_sid_null_secctx_returns_none() {
+        ProcessState::init_default().expect("init_default");
+        let _guard = FakeTransactionGuard::install(1000, 9999, std::ptr::null());
+        assert!(is_handling_transaction());
+        assert_eq!(get_calling_uid(), 1000);
+        assert!(get_calling_sid().is_none());
+    }
+
+    /// Pack/unpack round-trip across the
+    /// `(has_explicit, pid_sign)` quadrants that AOSP `static_assert`s
+    /// cover in IPCThreadState.cpp:530-560. The encoding only reserves
+    /// 30 bits + sign for the PID — values like `i32::MIN` (which would
+    /// overlap with the `hasExplicitIdentity` bit position) are outside
+    /// the documented window and intentionally not tested.
+    #[test]
+    fn test_calling_identity_token_pack_unpack_round_trip() {
+        for &(has_explicit, uid, pid) in &[
+            (true, 1000u32, 9999i32),
+            (false, 1000u32, 9999i32),
+            (true, 1000u32, -1i32),
+            (false, 1000u32, -1i32),
+            (true, 0u32, 0i32),
+            (false, 0u32, 0i32),
+        ] {
+            let tok = pack_calling_identity(has_explicit, uid, pid);
+            assert_eq!(
+                unpack_has_explicit_identity(tok),
+                has_explicit,
+                "has_explicit ({has_explicit},{uid},{pid})"
+            );
+            assert_eq!(
+                unpack_calling_uid(tok),
+                uid,
+                "uid ({has_explicit},{uid},{pid})"
+            );
+            assert_eq!(
+                unpack_calling_pid(tok),
+                pid,
+                "pid ({has_explicit},{uid},{pid})"
+            );
+        }
+    }
+
+    /// Clear → restore round-trip inside a
+    /// transaction. Clear stamps self uid/pid + has_explicit; restore
+    /// pulls the original values back.
+    ///
+    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn test_clear_and_restore_calling_identity_round_trip() {
+        ProcessState::init_default().expect("init_default");
+        let _guard = FakeTransactionGuard::install(1000, 9999, std::ptr::null());
+        assert_eq!(get_calling_uid(), 1000);
+        assert_eq!(get_calling_pid(), 9999);
+        assert!(!has_explicit_identity());
+
+        let token = clear_calling_identity();
+
+        // After clear: calling identity is the current process.
+        assert_eq!(get_calling_uid(), rustix::process::getuid().as_raw());
+        assert_eq!(
+            get_calling_pid(),
+            rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
+        );
+        assert!(has_explicit_identity());
+        assert!(get_calling_sid().is_none());
+
+        restore_calling_identity(token);
+
+        assert_eq!(get_calling_uid(), 1000);
+        assert_eq!(get_calling_pid(), 9999);
+        assert!(!has_explicit_identity());
+    }
+
+    /// Set/get strict-mode policy round-trip thread-locally.
+    /// The reset at the end protects subsequent tests that share the
+    /// same thread (thread-local).
+    ///
+    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn test_strict_mode_policy_round_trip() {
+        ProcessState::init_default().expect("init_default");
+        let saved = get_strict_mode_policy();
+        set_strict_mode_policy(0x1234_5678);
+        assert_eq!(get_strict_mode_policy(), 0x1234_5678);
+        set_strict_mode_policy(saved);
+        assert_eq!(get_strict_mode_policy(), saved);
     }
 }

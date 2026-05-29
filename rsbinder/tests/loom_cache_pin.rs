@@ -49,9 +49,9 @@
 //!   `Arc<MockProxyHandle>` allocation Drops exactly once, and
 //!   Drop's `BC_RELEASE` always lands on a live slot.
 //!
-//! ### Why N=2 instead of plan-spec N=3
+//! ### Why N=2 worker threads
 //!
-//! Plan FOLLOW_UP_PR_100 test plan #6 specifies N=3. This PoC uses
+//! This PoC uses
 //! N=2 because the simplified single-handle model already saturates
 //! the relevant interleaving space at N=2: a third thread on the
 //! same handle cannot reach a qualitatively new interleaving — it

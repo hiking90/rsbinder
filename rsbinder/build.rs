@@ -64,4 +64,16 @@ fn main() {
         .output(PathBuf::from("accessor_16.rs"))
         .generate()
         .unwrap();
+
+    // Client-side stub for system_server's
+    // PermissionManagerService. Single AIDL (interface is stable across
+    // android-{11..16}), so it lives outside the versioned IServiceManager
+    // trees under aidl/permission/.
+    new_builder()
+        .source(PathBuf::from(
+            "aidl/permission/android/os/IPermissionController.aidl",
+        ))
+        .output(PathBuf::from("permission_controller.rs"))
+        .generate()
+        .unwrap();
 }

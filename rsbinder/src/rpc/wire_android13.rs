@@ -1,9 +1,9 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `Android13PlusCodec` — the android-13+ *versioned* RPC wire
-//! (subplan 2-5b), an **additive** [`super::wire::WireCodec`] impl
-//! behind the same trait as [`super::wire::R34Codec`].
+//! `Android13PlusCodec` — the android-13+ *versioned* RPC wire, an
+//! **additive** [`super::wire::WireCodec`] impl behind the same trait
+//! as [`super::wire::R34Codec`].
 //! `R34Codec` is byte-unchanged; nothing here touches the kernel path.
 //!
 //! One codec, **version-keyed** — exactly AOSP's own design
@@ -14,14 +14,14 @@
 //!   (`RPC_WIRE_PROTOCOL_VERSION = 1`; their `RpcWireFormat.h` is
 //!   byte-identical to each other)
 //! * **v2** = android-16 (`RPC_WIRE_PROTOCOL_VERSION = 2`,
-//!   `RPC_HEADER_INCLUDES_BINDER_POSITIONS`; subplan 2-8)
+//!   `RPC_HEADER_INCLUDES_BINDER_POSITIONS`)
 //!
 //! The negotiated version is selected at runtime by the connection
 //! handshake (`RpcConnectionHeader`/`RpcNewSessionResponse`). r34
 //! (android-12, pre-versioning, 32-byte address, no handshake) stays a
 //! separate codec.
 //!
-//! # v1 ≡ v2 framing (subplan 2-8 §0.3, verified vs `android-16.0.0_r4`)
+//! # v1 ≡ v2 framing (verified vs `android-16.0.0_r4`)
 //!
 //! v2's wire-protocol delta is **not** a framing change. A full sweep
 //! of `RpcState.cpp` + `RpcWireFormat.h` (android-16.0.0_r4) shows
@@ -34,16 +34,16 @@
 //! is recorded in `mObjectPositions`. So v1 and v2 share **one
 //! framing path**; the codec is version-agnostic about the object
 //! table's *contents* (it just frames the trailing `u32[]`), and the
-//! v1↔v2 distinction lives entirely in the Parcel position producer
-//! (subplan 2-8 Phase B). A no-object parcel ⇒ empty table ⇒
-//! byte-identical v1/v2 wire (AC-8.2, structural v1 no-regression).
+//! v1↔v2 distinction lives entirely in the Parcel position producer.
+//! A no-object parcel ⇒ empty table ⇒ byte-identical v1/v2 wire
+//! (structural v1 no-regression).
 //!
 //! # Spec of record
 //!
 //! Extracted byte-exact from AOSP `frameworks/native`
 //! (`android-13.0.0_r84` for v0, `android-15.0.0_r36` == v1 ==
-//! `android-14.0.0_r75`), device-free — exactly the route 2-5a used
-//! for r34. Source files: `libs/binder/RpcWireFormat.h`,
+//! `android-14.0.0_r75`), device-free — the same route used for r34.
+//! Source files: `libs/binder/RpcWireFormat.h`,
 //! `include/binder/RpcSession.h`, `RpcSession.cpp`, `RpcState.cpp`,
 //! `tests/binderRpcWireProtocolTest.cpp`.
 //!
@@ -76,18 +76,18 @@
 //! * `RpcConnectionHeader` (still 16 B): a reserved byte becomes
 //!   `u8 fileDescriptorTransportMode` (`NONE=0/UNIX=1/TRUSTY=2`) —
 //!   FD mode is negotiated *in the connection header* at v1, not via
-//!   the separate `GET_FD_MODE` special transact rsbinder/2-7 uses.
+//!   the separate `GET_FD_MODE` special transact rsbinder uses.
 //!
-//! ## v1 → v2 (android-16, subplan 2-8)
+//! ## v1 → v2 (android-16)
 //!
 //! **No struct/framing change.** `RpcWireFormat.h` is byte-identical to
 //! v1 (`RpcWireReply::wireSize` still `v0?4:20`; `RpcWireTransaction`
 //! still 40 B with `parcelDataSize`). The only delta is that the
 //! trailing object table (`mObjectPositions`, framed as a `u32[]` after
 //! the parcel data — already present at v1 for FD positions) now also
-//! carries **binder** positions. That is a Parcel-producer concern
-//! (subplan 2-8 Phase B), not a codec/framing concern: the codec
-//! frames the `u32[]` identically for v1 and v2.
+//! carries **binder** positions. That is a Parcel-producer concern,
+//! not a codec/framing concern: the codec frames the `u32[]`
+//! identically for v1 and v2.
 //!
 //! Version constants (`include/binder/RpcSession.h` @
 //! **android-16.0.0_r4**): `RPC_WIRE_PROTOCOL_VERSION = 2`,
@@ -99,15 +99,13 @@
 //! _EXPERIMENTAL` — so a peer that supports up to v2 accepts
 //! {0, 1, 2, EXPERIMENTAL}.
 //!
-//! ## Scope (2-5b, device-free)
+//! ## Scope
 //!
 //! Delivers the **spec-conformance** half (byte-exact codec + golden
-//! vectors from `RpcWireFormat.h`), the gating-equivalent route 2-5a
-//! used for r34. Wiring the handshake into `RpcSession` against a
-//! *live* android-13/14/15 RPC peer (G4), and matching a real peer's
-//! `RpcState` node-id / `FOR_SERVER` address semantics, remain gated —
-//! RPC_STATUS §2-5b. The Parcel-body layer (AOSP `kCurrentRepr`) is a
-//! separate conformance tracked there.
+//! vectors from `RpcWireFormat.h`), the same device-free route used for
+//! r34. Matching a real peer's `RpcState` node-id / `FOR_SERVER`
+//! address semantics is a separate refinement, as is the Parcel-body
+//! layer (AOSP `kCurrentRepr`).
 
 use std::io::{Read, Write};
 
@@ -153,10 +151,10 @@ pub const PROTOCOL_V0: u32 = 0;
 /// (`RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE`).
 pub const PROTOCOL_V1: u32 = 1;
 /// android-16 stable wire protocol version
-/// (`RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_INCLUDES_BINDER_POSITIONS`;
-/// subplan 2-8). Framing is byte-identical to [`PROTOCOL_V1`]; the
-/// only delta is that binder positions also enter the object table
-/// (a Parcel-producer concern — Phase B).
+/// (`RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_INCLUDES_BINDER_POSITIONS`).
+/// Framing is byte-identical to [`PROTOCOL_V1`]; the only delta is that
+/// binder positions also enter the object table (a Parcel-producer
+/// concern).
 pub const PROTOCOL_V2: u32 = 2;
 /// Highest version this codec implements (android-16.0.0_r4
 /// `RPC_WIRE_PROTOCOL_VERSION`).
@@ -170,8 +168,8 @@ pub const RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL: u32 = 0xF000_0000;
 
 /// `RpcSession::FileDescriptorTransportMode` (u8) — the v1
 /// `RpcConnectionHeader.fileDescriptorTransportMode` byte. rsbinder
-/// only ever advertises `NONE`/`UNIX` (subplan 2-7); `TRUSTY` is
-/// out of scope but defined for wire fidelity.
+/// only ever advertises `NONE`/`UNIX`; `TRUSTY` is out of scope but
+/// defined for wire fidelity.
 pub const FD_MODE_NONE: u8 = 0;
 pub const FD_MODE_UNIX: u8 = 1;
 pub const FD_MODE_TRUSTY: u8 = 2;
@@ -180,9 +178,9 @@ pub const FD_MODE_TRUSTY: u8 = 2;
 /// (`Parcel.h`, `int32_t`) — the first int32 of an RPC-Parcel fd
 /// object body. Pinned byte-exact android-14.0.0_r75…android-16.0.0_r4
 /// (`TYPE_BINDER_NULL=0, TYPE_BINDER=1, TYPE_NATIVE_FILE_DESCRIPTOR=2`).
-/// Load-bearing for subplan 2-11: the AOSP-faithful FD-over-RPC v1+
-/// Parcel body (`[not-null|hasComm|TYPE|fdIndex]`) that replaces
-/// rsbinder's internal `[present|idx]` shape.
+/// Load-bearing for the AOSP-faithful FD-over-RPC v1+ Parcel body
+/// (`[not-null|hasComm|TYPE|fdIndex]`) that replaces rsbinder's
+/// internal `[present|idx]` shape.
 pub const TYPE_NATIVE_FILE_DESCRIPTOR: i32 = 2;
 
 /// `setProtocolVersion` acceptance for a peer that supports up to
@@ -210,7 +208,7 @@ fn reply_fixed_len(version: u32) -> usize {
 /// (`>= RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE`).
 /// v0 has no `parcelDataSize` and no object table at all. (v1 and v2
 /// are identical here — the v1↔v2 distinction is purely *which*
-/// objects the Parcel producer records, subplan 2-8 Phase B.)
+/// objects the Parcel producer records.)
 fn has_object_table(version: u32) -> bool {
     version >= PROTOCOL_V1
 }
@@ -237,7 +235,7 @@ fn rd_u64(buf: &[u8], off: usize) -> RpcResult<u64> {
     Ok(u64::from_le_bytes(s.try_into().unwrap()))
 }
 
-/// The android-13+ versioned RPC wire codec (subplan 2-5b, additive).
+/// The android-13+ versioned RPC wire codec (additive).
 /// `version` is the negotiated `RPC_WIRE_PROTOCOL_VERSION`
 /// ([`PROTOCOL_V0`] = android-13, [`PROTOCOL_V1`] = android-14/15).
 #[derive(Debug, Clone, Copy)]
@@ -267,9 +265,9 @@ impl Android13PlusCodec {
         }
     }
 
-    /// v2 — android-16 (subplan 2-8). Framing byte-identical to v1;
-    /// differs only in that the Parcel producer also records binder
-    /// positions in the object table (Phase B).
+    /// v2 — android-16. Framing byte-identical to v1; differs only in
+    /// that the Parcel producer also records binder positions in the
+    /// object table.
     pub fn android16() -> Self {
         Self {
             version: PROTOCOL_V2,
@@ -285,9 +283,7 @@ impl Android13PlusCodec {
     /// store the sentinel as-is, advertise it on the wire, and drive
     /// v1+ framing from it (because `version >= PROTOCOL_V1` holds for
     /// `0xF000_0000`). rsbinder mirrors that exactly — do **not**
-    /// normalize EXPERIMENTAL to `SUPPORTED_MAX_VERSION` (the
-    /// 2026-05-21 review's M7 finding is retracted by AOSP cross-check;
-    /// see review report meta evaluation).
+    /// normalize EXPERIMENTAL to `SUPPORTED_MAX_VERSION`.
     pub fn with_version(version: u32) -> RpcResult<Self> {
         if !is_supported_protocol_version(version) {
             return Err(RpcError::Protocol("unsupported RPC wire protocol version"));
@@ -301,8 +297,8 @@ impl Android13PlusCodec {
     }
 
     fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
-        // M1 fix (review 2026-05-21): encoder/decoder symmetry. The
-        // decoder rejects `body_size > MAX_FRAME_LEN` at every entry
+        // Encoder/decoder symmetry: the decoder rejects
+        // `body_size > MAX_FRAME_LEN` at every entry
         // (see `decode_message`, `read_aosp_message`,
         // `write_aosp_message`); without this guard the encoder would
         // silently truncate a `body_size > u32::MAX` via `as u32` on
@@ -331,14 +327,14 @@ impl Android13PlusCodec {
     /// counter`, `options = CREATED | (FOR_SERVER if Acceptor-minted)`.
     /// Documented + internally consistent (round-trips within
     /// rsbinder); matching a live peer's `RpcState` node-id semantics
-    /// is the G4 refinement (RPC_STATUS §2-5b).
+    /// is a separate refinement.
     ///
     /// `pub(crate)` because the *in-parcel* binder encoding
     /// (`flattenBinder` RPC branch: `i32 present` + `writeUint64`) must
     /// use this same 8-byte `RpcWireAddress` — the session's
     /// `write_binder`/`read_binder` route through it for the
-    /// android-13+ profile (G4(b): r34's 32-byte in-parcel address was
-    /// rejected by the real libbinder peer).
+    /// android-13+ profile (a real libbinder peer rejects r34's 32-byte
+    /// in-parcel address).
     pub(crate) fn encode_addr(addr: &RpcAddress) -> [u8; A13_ADDR_LEN] {
         let mut out = [0u8; A13_ADDR_LEN];
         if addr.is_zero() {
@@ -373,8 +369,7 @@ impl Android13PlusCodec {
         Ok(RpcAddress::from_wire_bytes(bytes))
     }
 
-    // --- connection handshake (used by the conformance test now and
-    //     the live-session wiring later — G4) ----------------------
+    // --- connection handshake --------------------------------------
 
     /// `RpcConnectionHeader` (16 B) + `session_id` bytes
     /// (empty ⇒ request a new session). `fd_mode` is written into the
@@ -387,13 +382,12 @@ impl Android13PlusCodec {
         fd_mode: u8,
         session_id: &[u8],
     ) -> RpcResult<Vec<u8>> {
-        // M2 fix (review 2026-05-21): explicit `u16` bound on
-        // `sessionIdSize`. AOSP `RpcConnectionHeader.sessionIdSize` is
-        // a `uint16_t`; rsbinder's session ids are 32 B (the canonical
-        // path), but this is a `pub fn` and a caller passing a 64 KiB+
-        // slice would previously wrap the on-wire size while the full
-        // body was still appended — a peer reading per `sessionIdSize`
-        // would misframe the following message.
+        // Explicit `u16` bound on `sessionIdSize`. AOSP
+        // `RpcConnectionHeader.sessionIdSize` is a `uint16_t`; this is a
+        // `pub fn` and a caller passing a 64 KiB+ slice would otherwise
+        // wrap the on-wire size while the full body was still appended
+        // — a peer reading per `sessionIdSize` would misframe the
+        // following message.
         let id_size: u16 = session_id
             .len()
             .try_into()
@@ -421,7 +415,7 @@ impl Android13PlusCodec {
         let version = rd_u32(buf, 0)?;
         let options = buf[4];
         let fd_mode = if version == PROTOCOL_V0 { 0 } else { buf[5] };
-        // M8 fix (review 2026-05-21): symmetric with `server_accept`.
+        // Symmetric with `server_accept`.
         if !matches!(fd_mode, FD_MODE_NONE | FD_MODE_UNIX | FD_MODE_TRUSTY) {
             return Err(RpcError::Protocol(
                 "unknown RpcConnectionHeader.fileDescriptorTransportMode",
@@ -481,9 +475,9 @@ impl Android13PlusCodec {
 /// then the object table as a trailing LE `u32[]` (`objectTableSpan
 /// .toIovec()`). The wire body is `[fixed prefix][parcel data
 /// (parcelDataSize bytes)][object table (4·N bytes)]`. v0 has no
-/// object table (`validateParcel` rejects v0 + non-empty positions —
-/// AC-8.4); v1 and v2 are byte-identical here (the table is just a
-/// `u32[]`, version-agnostic — subplan 2-8 §0.3).
+/// object table (`validateParcel` rejects v0 + non-empty positions);
+/// v1 and v2 are byte-identical here (the table is just a `u32[]`,
+/// version-agnostic).
 fn encode_data_and_table(
     out: &mut Vec<u8>,
     version: u32,
@@ -512,9 +506,9 @@ fn encode_data_and_table(
 /// Inverse of [`encode_data_and_table`]: AOSP's `parcelSpan.splitOff(
 /// parcelDataSize)` + `objectTableBytes->reinterpret<uint32_t>()`
 /// (`RpcState.cpp:840-866`/`1144-1176`). `rest` is the body after the
-/// fixed prefix. Phase A does **length + %4 validation only**; v2
-/// strict position-content validation (`binary_search`/range) is
-/// Phase C (subplan 2-8 §3.1 — a lenient decoder still interops).
+/// fixed prefix. This does **length + %4 validation only**; strict v2
+/// position-content validation (`binary_search`/range) is a separate
+/// step — a lenient decoder still interops.
 fn split_data_and_table(
     version: u32,
     rest: &[u8],
@@ -601,7 +595,7 @@ impl WireCodec for Android13PlusCodec {
         // RpcDecStrong { addr(8); u32 amount; u32 reserved } — 16 B,
         // unchanged v0↔v1. rsbinder sends one decrement per drop.
         // `A13_DEC_STRONG_LEN` is a const ≪ `MAX_FRAME_LEN`, so the
-        // M1 guard inside `Self::header` is structurally satisfied.
+        // frame-size guard inside `Self::header` is structurally satisfied.
         let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
             .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + A13_DEC_STRONG_LEN);
@@ -689,8 +683,8 @@ impl WireCodec for Android13PlusCodec {
                 }
                 let address = Self::decode_addr(body, 0)?;
                 // amount @8 — rsbinder applies one decrement per
-                // DEC_STRONG; honoring amount>1 from a live peer is the
-                // G4 refinement (RPC_STATUS §2-5b).
+                // DEC_STRONG; honoring amount>1 from a live peer is a
+                // separate refinement.
                 Ok(WireMessage::DecStrong(address))
             }
             _ => Err(RpcError::Protocol("unknown RpcWireHeader.command")),
@@ -698,8 +692,8 @@ impl WireCodec for Android13PlusCodec {
     }
 
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8> {
-        // Empty `session_id` ⇒ M2's `u16` bound is structurally
-        // satisfied; the inner `expect` can never fire.
+        // Empty `session_id` ⇒ the `u16` sessionIdSize bound is
+        // structurally satisfied; the inner `expect` can never fire.
         // android-13+ replaced the bare int32 preamble with the
         // versioned RpcConnectionHeader. rsbinder only opens a new
         // session here (session_id == RPC_SESSION_ID_NEW) and defaults
@@ -707,7 +701,7 @@ impl WireCodec for Android13PlusCodec {
         // / "cci") uses the inherent methods.
         let _ = session_id;
         self.encode_connection_header(false, FD_MODE_NONE, &[])
-            .expect("preamble passes empty session_id ⇒ M2 u16 bound trivially satisfied")
+            .expect("preamble passes empty session_id ⇒ u16 bound trivially satisfied")
     }
 
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
@@ -719,7 +713,7 @@ impl WireCodec for Android13PlusCodec {
 }
 
 // ---------------------------------------------------------------------
-// AOSP-faithful framing + connection handshake (G4)
+// AOSP-faithful framing + connection handshake
 //
 // The real android RPC wire has **no length prefix**: a peer writes the
 // 16-byte `RpcWireHeader` (whose `bodySize` field is authoritative)
@@ -732,10 +726,9 @@ impl WireCodec for Android13PlusCodec {
 //
 // These helpers operate directly on a byte stream (`Read + Write`), so
 // they are wire-identical to a genuine android-13/14/15 RPC peer. They
-// are the reusable primitives the future opt-in `RpcSession`
-// android-13+ profile wires in (the rest of G4 — see RPC_STATUS §2-5b);
-// nothing here touches the existing R34 `RpcSession`/`RpcTransport`
-// path (additive, R34 byte-unchanged).
+// are the reusable primitives the opt-in `RpcSession` android-13+
+// profile wires in; nothing here touches the existing R34
+// `RpcSession`/`RpcTransport` path (additive, R34 byte-unchanged).
 // ---------------------------------------------------------------------
 
 fn map_io(e: std::io::Error) -> RpcError {
@@ -783,7 +776,7 @@ pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
 
 /// Read one message AOSP-faithfully: read the 16-byte `RpcWireHeader`,
 /// take `bodySize` (LE @ offset 4, capped vs [`MAX_FRAME_LEN`] before
-/// allocation — V4), then read exactly that many body bytes. Returns
+/// allocation), then read exactly that many body bytes. Returns
 /// `[header | body]`, exactly what [`Android13PlusCodec::decode_message`]
 /// expects.
 pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
@@ -803,8 +796,8 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     Ok(out)
 }
 
-/// [`write_aosp_message`] + out-of-band `SCM_RIGHTS` fds (subplan 2-11
-/// Phase A0 — the android-13+ v1+ `Unix` FD-over-RPC path). `msg` is
+/// [`write_aosp_message`] + out-of-band `SCM_RIGHTS` fds (the
+/// android-13+ v1+ `Unix` FD-over-RPC path). `msg` is
 /// the codec output (`[RpcWireHeader(16) | body]`, `bodySize` correct),
 /// emitted raw with **no length prefix**; `fds` ride the first
 /// `sendmsg` (AOSP `RpcTransportRaw`). With `fds` empty this is exactly
@@ -827,10 +820,10 @@ pub fn write_aosp_message_with_fds(
     t.send_raw_with_fds(msg, fds)
 }
 
-/// [`read_aosp_message`] + the `SCM_RIGHTS` fds delivered with it
-/// (subplan 2-11 Phase A0). Reads the 16-byte `RpcWireHeader`, then
+/// [`read_aosp_message`] + the `SCM_RIGHTS` fds delivered with it.
+/// Reads the 16-byte `RpcWireHeader`, then
 /// exactly `bodySize` body bytes (capped vs [`MAX_FRAME_LEN`] before
-/// allocation — V4), **accumulating ancillary fds across every
+/// allocation), **accumulating ancillary fds across every
 /// `recvmsg`** that read the message (AOSP
 /// `RpcTransportRaw::interruptableReadFully`: the kernel delivers
 /// `SCM_RIGHTS` with the first byte of the sender's `sendmsg`, i.e. on
@@ -853,15 +846,14 @@ pub fn read_aosp_message_with_fds(
         while got < want {
             let (n, mut more) = t.recv_raw_with_fds(&mut buf[got..])?;
             fds.append(&mut more);
-            // C3 fix (review 2026-05-21): enforce the per-message
-            // `MAX_FDS_PER_FRAME` cap *across* the multiple recvmsgs
-            // that read one message. The transport's per-call cap
-            // (`recv_raw_with_fds` rejects > 64 per single recvmsg)
-            // is per-recvmsg, not per-message — without this
-            // accumulator-side check, a hostile peer that fragments
-            // a message across N recvmsgs each carrying 64 fds would
-            // accumulate 64·N ancillary fds and walk the process
-            // toward `RLIMIT_NOFILE`. Plan 2-7.d / AC-7.5 DoS bound.
+            // Enforce the per-message `MAX_FDS_PER_FRAME` cap *across*
+            // the multiple recvmsgs that read one message. The
+            // transport's per-call cap (`recv_raw_with_fds` rejects
+            // > 64 per single recvmsg) is per-recvmsg, not per-message
+            // — without this accumulator-side check, a hostile peer
+            // that fragments a message across N recvmsgs each carrying
+            // 64 fds would accumulate 64·N ancillary fds and walk the
+            // process toward `RLIMIT_NOFILE` (DoS bound).
             if fds.len() > super::transport::unix::MAX_FDS_PER_FRAME {
                 return Err(RpcError::Protocol(
                     "RPC message exceeded MAX_FDS_PER_FRAME (ancillary fd budget)",
@@ -900,7 +892,7 @@ pub fn read_aosp_message_with_fds(
 ///
 /// **Wire order is byte-exact to AOSP `RpcSession::setupClient`
 /// (android-13.0.0_r84), validated against a *real* compiled libbinder
-/// peer on the Android 13 emulator (RPC_STATUS §"G4(b)"):**
+/// peer on the Android 13 emulator:**
 ///
 /// 1. write `RpcConnectionHeader` (caller's max version, raw — no framing);
 /// 2. write `RpcOutgoingConnectionInit` (`"cci"`) — the *outgoing*
@@ -916,13 +908,14 @@ pub fn client_connect<S: Read + Write>(
     incoming: bool,
     fd_mode: u8,
 ) -> RpcResult<Android13PlusCodec> {
-    // Empty id ⇒ request a new session — byte-identical to the
-    // pre-2-12 wire (the `session_id` slot already existed).
+    // Empty id ⇒ request a new session — byte-identical to a
+    // single-connection session (the `session_id` slot already
+    // existed).
     client_connect_with_id(stream, max_version, incoming, fd_mode, &[])
 }
 
-/// Subplan 2-12 Phase A0a: like [`client_connect`] but echoes a
-/// server-minted 32-byte `session_id` in the `RpcConnectionHeader`
+/// Like [`client_connect`] but echoes a server-minted 32-byte
+/// `session_id` in the `RpcConnectionHeader`
 /// (AOSP `RpcSession::setupClient`: the first connection sends an empty
 /// id and reads the server-minted one; the remaining connections echo
 /// it). An **empty** `session_id` is byte-for-byte identical to
@@ -955,7 +948,7 @@ pub fn client_connect<S: Read + Write>(
 /// writes `RpcNewSessionResponse` for `requestingNewSession`). The
 /// caller enforces uniformity by clamping `max_version =
 /// min(caller_max, session_version)` *before* the handshake (see
-/// [`RpcSession::add_outgoing_connection_android13plus`]); a peer
+/// [`super::session::RpcSession::add_outgoing_connection_android13plus`]); a peer
 /// running a different actual version on an id-echoing attach is an
 /// unverifiable wire condition on both sides.
 pub fn client_connect_with_id<S: Read + Write>(
@@ -1039,7 +1032,7 @@ pub fn server_accept<S: Read + Write>(
     } else {
         head[5]
     };
-    // M8 fix (review 2026-05-21): reject out-of-enum
+    // Reject out-of-enum
     // `RpcConnectionHeader.fileDescriptorTransportMode`. AOSP defines
     // the field as an enum {NONE, UNIX, TRUSTY}; an unknown value is
     // malformed input that must not flow to downstream consumers as a
@@ -1089,8 +1082,8 @@ fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 /// (currently `unix`). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
 /// `Read` returning `Ok(0)`, so `read_exact_raw` still yields the
 /// correct `PeerClosed`/`Truncated`. This is the bridge the opt-in
-/// android-13+ `RpcSession` profile uses (G4); the R34 path never
-/// touches it.
+/// android-13+ `RpcSession` profile uses; the R34 path never touches
+/// it.
 pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
@@ -1134,7 +1127,7 @@ mod tests {
         }
     }
 
-    /// 2-5b spec-conformance golden — byte-exact against AOSP
+    /// Spec-conformance golden — byte-exact against AOSP
     /// `RpcWireFormat.h` (v0 = android-13.0.0_r84, v1 =
     /// android-15.0.0_r36 == android-14.0.0_r75). Device-free.
     #[test]
@@ -1266,7 +1259,7 @@ mod tests {
         c1.decode_connection_init(&init).expect("\"cci\"");
 
         // Version acceptance (AOSP rule @ android-16.0.0_r4, _NEXT = 3):
-        // accept 0,1,2,EXPERIMENTAL; reject 3 and above (AC-8.1).
+        // accept 0,1,2,EXPERIMENTAL; reject 3 and above.
         assert!(is_supported_protocol_version(0));
         assert!(is_supported_protocol_version(1));
         assert!(is_supported_protocol_version(2));
@@ -1297,7 +1290,7 @@ mod tests {
                 let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
                 // v1+ may carry an object table; synthesize sorted
                 // positions within the parcel data (v0 must stay empty
-                // — exercised separately by the AC-8.4 negative test).
+                // — exercised separately by the negative test).
                 let positions: Vec<u32> = if c.version() >= PROTOCOL_V1 && size >= 8 {
                     vec![0, (size / 2) as u32, (size - 4) as u32]
                 } else {
@@ -1379,7 +1372,7 @@ mod tests {
         assert_eq!(v1.len(), WIRE_HEADER_LEN + 40);
         assert_ne!(v0, r34, "android-13+ must differ from r34");
         // No-object parcel ⇒ v1 and v2 wire are byte-identical
-        // (AC-8.2 — the structural v1 no-regression invariant).
+        // (the structural v1 no-regression invariant).
         assert_eq!(v1, v2, "no-object v1 ≡ v2 (AC-8.2)");
 
         // Reply: the load-bearing v0/v1 divergence (4B vs 20B fixed);
@@ -1412,7 +1405,7 @@ mod tests {
         );
     }
 
-    /// 2-2.b4 / V4 — malformed input never panics/OOMs (both versions).
+    /// Malformed input never panics/OOMs (both versions).
     #[test]
     fn android13plus_decoder_rejects_hostile_input_safely() {
         for c in [
@@ -1477,15 +1470,13 @@ mod tests {
         assert!(matches!(c1.decode_message(&f), Err(RpcError::Protocol(_))));
     }
 
-    /// G4 — the full android-13+ RPC protocol (versioned connection
+    /// The full android-13+ RPC protocol (versioned connection
     /// **handshake** + **AOSP-faithful framing** + `Android13PlusCodec`)
     /// driven end-to-end over a **raw `UnixStream`** (no rsbinder
     /// `RpcTransport` u32 prefix — wire-identical to a genuine
     /// android-13/14/15 RPC peer). Proves all three protocol layers
     /// interoperate, hermetically, over both v0 and v1 and across
-    /// version negotiation. The remaining G4 work (wiring this as an
-    /// opt-in `RpcSession` profile; running vs a compiled AOSP
-    /// `binderRpcTest`) is scoped in RPC_STATUS §2-5b.
+    /// version negotiation.
     #[test]
     fn android13plus_live_protocol_e2e_over_raw_socket() {
         use std::os::unix::net::UnixStream;
@@ -1586,8 +1577,8 @@ mod tests {
         }
     }
 
-    /// G4 layer-1 milestone: the same full android-13+ protocol, but
-    /// driven over a real [`UnixTransport`](crate::rpc::transport::UnixTransport)
+    /// The same full android-13+ protocol, but driven over a real
+    /// [`UnixTransport`](crate::rpc::transport::UnixTransport)
     /// through the [`RawTransportIo`] bridge (not a bare `UnixStream`)
     /// — i.e. over the actual `RpcTransport` abstraction the opt-in
     /// `RpcSession` profile will use. v0 and v1.
@@ -1766,9 +1757,9 @@ mod tests {
         );
     }
 
-    // ===== subplan 2-8 — android-16 RPC wire v2 (Phase A) ==========
+    // ===== android-16 RPC wire v2 ==================================
 
-    /// **AC-8.1** — android-16.0.0_r4 version constants golden.
+    /// android-16.0.0_r4 version constants golden.
     /// `RpcSession.h`: `RPC_WIRE_PROTOCOL_VERSION = 2`, `_NEXT = 3`,
     /// `_EXPLICIT_PARCEL_SIZE = 1`, `_INCLUDES_BINDER_POSITIONS = 2`.
     /// `setProtocolVersion` accepts {0,1,2,EXPERIMENTAL}, rejects ≥3.
@@ -1805,12 +1796,11 @@ mod tests {
         assert!(has_object_table(2));
     }
 
-    /// **AC-8.2** — a no-object parcel encodes **byte-identically** at
-    /// v1 and v2 (TRANSACT *and* REPLY, several payload sizes). This is
-    /// the structural v1-no-regression guarantee: an empty object table
-    /// is 0 wire bytes ⇒ `bodySize` unchanged ⇒ a v2-capable rsbinder's
-    /// no-object traffic is wire-identical to its v1 traffic (and to
-    /// the pre-2-8 wire).
+    /// A no-object parcel encodes **byte-identically** at v1 and v2
+    /// (TRANSACT *and* REPLY, several payload sizes). This is the
+    /// structural v1-no-regression guarantee: an empty object table is
+    /// 0 wire bytes ⇒ `bodySize` unchanged ⇒ a v2-capable rsbinder's
+    /// no-object traffic is wire-identical to its v1 traffic.
     #[test]
     fn android16_no_object_v1_eq_v2_byte_identical() {
         let v1 = Android13PlusCodec::android14_15();
@@ -1838,7 +1828,7 @@ mod tests {
         }
     }
 
-    /// **AC-8.3** — object-table framing golden vs AOSP
+    /// Object-table framing golden vs AOSP
     /// `RpcState.cpp`: `bodySize = fixed + parcelDataSize + 4·N`; the
     /// table is the trailing LE `u32[]` after the parcel data;
     /// `parcelDataSize` is the data length (unchanged); encode→decode
@@ -1938,8 +1928,8 @@ mod tests {
         assert!(matches!(c.decode_message(&bad), Err(RpcError::Protocol(_))));
     }
 
-    /// **AC-8.4** — `validateParcel` analogue: a v0 (android-13) or r34
-    /// wire can carry **no** object table; a non-empty `object_positions`
+    /// `validateParcel` analogue: a v0 (android-13) or r34 wire can
+    /// carry **no** object table; a non-empty `object_positions`
     /// on those is a protocol error, not a silently-dropped table
     /// (AOSP `RpcState::validateParcel` ⇒ `BAD_VALUE`).
     #[test]

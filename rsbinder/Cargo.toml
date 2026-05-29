@@ -85,14 +85,14 @@ sha2 = { version = "0.11", optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # subplan 2-9 Phase A: macOS/BSD peer-credential resolution
-# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux
-# `SO_PEERCRED`. **Target-gated to non-Linux unix only**, so Linux /
-# default / CI builds pull **zero** direct `libc` (AC-9.3): the
-# `[target.'cfg(...)']` table simply does not apply there. Only the
-# `#[cfg(feature = "rpc")]` RPC module references it, so an rpc-off
-# build links no `libc` symbols even on macOS.
+# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
+
+# Plan 4-5 Phase C: `sched_getscheduler` + SCHED_* constants are in libc;
+# rustix omits the SCHED_* constants.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

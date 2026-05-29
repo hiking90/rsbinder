@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! **INSECURE** plaintext TCP transport — DEBUG / interop bring-up
-//! ONLY (subplan 2-1 §2-1.f2 / AC-1.8). Gated behind the
-//! `rpc-tcp-debug` feature so it is absent from a plain `rpc` build.
+//! ONLY. Gated behind the `rpc-tcp-debug` feature so it is absent from
+//! a plain `rpc` build.
 //!
 //! Android precedent: android-12 r34 RPC binder has `SocketType::INET`
 //! and `binderRpcTest.cpp` uses an INET loopback as a *test* transport.
 //! This is the rsbinder equivalent — for observing the R34 wire with
-//! `tcpdump`, for live r34 interop (subplan 2-5a) over standard INET
-//! loopback, and for macOS development (no `SO_PEERCRED`).
+//! `tcpdump`, for live r34 interop over standard INET loopback, and for
+//! macOS development (no `SO_PEERCRED`).
 //!
 //! **Never production.** Safeguards baked in by type/construction:
 //! * [`PeerIdentity::Anonymous`] is hard-wired — there is no code path
@@ -19,7 +19,7 @@
 //!   separate, explicitly-named, warned constructor.
 //! * A loud one-time warning is logged the first time this transport is
 //!   used in a process.
-//! * For real networks use the `tls` backend (subplan 2-4) instead.
+//! * For real networks use the `tls` backend instead.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
@@ -30,7 +30,7 @@ use crate::rpc::RpcResult;
 
 /// Set the first time *any* `TcpDebugTransport` is constructed in this
 /// process. Drives the one-time insecure warning and lets tests assert
-/// the warning fired (AC-1.8a) without capturing the log backend.
+/// the warning fired without capturing the log backend.
 static INSECURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn warn_once() {
@@ -43,7 +43,7 @@ fn warn_once() {
 }
 
 /// `true` once the process-wide insecure warning has been emitted.
-/// Test/diagnostic hook (AC-1.8a).
+/// Test/diagnostic hook.
 pub fn insecure_warning_emitted() -> bool {
     INSECURE_WARNED.load(Ordering::SeqCst)
 }
@@ -68,8 +68,8 @@ impl TcpDebugTransport {
         Ok(TcpDebugTransport { stream, desc })
     }
 
-    /// Wrap a preconnected `OwnedFd` (subplan 2-13 A0.2 — the
-    /// `IAccessor::addConnection()` fd-adopt path, `AF_INET` family).
+    /// Wrap a preconnected `OwnedFd` (the `IAccessor::addConnection()`
+    /// fd-adopt path, `AF_INET` family).
     /// `std`'s `From<OwnedFd> for TcpStream` is stable cross-platform;
     /// the caller is responsible for asserting the fd's address family.
     pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
@@ -84,8 +84,7 @@ impl TcpDebugTransport {
     }
 
     /// Bind a listener on an ephemeral **loopback** port. The default,
-    /// safe bind. Server accept loop is subplan 2-3; this returns the
-    /// raw listener for tests / bring-up.
+    /// safe bind. Returns the raw listener for tests / bring-up.
     pub fn bind_loopback() -> RpcResult<TcpListener> {
         warn_once();
         Ok(TcpListener::bind(SocketAddr::from((
@@ -157,7 +156,7 @@ mod tests {
     fn tcp_debug_roundtrip_and_safeguards() {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
 
-        // AC-1.8a: identity is hard-wired Anonymous on both ends.
+        // Identity is hard-wired Anonymous on both ends.
         assert_eq!(client.peer_identity(), PeerIdentity::Anonymous);
         assert_eq!(server.peer_identity(), PeerIdentity::Anonymous);
         // The one-time insecure warning must have fired by now.
@@ -176,8 +175,8 @@ mod tests {
         }
     }
 
-    /// Subplan 2-13 A0.2: `from_owned_fd` adopt → frame roundtrip.
-    /// Mirrors the `unix` counterpart but uses the TCP loopback pair.
+    /// `from_owned_fd` adopt → frame roundtrip. Mirrors the `unix`
+    /// counterpart but uses the TCP loopback pair.
     #[test]
     fn tcp_debug_from_owned_fd_roundtrip() {
         use std::os::fd::OwnedFd;

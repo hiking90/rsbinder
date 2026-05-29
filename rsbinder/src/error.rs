@@ -145,21 +145,12 @@ impl From<StatusCode> for i32 {
 
 impl From<i32> for StatusCode {
     fn from(code: i32) -> Self {
-        // Every wire value is `const`-evaluable because
-        // `rustix::io::Errno::raw_os_error` is `const fn` and the
-        // `UNKNOWN_ERROR + N` family are integer constants. Lifting
-        // the forward map's values into `const`s lets the match
-        // below lower to a single jump-table / equality cascade
-        // (CODE_REVIEW_RECOMMENDATIONS #1). The previous impl ran
-        // each `code == <variant>.into()` guard linearly — for any
-        // non-matching `code` the compiler couldn't fold the
-        // chained `.into()` calls because each arm re-invoked
-        // `From<StatusCode> for i32`'s entire match on a fresh
-        // input, so the worst case was ~22 nested matches per
-        // call. Per-platform errno mapping is preserved — the
-        // `const` initialisers compile down to the same values
-        // the original `.into()` calls would have produced for
-        // whatever `target_os` is being built.
+        // Lifting the forward map's values into `const`s (each is
+        // `const`-evaluable: `Errno::raw_os_error` is `const fn` and
+        // `UNKNOWN_ERROR + N` are integer constants) lets this match
+        // lower to a jump-table / equality cascade instead of a linear
+        // chain of `code == <variant>.into()` guards. Per-platform errno
+        // mapping is preserved.
         use rustix::io::Errno;
         const OK: i32 = 0;
         const UNKNOWN: i32 = UNKNOWN_ERROR;
@@ -499,14 +490,13 @@ mod tests {
         assert_eq!(code, StatusCode::Errno(-64));
     }
 
-    // CODE_REVIEW_RECOMMENDATIONS #1: pin the round-trip between the
-    // forward `From<StatusCode> for i32` and the refactored reverse
-    // `From<i32> for StatusCode`. Each named variant must come back
-    // through the const-pattern match identically, otherwise the new
-    // const initialisers diverged from the forward map's calls into
-    // `rustix::io::Errno::*.raw_os_error()`. Run on every target
-    // (macOS / Linux / Android) since the errno wire values differ
-    // per OS.
+    // Pin the round-trip between the forward `From<StatusCode> for i32`
+    // and the reverse `From<i32> for StatusCode`. Each named variant
+    // must come back through the const-pattern match identically,
+    // otherwise the const initialisers diverged from the forward map's
+    // calls into `rustix::io::Errno::*.raw_os_error()`. Run on every
+    // target (macOS / Linux / Android) since the errno wire values
+    // differ per OS.
     #[test]
     fn from_i32_round_trip_pins_every_named_variant() {
         let variants = [

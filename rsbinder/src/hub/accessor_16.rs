@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-13 (A.4 + A.5): the `IAccessor` bridge that turns the
+//! The `IAccessor` bridge that turns the
 //! `Service::Accessor` arm of [`hub::android_16::get_service`]
 //! /[`check_service`](super::servicemanager_16) — historically dropped
 //! to `None` with a warning — into a usable RPC root binder.
@@ -30,7 +30,7 @@
 //! ([`super::servicemanager_16`] cfg guards the whole resolve path).
 //!
 //! Process-wide state: **none**. There is no global registry, no
-//! `OnceLock<Mutex<Vec<RpcSession>>>` (P6 would forbid it); the session
+//! `OnceLock<Mutex<Vec<RpcSession>>>`; the session
 //! lives exactly as long as the wrapper the caller holds.
 
 // cfg lives on the mod decl in super — duplicating here trips
@@ -48,7 +48,7 @@ use crate::error::Result;
 use crate::parcel::Parcel;
 use crate::rpc::RpcSession;
 
-// Generated `IAccessor` stub (build.rs A0.1). The accessor AIDL is its
+// Generated `IAccessor` stub. The accessor AIDL is its
 // own AIDL output so the `IServiceManager.aidl` transitive resolution
 // stays unchanged.
 include!(concat!(env!("OUT_DIR"), "/accessor_16.rs"));
@@ -81,16 +81,12 @@ pub(crate) struct AccessorRoot {
     /// an `Arc<RpcProxy>` (one of two: the other is cached inside
     /// `RpcSessionInner.state` and dies with the session).
     inner: SIBinder,
-    /// **Load-bearing**: drops *after* `inner` (Rust drops fields in
-    /// declaration order). The reverse — `session` first — kills the
-    /// `RpcSessionInner` before the inner `RpcProxy::drop` can fire,
-    /// so the proxy's `queue_dec_strong` silent-skips on the dead
-    /// session and the peer leaks a strong ref until its own
-    /// teardown. The field is technically "unused" in code (Rust
-    /// would let it be renamed `_session` to suppress that lint), but
-    /// the underscore convention falsely suggests it's removable —
-    /// hence the explicit allow attribute. **Reorder = wire
-    /// regression**. (M13 fix — review 2026-05-21.)
+    /// **Load-bearing**: must drop *after* `inner` (Rust drops fields in
+    /// declaration order). Dropping `session` first kills the
+    /// `RpcSessionInner` before the inner `RpcProxy::drop` fires, so the
+    /// proxy's `queue_dec_strong` silent-skips on the dead session and
+    /// the peer leaks a strong ref until its own teardown. Reorder =
+    /// wire regression.
     #[allow(dead_code)]
     session: RpcSession,
 }
@@ -191,7 +187,7 @@ impl IBinder for AccessorRoot {
 /// 3. `addConnection()` — server-side connected socket fd. Failures
 ///    surface as `Status::service_specific_error()` with one of the
 ///    five `IAccessor::ERROR_*` codes (decoded by the caller via
-///    [`accessor_error_name`] in B.6 logging).
+///    [`accessor_error_name`] for logging).
 /// 4. `RpcSession::from_preconnected_fd(fd, max_version=2)` —
 ///    android-16 max wire version.
 /// 5. `get_root()` → wrap in `AccessorRoot` so the session stays
@@ -292,7 +288,7 @@ pub fn resolve_accessor(
     )
 }
 
-/// Map an `IAccessor::ERROR_*` service-specific code (subplan 2-13 B.6)
+/// Map an `IAccessor::ERROR_*` service-specific code
 /// to its symbolic name for logging. `0` is also the
 /// `CONNECTION_INFO_NOT_FOUND` code (AIDL constant value) — when the
 /// inbound `Status` has no `ServiceSpecific` variant the caller passes
@@ -310,7 +306,7 @@ pub fn accessor_error_name(code: i32) -> &'static str {
     }
 }
 
-/// Fuzz hook (subplan 2-13 B.6 / V4): feed an arbitrary big-endian i32
+/// Fuzz hook: feed an arbitrary big-endian i32
 /// byte payload into [`accessor_error_name`] and assert it never
 /// panics, allocates indefinitely, or returns a non-`'static str`. The
 /// returned string is intentionally consumed via `std::hint::black_box`
@@ -329,11 +325,9 @@ pub fn __fuzz_accessor_error_decode(input: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    //! Subplan 2-13 B.6 deterministic regression: the
-    //! `ServiceSpecificError` decode is the gate that survives without
-    //! a nightly fuzz infrastructure (the master plan calls these the
-    //! *enforceable* adversarial-input gates; the libFuzzer target is
-    //! the soak supplement).
+    //! Deterministic regression for the `ServiceSpecificError` decode —
+    //! the enforceable adversarial-input gate; the libFuzzer target is
+    //! the soak supplement.
 
     use super::*;
 

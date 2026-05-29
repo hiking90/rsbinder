@@ -1,16 +1,16 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! RPC wire codec (subplan 2-2 S-b).
+//! RPC wire codec.
 //!
-//! **D3 (master §7.1):** rsbinder does not invent a wire. The Track-1
-//! wire is the [`WireCodec`] trait + [`R34Codec`], a *direct
-//! implementation of the real android-12 r34 RPC wire* (spec extracted
-//! in `plan/2-5-android-interop.md` §9). So the Track-1 round-trip and
-//! golden tests are simultaneously r34 spec-conformance (AC-2.2r) — no
-//! device, no AOSP build needed. android-13+ versioned wire is the
-//! additive [`Android13PlusCodec`](super::wire_android13::Android13PlusCodec)
-//! behind the same trait (2-5b; v0 = android-13, v1 = android-14/15).
+//! rsbinder does not invent a wire. The default codec is the
+//! [`WireCodec`] trait + [`R34Codec`], a *direct implementation of the
+//! real android-12 r34 RPC wire*, so the round-trip and golden tests are
+//! simultaneously r34 spec-conformance — no device, no AOSP build
+//! needed. The android-13+ versioned wire is the additive
+//! [`Android13PlusCodec`](super::wire_android13::Android13PlusCodec)
+//! behind the same trait (v0 = android-13, v1 = android-14/15, v2 =
+//! android-16).
 //!
 //! r34 layout (LE, explicit serialization — no `#[repr]` dependency):
 //! * `RpcWireHeader` (16B): `u32 command; u32 bodySize; u32 reserved[2]`
@@ -22,8 +22,7 @@
 //! * session preamble: a bare `int32` session id (no header)
 //!
 //! No magic / self-sync: `bodySize` is authoritative, so the decoder is
-//! strict and every length/offset is bounds-checked before use (2-2.b4
-//! / V4, baseline `d659ae3`).
+//! strict and every length/offset is bounds-checked before use.
 
 use super::address::{RpcAddress, RPC_ADDR_LEN};
 use super::transport::MAX_FRAME_LEN;
@@ -56,11 +55,11 @@ pub struct WireTransaction {
     /// AOSP `RpcFields::mObjectPositions` — the sorted byte offsets,
     /// **within `data`**, of every flattened RPC object (binder at
     /// android-16 v2, FD at v1+). Sent on the wire as a trailing LE
-    /// `u32[]` after the parcel data (subplan 2-8, android-16 v2).
-    /// **Default empty** ⇒ the wire is byte-identical to the pre-2-8
-    /// no-object encoding (the v1≡v2 invariant, AC-8.2). The R34 and
-    /// v0 wires have no object table; a non-empty table on those is a
-    /// protocol error (`validateParcel`, AC-8.4).
+    /// `u32[]` after the parcel data (android-16 v2).
+    /// **Default empty** ⇒ the wire is byte-identical to the no-object
+    /// encoding (the v1≡v2 invariant). The R34 and v0 wires
+    /// have no object table; a non-empty table on those is a protocol
+    /// error (`validateParcel`).
     pub object_positions: Vec<u32>,
 }
 
@@ -72,8 +71,8 @@ pub struct WireReply {
     /// The serialized RPC-mode `Parcel` payload.
     pub data: Vec<u8>,
     /// See [`WireTransaction::object_positions`] — the reply parcel's
-    /// object table (subplan 2-8). Default empty = byte-identical to
-    /// the pre-2-8 reply encoding.
+    /// object table (android-16 v2). Default empty = byte-identical to
+    /// the no-object reply encoding.
     pub object_positions: Vec<u32>,
 }
 
@@ -101,13 +100,14 @@ pub enum WireMessage {
     DecStrong(RpcAddress),
 }
 
-/// Pluggable RPC wire format. The session owns a codec instance (P6 —
-/// no global). android-13+ versioned wire is a future additional impl.
+/// Pluggable RPC wire format. The session owns a codec instance (no
+/// global); the android-13+ versioned wire is an additional impl
+/// ([`super::wire_android13::Android13PlusCodec`]) behind this trait.
 pub trait WireCodec: Send + Sync {
     /// Encode a complete `TRANSACT` message (header + txn + data +
-    /// optional object table). Fails (`validateParcel`, AC-8.4) if the
-    /// codec's wire version has no object table but
-    /// `txn.object_positions` is non-empty.
+    /// optional object table). Fails (`validateParcel`) if the codec's
+    /// wire version has no object table but `txn.object_positions` is
+    /// non-empty.
     fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>>;
     /// Encode a complete `REPLY` message. Same object-table version
     /// rule as [`WireCodec::encode_transact`].
@@ -127,14 +127,24 @@ pub trait WireCodec: Send + Sync {
 pub struct R34Codec;
 
 impl R34Codec {
-    fn header(command: u32, body_size: usize) -> [u8; WIRE_HEADER_LEN] {
+    fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
+        // Encoder/decoder symmetry (mirrors `Android13PlusCodec::header`):
+        // `decode_message` rejects `body_size > MAX_FRAME_LEN`, so the
+        // encoder must too — otherwise a `body_size > u32::MAX` payload
+        // on a 64-bit host would be silently truncated by `as u32`, emitting
+        // a header whose `bodySize` disagrees with the actual body and
+        // misframing the peer's next message.
+        if body_size > MAX_FRAME_LEN {
+            return Err(RpcError::FrameTooLarge {
+                declared: body_size,
+                max: MAX_FRAME_LEN,
+            });
+        }
         let mut h = [0u8; WIRE_HEADER_LEN];
         h[0..4].copy_from_slice(&command.to_le_bytes());
-        // bodySize is a u32 on the wire; callers never exceed it
-        // (bounded by MAX_FRAME_LEN, far below u32::MAX).
         h[4..8].copy_from_slice(&(body_size as u32).to_le_bytes());
         // reserved[2] stays zero.
-        h
+        Ok(h)
     }
 }
 
@@ -180,10 +190,9 @@ impl WireCodec for R34Codec {
         // android-12 r34 predates the versioned wire: there is **no**
         // object table on this wire at all. The android-13+ v2 object
         // table is a separate codec; the R34 path never records
-        // positions (subplan 2-8 Phase B gates recording behind the
-        // android-13+ v2 profile), so a non-empty table here is a
-        // protocol break — reject it rather than silently drop the
-        // table and desync the peer (AOSP `validateParcel` analogue).
+        // positions, so a non-empty table here is a protocol break —
+        // reject it rather than silently drop the table and desync the
+        // peer (AOSP `validateParcel` analogue).
         if !txn.object_positions.is_empty() {
             return Err(RpcError::Protocol(
                 "r34 wire has no object table (object_positions must be empty)",
@@ -191,7 +200,7 @@ impl WireCodec for R34Codec {
         }
         let body_len = WIRE_TXN_FIXED_LEN + txn.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len));
+        out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len)?);
         out.extend_from_slice(txn.address.as_wire_bytes()); // 32
         out.extend_from_slice(&txn.code.to_le_bytes()); // 4
         out.extend_from_slice(&txn.flags.to_le_bytes()); // 4
@@ -209,7 +218,7 @@ impl WireCodec for R34Codec {
         }
         let body_len = 4 + reply.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_REPLY, body_len));
+        out.extend_from_slice(&Self::header(CMD_REPLY, body_len)?);
         out.extend_from_slice(&reply.status.to_le_bytes());
         out.extend_from_slice(&reply.data);
         Ok(out)
@@ -217,7 +226,12 @@ impl WireCodec for R34Codec {
 
     fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8> {
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + RPC_ADDR_LEN);
-        out.extend_from_slice(&Self::header(CMD_DEC_STRONG, RPC_ADDR_LEN));
+        // RPC_ADDR_LEN is a small constant, far below MAX_FRAME_LEN, so the
+        // bound check can never trip here — unwrap the const-length header.
+        out.extend_from_slice(
+            &Self::header(CMD_DEC_STRONG, RPC_ADDR_LEN)
+                .expect("dec_strong header is within the frame bound"),
+        );
         out.extend_from_slice(addr.as_wire_bytes());
         out
     }
@@ -292,16 +306,9 @@ impl WireCodec for R34Codec {
     }
 
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
-        // m4 fix (review 2026-05-21): strict-equal. The R34 preamble is
-        // exactly a bare `int32` (4 B); `encode_session_preamble` emits
-        // exactly 4 B; `decode_message` enforces frame-size-exact on
-        // every other path. Without `!= 4`, a peer that sends 5+ bytes
-        // would have the trailing slop silently consumed by the next
-        // recv, and an empty buf or a 2-byte stub would not be
-        // distinguished from a peer that didn't speak the preamble at
-        // all. The fuzz target's `input.len().min(4)` slice still hits
-        // this fn with len ≤ 4, so the only behavior change is
-        // rejecting genuinely malformed input.
+        // Strict-equal: the R34 preamble is exactly a bare `int32`
+        // (4 B), so a peer sending more or fewer bytes is malformed and
+        // must not silently desync the next recv.
         let arr: [u8; 4] = buf
             .try_into()
             .map_err(|_| RpcError::Protocol("session preamble must be exactly 4 bytes"))?;
@@ -309,8 +316,8 @@ impl WireCodec for R34Codec {
     }
 }
 
-/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target
-/// (2-2.A / V4). Not part of the supported API surface.
+/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target.
+/// Not part of the supported API surface.
 #[doc(hidden)]
 pub fn __fuzz_decode_wire(input: &[u8]) {
     let _ = R34Codec.decode_message(input);
@@ -320,9 +327,9 @@ pub fn __fuzz_decode_wire(input: &[u8]) {
 /// the address sits inside a TRANSACT/DEC_STRONG body, so feeding
 /// arbitrary bytes through the message decoder also exercises the
 /// 32-byte address parse path with full bounds checking.
-/// Decode-only entrypoint for the `rpc_session_handshake` fuzz target
-/// (subplan 2-3 §6.3 / V4): the first 4 bytes are fed to the session
-/// preamble decoder, the remainder through the message decoder — the
+/// Decode-only entrypoint for the `rpc_session_handshake` fuzz target:
+/// the first 4 bytes are fed to the session preamble decoder, the
+/// remainder through the message decoder — the
 /// exact untrusted path a session's negotiation/serve loop walks. No
 /// panic / OOM / hang on any input; bad negotiation values are
 /// rejected, not trusted.
@@ -338,8 +345,11 @@ pub fn __fuzz_session_handshake(input: &[u8]) {
 pub fn __fuzz_decode_address(input: &[u8]) {
     // Wrap as a DEC_STRONG frame so the address parser is reached even
     // for short/garbage inputs without panicking.
+    let Ok(header) = R34Codec::header(CMD_DEC_STRONG, input.len()) else {
+        return;
+    };
     let mut frame = Vec::with_capacity(WIRE_HEADER_LEN + input.len());
-    frame.extend_from_slice(&R34Codec::header(CMD_DEC_STRONG, input.len()));
+    frame.extend_from_slice(&header);
     frame.extend_from_slice(input);
     let _ = R34Codec.decode_message(&frame);
 }
@@ -353,8 +363,20 @@ mod tests {
         R34Codec
     }
 
-    /// T2.1 — encode∘decode == identity for every command, arbitrary
-    /// payloads (0..1 MiB sampled).
+    /// `R34Codec::header` must reject a body larger than `MAX_FRAME_LEN`
+    /// (encoder/decoder symmetry with `Android13PlusCodec`) rather than
+    /// silently truncating `bodySize` via `as u32`.
+    #[test]
+    fn header_rejects_oversize_body() {
+        assert!(matches!(
+            R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN + 1),
+            Err(RpcError::FrameTooLarge { .. })
+        ));
+        assert!(R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN).is_ok());
+    }
+
+    /// encode∘decode == identity for every command, arbitrary payloads
+    /// (0..1 MiB sampled).
     #[test]
     fn roundtrip_all_commands() {
         let c = rt_codec();
@@ -410,9 +432,8 @@ mod tests {
         assert_eq!(c.decode_session_preamble(&pre).unwrap(), RPC_SESSION_ID_NEW);
     }
 
-    /// AC-2.2r / T2.1r — fixed golden vectors matched byte-for-byte
-    /// against the android-12 r34 spec (`plan/2-5` §9). This is the
-    /// r34 spec-conformance gate (2-5a absorbed): no device, no AOSP.
+    /// Fixed golden vectors matched byte-for-byte against the android-12
+    /// r34 spec. The r34 spec-conformance gate: no device, no AOSP.
     #[test]
     fn r34_spec_golden_vectors() {
         let c = R34Codec;
@@ -477,8 +498,8 @@ mod tests {
         );
     }
 
-    /// T2.10 mutant: a one-byte change in a golden header must be
-    /// detected (the golden compare is exact, not "close enough").
+    /// A one-byte change in a golden header must be detected (the golden
+    /// compare is exact, not "close enough").
     #[test]
     fn golden_is_not_close_enough() {
         let c = R34Codec;
@@ -496,8 +517,8 @@ mod tests {
         assert!(matches!(c.decode_message(&enc), Err(RpcError::Protocol(_))));
     }
 
-    /// 2-2.b4 / V4 — malformed input must never panic/OOM; every
-    /// length/offset is bounds-checked, no pre-allocation past bounds.
+    /// Malformed input must never panic/OOM; every length/offset is
+    /// bounds-checked, no pre-allocation past bounds.
     #[test]
     fn decoder_rejects_hostile_input_safely() {
         let c = R34Codec;

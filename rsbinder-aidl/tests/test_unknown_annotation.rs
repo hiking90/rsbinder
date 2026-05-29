@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan 3-1 A.1/A.2: AOSP `AidlAnnotation::AllSchemas()` defines a
+//! AOSP `AidlAnnotation::AllSchemas()` defines a
 //! closed set of 23 recognised annotations. Anything else used to be
 //! silently dropped — so a typo like `@RustDrive` would compile clean
 //! with no codegen effect and no diagnostic. The parser now records

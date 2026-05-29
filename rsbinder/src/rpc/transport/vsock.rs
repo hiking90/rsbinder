@@ -1,24 +1,23 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! vsock transport (subplan 2-4 track V) — **Linux / Android** (the
-//! `vsock` crate's `AF_VSOCK` impl covers both `target_os = "linux"` and
-//! `"android"`; Android is the Virtualization Framework / Microdroid pVM
-//! host↔guest target — subplan 2-15).
+//! vsock transport — **Linux / Android** (the `vsock` crate's
+//! `AF_VSOCK` impl covers both `target_os = "linux"` and `"android"`;
+//! Android is the Virtualization Framework / Microdroid pVM host↔guest
+//! target).
 //!
-//! Trust boundary: hypervisor VM isolation (plan §5). Plaintext is
-//! *correct* here, exactly as for `unix` on a single host. The peer
-//! identity is [`PeerIdentity::Vsock`] carrying the context id — a
-//! **routing address, not an ACL basis** (subplan 2-4 R1): the
-//! hypervisor, not the cid value, is the trust boundary; the cid is
-//! logged for diagnostics.
+//! Trust boundary: hypervisor VM isolation. Plaintext is *correct*
+//! here, exactly as for `unix` on a single host. The peer identity is
+//! [`PeerIdentity::Vsock`] carrying the context id — a **routing
+//! address, not an ACL basis**: the hypervisor, not the cid value, is
+//! the trust boundary; the cid is logged for diagnostics.
 //!
-//! Additive invariant (AC-4.1): this file + the feature + the
-//! `PeerIdentity::Vsock` variant are the only change — the 2-2/2-3
-//! core is untouched and runs unmodified with the transport swapped.
+//! Additive: this file + the feature + the `PeerIdentity::Vsock`
+//! variant are the only change — the core is untouched and runs
+//! unmodified with the transport swapped.
 //!
 //! Tests are Linux+VM and `#[ignore]` by default (need a peer VM or
-//! `VMADDR_CID_LOCAL`), per the plan's V6 environment gate.
+//! `VMADDR_CID_LOCAL`).
 
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 
@@ -29,13 +28,11 @@ use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
 ///
-/// **M11 fix (review 2026-05-21)**: lock-free, full-duplex. `vsock`
-/// 0.5+ implements `impl Read for &VsockStream` and `impl Write for
-/// &VsockStream`, mirroring `UnixStream`, so a shared `&self` can
-/// `send_frame` while another thread `recv_frame`s without serializing
-/// through a `Mutex`. The trait doc on [`RpcTransport`] requires
-/// concurrent send+recv, which the previous `Mutex<VsockStream>`
-/// violated.
+/// Lock-free, full-duplex. `vsock` 0.5+ implements `impl Read for
+/// &VsockStream` and `impl Write for &VsockStream`, mirroring
+/// `UnixStream`, so a shared `&self` can `send_frame` while another
+/// thread `recv_frame`s without serializing through a `Mutex` — as the
+/// [`RpcTransport`] trait contract requires.
 pub struct VsockTransport {
     stream: VsockStream,
     peer: PeerIdentity,
@@ -49,7 +46,7 @@ impl VsockTransport {
         Self::from_stream(stream)
     }
 
-    /// Wrap a preconnected vsock `OwnedFd` (subplan 2-13 A0.2 — the
+    /// Wrap a preconnected vsock `OwnedFd` (the
     /// `IAccessor::addConnection()` fd-adopt path, `AF_VSOCK` family).
     /// The `vsock` crate has no public `From<OwnedFd>` for `VsockStream`
     /// so this goes through `FromRawFd` after taking ownership; the

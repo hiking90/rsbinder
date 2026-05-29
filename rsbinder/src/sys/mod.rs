@@ -55,6 +55,17 @@ pub mod binder {
     pub const BR_ONEWAY_SPAM_SUSPECT: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_ONEWAY_SPAM_SUSPECT;
 
+    // Freeze observer additions (Android 14+, kernel 6.5+). These BR
+    // constants are exposed so the RETURN_STRINGS table can decode them;
+    // dispatch is not yet wired, so the default arm still treats them as
+    // "Unknown BR_ return" and the kernel wire stays byte-unchanged.
+    pub const BR_TRANSACTION_PENDING_FROZEN: binder_driver_return_protocol =
+        binder_driver_return_protocol_BR_TRANSACTION_PENDING_FROZEN;
+    pub const BR_FROZEN_BINDER: binder_driver_return_protocol =
+        binder_driver_return_protocol_BR_FROZEN_BINDER;
+    pub const BR_CLEAR_FREEZE_NOTIFICATION_DONE: binder_driver_return_protocol =
+        binder_driver_return_protocol_BR_CLEAR_FREEZE_NOTIFICATION_DONE;
+
     pub const BC_TRANSACTION: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_TRANSACTION;
     pub const BC_REPLY: binder_driver_command_protocol = binder_driver_command_protocol_BC_REPLY;
@@ -92,6 +103,18 @@ pub mod binder {
         binder_driver_command_protocol_BC_TRANSACTION_SG;
     pub const BC_REPLY_SG: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_REPLY_SG;
+
+    // Freeze observer BC counterparts. The send path
+    // (`BC_REQUEST_FREEZE_NOTIFICATION` and friends) is not yet wired;
+    // these constants plus the `binder_handle_cookie` struct and
+    // `binder_frozen_state_info` payload are exposed so call sites can
+    // pattern-match on them once the dispatch arms land.
+    pub const BC_REQUEST_FREEZE_NOTIFICATION: binder_driver_command_protocol =
+        binder_driver_command_protocol_BC_REQUEST_FREEZE_NOTIFICATION;
+    pub const BC_CLEAR_FREEZE_NOTIFICATION: binder_driver_command_protocol =
+        binder_driver_command_protocol_BC_CLEAR_FREEZE_NOTIFICATION;
+    pub const BC_FREEZE_NOTIFICATION_DONE: binder_driver_command_protocol =
+        binder_driver_command_protocol_BC_FREEZE_NOTIFICATION_DONE;
 
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
@@ -293,6 +316,24 @@ pub mod binder {
                 { ioctl::opcode::read_write::<binder_frozen_status_info>(b'b', 15) },
                 _,
             >::new(frozen_info);
+            ioctl::ioctl(fd, ctl)
+        }
+    }
+
+    // Android 12+ driver. The kernel returns 12
+    // bytes describing the last transaction failure on the current
+    // thread (id / command / errno). Older kernels respond `ENOTTY`;
+    // callers should treat that as "feature unavailable".
+    pub(crate) fn get_extended_error<Fd: AsFd>(
+        fd: Fd,
+        ee: &mut binder_extended_error,
+    ) -> std::result::Result<(), io::Errno> {
+        unsafe {
+            // SAFETY: see shared rationale above. Request: BINDER_GET_EXTENDED_ERROR.
+            let ctl = ioctl::Updater::<
+                { ioctl::opcode::read_write::<binder_extended_error>(b'b', 17) },
+                _,
+            >::new(ee);
             ioctl::ioctl(fd, ctl)
         }
     }

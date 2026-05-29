@@ -4,7 +4,7 @@
 //! RPC (binder-over-socket) variant of `hello_service` — serves the
 //! **same generated `IHello` stub** over a Unix-domain socket instead
 //! of the kernel binder driver. No `/dev/binder`, no service manager:
-//! the RPC transport is a separate, parallel stack (Plan 2). Pair it
+//! the RPC transport is a separate, parallel stack. Pair it
 //! with `rpc_hello_client`:
 //!
 //! ```text

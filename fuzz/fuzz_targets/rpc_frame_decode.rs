@@ -6,9 +6,6 @@
 //! backends). Property under test: **no panic, no OOM, no infinite
 //! loop, no UB** on any input — a declared length above
 //! `MAX_FRAME_LEN` must be rejected before allocation.
-//!
-//! Baseline parity: plan 2 §6.3 / branch history `d659ae3`
-//! ("untrusted input UB/abort/underflow 0").
 
 #![no_main]
 

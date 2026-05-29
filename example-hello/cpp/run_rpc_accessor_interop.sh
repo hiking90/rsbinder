@@ -13,7 +13,7 @@
 #     (`rustup target add aarch64-linux-android`).
 #
 # Usage:
-#   ./run_stage3.sh [-s emulator-5556]
+#   ./run_rpc_accessor_interop.sh [-s emulator-5556]
 #
 # Exits 0 on STAGE3 PASS; non-zero otherwise.
 

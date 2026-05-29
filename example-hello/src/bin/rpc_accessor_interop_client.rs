@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-13 D.8 STAGE3 — rsbinder side of the IAccessor bridge
+//! rsbinder side of the IAccessor bridge
 //! real-libbinder interop harness.
 //!
 //! Pairs with `cpp/rpc_accessor_interop_launcher` (real-libbinder side)
@@ -26,13 +26,13 @@
 //!      which the stock emulator's read-only /system blocks).
 //!   4. `accessor_16::resolve_accessor(name, accessor_binder)` drives
 //!      the bridge **end-to-end**: BpAccessor wire (real libbinder) →
-//!      `addConnection()` → fd adopt → 2-8 v2 handshake (real libbinder
+//!      `addConnection()` → fd adopt → v2 handshake (real libbinder
 //!      RPC server peer) → `get_root()` → real RPC root.
 //!   5. Full transact: `TX_ECHO` (round-trip arg) + `TX_GIVE_MARKER`
 //!      (server-side string, no arg). The marker is a fixed string the
 //!      C++ launcher hard-codes, so an end-to-end PASS proves the
 //!      Parcel body bytes match against the genuine peer (the same
-//!      shape the 2-8 STAGE3 used).
+//!      shape the v2 STAGE3 interop used).
 //!
 //! Exit code 0 = STAGE3 PASS; non-zero = bug.
 

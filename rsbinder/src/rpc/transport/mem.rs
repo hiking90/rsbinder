@@ -1,16 +1,15 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process transport for hermetic tests (subplan 2-1, AC-1.4).
+//! In-process transport for hermetic tests.
 //!
 //! No sockets, no kernel: a pair of `mpsc` channels. One channel
 //! message **is** one frame, so the length-prefix framing is bypassed
 //! entirely. Two `MemTransport`s from [`MemTransport::pair`] are wired
 //! cross-over so a write on one is a read on the other.
 //!
-//! Per **P6** there is no global state — every test makes its own
-//! independent pair, so the RPC test suite is parallel-safe by
-//! construction.
+//! There is no global state — every test makes its own independent
+//! pair, so the RPC test suite is parallel-safe by construction.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Mutex;
@@ -20,11 +19,10 @@ use crate::rpc::{RpcError, RpcResult};
 
 /// An in-process, in-memory framed transport endpoint.
 ///
-/// **m14 fix (review 2026-05-21)**: `tx: Sender<…>` (no `Mutex`).
-/// `mpsc::Sender` is `Sync + Clone` and `Sender::send` takes `&self`,
-/// so wrapping it in a `Mutex` only serialized unrelated senders
-/// without protecting anything. `Receiver` stays under `Mutex` (it is
-/// `!Sync`).
+/// `tx: Sender<…>` is not wrapped in a `Mutex`: `mpsc::Sender` is
+/// `Sync + Clone` and `Sender::send` takes `&self`, so a `Mutex` would
+/// only serialize unrelated senders without protecting anything.
+/// `Receiver` stays under `Mutex` (it is `!Sync`).
 pub struct MemTransport {
     tx: Sender<Vec<u8>>,
     rx: Mutex<Receiver<Vec<u8>>>,
@@ -142,7 +140,7 @@ mod tests {
         assert!(matches!(a.send_frame(b"x"), Err(RpcError::PeerClosed)));
     }
 
-    /// AC-1.4: bidirectional simultaneous traffic must not deadlock or
+    /// Bidirectional simultaneous traffic must not deadlock or
     /// lose/reorder frames. Two threads cross-fire 10k frames each.
     #[test]
     fn mem_bidirectional_concurrent_no_deadlock() {

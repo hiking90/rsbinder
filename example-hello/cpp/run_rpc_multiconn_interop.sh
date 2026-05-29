@@ -34,7 +34,7 @@
 #     "1 slot pool + DRIVING `(sess, slot)` reentrant pin" model is
 #     functionally equivalent at the wire level.
 #
-# Prereqs (same as run_stage3.sh / run_stage3_register.sh):
+# Prereqs (same as run_rpc_accessor_interop.sh / run_rpc_accessor_register_interop.sh):
 #   * Android_16 AVD booted (`emulator -avd Android_16 -port 5556`).
 #   * NDK r29+ at `$ANDROID_NDK_HOME` (default
 #     `/opt/homebrew/share/android-ndk`).
@@ -42,7 +42,7 @@
 #   * `aarch64-linux-android` rustup target installed.
 #
 # Usage:
-#   ./run_stage3_multiconn.sh [-s emulator-5556]
+#   ./run_rpc_multiconn_interop.sh [-s emulator-5556]
 #
 # Exits 0 on AC-12.6 PASS; non-zero otherwise.
 

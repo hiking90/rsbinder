@@ -218,17 +218,17 @@ pub mod android_14 {
 
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_16;
-/// Subplan 2-14: register-side companion to [`accessor_16`]. Defines
-/// `AccessorSockAddr` + `AccessorAddrProvider` (A0.1), `LocalAccessor`
-/// (A0.3), the `add_accessor_provider` / `create_accessor` /
-/// `remove_accessor_provider` process-local registry (A.4), and the
-/// `resolve_via_process_local` fallback helper (A.5). Same
+/// Register-side companion to [`accessor_16`]. Defines
+/// `AccessorSockAddr` + `AccessorAddrProvider`, `LocalAccessor`,
+/// the `add_accessor_provider` / `create_accessor` /
+/// `remove_accessor_provider` process-local registry, and the
+/// `resolve_via_process_local` fallback helper. Same
 /// `cfg(feature = "rpc")` gate as the consume side.
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_register;
 mod servicemanager_16;
 pub mod android_16 {
-    /// Subplan 2-13 B.6: expose the deterministic error-name decoder
+    /// Expose the deterministic error-name decoder
     /// (and its `__fuzz_*` hook) so the libFuzzer target can drive it
     /// without re-implementing the i32→symbol map.
     #[cfg(feature = "rpc")]
@@ -243,7 +243,7 @@ pub mod android_16 {
     // mirrors the codegen gate in `accessor_16::pub use ...`.
     #[cfg(all(feature = "rpc", feature = "async"))]
     pub use super::accessor_16::IAccessorAsyncService;
-    /// Subplan 2-14 register-side public surface (A0.1–A0.3 + A.4 + A.5).
+    /// Register-side public surface.
     #[cfg(feature = "rpc")]
     pub use super::accessor_register::{
         add_accessor_provider, create_accessor, remove_accessor_provider,

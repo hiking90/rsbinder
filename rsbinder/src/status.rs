@@ -45,8 +45,22 @@ pub enum ExceptionCode {
     /// Parcelable exception
     Parcelable = -9,
 
+    /// Reply parcel carries a noted-AppOps blob before the *real*
+    /// exception code. Wire value `-127` matches
+    /// AOSP `EX_HAS_NOTED_APPOPS_REPLY_HEADER`
+    /// (`frameworks/native/libs/binder/include/binder/Status.h:71`).
+    ///
+    /// Set by a server that received the transaction with
+    /// `TF_COLLECT_NOTED_APP_OPS` (see [`crate::FLAG_COLLECT_NOTED_APP_OPS`]).
+    /// rsbinder's [`Status::deserialize`] transparently skips the header
+    /// and reads the next i32 as the actual exception code — clients
+    /// observe the same `Status` they would have without the header.
+    HasNotedAppOpsReplyHeader = -127,
     // This is special and Java specific; see Parcel.java.
-    /// Has reply header (Java-specific)
+    /// Has reply header (Java-specific). Wire value `-128` matches AOSP
+    /// `EX_HAS_REPLY_HEADER`. Treated as `EX_NONE` after the header is
+    /// skipped — the AOSP convention for "fat response header"
+    /// piggybacking.
     HasReplyHeader = -128,
     // This is special, and indicates to C++ binder proxies that the
     // transaction has failed at a low level.
@@ -69,6 +83,7 @@ impl Display for ExceptionCode {
             ExceptionCode::UnsupportedOperation => write!(f, "UnsupportedOperation"),
             ExceptionCode::ServiceSpecific => write!(f, "ServiceSpecific"),
             ExceptionCode::Parcelable => write!(f, "Parcelable"),
+            ExceptionCode::HasNotedAppOpsReplyHeader => write!(f, "HasNotedAppOpsReplyHeader"),
             ExceptionCode::HasReplyHeader => write!(f, "HasReplyHeader"),
             ExceptionCode::TransactionFailed => write!(f, "TransactionFailed"),
             ExceptionCode::JustError => write!(f, "JustError"),
@@ -110,6 +125,9 @@ impl Deserialize for ExceptionCode {
                 ExceptionCode::ServiceSpecific
             }
             exception if exception == ExceptionCode::Parcelable as i32 => ExceptionCode::Parcelable,
+            exception if exception == ExceptionCode::HasNotedAppOpsReplyHeader as i32 => {
+                ExceptionCode::HasNotedAppOpsReplyHeader
+            }
             exception if exception == ExceptionCode::HasReplyHeader as i32 => {
                 ExceptionCode::HasReplyHeader
             }
@@ -330,6 +348,17 @@ impl Deserialize for Status {
     fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
         let mut exception = parcel.read::<ExceptionCode>()?;
 
+        // AOSP-faithful order — `Status::readFromParcel` in
+        // `frameworks/native/libs/binder/Status.cpp`:
+        //   1. EX_HAS_NOTED_APPOPS_REPLY_HEADER → skip blob, re-read
+        //      the next i32 as the actual exception code (which may
+        //      itself be EX_HAS_REPLY_HEADER).
+        //   2. EX_HAS_REPLY_HEADER → skip blob, treat as EX_NONE
+        //      (libbinder convention for "fat response header").
+        if exception == ExceptionCode::HasNotedAppOpsReplyHeader {
+            read_check_header_size(parcel)?;
+            exception = parcel.read::<ExceptionCode>()?;
+        }
         if exception == ExceptionCode::HasReplyHeader {
             read_check_header_size(parcel)?;
             exception = ExceptionCode::None;
@@ -338,6 +367,20 @@ impl Deserialize for Status {
             exception.into()
         } else {
             let message: String = parcel.read::<String>()?;
+
+            // AOSP `Status::readFromParcel` (frameworks/native/libs/binder/
+            // Status.cpp): capture the header start position and the
+            // available bytes BEFORE reading the size int32. The remote
+            // stack-trace header size is size-INCLUSIVE (it counts the
+            // 4-byte size field itself), so reposition to
+            // `header_start + size` — and ONLY when size != 0. size == 0
+            // (the native writer's "empty remote stack trace header") leaves
+            // the cursor right after the size field. The previous
+            // size-EXCLUSIVE arithmetic (`current_pos_after_read + size`)
+            // landed 4 bytes too far whenever a Java peer propagated a
+            // non-zero stack-trace header.
+            let header_start = parcel.data_position();
+            let header_avail = parcel.data_avail();
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
 
             // Check for negative values first
@@ -351,25 +394,26 @@ impl Deserialize for Status {
             // Safe conversion after negativity check
             let trace_size_usize = remote_stack_trace_header_size as usize;
 
-            // Check against available data
-            if trace_size_usize > parcel.data_avail() {
+            // Check against available data (pre-read avail, which includes
+            // the 4-byte size field, mirroring AOSP's `remote_avail`).
+            if trace_size_usize > header_avail {
                 log::error!(
-                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size}) exceeds available({}).",
-                    parcel.data_avail()
+                    "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size}) exceeds available({header_avail})."
                 );
                 return Err(StatusCode::BadValue);
             }
 
-            // Prevent integer overflow in position calculation
-            let current_pos = parcel.data_position();
-            let new_position = current_pos.checked_add(trace_size_usize).ok_or_else(|| {
-                log::error!(
-                    "0x534e4554:132650049 Position overflow with remote_stack_trace_header_size({remote_stack_trace_header_size})"
-                );
-                StatusCode::BadValue
-            })?;
+            if trace_size_usize != 0 {
+                // Prevent integer overflow in position calculation
+                let new_position = header_start.checked_add(trace_size_usize).ok_or_else(|| {
+                    log::error!(
+                        "0x534e4554:132650049 Position overflow with remote_stack_trace_header_size({remote_stack_trace_header_size})"
+                    );
+                    StatusCode::BadValue
+                })?;
 
-            parcel.set_data_position(new_position);
+                parcel.set_data_position(new_position);
+            }
 
             let code = if exception == ExceptionCode::ServiceSpecific {
                 let code = parcel.read::<i32>()?;
@@ -422,6 +466,34 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // Regression: a non-zero, size-INCLUSIVE remote stack-trace header
+    // (as a Java peer propagating an exception trace emits) must be skipped
+    // by exactly `header_start + size` so the following EX_SERVICE_SPECIFIC
+    // code reads back correctly. The previous size-EXCLUSIVE arithmetic
+    // (`pos_after_size_read + size`) overshot by 4 bytes and desynced the
+    // cursor.
+    #[test]
+    fn deserialize_skips_nonzero_remote_stack_trace_header() {
+        let mut parcel = Parcel::new();
+        parcel
+            .write::<i32>(&(ExceptionCode::ServiceSpecific as i32))
+            .unwrap();
+        parcel.write::<String>(&"boom".to_owned()).unwrap();
+        // Size-inclusive header: 4 (the size field) + 4 (one i32 of opaque
+        // trace payload) = 8.
+        parcel.write::<i32>(&8i32).unwrap();
+        parcel.write::<i32>(&0x5555_5555i32).unwrap(); // trace payload
+        parcel.write::<i32>(&777i32).unwrap(); // service-specific code
+
+        parcel.set_data_position(0);
+        let status = Status::deserialize(&mut parcel).expect("deserialize");
+        assert_eq!(
+            StatusCode::from(status),
+            StatusCode::ServiceSpecific(777),
+            "non-zero size-inclusive stack-trace header must be skipped exactly"
+        );
     }
 
     #[test]
@@ -498,5 +570,151 @@ mod tests {
             0,
             "nothing must be written on the failed path"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // EX_HAS_NOTED_APPOPS_REPLY_HEADER / EX_HAS_REPLY_HEADER
+    // ----------------------------------------------------------------
+
+    /// The bare wire values match AOSP `Status.h:71,74`.
+    /// A driver running on a current Android release embeds these
+    /// codes into reply parcels, so a mismatch would silently corrupt
+    /// every reply that piggybacks a header.
+    #[test]
+    fn appops_header_exception_codes_match_aosp_wire() {
+        assert_eq!(
+            ExceptionCode::HasNotedAppOpsReplyHeader as i32,
+            -127,
+            "EX_HAS_NOTED_APPOPS_REPLY_HEADER must be -127 (AOSP Status.h:71)"
+        );
+        assert_eq!(
+            ExceptionCode::HasReplyHeader as i32,
+            -128,
+            "EX_HAS_REPLY_HEADER must be -128 (AOSP Status.h:74)"
+        );
+    }
+
+    /// Helper — write a fake length-prefixed header blob whose size
+    /// field includes itself (AOSP convention,
+    /// `Status.cpp::skipUnusedHeader`: "the header size includes the
+    /// 4 byte size field"). The Parcel write path enforces 4-byte
+    /// alignment, so each "payload byte" needs an `i32` slot; we round
+    /// the requested byte count up to the nearest 4 before allocating
+    /// the zero-filled slots.
+    fn write_header_blob(parcel: &mut Parcel, header_payload_bytes: usize) {
+        let aligned_payload = header_payload_bytes.div_ceil(4) * 4;
+        let size_field = 4 + aligned_payload;
+        parcel.write::<i32>(&(size_field as i32)).unwrap();
+        for _ in 0..(aligned_payload / 4) {
+            parcel.write::<i32>(&0i32).unwrap();
+        }
+    }
+
+    /// A reply that starts with `EX_HAS_NOTED_APPOPS_REPLY_HEADER`
+    /// (-127), then carries a blob, then the real `EX_NONE` (0), must
+    /// decode as `Status::ok()` — the AppOps header is transparent to
+    /// the user.
+    #[test]
+    fn deserialize_skips_appops_header_then_reads_ex_none() {
+        let mut parcel = Parcel::new();
+        parcel
+            .write::<i32>(&(ExceptionCode::HasNotedAppOpsReplyHeader as i32))
+            .unwrap();
+        write_header_blob(&mut parcel, 16); // 16-byte fake AppOps blob
+        parcel.write::<i32>(&(ExceptionCode::None as i32)).unwrap();
+
+        parcel.set_data_position(0);
+        let status = Status::deserialize(&mut parcel).expect("deserialize");
+        assert_eq!(status.exception_code(), ExceptionCode::None);
+        assert!(status.is_ok());
+    }
+
+    /// A reply that chains AppOps header → reply header
+    /// (`Status.cpp::readFromParcel` allows the AppOps header first)
+    /// must collapse to `EX_NONE` — the AOSP convention for "fat
+    /// response header + no exception".
+    #[test]
+    fn deserialize_skips_appops_then_reply_header_collapses_to_none() {
+        let mut parcel = Parcel::new();
+        parcel
+            .write::<i32>(&(ExceptionCode::HasNotedAppOpsReplyHeader as i32))
+            .unwrap();
+        write_header_blob(&mut parcel, 8);
+        parcel
+            .write::<i32>(&(ExceptionCode::HasReplyHeader as i32))
+            .unwrap();
+        write_header_blob(&mut parcel, 4);
+
+        parcel.set_data_position(0);
+        let status = Status::deserialize(&mut parcel).expect("deserialize");
+        assert_eq!(
+            status.exception_code(),
+            ExceptionCode::None,
+            "EX_HAS_REPLY_HEADER (-128) must collapse to None"
+        );
+    }
+
+    /// AppOps header + real `EX_SECURITY` (-1) must surface
+    /// the security exception to the caller — the header is
+    /// transparent but the underlying error is not.
+    #[test]
+    fn deserialize_skips_appops_header_then_surfaces_real_exception() {
+        let mut parcel = Parcel::new();
+        parcel
+            .write::<i32>(&(ExceptionCode::HasNotedAppOpsReplyHeader as i32))
+            .unwrap();
+        write_header_blob(&mut parcel, 12);
+        // Real exception payload: code + message + trace size.
+        parcel
+            .write::<i32>(&(ExceptionCode::Security as i32))
+            .unwrap();
+        parcel.write::<String>(&"denied".to_owned()).unwrap();
+        parcel.write::<i32>(&0i32).unwrap(); // remote stack trace header size
+
+        parcel.set_data_position(0);
+        let status = Status::deserialize(&mut parcel).expect("deserialize");
+        assert_eq!(status.exception_code(), ExceptionCode::Security);
+    }
+
+    // ----------------------------------------------------------------
+    // TF_UPDATE_TXN / TF_COLLECT_NOTED_APP_OPS flag values
+    // ----------------------------------------------------------------
+
+    /// `FLAG_UPDATE_TXN` must equal AOSP `TF_UPDATE_TXN = 0x40`
+    /// (kernel UAPI `binder.h:346`). The kernel driver only checks the
+    /// bit value, so a mismatch is a silent wire incompatibility.
+    #[test]
+    fn flag_update_txn_matches_kernel_wire() {
+        assert_eq!(
+            crate::FLAG_UPDATE_TXN,
+            0x40,
+            "FLAG_UPDATE_TXN must be the kernel-defined 0x40"
+        );
+    }
+
+    /// `FLAG_COLLECT_NOTED_APP_OPS = 0x80` matches AOSP's
+    /// userspace libbinder convention.
+    #[test]
+    fn flag_collect_noted_app_ops_matches_aosp_userspace() {
+        assert_eq!(
+            crate::FLAG_COLLECT_NOTED_APP_OPS,
+            0x80,
+            "FLAG_COLLECT_NOTED_APP_OPS must be 0x80 (AOSP userspace)"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // binder_extended_error struct layout
+    // ----------------------------------------------------------------
+
+    /// rsbinder's `ExtendedError` mirror must match the
+    /// 12-byte kernel struct exactly — id (4) + command (4) + param (4).
+    /// Any field reorder would corrupt the ioctl read.
+    #[test]
+    fn extended_error_struct_layout_matches_kernel() {
+        use std::mem::{align_of, size_of};
+        type Ee = crate::sys::binder_extended_error;
+        assert_eq!(size_of::<Ee>(), 12);
+        assert_eq!(align_of::<Ee>(), 4);
     }
 }

@@ -17,13 +17,13 @@ struct Service {
     has_clients: bool,
     guarantee_client: bool,
     context: rsbinder::thread_state::CallingContext,
-    /// Plan 2-14 B.6: descriptor-based accessor marking. Set at
-    /// `addService` time by checking whether `binder.descriptor()`
-    /// equals `"android.os.IAccessor"`. AOSP's servicemanager
-    /// distinguishes accessors via VINTF `<accessor>` entries; without
-    /// VINTF, descriptor inspection is the closest semantic equivalent
-    /// (the binder itself self-identifies as `IAccessor`). When `true`,
-    /// `getService2`/`checkService2` (B.7) wraps the binder in
+    /// Descriptor-based accessor marking. Set at `addService` time by
+    /// checking whether `binder.descriptor()` equals
+    /// `"android.os.IAccessor"`. AOSP's servicemanager distinguishes
+    /// accessors via VINTF `<accessor>` entries; without VINTF,
+    /// descriptor inspection is the closest semantic equivalent (the
+    /// binder itself self-identifies as `IAccessor`). When `true`,
+    /// `getService2`/`checkService2` wraps the binder in
     /// `Service::Accessor(Some(binder))` instead of
     /// `Service::ServiceWithMetadata`, so the consume-side accessor
     /// arm in `rsbinder::hub::servicemanager_16` picks it up.
@@ -143,12 +143,10 @@ impl Inner {
         is_called_on_interval: bool,
     ) -> Result<bool> {
         let service = if let Some(service) = self.name_to_service.get(service_name) {
-            // Clippy recommands to use 'is_none_or' here, but 'is_none_or' is not supported by 1.77.
-            #[allow(clippy::unnecessary_map_or)]
             if self
                 .name_to_client_callbacks
                 .get(service_name)
-                .map_or(true, |callbacks| callbacks.is_empty())
+                .is_none_or(|callbacks| callbacks.is_empty())
             {
                 return Ok(true);
             }
@@ -230,8 +228,8 @@ impl Inner {
 
     /// Look up a registered service by name. Returns `Some((binder,
     /// is_accessor))` if registered — the `is_accessor` flag is the
-    /// one stamped at `addService` time (plan 2-14 B.6), used by
-    /// `getService2`/`checkService2` (B.7) to choose between
+    /// one stamped at `addService` time, used by
+    /// `getService2`/`checkService2` to choose between
     /// `Service::Accessor(Some(_))` and `Service::ServiceWithMetadata`.
     /// Callers that only need the binder can `.map(|(b, _)| b)`.
     fn try_get_binder(
@@ -287,6 +285,19 @@ impl Inner {
 
         found
     }
+
+    fn remove_client_callback(&mut self, who: &rsbinder::WIBinder) {
+        // Mirror AOSP `ServiceManager::binderDied`'s third loop
+        // (`removeClientCallback` over `mNameToClientCallback`): drop every
+        // client callback whose binder matches the dead `who`, and remove
+        // any now-empty entries. Without this the dead `IClientCallback`
+        // `Strong` is leaked for the lifetime of rsb_hub and
+        // `onClients` keeps firing on a dead proxy on every state change.
+        self.name_to_client_callbacks.retain(|_, callbacks| {
+            callbacks.retain(|callback| SIBinder::downgrade(&callback.as_binder()) != *who);
+            !callbacks.is_empty()
+        });
+    }
 }
 
 struct ServiceManager {
@@ -320,6 +331,7 @@ impl ServiceManager {
                         .retain(|_, service| !(SIBinder::downgrade(&service.binder) == who));
 
                     inner.remove_registration_callback(None, &who);
+                    inner.remove_client_callback(&who);
                 }
             });
         if let Err(e) = spawn_result {
@@ -422,7 +434,7 @@ impl ServiceManager {
 
 impl Interface for ServiceManager {}
 
-/// Plan 2-14 B.7: convert a `Inner::try_get_binder` lookup result
+/// Convert a `Inner::try_get_binder` lookup result
 /// into the `Service` union arm shape returned by
 /// `getService2`/`checkService2`. Routes `is_accessor=true`
 /// registrations to `Service::Accessor(Some(_))` and regular services
@@ -495,18 +507,10 @@ impl IServiceManager for ServiceManager {
             }
         }
 
-        // Plan 2-14 B.6: detect `IAccessor` binders by their interface
-        // descriptor at registration. The string matches the AOSP-stable
-        // `android.os.IAccessor` AIDL declaration (also used by the
-        // generated `BpAccessor`/`BnAccessor` stubs in
-        // `hub::accessor_16`). `SIBinder::descriptor()` is a cheap
-        // accessor — for native binders it is a compile-time constant,
-        // for proxies it is the cached result of the
-        // `INTERFACE_TRANSACTION` issued at proxy construction (see
-        // `query_local_interface` in `rsbinder::thread_state`).
-        // Hardcoding the string (instead of pulling the `IAccessor`
-        // symbol) keeps rsb_hub buildable without the `rpc` feature; the
-        // contract is byte-stable AOSP AIDL.
+        // Detect `IAccessor` binders by interface descriptor at registration.
+        // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
+        // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
+        // `rpc` feature.
         let is_accessor = service.descriptor() == "android.os.IAccessor";
 
         // `allowIsolated` is accepted by AIDL for AOSP source
@@ -828,9 +832,9 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
-        // Routing logic (Plan 2-14 B.7) lives in
-        // `classify_for_service_union` so `checkService2` stays
-        // byte-identical without re-stating the match arms.
+        // Routing logic lives in `classify_for_service_union` so
+        // `checkService2` stays byte-identical without re-stating the
+        // match arms.
         let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
         Ok(classify_for_service_union(lookup))
     }
@@ -839,8 +843,8 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
-        // See `getService2` — both surface the same Plan 2-14 B.7
-        // routing through `classify_for_service_union`.
+        // See `getService2` — both route through
+        // `classify_for_service_union`.
         let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
         Ok(classify_for_service_union(lookup))
     }

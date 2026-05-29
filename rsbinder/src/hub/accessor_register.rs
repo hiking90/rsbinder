@@ -11,6 +11,9 @@
 //! ([`accessor_16`](super::accessor_16)) then performs the v2/v1
 //! handshake against that fd.
 //!
+//! Interop against a real libbinder on an android-16 emulator is the
+//! non-negotiable validation for this path.
+//!
 //! Cross-platform: the [`Unix`](AccessorSockAddr::Unix) variant is
 //! always present so macOS host hermetic tests can exercise the
 //! register-side path without `rpc-vsock` / `rpc-tcp-debug` features.
@@ -21,14 +24,6 @@
 //! so an instance configured for a backend the binary wasn't built with
 //! surfaces as the same AOSP-faithful service-specific error a
 //! wrong-family `addConnection` returns.
-//!
-//! ## Implementation history
-//!
-//! Originally landed under plan 2-14 (phases A0.1 / A0.2 / A0.3 / A.4 /
-//! A.5) with the D.9 STAGE3 real-libbinder gate as the non-negotiable
-//! validation against android-16 emulator. Plan references are
-//! preserved in commit messages and the long-form plan doc; user-facing
-//! docstrings here describe the AOSP analogue, not the plan tag.
 
 // cfg lives on the mod decl in super — duplicating here trips
 // clippy::duplicated_attributes.
@@ -49,7 +44,7 @@ use crate::error::Result;
 /// All three variants exist regardless of build features so the enum's
 /// shape stays stable across feature flags (matching exhaustively in
 /// downstream `match` is therefore predictable). The
-/// `connect_*_owned_fd` helpers (A0.2) gate the *connect path* on the
+/// `connect_*_owned_fd` helpers gate the *connect path* on the
 /// matching `rpc-vsock`/`rpc-tcp-debug` feature and return
 /// `ERROR_UNSUPPORTED_SOCKET_FAMILY` otherwise.
 ///
@@ -85,7 +80,7 @@ impl AccessorSockAddr {
         }
     }
 
-    /// Subplan 2-14 A0.2: open a *server-process* client connection to
+    /// Open a *server-process* client connection to
     /// the address this `AccessorSockAddr` describes and return the
     /// raw `OwnedFd`. This is what AOSP `singleSocketConnection` does
     /// inside `LocalAccessor::addConnection` — a plain `connect(2)`
@@ -93,7 +88,7 @@ impl AccessorSockAddr {
     /// fd is then transferred to the remote `BpAccessor` client via
     /// `ParcelFileDescriptor` (kernel-level fd duplication).
     ///
-    /// Errors map onto the AOSP `IAccessor::ERROR_*` codes; the A0.3
+    /// Errors map onto the AOSP `IAccessor::ERROR_*` codes; the
     /// `LocalAccessor::addConnection` impl translates these into
     /// `Status::from_service_specific_error(ERROR_*)`. The mapping is:
     ///
@@ -120,7 +115,7 @@ impl AccessorSockAddr {
 }
 
 /// AOSP `IAccessor::ERROR_*`-aligned classification of a failure
-/// returned by [`AccessorSockAddr::connect_owned_fd`]. The A0.3
+/// returned by [`AccessorSockAddr::connect_owned_fd`]. The
 /// `LocalAccessor::addConnection` impl converts each variant into the
 /// corresponding AIDL `Status::from_service_specific_error(...)`.
 ///
@@ -173,7 +168,7 @@ impl std::error::Error for AccessorConnectError {}
 /// stream's `OwnedFd` is the *client-side endpoint of a connected
 /// socket pair* whose server-side endpoint is whoever accepted on
 /// `path` (typically the same process's `RpcServer::setup_unix_server`
-/// listener — see plan 2-14 §3 A0(ii)).
+/// listener).
 fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, AccessorConnectError> {
     use std::os::unix::net::UnixStream;
     match UnixStream::connect(path) {
@@ -250,7 +245,7 @@ fn connect_inet_owned_fd(
 #[cfg(feature = "rpc-vsock")]
 use std::os::fd::FromRawFd;
 
-// --- Subplan 2-14 A0.3: `LocalAccessor` (`BnAccessor` impl) -------
+// --- `LocalAccessor` (`BnAccessor` impl) -------
 
 use super::accessor_16::{
     BnAccessor, IAccessor, ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
@@ -261,7 +256,7 @@ use crate::binder::{Interface, Strong};
 use crate::file_descriptor::ParcelFileDescriptor;
 use crate::status::Status;
 
-/// Subplan 2-14 A0.3: the AOSP `LocalAccessor` analog — a server-side
+/// The AOSP `LocalAccessor` analog — a server-side
 /// `BnAccessor` whose `addConnection()` calls a user-supplied
 /// [`AccessorAddrProvider`] for an [`AccessorSockAddr`], opens a
 /// `connect(2)` to it inside *this* process, and ships the resulting
@@ -276,8 +271,8 @@ use crate::status::Status;
 /// AOSP parity:
 ///
 ///  * `singleSocketConnection` ⇒
-///    [`AccessorSockAddr::connect_owned_fd`] (A0.2)
-///  * `RpcSocketAddressProvider` ⇒ [`AccessorAddrProvider`] (A0.1)
+///    [`AccessorSockAddr::connect_owned_fd`]
+///  * `RpcSocketAddressProvider` ⇒ [`AccessorAddrProvider`]
 ///  * `Status::fromServiceSpecificError(ERROR_*, msg)` ⇒
 ///    `Status::new_service_specific_error_str` with the matching
 ///    `IAccessor::ERROR_*` constant
@@ -285,8 +280,8 @@ use crate::status::Status;
 /// Use via [`Self::new_binder`] (the `BnAccessor::new_binder` AIDL
 /// stub) — the returned `SIBinder` is what
 /// [`create_accessor`](crate::hub::android_16::create_accessor) wraps
-/// for registration (A.4) and what `kernel addService(name, _)`
-/// publishes to the system service manager (D.9 STAGE3 launcher).
+/// for registration and what `kernel addService(name, _)`
+/// publishes to the system service manager.
 pub struct LocalAccessor {
     instance: String,
     addr_provider: AccessorAddrProvider,
@@ -301,7 +296,7 @@ impl LocalAccessor {
     /// Returned wrapped as a `Strong<dyn IAccessor>` so callers can
     /// trivially `as_binder()` for `addService` or stash on a server's
     /// service directory. The `Strong<dyn IAccessor>` is also what a
-    /// future [`add_accessor_provider`] (A.4) returns from its
+    /// future [`add_accessor_provider`] returns from its
     /// closure.
     pub fn new_binder(
         instance: impl Into<String>,
@@ -382,8 +377,8 @@ fn accessor_error_code_for(err: &AccessorConnectError) -> (i32, &'static str) {
     }
 }
 
-/// Closure type returned by [`add_accessor_provider`] (A.4) and called
-/// by [`LocalAccessor::addConnection`] (A0.3) to resolve an instance
+/// Closure type returned by [`add_accessor_provider`] and called
+/// by [`LocalAccessor::addConnection`] to resolve an instance
 /// name to the socket address it should connect to. Mirrors AOSP
 /// `RpcSocketAddressProvider`'s `(name, sockaddr*, size_t) -> status_t`
 /// signature but returns the strongly-typed [`AccessorSockAddr`]
@@ -401,7 +396,7 @@ fn accessor_error_code_for(err: &AccessorConnectError) -> (i32, &'static str) {
 /// [`LocalAccessor::addConnection`]: super::accessor_register::LocalAccessor
 pub type AccessorAddrProvider = Box<dyn Fn(&str) -> Result<AccessorSockAddr> + Send + Sync>;
 
-// --- Subplan 2-14 A.4: process-local AccessorProvider registry ----
+// --- process-local AccessorProvider registry ----
 //
 // AOSP `gAccessorProviders` (`IServiceManager.cpp:200-201`) is a
 // process-local list of `AccessorProvider{ instances, providerCallback }`.
@@ -410,8 +405,7 @@ pub type AccessorAddrProvider = Box<dyn Fn(&str) -> Result<AccessorSockAddr> + S
 // matching shared_ptr. The cross-process pickup is via
 // `getInjectedAccessor` — `BackendUnifiedServiceManager::getService2`
 // calls it as a *fallback* when servicemanager returns no binder for
-// `name`. Phase A.5 wires that fallback; this commit lands the
-// registry primitive itself.
+// `name`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, Weak};
@@ -423,7 +417,7 @@ use std::sync::{Arc, OnceLock, Weak};
 ///
 /// `Send + Sync` so the registry can be walked under a mutex by any
 /// thread issuing a `hub::get_service` lookup; the closure should be
-/// idempotent across threads (Phase A.5 dispatches without re-locking
+/// idempotent across threads (lookup dispatches without re-locking
 /// the registry — see `IServiceManager.cpp:286-291` snapshot pattern).
 pub type AccessorProviderFn = Box<dyn Fn(&str) -> Option<crate::binder::SIBinder> + Send + Sync>;
 
@@ -444,8 +438,8 @@ struct AccessorProviderEntry {
 ///
 /// Initialized lazily via `OnceLock` so the `rpc`-OFF /
 /// non-android-16 build never allocates the mutex. The
-/// `Mutex<Vec<_>>` shape is the AOSP-faithful one — readers (Phase
-/// A.5 lookup) snapshot the entries inside the lock, then release
+/// `Mutex<Vec<_>>` shape is the AOSP-faithful one — readers (lookup)
+/// snapshot the entries inside the lock, then release
 /// before calling the provider closure (no callback under the lock
 /// — see `IServiceManager.cpp:286-291`).
 static REGISTRY: OnceLock<std::sync::Mutex<Vec<AccessorProviderEntry>>> = OnceLock::new();
@@ -460,7 +454,7 @@ fn is_instance_provided_locked(entries: &[AccessorProviderEntry], instance: &str
     entries.iter().any(|e| e.instances.contains(instance))
 }
 
-/// Subplan 2-14 A.4: register a process-local accessor provider for
+/// Register a process-local accessor provider for
 /// `instances`. AOSP `addAccessorProvider`
 /// (`IServiceManager.cpp:368-389`). Returns a
 /// [`AccessorProviderHandle`] whose `Drop` un-registers the provider
@@ -479,8 +473,7 @@ fn is_instance_provided_locked(entries: &[AccessorProviderEntry], instance: &str
 /// `Err(StatusCode::BadValue)` (AOSP `ALOGE`+empty-weak).
 ///
 /// The provider closure must be `Send + Sync` — it is invoked from
-/// whatever thread services a `hub::get_service` fallback (Phase
-/// A.5).
+/// whatever thread services a `hub::get_service` fallback.
 pub fn add_accessor_provider(
     instances: HashSet<String>,
     provider: AccessorProviderFn,
@@ -507,7 +500,7 @@ pub fn add_accessor_provider(
     Ok(handle)
 }
 
-/// Subplan 2-14 A.4: explicit removal of a provider previously
+/// Explicit removal of a provider previously
 /// registered via [`add_accessor_provider`]. AOSP
 /// `removeAccessorProvider` (`IServiceManager.cpp:391-411`). Returns
 /// `Err(StatusCode::BadValue)` if the handle is already dead (the
@@ -537,7 +530,7 @@ pub fn remove_accessor_provider(
     Ok(())
 }
 
-/// Subplan 2-14 A.4: RAII handle returned by
+/// RAII handle returned by
 /// [`add_accessor_provider`]. Dropping the handle un-registers the
 /// provider; ignore the handle (`_handle`) only if you want the
 /// provider to live for the whole process lifetime.
@@ -590,7 +583,7 @@ impl Drop for AccessorProviderHandle {
     }
 }
 
-/// Subplan 2-14 A.4: lookup a provider by instance name. AOSP
+/// Lookup a provider by instance name. AOSP
 /// `getInjectedAccessor` (`IServiceManager.cpp:284-312`) — snapshot
 /// the registry under the lock, then walk the snapshot *outside* the
 /// lock calling each provider's closure until one returns
@@ -599,8 +592,8 @@ impl Drop for AccessorProviderHandle {
 /// `Service::Accessor(None)` / `ServiceWithMetadata(None)` they were
 /// trying to backfill).
 ///
-/// Consumed by [`resolve_via_process_local`] (the A.5 fallback the
-/// public `hub::get_service` arm uses) and by the hermetic A.5 tests.
+/// Consumed by [`resolve_via_process_local`] (the fallback the public
+/// `hub::get_service` arm uses) and by the hermetic tests.
 /// `pub(crate)` keeps all callers inside the crate.
 pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBinder> {
     // Snapshot of `Arc<AccessorProviderFn>` for entries that include
@@ -627,9 +620,9 @@ pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBi
     None
 }
 
-/// Subplan 2-14 A.5: process-local "consume" — look up a registered
-/// `IAccessor` provider for `name` (via the A.4 registry) and bridge
-/// it to an `RpcSession` root using 2-13's
+/// Process-local "consume" — look up a registered
+/// `IAccessor` provider for `name` (via the registry) and bridge
+/// it to an `RpcSession` root using
 /// [`super::accessor_16::resolve_accessor`]. Returns `None` if no
 /// provider claims `name`, or if the bridge fails
 /// (instance-name mismatch / addConnection failure / handshake / no
@@ -648,7 +641,7 @@ pub fn resolve_via_process_local(
     super::accessor_16::resolve_accessor(name, accessor)
 }
 
-/// Subplan 2-14 A.4: AOSP `createAccessor`
+/// AOSP `createAccessor`
 /// (`IServiceManager.cpp:439-450`). Wrap an [`AccessorAddrProvider`]
 /// in a [`LocalAccessor`] `BnAccessor`, return the binder.
 /// Convenience over [`LocalAccessor::new_binder`] for the "I just
@@ -670,7 +663,7 @@ mod tests {
 
     /// Family-string dispatch is order-independent across variants and
     /// stable across feature flags (`Vsock`/`Inet` variants exist
-    /// unconditionally — A0.1 design note in the module doc).
+    /// unconditionally — see the module doc).
     #[test]
     fn family_str_covers_all_variants() {
         let unix = AccessorSockAddr::Unix(PathBuf::from("/tmp/rsbinder-test-2-14.sock"));
@@ -726,7 +719,7 @@ mod tests {
         (l, p)
     }
 
-    /// A0.2 unix path — `connect_owned_fd` returns a real, connected
+    /// Unix path — `connect_owned_fd` returns a real, connected
     /// `OwnedFd` whose other endpoint is the listener's `accept`. The
     /// fd is byte-functional (echo round-trip) — proves the fd isn't
     /// dropped/closed somewhere in the wrapping.
@@ -758,7 +751,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A0.2 unix path — connect to a non-existent path surfaces as
+    /// Unix path — connect to a non-existent path surfaces as
     /// `ConnectFailed` (not `UnsupportedFamily` or panic). The exact
     /// `io::ErrorKind` is host-OS dependent (Linux = `ConnectionRefused`,
     /// macOS = `NotFound`), so we only assert the variant.
@@ -773,13 +766,13 @@ mod tests {
         );
     }
 
-    /// A0.2 vsock / inet `UnsupportedFamily` when the feature is off
+    /// Vsock / inet `UnsupportedFamily` when the feature is off
     /// (= rsbinder default build on macOS). This is the AOSP-faithful
     /// `ERROR_UNSUPPORTED_SOCKET_FAMILY` path. When the feature **is**
     /// built in, the connect attempt would surface as `ConnectFailed`
     /// (no listener on `cid:port` / `127.0.0.1:0`) — that arm is left
-    /// for the integration test in `tests/rpc_accessor_register.rs`
-    /// (D.8.a), since exercising it requires a live listener and the
+    /// for the integration test in `tests/rpc_accessor_register.rs`,
+    /// since exercising it requires a live listener and the
     /// vsock crate's connect behaviour differs on macOS.
     #[cfg(not(feature = "rpc-vsock"))]
     #[test]
@@ -838,11 +831,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // --- A0.3 LocalAccessor tests (in-process Bn/Bp round-trip) -----
+    // --- LocalAccessor tests (in-process Bn/Bp round-trip) -----
 
     use crate::FromIBinder;
 
-    /// A0.3 happy path: `LocalAccessor::new_binder(...)` ⇒ Bn-side
+    /// Happy path: `LocalAccessor::new_binder(...)` ⇒ Bn-side
     /// SIBinder ⇒ in-process `BpAccessor::from_binder` (via the
     /// generated `IAccessor::FromIBinder` hook) ⇒
     /// `getInstanceName()` returns the stored name + `addConnection()`
@@ -892,7 +885,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A0.3 provider error path: provider returns `Err` ⇒
+    /// Provider error path: provider returns `Err` ⇒
     /// `addConnection()` ⇒ `Status::ServiceSpecific(ERROR_CONNECTION_INFO_NOT_FOUND)`.
     /// `getInstanceName()` keeps working — the error is *per-call*,
     /// not per-instance.
@@ -918,7 +911,7 @@ mod tests {
         );
     }
 
-    /// A0.3 connect-failure path: provider returns a valid
+    /// Connect-failure path: provider returns a valid
     /// `AccessorSockAddr::Unix` whose path has no listener ⇒
     /// `addConnection()` ⇒
     /// `Status::ServiceSpecific(ERROR_FAILED_TO_CONNECT_TO_SOCKET)`.
@@ -944,7 +937,7 @@ mod tests {
         );
     }
 
-    /// A0.3 unsupported-family path (feature-disabled vsock on
+    /// Unsupported-family path (feature-disabled vsock on
     /// macOS-default build): provider returns `Vsock { .. }` ⇒
     /// `addConnection()` ⇒
     /// `Status::ServiceSpecific(ERROR_UNSUPPORTED_SOCKET_FAMILY)`.
@@ -969,7 +962,7 @@ mod tests {
         );
     }
 
-    // --- A.4 process-local registry tests --------------------------
+    // --- process-local registry tests --------------------------
     //
     // `REGISTRY` is a process-wide `OnceLock<Mutex<Vec<_>>>`; under
     // `cargo test` multiple test threads share it. We give every test
@@ -1196,7 +1189,7 @@ mod tests {
         );
     }
 
-    /// Concurrent register + lookup — P6 safety witness. Multiple
+    /// Concurrent register + lookup — thread-safety witness. Multiple
     /// threads register disjoint instances and look up each other's
     /// instances; no panic, no deadlock, and every lookup either
     /// finds the registered provider or returns `None` (never a stale

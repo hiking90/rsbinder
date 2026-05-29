@@ -1,21 +1,20 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-2 end-to-end: a hand-written AIDL-style interface driven
+//! RPC end-to-end: a hand-written AIDL-style interface driven
 //! over the RPC stack with the **server stub reused unmodified** (the
 //! generated free `on_transact` shape, dispatched via
-//! `IBinder::rpc_transact` — never `Inner::transact`/`check_interface`,
-//! AC-2.7/2.12) and a **hand-written `RpcProxy` client** (D1; the
-//! single-stub generator change is subplan 2-6).
+//! `IBinder::rpc_transact` — never `Inner::transact`/`check_interface`)
+//! and a **hand-written `RpcProxy` client**.
 //!
 //! Separate test binary (not a `src/` unit test) so it never shares a
-//! process with the kernel-binder unit tests (master §6). P6: every
+//! process with the kernel-binder unit tests. Every
 //! test builds its own session pair → parallel-safe, no `--test-threads=1`.
 //!
-//! Covers AC-2.4 (scalar/string/binder-arg e2e over `mem` *and*
-//! `unix`), AC-2.5 (DEC_STRONG releases the server node — no leak),
-//! AC-2.6 (binder-in-parcel: reply binder → `RpcProxy` → re-call;
-//! object-returning-home identity), AC-2.11 (FD reject).
+//! Covers scalar/string/binder-arg e2e over `mem` *and*
+//! `unix`, DEC_STRONG releasing the server node (no leak),
+//! binder-in-parcel (reply binder → `RpcProxy` → re-call;
+//! object-returning-home identity), and FD reject.
 
 #![cfg(feature = "rpc")]
 
@@ -275,7 +274,7 @@ fn make_root() -> SIBinder {
 }
 
 /// Run the full scenario over a connected transport pair. Returns the
-/// server session so the caller can assert AC-2.5 node accounting.
+/// server session so the caller can assert node accounting.
 fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(make_root());
@@ -288,13 +287,13 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
         let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
         let root = SmokeProxy(client.get_root().expect("get_root"));
 
-        // AC-2.4: scalar + string round-trip, exact values.
+        // Scalar + string round-trip, exact values.
         assert_eq!(root.echo("hello rpc").unwrap(), "hello rpc");
         assert_eq!(root.echo("").unwrap(), "");
         assert_eq!(root.add(2, 3).unwrap(), 5);
         assert_eq!(root.add(-7, 7).unwrap(), 0);
 
-        // AC-2.6: reply contains a binder → client builds an RpcProxy
+        // Reply contains a binder → client builds an RpcProxy
         // → re-calls it.
         let child_sib = root.get_child().unwrap();
         assert!(
@@ -304,11 +303,11 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
         let child = ChildProxy(child_sib);
         assert_eq!(child.name().unwrap(), "child-1");
 
-        // AC-2.6: binder *argument* — the proxy travels back to the
+        // Binder *argument* — the proxy travels back to the
         // server which recognises it as its own local object.
         assert_eq!(root.pass_binder(&child.0).unwrap(), ICHILD_DESC);
 
-        // AC-2.5: dropping the child proxy sends DEC_STRONG; the next
+        // Dropping the child proxy sends DEC_STRONG; the next
         // ordered round-trip guarantees the server has processed it,
         // so the child node is released (no leak).
         assert_eq!(server.local_node_count(), 2, "root + child registered");
@@ -336,13 +335,12 @@ fn rpc_e2e_over_unix_socketpair() {
     run_scenario(Box::new(a), Box::new(b));
 }
 
-/// Subplan 2-6 (D1): an RPC binder obtained from the stack is
+/// An RPC binder obtained from the stack is
 /// reachable through the **generalized** `dyn IBinder::as_remote()`
 /// as a `&dyn RemoteProxy`, and a full AIDL call driven via the
-/// trait's `prepare_transact`/`submit_transact` (the exact shape the
-/// generator will emit after 2-6.B) works over RPC — the same trait
-/// `ProxyHandle` implements for the kernel path. Proves the single
-/// abstraction without any generator change.
+/// trait's `prepare_transact`/`submit_transact` works over RPC — the
+/// same trait `ProxyHandle` implements for the kernel path. Proves the
+/// single abstraction without any generator change.
 #[test]
 fn rpc_call_via_generalized_remote_proxy_trait() {
     use rsbinder::RemoteProxy;
@@ -365,11 +363,10 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
 
     // The trait's `prepare_transact` is callable on the RPC proxy
     // (it allocates an RPC-mode parcel). Descriptor *stamping* of an
-    // RpcProxy from `get_root` is 2-6.B's typed-stub constructor
-    // change, so for this pre-2-6.B check the real call is issued with
-    // an explicitly-built request parcel and dispatched **through the
-    // generalized `&dyn RemoteProxy::submit_transact`** (exactly what
-    // the generator will emit after 2-6.B).
+    // RpcProxy from `get_root` is the typed-stub constructor's job, so
+    // here the real call is issued with an explicitly-built request
+    // parcel and dispatched **through the generalized
+    // `&dyn RemoteProxy::submit_transact`**.
     let _ = remote
         .prepare_transact(true)
         .expect("prepare_transact callable");
@@ -387,7 +384,7 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
     h.join().unwrap();
 }
 
-/// AC-2.11 / T2.11: an FD written into an RPC-mode parcel is a hard
+/// An FD written into an RPC-mode parcel is a hard
 /// `BadType` reject (android-12 r34 fidelity), never a silent
 /// corruption or partial write.
 #[test]

@@ -82,9 +82,8 @@ impl Eq for ParcelFileDescriptor {}
 
 impl Serialize for ParcelFileDescriptor {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        // RPC-mode FD policy (subplan 2-2 / 2-7). `None` (default,
-        // android-12 fidelity / android-13 default) is the hard
-        // `BAD_TYPE` reject — **bit-identical to 2-2** (AC-7.1). `Unix`
+        // RPC-mode FD policy. `None` (default, android-12 fidelity /
+        // android-13 default) is the hard `BAD_TYPE` reject. `Unix`
         // (both peers opted in + UDS) stashes a dup'd fd for
         // out-of-band `SCM_RIGHTS` transfer and writes only an
         // ancillary-table index in the body (android-13+ shape).
@@ -98,7 +97,7 @@ impl Serialize for ParcelFileDescriptor {
                     let idx = parcel.rpc_push_out_fd(dup);
                     if parcel.rpc_record_fd_positions() {
                         // android-13+ **v1+**: the AOSP-faithful
-                        // FD-over-RPC Parcel body (subplan 2-11 Phase A).
+                        // FD-over-RPC Parcel body.
                         // AOSP `AParcel_writeParcelFileDescriptor(fd>=0)`
                         // = `writeInt32(1)` not-null →
                         // `writeDupParcelFileDescriptor` →
@@ -111,9 +110,8 @@ impl Serialize for ParcelFileDescriptor {
                         // Pinned byte-exact android-14.0.0_r75…
                         // android-16.0.0_r4 (v1≡v2 for the body; v2 only
                         // merges binder positions into the same sorted
-                        // table — subplan 2-8 Phase B). The recorded
-                        // position is the **TYPE int32 offset**, not the
-                        // not-null marker.
+                        // table). The recorded position is the **TYPE
+                        // int32 offset**, not the not-null marker.
                         parcel.write::<i32>(&1)?; // not-null marker
                         parcel.write::<i32>(&0)?; // hasComm = 0 (no comm fd)
                         let obj_pos = parcel.data_position();
@@ -124,12 +122,11 @@ impl Serialize for ParcelFileDescriptor {
                         parcel.rpc_record_object_position(obj_pos);
                     } else {
                         // R34 / v0 (non-versioned): rsbinder's internal
-                        // `[present|idx]` shape (subplan 2-7). AOSP
-                        // **category-forbids** fd-over-RPC at android-12
-                        // r34 and android-13 (v0), so this is a
-                        // rsbinder-only symmetric extension — kept
-                        // **byte-unchanged** (AC-11.1 / `rpc_fd` 3/0).
-                        // No object table on R34/v0, so no position.
+                        // `[present|idx]` shape. AOSP **category-forbids**
+                        // fd-over-RPC at android-12 r34 and android-13
+                        // (v0), so this is a rsbinder-only symmetric
+                        // extension — kept **byte-unchanged**. No object
+                        // table on R34/v0, so no position.
                         parcel.write::<i32>(&1)?; // present
                         parcel.write::<i32>(&idx)?; // ancillary fd-table index
                     }
@@ -168,15 +165,15 @@ impl SerializeOption for ParcelFileDescriptor {
 
 impl DeserializeOption for ParcelFileDescriptor {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        // RPC-mode FD read (subplan 2-7 / 2-11). The leading `i32` is
-        // the not-null marker (`0` ⇒ `None`; AOSP null fd =
-        // `writeInt32(0)`, 4 B — profile-independent, unchanged).
-        // `None` fd-mode: an fd in an incoming RPC parcel is impossible
-        // (the sender was rejected) → BadType. `Unix`: body shape is
-        // profile-keyed (must mirror `serialize`):
-        //  * v1+ (AOSP-faithful, subplan 2-11): `[not-null|hasComm|
+        // RPC-mode FD read. The leading `i32` is the not-null marker
+        // (`0` ⇒ `None`; AOSP null fd = `writeInt32(0)`, 4 B —
+        // profile-independent, unchanged). `None` fd-mode: an fd in an
+        // incoming RPC parcel is impossible (the sender was rejected) →
+        // BadType. `Unix`: body shape is profile-keyed (must mirror
+        // `serialize`):
+        //  * v1+ (AOSP-faithful): `[not-null|hasComm|
         //    TYPE_NATIVE_FILE_DESCRIPTOR|fdIndex]` + the **strict
-        //    object-position read** (Phase B);
+        //    object-position read**;
         //  * R34/v0: rsbinder's legacy `[present|idx]` (byte-unchanged).
         // The real fd arrived out-of-band via `SCM_RIGHTS`.
         #[cfg(feature = "rpc")]
@@ -192,15 +189,15 @@ impl DeserializeOption for ParcelFileDescriptor {
                     // v1+ AOSP body. `present` was the not-null marker;
                     // next is `hasComm`. rsbinder has no comm channel,
                     // so `hasComm != 0` is `BadValue` — a documented
-                    // divergence (AC-11.5): AOSP `readParcelFile
-                    // Descriptor` would read a second (comm) fd. Real
-                    // libbinder via `AParcel_writeParcelFileDescriptor`
-                    // always writes `hasComm == 0`.
+                    // divergence: AOSP `readParcelFileDescriptor` would
+                    // read a second (comm) fd. Real libbinder via
+                    // `AParcel_writeParcelFileDescriptor` always writes
+                    // `hasComm == 0`.
                     let has_comm = parcel.read::<i32>()?;
                     if has_comm != 0 {
                         return Err(StatusCode::BadValue);
                     }
-                    // Phase B — v1+ strict receive (AOSP
+                    // v1+ strict receive (AOSP
                     // `Parcel::readFileDescriptor`: a `binary_search`
                     // miss in `mObjectPositions` ⇒ **`BAD_TYPE`**). This
                     // is v1 **and** v2 for fd (verified
@@ -251,6 +248,18 @@ impl DeserializeOption for ParcelFileDescriptor {
 
         let obj = parcel.read_object(true)?;
 
+        // AOSP `Parcel::readFileDescriptor` returns BAD_TYPE unless
+        // `hdr.type == BINDER_TYPE_FD`. `read_object` only verifies the
+        // object's offset-table membership, not its type, so a peer could
+        // place a (kernel-translated) BINDER_TYPE_HANDLE object where an
+        // FD is expected; reinterpreting its handle as an fd via
+        // `borrowed_fd()` (valid only on a BINDER_TYPE_FD object) would be
+        // a type-confusion that dups an arbitrary already-open fd. Guard
+        // the type before dup'ing.
+        if obj.header_type() != crate::sys::BINDER_TYPE_FD {
+            return Err(StatusCode::BadType);
+        }
+
         let fd = rustix::io::fcntl_dupfd_cloexec(obj.borrowed_fd(), 0)?;
 
         Ok(Some(ParcelFileDescriptor::new(fd)))
@@ -267,11 +276,11 @@ impl Deserialize for ParcelFileDescriptor {
 
 impl DeserializeArray for ParcelFileDescriptor {}
 
-/// Fuzz entrypoint for the `rpc_fd_ancillary` target (subplan 2-7
-/// §6.3 / V4 / T7.6): arbitrary body bytes through the RPC `Unix`-mode
-/// FD-table decode **with no received fds**. Property: no panic / UB /
-/// fd leak — an out-of-bounds or dangling fd-table index is a clean
-/// `Err`, never a crash. Not part of the supported API surface.
+/// Fuzz entrypoint for the `rpc_fd_ancillary` target: arbitrary body
+/// bytes through the RPC `Unix`-mode FD-table decode **with no received
+/// fds**. Property: no panic / UB / fd leak — an out-of-bounds or
+/// dangling fd-table index is a clean `Err`, never a crash. Not part of
+/// the supported API surface.
 #[cfg(feature = "rpc")]
 #[doc(hidden)]
 pub fn __fuzz_rpc_fd_index(input: &[u8]) {
@@ -283,9 +292,9 @@ pub fn __fuzz_rpc_fd_index(input: &[u8]) {
     let _ = <ParcelFileDescriptor as DeserializeOption>::deserialize_option(&mut p);
 }
 
-/// Fuzz entrypoint for the **v1+ AOSP-shape** RPC FD decode (subplan
-/// 2-11 Phase B / V4): arbitrary body bytes + a hostile object-position
-/// table through the strict `[not-null|hasComm|TYPE|idx]` +
+/// Fuzz entrypoint for the **v1+ AOSP-shape** RPC FD decode: arbitrary
+/// body bytes + a hostile object-position table through the strict
+/// `[not-null|hasComm|TYPE|idx]` +
 /// `binary_search` read, **no received fds**. Property: no panic / UB /
 /// fd leak — a forged/unsorted/absent position, a wrong `TYPE`, a
 /// non-zero `hasComm`, or a dangling index is a clean `Err`, never a
@@ -337,12 +346,12 @@ mod tests {
         assert_eq!(pfd.into_raw_fd(), 1);
     }
 
-    // ---- subplan 2-11: AOSP-faithful FD-over-RPC Parcel body ----
+    // ---- AOSP-faithful FD-over-RPC Parcel body ----
     //
-    // Device-free byte-exact goldens (AC-11.1) + Phase B strict-read
-    // mutant detection (V3). The single-fd write side is asserted here;
-    // the full v1+↔v1+ socket round-trip (A0 + A + B) is the hermetic
-    // `rpc_fd::fd_v1plus_aosp_roundtrip_*` (AC-11.0/11.4).
+    // Device-free byte-exact goldens + strict-read mutant detection.
+    // The single-fd write side is asserted here; the full v1+↔v1+
+    // socket round-trip is the hermetic
+    // `rpc_fd::fd_v1plus_aosp_roundtrip_*`.
 
     #[cfg(feature = "rpc")]
     fn dev_null_pfd() -> ParcelFileDescriptor {
@@ -363,7 +372,7 @@ mod tests {
         p
     }
 
-    /// AC-11.1: v1+ (`record_fd_positions`) writes the AOSP-faithful
+    /// v1+ (`record_fd_positions`) writes the AOSP-faithful
     /// `[not-null=1][hasComm=0][TYPE=2][fdIndex=0]` (16 B) and records
     /// the **TYPE int32 offset (= start+8)**, not the not-null marker.
     #[cfg(feature = "rpc")]
@@ -384,9 +393,8 @@ mod tests {
         );
     }
 
-    /// AC-11.1 / AC-11.4: R34 / v0 (no object table) keeps rsbinder's
-    /// legacy `[present=1][fdIndex=0]` (8 B) **byte-unchanged**, no
-    /// position — the anchor that `rpc_fd` 3/0 stays green.
+    /// R34 / v0 (no object table) keeps rsbinder's legacy
+    /// `[present=1][fdIndex=0]` (8 B) **byte-unchanged**, no position.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_fd_r34_body_byte_unchanged() {
@@ -402,7 +410,7 @@ mod tests {
         );
     }
 
-    /// AC-11.1: a null fd is `writeInt32(0)` (4 B), **no TYPE, no
+    /// A null fd is `writeInt32(0)` (4 B), **no TYPE, no
     /// position**, at *both* profiles (an easy reshape mistake is to
     /// grow a position for null at v1+).
     #[cfg(feature = "rpc")]
@@ -436,7 +444,7 @@ mod tests {
         p
     }
 
-    /// V3 mutants — each malformed/forged v1+ body must be a clean
+    /// Each malformed/forged v1+ body must be a clean
     /// `Err`, never a panic or a mis-parse (the symmetric-illusion trap
     /// is exactly why these are explicit).
     #[cfg(feature = "rpc")]
@@ -463,8 +471,8 @@ mod tests {
             "legacy [present|idx] vs v1+ reader (hasComm!=0)"
         );
 
-        // (2) position omitted from the object table ⇒ Phase B strict
-        //     miss ⇒ BadType (AOSP fd: binary_search miss ⇒ BAD_TYPE).
+        // (2) position omitted from the object table ⇒ strict miss ⇒
+        //     BadType (AOSP fd: binary_search miss ⇒ BAD_TYPE).
         assert_eq!(
             de(&mut v1_reader(&ok_body, vec![])).unwrap_err(),
             StatusCode::BadType,
@@ -488,8 +496,8 @@ mod tests {
             "TYPE != TYPE_NATIVE_FILE_DESCRIPTOR rejected"
         );
 
-        // (5) hasComm != 0 (AC-11.5 documented divergence: rsbinder has
-        //     no comm channel — AOSP would read a second fd).
+        // (5) hasComm != 0 (documented divergence: rsbinder has no comm
+        //     channel — AOSP would read a second fd).
         let mut comm = ok_body.clone();
         comm[4..8].copy_from_slice(&1i32.to_le_bytes());
         assert_eq!(

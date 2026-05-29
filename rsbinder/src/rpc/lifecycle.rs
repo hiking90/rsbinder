@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-12 §7.3 **R1** — typed session lifecycle.
+//! Typed session lifecycle.
 //!
 //! Replaces the prior `live_conns: AtomicUsize` + `obituary_sent:
 //! AtomicBool` pair on [`super::session::SharedSession`] with a single
@@ -22,14 +22,13 @@
 //! `Dying`/`Dead` carry no count. Every transition is a CAS — `0` is
 //! never transiently visible as `≥ 1` from one observer's point of view
 //! between another's bump-and-rollback (the two-attacker hole the
-//! review-R2 CAS-loop closed against the original optimistic-bump shape;
-//! plan §7.2). The typed enum makes the four reachable states explicit:
+//! CAS-loop closes against a naive optimistic-bump shape). The typed
+//! enum makes the four reachable states explicit:
 //! a reviewer can grep [`SessionLifecycleSnapshot`] variants for every
 //! point that branches on them.
 //!
 //! **Default single-connection sessions** never leave `Live(1)` until
-//! teardown, so the only behavioral change vs the pre-R1 two-atomic
-//! shape is that the `is_torn_down` snapshot can now return `true` in
+//! teardown. The `is_torn_down` snapshot can return `true` in
 //! the `Dying` window *before* the obituary completes — a strict
 //! improvement (a `RpcProxy::drop` reaper that races the dying founding
 //! worker skips its best-effort `DEC_STRONG` slightly earlier, never
@@ -57,7 +56,7 @@ const STATE_DEAD_TAG: u64 = 2;
 /// cover the common cases. The unit tests below match against every
 /// variant explicitly.
 #[allow(dead_code)]
-// The hot-path uses the boolean/count helpers; the typed snapshot is the grep-friendly mutant-gate surface.
+// The hot path uses the boolean/count helpers; the typed snapshot is the grep-friendly exhaustive-match surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLifecycleSnapshot {
     /// At least one connection is still driving the session. `n` is the
@@ -68,7 +67,7 @@ pub(crate) enum SessionLifecycleSnapshot {
     /// obituary callback returns.
     Dying,
     /// Obituary callbacks have completed. A subsequent
-    /// [`SessionLifecycle::try_bump_live`] never succeeds (F4 anti-
+    /// [`SessionLifecycle::try_bump_live`] never succeeds (anti-
     /// resurrection — a session whose obituaries fired must never
     /// acquire another driver, else `binder_died` would be silently
     /// lost for any `DeathRecipient` linked through the attaching
@@ -94,8 +93,8 @@ impl SessionLifecycle {
     /// Lock-free typed snapshot. Production code prefers
     /// [`is_torn_down`](Self::is_torn_down) (boolean) or
     /// [`live_count`](Self::live_count) (numeric) for the hot path;
-    /// `snapshot` is the test/mutant-gate surface that exhaustively
-    /// matches every variant.
+    /// `snapshot` is the test surface that exhaustively matches every
+    /// variant.
     #[allow(dead_code)]
     pub(crate) fn snapshot(&self) -> SessionLifecycleSnapshot {
         decode(self.inner.load(Ordering::SeqCst))
@@ -108,9 +107,7 @@ impl SessionLifecycle {
         self.inner.load(Ordering::Acquire) >> STATE_SHIFT != STATE_LIVE_TAG
     }
 
-    /// Current live count (`Live(n) → n`, `Dying`/`Dead → 0`). The
-    /// deterministic F4 witness — replaces the prior
-    /// `live_conns.load()` direct read.
+    /// Current live count (`Live(n) → n`, `Dying`/`Dead → 0`).
     pub(crate) fn live_count(&self) -> usize {
         let v = self.inner.load(Ordering::SeqCst);
         if v >> STATE_SHIFT == STATE_LIVE_TAG {
@@ -120,14 +117,14 @@ impl SessionLifecycle {
         }
     }
 
-    /// **F4 anti-resurrection primitive.** Atomically bump the live
+    /// **Anti-resurrection primitive.** Atomically bump the live
     /// count *if* the session is still `Live`. Returns `false` from
     /// `Dying` or `Dead` (never attaches to a session whose obituaries
     /// fired / are firing).
     ///
-    /// CAS-loop rather than optimistic-bump-then-rollback — the prior
-    /// shape closed the *single-attacker* race but not the
-    /// **multi-attacker** one (review-R2; plan §7.2): two concurrent
+    /// CAS-loop rather than optimistic-bump-then-rollback — the latter
+    /// closes the *single-attacker* race but not the
+    /// **multi-attacker** one: two concurrent
     /// attackers A and B both bumping after the founding `fetch_sub`'d
     /// to 0 could let B see A's transient `prev=1` before A rolls
     /// back, attaching to a dying session. Value-decision CAS closes
@@ -283,8 +280,8 @@ mod tests {
         assert!(!lc.try_bump_live(), "Dead must refuse new attach");
     }
 
-    /// Review-R2 multi-attacker hole, hermetic mutant gate. The prior
-    /// optimistic-bump-then-rollback shape would have let one of N
+    /// Multi-attacker hole, hermetic regression. A naive
+    /// optimistic-bump-then-rollback shape would let one of N
     /// concurrent attackers attach to a dying session by observing
     /// another's transient bump. The CAS-loop primitive — which the
     /// typed enum here preserves — must keep `Dying`/`Dead` invariant
