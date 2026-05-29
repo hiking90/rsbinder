@@ -26,7 +26,9 @@ pub use android::aidl::fixedsizearray::FixedSizeArrayExample::{
 };
 
 use android::aidl::tests::nested::{INestedService, ParcelableWithNested};
+use android::aidl::tests::vintf::VintfExtendableParcelable::VintfExtendableParcelable;
 use android::aidl::tests::ITestService::{self, BnTestService, BpTestService, Empty::Empty};
+use android::aidl::tests::SimpleParcelable::SimpleParcelable;
 use android::aidl::tests::{
     extension::ExtendableParcelable::ExtendableParcelable, extension::MyExt::MyExt,
     BackendType::BackendType, ByteEnum::ByteEnum, CircularParcelable::CircularParcelable,
@@ -38,6 +40,30 @@ use android::aidl::versioned::tests::{
     BazUnion::BazUnion, Foo::Foo, IFooInterface, IFooInterface::BnFooInterface,
     IFooInterface::BpFooInterface,
 };
+
+// V1 (frozen) IFooInterface — see plans/5-aosp-test-porting.md §4 and the sync
+// `test_service.rs` counterpart.
+mod foo_v1_gen {
+    include!(concat!(env!("OUT_DIR"), "/foo_v1.rs"));
+}
+use foo_v1_gen::android::aidl::versioned::tests::{
+    BazUnion::BazUnion as BazUnionV1, Foo::Foo as FooV1, IFooInterface::BnFooInterface as BnFooV1,
+    IFooInterface::IFooInterfaceAsyncService as IFooInterfaceV1Async,
+};
+
+pub const FOO_V1_SERVICE_NAME: &str = "android.aidl.versioned.tests.IFooInterface-v1";
+
+// V1 (frozen) ITrunkStableTest — async SERVICE side. See §5 and the sync
+// `test_service.rs` counterpart.
+mod trunk_v1_gen {
+    include!(concat!(env!("OUT_DIR"), "/trunk_v1.rs"));
+}
+use trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::{
+    BnTrunkStableTest as BnTrunkV1, IMyCallback as TrunkCb,
+    ITrunkStableTestAsyncService as ITrunkStableTestV1Async, MyEnum::MyEnum as TMyEnum,
+    MyParcelable::MyParcelable as TMyParcelable, MyUnion::MyUnion as TMyUnion,
+};
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -506,6 +532,24 @@ impl ITestService::ITestServiceAsyncService for TestService {
         Ok(())
     }
 
+    async fn RepeatExtendableParcelableVintf(
+        &self,
+        ep: &ExtendableParcelable,
+        ep2: &mut ExtendableParcelable,
+    ) -> rsbinder::status::Result<()> {
+        ep2.a = ep.a;
+        ep2.b.clone_from(&ep.b);
+
+        let my_ext = ep.ext.get_parcelable::<VintfExtendableParcelable>()?;
+        if let Some(my_ext) = my_ext {
+            ep2.ext.set_parcelable(my_ext)?;
+        } else {
+            ep2.ext.reset();
+        }
+
+        Ok(())
+    }
+
     async fn ReverseList(&self, list: &RecursiveList) -> rsbinder::status::Result<RecursiveList> {
         let mut reversed: Option<RecursiveList> = None;
         let mut cur: Option<&RecursiveList> = Some(list);
@@ -584,6 +628,24 @@ impl ITestService::ITestServiceAsyncService for TestService {
         Ok(ICircular::BnCircular::new_async_binder(Circular, rt()))
     }
 
+    async fn RepeatSimpleParcelable(
+        &self,
+        input: &SimpleParcelable,
+        repeat: &mut SimpleParcelable,
+    ) -> rsbinder::status::Result<SimpleParcelable> {
+        *repeat = input.clone();
+        Ok(input.clone())
+    }
+
+    async fn ReverseSimpleParcelables(
+        &self,
+        input: &[SimpleParcelable],
+        repeated: &mut Vec<SimpleParcelable>,
+    ) -> rsbinder::status::Result<Vec<SimpleParcelable>> {
+        *repeated = input.to_vec();
+        Ok(input.iter().rev().cloned().collect())
+    }
+
     async fn r#killService(&self) -> rsbinder::status::Result<()> {
         std::process::exit(0);
     }
@@ -617,6 +679,68 @@ impl IFooInterface::IFooInterfaceAsyncService for FooInterface {
         Ok(value)
     }
     async fn newApi(&self) -> rsbinder::status::Result<()> {
+        Ok(())
+    }
+}
+
+/// V1 async impl: `FooInterface` minus `newApi`.
+struct FooInterfaceV1;
+
+impl Interface for FooInterfaceV1 {}
+
+#[async_trait]
+impl IFooInterfaceV1Async for FooInterfaceV1 {
+    async fn originalApi(&self) -> rsbinder::status::Result<()> {
+        Ok(())
+    }
+    async fn acceptUnionAndReturnString(&self, u: &BazUnionV1) -> rsbinder::status::Result<String> {
+        match u {
+            BazUnionV1::IntNum(n) => Ok(n.to_string()),
+            BazUnionV1::LongNum(n) => Ok(n.to_string()),
+        }
+    }
+    async fn returnsLengthOfFooArray(&self, foos: &[FooV1]) -> rsbinder::status::Result<i32> {
+        Ok(foos.len() as i32)
+    }
+    async fn ignoreParcelablesAndRepeatInt(
+        &self,
+        _in_foo: &FooV1,
+        _inout_foo: &mut FooV1,
+        _out_foo: &mut FooV1,
+        value: i32,
+    ) -> rsbinder::status::Result<i32> {
+        Ok(value)
+    }
+}
+
+/// V1 (frozen) ITrunkStableTest — async service. See §5.
+struct TrunkStableTest;
+
+impl Interface for TrunkStableTest {}
+
+#[async_trait]
+impl ITrunkStableTestV1Async for TrunkStableTest {
+    async fn repeatParcelable(
+        &self,
+        input: &TMyParcelable,
+    ) -> rsbinder::status::Result<TMyParcelable> {
+        Ok(input.clone())
+    }
+    async fn repeatEnum(&self, input: TMyEnum) -> rsbinder::status::Result<TMyEnum> {
+        Ok(input)
+    }
+    async fn repeatUnion(&self, input: &TMyUnion) -> rsbinder::status::Result<TMyUnion> {
+        Ok(input.clone())
+    }
+    async fn callMyCallback(
+        &self,
+        cb: &rsbinder::Strong<dyn TrunkCb::IMyCallback>,
+    ) -> rsbinder::status::Result<()> {
+        // Echoed return values are unused, but propagate transaction failures
+        // (e.g. a dead callback proxy) rather than swallowing them.
+        cb.repeatParcelable(&TMyParcelable::default())?;
+        cb.repeatEnum(TMyEnum::ZERO)?;
+        cb.repeatUnion(&TMyUnion::default())?;
         Ok(())
     }
 }
@@ -763,6 +887,17 @@ fn main() {
             BnFooInterface::new_async_binder(FooInterface, rt());
         hub::add_service(versioned_service_name, versioned_service.as_binder())
             .expect("Could not register service");
+
+        // V1 IFooInterface under a dedicated name (no `newApi`) — see §4.
+        let versioned_service_v1 = BnFooV1::new_async_binder(FooInterfaceV1, rt());
+        hub::add_service(FOO_V1_SERVICE_NAME, versioned_service_v1.as_binder())
+            .expect("Could not register V1 service");
+
+        // V1 ITrunkStableTest under its descriptor — §5.
+        let trunk_service_name = <trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::BpTrunkStableTest as trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::ITrunkStableTest>::descriptor();
+        let trunk_service = BnTrunkV1::new_async_binder(TrunkStableTest, rt());
+        hub::add_service(trunk_service_name, trunk_service.as_binder())
+            .expect("Could not register trunk service");
 
         let nested_service_name =
             <INestedService::BpNestedService as INestedService::INestedService>::descriptor();

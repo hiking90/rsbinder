@@ -620,7 +620,9 @@ pub mod OuterUnion {
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
+                    if !_sub_parcel.has_more_data() { return Ok(()); }
                     self.r#value = _sub_parcel.read()?;
+                    if !_sub_parcel.has_more_data() { return Ok(()); }
                     self.r#name = _sub_parcel.read()?;
                     Ok(())
                 })
@@ -746,6 +748,7 @@ pub mod MultiNestedUnion {
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
+                    if !_sub_parcel.has_more_data() { return Ok(()); }
                     self.r#id = _sub_parcel.read()?;
                     Ok(())
                 })

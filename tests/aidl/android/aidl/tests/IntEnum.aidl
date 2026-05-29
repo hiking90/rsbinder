@@ -19,6 +19,15 @@ package android.aidl.tests;
 @JavaDerive(toString=true)
 @Backing(type="int")
 enum IntEnum {
+    ZERO,
+    ONE,
+    TWO,
+    /**
+     * Reserved: 12 and 2040
+     * We are using 12 and (FOO | BAR) in some tests because
+     * they _are not_ defined in this enum.
+     * Please do not add them here.
+     */
     FOO = 1000,
     BAR = 2000,
     BAZ,

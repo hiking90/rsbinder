@@ -26,6 +26,7 @@ import android.aidl.tests.IOldName;
 import android.aidl.tests.IntEnum;
 import android.aidl.tests.LongEnum;
 import android.aidl.tests.RecursiveList;
+import android.aidl.tests.SimpleParcelable;
 import android.aidl.tests.StructuredParcelable;
 import android.aidl.tests.Union;
 import android.aidl.tests.extension.ExtendableParcelable;
@@ -328,6 +329,12 @@ interface ITestService {
     }
 
     ICircular GetCircular(out CircularParcelable cp);
+
+    void RepeatExtendableParcelableVintf(in ExtendableParcelable ep, out ExtendableParcelable ep2);
+
+    SimpleParcelable RepeatSimpleParcelable(in SimpleParcelable input, out SimpleParcelable repeat);
+    SimpleParcelable[] ReverseSimpleParcelables(
+            in SimpleParcelable[] input, out SimpleParcelable[] repeated);
 
     oneway void killService();
 }
