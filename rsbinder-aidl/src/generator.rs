@@ -134,7 +134,12 @@ pub mod {{mod}} {
         fn read_from_parcel(&mut self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
+                if !_sub_parcel.has_more_data() { return Ok(()); }
+                {%- if member.3 %}
+                _sub_parcel.read_onto(&mut self.r#{{ member.0 }})?;
+                {%- else %}
                 self.r#{{ member.0 }} = _sub_parcel.read()?;
+                {%- endif %}
                 {%- endfor %}
                 Ok(())
             })
@@ -1117,6 +1122,10 @@ pub mod {mod} {{
                                     .with_vintf(is_vintf)
                                     .with_crate_name(self.get_crate_name()),
                             )?,
+                            // is_holder: read via `read_onto` so the field's
+                            // pre-set stability survives (see ParcelableHolder
+                            // ::deserialize_from).
+                            matches!(generator.value_type, ValueType::Holder),
                         ))
                     }
                 } else {
@@ -1255,11 +1264,27 @@ pub mod {mod} {{
                         )?,
                     ));
                 } else {
+                    // Honor an explicit `= EnumType.VARIANT` default; the union's
+                    // `Default` impl uses members[0] (AOSP-faithful), so only the
+                    // first member's default expression is emitted.
+                    let default_expr = if !members.is_empty() {
+                        String::new()
+                    } else if var.const_expr.is_some() {
+                        generator.init_value(
+                            var.const_expr.as_ref(),
+                            InitParam::builder()
+                                .with_const(false)
+                                .with_vintf(is_vintf)
+                                .with_crate_name(self.get_crate_name()),
+                        )?
+                    } else {
+                        generator.default_value()
+                    };
                     members.push((
                         var.union_identifier(),
                         generator.type_declaration(true),
                         var.identifier(),
-                        generator.default_value(),
+                        default_expr,
                     ));
                 }
             } else {

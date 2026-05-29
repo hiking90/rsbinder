@@ -17,7 +17,9 @@ pub use android::aidl::fixedsizearray::FixedSizeArrayExample::{
 };
 
 pub use android::aidl::tests::nested::{INestedService, ParcelableWithNested};
+pub use android::aidl::tests::vintf::VintfExtendableParcelable::VintfExtendableParcelable;
 pub use android::aidl::tests::ITestService::{self, BnTestService, BpTestService, Empty::Empty};
+pub use android::aidl::tests::SimpleParcelable::SimpleParcelable;
 pub use android::aidl::tests::{
     extension::ExtendableParcelable::ExtendableParcelable, extension::MyExt::MyExt,
     BackendType::BackendType, ByteEnum::ByteEnum, CircularParcelable::CircularParcelable,
@@ -28,6 +30,34 @@ pub use android::aidl::tests::{
 pub use android::aidl::versioned::tests::{
     BazUnion::BazUnion, Foo::Foo, IFooInterface, IFooInterface::BnFooInterface,
     IFooInterface::BpFooInterface,
+};
+
+// V1 (frozen) IFooInterface — same descriptor, no `newApi()`. Wrapped in its
+// own module so its BazUnion/Foo don't clash with the V2 ones above. Drives
+// the cross-version `test_calling_v2_api_triggers_error`. See
+// plans/5-aosp-test-porting.md §4.
+mod foo_v1_gen {
+    include!(concat!(env!("OUT_DIR"), "/foo_v1.rs"));
+}
+use foo_v1_gen::android::aidl::versioned::tests::{
+    BazUnion::BazUnion as BazUnionV1, Foo::Foo as FooV1, IFooInterface::BnFooInterface as BnFooV1,
+    IFooInterface::IFooInterface as IFooInterfaceV1,
+};
+
+/// Service name the V1 IFooInterface is registered under (distinct from the
+/// descriptor, which still maps to the V2 service for the other versioned
+/// tests). Must match the literal in `test_client.rs`.
+pub const FOO_V1_SERVICE_NAME: &str = "android.aidl.versioned.tests.IFooInterface-v1";
+
+// V1 (frozen) ITrunkStableTest — the SERVICE side of the trunk-stable
+// cross-version tests. See plans/5-aosp-test-porting.md §5.
+mod trunk_v1_gen {
+    include!(concat!(env!("OUT_DIR"), "/trunk_v1.rs"));
+}
+use trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::{
+    BnTrunkStableTest as BnTrunkV1, IMyCallback as TrunkCb, ITrunkStableTest as ITrunkStableTestV1,
+    MyEnum::MyEnum as TMyEnum, MyParcelable::MyParcelable as TMyParcelable,
+    MyUnion::MyUnion as TMyUnion,
 };
 
 fn dup_fd(fd: &ParcelFileDescriptor) -> ParcelFileDescriptor {
@@ -456,6 +486,24 @@ impl ITestService::ITestService for TestService {
         Ok(())
     }
 
+    fn RepeatExtendableParcelableVintf(
+        &self,
+        ep: &ExtendableParcelable,
+        ep2: &mut ExtendableParcelable,
+    ) -> std::result::Result<(), rsbinder::Status> {
+        ep2.a = ep.a;
+        ep2.b.clone_from(&ep.b);
+
+        let my_ext = ep.ext.get_parcelable::<VintfExtendableParcelable>()?;
+        if let Some(my_ext) = my_ext {
+            ep2.ext.set_parcelable(my_ext)?;
+        } else {
+            ep2.ext.reset();
+        }
+
+        Ok(())
+    }
+
     fn ReverseList(
         &self,
         list: &RecursiveList,
@@ -537,6 +585,24 @@ impl ITestService::ITestService for TestService {
         Ok(ICircular::BnCircular::new_binder(Circular))
     }
 
+    fn RepeatSimpleParcelable(
+        &self,
+        input: &SimpleParcelable,
+        repeat: &mut SimpleParcelable,
+    ) -> std::result::Result<SimpleParcelable, rsbinder::Status> {
+        *repeat = input.clone();
+        Ok(input.clone())
+    }
+
+    fn ReverseSimpleParcelables(
+        &self,
+        input: &[SimpleParcelable],
+        repeated: &mut Vec<SimpleParcelable>,
+    ) -> std::result::Result<Vec<SimpleParcelable>, rsbinder::Status> {
+        *repeated = input.to_vec();
+        Ok(input.iter().rev().cloned().collect())
+    }
+
     fn r#killService(&self) -> rsbinder::status::Result<()> {
         std::process::exit(0);
     }
@@ -569,6 +635,70 @@ impl IFooInterface::IFooInterface for FooInterface {
         Ok(value)
     }
     fn newApi(&self) -> rsbinder::status::Result<()> {
+        Ok(())
+    }
+}
+
+/// V1 implementation: identical to `FooInterface` minus `newApi`, so the
+/// generated `BnFooV1` dispatch table has no transaction code for it.
+struct FooInterfaceV1;
+
+impl Interface for FooInterfaceV1 {}
+
+impl IFooInterfaceV1 for FooInterfaceV1 {
+    fn originalApi(&self) -> std::result::Result<(), Status> {
+        Ok(())
+    }
+    fn acceptUnionAndReturnString(&self, u: &BazUnionV1) -> std::result::Result<String, Status> {
+        match u {
+            BazUnionV1::IntNum(n) => Ok(n.to_string()),
+            BazUnionV1::LongNum(n) => Ok(n.to_string()),
+        }
+    }
+    fn returnsLengthOfFooArray(&self, foos: &[FooV1]) -> std::result::Result<i32, Status> {
+        Ok(foos.len() as i32)
+    }
+    fn ignoreParcelablesAndRepeatInt(
+        &self,
+        _in_foo: &FooV1,
+        _inout_foo: &mut FooV1,
+        _out_foo: &mut FooV1,
+        value: i32,
+    ) -> std::result::Result<i32, Status> {
+        Ok(value)
+    }
+}
+
+/// V1 (frozen) ITrunkStableTest service. Echoes the three V1 types and, on
+/// `callMyCallback`, invokes the client callback's three V1 methods (the V2
+/// `repeatOtherParcelable` does not exist here → the client observes it as
+/// never-called). See plans/5-aosp-test-porting.md §5.
+struct TrunkStableTest;
+
+impl Interface for TrunkStableTest {}
+
+impl ITrunkStableTestV1 for TrunkStableTest {
+    fn repeatParcelable(
+        &self,
+        input: &TMyParcelable,
+    ) -> std::result::Result<TMyParcelable, Status> {
+        Ok(input.clone())
+    }
+    fn repeatEnum(&self, input: TMyEnum) -> std::result::Result<TMyEnum, Status> {
+        Ok(input)
+    }
+    fn repeatUnion(&self, input: &TMyUnion) -> std::result::Result<TMyUnion, Status> {
+        Ok(input.clone())
+    }
+    fn callMyCallback(
+        &self,
+        cb: &rsbinder::Strong<dyn TrunkCb::IMyCallback>,
+    ) -> std::result::Result<(), Status> {
+        // Echoed return values are unused, but propagate transaction failures
+        // (e.g. a dead callback proxy) rather than swallowing them.
+        cb.repeatParcelable(&TMyParcelable::default())?;
+        cb.repeatEnum(TMyEnum::ZERO)?;
+        cb.repeatUnion(&TMyUnion::default())?;
         Ok(())
     }
 }
@@ -726,6 +856,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let versioned_service = BnFooInterface::new_binder(FooInterface);
     hub::add_service(versioned_service_name, versioned_service.as_binder())
         .expect("Could not register service");
+
+    // V1 IFooInterface under a dedicated name (no `newApi`) — see §4.
+    let versioned_service_v1 = BnFooV1::new_binder(FooInterfaceV1);
+    hub::add_service(FOO_V1_SERVICE_NAME, versioned_service_v1.as_binder())
+        .expect("Could not register V1 service");
+
+    // V1 ITrunkStableTest under its descriptor (the V2 client connects here) — §5.
+    let trunk_service_name = <trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::BpTrunkStableTest as ITrunkStableTestV1>::descriptor();
+    let trunk_service = BnTrunkV1::new_binder(TrunkStableTest);
+    hub::add_service(trunk_service_name, trunk_service.as_binder())
+        .expect("Could not register trunk service");
 
     let nested_service_name =
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor();

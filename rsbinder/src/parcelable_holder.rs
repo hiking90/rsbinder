@@ -205,6 +205,22 @@ impl Deserialize for ParcelableHolder {
             Ok(parcelable)
         }
     }
+
+    /// Read ONTO `self`, preserving its already-set stability. Plain
+    /// `deserialize()` constructs a fresh `Local` holder, which then rejects a
+    /// higher wire stability — losing the `@VintfStability` (or vendor/system)
+    /// level a generated parcelable's `Default` assigned to a holder field.
+    /// Generated `read_from_parcel` reads holder fields via `read_onto` so this
+    /// override runs; mirrors AOSP's `field.readFromParcel(parcel)`.
+    fn deserialize_from(&mut self, parcel: &mut Parcel) -> Result<()> {
+        let status: i32 = parcel.read()?;
+        if status == NULL_PARCELABLE_FLAG {
+            log::error!("ParcelableHolder::deserialize_from: unexpected null");
+            Err(StatusCode::UnexpectedNull)
+        } else {
+            self.read_from_parcel(parcel)
+        }
+    }
 }
 
 impl Parcelable for ParcelableHolder {

@@ -262,6 +262,52 @@ pub trait RpcParcelOps: Send + Sync {
     fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<crate::binder::SIBinder>>;
 }
 
+/// All RPC-mode serialization state for a [`Parcel`], bundled into one
+/// struct (AOSP `Parcel.h`'s `RpcFields`, the RPC arm of its
+/// `std::variant<KernelFields, RpcFields> mVariantFields`). Unlike
+/// AOSP we need no `KernelFields`: rsbinder keeps the kernel offset
+/// table in [`Parcel::objects`], a wholly separate field, so only the
+/// RPC arm has to be bundled.
+///
+/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode
+/// (the former `is_for_rpc == true`), `None` ⇒ kernel path,
+/// byte-identical to the kernel wire. Tying every RPC field's
+/// existence to the mode flag in the type makes "RPC mode ⇒ RPC state
+/// present" an invariant the compiler enforces, instead of seven
+/// independently-defaulted fields gated on a separate bool.
+#[cfg(feature = "rpc")]
+#[derive(Default)]
+struct RpcFields {
+    /// Object-marshalling hooks for RPC mode (android `mSession`
+    /// equivalent). `Some` only on an RPC-mode parcel that will carry
+    /// binders.
+    ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
+    /// Negotiated FD-over-RPC mode. Default `None` ⇒ FD writes are
+    /// rejected, bit-identical to a parcel that carries no FDs.
+    fd_mode: crate::rpc::FileDescriptorTransportMode,
+    /// FDs collected while serializing this (outgoing) RPC parcel in
+    /// `Unix` fd-mode — sent out-of-band via `SCM_RIGHTS`.
+    fds_out: Vec<std::os::fd::OwnedFd>,
+    /// FDs received out-of-band with this (incoming) RPC parcel,
+    /// indexed by the in-body fd-table index.
+    fds_in: Vec<Option<std::os::fd::OwnedFd>>,
+    /// AOSP `RpcFields::mObjectPositions` — sorted byte offsets of
+    /// flattened RPC objects (binder at android-16 v2, FD at v1+),
+    /// produced by `write_binder` / FD-write while serializing an
+    /// RPC-mode parcel and consumed by the wire codec as the trailing
+    /// `u32[]` object table. The kernel path never touches it (kernel
+    /// objects live in [`Parcel::objects`]); empty ⇒ byte-identical to
+    /// a wire with no object table.
+    object_positions: Vec<u32>,
+    /// Whether an FD flattened into this parcel records its position
+    /// in `object_positions`. The session sets this from its wire
+    /// profile alongside the FD mode: `true` only on the android-13+
+    /// v1+ profile (R34 has no object table). Binder positions are
+    /// recorded by the session directly (it owns the profile); only
+    /// the FD path needs this Parcel-side flag.
+    record_fd_positions: bool,
+}
+
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
 ///
@@ -273,51 +319,24 @@ pub struct Parcel {
     pub(crate) objects: ParcelData<binder_size_t>,
     pos: usize,
     next_object_hint: usize,
+    /// End offset of the innermost active [`Parcel::sized_read`] block;
+    /// `None` when not inside one (⇒ [`Parcel::has_more_data`] uses the
+    /// full buffer length). Lets a version-N reader stop at the parcelable
+    /// boundary written by a version-M (< N) peer instead of reading into
+    /// trailing bytes — the stable-AIDL forward-compatibility read path,
+    /// paired with the per-field `has_more_data()` guards emitted in
+    /// generated `read_from_parcel`.
+    read_boundary: Option<usize>,
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
-    /// RPC serialization mode. Default `false` == kernel
-    /// path, byte-identical to the kernel wire. Only object marshalling
-    /// and the object/FD lifetime branch on this; scalar/string/POD
-    /// paths are unaffected.
+    /// RPC serialization state, or `None` for the kernel path
+    /// (byte-identical to the kernel wire). `Some` is the former
+    /// `is_for_rpc == true`. Only object marshalling and the
+    /// object/FD lifetime branch on this; scalar/string/POD paths are
+    /// unaffected. See [`RpcFields`].
     #[cfg(feature = "rpc")]
-    is_for_rpc: bool,
-    /// Object-marshalling hooks for RPC mode (android `mSession`
-    /// equivalent). `Some` only on an RPC-mode parcel that will carry
-    /// binders.
-    #[cfg(feature = "rpc")]
-    rpc_ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
-    /// Negotiated FD-over-RPC mode. Default `None` ⇒ FD writes are
-    /// rejected, bit-identical to a parcel that carries no FDs.
-    #[cfg(feature = "rpc")]
-    rpc_fd_mode: crate::rpc::FileDescriptorTransportMode,
-    /// FDs collected while serializing this (outgoing) RPC parcel in
-    /// `Unix` fd-mode — sent out-of-band via `SCM_RIGHTS`.
-    #[cfg(feature = "rpc")]
-    rpc_fds_out: Vec<std::os::fd::OwnedFd>,
-    /// FDs received out-of-band with this (incoming) RPC parcel,
-    /// indexed by the in-body fd-table index.
-    #[cfg(feature = "rpc")]
-    rpc_fds_in: Vec<Option<std::os::fd::OwnedFd>>,
-    /// AOSP `RpcFields::mObjectPositions` — sorted byte offsets of
-    /// flattened RPC objects (binder at android-16 v2, FD at v1+),
-    /// produced by `write_binder` / FD-write while serializing an
-    /// RPC-mode parcel and consumed by the wire codec as the trailing
-    /// `u32[]` object table. **Always empty unless
-    /// `is_for_rpc`** — the kernel path never touches it:
-    /// kernel objects live in [`Parcel::objects`], a wholly separate
-    /// field. Empty ⇒ byte-identical to a wire with no object table.
-    #[cfg(feature = "rpc")]
-    rpc_object_positions: Vec<u32>,
-    /// Whether an FD flattened into this parcel records its position
-    /// in [`Parcel::rpc_object_positions`]. The
-    /// session sets this from its wire profile alongside the FD mode:
-    /// `true` only on the android-13+ v1+ profile (R34 has no object
-    /// table). Binder
-    /// positions are recorded by the session directly (it owns the
-    /// profile); only the FD path needs this Parcel-side flag.
-    #[cfg(feature = "rpc")]
-    rpc_record_fd_positions: bool,
+    rpc: Option<RpcFields>,
 }
 
 impl Default for Parcel {
@@ -339,23 +358,12 @@ impl Parcel {
             objects: ParcelData::new(),
             pos: 0,
             next_object_hint: 0,
+            read_boundary: None,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
             #[cfg(feature = "rpc")]
-            is_for_rpc: false,
-            #[cfg(feature = "rpc")]
-            rpc_ops: None,
-            #[cfg(feature = "rpc")]
-            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
-            #[cfg(feature = "rpc")]
-            rpc_fds_out: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_fds_in: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_object_positions: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_record_fd_positions: false,
+            rpc: None,
         }
     }
 
@@ -381,23 +389,12 @@ impl Parcel {
             objects: ParcelData::from_raw_parts_mut(objects, object_count),
             pos: 0,
             next_object_hint: 0,
+            read_boundary: None,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: Some(free_buffer),
             #[cfg(feature = "rpc")]
-            is_for_rpc: false,
-            #[cfg(feature = "rpc")]
-            rpc_ops: None,
-            #[cfg(feature = "rpc")]
-            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
-            #[cfg(feature = "rpc")]
-            rpc_fds_out: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_fds_in: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_object_positions: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_record_fd_positions: false,
+            rpc: None,
         }
     }
 
@@ -407,25 +404,14 @@ impl Parcel {
             objects: ParcelData::new(),
             pos: 0,
             next_object_hint: 0,
+            read_boundary: None,
             // objects: ptr::null_mut(),
             // object_count: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
             #[cfg(feature = "rpc")]
-            is_for_rpc: false,
-            #[cfg(feature = "rpc")]
-            rpc_ops: None,
-            #[cfg(feature = "rpc")]
-            rpc_fd_mode: crate::rpc::FileDescriptorTransportMode::None,
-            #[cfg(feature = "rpc")]
-            rpc_fds_out: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_fds_in: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_object_positions: Vec::new(),
-            #[cfg(feature = "rpc")]
-            rpc_record_fd_positions: false,
+            rpc: None,
         }
     }
 
@@ -451,27 +437,32 @@ impl Parcel {
     /// string and POD bytes are identical in both modes.
     #[cfg(feature = "rpc")]
     pub fn set_for_rpc(&mut self, yes: bool) {
-        self.is_for_rpc = yes;
+        if yes {
+            // Idempotent: preserve any RpcFields already configured
+            // (e.g. via a prior `attach_rpc_ops`).
+            self.rpc.get_or_insert_with(RpcFields::default);
+        } else {
+            self.rpc = None;
+        }
     }
 
     /// `true` if this parcel serializes binders/FDs the RPC way
     /// (`RpcAddress` instead of `flat_binder_object`; FD rejected).
     #[cfg(feature = "rpc")]
     pub fn is_for_rpc(&self) -> bool {
-        self.is_for_rpc
+        self.rpc.is_some()
     }
 
     /// Attach the RPC object-marshalling hooks and enter RPC mode
     /// (android `Parcel::markForRpc`/`mSession` equivalent).
     #[cfg(feature = "rpc")]
     pub fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
-        self.is_for_rpc = true;
-        self.rpc_ops = Some(ops);
+        self.rpc.get_or_insert_with(RpcFields::default).ops = Some(ops);
     }
 
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_ops(&self) -> Option<std::sync::Arc<dyn RpcParcelOps>> {
-        self.rpc_ops.clone()
+        self.rpc.as_ref().and_then(|r| r.ops.clone())
     }
 
     /// The written byte buffer (for placing into an RPC wire body).
@@ -488,7 +479,9 @@ impl Parcel {
     /// flattened — i.e. byte-identical to a wire with no object table.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_positions(&self) -> &[u32] {
-        &self.rpc_object_positions
+        self.rpc
+            .as_ref()
+            .map_or(&[], |r| r.object_positions.as_slice())
     }
 
     /// Install the object table that arrived with an incoming RPC
@@ -497,10 +490,9 @@ impl Parcel {
     /// No-op kernel-side (`!is_for_rpc`).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
-        if !self.is_for_rpc {
-            return;
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.object_positions = positions;
         }
-        self.rpc_object_positions = positions;
     }
 
     /// AOSP `Parcel::unflattenBinder` v2 strict check: a binder may
@@ -513,7 +505,9 @@ impl Parcel {
         let Ok(pos) = u32::try_from(pos) else {
             return false;
         };
-        self.rpc_object_positions.binary_search(&pos).is_ok()
+        self.rpc
+            .as_ref()
+            .is_some_and(|r| r.object_positions.binary_search(&pos).is_ok())
     }
 
     /// Record the start offset of an RPC object just flattened into
@@ -529,15 +523,15 @@ impl Parcel {
     /// per-call version gate.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_object_position(&mut self, pos: usize) {
-        if !self.is_for_rpc {
+        let Some(rpc) = self.rpc.as_mut() else {
             return;
-        }
+        };
         let pos = pos as u32;
         // `upper_bound` ⇒ stable, AOSP-faithful sorted insert (positions
         // are produced in ascending write order in practice, so this is
         // an O(1) push on the common path).
-        let at = self.rpc_object_positions.partition_point(|&p| p <= pos);
-        self.rpc_object_positions.insert(at, pos);
+        let at = rpc.object_positions.partition_point(|&p| p <= pos);
+        rpc.object_positions.insert(at, pos);
     }
 
     // ---- FD-over-RPC (opt-in, Unix mode) ---------------------------
@@ -546,13 +540,15 @@ impl Parcel {
     /// `None` ⇒ FD write is rejected, bit-identical).
     #[cfg(feature = "rpc")]
     pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
-        self.rpc_fd_mode = mode;
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.fd_mode = mode;
+        }
     }
 
     /// The negotiated FD-over-RPC mode.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_fd_mode(&self) -> crate::rpc::FileDescriptorTransportMode {
-        self.rpc_fd_mode
+        self.rpc.as_ref().map_or(Default::default(), |r| r.fd_mode)
     }
 
     /// Set by the session from its wire profile (alongside the FD
@@ -561,13 +557,15 @@ impl Parcel {
     /// byte-unchanged.
     #[cfg(feature = "rpc")]
     pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
-        self.rpc_record_fd_positions = yes;
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.record_fd_positions = yes;
+        }
     }
 
     /// Whether the FD-write path records its object position.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_fd_positions(&self) -> bool {
-        self.rpc_record_fd_positions
+        self.rpc.as_ref().is_some_and(|r| r.record_fd_positions)
     }
 
     /// Stash an outgoing fd (already an owned dup) and return its
@@ -575,8 +573,14 @@ impl Parcel {
     /// only in `Unix` fd-mode.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
-        let idx = self.rpc_fds_out.len() as i32;
-        self.rpc_fds_out.push(fd);
+        // Only ever reached from the RPC `Unix` fd-write path (guarded
+        // by `is_for_rpc()` upstream), so RPC mode is a hard
+        // precondition — a stray kernel-parcel call is a programming
+        // error, and returning a bogus index would be worse than a
+        // clear panic.
+        let rpc = self.rpc.as_mut().expect("rpc_push_out_fd on kernel parcel");
+        let idx = rpc.fds_out.len() as i32;
+        rpc.fds_out.push(fd);
         idx
     }
 
@@ -586,19 +590,23 @@ impl Parcel {
     /// already has its own dup'd copies via the kernel).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_out_fds(&self) -> &[std::os::fd::OwnedFd] {
-        &self.rpc_fds_out
+        self.rpc.as_ref().map_or(&[], |r| r.fds_out.as_slice())
     }
 
     /// Install the fds received out-of-band, before deserialization.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_in_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
-        self.rpc_fds_in = fds.into_iter().map(Some).collect();
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.fds_in = fds.into_iter().map(Some).collect();
+        }
     }
 
     /// Take the received fd at table `index` (consumed once).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_take_in_fd(&mut self, index: usize) -> Option<std::os::fd::OwnedFd> {
-        self.rpc_fds_in.get_mut(index).and_then(Option::take)
+        self.rpc
+            .as_mut()
+            .and_then(|r| r.fds_in.get_mut(index).and_then(Option::take))
     }
 
     pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
@@ -623,7 +631,7 @@ impl Parcel {
         // RPC-mode parcels never carry kernel FD objects (FD over RPC
         // is rejected by default / opt-in via Unix mode); nothing to close here.
         #[cfg(feature = "rpc")]
-        if self.is_for_rpc {
+        if self.rpc.is_some() {
             return;
         }
 
@@ -699,7 +707,7 @@ impl Parcel {
         // `flat_binder_object`). Reaching here in RPC mode is a
         // protocol error, not a silent mis-read.
         #[cfg(feature = "rpc")]
-        if self.is_for_rpc {
+        if self.rpc.is_some() {
             return Err(StatusCode::BadType);
         }
 
@@ -773,13 +781,33 @@ impl Parcel {
             return Err(StatusCode::NotEnoughData);
         }
 
-        f(self)?;
+        // Bound `has_more_data()` to this block while the closure runs, so a
+        // newer reader stops at a shorter (older-peer) parcelable's end
+        // rather than reading trailing bytes. Saved/restored to support
+        // nested parcelables.
+        let prev_boundary = self.read_boundary;
+        self.read_boundary = Some(end);
+        let result = f(self);
+        self.read_boundary = prev_boundary;
+        result?;
 
         // Advance the data position to the actual end,
         // in case the closure read less data than was available
         self.set_data_position(end);
 
         Ok(())
+    }
+
+    /// Whether the read cursor has more data *within the current
+    /// [`Parcel::sized_read`] block* (or the whole buffer when not inside
+    /// one). Generated `read_from_parcel` guards each field read with this
+    /// so a version-N reader cleanly leaves trailing fields at their default
+    /// when reading a version-M (< N) peer's shorter parcelable — the
+    /// stable-AIDL forward-compatibility contract. Mirrors AOSP
+    /// `Parcel::hasMoreData()`.
+    pub fn has_more_data(&self) -> bool {
+        let end = self.read_boundary.unwrap_or_else(|| self.data_size());
+        self.pos < end
     }
 
     pub(crate) fn read_array<D: Deserialize>(&mut self) -> Result<Option<Vec<D>>> {
@@ -1059,7 +1087,7 @@ impl Parcel {
         // refcount. The kernel path below is byte-identical when
         // `is_for_rpc == false`.
         #[cfg(feature = "rpc")]
-        if self.is_for_rpc {
+        if self.rpc.is_some() {
             self.write_aligned(obj);
             return Ok(());
         }
@@ -1208,7 +1236,7 @@ impl Parcel {
         // `self.objects` is already empty in RPC mode so this is also
         // defence-in-depth.
         #[cfg(feature = "rpc")]
-        let skip_objects = self.is_for_rpc;
+        let skip_objects = self.rpc.is_some();
         #[cfg(not(feature = "rpc"))]
         let skip_objects = false;
 
@@ -1245,7 +1273,7 @@ impl Parcel {
         // (DecStrong-based) lifetime. `self.objects` is empty in RPC
         // mode anyway; this is defence-in-depth + intent.
         #[cfg(feature = "rpc")]
-        if self.is_for_rpc {
+        if self.rpc.is_some() {
             return;
         }
 
@@ -1676,6 +1704,81 @@ mod tests {
             parcel.data_avail(),
             0,
             "saturating_sub, not underflow panic"
+        );
+    }
+
+    /// Stable-AIDL forward-compat read path: a reader expecting more fields
+    /// than a shorter (older-peer) parcelable carries must leave the trailing
+    /// fields at their default — driven by `has_more_data()` respecting the
+    /// `sized_read` block boundary — and a reader expecting fewer fields than
+    /// a longer (newer-peer) parcelable must skip the extra bytes cleanly.
+    #[test]
+    fn sized_read_field_truncation_via_has_more_data() {
+        // A "V1" writer emits a length-prefixed parcelable of two i32s.
+        let mut wv1 = Parcel::new();
+        wv1.sized_write(|p| {
+            p.write(&11i32)?;
+            p.write(&22i32)
+        })
+        .expect("v1 write");
+        // Trailing sentinel after the parcelable (reply-trailer analogue) so
+        // an over-read past the block boundary would be detectable.
+        wv1.write(&0x7777_7777i32).expect("sentinel");
+
+        // A "V3" reader expects three i32s, each guarded by has_more_data.
+        wv1.set_data_position(0);
+        let (mut a, mut b, mut c) = (0i32, 0i32, -1i32);
+        wv1.sized_read(|p| {
+            if !p.has_more_data() {
+                return Ok(());
+            }
+            a = p.read()?;
+            if !p.has_more_data() {
+                return Ok(());
+            }
+            b = p.read()?;
+            if !p.has_more_data() {
+                return Ok(());
+            }
+            c = p.read()?;
+            Ok(())
+        })
+        .expect("v3 read of v1 data");
+        assert_eq!((a, b), (11, 22), "present fields read");
+        assert_eq!(c, -1, "absent trailing field left at default, no over-read");
+        // The cursor is parked at the parcelable end → sentinel reads next.
+        assert_eq!(wv1.read::<i32>().expect("sentinel"), 0x7777_7777);
+
+        // Reverse direction: a "V3" writer emits three i32s; a "V1" reader
+        // expecting two must skip the extra field and land on the sentinel.
+        let mut wv3 = Parcel::new();
+        wv3.sized_write(|p| {
+            p.write(&1i32)?;
+            p.write(&2i32)?;
+            p.write(&3i32)
+        })
+        .expect("v3 write");
+        wv3.write(&0x5555_5555i32).expect("sentinel");
+
+        wv3.set_data_position(0);
+        let (mut x, mut y) = (0i32, 0i32);
+        wv3.sized_read(|p| {
+            if !p.has_more_data() {
+                return Ok(());
+            }
+            x = p.read()?;
+            if !p.has_more_data() {
+                return Ok(());
+            }
+            y = p.read()?;
+            Ok(())
+        })
+        .expect("v1 read of v3 data");
+        assert_eq!((x, y), (1, 2), "first two fields read");
+        assert_eq!(
+            wv3.read::<i32>().expect("sentinel"),
+            0x5555_5555,
+            "extra field skipped to block end, sentinel intact"
         );
     }
 

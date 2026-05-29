@@ -236,6 +236,7 @@ pub mod StructuredParcelable {
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
+                if !_sub_parcel.has_more_data() { return Ok(()); }
                 self.r#value = _sub_parcel.read()?;
                 Ok(())
             })
@@ -312,9 +313,13 @@ pub mod FixedSizeArrayExample {
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
+                if !_sub_parcel.has_more_data() { return Ok(()); }
                 self.r#int2x3 = _sub_parcel.read()?;
+                if !_sub_parcel.has_more_data() { return Ok(()); }
                 self.r#stringNullableMatrix = _sub_parcel.read()?;
+                if !_sub_parcel.has_more_data() { return Ok(()); }
                 self.r#byteEnumNullableMatrix = _sub_parcel.read()?;
+                if !_sub_parcel.has_more_data() { return Ok(()); }
                 self.r#interfaceNullableMatrix = _sub_parcel.read()?;
                 Ok(())
             })
@@ -441,6 +446,7 @@ pub mod FixedSizeArrayExample {
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
+                    if !_sub_parcel.has_more_data() { return Ok(()); }
                     self.r#value = _sub_parcel.read()?;
                     Ok(())
                 })
