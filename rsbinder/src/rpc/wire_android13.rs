@@ -1127,6 +1127,65 @@ mod tests {
         }
     }
 
+    /// A `UnixStream::pair()` with read/write deadlines on both ends.
+    /// The handshake/e2e exchanges below complete in microseconds, so
+    /// the deadline never trips in normal operation; it bounds a
+    /// macOS-specific EOF-wakeup race (see [`drain_leftover`]) and any
+    /// stray stall so the (default, 5×-soak) CI job can never hang to
+    /// its wall-clock timeout.
+    fn timed_socketpair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (c, s) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let timeout = std::time::Duration::from_secs(10);
+        for sock in [&c, &s] {
+            sock.set_read_timeout(Some(timeout))
+                .expect("set read timeout");
+            sock.set_write_timeout(Some(timeout))
+                .expect("set write timeout");
+        }
+        (c, s)
+    }
+
+    /// Drain everything the peer sent after the handshake, returning all
+    /// bytes read. Stops at a clean EOF (the peer's write-half shutdown —
+    /// the Linux fast path) **or** at the [`timed_socketpair`] read
+    /// deadline.
+    ///
+    /// The deadline arm is load-bearing on macOS: a peer's
+    /// `shutdown(SHUT_WR)` does *not* reliably wake a `recv` already
+    /// parked in the kernel on an `AF_UNIX` `socketpair` (reproduced
+    /// ~1-in-50 full `rpc::` soak runs locally — the stuck thread sits
+    /// forever in `read_to_end` → `recvfrom`), so a plain blocking
+    /// `read_to_end` can wait for an EOF that never arrives. Treating
+    /// the deadline as end-of-stream is correct for the leftover-byte
+    /// assertions here: any *real* trailing byte was written by the peer
+    /// during the handshake and is already in the socket buffer, so it
+    /// comes back on the first `recv`; a timeout with nothing buffered
+    /// genuinely means the peer sent nothing.
+    fn drain_leftover(stream: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(e) => panic!("drain_leftover: unexpected error: {e}"),
+            }
+        }
+        out
+    }
+
     /// Spec-conformance golden — byte-exact against AOSP
     /// `RpcWireFormat.h` (v0 = android-13.0.0_r84, v1 =
     /// android-15.0.0_r36 == android-14.0.0_r75). Device-free.
@@ -1479,7 +1538,6 @@ mod tests {
     /// version negotiation.
     #[test]
     fn android13plus_live_protocol_e2e_over_raw_socket() {
-        use std::os::unix::net::UnixStream;
         use std::thread;
 
         // (client_max, server_max, expected_negotiated) — incl.
@@ -1494,7 +1552,7 @@ mod tests {
             (1, 2, 1),
             (2, 0, 0),
         ] {
-            let (mut c, mut s) = UnixStream::pair().expect("socketpair");
+            let (mut c, mut s) = timed_socketpair();
 
             let srv = thread::spawn(move || -> u32 {
                 let (codec, fd_mode, sid, incoming) =
@@ -1661,9 +1719,7 @@ mod tests {
     /// after both shutdown their write halves.
     #[test]
     fn android13plus_attach_handshake_wire_byte_exact() {
-        use std::io::Read;
         use std::net::Shutdown;
-        use std::os::unix::net::UnixStream;
         use std::thread;
 
         let session_id = [0x42u8; 32];
@@ -1676,23 +1732,20 @@ mod tests {
             (true, PROTOCOL_V1),
             (true, PROTOCOL_V2),
         ] {
-            let (mut c, mut s) = UnixStream::pair().expect("pair");
+            let (mut c, mut s) = timed_socketpair();
             let sid = session_id;
             let srv = thread::spawn(move || -> (u32, bool, Vec<u8>, Vec<u8>) {
                 let (codec, _fd, got_sid, srv_incoming) =
                     server_accept(&mut s, version).expect("server_accept");
                 s.shutdown(Shutdown::Write).expect("srv shutdown w");
-                let mut leftover = Vec::new();
-                s.read_to_end(&mut leftover).expect("srv read_to_end");
+                let leftover = drain_leftover(&mut s);
                 (codec.version(), srv_incoming, got_sid, leftover)
             });
 
             let codec = client_connect_with_id(&mut c, version, incoming, FD_MODE_NONE, &sid)
                 .expect("client_connect_with_id");
             c.shutdown(Shutdown::Write).expect("cli shutdown w");
-            let mut client_leftover = Vec::new();
-            c.read_to_end(&mut client_leftover)
-                .expect("cli read_to_end");
+            let client_leftover = drain_leftover(&mut c);
             assert!(
                 client_leftover.is_empty(),
                 "(attach, incoming={incoming}, v={version}): server wrote {} unexpected \
@@ -1723,11 +1776,9 @@ mod tests {
     /// wire order.
     #[test]
     fn android13plus_new_session_incoming_rejected() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
         use std::thread;
 
-        let (mut c, mut s) = UnixStream::pair().expect("pair");
+        let (mut c, mut s) = timed_socketpair();
         let srv = thread::spawn(move || -> RpcResult<_> {
             let result = server_accept(&mut s, PROTOCOL_V1);
             drop(s);
@@ -1746,8 +1797,7 @@ mod tests {
             "server must reject new-session + incoming, got {r:?}"
         );
 
-        let mut buf = Vec::new();
-        c.read_to_end(&mut buf).expect("read response + EOF");
+        let buf = drain_leftover(&mut c);
         assert_eq!(
             buf.len(),
             A13_NEW_SESSION_RESP_LEN,
