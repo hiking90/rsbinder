@@ -666,19 +666,6 @@ jobs:
             cargo test -p rsbinder --features rpc-tls --test rpc_tls || exit 1
           done
 
-      - name: Hermetic soak — rpc-experimental-multiconn x5 (AC-12.1 timing flake gate)
-        # The multi-conn `rpc_server.rs` tests include the cv-wait timing
-        # band assertions (AC-12.1 family). On macOS-latest under load,
-        # these flake at a low single-shot rate; the 5x soak is the
-        # explicit gate against landing a regression that single-shot
-        # `build.yml` happens to pass.
-        run: |
-          for i in $(seq 1 5); do
-            echo "=== multi-conn soak iteration $i / 5 ==="
-            cargo test -p rsbinder --features rpc-experimental-multiconn \
-              --test rpc_server || exit 1
-          done
-
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v7

@@ -2649,7 +2649,7 @@ mod tests {
         // Discard whatever the prior in-thread test may have left in
         // `THREAD_STATE.transaction`; `serial(binder)` only serializes
         // entry, not thread-local state.
-        drop(THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take()));
+        let _ = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take());
         assert!(!is_handling_transaction());
         assert_eq!(get_calling_uid(), 0);
         assert_eq!(get_calling_pid(), 0);

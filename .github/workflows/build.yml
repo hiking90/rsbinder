@@ -70,7 +70,7 @@ jobs:
           # `CARGO_FEATURE_ASYNC`, but the baseline can't be retroactively
           # patched. Without `async` in the feature set, semver-checks
           # fails to `cargo doc` the baseline crate.
-          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,rpc-experimental-multiconn,async
+          features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,async
 
   test:
     name: Test Suite
@@ -134,28 +134,18 @@ jobs:
       # runs on a plain runner, unlike the kernel-binder matrix in
       # integration-test.yml. This job is the missing CI enforcement
       # of the plan's V1/V4/V5 gates for the RPC stack (T3).
-      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls / experimental-multiconn)
+      - name: AC-1.1 build matrix (rpc OFF / rpc / tcp-debug / tls / vsock)
         run: |
           cargo build -p rsbinder
           cargo build -p rsbinder --features rpc
           cargo build -p rsbinder --features rpc-tcp-debug
           cargo build -p rsbinder --features rpc-tls
-          cargo build -p rsbinder --features rpc-experimental-multiconn
-      - name: RPC unit + e2e (rsbinder, hermetic — default build, multi-conn fns cfg-gated out)
+          cargo build -p rsbinder --features rpc-vsock
+      - name: RPC unit + e2e (rsbinder, hermetic — multi-conn now default per AC-12.6)
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
           cargo test -p rsbinder --features rpc-tls --test rpc_tls
-      - name: AC-12.x experimental multi-conn (hermetic, plan 2-12)
-        # Phase 2-12 multi-connection-per-session tests are cfg-gated to
-        # `rpc-experimental-multiconn` because the attach arm clamps the
-        # slot cap to 1 on default builds (real-libbinder interop gate
-        # AC-12.6 not yet passed — see `RpcServer::set_max_threads`
-        # rustdoc and plan/2-12-multi-connection-per-session.md §3).
-        # This job is the hermetic enforcement gate for that path: the
-        # 8 multi-conn fns in `rpc_server.rs` only compile + run here.
-        run: |
-          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
         # "android_16"))]`; without `android_16` the file compiles to
@@ -199,15 +189,12 @@ jobs:
         run: cargo build -p rsbinder-tools --release
       - name: rsb_device unit (mounts parser)
         run: cargo test -p rsbinder-tools --bin rsb_device
-      - name: RPC hermetic (default — multi-conn cfg-gated out)
+      - name: RPC hermetic (multi-conn now default per AC-12.6)
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
           cargo test -p rsbinder --features rpc-tls --test rpc_tls
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
-      - name: RPC hermetic (experimental multi-conn)
-        run: |
-          cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
         # See the matching step in `linux-build` — plan 3 AC-3.4
         # requires the sweep + allowlist gate to run on both Linux and
