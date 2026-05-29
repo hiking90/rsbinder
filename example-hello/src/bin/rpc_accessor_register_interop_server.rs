@@ -1,15 +1,15 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-14 D.9 STAGE3 — rsbinder *server* side of the IAccessor
+//! rsbinder *server* side of the IAccessor
 //! **register**-side real-libbinder interop harness. The role-inverse
-//! of 2-13 D.8: there libbinder served the IAccessor + RPC root and
-//! rsbinder consumed; here rsbinder serves both and the real
-//! libbinder C launcher consumes.
+//! of the consume-side harness: there libbinder served the IAccessor +
+//! RPC root and rsbinder consumed; here rsbinder serves both and the
+//! real libbinder C launcher consumes.
 //!
 //! Pairs with `cpp/rpc_accessor_register_interop_launcher` (real-
 //! libbinder client) on an **android-16 emulator (API 36)**. See
-//! `cpp/run_stage3_register.sh` for the automation around it.
+//! `cpp/run_rpc_accessor_register_interop.sh` for the automation around it.
 //!
 //! ```text
 //! ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
@@ -36,13 +36,13 @@
 //!      profile; max=2 ⇒ android-16 v2 (matches real libbinder on the
 //!      emulator).
 //!   5. `set_root(BnInterop)` installs a tiny `TX_ECHO` / `TX_GIVE_MARKER`
-//!      service — same shape as the 2-13 D.8 launcher's, swapped sides.
+//!      service — same shape as the consume-side launcher's, swapped sides.
 //!   6. `create_accessor(instance, addr_provider)` builds the
 //!      `LocalAccessor` `BnAccessor` binder; `hub::add_service` publishes
 //!      it to the kernel service manager as a regular service — no
 //!      VINTF `<accessor>` entry needed (the stock emulator's /system is
 //!      read-only). The libbinder client picks it up the same way the
-//!      2-13 D.8 launcher's `AServiceManager_addService` did, then
+//!      consume-side launcher's `AServiceManager_addService` did, then
 //!      transacts `addConnection()` on it directly.
 //!   7. `RpcServer::run_background()` serves the preconnected fd; the
 //!      main thread joins the kernel-binder thread pool to keep
@@ -91,9 +91,9 @@ impl Remotable for Interop {
             TX_ECHO => {
                 // AIDL-shaped wire: caller writes one String arg; reply
                 // is `Status::Ok` + the echoed String. Mirrors the C++
-                // launcher's `TX_ECHO` in 2-13 D.8 (`rpc_accessor_
-                // interop_launcher.cpp`) bit-for-bit, just on the
-                // opposite side of the bridge.
+                // consume-side launcher's `TX_ECHO`
+                // (`rpc_accessor_interop_launcher.cpp`) bit-for-bit,
+                // just on the opposite side of the bridge.
                 let s: String = reader.read()?;
                 eprintln!("[rsbinder-server] TX_ECHO arg={s:?} (from real libbinder client)");
                 reply.write(&Status::from(StatusCode::Ok))?;
@@ -147,7 +147,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 2) Kernel-binder worker threads — without these, the registered
     //    IAccessor binder cannot answer transactions and the libbinder
     //    client hangs in `addConnection()` (mirrors the
-    //    `ABinderProcess_startThreadPool()` call in the 2-13 D.8
+    //    `ABinderProcess_startThreadPool()` call in the consume-side
     //    launcher).
     ProcessState::start_thread_pool();
 
@@ -179,7 +179,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     //    the libbinder client looks it up via `AServiceManager_get*`
     //    and then transacts `addConnection()` on it directly. No VINTF
     //    `<accessor>` entry is needed (the stock emulator's read-only
-    //    /system blocks it anyway — same constraint the 2-13 D.8
+    //    /system blocks it anyway — same constraint the consume-side
     //    launcher hits and works around).
     hub::add_service(&instance, accessor_binder)?;
 

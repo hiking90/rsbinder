@@ -1,22 +1,20 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `RpcProxy` — client-side handle to a remote RPC object
-//! (subplan 2-2 S-d, **P5**).
+//! `RpcProxy` — client-side handle to a remote RPC object.
 //!
 //! A **distinct `IBinder` type** from `proxy::ProxyHandle`. It never
 //! goes through the u32 kernel handle / `handle_to_proxy` / cache-pin
-//! machinery (AC-2.6) — RPC has its own `RpcAddress` identity space and
+//! machinery — RPC has its own `RpcAddress` identity space and
 //! its own ref-count. Android made `BpBinder` a dual-mode
 //! `variant<BinderHandle, RpcHandle>`; because rsbinder's `IBinder` is
-//! a trait, a separate type is cleaner (master §4 P5).
+//! a trait, a separate type is cleaner.
 //!
-//! Subplan 2-2 drove this proxy from a hand-written typed stub.
-//! Subplan 2-6.B generalised the generator to emit
-//! `as_remote().ok_or(BadType)?` (a [`RemoteProxy`](crate::RemoteProxy)
-//! trait object) instead of the kernel-only `as_proxy().unwrap()`, so
-//! the **generated** `Bp*` stub now drives this proxy directly — the
-//! same single stub also drives the kernel `ProxyHandle`.
+//! The generator emits `as_remote().ok_or(BadType)?` (a
+//! [`RemoteProxy`](crate::RemoteProxy) trait object) instead of the
+//! kernel-only `as_proxy().unwrap()`, so the **generated** `Bp*` stub
+//! drives this proxy directly — the same single stub also drives the
+//! kernel `ProxyHandle`.
 
 use std::any::Any;
 use std::mem::ManuallyDrop;
@@ -38,9 +36,9 @@ pub struct RpcProxy {
     /// address (not a descriptor string), so a proxy resolved from
     /// `read_binder`/`get_root` starts empty and is stamped **once,
     /// in place** by the generated typed stub's `from_binder`
-    /// (subplan 2-6.B, via [`stamp_descriptor`](Self::stamp_descriptor)).
+    /// (via [`stamp_descriptor`](Self::stamp_descriptor)).
     /// In-place — never a replacement proxy — keeps the dedup-cache
-    /// identity and the single `DEC_STRONG` intact (AC-2.5 / P5).
+    /// identity and the single `DEC_STRONG` intact.
     descriptor: OnceLock<String>,
     session: Weak<RpcSessionInner>,
     /// Death-notification state, mirroring the kernel
@@ -79,12 +77,9 @@ impl RpcProxy {
         let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
             // All `obituary_sent` reads/writes that race `link`/`unlink`
             // happen under this write lock (kernel parity: `mLock`).
-            //
-            // M18 fix (review 2026-05-21): a poisoned recipients lock
-            // means a prior panic on this proxy's death pathway —
-            // log + return best-effort instead of panicking the serve
-            // loop. (`link_to_death`/`unlink_to_death` surface poison
-            // as `StatusCode::DeadObject` via `?`.)
+            // A poisoned recipients lock means a prior panic on this
+            // proxy's death pathway — log + return best-effort instead
+            // of panicking the serve loop.
             let mut recipients = match self.recipients.write() {
                 Ok(g) => g,
                 Err(_) => {
@@ -135,13 +130,13 @@ impl RpcProxy {
         self.addr
     }
 
-    /// Subplan 2-6.B: stamp the interface descriptor — known only to
+    /// Stamp the interface descriptor — known only to
     /// the generated typed stub at compile time — onto this
     /// **already-cached** proxy, in place. First write wins and is
     /// idempotent for the same interface (one wire address identifies
     /// one remote object = one interface). Never replaces the proxy:
     /// a replacement would send a second `DEC_STRONG` on drop and
-    /// split the per-address dedup cache (AC-2.5 / P5).
+    /// split the per-address dedup cache.
     ///
     /// Because the generated `from_binder` stamps *its own*
     /// `$descriptor` here **before** its `binder.descriptor() !=
@@ -156,11 +151,11 @@ impl RpcProxy {
     /// `from_binder`'s descriptor check then returns `None`).
     ///
     /// **Return**: `true` if this call wrote the descriptor, `false`
-    /// if it was already stamped (M20 fix — review 2026-05-21:
-    /// surfacing the `OnceLock::set` result lets a caller distinguish
-    /// fresh-stamp from already-stamped without an extra
-    /// `descriptor()` round-trip. Existing callers (generator
-    /// `from_binder`) can keep ignoring the result with `let _ = …`).
+    /// if it was already stamped. Surfacing the `OnceLock::set` result
+    /// lets a caller distinguish fresh-stamp from already-stamped
+    /// without an extra `descriptor()` round-trip; existing callers
+    /// (generator `from_binder`) can keep ignoring the result with
+    /// `let _ = …`.
     pub fn stamp_descriptor(&self, descriptor: &str) -> bool {
         self.descriptor.set(descriptor.to_string()).is_ok()
     }
@@ -173,14 +168,14 @@ impl RpcProxy {
 
     /// Build an RPC-mode request `Parcel` for `descriptor`, with the
     /// session's object hooks attached and the interface token written.
-    /// Hand-written typed stubs (2-2) call this, write their args, then
+    /// Hand-written typed stubs call this, write their args, then
     /// [`RpcProxy::transact`].
     pub fn build_request(&self, descriptor: &str) -> Result<Parcel> {
         let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
         let mut data = Parcel::new();
         data.attach_rpc_ops(inner.parcel_ops());
         // So `ParcelFileDescriptor::serialize` applies the negotiated
-        // FD policy (default `None` ⇒ the 2-2 reject — subplan 2-7).
+        // FD policy (default `None` ⇒ the categorical reject).
         data.set_rpc_fd_mode(inner.fd_mode());
         data.set_rpc_record_fd_positions(inner.records_fd_positions());
         super::session::write_rpc_interface_token(&mut data, descriptor)?;
@@ -200,10 +195,10 @@ impl RpcProxy {
     }
 }
 
-/// Subplan 2-6 (D1): the RPC proxy implements the same generalized
+/// The RPC proxy implements the same generalized
 /// [`RemoteProxy`](crate::RemoteProxy) trait as the kernel
 /// `ProxyHandle`, so the one generated `Bp*` stub drives either stack
-/// (generator emits `as_remote()`, 2-6.B). `prepare_transact` writes
+/// (generator emits `as_remote()`). `prepare_transact` writes
 /// the interface token from the descriptor stamped in place by the
 /// generated `from_binder` ([`stamp_descriptor`](RpcProxy::stamp_descriptor)).
 impl crate::binder::RemoteProxy for RpcProxy {
@@ -232,23 +227,21 @@ impl crate::binder::RemoteProxy for RpcProxy {
 impl Drop for RpcProxy {
     fn drop(&mut self) {
         // Last `Arc<RpcProxy>` for this address is going away: tell the
-        // peer to drop its strong ref (AC-2.5). Best-effort — never
-        // panic in Drop, and a dead session simply means the peer is
-        // already gone.
+        // peer to drop its strong ref. Best-effort — never panic in
+        // Drop, and a dead session simply means the peer is already
+        // gone.
         //
-        // **C1 fix (review 2026-05-21)**: `queue_dec_strong` is a
-        // non-blocking mpsc enqueue handled by the session's reaper
-        // thread. The previous synchronous `send_dec_strong` here
-        // called `find_conn(false)`, which on a single-slot session
-        // (default `N==1`) `cv.wait`s if another thread already drives
-        // the slot — a Drop on an unrelated worker would block the
-        // user's hot path for the full peer round-trip.
+        // `queue_dec_strong` is a non-blocking mpsc enqueue handled by
+        // the session's reaper thread, rather than a synchronous send:
+        // on a single-slot session a synchronous `find_conn` would
+        // `cv.wait` if another thread already drives the slot, blocking
+        // the user's hot path for the full peer round-trip.
         if let Some(inner) = self.session.upgrade() {
             inner.queue_dec_strong(self.addr);
             // Identity-checked: if this proxy's `Arc` already hit 0 and
             // a concurrent `read_binder` re-cached a fresh live proxy
             // for the same address, this stale `Drop` must NOT evict
-            // that successor (AC-2.5 / P5 — see `forget_remote_if`).
+            // that successor (see `forget_remote_if`).
             inner.forget_remote_if(&self.addr, self as *const RpcProxy as *const ());
         }
     }
@@ -276,10 +269,9 @@ impl IBinder for RpcProxy {
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
         let mut recipients = self.recipients.write().map_err(|_| {
-            // M18 fix (review 2026-05-21): a poisoned recipients
-            // lock means a prior panic on this proxy's death
-            // pathway. Surface as `DeadObject` so a caller can
-            // recover (e.g. drop the binder, re-establish) rather
+            // A poisoned recipients lock means a prior panic on this
+            // proxy's death pathway. Surface as `DeadObject` so a
+            // caller can recover (drop the binder, re-establish) rather
             // than panicking out of a public `IBinder` method.
             StatusCode::DeadObject
         })?;
@@ -296,10 +288,9 @@ impl IBinder for RpcProxy {
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         let mut recipients = self.recipients.write().map_err(|_| {
-            // M18 fix (review 2026-05-21): a poisoned recipients
-            // lock means a prior panic on this proxy's death
-            // pathway. Surface as `DeadObject` so a caller can
-            // recover (e.g. drop the binder, re-establish) rather
+            // A poisoned recipients lock means a prior panic on this
+            // proxy's death pathway. Surface as `DeadObject` so a
+            // caller can recover (drop the binder, re-establish) rather
             // than panicking out of a public `IBinder` method.
             StatusCode::DeadObject
         })?;

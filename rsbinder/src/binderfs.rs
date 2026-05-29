@@ -27,11 +27,23 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
         minor: 0,
     };
 
-    for (a, c) in device
-        .name
-        .iter_mut()
-        .zip(CString::new(name)?.as_bytes_with_nul())
-    {
+    let cname = CString::new(name)?;
+    let name_bytes = cname.as_bytes_with_nul();
+    // `zip` would otherwise silently truncate a name that does not fit,
+    // leaving the 256-byte field without a NUL terminator and handing the
+    // kernel a mis-named device. Fail loudly instead.
+    if name_bytes.len() > device.name.len() {
+        log::error!(
+            "Binder device name too long: {} bytes (max {})",
+            name_bytes.len(),
+            device.name.len()
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "binder device name too long",
+        ));
+    }
+    for (a, c) in device.name.iter_mut().zip(name_bytes) {
         *a = *c as std::os::raw::c_char;
     }
 

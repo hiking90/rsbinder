@@ -1,20 +1,20 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! TLS transport over **rustls** (subplan 2-4 track T; decoupled in 2-15).
+//! TLS transport over **rustls**.
 //!
 //! Trust boundary: the TLS certificate chain. rsbinder **never invents
 //! crypto** — key/cert/root management and all verification are the
-//! caller's `rustls::ClientConfig`/`ServerConfig` and rustls itself
-//! (plan §5). A failed certificate check is rejected at the handshake,
-//! before a single RPC payload byte is exchanged (AC-4.5).
+//! caller's `rustls::ClientConfig`/`ServerConfig` and rustls itself.
+//! A failed certificate check is rejected at the handshake, before a
+//! single RPC payload byte is exchanged.
 //!
 //! The peer identity is the leaf certificate: subject label + SHA-256
 //! fingerprint ([`super::CertId`]). There is deliberately **no
 //! plaintext-network backend** — `tcp_debug` is debug-only and
 //! `Anonymous`; real networks must use this.
 //!
-//! ## Decoupled from TCP and from framing (subplan 2-15)
+//! ## Decoupled from TCP and from framing
 //!
 //! TLS is **orthogonal to the socket kind** (mirrors AOSP
 //! `RpcTransportCtx::newTransport(fd)`): the crypto state machine
@@ -25,7 +25,7 @@
 //! and the android-13+ raw I/O (`send_raw`/`recv_raw`), so the opt-in
 //! android-13+ `RpcSession` profile can run over TLS.
 //!
-//! ## Concurrency (the keystone, 2-15 §2.0)
+//! ## Concurrency
 //!
 //! `Connection` (crypto) is behind a `Mutex` that is held **only for
 //! in-memory work** — ciphertext is produced into a buffer, then the
@@ -143,7 +143,7 @@ impl Write for IoAdapter<'_> {
 }
 
 /// A framed-or-raw transport over a completed TLS connection, decoupled
-/// from the socket kind and from the wire profile (subplan 2-15).
+/// from the socket kind and from the wire profile.
 pub struct TlsTransport {
     /// rustls crypto state (both directions). Held **only for in-memory
     /// work** — never across a blocking socket op.
@@ -163,7 +163,7 @@ pub struct TlsTransport {
 /// SHA-256 of the peer's leaf certificate, as a [`CertId`]. `subject`
 /// is a caller-meaningful label (the SNI for a client-side peer, a
 /// fixed marker for an mTLS client) — rsbinder does not parse X.509;
-/// the fingerprint is the authoritative identity (plan 2-4.t2).
+/// the fingerprint is the authoritative identity.
 fn cert_identity(
     certs: Option<&[rustls::pki_types::CertificateDer<'_>]>,
     subject: &str,
@@ -180,7 +180,7 @@ fn cert_identity(
 
 /// Drive the TLS handshake to completion over `stream` (blocking,
 /// single-threaded — before the connection is shared). A verification
-/// failure surfaces here, before any RPC payload (AC-4.5).
+/// failure surfaces here, before any RPC payload.
 fn drive_handshake(conn: &mut Connection, stream: &dyn TlsStream) -> RpcResult<()> {
     let mut io = IoAdapter(stream);
     while conn.is_handshaking() {
@@ -221,7 +221,7 @@ impl TlsTransport {
 
     /// Server side over **any** stream: TLS-handshake per `config`. With
     /// an mTLS config the client certificate is required + verified by
-    /// rustls; its absence/invalidity fails the handshake here (AC-4.5).
+    /// rustls; its absence/invalidity fails the handshake here.
     pub fn accept_stream(
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,
@@ -294,9 +294,8 @@ impl TlsTransport {
     /// these control records) in sequence order under its own `wlock`,
     /// and `recv_raw` retries on its next iteration. This keeps the
     /// reader from ever blocking behind a (possibly back-pressured)
-    /// socket write — preserving the lock-free-duplex liveness the
-    /// keystone (§2.0) provides, while still ordering every write_tls →
-    /// transmit under `wlock`.
+    /// socket write — preserving the lock-free-duplex liveness, while
+    /// still ordering every write_tls → transmit under `wlock`.
     fn flush_control(&self) -> RpcResult<()> {
         let Ok(_g) = self.wlock.try_lock() else {
             return Ok(());

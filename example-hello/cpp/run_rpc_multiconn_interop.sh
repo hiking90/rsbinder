@@ -5,14 +5,36 @@
 # android-16 emulator. The non-negotiable multi-connection-per-session
 # interop gate (Plan 2-12 §3 AC-12.6).
 #
-# ⚠ STATUS (2026-05-21): GATE NOT YET PASSING — kept in tree as the
-# future-gate harness. See launcher source (cpp/rpc_multiconn_interop_
-# launcher.cpp) for the 2026-05-21 diagnostic summary (rsbinder wire
-# bytes are byte-correct; even a process-wide server send mutex
-# doesn't fix it; root cause still undiagnosed — multi-conn is
-# experimental in `RpcServer::set_max_threads(N >= 2)`'s doc).
+# STATUS (2026-05-28): AC-12.6 PASS — all three gates green, multi-
+# conn is out of EXPERIMENTAL.
+#   * (a) PASS: concurrent twoway across 2 outgoing slots (~80 ms,
+#     well under 250 ms parallel budget). Validates the plan 2-12
+#     Phase D wire fix (`server_accept` INCOMING bit parse +
+#     NewSessionResponse only for new session + direction-aware
+#     "cci" exchange).
+#   * (b) PASS: 20 oneway calls + polled TX_GET_LOG drain. Validates
+#     Phase C (per-`mNodeForAddress` `asyncNumber` send-side +
+#     receive-side `asyncTodo` priority replay): libbinder's
+#     `ExclusiveConnection::find(CLIENT_ASYNC)` round-robins oneway
+#     across the client's `mOutgoing` pool, so the rsbinder server
+#     receives them split across slots whose `serve_blocking_on`
+#     workers dispatch independently. The per-node `asyncTodo` parks
+#     out-of-order arrivals and the priority replay drains them when
+#     the matching expected `async_number` arrives — eventual per-
+#     node monotonic order, bounded poll window in the launcher.
+#   * (c) PASS: 2 parallel TX_INVOKE_CALLBACK from 2 client threads
+#     each land on their own server incoming-slot worker; the nested
+#     server→client `cb.transact` rides the **same** slot via the
+#     plan 2-12 Phase A `find_conn` DRIVING `(sess, slot)` re-entry
+#     pin (bidirectional wire on one TCP socket). The libbinder
+#     client's `waitForReply` loop on that slot dispatches the
+#     inbound nested TRANSACT in re-entrant context and writes the
+#     reply on the same slot. F8.B (split `mOutgoing`/`mIncoming`
+#     pools) turned out to be **not required** — the AOSP-divergent
+#     "1 slot pool + DRIVING `(sess, slot)` reentrant pin" model is
+#     functionally equivalent at the wire level.
 #
-# Prereqs (same as run_stage3.sh / run_stage3_register.sh):
+# Prereqs (same as run_rpc_accessor_interop.sh / run_rpc_accessor_register_interop.sh):
 #   * Android_16 AVD booted (`emulator -avd Android_16 -port 5556`).
 #   * NDK r29+ at `$ANDROID_NDK_HOME` (default
 #     `/opt/homebrew/share/android-ndk`).
@@ -20,7 +42,7 @@
 #   * `aarch64-linux-android` rustup target installed.
 #
 # Usage:
-#   ./run_stage3_multiconn.sh [-s emulator-5556]
+#   ./run_rpc_multiconn_interop.sh [-s emulator-5556]
 #
 # Exits 0 on AC-12.6 PASS; non-zero otherwise.
 

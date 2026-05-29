@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fuzz target: arbitrary bytes → **RPC-mode** `Parcel` deserialization
-//! (`plan/2-2` §6.3 / V4 — the third 2-2 fuzz target). RPC newly drives
+//! RPC newly drives
 //! the AIDL parcel deserializers with untrusted *socket* bytes (the
 //! kernel path never did — the driver validated senders). Property: no
 //! panic / OOM / UB / unbounded pre-allocation; every length-driven
-//! allocation is bounded by the bytes actually present (T1-3).
+//! allocation is bounded by the bytes actually present.
 
 #![no_main]
 

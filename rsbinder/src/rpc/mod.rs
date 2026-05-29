@@ -8,8 +8,7 @@
 //! (`RpcServer`/`RpcSession`/`RpcState`). It shares only the high-level
 //! data model (`IBinder`/`Parcel`/AIDL stubs) with the kernel path; it
 //! never touches `ProcessState`, `ThreadState`, `/dev/binder`, ioctl or
-//! mmap. See `plan/2-rpc-transport.md` for the architecture and the
-//! per-workstream subplans `plan/2-1`…`plan/2-7`.
+//! mmap.
 //!
 //! # Security
 //!
@@ -23,7 +22,7 @@
 //! gives the RPC layer **no basis for access control** — this is
 //! logged explicitly and must be treated as untrusted. Plaintext
 //! network transport is never appropriate for production (use the
-//! `tls` backend, added by subplan 2-4).
+//! `tls` backend).
 //!
 //! # Example (Unix-domain server + client)
 //!
@@ -42,9 +41,8 @@
 //! let _negotiated = client.negotiate(4).unwrap();
 //! let root = client.get_root().unwrap();
 //! // Drive `root` with the **same generated stub** as the kernel path
-//! // — subplan 2-6.B makes the AIDL generator emit
-//! // `as_remote().ok_or(BadType)?`, so one `Bp*` resolves either
-//! // stack:
+//! // — the AIDL generator emits `as_remote().ok_or(BadType)?`, so one
+//! // `Bp*` resolves either stack:
 //! //
 //! //     let foo: Strong<dyn IFoo> =
 //! //         <dyn IFoo as FromIBinder>::try_from(root)?;
@@ -62,10 +60,9 @@
 //!
 //! # Async
 //!
-//! The RPC stack's I/O is **blocking** (subplan 2-3 §7-2 — matches
+//! The RPC stack's I/O is **blocking** (thread-per-connection, matching
 //! android-12 r34's blocking-thread model). There is deliberately *no*
-//! non-blocking `RpcTransport` / async serve loop; that "true async
-//! I/O" is a separately-deferred §7-2 item.
+//! non-blocking `RpcTransport` / async reactor serve loop.
 //!
 //! What *is* supported (and verified — `tests/rpc_async.rs`) is the
 //! same `spawn_blocking` adapter the kernel async path uses, over RPC:
@@ -75,7 +72,7 @@
 //!   `client_transact` on `tokio::task::spawn_blocking`; the reply
 //!   parse is the async continuation. Concurrent calls on one shared
 //!   session stay correctly serialized by the per-connection driver
-//!   lock (AC-3.2), now under genuine async concurrency.
+//!   lock, now under genuine async concurrency.
 //! * **Async service** — `Bn*::new_async_binder(impl …AsyncService,
 //!   TokioRuntime(handle))` drives an `async fn` handler via
 //!   `rt.block_on` from the blocking serve worker.
@@ -87,6 +84,7 @@
 
 pub mod address;
 pub mod fd_mode;
+pub(crate) mod lifecycle;
 pub mod proxy;
 pub mod server;
 pub mod session;
@@ -105,12 +103,12 @@ pub use transport::{CertId, PeerIdentity, RpcTransport};
 
 /// Re-export of the exact `rustls` the `tls` backend links, so callers
 /// build `ClientConfig`/`ServerConfig` against a matching version
-/// (subplan 2-4 track T — key/cert management stays caller-side).
+/// (key/cert management stays caller-side).
 #[cfg(feature = "rpc-tls")]
 pub use rustls;
 pub use wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
-/// android-13+ versioned wire codec (subplan 2-5b, additive —
-/// version-keyed: v0 = android-13, v1 = android-14/15. `R34Codec`
+/// android-13+ versioned wire codec (additive — version-keyed:
+/// v0 = android-13, v1 = android-14/15. `R34Codec`
 /// stays the default; this never affects the kernel path).
 pub use wire_android13::Android13PlusCodec;
 
@@ -120,7 +118,7 @@ use std::fmt;
 ///
 /// The transport layer surfaces a *rich* [`RpcError`] (so callers can
 /// distinguish a clean peer close from a truncated frame, etc.). Public
-/// RPC APIs (added by later subplans) project this onto
+/// RPC APIs project this onto
 /// `rsbinder::Result` (`StatusCode`) or AIDL-facing `Status` at the
 /// boundary — see [`StatusCode::RpcError`](crate::StatusCode::RpcError)
 /// and `From<RpcError> for StatusCode`.
@@ -130,9 +128,8 @@ pub type RpcResult<T> = std::result::Result<T, RpcError>;
 ///
 /// Kept separate from [`StatusCode`](crate::StatusCode) because
 /// `StatusCode` is `Copy`/`Ord`/`Hash` and cannot carry a rich payload.
-/// `#[non_exhaustive]` so later subplans (wire decode in 2-2, session
-/// handshake in 2-3, TLS in 2-4) can add variants without a breaking
-/// change.
+/// `#[non_exhaustive]` so the wire-decode, session-handshake, and TLS
+/// layers can add variants without a breaking change.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum RpcError {
@@ -143,7 +140,7 @@ pub enum RpcError {
     /// truncated (peer closed mid-body, or declared more than it sent).
     Truncated,
     /// A declared frame length exceeds [`transport::MAX_FRAME_LEN`].
-    /// Rejected *before* any allocation (anti-OOM, V4).
+    /// Rejected *before* any allocation (anti-OOM).
     FrameTooLarge {
         /// The length the peer (or caller) declared.
         declared: usize,
@@ -152,10 +149,10 @@ pub enum RpcError {
     },
     /// An underlying transport I/O error that is not a clean close.
     Io(std::io::Error),
-    /// A protocol-level violation (used by the wire codec in 2-2+).
+    /// A protocol-level violation (used by the wire codec).
     Protocol(&'static str),
     /// A configured wait deadline elapsed with no frame boundary
-    /// reached (subplan 2-3 — reply / negotiation timeout). Reported
+    /// reached (reply / negotiation timeout). Reported
     /// only when nothing partial was consumed, so the stream stays
     /// frame-synchronized.
     Timeout,
@@ -203,6 +200,22 @@ impl From<std::io::Error> for RpcError {
     }
 }
 
+impl From<RpcError> for std::io::Error {
+    /// Boundary projection back to `std::io::Error` for callers that
+    /// hold an `io::Result<_>` accumulator (the accept-loop dispatch in
+    /// `RpcServer::run` is the motivating site — its `accept_transport`
+    /// helper must surface a `from_stream`-side `RpcError` through the
+    /// same `io::ErrorKind` matching as the underlying `accept()`).
+    /// `RpcError::Io` round-trips the original `io::Error` unchanged;
+    /// other variants are wrapped with [`std::io::ErrorKind::Other`].
+    fn from(e: RpcError) -> Self {
+        match e {
+            RpcError::Io(io) => io,
+            other => std::io::Error::other(format!("{other}")),
+        }
+    }
+}
+
 impl From<RpcError> for crate::StatusCode {
     /// Boundary projection used when an RPC failure must surface through
     /// `rsbinder::Result`. Specific, actionable mappings where they
@@ -221,14 +234,14 @@ impl From<RpcError> for crate::StatusCode {
     }
 }
 
-/// Decode-only entrypoint for the `rpc_parcel_rpc_mode` fuzz target
-/// (2-2 §6.3 / V4). Arbitrary bytes are interpreted as an **RPC-mode**
+/// Decode-only entrypoint for the `rpc_parcel_rpc_mode` fuzz target.
+/// Arbitrary bytes are interpreted as an **RPC-mode**
 /// `Parcel` body and run through the deserializers a real RPC
 /// transaction reaches: scalars, `String`, the generic `Vec<T>` array
 /// path, binder-as-`RpcAddress`, and the AIDL out-vec resizers.
 /// Property: no panic / OOM / UB / unbounded pre-allocation on *any*
-/// input — every length is bounded by the bytes actually present
-/// (T1-3 hardening). Not part of the supported API surface.
+/// input — every length is bounded by the bytes actually present.
+/// Not part of the supported API surface.
 #[doc(hidden)]
 pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     use crate::binder::SIBinder;
@@ -271,7 +284,7 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     // (upstream Android is identical); feeding an arbitrary length
     // would just OOM the fuzzer without modelling a real wire input.
     // The bounded `in`-array path (`deserialize_array`) above is the
-    // T1-3 surface this target covers.
+    // surface this target covers.
 }
 
 #[cfg(test)]
@@ -331,13 +344,13 @@ mod tests {
         assert_ne!(v, StatusCode::FailedTransaction.into());
     }
 
-    /// T1-3 / V3: a hostile array length in an RPC-mode parcel must
-    /// fail gracefully (bounded pre-allocation + `Err`), never
-    /// pre-allocate gigabytes. Deterministic regression — reverting the
+    /// A hostile array length in an RPC-mode parcel must fail
+    /// gracefully (bounded pre-allocation + `Err`), never pre-allocate
+    /// gigabytes. Deterministic regression — reverting the
     /// `min(len, data_avail())` / `len > data_avail()` guards turns each
     /// of these into a multi-GB allocation that aborts the test
-    /// process (mutant detected). It is the *enforceable* V4 gate;
-    /// the `rpc_parcel_rpc_mode` fuzz target is the soak supplement.
+    /// process. The `rpc_parcel_rpc_mode` fuzz target is the soak
+    /// supplement.
     #[test]
     fn rpc_parcel_hostile_array_len_is_bounded_not_oom() {
         use crate::parcel::Parcel;
@@ -366,7 +379,7 @@ mod tests {
         // data — the callee fills it — so they are unbounded by design,
         // exactly like Android libbinder's `resizeOutVector`. Bounding
         // them by `data_avail()` regressed the live kernel out-array
-        // path; see the T1-3 note in `parcel.rs`.)
+        // path; see the note in `parcel.rs`.)
 
         // The fuzz entrypoint must never panic on adversarial bytes.
         for pat in [

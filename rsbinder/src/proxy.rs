@@ -35,7 +35,7 @@ use crate::{
 ///     `binder_ref → binder_node` association across that thrash and
 ///     return `BR_FAILED_REPLY` ("cannot find target node") on the very
 ///     next transaction. Stable strong caching avoids the thrash
-///     entirely and matches the PR #102 baseline.
+///     entirely.
 ///
 ///   * **Self-cycle case (`CachedExtension::Weak`)** — the extension's
 ///     handle equals the parent's own handle (a remote naming itself as
@@ -73,6 +73,20 @@ enum CachedExtension {
 pub struct ProxyHandle {
     handle: u32,
     descriptor: String,
+    /// Uid attributed to this proxy at construction
+    /// time, used by [`crate::proxy_count`]'s per-uid map. Captured
+    /// via [`thread_state::get_calling_uid_or_self`], which mirrors
+    /// AOSP `IPCThreadState::getCallingUid()`: the kernel-delivered
+    /// sender uid inside a `BR_TRANSACTION`, or this process's own
+    /// `getuid()` when no incoming transaction is on the stack.
+    tracked_uid: u32,
+    /// True iff this proxy's construction reached the
+    /// matching `proxy_count::on_proxy_create` call, so [`Drop`] knows
+    /// it owes a matching `on_proxy_drop`. Set on the success path of
+    /// `new_acquired`; left `false` by test-only construction helpers
+    /// (`synthetic_proxy`) and by the construction-failure path where
+    /// `inc_strong_handle` errored before the counter was bumped.
+    count_acquired: AtomicBool,
     stability: Stability,
     /// Set once when `send_obituary` runs to publish "this proxy is
     /// dead" to all observers.
@@ -110,16 +124,28 @@ impl ProxyHandle {
         descriptor: String,
         stability: Stability,
     ) -> Result<Arc<Self>> {
-        let arc = Arc::new(Self {
+        // Capture the calling uid via the AOSP-faithful helper so the
+        // per-uid tracking map matches `IPCThreadState::getCallingUid()`
+        // semantics (this process's `getuid()` outside a transaction,
+        // kernel-delivered sender uid inside).
+        let tracked_uid = thread_state::get_calling_uid_or_self();
+        // Bump the kernel ref FIRST. If this errors, the `Arc` we build
+        // below is dropped immediately, and `Drop::drop` must NOT call
+        // `proxy_count::on_proxy_drop` — otherwise we'd post a drop for
+        // a proxy that never reached `on_proxy_create`. The
+        // `count_acquired` guard below is how `Drop` knows.
+        thread_state::inc_strong_handle(handle)?;
+        crate::proxy_count::on_proxy_create(tracked_uid);
+        Ok(Arc::new(Self {
             handle,
             descriptor,
+            tracked_uid,
+            count_acquired: AtomicBool::new(true),
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
-        });
-        thread_state::inc_strong_handle(handle)?;
-        Ok(arc)
+        }))
     }
 
     /// Get the underlying binder handle number.
@@ -183,13 +209,10 @@ impl ProxyHandle {
     }
 }
 
-// Subplan 2-6: the kernel proxy implements the generalized
-// `RemoteProxy` trait by **delegating to its unchanged inherent
-// methods**. The inherent `submit_transact`/`prepare_transact` are
-// untouched, so existing generated `Bp*` code (which still calls them
-// via `as_proxy()`) and the kernel proxy's runtime behavior are
-// bit-identical by construction (AC-6.2 — no codegen change for the
-// kernel path).
+// The kernel proxy implements the generalized `RemoteProxy` trait by
+// delegating to its unchanged inherent methods, so existing generated
+// `Bp*` code (which still calls them via `as_proxy()`) and the kernel
+// proxy's runtime behavior are bit-identical by construction.
 impl RemoteProxy for ProxyHandle {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         ProxyHandle::prepare_transact(self, write_header)
@@ -330,16 +353,14 @@ impl ProxyHandle {
 
     pub fn dump<F: IntoRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
         // Fast-fail BEFORE consuming the fd. `submit_transact` would
-        // also short-circuit on `obituary_sent` (PR #104 §1), but by
-        // the time we reach it, `fd.into_raw_fd()` has already
-        // detached the raw fd from `F`'s RAII; an early `Err` from
-        // `submit_transact` would then leak the fd. Mirroring the
-        // `submit_transact` Acquire-load here lets `F` drop naturally
-        // (closing the fd) when the proxy is already dead. The non-
-        // fast-fail error paths (parcel-write failures, in-`transact`
-        // errors after the kernel sees the fd) still exhibit the
-        // pre-existing leak shape — see FOLLOW_UP_PR_104.md Item 4
-        // "Follow-up scope" for the wider fix.
+        // also short-circuit on `obituary_sent`, but by the time we
+        // reach it, `fd.into_raw_fd()` has already detached the raw fd
+        // from `F`'s RAII; an early `Err` from `submit_transact` would
+        // then leak the fd. Mirroring the `submit_transact` Acquire-load
+        // here lets `F` drop naturally (closing the fd) when the proxy
+        // is already dead. The non-fast-fail error paths (parcel-write
+        // failures, in-`transact` errors after the kernel sees the fd)
+        // still exhibit a leak.
         if self.obituary_sent.load(Ordering::Acquire) {
             return Err(StatusCode::DeadObject);
         }
@@ -385,6 +406,13 @@ impl Drop for ProxyHandle {
                 "BC_RELEASE for handle {} failed during Drop: {err:?}",
                 self.handle
             );
+        }
+        // Only post the drop if construction reached the matching
+        // `on_proxy_create`. Test-only `synthetic_proxy`
+        // and the `inc_strong_handle`-failure path leave the guard
+        // `false`, so the proxy_count globals never see a phantom drop.
+        if self.count_acquired.load(Ordering::Relaxed) {
+            crate::proxy_count::on_proxy_drop(self.tracked_uid);
         }
     }
 }
@@ -442,16 +470,12 @@ impl IBinder for ProxyHandle {
     fn set_extension(&self, _extension: &SIBinder) -> Result<()> {
         // `set_extension` is a server-side operation: a service
         // publishes its extension binder for clients to discover via
-        // `get_extension()`. Calling it on a client proxy used to
-        // succeed silently, caching locally without telling the
-        // remote service — and after PR #104's §4 scope-down the
-        // local cache holds a strong `Arc<dyn IBinder>` for the
-        // parent's lifetime, silently pinning an unrelated binder.
+        // `get_extension()`. A client proxy has no way to inform the
+        // remote service, and the local strong cache would pin an
+        // unrelated `Arc<dyn IBinder>` for the parent's lifetime.
         // Reject with `InvalidOperation`, matching the default trait
         // impl in `binder.rs`. In-tree callers operate on native
-        // `Binder`, not `ProxyHandle`, so this reject is safe (see
-        // `tests/src/test_client.rs`, `tests/src/bin/test_service.rs`,
-        // `tests/src/bin/test_service_async.rs`).
+        // `Binder`, not `ProxyHandle`, so this reject is safe.
         Err(StatusCode::InvalidOperation)
     }
 
@@ -639,6 +663,11 @@ mod tests {
         Arc::new(ProxyHandle {
             handle: 1,
             descriptor: "test".to_string(),
+            tracked_uid: 0,
+            // `count_acquired = false` means `Drop` skips
+            // `proxy_count::on_proxy_drop`, matching this constructor's
+            // skip of `new_acquired`'s `on_proxy_create`.
+            count_acquired: AtomicBool::new(false),
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),
@@ -658,12 +687,6 @@ mod tests {
     /// turn the returned `Weak` into a dangling reference that
     /// `Weak::upgrade()` and the production-side liveness check
     /// would treat as already-dead.
-    ///
-    /// Older tests used `noop_recipient_weak()` which returned a
-    /// dangling weak directly. That was benign for fast-fail tests
-    /// (the obituary check fired first) but masked the upgrade
-    /// liveness check added in Item 8 — a future test added against
-    /// the dangling form would fail mysteriously.
     fn live_recipient_pair() -> (Arc<dyn DeathRecipient>, sync::Weak<dyn DeathRecipient>) {
         let arc: Arc<dyn DeathRecipient> = Arc::new(NoopRecipient);
         let weak = Arc::downgrade(&arc);
@@ -737,8 +760,7 @@ mod tests {
 
     /// Registering the same recipient twice and unlinking once must
     /// remove only one entry — the user's remaining registration is
-    /// silently lost if `unlink_to_death` removes every match (the
-    /// `Vec::retain` bug fixed here). Mirrors C++
+    /// silently lost if `unlink_to_death` removes every match. Mirrors C++
     /// `BpBinder::unlinkToDeath` returning after a single
     /// `mObituaries->removeAt(i)`. The recipients vector is
     /// populated directly so the test does not require ProcessState
@@ -893,10 +915,9 @@ mod tests {
     /// `InvalidOperation` — the operation is server-side only and a
     /// proxy has no way to inform the remote service. Silent
     /// success would (a) leave the remote unaware of the new
-    /// extension and (b) after PR #104's §4 scope-down, pin an
-    /// unrelated `Arc<dyn IBinder>` for the parent's lifetime via
-    /// the strong-cache common case. The cache must remain
-    /// `NotQueried` after the rejected call.
+    /// extension and (b) pin an unrelated `Arc<dyn IBinder>` for the
+    /// parent's lifetime via the strong-cache common case. The cache
+    /// must remain `NotQueried` after the rejected call.
     #[test]
     fn test_set_extension_on_proxy_rejects_with_invalid_operation() {
         let proxy = synthetic_proxy(false);

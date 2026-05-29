@@ -1,12 +1,12 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-4 track T: the TLS backend, exercised with the **2-2/2-3
-//! core unchanged** — only the transport is swapped (additive
-//! invariant AC-4.1). Covers AC-4.4 (valid cert handshake + AIDL
-//! round-trip + `Certificate` peer-id), AC-4.5 (untrusted cert →
-//! handshake reject, **zero RPC payload**), AC-4.6 (no plaintext
-//! network backend — enforced by type/absence, noted here).
+//! The TLS backend, exercised with the **core
+//! unchanged** — only the transport is swapped. Covers a valid cert
+//! handshake + AIDL round-trip + `Certificate` peer-id, an untrusted
+//! cert → handshake reject (**zero RPC payload**), and the absence of
+//! any plaintext network backend (enforced by type/absence, noted
+//! here).
 //!
 //! Separate test binary; `#![cfg(feature = "rpc-tls")]` so it only
 //! builds/runs with the feature (default test runs don't pay rustls).
@@ -133,7 +133,7 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// AC-4.1 / AC-4.4: valid cert → handshake + the unchanged 2-2/2-3
+/// Valid cert → handshake + the unchanged
 /// AIDL e2e over TLS; both ends see a `Certificate` peer identity.
 #[test]
 fn tls_valid_cert_e2e_and_peer_identity() {
@@ -155,7 +155,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     let tcp = TcpStream::connect(addr).expect("tcp connect");
     let client_t = TlsTransport::connect(tcp, "localhost", client_config_trusting(CA))
         .expect("client handshake");
-    // AC-4.4: peer identity is a leaf-cert fingerprint.
+    // Peer identity is a leaf-cert fingerprint.
     match client_t.peer_identity() {
         PeerIdentity::Certificate(c) => {
             assert_eq!(c.fingerprint().len(), 32);
@@ -174,8 +174,8 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     server.join().unwrap();
 }
 
-/// **2-15 AC-15.1**: TLS is decoupled from TCP — the same handshake +
-/// unchanged 2-2/2-3 AIDL e2e runs over a **`UnixStream`** via
+/// TLS is decoupled from TCP — the same handshake +
+/// unchanged AIDL e2e runs over a **`UnixStream`** via
 /// [`TlsTransport::connect_stream`]/[`TlsTransport::accept_stream`]
 /// (not just `TcpStream`). Mirrors AOSP's socket-kind-orthogonal
 /// `RpcTransportCtx::newTransport(fd)`.
@@ -212,7 +212,7 @@ fn tls_over_unix_socket_e2e() {
     server.join().unwrap();
 }
 
-/// **2-15 (2-15.5 convenience)**: the one-call TCP+TLS client
+/// The one-call TCP+TLS client
 /// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
 /// handshake + R34 session — interoperates with a TLS server end to end.
 #[test]
@@ -240,11 +240,11 @@ fn setup_tcp_client_tls_convenience_e2e() {
     server.join().unwrap();
 }
 
-/// **2-15 keystone concurrency gate**: a single `TlsTransport` must
+/// Concurrency gate: a single `TlsTransport` must
 /// support a sender thread and a receiver thread **concurrently**
 /// ([`RpcTransport`] contract). The decomposed `Mutex<Connection>` +
-/// `try_lock` write-path (subplan 2-15 §2.0) makes this lock-free-duplex
-/// safe — the original single-`Mutex<TlsIo>` would deadlock here (a
+/// `try_lock` write-path makes this lock-free-duplex
+/// safe — a single-`Mutex<TlsIo>` would deadlock here (a
 /// blocked `recv` held the lock the `send` needed). Drives full
 /// bidirectional traffic on both ends and checks FIFO integrity.
 #[test]
@@ -302,7 +302,7 @@ fn tls_concurrent_bidirectional_duplex() {
     cli_send.join().unwrap();
 }
 
-/// **2-15 AC-15.5**: TLS rejects out-of-band file descriptors *by type*
+/// TLS rejects out-of-band file descriptors *by type*
 /// — `SCM_RIGHTS` cannot ride an encrypted byte stream, so `TlsTransport`
 /// keeps the trait's rejecting default for `send_*_with_fds` (no
 /// override). Matches AOSP, where `FileDescriptorTransportMode::Unix` is
@@ -337,7 +337,7 @@ fn tls_rejects_fd_passing_by_type() {
     let _ = server.join();
 }
 
-/// AC-4.5 (security, 1st class): a server cert NOT signed by the
+/// Security: a server cert NOT signed by the
 /// client's trusted CA must be rejected **at the handshake** — the
 /// client never obtains a session, so zero RPC payload is exchanged.
 #[test]
@@ -363,7 +363,7 @@ fn tls_untrusted_cert_rejected_at_handshake() {
     let _ = server.join();
 }
 
-/// AC-4.6 documentation gate: there is **no** plaintext-network
+/// Documentation gate: there is **no** plaintext-network
 /// constructor in the RPC public API — `tcp_debug` is the only TCP
 /// path, it is `rpc-tcp-debug`-gated and hard-wired `Anonymous`, and
 /// `tls` is the only real-network transport. This is enforced by
@@ -375,4 +375,197 @@ fn no_plaintext_network_backend_in_api() {
     // If a plaintext network transport were ever added, this file
     // would be the natural place to construct it — its continued
     // absence is the gate. (Compile-time: nothing to call.)
+}
+
+/// TCP+TLS server e2e via `RpcServer::setup_tcp_server_tls`.
+/// The server is a real `RpcServer`:
+/// accept loop, worker-thread TLS handshake (so a slow-handshake peer
+/// never stalls accept), authorizer hook (post-handshake peer-id), and
+/// the rest of the `RpcServer` knob set all work unchanged.
+///
+/// **Mutant gate**: dropping the `*server.tls_config.lock() =
+/// Some(config)` line in `setup_tcp_server_tls` (or returning `None`
+/// from `tls_snapshot()`) leaves the worker wrapping the accepted
+/// TcpStream with the plain branch — `RawAccepted::Tcp(_)` then hits
+/// the "plain-text TCP server is not exposed" error, the worker exits
+/// without serving, the client's TLS handshake times out / errors.
+#[test]
+fn setup_tcp_server_tls_e2e() {
+    use rsbinder::rpc::RpcServer;
+
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server =
+        RpcServer::setup_tcp_server_tls("127.0.0.1:0", srv_cfg).expect("setup_tcp_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    let addr = server.tcp_address().expect("tcp_address");
+    // Accessor gates: tcp_address Some, path None.
+    assert!(server.path().is_none(), "TCP server has no fs path");
+    let bg = server.run_background();
+
+    // Use the matching one-call client convenience constructor — the
+    // helper itself goes through `setup_tcp_client_tls`'s normal
+    // TCP-connect → TLS-handshake → R34 session path.
+    let client = RpcSession::setup_tcp_client_tls(addr, "localhost", client_config_trusting(CA))
+        .expect("setup_tcp_client_tls");
+    let root = client.get_root().expect("get_root over TCP+TLS server");
+    assert_eq!(ping_via(&root, "e1-tcp").unwrap(), "pong:e1-tcp");
+    assert_eq!(ping_via(&root, "").unwrap(), "pong:");
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+}
+
+/// vsock × TLS hermetic e2e, server built
+/// via `RpcServer::setup_vsock_server_tls`, client TLS-wraps a raw
+/// vsock stream with `TlsTransport::connect_stream`. The 1st-class
+/// Android AVF / Microdroid pVM scenario (vsock socket plane + TLS
+/// crypto plane), now end-to-end through the public `RpcServer` API.
+///
+/// **Environment gate** — `#[ignore]` so default `cargo test`
+/// (CI / macOS) never runs it. Loopback vsock requires the Linux
+/// `vsock_loopback` kernel module (`sudo modprobe vsock_loopback` on a
+/// host with no peer VM); a peer-VM environment skips the modprobe
+/// step. CI does not load kernel modules, so this is hermetic-by-
+/// `#[ignore]`; the canonical verification surface is the REMOTE_LINUX
+/// box per memory.
+///
+/// **Compile gate** — `target_os = "linux"` plus the `rpc-vsock` and
+/// `rpc-tls` features. macOS host compiles this file out of this test
+/// (the `rpc-tls` `#![cfg]` at the top of the file keeps the build
+/// graph clean elsewhere).
+#[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn vsock_tls_loopback_e2e() {
+    use rsbinder::rpc::transport::VsockTransport;
+    use rsbinder::rpc::RpcServer;
+    use vsock::VMADDR_CID_LOCAL;
+
+    // Arbitrary unused port; mirrors `tests/rpc_vsock.rs` choice +
+    // bumped one digit so a left-behind no-TLS server (the other test)
+    // doesn't `EADDRINUSE` this one in a back-to-back run.
+    const TLS_TEST_PORT: u32 = 0x52_43;
+
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server = RpcServer::setup_vsock_server_tls(VMADDR_CID_LOCAL, TLS_TEST_PORT, srv_cfg)
+        .expect("setup_vsock_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    assert_eq!(
+        server.vsock_address(),
+        Some((VMADDR_CID_LOCAL, TLS_TEST_PORT))
+    );
+    assert!(server.path().is_none(), "vsock+TLS server has no fs path");
+    let bg = server.run_background();
+
+    // Client: vsock connect → TLS handshake over the raw vsock stream.
+    // No client-side `setup_vsock_client_tls` convenience function yet
+    // (a separate small follow-up); the underlying composition is one
+    // line per AOSP `RpcTransportCtx::newTransport(fd)` (socket-kind-
+    // orthogonal TLS).
+    //
+    // `VsockTransport::connect` returns an `RpcTransport` already, but
+    // here we need the raw `VsockStream` so the TLS handshake runs
+    // *over* it (not as the framing transport itself). Build the
+    // stream by hand — `vsock::VsockStream::connect` matches the
+    // existing `VsockTransport::connect` body.
+    let vsock_stream =
+        vsock::VsockStream::connect(&vsock::VsockAddr::new(VMADDR_CID_LOCAL, TLS_TEST_PORT))
+            .expect("client vsock connect");
+    let client_t = TlsTransport::connect_stream(
+        Box::new(vsock_stream),
+        "localhost",
+        client_config_trusting(CA),
+    )
+    .expect("client TLS handshake over vsock");
+    // Over vsock+TLS: peer identity is the leaf-cert fingerprint
+    // (not `Vsock { cid }` — that's the `VsockTransport` plain identity,
+    // here the TLS layer overrides).
+    match client_t.peer_identity() {
+        PeerIdentity::Certificate(c) => assert_eq!(c.fingerprint().len(), 32),
+        other => panic!("expected Certificate peer id over vsock+TLS, got {other}"),
+    }
+    let client =
+        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let root = client.get_root().expect("get_root over vsock+TLS");
+    assert_eq!(ping_via(&root, "vsock-tls").unwrap(), "pong:vsock-tls");
+    assert_eq!(ping_via(&root, "").unwrap(), "pong:");
+
+    // Silence the `VsockTransport` import on Linux builds where it's
+    // not referenced (we only use it as a type-witness that the vsock
+    // client transport exists; the actual client builds the stream by
+    // hand to keep the TLS wrap explicit).
+    let _: fn(u32, u32) -> _ = VsockTransport::connect;
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+}
+
+/// UDS+TLS server e2e via `RpcServer::setup_unix_server_tls`.
+/// TLS is socket-kind-orthogonal (AOSP `RpcTransportCtx::newTransport(fd)`);
+/// the same TLS handshake runs over a UnixStream once `RpcServer` no
+/// longer pins the listener to UDS-without-TLS. Demonstrates the
+/// listener generalization carrying the TLS path through it.
+#[test]
+fn setup_unix_server_tls_e2e() {
+    use rsbinder::rpc::RpcServer;
+
+    let path = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rsb_rpc_unix_tls_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    };
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server = RpcServer::setup_unix_server_tls(&path, srv_cfg).expect("setup_unix_server_tls");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    assert_eq!(
+        server.path(),
+        Some(path.as_path()),
+        "UDS+TLS server still exposes its fs path"
+    );
+    let bg = server.run_background();
+    // Wait for the socket file to appear (bounded).
+    for _ in 0..400 {
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(path.exists(), "UDS server socket must appear");
+
+    // Client: open the UDS by hand and run the TLS handshake on it
+    // via `TlsTransport::connect_stream` (the socket-kind-orthogonal
+    // client API). The R34 wire then carries the AIDL e2e.
+    let unix_client = UnixStream::connect(&path).expect("unix connect");
+    let client_t = TlsTransport::connect_stream(
+        Box::new(unix_client),
+        "localhost",
+        client_config_trusting(CA),
+    )
+    .expect("client TLS handshake over UDS+TLS server");
+    let client =
+        RpcSession::new(Box::new(client_t), AddressSpace::Initiator).expect("RpcSession::new");
+    let root = client.get_root().expect("get_root over UDS+TLS");
+    assert_eq!(ping_via(&root, "e1-uds").unwrap(), "pong:e1-uds");
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
 }

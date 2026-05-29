@@ -180,7 +180,7 @@ const FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT: u32 = 9;
 /// (= this value `<< FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT`); the constant here is
 /// the pre-shift value mask used to clamp callers (`policy` must be 0..=3).
 /// Naming `_VALUE_MASK` (rather than `_MASK`) avoids colliding with the post-shift
-/// `_MASK` in AOSP `binder.h`. CODE_REVIEW_RECOMMENDATIONS #6.
+/// `_MASK` in AOSP `binder.h`.
 const FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK: u32 = 0x3;
 
 fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
@@ -229,15 +229,33 @@ impl From<&SIBinder> for flat_binder_object {
             // single-statement window between this `From` returning
             // and the first `acquire` is the only leak path under a
             // `Parcel::write_aligned` panic (typically OOM), which is
-            // process-fatal anyway — see plan §5 #11.
+            // process-fatal anyway.
             let id =
                 process_state::ProcessState::as_self().publish_native(Arc::clone(binder.as_arc()));
+
+            // AOSP `Parcel.cpp::flattenBinder`: the scheduler priority /
+            // policy bits come from a SINGLE source. An explicit min
+            // priority/policy on the binder (any non-zero bit in those
+            // ranges — matching AOSP's `policy != 0 || priority != 0`
+            // test) OVERRIDES the default node priority instead of being
+            // OR-combined with it ("override value, since it is set
+            // explicitly"). Blindly OR-ing `sched_bits` over
+            // `local_binder_flags()` would corrupt the requested priority
+            // (e.g. requested 5 | default 19 = 23).
+            let local = binder.local_binder_flags();
+            let sched_mask = FLAT_BINDER_FLAG_PRIORITY_MASK
+                | (FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT);
+            let effective_sched = if local & sched_mask != 0 {
+                local & sched_mask
+            } else {
+                sched_bits
+            };
 
             flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_BINDER,
                 },
-                flags: binder.local_binder_flags() | sched_bits,
+                flags: (local & !sched_mask) | effective_sched,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: id },
                 cookie: 0,
             }

@@ -1448,8 +1448,8 @@ fn test_hub() {
         .any(|s| s.name == ITestService::BpTestService::descriptor()));
 }
 
-/// Real-binder regression for the lock-decoupled slow path
-/// (PR #118, `481b8c9`). N threads concurrently resolve the same
+/// Real-binder regression for the lock-decoupled slow path.
+/// N threads concurrently resolve the same
 /// service, racing through `strong_proxy_for_handle`'s P1/P2/P3 slow
 /// path while it performs IPC (descriptor query / service-manager
 /// ping) with the `handle_to_proxy` lock released.
@@ -1744,7 +1744,7 @@ fn test_binder_extension_use_as_interface() {
 }
 
 // =============================================================================
-// Cache-pin model integration tests (FOLLOW_UP_PR_100 test plan #1, #2, #3, #5)
+// Cache-pin model integration tests
 // =============================================================================
 //
 // These tests validate the cache-pin model on real binderfs. They require:
@@ -1754,19 +1754,19 @@ fn test_binder_extension_use_as_interface() {
 // They are run as part of the standard `cargo test --package tests` invocation
 // in `.github/workflows/integration-test.yml`.
 
-/// Test plan #2 — kernel ref-count consistency under the cache-pin model.
+/// Kernel ref-count consistency under the cache-pin model.
 ///
 /// Verifies that user-space `SIBinder` clones do NOT raise the kernel
 /// strong count: under the cache-pin model the kernel observes exactly
 /// **one `BC_ACQUIRE` per `Arc<ProxyHandle>` lifetime**, regardless of
-/// how many `SIBinder` / `Strong<I>` clones exist. Pre-PR (PR #100 and
-/// earlier), each clone drove its own `RefCounter.strong` cycle which
-/// could elevate the kernel count.
+/// how many `SIBinder` / `Strong<I>` clones exist. A per-clone
+/// `RefCounter.strong` cycle would have been able to elevate the kernel
+/// count.
 ///
 /// Sampling discipline: every command must reach the kernel before we
 /// read the count, so we issue a `ping_binder()` (which forces a driver
 /// round-trip) before each `strong_ref_count_for_node` query. This is
-/// the test-side analog of plan §4's `barrier_then_sample`.
+/// the test-side analog of a `barrier_then_sample`.
 #[test]
 fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     init_test();
@@ -1846,9 +1846,9 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     );
 }
 
-/// Test plan #1 — race reproducer for slow-path case (b).
+/// Race reproducer for slow-path case (b).
 ///
-/// Under master pre-PR-#100 with aggressive concurrency, the cache
+/// Without the cache-pin model, under aggressive concurrency the cache
 /// could hand out a fresh `ProxyHandle` whose handle had been freed
 /// by a racing `BC_RELEASE`, surfacing as `DeadObject` / `BadType` /
 /// wrong descriptor. Under the cache-pin model the cache pin keeps
@@ -1935,7 +1935,7 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
     }
 }
 
-/// Test plan #5 — barrier-coordinated case (b) variant.
+/// Barrier-coordinated case (b) variant.
 ///
 /// Tighter than the bulk reproducer: explicitly drives the cache
 /// `Weak` to dangling between rounds, then re-resolves to force
@@ -2037,13 +2037,13 @@ fn test_weak_partial_eq_handle_identity_across_resurrection() {
     );
 }
 
-/// Test plan #3 second bullet — `WIBinder::upgrade()` `Err(DeadObject)`
+/// `WIBinder::upgrade()` `Err(DeadObject)`
 /// branch coverage on the in-tree death-recipient path.
 ///
-/// Pre-PR `WIBinder` held a strong `Arc<dyn IBinder>`, so
-/// `WIBinder::upgrade()` always succeeded — the `Err` branch was
-/// dead code. Under this PR `WIBinder` is `sync::Weak<dyn IBinder>`,
-/// and once the last `Arc<ProxyHandle>` is dropped (which happens
+/// A `WIBinder` holding a strong `Arc<dyn IBinder>` would make
+/// `WIBinder::upgrade()` always succeed — the `Err` branch dead code.
+/// Because `WIBinder` is `sync::Weak<dyn IBinder>`,
+/// once the last `Arc<ProxyHandle>` is dropped (which happens
 /// after `BR_DEAD_BINDER` removes the cache entry and any user-held
 /// Strong drops) `upgrade()` legitimately returns `Err(DeadObject)`.
 ///
@@ -2142,7 +2142,7 @@ fn test_wibinder_upgrade_after_obituary() {
 }
 
 // =============================================================================
-// FOLLOW_UP_PR_104 integration tests
+// Death-notification / extension / dump integration tests
 //
 // These exercise the death-notification / extension / dump fixes through real
 // binder communication against `test_service`, complementing the in-crate unit
@@ -2352,10 +2352,10 @@ fn test_link_to_death_rejects_already_dead_weak_remote_proxy() {
     );
 }
 
-/// Item 3: `set_extension` on a remote proxy must reject with
+/// `set_extension` on a remote proxy must reject with
 /// `InvalidOperation` — the operation is server-side only and a proxy
-/// has no way to inform the remote service. The post-PR-104 §4
-/// strong-cache common case would otherwise silently pin an unrelated
+/// has no way to inform the remote service. A strong-cache common case
+/// would otherwise silently pin an unrelated
 /// `Arc<dyn IBinder>` for the parent's lifetime. Non-destructive —
 /// `get_extension` continues to work, returning the extension that
 /// `test_service` set on its native side.

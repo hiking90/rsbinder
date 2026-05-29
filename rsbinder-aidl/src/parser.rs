@@ -1,7 +1,13 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// #![allow(clippy::missing_const_for_fn)]
+// Clippy's `missing_const_for_thread_local` is a false positive for our
+// `HashMap` / `HashSet` / `Document` (transitively HashMap) initializers
+// — they are not `const fn` (need `RandomState` at runtime), so the
+// suggested `const { ... }` wrap fails with E0015. The lint fires against
+// the whole `thread_local!` block, and neither macro-invocation-level nor
+// per-static `#[allow]` reaches that scope, so suppression is file-scope.
+#![allow(clippy::missing_const_for_thread_local)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -27,21 +33,15 @@ pub enum SymbolType {
 }
 
 #[derive(Debug, Clone)]
-pub struct Symbol {
-    #[allow(dead_code)]
-    pub name: String,
+pub(crate) struct Symbol {
     pub value: crate::const_expr::ConstExpr,
-    #[allow(dead_code)]
     pub symbol_type: SymbolType,
-    #[allow(dead_code)]
-    pub namespace: Option<String>,
 }
 
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     static DECLARATION_DOCUMENT_MAP: RefCell<HashMap<Namespace, DocumentContext>> = RefCell::new(HashMap::new());
-    #[allow(clippy::missing_const_for_thread_local)]
-    static NAMESPACE_STACK: RefCell<Vec<Namespace>> = RefCell::new(Vec::new());
+    static NAMESPACE_STACK: RefCell<Vec<Namespace>> = const { RefCell::new(Vec::new()) };
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
 
     // Universal Symbol Table - supports all types of named constants
@@ -50,10 +50,8 @@ thread_local! {
     static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
     // Filename and source text of the source currently being parsed (used for error message generation)
-    #[allow(clippy::missing_const_for_thread_local)]
-    static CURRENT_SOURCE_NAME: RefCell<String> = RefCell::new(String::new());
-    #[allow(clippy::missing_const_for_thread_local)]
-    static CURRENT_SOURCE_TEXT: RefCell<String> = RefCell::new(String::new());
+    static CURRENT_SOURCE_NAME: RefCell<String> = const { RefCell::new(String::new()) };
+    static CURRENT_SOURCE_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
 
     // Non-fatal diagnostics accumulated during the current `parse_document`
     // call. Drained into `Document::warnings` before parse_document returns.
@@ -435,7 +433,11 @@ pub(crate) fn enum_member_const_expr_from_lookup(
             break;
         }
 
-        enum_val += 1;
+        // `wrapping_add` matches AOSP's C++ wraparound semantics and avoids
+        // a debug-build panic / release silent overflow when an enumerator
+        // carries an explicit `i64::MAX` value followed by an auto-increment
+        // member.
+        enum_val = enum_val.wrapping_add(1);
     }
 
     ENUM_RESOLUTION_STACK.with(|stack| {
@@ -501,12 +503,7 @@ pub fn register_symbol(
     symbol_type: SymbolType,
     namespace: Option<&str>,
 ) {
-    let symbol = Symbol {
-        name: name.to_string(),
-        value,
-        symbol_type,
-        namespace: namespace.map(|s| s.to_string()),
-    };
+    let symbol = Symbol { value, symbol_type };
 
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();
@@ -935,6 +932,111 @@ pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     String::new()
 }
 
+/// Parsed AOSP `@EnforcePermission` annotation. Mirrors the three forms
+/// `aidl_language.cpp::AidlAnnotation::EnforceExpression()` accepts:
+/// `@EnforcePermission("X")` / `@EnforcePermission(value = "X")` =
+/// [`EnforcePermissionExpr::Single`], `@EnforcePermission(allOf = {...})`
+/// = [`EnforcePermissionExpr::AllOf`], `@EnforcePermission(anyOf = {...})`
+/// = [`EnforcePermissionExpr::AnyOf`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnforcePermissionExpr {
+    Single(String),
+    AllOf(Vec<String>),
+    AnyOf(Vec<String>),
+}
+
+/// Walks an `Annotation::const_expr` (or array element) and returns the
+/// owned string when the value is `ValueType::String(_)`. The pest
+/// grammar already strips the surrounding double quotes, so no
+/// `trim_matches('"')` is required.
+fn const_expr_as_string(expr: &ConstExpr) -> Option<String> {
+    if let crate::const_expr::ValueType::String(ref s) = expr.value {
+        Some(s.clone())
+    } else {
+        None
+    }
+}
+
+/// Walks an `Annotation::const_expr` representing an AIDL string-array
+/// literal (`{"A", "B"}`) and returns the contained strings. Returns
+/// `None` for non-array values or arrays containing non-string elements
+/// — both are AOSP-rejected per
+/// `aidl_language.cpp::AidlAnnotation::CheckValid()`.
+fn const_expr_as_string_array(expr: &ConstExpr) -> Option<Vec<String>> {
+    let crate::const_expr::ValueType::Array(items) = &expr.value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(const_expr_as_string(item)?);
+    }
+    Some(out)
+}
+
+/// Extracts a parsed `@EnforcePermission(...)` from a method's annotation
+/// list, or `None` when the annotation is absent or syntactically
+/// malformed (no `value`/`allOf`/`anyOf` recognized — already surfaced by
+/// `parse_annotation_list`'s unknown-annotation warning path).
+///
+/// AOSP schema reference: `aidl_language.cpp:211-214` declares
+/// `EnforcePermission` with `{{"value", kStringType}, {"anyOf",
+/// kStringArrayType}, {"allOf", kStringArrayType}}` — exactly the three
+/// forms decoded here.
+pub fn enforce_permission_from_annotation_list(
+    annotation_list: &[Annotation],
+    method_name: &str,
+) -> Result<Option<EnforcePermissionExpr>, crate::error::AidlError> {
+    for annotation in annotation_list {
+        if annotation.annotation != "@EnforcePermission" {
+            continue;
+        }
+
+        // Shorthand `@EnforcePermission("X")`: AIDL grammar parses the
+        // bare positional argument into `annotation.const_expr` rather
+        // than `parameter_list`.
+        if let Some(c) = &annotation.const_expr {
+            if let Some(s) = const_expr_as_string(c) {
+                return Ok(Some(EnforcePermissionExpr::Single(s)));
+            }
+        }
+
+        // Named-parameter forms — match the AOSP schema's three keys.
+        for param in &annotation.parameter_list {
+            match param.identifier.as_str() {
+                "value" => {
+                    if let Some(s) = const_expr_as_string(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::Single(s)));
+                    }
+                }
+                "allOf" => {
+                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::AllOf(items)));
+                    }
+                }
+                "anyOf" => {
+                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
+                        return Ok(Some(EnforcePermissionExpr::AnyOf(items)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // `@EnforcePermission` annotation present but no recognized
+        // argument form matched. Refuse to emit an unguarded Bn —
+        // AOSP rejects this at build time too.
+        let (start, end) = annotation.annotation_span.unwrap_or((0, 0));
+        return Err(crate::error::AidlError::Semantic(Box::new(
+            crate::error::SemanticError::MalformedEnforcePermission {
+                method: method_name.to_string(),
+                src: miette::NamedSource::new(current_source_name(), current_source_text()),
+                span: (start, end.saturating_sub(start)).into(),
+            },
+        )));
+    }
+    Ok(None)
+}
+
 pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
     for annotation in annotation_list {
         if annotation.annotation == "@Descriptor" {
@@ -1280,8 +1382,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                     .next()
                     .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
                 // Map the common C/AIDL escape sequences to their actual code
-                // points; previously the escaped char was returned verbatim
-                // (e.g. `'\n'` yielded 'n' instead of newline).
+                // points (e.g. `'\n'` becomes newline, not the literal 'n').
                 match esc {
                     'n' => '\n',
                     't' => '\t',

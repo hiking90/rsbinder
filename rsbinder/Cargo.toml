@@ -43,20 +43,13 @@ rpc-vsock = ["rpc", "dep:vsock"]
 # channels. Zero cost when off (optional deps). rsbinder never
 # invents crypto — it delegates entirely to rustls (plan §5).
 rpc-tls = ["rpc", "dep:rustls", "dep:sha2"]
-# Lift the multi-connection-per-session slot-cap clamp (`RpcServer::set_max_threads(N >= 2)`,
-# subplan 2-12). EXPERIMENTAL: hermetic rsbinder↔rsbinder PASS, but the
-# non-negotiable real-libbinder interop gate AC-12.6 has not yet passed.
-#
-# `set_max_threads(N)` is always callable so AOSP libbinder peers that
-# expect a specific advertised value can interoperate on default builds
-# (the advertise side is unchanged). What this feature toggles is the
-# **attach arm**: on default builds the effective incoming-slot cap is
-# clamped to 1 even when N>=2, so id-echoing attach #2 is refused with
-# `rejected_unknown_id`; with this feature the cap takes the stored value
-# verbatim, enabling the hermetic multi-conn suite. See
-# `RpcServer::set_max_threads` rustdoc, `plan/2-12-multi-connection-per-session.md`
-# §3, and `RPC_STATUS.md`.
-rpc-experimental-multiconn = ["rpc"]
+# `rpc-experimental-multiconn` retired 2026-05-28: AC-12.6 (a) twoway
+# + (b) oneway PASS lifted multi-connection-per-session
+# (`RpcServer::set_max_threads(N >= 2)`) out of EXPERIMENTAL. The
+# slot-cap clamp is gone — `set_max_threads(N)` is now the true cap on
+# every build, with the AOSP-faithful `setMaxIncomingThreads` semantic.
+# See `plan/2-12-multi-connection-per-session.md` §8 (Phase D wire
+# fix) + §9 (Phase C asyncTodo).
 android_10 = []
 android_11 = []
 android_12 = []
@@ -92,14 +85,14 @@ sha2 = { version = "0.11", optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # subplan 2-9 Phase A: macOS/BSD peer-credential resolution
-# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux
-# `SO_PEERCRED`. **Target-gated to non-Linux unix only**, so Linux /
-# default / CI builds pull **zero** direct `libc` (AC-9.3): the
-# `[target.'cfg(...)']` table simply does not apply there. Only the
-# `#[cfg(feature = "rpc")]` RPC module references it, so an rpc-off
-# build links no `libc` symbols even on macOS.
+# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
+
+# Plan 4-5 Phase C: `sched_getscheduler` + SCHED_* constants are in libc;
+# rustix omits the SCHED_* constants.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

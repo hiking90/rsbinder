@@ -113,7 +113,20 @@ impl TypeGenerator {
             "IBinder" => ValueType::IBinder,
             "List" => match &aidl_type.generic {
                 Some(gen) => {
-                    array_types.push(ArrayInfo::new_list(&gen.to_value_type()?, &Vec::new()));
+                    // The grammar admits an array-typed generic argument
+                    // (`List<int[]>`), but a list-of-array element would be
+                    // stored as `ValueType::Array` and later hit the
+                    // `panic!` in `type_decl`. Reject it here with a proper
+                    // diagnostic (AOSP `aidl` likewise rejects list-of-array
+                    // semantically) rather than crashing the generator.
+                    let elem = gen.to_value_type()?;
+                    if matches!(elem, ValueType::Array(_)) {
+                        return Err(make_type_error(
+                            "List element type cannot be an array",
+                            aidl_type.name_span,
+                        ));
+                    }
+                    array_types.push(ArrayInfo::new_list(&elem, &Vec::new()));
                     ValueType::Array(Vec::new())
                 }
                 None => {

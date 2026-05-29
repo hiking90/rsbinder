@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Subplan 2-14 D.8.b — cross-process accessor discovery via rsb_hub on
-# a Linux host. The Linux native sibling of `run_stage3_register.sh`:
+# a Linux host. The Linux native sibling of `run_rpc_accessor_register_interop.sh`:
 # instead of cross-compiling for an Android emulator and using real
 # libbinder as the client, this drives the rsbinder consume-side
 # (`hub::get_service` → `Service::Accessor(Some(_))` arm → bridged RPC

@@ -1,27 +1,25 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Plan 2-14 D.8.b — cross-process accessor discovery via `rsb_hub`.
+//! Cross-process accessor discovery via `rsb_hub`.
 //!
-//! Exercises the end-to-end path that B.6 + B.7 enable on the kernel
-//! binder side:
+//! Exercises the end-to-end path on the kernel binder side:
 //!
 //!   1. A *separate* server process (the
 //!      `example-hello/src/bin/rpc_accessor_register_interop_server`
-//!      binary, originally written for the D.9 STAGE3 emulator harness
-//!      — reused verbatim here) registers an `IAccessor` binder with
-//!      `rsb_hub` via `hub::add_service(instance, accessor_binder)`.
-//!      rsb_hub's `addService` (B.6) inspects
+//!      binary, reused verbatim here) registers an `IAccessor` binder
+//!      with `rsb_hub` via `hub::add_service(instance, accessor_binder)`.
+//!      rsb_hub's `addService` inspects
 //!      `service.descriptor() == "android.os.IAccessor"` and stamps
 //!      `is_accessor = true`.
 //!   2. This test process calls `hub::get_service(instance)`.
-//!      rsb_hub's `getService2` (B.7) sees the flag and returns
+//!      rsb_hub's `getService2` sees the flag and returns
 //!      `Service::Accessor(Some(binder))` — distinct from the regular
 //!      `ServiceWithMetadata` wrap.
 //!   3. The consume-side accessor arm in
 //!      [`rsbinder::hub::servicemanager_16::resolve_accessor_arm`]
-//!      (2-13) transparently calls `IAccessor::addConnection` → adopts
-//!      the returned fd → runs the 2-8 android-13+ handshake → returns
+//!      transparently calls `IAccessor::addConnection` → adopts
+//!      the returned fd → runs the android-13+ handshake → returns
 //!      the RPC root binder.
 //!   4. This test transacts `TX_ECHO` and `TX_GIVE_MARKER` against the
 //!      root, asserting full Parcel-body byte parity with the server's
@@ -47,7 +45,7 @@ use rsbinder::*;
 
 /// Service-manager instance name the server bin registers under. The
 /// orchestration script passes the same string as `argv[1]` to the
-/// server bin. Distinct from the D.9 STAGE3 emulator instance to
+/// server bin. Distinct from the STAGE3 emulator instance to
 /// avoid collisions when both harnesses share a binder driver.
 const INSTANCE: &str = "rsbinder.test.d8b.accessor";
 
@@ -80,7 +78,7 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
 
     // 1. Discover via rsb_hub.
     //    Under the hood: kernel-binder `getService2(INSTANCE)`
-    //                    → rsb_hub returns `Service::Accessor(Some(_))` (B.7)
+    //                    → rsb_hub returns `Service::Accessor(Some(_))`
     //                    → consume-side `resolve_accessor_arm` bridges to RPC
     //                    → returns the RPC root binder.
     let root = hub::get_service(INSTANCE).unwrap_or_else(|| {
@@ -94,7 +92,7 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
     // The accessor arm wraps the consumed RPC connection in an
     // `RpcProxy`; downcasting is the canonical way to use the
     // `build_request`/`transact` helpers without going through a
-    // generated AIDL stub. Same pattern the 2-13 D.8 client uses.
+    // generated AIDL stub.
     let rp = (*root)
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()

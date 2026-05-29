@@ -13,14 +13,14 @@ pub use android::os::IServiceManager::{
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
-/// Subplan 2-13 A.4: bridge the `Service::Accessor` arm of
+/// Bridge the `Service::Accessor` arm of
 /// `getService2`/`checkService2` into a `ServiceWithMetadata` whose
 /// `service` is the RPC root pinned by an owning [`RpcSession`].
 ///
 /// Optional Accessor arm: an Accessor binder is **only** consumable via
 /// the RPC stack, so a build without the `rpc` feature falls back to
 /// the historical "log + None" behavior — byte-unchanged for that
-/// build (V1).
+/// build.
 #[cfg(feature = "rpc")]
 fn resolve_accessor_arm(
     name: &str,
@@ -45,7 +45,7 @@ fn resolve_accessor_arm(
     None
 }
 
-/// Subplan 2-14 A.5: process-local AccessorProvider fallback. AOSP
+/// Process-local AccessorProvider fallback. AOSP
 /// `BackendUnifiedServiceManager::toBinderService`
 /// (`BackendUnifiedServiceManager.cpp:287-313`, android-16.0.0_r4)
 /// calls `getInjectedAccessor(name, &accessor)` from the
@@ -60,34 +60,28 @@ fn resolve_accessor_arm(
 /// where servicemanager itself returns a VINTF `<accessor>` binder)
 /// and **does not** consult `getInjectedAccessor`.
 ///
-/// **M15 caveat (review 2026-05-21)**: rsbinder *intentionally departs*
-/// from that AOSP policy: the `Accessor` arm here calls
-/// `try_process_local_fallback` on miss. The rationale is defensive
-/// — a peer-supplied accessor whose `getInstanceName` doesn't match
-/// the requested name (mis-routing or impersonation) shouldn't
-/// shadow a locally-registered provider. This is a hardening choice,
-/// not an AOSP-faithfulness defect: rsbinder accepts a slightly
-/// broader resolution surface in exchange for closing a class of
-/// silent failures. If strict AOSP parity is required, gate this
-/// `or_else` behind a future opt-out flag.
+/// rsbinder *intentionally departs* from that AOSP policy: the
+/// `Accessor` arm here also calls `try_process_local_fallback` on miss.
+/// The rationale is defensive — a peer-supplied accessor whose
+/// `getInstanceName` doesn't match the requested name (mis-routing or
+/// impersonation) shouldn't shadow a locally-registered provider. This
+/// is a hardening choice, not an AOSP-faithfulness defect: rsbinder
+/// accepts a slightly broader resolution surface in exchange for
+/// closing a class of silent failures.
 ///
 /// The fallback fires when (a) the `ServiceWithMetadata` arm's inner
 /// binder is `None` (the common "no entry" signal) or (b) the
-/// `Accessor` arm fails to resolve (M15-defensive). The bridge from
-/// the returned `IAccessor` SIBinder to an `RpcSession` root is the
-/// same Phase 2-13 helper [`super::accessor_16::resolve_accessor`].
+/// `Accessor` arm fails to resolve. The bridge from the returned
+/// `IAccessor` SIBinder to an `RpcSession` root is the same helper
+/// [`super::accessor_16::resolve_accessor`].
 ///
-/// **M21 cfg-gate clarification (review 2026-05-21)**:
-/// `try_process_local_fallback` carries a `cfg(feature = "rpc")`
-/// gate, but `dispatch_typed_service` itself is cfg-free.
-/// `rpc`-OFF builds reach the `swm.service.is_none()` arm and call
-/// the **no-op stub**, which returns `None`, so the `or(Some(swm))`
-/// falls back to the original null `swm` — the same `None`-inside
-/// `swm` a pre-2-14 build would have returned (callers map it to
-/// `NameNotFound` identically). The end-to-end *result* is byte-
-/// unchanged; the *call shape* differs (a no-op stub is now invoked).
-/// "byte-unchanged" here therefore means "observable result unchanged",
-/// not "no extra function frame in the call stack".
+/// `try_process_local_fallback` carries a `cfg(feature = "rpc")` gate,
+/// but `dispatch_typed_service` itself is cfg-free. `rpc`-OFF builds
+/// reach the `swm.service.is_none()` arm and call the **no-op stub**,
+/// which returns `None`, so the `or(Some(swm))` falls back to the
+/// original null `swm` — the observable result is unchanged (callers
+/// map it to `NameNotFound` identically); only an extra no-op stub
+/// frame is invoked.
 #[cfg(feature = "rpc")]
 fn try_process_local_fallback(
     name: &str,
@@ -248,7 +242,7 @@ pub fn get_service_debug_info(
 
 #[cfg(all(test, feature = "rpc"))]
 mod tests {
-    //! Subplan 2-14 A.5 wire-up gate: drive `dispatch_typed_service`
+    //! Drive `dispatch_typed_service`
     //! directly so the AOSP-faithful fallback choice (process-local
     //! provider on `ServiceWithMetadata(service: None)` AND
     //! `Accessor(None)`) is *exercised* — not just the
@@ -306,7 +300,7 @@ mod tests {
         add_accessor_provider(HashSet::from([instance.to_owned()]), provider).expect("registry add")
     }
 
-    /// M14 fix (review 2026-05-21): wrap the provider closure with an
+    /// Wrap the provider closure with an
     /// observable side effect so a mutant removing the
     /// `dispatch_typed_service → try_process_local_fallback` call
     /// flips the test red. Returns the `(handle, called)` pair —
@@ -369,7 +363,7 @@ mod tests {
 
         // Now register a provider and re-dispatch — the fallback must
         // surface the registered Accessor's resolved root.
-        // **M14 mutant gate**: `called` flips iff the dispatcher
+        // Mutant gate: `called` flips iff the dispatcher
         // actually walked into `try_process_local_fallback` →
         // registry lookup → our provider closure.
         let (_handle, called) = register_observing_provider(&instance);
@@ -406,7 +400,7 @@ mod tests {
         // With a registered provider, dispatch_typed_service tries the
         // Accessor arm first (null ⇒ resolve_accessor_arm returns None),
         // then falls back. The fallback's full bridge may not connect
-        // (fake path) — the **M14 mutant gate** below is that the
+        // (fake path) — the mutant gate below is that the
         // provider closure was invoked, proving the `or_else` fired.
         let _ = dispatch_typed_service(&instance, null_accessor);
         assert!(

@@ -242,14 +242,13 @@ pub type FnFreeBuffer =
     fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
 /// RPC object-marshalling hooks attached to an RPC-mode `Parcel`
-/// (subplan 2-2, the rsbinder equivalent of android's
-/// `Parcel::mSession`/`RpcState`).
+/// (the rsbinder equivalent of android's `Parcel::mSession`/`RpcState`).
 ///
 /// `parcel.rs` only knows this trait; the implementation lives in the
 /// `rpc` module's session/state. When a `Parcel` is in RPC mode the
 /// `SIBinder` (de)serializers route through these hooks instead of the
 /// kernel `flat_binder_object` path — the kernel path is byte-identical
-/// when `is_for_rpc == false` (AC-2.9).
+/// when `is_for_rpc == false`.
 #[cfg(feature = "rpc")]
 pub trait RpcParcelOps: Send + Sync {
     /// Marshal a possibly-null binder leaving this process: append the
@@ -277,8 +276,8 @@ pub struct Parcel {
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
-    /// RPC serialization mode (subplan 2-2). Default `false` == kernel
-    /// path, byte-identical to before (AC-2.9). Only object marshalling
+    /// RPC serialization mode. Default `false` == kernel
+    /// path, byte-identical to the kernel wire. Only object marshalling
     /// and the object/FD lifetime branch on this; scalar/string/POD
     /// paths are unaffected.
     #[cfg(feature = "rpc")]
@@ -288,8 +287,8 @@ pub struct Parcel {
     /// binders.
     #[cfg(feature = "rpc")]
     rpc_ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
-    /// Negotiated FD-over-RPC mode (subplan 2-7). Default `None` ⇒ the
-    /// 2-2 reject, bit-identical (AC-7.1).
+    /// Negotiated FD-over-RPC mode. Default `None` ⇒ FD writes are
+    /// rejected, bit-identical to a parcel that carries no FDs.
     #[cfg(feature = "rpc")]
     rpc_fd_mode: crate::rpc::FileDescriptorTransportMode,
     /// FDs collected while serializing this (outgoing) RPC parcel in
@@ -304,17 +303,17 @@ pub struct Parcel {
     /// flattened RPC objects (binder at android-16 v2, FD at v1+),
     /// produced by `write_binder` / FD-write while serializing an
     /// RPC-mode parcel and consumed by the wire codec as the trailing
-    /// `u32[]` object table (subplan 2-8). **Always empty unless
-    /// `is_for_rpc`** — the kernel path never touches it (P1, AC-2.9):
+    /// `u32[]` object table. **Always empty unless
+    /// `is_for_rpc`** — the kernel path never touches it:
     /// kernel objects live in [`Parcel::objects`], a wholly separate
-    /// field. Empty ⇒ byte-identical to the pre-2-8 wire.
+    /// field. Empty ⇒ byte-identical to a wire with no object table.
     #[cfg(feature = "rpc")]
     rpc_object_positions: Vec<u32>,
     /// Whether an FD flattened into this parcel records its position
-    /// in [`Parcel::rpc_object_positions`] (subplan 2-8 Phase B). The
+    /// in [`Parcel::rpc_object_positions`]. The
     /// session sets this from its wire profile alongside the FD mode:
     /// `true` only on the android-13+ v1+ profile (R34 has no object
-    /// table — keeps the 2-7 FD-over-RPC wire byte-unchanged). Binder
+    /// table). Binder
     /// positions are recorded by the session directly (it owns the
     /// profile); only the FD path needs this Parcel-side flag.
     #[cfg(feature = "rpc")]
@@ -447,7 +446,7 @@ impl Parcel {
     }
 
     /// Switch this parcel between the kernel and RPC serialization
-    /// modes (subplan 2-2 / §7-3). Default is kernel mode; only object
+    /// modes. Default is kernel mode; only object
     /// marshalling and the object/FD lifetime branch on this — scalar,
     /// string and POD bytes are identical in both modes.
     #[cfg(feature = "rpc")]
@@ -481,12 +480,12 @@ impl Parcel {
         self.data.as_slice()
     }
 
-    // ---- subplan 2-8: RPC object table (android-16 v2) -------------
+    // ---- RPC object table (android-16 v2) --------------------------
 
     /// The sorted object-position table (AOSP `mObjectPositions`),
     /// consumed by the wire codec as a trailing `u32[]`. Always empty
     /// on the kernel path (`!is_for_rpc`) and when no RPC object was
-    /// flattened — i.e. byte-identical to the pre-2-8 wire.
+    /// flattened — i.e. byte-identical to a wire with no object table.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_positions(&self) -> &[u32] {
         &self.rpc_object_positions
@@ -494,8 +493,8 @@ impl Parcel {
 
     /// Install the object table that arrived with an incoming RPC
     /// parcel (AOSP `rpcSetDataReference`'s `mObjectPositions` copy),
-    /// so the binder/FD deserializers can validate object positions
-    /// (subplan 2-8 Phase C). No-op kernel-side (`!is_for_rpc`).
+    /// so the binder/FD deserializers can validate object positions.
+    /// No-op kernel-side (`!is_for_rpc`).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
         if !self.is_for_rpc {
@@ -506,10 +505,9 @@ impl Parcel {
 
     /// AOSP `Parcel::unflattenBinder` v2 strict check: a binder may
     /// only be read from a position that is in the object table
-    /// (`std::binary_search(mObjectPositions, objectPos)`; subplan
-    /// 2-8 Phase C / AC-8.7). The table arrives sorted from a
-    /// conformant peer; an unsorted/forged table simply fails the
-    /// search ⇒ the caller returns `BAD_VALUE` (safe).
+    /// (`std::binary_search(mObjectPositions, objectPos)`). The table
+    /// arrives sorted from a conformant peer; an unsorted/forged table
+    /// simply fails the search ⇒ the caller returns `BAD_VALUE` (safe).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_position_present(&self, pos: usize) -> bool {
         let Ok(pos) = u32::try_from(pos) else {
@@ -524,11 +522,11 @@ impl Parcel {
     /// `mObjectPositions.insert(upper_bound(...), dataPos)`).
     ///
     /// **Hard-gated on `is_for_rpc`**: a stray call on a kernel parcel
-    /// is a no-op, so the kernel wire (P1, AC-2.9) can never grow an
-    /// object table. The producer (subplan 2-8 Phase B) only calls
-    /// this from the RPC `write_binder` / FD-write paths, and the
-    /// caller decides *whether* to record (binder ⇒ v2 only; FD ⇒
-    /// v1+), faithfully mirroring AOSP's per-call version gate.
+    /// is a no-op, so the kernel wire can never grow an object table.
+    /// The producer only calls this from the RPC `write_binder` /
+    /// FD-write paths, and the caller decides *whether* to record
+    /// (binder ⇒ v2 only; FD ⇒ v1+), faithfully mirroring AOSP's
+    /// per-call version gate.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_object_position(&mut self, pos: usize) {
         if !self.is_for_rpc {
@@ -542,10 +540,10 @@ impl Parcel {
         self.rpc_object_positions.insert(at, pos);
     }
 
-    // ---- subplan 2-7: FD-over-RPC (opt-in, Unix mode) --------------
+    // ---- FD-over-RPC (opt-in, Unix mode) ---------------------------
 
     /// Set the negotiated FD-over-RPC mode for this parcel (default
-    /// `None` ⇒ FD write is the 2-2 reject, bit-identical).
+    /// `None` ⇒ FD write is rejected, bit-identical).
     #[cfg(feature = "rpc")]
     pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
         self.rpc_fd_mode = mode;
@@ -559,8 +557,8 @@ impl Parcel {
 
     /// Set by the session from its wire profile (alongside the FD
     /// mode): record FD object positions only on the android-13+ v1+
-    /// profile (subplan 2-8 Phase B). R34 stays `false` ⇒ the 2-7
-    /// FD-over-RPC wire is byte-unchanged.
+    /// profile. R34 stays `false` ⇒ the FD-over-RPC wire is
+    /// byte-unchanged.
     #[cfg(feature = "rpc")]
     pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
         self.rpc_record_fd_positions = yes;
@@ -623,7 +621,7 @@ impl Parcel {
 
     pub fn close_file_descriptors(&self) {
         // RPC-mode parcels never carry kernel FD objects (FD over RPC
-        // is rejected in 2-2 / opt-in in 2-7); nothing to close here.
+        // is rejected by default / opt-in via Unix mode); nothing to close here.
         #[cfg(feature = "rpc")]
         if self.is_for_rpc {
             return;
@@ -699,7 +697,7 @@ impl Parcel {
         // The kernel offset-table scan below is meaningless for an
         // RPC-mode parcel (RPC carries `RpcAddress`, not
         // `flat_binder_object`). Reaching here in RPC mode is a
-        // protocol error, not a silent mis-read (2-2.d2 #4).
+        // protocol error, not a silent mis-read.
         #[cfg(feature = "rpc")]
         if self.is_for_rpc {
             return Err(StatusCode::BadType);
@@ -903,17 +901,15 @@ impl Parcel {
 
         // usize in Rust may be 16-bit, so i32 may not fit
         let len = len.try_into().or(Err(StatusCode::BadValue))?;
-        // NOTE (T1-3): no `len <= data_avail()` cap here. Unlike an
-        // `in` array, an `out`/`inout` vec sends only its *length* in
-        // the parcel — the elements are produced by the callee, not
-        // read from the bytes that follow — so `len > data_avail()` is
-        // the normal, valid case. Capping it here regressed every
-        // out-array AIDL method on the live kernel binder (caught by
-        // the Android emulator integration run, not macOS). The
-        // unbounded-`len` OOM concern is real but must be bounded by a
-        // configured maximum, not by `data_avail()`; left as upstream
-        // (Android libbinder's `resizeOutVector` is likewise unbounded)
-        // — see RPC_STATUS T1-3 follow-up.
+        // No `len <= data_avail()` cap here. Unlike an `in` array, an
+        // `out`/`inout` vec sends only its *length* in the parcel —
+        // the elements are produced by the callee, not read from the
+        // bytes that follow — so `len > data_avail()` is the normal,
+        // valid case. Capping it here would regress every out-array
+        // AIDL method on the live kernel binder. The unbounded-`len`
+        // OOM concern is real but must be bounded by a configured
+        // maximum, not by `data_avail()` (Android libbinder's
+        // `resizeOutVector` is likewise unbounded).
         out_vec.resize_with(len, Default::default);
 
         Ok(())
@@ -936,9 +932,8 @@ impl Parcel {
         } else {
             // usize in Rust may be 16-bit, so i32 may not fit
             let len = len.try_into().or(Err(StatusCode::BadValue))?;
-            // See `resize_out_vec` (T1-3): an out-vec length is not
-            // backed by parcel data, so no `data_avail()` cap here —
-            // capping it regressed the live kernel out-array path.
+            // See `resize_out_vec`: an out-vec length is not backed by
+            // parcel data, so no `data_avail()` cap here.
             let mut vec = Vec::with_capacity(len);
             vec.resize_with(len, Default::default);
             *out_vec = Some(vec);
@@ -1058,11 +1053,11 @@ impl Parcel {
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
         // RPC mode never carries `flat_binder_object`s: binders are
-        // marshalled as `RpcAddress` and FDs are rejected upstream
-        // (2-2.d2 #3). Write the bytes verbatim but never load the
-        // kernel offset table or take a kernel `acquire()` — RPC has
-        // its own refcount. The kernel path below is byte-identical
-        // when `is_for_rpc == false` (AC-2.9).
+        // marshalled as `RpcAddress` and FDs are rejected upstream.
+        // Write the bytes verbatim but never load the kernel offset
+        // table or take a kernel `acquire()` — RPC has its own
+        // refcount. The kernel path below is byte-identical when
+        // `is_for_rpc == false`.
         #[cfg(feature = "rpc")]
         if self.is_for_rpc {
             self.write_aligned(obj);
@@ -1081,7 +1076,7 @@ impl Parcel {
     }
 
     pub(crate) fn write_interface_token(&mut self, interface: &str) -> Result<()> {
-        self.write(&(thread_state::strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
+        self.write(&(thread_state::get_strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
         self.update_work_source_request_header_pos();
         let work_source: i32 = if thread_state::should_propagate_work_source() {
             thread_state::calling_work_source_uid() as _
@@ -1169,7 +1164,13 @@ impl Parcel {
         let mut last_idx: i32 = -2;
         {
             let object_size = std::mem::size_of::<flat_binder_object>() as u64;
-            let objects = self.objects.as_slice();
+            // Scan the SOURCE parcel's object table (mirrors AOSP
+            // Parcel.cpp::appendFrom, which iterates `other`'s mObjects),
+            // not `self.objects`. The destination may be empty (e.g. a fresh
+            // ParcelableHolder parcel), in which case using `self.objects`
+            // would compute num_objects == 0 and silently drop every
+            // binder/FD object nested in the copied range.
+            let objects = other.objects.as_slice();
 
             for (i, &off) in objects.iter().enumerate() {
                 if off >= offset as _ && (off + object_size) <= (offset + size) as u64 {
@@ -1203,9 +1204,9 @@ impl Parcel {
         self.set_data_position(self.pos + size);
 
         // An RPC-mode parcel carries no `flat_binder_object`s, so the
-        // offset recompute / re-acquire / FD-dup below is kernel-only
-        // (2-2.d2 #5). `self.objects` is already empty in RPC mode so
-        // this is also defence-in-depth.
+        // offset recompute / re-acquire / FD-dup below is kernel-only.
+        // `self.objects` is already empty in RPC mode so this is also
+        // defence-in-depth.
         #[cfg(feature = "rpc")]
         let skip_objects = self.is_for_rpc;
         #[cfg(not(feature = "rpc"))]
@@ -1215,10 +1216,14 @@ impl Parcel {
             let start = self.objects.len();
             self.objects.resize(start + (num_objects as usize));
 
-            let objects = self.objects.as_mut_slice();
+            // Recompute each offset from the SOURCE table position
+            // (`other.objects`), then store the relocated offset into the
+            // destination table. AOSP: `off = pos - offset + startPos`.
+            let src_objects = other.objects.as_slice();
+            let dst_objects = self.objects.as_mut_slice();
             for (idx, i) in (start..).zip(first_idx..=last_idx) {
-                let off = objects[i as usize] as usize - offset + start_pos;
-                objects[idx] = off as _;
+                let off = src_objects[i as usize] as usize - offset + start_pos;
+                dst_objects[idx] = off as _;
                 let mut flat = read_flat_binder(self.data.as_slice(), off)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
@@ -1237,8 +1242,8 @@ impl Parcel {
     fn release_objects(&self) {
         // An RPC-mode parcel must never run kernel `release()` /
         // `decref_publish` — RPC objects have a different
-        // (DecStrong-based) lifetime (2-2.d2 #6). `self.objects` is
-        // empty in RPC mode anyway; this is defence-in-depth + intent.
+        // (DecStrong-based) lifetime. `self.objects` is empty in RPC
+        // mode anyway; this is defence-in-depth + intent.
         #[cfg(feature = "rpc")]
         if self.is_for_rpc {
             return;
@@ -1674,13 +1679,12 @@ mod tests {
         );
     }
 
-    /// **AC-8.6 / subplan 2-8 Phase B** — the RPC object-position
-    /// table is collected AOSP-faithfully: the recorded offset is the
-    /// position of the object's leading int32 (AOSP `dataPos =
-    /// mDataPos` *before* `writeInt32(TYPE_*)`), the table stays
-    /// **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
+    /// The RPC object-position table is collected AOSP-faithfully: the
+    /// recorded offset is the position of the object's leading int32
+    /// (AOSP `dataPos = mDataPos` *before* `writeInt32(TYPE_*)`), the
+    /// table stays **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
     /// dataPos)`) even when objects are recorded out of order, it is
-    /// hard-gated on `is_for_rpc` (kernel diff 0, AC-2.9), and it
+    /// hard-gated on `is_for_rpc` (kernel diff 0), and it
     /// survives a v2 codec encode→decode with the AOSP `bodySize =
     /// fixed + parcelDataSize + 4·N` framing. Single / multiple /
     /// mixed (binder-shaped + FD-shaped) objects.
@@ -1690,7 +1694,7 @@ mod tests {
         use crate::rpc::wire::{WireCodec, WireMessage, WireTransaction};
         use crate::rpc::wire_android13::Android13PlusCodec;
 
-        // ---- kernel parcel: recording is a hard no-op (P1/AC-2.9) ----
+        // ---- kernel parcel: recording is a hard no-op ----
         let mut kparcel = Parcel::new();
         kparcel.write(&7i32).unwrap();
         kparcel.rpc_record_object_position(0); // !is_for_rpc ⇒ ignored
@@ -1765,7 +1769,7 @@ mod tests {
             "upper_bound insert keeps the table sorted (dups allowed)"
         );
 
-        // AC-8.7 — the v2 strict-receive `binary_search` primitive
+        // The v2 strict-receive `binary_search` primitive
         // (`Parcel::unflattenBinder`): a recorded position passes, an
         // unrecorded one fails ⇒ `read_binder` returns BAD_VALUE.
         for &good in &[0u32, 8, 24, 40] {

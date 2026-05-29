@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Subplan 2-14 D.9 STAGE3 — drive a real-libbinder *client* against the
 # rsbinder IAccessor *register*-side bridge on the android-16 emulator.
-# The role-inverse of subplan 2-13 D.8's `run_stage3.sh` (there
+# The role-inverse of subplan 2-13 D.8's `run_rpc_accessor_interop.sh` (there
 # rsbinder was the client + libbinder served; here rsbinder serves +
 # libbinder is the client).
 #
@@ -14,7 +14,7 @@
 #     (`rustup target add aarch64-linux-android`).
 #
 # Usage:
-#   ./run_stage3_register.sh [-s emulator-5556]
+#   ./run_rpc_accessor_register_interop.sh [-s emulator-5556]
 #
 # Exits 0 on STAGE3 PASS; non-zero otherwise.
 

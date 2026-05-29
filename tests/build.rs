@@ -85,7 +85,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Subplan 2-6.B: test-only fixture for the generated-stub RPC e2e
+    // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen
     // that combines `rsbinder-aidl` output with the `rsbinder` runtime.

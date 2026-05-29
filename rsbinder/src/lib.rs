@@ -143,6 +143,13 @@ pub mod binderfs;
 pub mod error;
 /// File descriptor wrapper for IPC
 pub mod file_descriptor;
+/// `LazyServiceRegistrar` skeleton (state machine +
+/// `IClientCallback::onClients` dispatch). AOSP
+/// `frameworks/native/libs/binder/LazyServiceRegistrar.cpp`. Hub
+/// integration (actual `registerClientCallback` / `tryUnregisterService`
+/// IPC) is owed by the caller until the hub plumbing lands — see the
+/// module docs.
+pub mod lazy_service;
 mod macros;
 /// Native service implementation helpers
 pub mod native;
@@ -155,7 +162,21 @@ pub mod parcelable_holder;
 mod process_state;
 /// Client proxy for remote services
 pub mod proxy;
+/// Process-global proxy count + watermark callbacks
+/// with opt-in per-uid tracking. AOSP `BpBinder` proxy-count surface
+/// (`getBinderProxyCount` / `setBinderProxyCountWatermarks` /
+/// `setBinderProxyCountEventCallback` / `enableCountByUid`).
+pub mod proxy_count;
 mod ref_counter;
+/// Shared-memory IPC trait skeleton
+/// (`IMemoryHeap` / `IMemory` / `MemoryHeapBase`). AOSP
+/// `frameworks/native/libs/binder/include/binder/IMemory.h`. A future
+/// `memfd_create(2)`-backed `MemoryHeapBase` impl on Linux/Android and
+/// a `MemoryDealer` chunk allocator are not yet implemented. macOS
+/// host build compiles the trait surface but `MemoryHeapBase::new`
+/// permanently returns `Err(StatusCode::InvalidOperation)` — see the
+/// module docs.
+pub mod shared_memory;
 /// Status and exception handling
 pub mod status;
 mod sys;
@@ -163,13 +184,17 @@ mod sys;
 pub mod thread_state;
 
 /// RPC transport (binder-over-socket) — a separate stack from the
-/// kernel binder path. Present only with the `rpc` feature. See
-/// `plan/2-rpc-transport.md`.
+/// kernel binder path. Present only with the `rpc` feature.
 #[cfg(feature = "rpc")]
 pub mod rpc;
 
 /// Service hub and manager implementations
 pub mod hub;
+
+/// Client stub for Android's `PermissionManagerService`
+/// (`android.os.IPermissionController`). See module doc for the
+/// AOSP-faithful surface and fail-closed `check_permission` helper.
+pub mod permission_controller;
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
@@ -184,11 +209,11 @@ pub use binder::{
     DeathRecipient, FromIBinder, IBinder, Interface, Remotable, RemoteProxy, SIBinder, Stability,
     Strong, ToAsyncInterface, ToSyncInterface, Transactable, TransactionCode, TransactionFlags,
     WIBinder, Weak, DEBUG_PID_TRANSACTION, DUMP_TRANSACTION, EXTENSION_TRANSACTION,
-    FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF, FLAG_ONEWAY, FLAG_PRIVATE_LOCAL, FLAG_PRIVATE_VENDOR,
-    INTERFACE_HEADER, INTERFACE_TRANSACTION, LAST_CALL_TRANSACTION, LIKE_TRANSACTION,
-    PING_TRANSACTION, SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION,
-    START_RECORDING_TRANSACTION, STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION,
-    TWEET_TRANSACTION,
+    FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF, FLAG_COLLECT_NOTED_APP_OPS, FLAG_ONEWAY,
+    FLAG_PRIVATE_LOCAL, FLAG_PRIVATE_VENDOR, FLAG_UPDATE_TXN, INTERFACE_HEADER,
+    INTERFACE_TRANSACTION, LAST_CALL_TRANSACTION, LIKE_TRANSACTION, PING_TRANSACTION,
+    SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION, START_RECORDING_TRANSACTION,
+    STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION, TWEET_TRANSACTION,
 };
 // `declare_binder_interface!` expands to `$crate::__rpc_stamp_descriptor(...)`
 // in consumer crates, so this helper must stay reachable at the crate root.
@@ -202,6 +227,16 @@ pub use file_descriptor::ParcelFileDescriptor;
 
 // From `native` — server-side binder construction.
 pub use native::{is_handling_transaction, Binder, BinderFeatures};
+
+// From `thread_state` — calling identity (AOSP
+// `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
+// its own `PeerIdentity` model under `rpc::PeerIdentity`.
+pub use thread_state::{
+    clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
+    get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
+    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, CallingContext,
+    ExtendedError,
+};
 
 pub use parcel::Parcel;
 

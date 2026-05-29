@@ -1,11 +1,11 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-3: multi-session `RpcServer`, real-process e2e, threads,
+//! Multi-session `RpcServer`, real-process e2e, threads,
 //! `getRemoteMaxThreads` negotiation, oneway FIFO, nested callbacks,
-//! timeout, lifecycle, and the P6 no-global gate.
+//! timeout, lifecycle, and the no-global gate.
 //!
-//! Separate test binary (master §6). P6: each test builds its own
+//! Separate test binary. Each test builds its own
 //! server + sessions ⇒ parallel-safe, no `--test-threads=1`.
 
 #![cfg(feature = "rpc")]
@@ -44,7 +44,7 @@ struct EchoSvc {
     deeper: bool,
     /// Set on **entry** to `slow()` so a test can wait deterministically
     /// for a parked thread to have actually claimed a server worker
-    /// (e.g. AC-12.2's slot-pin scope). Tests that don't care pass a
+    /// (e.g. the slot-pin scope). Tests that don't care pass a
     /// fresh `AtomicBool` and ignore it. Set is one-way (no reset) —
     /// "at least one slow call entered" is the only signal needed.
     slow_entered: Arc<AtomicBool>,
@@ -166,8 +166,7 @@ fn make_service(counter: Arc<AtomicI64>) -> SIBinder {
 /// Build an `EchoSvc` whose `slow()` entry sets the supplied `AtomicBool`
 /// so a test can wait deterministically for a parked client thread to
 /// have actually claimed a server worker — instead of a sleep(N ms)
-/// heuristic that races scheduler jitter (the AC-12.2 mutant-gate
-/// reinforcement called out in review).
+/// heuristic that races scheduler jitter.
 fn make_service_with_slow_signal(
     counter: Arc<AtomicI64>,
     slow_entered: Arc<AtomicBool>,
@@ -279,7 +278,7 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
 /// an `assert!`/`unwrap`/`expect` panic mid-test. Without this an
 /// assertion failure leaks the background accept loop + every spawned
 /// `serve_blocking` worker into the test binary process for the
-/// remainder of the suite (each subsequent timing-sensitive AC-12.1*
+/// remainder of the suite (each subsequent timing-sensitive
 /// test then runs against a contaminated scheduler). Construct **once**
 /// per test, right after `server.run_background()`, then let `Drop` do
 /// the rest.
@@ -333,7 +332,7 @@ impl Drop for ServeCleanup {
     }
 }
 
-// ---- AC-3.1 real OS process e2e + AC-3.4 negotiation ---------------
+// ---- real OS process e2e + negotiation -----------------------------
 
 #[test]
 fn real_process_e2e_and_negotiation() {
@@ -357,12 +356,12 @@ fn real_process_e2e_and_negotiation() {
 
     {
         let client = RpcSession::setup_unix_client(&path).expect("connect");
-        // AC-3.4: explicit negotiation, local=8, server advertises 2.
+        // Explicit negotiation, local=8, server advertises 2.
         assert_eq!(client.negotiate(8).expect("negotiate"), 2);
         assert_eq!(client.negotiated_max_threads(), 2);
 
         let root = EchoProxy(client.get_root().expect("get_root"));
-        // AC-3.1: real cross-process AIDL call.
+        // Real cross-process AIDL call.
         assert_eq!(
             root.echo("over a real process").unwrap(),
             "over a real process"
@@ -373,13 +372,13 @@ fn real_process_e2e_and_negotiation() {
         }
     }
 
-    // AC-3.7: killing the client leaves the server able to exit cleanly.
+    // Killing the client leaves the server able to exit cleanly.
     child.kill().expect("kill server child");
     child.wait().expect("reap server child");
     let _ = std::fs::remove_file(&path);
 }
 
-// ---- AC-3.2 concurrency: many threads, ONE shared session ----------
+// ---- concurrency: many threads, ONE shared session ----------------
 
 #[test]
 fn concurrent_calls_single_shared_session() {
@@ -390,12 +389,12 @@ fn concurrent_calls_single_shared_session() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // AC-3.2 (as written: "8 client threads on the SAME session").
+    // 8 client threads on the SAME session.
     // ONE client session, its root proxy shared (Arc) across 8 threads
     // — exactly how a generated `Bp*` stub is used concurrently
     // (`SIBinder` is `Send`/`Sync`). Before the per-connection lock
-    // this interleaved the framed stream / cross-delivered replies
-    // (Major-2). Calls are internally serialized on the one
+    // this interleaved the framed stream / cross-delivered replies.
+    // Calls are internally serialized on the one
     // connection (the documented model: parallelism = multiple
     // connections), so wall time is also bounded well below a hang.
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -427,7 +426,7 @@ fn concurrent_calls_single_shared_session() {
     // _cu handles teardown.
 }
 
-// ---- AC-3.3 multi-session isolation --------------------------------
+// ---- multi-session isolation ---------------------------------------
 
 #[test]
 fn concurrent_clients_isolated_sessions() {
@@ -439,7 +438,7 @@ fn concurrent_clients_isolated_sessions() {
     wait_for_sock(&path);
 
     // 8 client threads, each its own connection (independent session +
-    // RpcState — P6). Each does 200 calls and must see only its own
+    // RpcState). Each does 200 calls and must see only its own
     // echoes (no cross-session contamination, no deadlock).
     let mut handles = Vec::new();
     for t in 0..8 {
@@ -459,14 +458,13 @@ fn concurrent_clients_isolated_sessions() {
     // _cu handles teardown.
 }
 
-// ---- 2-10: opt-in server-side connection admission bound -----------
+// ---- opt-in server-side connection admission bound -----------
 
 /// `set_max_connections(N)` caps *concurrent* connection workers via
 /// reactor-free accept backpressure (excess clients wait in the kernel
 /// listen backlog, none dropped; a freed slot resumes accept). This is
-/// the reactor-free, Android-faithful resource bound that the 2-10
-/// decision record carves out as the genuine middle ground (the
-/// no-reactor decision does NOT foreclose it).
+/// the reactor-free, Android-faithful resource bound — a genuine middle
+/// ground that the no-reactor design does NOT foreclose.
 ///
 /// Mutant: deleting the `max_connections` gate in `RpcServer::run`
 /// makes the 3rd client served immediately ⇒ its bounded-timeout
@@ -532,7 +530,7 @@ fn max_connections_admission_bound() {
     // _cu handles teardown.
 }
 
-// ---- AC-3.5 oneway FIFO + non-blocking send ------------------------
+// ---- oneway FIFO + non-blocking send -------------------------------
 
 #[test]
 fn oneway_fifo_and_nonblocking() {
@@ -574,7 +572,7 @@ fn oneway_fifo_and_nonblocking() {
     // _cu handles teardown.
 }
 
-// ---- AC-3.6 nested server→client callback --------------------------
+// ---- nested server→client callback ---------------------------------
 
 #[test]
 fn nested_callback_no_deadlock() {
@@ -604,7 +602,7 @@ fn nested_callback_no_deadlock() {
     // _cu handles teardown.
 }
 
-// ---- AC-3.8 timeout (hung server) ----------------------------------
+// ---- timeout (hung server) -----------------------------------------
 
 #[test]
 fn client_timeout_on_hung_server() {
@@ -631,10 +629,10 @@ fn client_timeout_on_hung_server() {
     // _cu handles teardown.
 }
 
-// ---- 2-5b / G4(a): opt-in android-13+ versioned-wire profile -------
+// ---- opt-in android-13+ versioned-wire profile ---------------------
 
-/// G4(a): the proven android-13+ connection handshake + AOSP-faithful
-/// framing + `Android13PlusCodec` (G4 Layer-1, hermetic) now driving a
+/// The proven android-13+ connection handshake + AOSP-faithful
+/// framing + `Android13PlusCodec` (hermetic) now driving a
 /// **live `RpcServer`/`RpcSession` dispatch path** end-to-end over a
 /// real `UnixTransport`, reusing the existing per-session `RpcState`,
 /// `client_transact`/`serve_blocking`, oneway-FIFO and nested-callback
@@ -650,7 +648,7 @@ fn android13plus_profile_e2e() {
         (1, 1, 1),          // v1 — android-14/15
         (1, 0, 0),          // mismatch ⇒ min = v0
         (0, 1, 0),          // mismatch ⇒ min = v0
-        (2, 2, 2),          // v2 — android-16 (subplan 2-8)
+        (2, 2, 2),          // v2 — android-16
         (2, 1, 1),          // v2↔v1 ⇒ min = v1
         (1, 2, 1),          // v1↔v2 ⇒ min = v1
         (2, 0, 0),          // v2↔v0 ⇒ min = v0
@@ -725,8 +723,8 @@ fn android13plus_profile_e2e() {
     }
 }
 
-/// **2-15 AC-15.3 / 2-15.0 PoC** — the decoupled `TlsTransport`
-/// (`Mutex<Connection>` + lock-free stream, subplan 2-15 §2.0) driving
+/// The decoupled `TlsTransport`
+/// (`Mutex<Connection>` + lock-free stream) driving
 /// the **android-13+ profile over TLS**, hermetic rsbinder↔rsbinder.
 /// Mirrors `android13plus_profile_e2e` (version negotiation v0/v1/v2 +
 /// mismatch, echo, 300-oneway FIFO, **nested server→client callback**)
@@ -796,7 +794,7 @@ fn tls_android13plus_nested_callback_e2e() {
             let _ = session.serve_blocking();
         });
 
-        // Exercises the 2-15.5 convenience constructor (TCP-connect +
+        // Exercises the convenience constructor (TCP-connect +
         // TLS-handshake + android-13+ handshake in one call).
         let client = RpcSession::setup_tcp_client_tls_android13plus(
             addr,
@@ -876,12 +874,9 @@ fn r34_profile_reports_no_wire_version() {
     drop(client);
 }
 
-/// **AC-12.0b** (subplan 2-12 Phase A0b — `transport` split out of
+/// `transport` split out of
 /// `RpcSessionInner` into a shared `SharedSession` + server id-demux +
-/// F4 death-trigger; see `plans/2-12-multi-connection-per-session.md`
-/// §0 F9 / §2 / §6). A0b is the ≡Phase-A-risk structural core the
-/// recursive review carved out of the (now byte-identical default)
-/// A0a plumbing.
+/// partial-vs-full death-trigger.
 ///
 /// Proves the **id-demux attach** is real (not dead plumbing):
 ///  - client #1 — **empty** id ⇒ new session; server registers a
@@ -899,37 +894,30 @@ fn r34_profile_reports_no_wire_version() {
 ///    attached connection;
 ///  - client #3 — an **unknown** 32-byte id ⇒ no live session ⇒
 ///    rejected (`rejected_unknown_id == 1`);
-///  - **F4 (partial vs. full teardown)**: dropping the *attached* #2
+///  - **partial vs. full teardown**: dropping the *attached* #2
 ///    must NOT tear the session down — #1 stays fully functional and
 ///    still reports the same shared id (a spurious obituary / early
 ///    teardown on a partial connection loss would break this). The
-///    complementary "fires exactly once on *full* teardown,
-///    byte-identical to pre-A0b" side is the unchanged
-///    `rpc_death_recipient_fires_on_session_drop` (single-connection
+///    complementary "fires exactly once on *full* teardown" side is
+///    the `rpc_death_recipient_fires_on_session_drop` (single-connection
 ///    `live_conns 1→0`) in this same suite.
 ///
-/// **Mutant gate (== pre-A0b code)**: make the found branch build a
+/// **Mutant gate**: make the found branch build a
 /// *fresh* session instead of attaching (`from_android13plus(.., None)`
 /// in `serve_connection`'s attach arm). Then #2 gets its own
 /// `SharedSession` ⇒ `c2.get_session_id() != sid1` ⇒ the shared-id
 /// assertion fails. That is what makes the demux load-bearing rather
-/// than the dead plumbing F1/F9 warn about.
-// EXPERIMENTAL multi-conn (plan 2-12 / AC-12.6): gated to the
-// `rpc-experimental-multiconn` feature so the default build leaves
-// the unverified attach path clamped to slot-cap 1 (see
-// `RpcServer::set_max_threads` rustdoc). Hermetic green either way
-// when the feature is on.
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// than dead plumbing.
 #[test]
 fn a0b_multi_connection_shared_session() {
     let path = tmp_sock("a0b");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1); // opt in to the versioned wire
-                                 // Phase B.1 (AC-12.4): `set_max_threads` is now the advertised
+                                 // `set_max_threads` is the advertised
                                  // *and* enforced per-session incoming-slot cap. This test exercises
                                  // founding + one attached connection ⇒ explicit opt-in at 2 slots
-                                 // (default 1 ⇒ founding-only). AOSP-faithful: AC-12.0b is fundamentally
+                                 // (default 1 ⇒ founding-only). AOSP-faithful: this is fundamentally
                                  // a multi-conn scenario, so AOSP `setMaxIncomingThreads(2)` is its
                                  // natural setup step.
     server.set_max_threads(2);
@@ -981,8 +969,8 @@ fn a0b_multi_connection_shared_session() {
     let c3 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &bogus)
         .expect("handshake completes (reject is post-handshake — A0b residual)");
     c3.set_timeout(Some(Duration::from_secs(3)));
-    // Strengthen the unknown-id reject assertion (review m8 + round-2
-    // M3): the original `is_err()` would also pass for an unrelated
+    // Strengthen the unknown-id reject assertion: a plain `is_err()`
+    // would also pass for an unrelated
     // error (e.g. handshake itself failed). Lock the contract to the
     // actual post-handshake-reject status set observed on UDS:
     //
@@ -999,11 +987,7 @@ fn a0b_multi_connection_shared_session() {
     //    surface a socket-close as an `io::Error` whose
     //    `raw_os_error() == None` (e.g. `ErrorKind::Other`), which
     //    `StatusCode::from(io::Error)` maps to `Unknown` rather than
-    //    `PeerClosed`. This was observed in practice on this host
-    //    during initial development. The ideal fix is to root-cause
-    //    the host-specific path so it normalizes to `DeadObject` (the
-    //    AOSP-faithful signature); kept as an accepted reject status
-    //    for now — **FOLLOWUP**: trace and tighten.
+    //    `PeerClosed`. Accepted as a reject status.
     //
     // Anything outside this set means a different bug (and `Ok` is
     // the true mutant: server honored the unknown id).
@@ -1022,29 +1006,26 @@ fn a0b_multi_connection_shared_session() {
     );
     assert_eq!(server.attached_count(), 1, "attach count stable");
 
-    // --- F4: drop **only** the ATTACHED connection #2 (a partial
+    // --- Drop **only** the ATTACHED connection #2 (a partial
     //     loss; `root2` is intentionally left alive — see below). The
     //     session must survive: the founding connection #1 keeps
     //     working and still reports the same shared id. A spurious
     //     obituary / early teardown on a partial connection loss
     //     (live_conns mis-gated) would make these DeadObject.
     //
-    //     This test keeps its A0b-era shape: the liveness probe is
-    //     `get_session_id` (a zero-address special transact) and it
-    //     does not drop a sibling proxy here — that *was* F7 (multi-
-    //     proxy refcount over a shared `RpcState`), at the time a
-    //     Phase-A residual. **F7 is now fixed** (AOSP `timesSent` /
-    //     `flushExcessBinderRefs`); the previously-avoided sibling-
-    //     proxy-drop path is covered by `f7_shared_node_survives_
-    //     sibling_proxy_drop` + `f7_excess_receipt_no_leak_single_
-    //     client`. This test stays focused on A0b's own contract
-    //     (attach works — shown above — + F4 no premature teardown on
-    //     partial loss, shown here) so its mutant gate stays clean.
+    //     The liveness probe is `get_session_id` (a zero-address
+    //     special transact). It does not drop a sibling proxy here;
+    //     the sibling-proxy-drop path (AOSP `timesSent` /
+    //     `flushExcessBinderRefs`) is covered by
+    //     `f7_shared_node_survives_sibling_proxy_drop` +
+    //     `f7_excess_receipt_no_leak_single_client`. This test stays
+    //     focused on attach (shown above) + no premature teardown on
+    //     partial loss (shown here) so its mutant gate stays clean.
     drop(c2);
     // **Deterministic** wait for the server's attached worker to
     // exit (`serve_blocking_on` → `live_conns.fetch_sub`), replacing
     // the prior `sleep(50ms)` heuristic that raced scheduler jitter
-    // under CI load. `session_live_conns` reads the F4 ledger
+    // under CI load. `session_live_conns` reads the live-conn ledger
     // directly: after `c2` drop the attached worker observes the
     // peer-close and `fetch_sub`s 2→1; once we see 1 the partial-loss
     // path is fully reaped and the *next* liveness check
@@ -1074,43 +1055,42 @@ fn a0b_multi_connection_shared_session() {
     // a panic above no longer leaks worker threads + socket file.
 }
 
-/// **AC-12.F8** (subplan 2-12 Phase A4 — server-side unification of
-/// `RpcSessionInner` into a single inner per session; see
-/// `plans/2-12-multi-connection-per-session.md` §2 Phase A4 / §6).
+/// Server-side unification of `RpcSessionInner` into a single inner per
+/// session.
 ///
-/// The post-A0b residual was that the *server* still built one
+/// Without it the *server* built one
 /// `RpcSessionInner` per accepted connection (sharing only the
 /// `SharedSession`), so `state.remote_proxies`-cached `RpcProxy.weak:
 /// Weak<RpcSessionInner>` pointed to the *first* worker's inner. A
 /// later worker unmarshaling the same client binder hit the cache and
 /// inherited that other inner — its nested `proxy.transact`
 /// `find_conn`ed inside the other worker's slot pool, not its own:
-/// cross-slot aliasing (F8). Phase A4 collapses N inners into 1 (slots
-/// in one pool); every cached `RpcProxy.weak` now points to the only
+/// cross-slot aliasing. Collapsing N inners into 1 (slots
+/// in one pool) makes every cached `RpcProxy.weak` point to the only
 /// inner, and any server worker's nested `proxy.transact` `find_conn`s
 /// **inside its own pool**.
 ///
-/// Witness via the *founding inner*'s slot count: after Phase A4 an
+/// Witness via the *founding inner*'s slot count: an
 /// id-echoing attached connection adds a *slot* to that inner, so
-/// `session_slot_count(sid) == Some(2)`. The F8 mutant (== pre-A4
-/// code: server attach arm builds `from_android13plus(.., Some(shared))`
-/// = a fresh inner sharing only `SharedSession`) leaves the founding
+/// `session_slot_count(sid) == Some(2)`. The mutant (server attach arm
+/// builds `from_android13plus(.., Some(shared))` = a fresh inner sharing
+/// only `SharedSession`) leaves the founding
 /// inner with its single founding slot ⇒ `Some(1)` — the assertion
-/// fails. This is what makes Phase A4 load-bearing rather than a
+/// fails. This is what makes the unification load-bearing rather than a
 /// no-op refactor.
 ///
-/// AC-12.0b still asserts the *attach* itself (shared `SharedSession`
-/// id round-trip + `attached_count == 1` + F4 partial-loss survival);
-/// this test layers Phase A4's structural shape on top of that
-/// without re-asserting the A0b contract.
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// `a0b_multi_connection_shared_session` asserts the *attach* itself
+/// (shared `SharedSession` id round-trip + `attached_count == 1` +
+/// partial-loss survival); this test layers the single-inner structural
+/// shape on top of that.
+
 #[test]
 fn ac_12_f8_attach_unifies_to_single_inner() {
     let path = tmp_sock("ac12f8");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: opt into 2 incoming slots (default 1 ⇒ founding-only).
+    // Opt into 2 incoming slots (default 1 ⇒ founding-only).
     server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
@@ -1131,13 +1111,13 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
         "founding-only ⇒ single slot in the founding inner"
     );
 
-    // Attached connection (#2): echo #1's id ⇒ Phase A4 attach arm
+    // Attached connection (#2): echo #1's id ⇒ the attach arm
     // adds a *slot* to the founding inner (rather than building a
-    // fresh inner sharing only SharedSession — the F8 mutant).
+    // fresh inner sharing only SharedSession — the mutant).
     let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
         .expect("a13+ #2 (attach)");
     // Bound without the conventional `_` prefix — `root2` is moved into
-    // an explicit `drop(...)` below to trigger the F4 partial-loss
+    // an explicit `drop(...)` below to trigger the partial-loss
     // reap; an underscore-prefix would have read as "intentionally
     // unused" and hidden that load-bearing drop.
     let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
@@ -1145,9 +1125,9 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
         poll_until(|| server.attached_count() == 1),
         "echo-id connection took the id-demux ATTACH path (A0b)"
     );
-    // Phase A4 contract: the attached connection is a *slot on the
+    // The attached connection is a *slot on the
     // founding inner*, so the inner's slot pool now has 2 slots.
-    // F8 mutant — each connection has its own inner with one slot —
+    // The mutant — each connection has its own inner with one slot —
     // would leave the founding inner at slot_count == 1.
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
@@ -1155,8 +1135,8 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
          (mutant: fresh-inner-on-attach leaves slot_count == 1)"
     );
 
-    // Partial-loss reaping (re-uses the existing F4 ledger): drop the
-    // attached and verify the founding inner's slot pool shrinks back
+    // Partial-loss reaping (re-uses the existing live-conn ledger): drop
+    // the attached and verify the founding inner's slot pool shrinks back
     // to 1, then the founding-only state survives.
     drop(root2);
     drop(c2);
@@ -1171,33 +1151,31 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     );
 }
 
-/// **AC-12.4 (Phase B.1 — `setMaxIncomingThreads` cap + negotiate
-/// reflection; see `plans/2-12-multi-connection-per-session.md` §2
-/// Phase B / §3 AC-12.4).** Phase B.1 unifies `set_max_threads(N)`'s
+/// `setMaxIncomingThreads` cap + negotiate reflection.
+/// `set_max_threads(N)` carries
 /// two meanings — advertise + enforce: the server attach arm refuses
 /// an id-echoing connection when adding it would push `slot_count() >
 /// max_threads_value()`. Default 1 ⇒ founding-only; multi-conn
 /// callers opt in via explicit `set_max_threads(N >= 2)`.
 ///
-/// Mutant gate (== pre-B.1 / advertise-only): cap check absent ⇒
+/// Mutant gate (advertise-only): cap check absent ⇒
 /// 3rd attach silently succeeds and `session_slot_count(sid) ==
 /// Some(3) > set_max_threads(2)` ⇒ the cap assertion fails (and the
 /// `rejected_unknown_id_count` witness stays at 0).
 ///
-/// Sub-AC (b): `GetMaxThreads` returns the same `max_threads_value()`
+/// `GetMaxThreads` returns the same `max_threads_value()`
 /// (advertise == enforce), so a client's `negotiate(local_max)`
 /// records `min(local_max, server_cap)` — verified at the wire by
 /// querying `negotiated_max_threads()` after a single
 /// `GetMaxThreads` round-trip.
 ///
-/// Sub-AC (c — `shutdown` gate): documented at the *code* level only
-/// — the attach arm shows `if server.shutdown.load() { reject }`. A
+/// The `shutdown` gate is documented at the *code* level only — the
+/// attach arm shows `if server.shutdown.load() { reject }`. A
 /// deterministic e2e trigger needs an accept-pass / handshake-stall /
-/// late-shutdown race that current test scaffolding does not bound;
-/// kept as a §7.3 FOLLOWUP (test scaffolding, not a B.1 deferral —
+/// late-shutdown race that the current test scaffolding does not bound;
 /// the *behavior* is already in code and falls inside the
-/// rejected_unknown_id observability).
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// rejected_unknown_id observability.
+
 #[test]
 fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let path = tmp_sock("ac124");
@@ -1228,7 +1206,7 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let rejected_before = server.rejected_unknown_id_count();
 
     // 3rd attach with the same session id ⇒ would push slot_count to
-    // 3 > max_threads(2) ⇒ refused at the attach arm (Phase B.1 cap).
+    // 3 > max_threads(2) ⇒ refused at the attach arm (cap).
     let c3 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
         .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
     c3.set_timeout(Some(Duration::from_secs(3)));
@@ -1254,10 +1232,10 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
          a B.1 mutant would have let this reach Some(3))"
     );
 
-    // Sub-AC (b): negotiate reflects the server's advertised + enforced
+    // negotiate reflects the server's advertised + enforced
     // value. Client opts into local_max=4; server advertises 2 ⇒
     // negotiated = min(4, 2) = 2. (Wire-level: a single GetMaxThreads
-    // round-trip, AC-3.4.) The advertise == enforce equation is exactly
+    // round-trip.) The advertise == enforce equation is exactly
     // what makes the cap observable to a well-behaved client *without*
     // needing to learn `rejected_unknown_id_count` out-of-band.
     let negotiated = c1.negotiate(4).expect("negotiate");
@@ -1272,71 +1250,290 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     );
 }
 
-/// **Phase A F7** (the AC-12.0b residual, now fixed). With a shared
-/// `RpcState` (A0b id-demux), two **independent** client sessions each
-/// hold their own proxy to the *same* server root. Pre-F7 the server
-/// pinned the node's strong count at 1 by object-identity, so the
-/// first connection's proxy drop `DEC_STRONG`'d it to 0 and freed the
-/// node ⇒ the sibling connection's proxy `DeadObject` (exactly what
-/// AC-12.0b had to *avoid*). With AOSP `timesSent` accounting the
-/// server counts each send (strong = 2), so the first DEC only brings
-/// it to 1 and the sibling survives; the node is freed only when the
-/// *second* proxy drops too (no leak — proven deterministically at the
-/// state level by `rpc::state::tests::f7_timessent_balance_no_leak`).
+/// AOSP `setupClient` fan-out automation, multi-conn path.
+/// `RpcSession::setup_unix_client_android13plus_fan_out` does
+/// in one helper what the manual API requires three explicit steps for:
+/// founding connect → `negotiate(local)` → N-1 additional outgoing
+/// `add_outgoing_connection_android13plus`. Witnesses that the helper's
+/// fan-out loop actually mints `N - 1` extras under the server's
+/// `set_max_threads(N)` cap.
 ///
-/// **Mutant gate (== pre-F7 code)**: revert `on_binder_leaving`'s
-/// `timesSent` bump (strong stays 1). Then dropping `root1` frees the
-/// shared node and `root2.echo()` is `DeadObject` ⇒ this fails.
-/// Default-build counterpart of `ac_12_4_set_max_threads_caps_incoming_slots`:
-/// sibling attach is refused via `rejected_unknown_id` and the
-/// `negotiate(local)` advertise side stays `min(local, stored)` unchanged.
-#[cfg(not(feature = "rpc-experimental-multiconn"))]
+/// **Mutant gate**: skipping the `1..negotiated` loop body (`for _ in
+/// 1..negotiated { … }` ⇒ `for _ in 0..0 { … }` or `unreachable!`)
+/// leaves the founding inner at a single slot ⇒ `session_slot_count`
+/// is `Some(1)` instead of `Some(N)` and this test fails.
 #[test]
-fn default_build_clamps_slot_cap_despite_advertise_two() {
-    let path = tmp_sock("dflt_cap");
+fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
+    let path = tmp_sock("b2fan");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
+    // N = 3 (founding + 2 fan-out attaches). Cap is server-side; the
+    // helper learns it via `negotiate` and mints exactly N - 1 extras.
+    server.set_max_threads(3);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 3)
+        .expect("setupClient fan-out");
+    // `negotiate` was the second step of the helper ⇒ negotiated value
+    // is recorded on the session and equals the fan-out pool size.
+    assert_eq!(
+        client.negotiated_max_threads(),
+        3,
+        "helper performed GET_MAX_THREADS and recorded min(local=3, server=3) = 3"
+    );
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid
+        .as_slice()
+        .try_into()
+        .expect("32-byte session id (AOSP kSessionIdBytes)");
+
+    // Functional gate: the session built by the helper round-trips
+    // through every transport (default outgoing slot picker spreads
+    // calls across the pool).
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    for i in 0..6 {
+        let msg = format!("b2-{i}");
+        assert_eq!(root.echo(&msg).unwrap(), msg, "fan-out echo #{i}");
+    }
+
+    // Mutant-gate witness: server-side, the founding `RpcSessionInner`'s
+    // slot pool holds *all* N connections (founding + N-1 attached).
+    // A mutant that skipped the fan-out leaves this at `Some(1)`.
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(3)),
+        "founding inner's pool has 3 slots (founding + 2 fan-out attaches) — \
+         mutant: helper skipping the fan-out loop leaves this at Some(1)"
+    );
+    assert_eq!(
+        server.attached_count(),
+        2,
+        "exactly 2 id-echoing attaches reached the server-side attach arm"
+    );
+    assert_eq!(
+        server.rejected_unknown_id_count(),
+        0,
+        "fan-out connections all pass under the cap"
+    );
+}
+
+/// Single-connection fast path. `local_max_outgoing ==
+/// 1` (and `0`, normalized) must skip the `GET_MAX_THREADS` round-trip
+/// and the fan-out loop entirely so the wire is bit-identical to the
+/// founding-only helper. A caller paying for the fan-out helper's
+/// convenience on a single-conn session must NOT pay an extra
+/// negotiation packet.
+///
+/// **Mutant gate**: dropping the `if local == 1 { return Ok(session); }`
+/// short-circuit makes the helper run `negotiate(1)` ⇒
+/// `negotiated_max_threads() == 1` instead of `0`.
+#[test]
+fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
+    let path = tmp_sock("b2one");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Server is multi-conn-capable but the client opts out — fan-out
+    // must NOT run regardless.
     server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ founding");
-    let _r1 = EchoProxy(c1.get_root().expect("get_root founding"));
-    let sid = c1.get_session_id().expect("get_session_id founding");
+    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 1)
+        .expect("setupClient (single-conn)");
+    // Negotiation skipped ⇒ session.negotiated_max_threads() stays at
+    // its default (0 = "not negotiated"). The byte-identical witness.
+    assert_eq!(
+        client.negotiated_max_threads(),
+        0,
+        "local_max_outgoing == 1 must skip GET_MAX_THREADS entirely \
+         (mutant: dropping the early-return would record 1 here)"
+    );
+    let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
-    assert_eq!(server.session_slot_count(&sid_arr), Some(1));
+    // Server side: exactly one slot (the founding). Mutant: extra
+    // outgoing attaches would push this past 1.
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(1)),
+        "founding-only session has exactly one slot on the server side"
+    );
+    assert_eq!(
+        server.attached_count(),
+        0,
+        "no id-echoing attach reached the server (no fan-out ran)"
+    );
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("b2-one").unwrap(), "b2-one");
 
-    let rejected_before = server.rejected_unknown_id_count();
-
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("handshake completes (reject is post-handshake)");
-    c2.set_timeout(Some(Duration::from_secs(3)));
-    let err = c2.get_root().expect_err("sibling attach refused");
-    assert!(matches!(
-        err,
-        StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
-    ));
-    assert!(poll_until(
-        || server.rejected_unknown_id_count() == rejected_before + 1
-    ));
-    assert_eq!(server.session_slot_count(&sid_arr), Some(1));
-
-    let negotiated = c1.negotiate(4).expect("negotiate");
-    assert_eq!(negotiated, 2);
-    assert_eq!(c1.negotiated_max_threads(), 2);
+    // `local_max_outgoing == 0` is normalized to 1 (a session needs at
+    // least the founding connection). Same byte-identical behavior.
+    let path2 = tmp_sock("b2zero");
+    let server2 = RpcServer::setup_unix_server(&path2).expect("bind");
+    server2.set_android13plus(1);
+    server2.set_max_threads(2);
+    server2.set_root(make_service(counter.clone()));
+    let bg2 = server2.run_background();
+    let _cu2 = ServeCleanup::new(Arc::clone(&server2), bg2, path2.clone());
+    wait_for_sock(&path2);
+    let client_zero = RpcSession::setup_unix_client_android13plus_fan_out(&path2, 1, 0)
+        .expect("local_max_outgoing == 0 normalized to 1");
+    assert_eq!(
+        client_zero.negotiated_max_threads(),
+        0,
+        "0 normalized to 1 ⇒ no negotiation"
+    );
 }
 
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// Shutdown-reject e2e. The android-13+ attach arm sits past a
+/// successful handshake but before the per-slot enqueue; in production
+/// the `shutdown.load()` gate at that point sees a *sub-microsecond*
+/// window between an accepted late attach and a concurrent
+/// `server.shutdown()`, so the branch is otherwise only observable by
+/// code inspection + the `rejected_unknown_id_count` counter.
+///
+/// The `__set_attach_shutdown_probe` `#[doc(hidden)]` test-only barrier
+/// makes the window deterministic: it
+/// fires after the codec check passes and *before* `shutdown.load()`,
+/// so the test can park the worker, flip `server.shutdown()`, then
+/// release the worker. The worker re-reads the now-true flag and
+/// takes the reject branch — exactly the production semantics, with
+/// no scheduler-luck dependency.
+///
+/// **Mutant gate**: removing the `if server.shutdown.load() {
+/// reject }` line at the outgoing-attach arm leaves the worker
+/// proceeding to `add_incoming_slot` after the barrier returns, so
+/// `rejected_unknown_id_count` does NOT increment (the assertion
+/// below fails) and the attach `get_root()` would succeed (also
+/// flagged). Reverting just the assertion-side checks would still
+/// fail the rejected-count delta — both arms catch the regression.
+#[test]
+fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
+    let path = tmp_sock("shutgate");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // 2 = founding + 1 attached. The cap is irrelevant to the
+    // shutdown gate (which fires *before* the cap check), but
+    // staying within it avoids confounding the reject-set: the only
+    // increment of `rejected_unknown_id` we want to observe is the
+    // shutdown-arm one.
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // Founding session — kept alive (`c1` not dropped) so the
+    // registry still resolves `sid` when the attach worker hits the
+    // arm. Were c1 dropped here, the founding inner would die, the
+    // attach would hit the "unknown/stale" arm, and the shutdown
+    // gate would never be tested.
+    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ founding connect");
+    let sid = c1.get_session_id().expect("get_session_id founding");
+
+    // Two channels form the barrier. The probe sends "handshake
+    // done" on the first call, then blocks on `release_rx`. The
+    // test waits for the signal, flips `shutdown`, then releases.
+    let (hs_done_tx, hs_done_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // Wrap `release_rx` in an `Option` so the *first* probe fire
+    // takes it; any later fire (no-op once the test is done) sees
+    // `None` and drops through. The whole closure must be `Fn`
+    // (not `FnOnce`), hence the `Mutex<Option<Receiver>>` shape.
+    let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+    server.__set_attach_shutdown_probe({
+        let release_rx = Arc::clone(&release_rx);
+        let hs_done_tx = hs_done_tx.clone();
+        move || {
+            let _ = hs_done_tx.send(());
+            if let Some(rx) = release_rx.lock().expect("release_rx poisoned").take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
+    });
+    let rejected_before = server.rejected_unknown_id_count();
+
+    // Run the attach in a background thread — its `get_root` would
+    // block on the parked worker otherwise.
+    let attach_path = path.clone();
+    let attach_sid = sid.clone();
+    let attach_handle = std::thread::spawn(move || -> std::result::Result<(), StatusCode> {
+        let c2 = RpcSession::setup_unix_client_android13plus_with_id(&attach_path, 1, &attach_sid)
+            .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
+        c2.set_timeout(Some(Duration::from_secs(3)));
+        c2.get_root().map(|_| ())
+    });
+
+    // Wait for the attach worker to reach the barrier.
+    hs_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("attach worker should reach the shutdown barrier");
+
+    // Flip shutdown *while* the worker is parked at the probe.
+    server.shutdown();
+
+    // Release the worker — it re-reads `shutdown.load() == true`
+    // and takes the reject branch (drops the transport).
+    let _ = release_tx.send(());
+
+    let attach_result = attach_handle
+        .join()
+        .expect("attach thread should not panic");
+    let err = attach_result.expect_err("attach during shutdown must be rejected (mutant: success)");
+    assert!(
+        matches!(
+            err,
+            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
+        ),
+        "shutdown-reject surfaces as the same reject set as cap/unknown-id reject \
+         (post-handshake socket close), got {err:?}"
+    );
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
+        "shutdown-reject increments the `rejected_unknown_id` observability counter \
+         (mutant: removing `if server.shutdown.load() {{ reject }}` leaves this flat)"
+    );
+    // Founding inner's slot pool stayed at 1 — the rejected attach
+    // never reached `add_incoming_slot` (otherwise this would be
+    // `Some(2)`, a second mutant-catch axis independent of the
+    // counter delta above).
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(1),
+        "shutdown-rejected attach did not enqueue a slot (mutant: would reach Some(2))"
+    );
+    // (`c1` lives to function exit by lexical scope — see its
+    // binding-site comment for why the founding inner must stay
+    // registered for the whole attach attempt.)
+}
+
+/// With a shared `RpcState` (id-demux), two **independent** client
+/// sessions each hold their own proxy to the *same* server root.
+/// Pinning the node's strong count at 1 by object-identity would make
+/// the first connection's proxy drop `DEC_STRONG` it to 0 and free the
+/// node ⇒ the sibling connection's proxy `DeadObject`. With AOSP
+/// `timesSent` accounting the server counts each send (strong = 2), so
+/// the first DEC only brings it to 1 and the sibling survives; the node
+/// is freed only when the *second* proxy drops too (no leak — proven
+/// deterministically at the state level by
+/// `rpc::state::tests::f7_timessent_balance_no_leak`).
+///
+/// **Mutant gate**: revert `on_binder_leaving`'s
+/// `timesSent` bump (strong stays 1). Then dropping `root1` frees the
+/// shared node and `root2.echo()` is `DeadObject` ⇒ this fails.
 #[test]
 fn f7_shared_node_survives_sibling_proxy_drop() {
     let path = tmp_sock("f7");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: opt into 2 incoming slots (founding + attached).
+    // Opt into 2 incoming slots (founding + attached).
     server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
@@ -1371,8 +1568,8 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
         .get_session_id()
         .expect("c1 still alive (ordering barrier)");
 
-    // F7: the shared node must survive the sibling's DEC (strong
-    // 2→1). Pre-F7 (mutant) it was freed (1→0) ⇒ DeadObject here.
+    // The shared node must survive the sibling's DEC (strong
+    // 2→1). The mutant freed it (1→0) ⇒ DeadObject here.
     assert_eq!(
         root2.echo("f7-after-sibling-drop").unwrap(),
         "f7-after-sibling-drop",
@@ -1395,7 +1592,7 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     // _cu handles teardown.
 }
 
-/// **Phase A F7 — client `flushExcessBinderRefs`** (the *other* mutant
+/// Client `flushExcessBinderRefs` (the *other* mutant
 /// arm). A **single** client session that receives the *same* server
 /// binder more than once while its deduped proxy stays live owes the
 /// sender one excess `DEC_STRONG` per duplicate receipt (the server
@@ -1462,7 +1659,7 @@ fn f7_excess_receipt_no_leak_single_client() {
     // _cu handles teardown.
 }
 
-/// **AC-12.1 (Phase A — connection pool)**: with N outgoing slots in
+/// Connection pool: with N outgoing slots in
 /// one `RpcSession`, concurrent `client_transact`s on different
 /// threads pick *different* slots (AOSP `findConnection` available-
 /// slot selection), so two server-side blocking handlers run **in
@@ -1470,7 +1667,7 @@ fn f7_excess_receipt_no_leak_single_client() {
 ///
 /// Wire-up: founding connection (slot 1) + one echoed-id outgoing
 /// (slot 2) via [`RpcSession::add_outgoing_connection_android13plus`].
-/// The slots end up id-demuxed to the *same* `SharedSession` (A0b),
+/// The slots end up id-demuxed to the *same* `SharedSession`,
 /// so the test's two threads transact through different sockets but
 /// the same server session.
 ///
@@ -1482,13 +1679,13 @@ fn f7_excess_receipt_no_leak_single_client() {
 /// **Mutant gates (verified in separate runs)**: `find_conn` always
 /// returning slot 1 OR `find_conn`'s "first available" check ignoring
 /// `exclusive_tid` would re-serialize ⇒ elapsed > 250 ms.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let path = tmp_sock("a1pool");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: AC-12.1 wires founding + one attached outgoing-echo
+    // Founding + one attached outgoing-echo
     // ⇒ 2 incoming slots at the server. Default cap = 1 would reject
     // the attach, defeating the pool-distribution scenario.
     server.set_max_threads(2);
@@ -1522,17 +1719,10 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let elapsed = t0.elapsed();
     // Normal (parallel): ~150 ms + scheduling/RPC slack.
     // Mutant (serialized): ~300 ms (= 2 × 150 ms sleep, sequential).
-    //
-    // The macOS CI runner occasionally schedules the two threads onto
-    // the same core under load and lands measurements in the 285-310 ms
-    // band even though the path is structurally parallel (one slot per
-    // worker, AOSP-style pool). 280 ms left ~5 ms slack and flaked.
-    // 380 ms preserves the parallel / serialized split — the mutant
-    // can't sleep less than 300 ms (literal `sleep(150)` × 2) so the
-    // bound is still below it + its observed wake-from-sleep / RPC
-    // wrap overhead (~80-100 ms = ~380-400 ms in practice). A tighter
-    // bound would require either a sample-min over multiple runs or a
-    // monotonic-clock barrier on the server side; both are scope creep.
+    // The 380 ms bound preserves the parallel / serialized split — the
+    // mutant can't sleep less than 300 ms (literal `sleep(150)` × 2),
+    // and the bound stays above the parallel path's wake-from-sleep / RPC
+    // wrap overhead even under a loaded scheduler.
     assert!(
         elapsed < Duration::from_millis(380),
         "AC-12.1: 2 concurrent slow(150) on a 2-slot pool must run in \
@@ -1545,8 +1735,8 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     // _cu handles teardown.
 }
 
-/// **AC-12.1 — pool-exhausted condvar wait** (F2: `find_conn` *blocks*
-/// on `slot_cv` when no slot is available; **never** a busy try-loop).
+/// Pool-exhausted condvar wait: `find_conn` *blocks*
+/// on `slot_cv` when no slot is available; **never** a busy try-loop.
 /// 2 outgoing slots + 3 concurrent `slow(120)`s ⇒ two run in parallel
 /// (~120 ms), the third waits on `slot_cv` for one to free, then
 /// runs (~120 ms) ⇒ total ≈ 240 ms. Busy-looping would still progress
@@ -1554,13 +1744,13 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
 /// returning prematurely without re-check) would either deadlock or
 /// race-corrupt the wire. We assert the timing band and rely on the
 /// transact correctness as the secondary signal.
-#[cfg(feature = "rpc-experimental-multiconn")]
+
 #[test]
 fn pool_exhausted_condvar_blocks_not_busy_loops() {
     let path = tmp_sock("a1exh");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: 2 incoming slots (founding + attached); 3 client
+    // 2 incoming slots (founding + attached); 3 client
     // threads observe the cv-wait band.
     server.set_max_threads(2);
     server.set_root(make_service(Arc::new(AtomicI64::new(0))));
@@ -1624,30 +1814,27 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     // _cu handles teardown.
 }
 
-/// **AC-12.2 (Phase A — nested-callback slot pin / F8, scoped)**: on
+/// Nested-callback slot pin (scoped): on
 /// a multi-outgoing client, when `client_transact` picks an outgoing
 /// slot, the nested server→client callback **arriving on that same
 /// socket** must dispatch on that slot — `find_conn`'s reentrant
 /// match is keyed by `(session_ptr, slot_id)`, not `session_ptr`
-/// alone (the pre-A key). The test forces slot 2 by parking slot 1
+/// alone. The test forces slot 2 by parking slot 1
 /// under a long-running `slow(...)`, then issues one `roundtrip(cb)`
 /// on slot 2.
 ///
-/// **F8 scoping note (documented next-increment).** This hybrid
-/// architecture (A0b "N server-`RpcSessionInner` sharing one
-/// `SharedSession`" + Phase-A client pool) has a known **cross-slot
-/// proxy-cache aliasing** hazard: two server workers concurrently
+/// The N-inner-per-connection hybrid had a cross-slot
+/// proxy-cache aliasing hazard: two server workers concurrently
 /// unmarshalling the *same* client binder hit `state.remote_proxy`'s
 /// shared cache, so the second caller's nested `proxy.transact`
 /// re-routes through the *first* server inner's socket — wire
-/// interleave / deadlock. The faithful fix is the **server-side
-/// unification** ("one `RpcSessionInner` per session, slots in one
+/// interleave / deadlock. The fix is the server-side unification
+/// ("one `RpcSessionInner` per session, slots in one
 /// pool") so all server-side proxies live in one inner and
-/// `findConnection` does the slot-pin uniformly — this is recorded
-/// as the *next* Phase-A increment. The scoped single-thread test
-/// here exercises the slot-pin without triggering the aliasing
-/// (only slot 2 unmarshals the cb).
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// `findConnection` does the slot-pin uniformly. The scoped
+/// single-thread test here exercises the slot-pin without triggering
+/// the aliasing (only slot 2 unmarshals the cb).
+
 #[test]
 fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let path = tmp_sock("a2pin");
@@ -1655,13 +1842,11 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     // at the server-side `slow()` handler's entry. The prior version
     // used `sleep(30 ms)` after spawning the parker thread, which under
     // CI load could finish *before* the parker reached `find_conn` and
-    // then both threads ended up on slot 1 (the test still passed —
-    // including under the mutant the doc-comment claims to gate — so
-    // it was a false-pass risk; see review M4).
+    // then both threads ended up on slot 1 — a false-pass risk.
     let slow_entered = Arc::new(AtomicBool::new(false));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: 2 incoming slots (founding + forced slot-2 echo).
+    // 2 incoming slots (founding + forced slot-2 echo).
     server.set_max_threads(2);
     server.set_root(make_service_with_slow_signal(
         Arc::new(AtomicI64::new(0)),
@@ -1717,35 +1902,79 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     // _cu handles teardown.
 }
 
-/// **AC-12.3 (Phase A — oneway Option-1)**: on a multi-outgoing
-/// client, all top-level **oneway** sends are pinned to the founding
-/// slot (single-slot in-order delivery preserves the same-object
-/// oneway FIFO from the pre-pool model), while **twoway** sends still
-/// distribute (AC-12.1). 300 oneway bumps interleaved with twoway
-/// echoes — all bumps must arrive (`count == 300`) and the wire on
-/// the founding socket must not corrupt (twoways still round-trip).
-///
-/// **Trade-off recorded (HOL).** Option-1's price is head-of-line
-/// blocking on the oneway-pinned slot — a slow oneway handler at the
-/// peer stalls every other oneway through that slot. AOSP avoids
-/// this via per-`mNodeForAddress` `asyncNumber` + receive-side
-/// `asyncTodo` priority replay (Option-2 — F5/F6), deferred to Phase
-/// C unless AC-12.6's real-libbinder multi-object-oneway gate forces
-/// it.
-///
-/// **Order is not strictly asserted** (atomic counter — order-blind).
-/// A strict-order gate would need a server-side sequence-recorder
-/// (deferred); the per-slot in-order delivery is exercised here by
-/// the count + the parallel twoway round-trips not corrupting the
-/// shared wire.
-#[cfg(feature = "rpc-experimental-multiconn")]
+/// Two client threads make concurrent
+/// `roundtrip(cb)` calls; each server worker must see a *distinct*
+/// `RpcProxy`-backed nested send (one inner per
+/// session, slots in one pool). The N-inner / 1-shared
+/// hybrid mutant: the two workers' `state.remote_proxies` would hand out
+/// `RpcProxy`s whose `Weak<RpcSessionInner>` pointed to different
+/// inners; the 2nd worker's nested `proxy.transact` would `find_conn`
+/// against the 1st worker's slot pool and deadlock or interleave.
+/// `set_timeout(3s)` bounds that deadlock so the mutant surfaces as a
+/// test failure rather than CI hang.
 #[test]
-fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
+fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
+    let path = tmp_sock("a2ext");
+    let counter = Arc::new(AtomicI64::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_root(make_service(counter.clone()));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    c.set_timeout(Some(Duration::from_secs(3)));
+    let sid = c.get_session_id().expect("get_session_id");
+    let slot2 = c
+        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .expect("slot 2");
+    assert_ne!(slot2, 1, "second slot has a fresh id");
+
+    let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
+    let cb_a = make_service(Arc::new(AtomicI64::new(0)));
+    let cb_b = make_service(Arc::new(AtomicI64::new(0)));
+
+    let r1 = Arc::clone(&root);
+    let cba = cb_a.clone();
+    let h1 = std::thread::spawn(move || r1.roundtrip(&cba).expect("rt thread 1"));
+    let r2 = Arc::clone(&root);
+    let cbb = cb_b.clone();
+    let h2 = std::thread::spawn(move || r2.roundtrip(&cbb).expect("rt thread 2"));
+
+    assert_eq!(h1.join().expect("join 1"), "rt:ping");
+    assert_eq!(h2.join().expect("join 2"), "rt:ping");
+
+    drop(root);
+    drop(c);
+}
+
+/// On a multi-outgoing client, oneway FIFO must hold under
+/// twoway interleave regardless of which slot each oneway rode.
+/// Top-level oneway `find_conn` does not pin to slot 1 — the
+/// per-`mNodeForAddress` `asyncNumber` send-side + receive-side
+/// `asyncTodo` priority replay
+/// ([state.rs](../src/rpc/state.rs)) carries the per-object oneway
+/// ordering invariant on both ends; a founding-slot pin would be a HOL
+/// throughput trade-off, not a correctness invariant.
+///
+/// What this test gates: 300 oneway bumps interleaved with concurrent
+/// twoway echoes across an outgoing slot pool of size 2 all arrive
+/// (`count == 300`) with no wire corruption between the oneway and
+/// twoway frames. The standing mutant gate is the
+/// asyncTodo deletion (covered as a unit gate at
+/// [`rpc::state::tests`](../src/rpc/state.rs)
+/// `phase_c_out_of_order_drains_in_order_via_async_todo`) plus
+/// the STAGE3 live libbinder round-robin path:
+/// [`rpc::state::tests::phase_c_out_of_order_enqueues_then_drains_in_priority_order`](../src/rpc/state.rs#L747)
+/// and `phase_c_send_async_number_is_per_address_monotonic`.
+#[test]
+fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let path = tmp_sock("a3one");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Phase B.1: founding + one outgoing-echo ⇒ 2 incoming slots.
     server.set_max_threads(2);
     server.set_root(make_service(counter.clone()));
     let bg = server.run_background();
@@ -1757,19 +1986,11 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
     let slot2 = c
         .add_outgoing_connection_android13plus(&path, 1, &sid)
         .expect("slot 2");
-    assert_ne!(
-        slot2, 1,
-        "second slot has a fresh id (founding == 1) — otherwise the \
-         'oneway pinned to founding' geometry collapses"
-    );
+    assert_ne!(slot2, 1, "second slot has a fresh id");
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
     let n = 300i64;
 
-    // Oneway bumps (pinned to slot 1) + concurrent twoway echoes
-    // (distributed). The twoway echoes also exercise the wire on the
-    // founding slot in between oneway sends — any frame interleave
-    // would corrupt them.
     let r1 = Arc::clone(&root);
     let bump_h = std::thread::spawn(move || {
         for _ in 0..n {
@@ -1791,27 +2012,25 @@ fn pool_oneway_pinned_to_founding_slot_multi_outgoing() {
         h.join().expect("echo thread");
     }
 
-    // Poll for the oneway bumps to drain.
     assert!(
         poll_until(|| root.count().unwrap() == n),
-        "AC-12.3: all oneway bumps delivered (option-1 pin preserves \
-         the per-slot oneway path); last observed count = {}",
+        "AC-12.3: all oneway bumps delivered across the slot pool; \
+         last observed count = {}",
         root.count().unwrap()
     );
 
     drop(root);
     drop(c);
-    // _cu handles teardown.
 }
 
-// ---- AC-3.9 P6: no globals anywhere in the RPC stack ---------------
+// ---- no globals anywhere in the RPC stack --------------------------
 
 // Source-scan: needs `env!("CARGO_MANIFEST_DIR")/src/rpc/*.rs` at
 // runtime, which is absent on a cross-compiled Android device.
 #[cfg(not(target_os = "android"))]
 #[test]
 fn rpc_stack_has_no_globals() {
-    // Static gate (master §6.2 V5 / AC-3.9): the RPC module must not
+    // Static gate: the RPC module must not
     // introduce any process-global state. Scans src/rpc/*.rs for
     // `static`/`OnceLock`/`lazy_static`. The one *intentional*
     // exception is the tcp_debug one-time INSECURE-warning latch,
@@ -1837,7 +2056,7 @@ fn rpc_stack_has_no_globals() {
                 }
                 // `&'static str` return types legitimately contain the
                 // substring "static " — only a real `static` *item*
-                // (mutable/immutable process global) is a P6 offender.
+                // (mutable/immutable process global) is an offender.
                 let static_item = (l.contains("static ") || l.starts_with("static"))
                     && !l.contains("'static")
                     && !l.contains("static_assertions");
@@ -1853,7 +2072,7 @@ fn rpc_stack_has_no_globals() {
                     }
                     // proxy.rs `descriptor: OnceLock<String>` (and its
                     // import) is a *per-RpcProxy-instance* write-once
-                    // field — the 2-6.B typed-stub descriptor stamp,
+                    // field — the typed-stub descriptor stamp,
                     // owned per session, never a process global. A real
                     // `static` here is still caught by `static_item`.
                     if name == "proxy.rs" && l.contains("OnceLock") && !static_item {
@@ -1861,7 +2080,7 @@ fn rpc_stack_has_no_globals() {
                     }
                     // session.rs `DRIVING` is a `thread_local!`
                     // recursion marker that lets a same-thread nested
-                    // call bypass the per-connection lock (AC-3.6). It
+                    // call bypass the per-connection lock. It
                     // is per-thread scratch, NOT session/protocol state
                     // — it carries no node/address/refcount data; those
                     // stay per-session in RpcState. Mirrors kernel
@@ -1882,17 +2101,17 @@ fn rpc_stack_has_no_globals() {
     );
 }
 
-// ---- 2-9 Phase A / D1: accepted peer identity is the CLIENT --------
+// ---- accepted peer identity is the CLIENT --------------------------
 
-/// AC-9.1 / D1 (defect-regression, **deterministic mutant gate**).
+/// Defect-regression, **deterministic mutant gate**.
 ///
 /// A real cross-process connection: a forked child connects, the
 /// parent `accept`s. `peer_identity()` on the accepted socket must be
-/// the **client's** pid, never the server's own. Before subplan 2-9
-/// Phase A the non-Linux `resolve_peer` returned `self_identity()` for
-/// *every* socket, so a macOS/BSD server saw **itself** as the peer —
-/// an authoritative-looking forged identity (the §0 contract defect).
-/// Reverting Phase A makes `pid == std::process::id()` (the parent)
+/// the **client's** pid, never the server's own. A non-Linux
+/// `resolve_peer` that returned `self_identity()` for
+/// *every* socket would make a macOS/BSD server see **itself** as the
+/// peer — an authoritative-looking forged identity.
+/// That mutant makes `pid == std::process::id()` (the parent)
 /// instead of `child.id()`, failing the assert. On Linux the real
 /// `SO_PEERCRED` already gave the client pid, so this is a permanent
 /// cross-platform regression gate.
@@ -2052,15 +2271,15 @@ fn rpc_death_recipient_fires_on_session_drop() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ---- 2-9 Phase B: opt-in authorization hook --------------------------
+// ---- opt-in authorization hook -------------------------------------
 
-/// AC-9.4 — the opt-in `set_authorizer` gate runs *before any RPC
+/// The opt-in `set_authorizer` gate runs *before any RPC
 /// byte* and is backend-independent. A rejecting hook closes the
 /// connection (the peer's next op is `DeadObject`, zero payload); an
 /// accepting hook is transparent; unset is accept-all = the prior
 /// behavior (every other test in this suite, unmodified, is the
-/// additive-invariant evidence). Builds directly on Phase A: the
-/// `PeerIdentity` the hook inspects is now the *real* peer.
+/// additive-invariant evidence). The `PeerIdentity` the hook inspects
+/// is the *real* peer.
 ///
 /// Mutant: deleting the `serve_connection` authorizer block makes the
 /// rejected client's `get_root()` succeed ⇒ the `is_err` assert fails.

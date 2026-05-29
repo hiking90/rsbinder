@@ -1,12 +1,12 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-12 Phase D / **AC-12.6** STAGE3 — rsbinder side of the
+//! rsbinder side of the
 //! **multi-connection-per-session** real-libbinder interop gate. Pairs
 //! with `cpp/rpc_multiconn_interop_launcher.cpp` (real-libbinder
 //! client wired with `ARpcSession_setMaxOutgoingConnections(2) +
 //! setMaxIncomingThreads(2)`) on an **android-16 emulator (API 36)**.
-//! See `cpp/run_stage3_multiconn.sh` for the automation around it.
+//! See `cpp/run_rpc_multiconn_interop.sh` for the automation around it.
 //!
 //! ```text
 //! ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
@@ -17,9 +17,9 @@
 //!     /data/local/tmp/rsmc.sock 2
 //! ```
 //!
-//! What this harness verifies (the non-negotiable gate Plan 2-12 §6 D /
-//! AC-12.6 spells out — *hermetic rsbinder↔rsbinder is byte-symmetric
-//! so F1/F5/F6-class defects only surface against the real peer*):
+//! What this harness verifies (*hermetic rsbinder↔rsbinder is
+//! byte-symmetric, so reorder/async-numbering defects only surface
+//! against the real peer*):
 //!
 //!   (a) **Concurrent twoway across N=2 outgoing slots**: the launcher
 //!       fires two `TX_SLOW_ECHO(80ms)` calls in parallel; both must
@@ -27,12 +27,11 @@
 //!       single slot — the launcher asserts the parallel budget so a
 //!       silent serialization on one slot fails the gate).
 //!
-//!   (b) **Oneway in-order receipt across the founding pin** (Option-1):
+//!   (b) **Oneway in-order receipt**:
 //!       20 oneway `TX_ONEWAY(i)` calls i=0..19, then one twoway
 //!       `TX_GET_LOG()` reading the recorded `Vec<i32>`. Must equal
-//!       `[0..20)` byte-exact. Catches F5 (reorder buffer absent) +
-//!       F6 (`asyncNumber` per-node missing). Option-1 design: founding-
-//!       slot pin preserves per-object FIFO.
+//!       `[0..20)` byte-exact. Catches a missing reorder buffer or
+//!       per-node `asyncNumber`.
 //!
 //!   (c) **Cross-slot nested callback** (pool-traversing): the launcher
 //!       registers a callback `AIBinder` and invokes
@@ -55,7 +54,7 @@ use rsbinder::*;
 /// Must match the descriptor the C launcher's AIBinder class uses for
 /// the *server root*. The genuine peer's `writeInterfaceToken` and
 /// rsbinder's `consume_rpc_interface_token` agree on it bit-for-bit
-/// (per 2-8 STAGE3 RPC token = bare `writeString16(descriptor)`).
+/// (STAGE3 RPC token = bare `writeString16(descriptor)`).
 const ROOT_DESC: &str = "rsbinder.test.IMultiConn";
 /// Must match the descriptor the C launcher's *callback* AIBinder uses.
 const CALLBACK_DESC: &str = "rsbinder.test.IMultiConnCallback";
@@ -70,7 +69,7 @@ const TX_CALLBACK_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 
 struct MultiConn {
     /// Oneway log — every `TX_ONEWAY(i)` appends `i` here, in receipt
-    /// order. Founding-slot pin (Plan 2-12 Option-1) means *all*
+    /// order. The founding-slot pin means *all*
     /// top-level oneway calls land on the same incoming slot, so order
     /// is preserved by single-slot in-order dispatch.
     oneway_log: Mutex<Vec<i32>>,
@@ -130,9 +129,9 @@ impl Remotable for MultiConn {
                 // `(cb: SIBinder, s: String) -> String` — call back into
                 // the client-supplied callback `cb.echo(s)` and return
                 // its reply. The nested call rides the *same* slot via
-                // DRIVING `(sess, slot)` re-entry pin (Plan 2-12 Phase
-                // A); cross-slot routing would deadlock (slot already
-                // owned by this dispatch).
+                // the DRIVING `(sess, slot)` re-entry pin; cross-slot
+                // routing would deadlock (slot already owned by this
+                // dispatch).
                 let cb: SIBinder = reader.read()?;
                 let s: String = reader.read()?;
                 let rp = (*cb)
@@ -170,7 +169,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let sock = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/data/local/tmp/rsmc.sock".to_string());
-    // argv[2] = max incoming slots per session. AC-12.6 baseline = 2
+    // argv[2] = max incoming slots per session. Baseline = 2
     // (founding + 1 attached). The launcher's
     // `ARpcSession_setMaxOutgoingConnections(2)` matches.
     let max_threads: u32 = std::env::args()
@@ -186,8 +185,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     server.set_android13plus(2);
     // **The gate**: opt into N=2 incoming slots per session (founding
     // + 1 attached). Default 1 would silently reject the launcher's
-    // second connection (Phase B.1 cap), so this is the load-bearing
-    // setting that wires AC-12.6 to the multi-conn code path.
+    // second connection (the per-session cap), so this is the
+    // load-bearing setting that wires the multi-conn code path.
     server.set_max_threads(max_threads);
     server.set_root(Interface::as_binder(&Binder::new(MultiConn {
         oneway_log: Mutex::new(Vec::new()),

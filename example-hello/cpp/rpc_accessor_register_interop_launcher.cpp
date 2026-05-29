@@ -8,7 +8,7 @@
 //
 // Pairs with `example-hello/src/bin/rpc_accessor_register_interop_server`
 // (cross-compiled rsbinder server binary). The companion bash script
-// `run_stage3_register.sh` automates build + push + run.
+// `run_rpc_accessor_register_interop.sh` automates build + push + run.
 //
 // Wire layers verified vs the genuine peer:
 //   - kernel-binder `IAccessor` AIDL (`addConnection`) on the rsbinder

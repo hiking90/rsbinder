@@ -1,11 +1,11 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Async-over-RPC e2e (subplan 2-3 §7-2 "async adapter is follow-up").
+//! Async-over-RPC e2e.
 //!
 //! Closes the documented capability gap: the generated **async** `Bp*`
 //! and the **async service** adapter (`new_async_binder`) were verified
-//! only over *kernel* binder (AC-6.5), never over the RPC transport.
+//! only over *kernel* binder, never over the RPC transport.
 //!
 //! There is **no new RPC production code** behind async-over-RPC — it is
 //! exactly the same `spawn_blocking` bridge the kernel async path uses:
@@ -20,16 +20,16 @@
 //!     `serve_blocking` worker.
 //!
 //! So this binary proves the existing adapters interoperate over a real
-//! `UnixTransport` (and `mem`), including the T1-1 / AC-3.2 invariant
+//! `UnixTransport` (and `mem`), including the shared-session invariant
 //! under genuine async concurrency: many in-flight calls on **one
 //! shared session** are serialized by the per-connection `conn_lock`
 //! and never cross-deliver replies (the r34 wire has no correlation id).
 //! True async *I/O* (a non-blocking `RpcTransport`, no blocking worker)
-//! remains the separately-deferred §7-2 item — it is *not* exercised
-//! here and is not required for this adapter to be correct.
+//! is not exercised here and is not required for this adapter to be
+//! correct.
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`, so it never shares
-//! a process with the kernel-binder unit tests (master §6). P6: each
+//! a process with the kernel-binder unit tests. Each
 //! test builds its own session pair → parallel-safe.
 
 #![cfg(feature = "rpc")]
@@ -123,8 +123,8 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         assert_eq!(e.unwrap(), "joined");
         assert_eq!(a.unwrap(), 30);
 
-        // Cross-task concurrency on **one shared session** (T1-1 /
-        // AC-3.2 under async): N tasks, each its own clone of the async
+        // Cross-task concurrency on **one shared session**
+        // under async: N tasks, each its own clone of the async
         // proxy, distinct payloads. Each task must observe *its own*
         // echo back — a frame interleave or reply mis-route would make
         // at least one assertion fail.

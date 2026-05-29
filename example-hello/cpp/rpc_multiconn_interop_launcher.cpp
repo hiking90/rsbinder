@@ -6,7 +6,7 @@
 //
 // Pairs with `example-hello/src/bin/rpc_multiconn_interop_server`
 // (cross-compiled rsbinder server). The companion bash script
-// `run_stage3_multiconn.sh` automates build + push + run.
+// `run_rpc_multiconn_interop.sh` automates build + push + run.
 //
 // ⚠ **STATUS (2026-05-21): NOT YET PASSING — gate is blocked.** The
 // harness compiles and runs end-to-end, but the (a) concurrent-twoway
@@ -21,7 +21,7 @@
 // or a non-wire protocol nuance rsbinder Phase A misses; investigation
 // is paused pending a deeper libbinder build/instrument session. This
 // launcher stays in tree as the **future-AC-12.6 gate harness**:
-// re-run `run_stage3_multiconn.sh` once the multi-conn root cause is
+// re-run `run_rpc_multiconn_interop.sh` once the multi-conn root cause is
 // known + fixed; the pass criteria below (a)/(b)/(c) and exit-codes
 // stay as the contract.
 //
@@ -445,8 +445,27 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[cpp-client] (a) PASS — parallel within budget\n");
     }
 
-    // ---- (b) Oneway in-order via founding-slot pin -----------------
-    // 20 oneway calls then one twoway TX_GET_LOG. Order must be exact.
+    // ---- (b) Oneway in-order via Phase C per-node asyncTodo ---------
+    // 20 oneway calls then polled twoway TX_GET_LOG (drain wait). The
+    // Phase C `asyncTodo` priority replay (AOSP `RpcState::process
+    // TransactInternal` lines 1093–1133 enqueue + 1247–1278 drain)
+    // guarantees per-node monotonic order *eventually*: libbinder's
+    // `ExclusiveConnection::find(CLIENT_ASYNC)` round-robins oneway
+    // across the client's `mOutgoing` pool, so the rsbinder server
+    // receives them split across slots whose `serve_blocking_on`
+    // workers dispatch independently. With Phase C the server parks
+    // out-of-order arrivals in the target node's `asyncTodo` heap and
+    // drains them when the matching expected `async_number` arrives.
+    //
+    // The crucial wrinkle: **TX_GET_LOG is a twoway, not gated by
+    // asyncTodo**, so it can race a still-draining queue. The test
+    // poll-loops `do_get_log` until `log.size() == kN` or a 2 s
+    // timeout, then asserts strict order — the in-order guarantee is
+    // structural (per-node monotonic), only the *timing* needs the
+    // poll to bound the eventual-consistency window. Pre-Phase-C this
+    // test got `log size 10` (founding slot's drain) or `log size 1`
+    // (asyncTodo with no drain wait); Phase C + poll gets `log size
+    // 20` in strict order.
     {
         constexpr int kN = 20;
         fprintf(stderr, "[cpp-client] (b) oneway in-order: %d × TX_ONEWAY then TX_GET_LOG\n", kN);
@@ -456,39 +475,102 @@ int main(int argc, char** argv) {
                 return 20;
             }
         }
-        // The rsbinder server's oneway dispatch is synchronous on its
-        // founding slot; by the time TX_GET_LOG (twoway) returns we
-        // know all the oneways landed in order (the twoway is queued
-        // behind them on the same slot per Option-1 pin).
         std::vector<int32_t> log;
-        if (!do_get_log(root, &log)) {
-            fprintf(stderr, "[cpp-client] (b) get_log failed\n");
-            return 21;
+        constexpr int kTimeoutMs = 2000;
+        constexpr int kPollMs = 25;
+        int elapsed_ms = 0;
+        while (elapsed_ms <= kTimeoutMs) {
+            log.clear();
+            if (!do_get_log(root, &log)) {
+                fprintf(stderr, "[cpp-client] (b) get_log failed\n");
+                return 21;
+            }
+            if ((int)log.size() == kN) break;
+            usleep(kPollMs * 1000);
+            elapsed_ms += kPollMs;
         }
         if ((int)log.size() != kN) {
-            fprintf(stderr, "[cpp-client] (b) FAIL: log size %zu != %d\n", log.size(), kN);
+            fprintf(stderr,
+                    "[cpp-client] (b) FAIL: log size %zu != %d after %d ms poll\n",
+                    log.size(), kN, elapsed_ms);
             return 22;
         }
         for (int i = 0; i < kN; ++i) {
             if (log[i] != i) {
                 fprintf(stderr,
-                        "[cpp-client] (b) FAIL: log[%d]=%d, expected %d — oneway reorder\n",
+                        "[cpp-client] (b) FAIL: log[%d]=%d, expected %d — oneway reorder \
+(Phase C asyncTodo bug)\n",
                         i, log[i], i);
                 return 23;
             }
         }
-        fprintf(stderr, "[cpp-client] (b) PASS — %d oneway calls in-order\n", kN);
+        fprintf(stderr,
+                "[cpp-client] (b) PASS — %d oneway calls in-order (drained after %d ms)\n",
+                kN, elapsed_ms);
     }
 
-    // ---- (c) Cross-slot nested callback ----------------------------
-    // Deferred behind F8.B (split mOutgoing/mIncoming pools) — see the
-    // setMaxIncomingThreads(0) scope note above. The callback wiring
-    // (do_invoke_callback + callback_on_transact + kCallbackDescriptor)
-    // and the rsbinder server's TX_INVOKE_CALLBACK arm stay in place so
-    // a follow-up commit that implements F8.B can re-enable this gate
-    // by flipping setMaxIncomingThreads back to 2 and uncommenting the
-    // assertion block below.
-    fprintf(stderr, "[cpp-client] (c) SKIPPED — needs F8.B (split outgoing/incoming pools)\n");
+    // ---- (c) Cross-slot nested callback (AC-12.2-extended) ----------
+    // 2 client threads fire TX_INVOKE_CALLBACK(cb, "pingN") in parallel
+    // on the 2 outgoing slots. The rsbinder server dispatches each on
+    // its own incoming-slot worker; inside on_transact, the server
+    // makes a *nested* server→client transact `cb.transact(TX_CALLBACK_
+    // ECHO, "pingN")` and reads the reply. The nested send rides the
+    // **same slot** the original transact arrived on via the Phase A
+    // `find_conn` DRIVING `(sess, slot)` re-entry pin — bidirectional
+    // wire on one TCP socket. The libbinder client's `waitForReply`
+    // loop on that slot accepts an inbound TRANSACT (nested context),
+    // dispatches our `callback_on_transact`, writes the reply back on
+    // the same slot, and returns to its outer wait. The launcher
+    // asserts both threads receive `cb-echo:pingN` (no cross-worker
+    // wire interleave / aliasing — F8). Pre-Phase-A4 (server-side
+    // N-inner) shared `state.remote_proxies` across workers, so the
+    // 2nd worker's nested send could route through the *first*
+    // worker's inner socket and deadlock or interleave; A4 + DRIVING
+    // (sess,slot) key fixed that, and this gate proves the integration.
+    {
+        constexpr int kN = 2;
+        fprintf(stderr,
+                "[cpp-client] (c) cross-slot nested callback: %d × TX_INVOKE_CALLBACK in parallel\n",
+                kN);
+        AIBinder_Class* cb_clazz = AIBinder_Class_define(
+                kCallbackDescriptor, cb_on_create, cb_on_destroy, callback_on_transact);
+        if (!cb_clazz) {
+            fprintf(stderr, "[cpp-client] (c) Class_define(cb) failed\n");
+            return 30;
+        }
+        AIBinder* cb_raw = AIBinder_new(cb_clazz, nullptr);
+        if (!cb_raw) {
+            fprintf(stderr, "[cpp-client] (c) AIBinder_new(cb) failed\n");
+            return 31;
+        }
+        auto cb_owner = std::unique_ptr<AIBinder, decltype(&AIBinder_decStrong)>(
+                cb_raw, AIBinder_decStrong);
+        AIBinder* cb = cb_owner.get();
+
+        std::vector<std::thread> ths;
+        std::vector<std::string> replies(kN);
+        std::vector<int> oks(kN, 0);
+        for (int i = 0; i < kN; ++i) {
+            ths.emplace_back([i, root, cb, &replies, &oks]() {
+                std::string arg = "ping" + std::to_string(i);
+                if (do_invoke_callback(root, cb, arg.c_str(), &replies[i])) {
+                    oks[i] = 1;
+                }
+            });
+        }
+        for (auto& t : ths) t.join();
+        for (int i = 0; i < kN; ++i) {
+            std::string want = "cb-echo:ping" + std::to_string(i);
+            if (!oks[i] || replies[i] != want) {
+                fprintf(stderr,
+                        "[cpp-client] (c) FAIL thread %d: ok=%d reply=\"%.*s\" want=\"%.*s\"\n",
+                        i, oks[i], (int)replies[i].size(), replies[i].data(),
+                        (int)want.size(), want.data());
+                return 32;
+            }
+        }
+        fprintf(stderr, "[cpp-client] (c) PASS — %d parallel nested callbacks round-tripped\n", kN);
+    }
 
     printf("AC-12.6 PASS — multi-conn real-libbinder ↔ rsbinder full transact\n");
     fflush(stdout);

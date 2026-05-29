@@ -1,25 +1,25 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-6.B AC-6.3 / AC-6.4: the **generated** `Bp*` stub —
-//! which now emits `as_remote().ok_or(BadType)?` instead of the
+//! The **generated** `Bp*` stub —
+//! which emits `as_remote().ok_or(BadType)?` instead of the
 //! kernel-only `as_proxy().unwrap()` — driven over the RPC transport,
 //! with the **generated server stub reused unmodified**. No
-//! hand-written proxy (contrast `rpc_e2e.rs`, subplan 2-2): this is
+//! hand-written proxy (contrast `rpc_e2e.rs`): this is
 //! the single-stub end state. The interface (`rpcsmoke.IRpcSmoke`) is
 //! compiled by `build.rs` to `OUT_DIR/rpc_smoke.rs`.
 //!
-//! - **AC-6.3**: an arbitrary AIDL interface round-trips over `mem`,
+//! - an arbitrary AIDL interface round-trips over `mem`,
 //!   `unix` (and `tcp_debug` when its feature is on) through the
 //!   generated `BpRpcSmoke`, whose `from_binder` stamps the RPC
-//!   descriptor in place (subplan 2-6.B).
-//! - **AC-6.4**: a non-remote / wrong binder is graceful — the
+//!   descriptor in place.
+//! - a non-remote / wrong binder is graceful — the
 //!   generator's old `.unwrap()` panic is gone (golden-proven), and
 //!   `try_from` yields a value or `Err`, never a panic.
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`, so it never
-//! shares a process with the kernel-binder unit tests (master §6).
-//! P6: each test builds its own session pair → parallel-safe.
+//! shares a process with the kernel-binder unit tests.
+//! Each test builds its own session pair → parallel-safe.
 
 #![cfg(feature = "rpc")]
 #![allow(non_snake_case)]
@@ -54,7 +54,7 @@ fn root() -> SIBinder {
     BnRpcSmoke::new_binder(SmokeSvc).as_binder()
 }
 
-// ---- AC-6.3: generated stub e2e over each transport -----------------
+// ---- generated stub e2e over each transport -------------------------
 
 fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
@@ -114,7 +114,7 @@ fn generated_stub_over_tcp_debug() {
     run(Box::new(a), Box::new(b));
 }
 
-// ---- AC-6.4: bad binder is graceful, never a panic ------------------
+// ---- bad binder is graceful, never a panic --------------------------
 
 /// A foreign native binder of an unrelated descriptor — neither an
 /// `IRpcSmoke` proxy nor `BnRpcSmoke`.
@@ -136,7 +136,7 @@ impl Remotable for BnOther {
     }
 }
 
-/// AC-6.4: the generator's old `as_proxy().unwrap()` (which panicked
+/// The generator's old `as_proxy().unwrap()` (which panicked
 /// on a non-`ProxyHandle` binder) is gone — golden-proven it now
 /// emits `as_remote().ok_or(StatusCode::BadType)?`. At the boundary,
 /// `try_from`:

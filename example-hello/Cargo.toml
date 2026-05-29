@@ -14,12 +14,6 @@ license = { workspace = true }
 #   cargo run -p example-hello --features rpc --bin rpc_hello_service
 #   cargo run -p example-hello --features rpc --bin rpc_hello_client
 rpc = ["rsbinder/rpc"]
-# Lift the EXPERIMENTAL multi-connection slot-cap clamp (plan 2-12).
-# Required by `rpc_multiconn_interop_server` since that bin's whole
-# purpose is to exercise N>=2 incoming slots — without this feature
-# the attach arm clamps the cap to 1 and the bin can only ever serve
-# the founding connection.
-rpc-experimental-multiconn = ["rpc", "rsbinder/rpc-experimental-multiconn"]
 # Subplan 2-13 — opt in to the android-16 accessor bridge symbols
 # (`hub::android_16::resolve_accessor`); only used by the STAGE3
 # interop client.
@@ -38,7 +32,7 @@ required-features = ["rpc"]
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
 #       --features rpc,android_16 --bin rpc_accessor_interop_client
 # and run on the android-16 emulator alongside the C++ launcher
-# (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_stage3.sh.
+# (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_rpc_accessor_interop.sh.
 [[bin]]
 name = "rpc_accessor_interop_client"
 required-features = ["rpc", "android_16"]
@@ -52,28 +46,31 @@ required-features = ["rpc", "android_16"]
 #       --features rpc,android_16 --bin rpc_accessor_register_interop_server
 # and run on the android-16 emulator alongside the C++ launcher
 # (`cpp/rpc_accessor_register_interop_launcher.cpp`). See
-# cpp/run_stage3_register.sh.
+# cpp/run_rpc_accessor_register_interop.sh.
 [[bin]]
 name = "rpc_accessor_register_interop_server"
 required-features = ["rpc", "android_16"]
 
-# Subplan 2-12 Phase D / AC-12.6 — rsbinder side of the multi-
+# Subplan 2-12 Phase D + C — rsbinder side of the multi-
 # connection-per-session real-libbinder interop gate. Pairs with
 # cpp/rpc_multiconn_interop_launcher (a real libbinder client built
 # with `ARpcSession_setMaxOutgoingConnections(2) + setMaxIncoming
-# Threads(2)`). Cross-compile with
+# Threads(1)`). Cross-compile with
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
-#       --features rpc-experimental-multiconn --bin rpc_multiconn_interop_server
-# and run on the android-16 emulator alongside cpp/run_stage3_
-# multiconn.sh.
+#       --features rpc --bin rpc_multiconn_interop_server
+# and run on the android-16 emulator alongside
+# cpp/run_rpc_multiconn_interop.sh. AC-12.6 (a) twoway + (b) oneway both PASS post-
+# Phase C (2026-05-28); the prior EXPERIMENTAL gate was removed.
 [[bin]]
 name = "rpc_multiconn_interop_server"
-required-features = ["rpc-experimental-multiconn"]
+required-features = ["rpc"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 env_logger = { workspace = true }
 async-trait = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+libc = { workspace = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

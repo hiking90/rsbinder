@@ -1,16 +1,15 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subplan 2-7: opt-in FD-over-RPC (`FileDescriptorTransportMode`).
+//! Opt-in FD-over-RPC (`FileDescriptorTransportMode`).
 //!
-//! * AC-7.1 — default (no opt-in) is the 2-2 `BadType` reject,
-//!   unchanged.
-//! * AC-7.2 — both peers opt in over UDS ⇒ fd travels via
+//! * default (no opt-in) is the `BadType` reject, unchanged.
+//! * both peers opt in over UDS ⇒ fd travels via
 //!   `SCM_RIGHTS`, valid + `O_CLOEXEC` at the receiver; works in
 //!   *both* directions (arg and reply).
-//! * AC-7.3 — one-sided opt-in falls back to `None` (reject, not an
+//! * one-sided opt-in falls back to `None` (reject, not an
 //!   error).
-//! * AC-7.4 — a non-UDS transport (`mem`) never passes fds (rejected
+//! * a non-UDS transport (`mem`) never passes fds (rejected
 //!   by type at send; zero fds reach the peer).
 //!
 //! Separate test binary; `#![cfg(feature = "rpc")]`.
@@ -166,7 +165,7 @@ fn wait_sock(p: &std::path::Path) {
     panic!("socket never appeared");
 }
 
-/// AC-7.2: both peers opt in over UDS ⇒ fd passes both ways, valid +
+/// Both peers opt in over UDS ⇒ fd passes both ways, valid +
 /// O_CLOEXEC at the receiver.
 #[test]
 fn fd_roundtrip_when_both_opt_in_over_uds() {
@@ -206,7 +205,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
         f.read_to_string(&mut s).unwrap();
         assert_eq!(s, "from-server");
     }
-    // O_CLOEXEC must be set on the received fd (plan 2-7.d).
+    // O_CLOEXEC must be set on the received fd.
     let flags = rustix::io::fcntl_getfd(got.as_ref().as_fd()).unwrap();
     assert!(
         flags.contains(rustix::io::FdFlags::CLOEXEC),
@@ -220,7 +219,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// AC-7.1 / AC-7.3: no opt-in (or one-sided) ⇒ fd write is the 2-2
+/// No opt-in (or one-sided) ⇒ fd write is the
 /// `BadType` reject, never a silent corruption or an error-less hang.
 #[test]
 fn fd_rejected_without_mutual_opt_in() {
@@ -255,7 +254,7 @@ fn fd_rejected_without_mutual_opt_in() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// AC-7.4: a non-UDS transport (`mem`) cannot pass fds — rejected by
+/// A non-UDS transport (`mem`) cannot pass fds — rejected by
 /// type at the transport, zero fds reach the peer.
 #[test]
 fn fd_rejected_on_non_uds_transport() {
@@ -291,17 +290,17 @@ fn fd_rejected_on_non_uds_transport() {
     let _ = h.join();
 }
 
-/// AC-11.0 / AC-11.4 (subplan 2-11): the **v1+ AOSP-faithful**
-/// FD-over-RPC path end-to-end over a real UDS — Phase A0 (FD mode
+/// The **v1+ AOSP-faithful**
+/// FD-over-RPC path end-to-end over a real UDS — FD mode
 /// negotiated in the `RpcConnectionHeader`, `SCM_RIGHTS` carried on the
-/// `aosp_framing` no-length-prefix wire) + Phase A (the
-/// `[not-null|hasComm|TYPE|fdIndex]` body) + Phase B (strict
-/// object-position read), at v1 (android-14/15) **and** v2
+/// `aosp_framing` no-length-prefix wire, the
+/// `[not-null|hasComm|TYPE|fdIndex]` body, and strict
+/// object-position read, at v1 (android-14/15) **and** v2
 /// (android-16). fd travels both ways: as a transaction *argument*
-/// (client→server, the A2b inbound-args gate) and in the *reply*
+/// (client→server, the server inbound-args gate) and in the *reply*
 /// (server→client), valid + `O_CLOEXEC` at the receiver. This is the
 /// hermetic symmetric proof; the non-negotiable AOSP-faithfulness gate
-/// is the real-libbinder Phase D (AC-11.3).
+/// is real-libbinder interop.
 #[test]
 fn fd_v1plus_aosp_roundtrip_both_directions() {
     for ver in [1u32, 2u32] {

@@ -531,9 +531,16 @@ impl ValueType {
         lhs: &ConstExpr,
         operator: &str,
         rhs: &ConstExpr,
+        visited: &mut std::collections::HashSet<String>,
     ) -> Result<ConstExpr, ConstExprError> {
-        let lhs = lhs.calculate()?;
-        let rhs = rhs.calculate()?;
+        // Thread the cycle-guard `visited` set through operand resolution so
+        // a reference cycle that crosses a binary operator (e.g.
+        // `const int A = B + 1; const int B = A + 1;`) is detected instead
+        // of recursing until the stack overflows. Each operand gets its OWN
+        // clone of the current resolution path so that sibling references to
+        // a common (non-cyclic) constant are not mistaken for a cycle.
+        let lhs = lhs.value.calculate_with_visited(&mut visited.clone())?;
+        let rhs = rhs.value.calculate_with_visited(&mut visited.clone())?;
 
         let promoted = type_conversion(
             integral_promotion(lhs.value.clone()),
@@ -659,7 +666,9 @@ impl ValueType {
                     Ok(expr)
                 }
             }
-            ValueType::Expr { lhs, operator, rhs } => ValueType::calc_expr(lhs, operator, rhs),
+            ValueType::Expr { lhs, operator, rhs } => {
+                ValueType::calc_expr(lhs, operator, rhs, visited)
+            }
             ValueType::Array(v) => {
                 let mut array = Vec::new();
 

@@ -207,6 +207,30 @@ pub enum SemanticError {
         #[label("'{type_name}' is not a valid enum backing type")]
         span: SourceSpan,
     },
+
+    /// `@EnforcePermission(...)` annotation present but its argument
+    /// matches none of the AOSP-recognized forms (`"X"`, `value="X"`,
+    /// `allOf={...}`, `anyOf={...}`). AOSP `aidl_language.cpp::
+    /// AidlAnnotation::CheckValid` rejects this at build time; rsbinder
+    /// errors here rather than silently dropping the annotation, which
+    /// would generate an unguarded Bn — a secure-by-default regression.
+    #[error("@EnforcePermission on '{method}' has an unrecognized argument form")]
+    #[diagnostic(
+        code(aidl::malformed_enforce_permission),
+        help(
+            "supported forms are @EnforcePermission(\"X\"), \
+             @EnforcePermission(value=\"X\"), \
+             @EnforcePermission(allOf={{\"X\",\"Y\"}}), \
+             @EnforcePermission(anyOf={{\"X\",\"Y\"}})"
+        )
+    )]
+    MalformedEnforcePermission {
+        method: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("malformed @EnforcePermission argument")]
+        span: SourceSpan,
+    },
 }
 
 /// Auxiliary diagnostic for marking the second conflicting location in

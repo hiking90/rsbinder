@@ -463,6 +463,9 @@ pub mod {{mod}} {
         match _code {
         {%- for member in fn_members %}
             transactions::r#{{ member.identifier }} => {
+            {%- if member.enforce_permission_check %}
+                {{ member.enforce_permission_check }}
+            {%- endif %}
             {%- for decl in member.transaction_decls %}
                 {{ decl }}
             {%- endfor %}
@@ -558,9 +561,14 @@ struct FnMembers {
     read_onto_params: Vec<String>,
     transaction_code: u32,
     has_explicit_code: bool,
+    /// Pre-rendered Rust block that runs at the top of this method's
+    /// `on_transact` arm and replies with `ExceptionCode::Security`
+    /// (AOSP `EX_SECURITY`) on permission denial. `None` when the
+    /// method carries no `@EnforcePermission`.
+    enforce_permission_check: Option<String>,
 }
 
-fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
+fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMembers, AidlError> {
     let mut func_call_params = String::new();
     let mut args = "&self".to_string();
     let mut args_async = "&'a self".to_string();
@@ -659,6 +667,12 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
     let return_type = generator.type_declaration(false);
     let transaction_has_return = return_type != "()";
 
+    let enforce_permission_check = parser::enforce_permission_from_annotation_list(
+        &method.annotation_list,
+        &method.identifier,
+    )?
+    .map(|expr| render_enforce_permission_check(&expr, crate_name));
+
     Ok(FnMembers {
         // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
@@ -675,7 +689,49 @@ fn make_fn_member(method: &parser::MethodDecl) -> Result<FnMembers, AidlError> {
         read_onto_params,
         transaction_code: method.intvalue.unwrap_or(0) as u32,
         has_explicit_code: method.intvalue.is_some(),
+        enforce_permission_check,
     })
+}
+
+/// Renders `@EnforcePermission(...)` into the `on_transact` arm's
+/// early-deny block; short-circuits per AOSP
+/// `system/tools/aidl/generate_cpp.cpp::WriteEnforcePermissionCheck`.
+fn render_enforce_permission_check(
+    expr: &parser::EnforcePermissionExpr,
+    crate_name: &str,
+) -> String {
+    fn lit(s: &str) -> String {
+        // The AIDL pest grammar already forbids `\` and `"` in
+        // permission strings; the escape stays as defense-in-depth
+        // against future grammar relaxation.
+        debug_assert!(
+            !s.contains('\\') && !s.contains('"'),
+            "AIDL grammar must reject {s:?} before reaching codegen"
+        );
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    // Route the crate prefix through the same `{{crate}}` selection used
+    // everywhere else (`crate::` for AIDL compiled inside the rsbinder crate
+    // via `set_crate_support(true)`, `rsbinder::` otherwise) — a hardcoded
+    // `rsbinder::` would not resolve for internally-compiled AIDL.
+    let call = |p: &str| {
+        format!(
+            "{crate_name}::permission_controller::check_permission(\"{}\")",
+            lit(p)
+        )
+    };
+    let join = |ps: &[String], op: &str| ps.iter().map(|p| call(p)).collect::<Vec<_>>().join(op);
+    let condition = match expr {
+        parser::EnforcePermissionExpr::Single(p) => call(p),
+        parser::EnforcePermissionExpr::AllOf(ps) => join(ps, " && "),
+        parser::EnforcePermissionExpr::AnyOf(ps) => join(ps, " || "),
+    };
+    format!(
+        "if !({condition}) {{ \
+             _reply.write(&{crate_name}::Status::from({crate_name}::ExceptionCode::Security))?; \
+             return Ok(()); \
+         }}"
+    )
 }
 
 /// Enforces AOSP's transaction-code rules for an interface's methods, before
@@ -936,7 +992,7 @@ impl Generator {
             validate_transaction_codes(&decl)?;
 
             for method in decl.method_list.iter() {
-                fn_members.push(make_fn_member(method)?);
+                fn_members.push(make_fn_member(method, self.get_crate_name())?);
             }
         }
 
