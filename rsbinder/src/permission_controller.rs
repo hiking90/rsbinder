@@ -34,7 +34,7 @@ pub use android::os::IPermissionController::{
 };
 
 use crate::error::Result;
-use crate::{hub, FromIBinder, Strong};
+use crate::{hub, FromIBinder, Parcel, Strong};
 
 /// Service name registered by Android's `PermissionManagerService`. Used
 /// as the key for [`crate::hub::get_service`].
@@ -62,13 +62,36 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// [`crate::get_calling_uid`] / [`crate::get_calling_pid`]) holds
 /// `permission_name`.
 ///
+/// This is the runtime backing the generated `@EnforcePermission` deny
+/// block; `reader` is the inbound transaction parcel held by
+/// `on_transact`, used to detect the transport (see *RPC fail-closed*).
+///
 /// Intended for server-side use inside a [`crate::Transactable::transact`]
 /// dispatch, mirroring AOSP `IPCThreadState::self()->getCallingUid()` +
 /// `IPermissionController::checkPermission(...)`.
 ///
+/// # RPC fail-closed (`@EnforcePermission` is kernel-only) — Plan 2-16 Phase A
+///
+/// `@EnforcePermission` has **no meaning over the RPC transport**: AOSP's
+/// RPC stack carries no uid/permission concept, and on the RPC dispatch
+/// path [`crate::get_calling_uid`] is not populated, so it would read `0`
+/// (= root) — and `PermissionManagerService` *unconditionally grants
+/// root*. That would turn every guarded method into a **silent grant to
+/// any anonymous RPC peer**. To prevent this, when `reader` is an RPC
+/// parcel ([`Parcel::is_for_rpc`]) this returns `false` **before any uid
+/// read or PMS lookup**, regardless of process shape, and emits a
+/// one-time `warn`. The deny is therefore independent of whether uid is
+/// later wired over Unix RPC (Plan 2-16 Phase B): `is_for_rpc()` stays
+/// `true` no matter what uid is populated.
+///
+/// RPC services needing authorization must use transport-native means
+/// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
+/// via [`crate::get_calling_uid`] over Unix RPC).
+///
 /// # Fail-closed semantics
 ///
 /// Returns `false` when:
+/// - The transaction arrived over RPC (see above).
 /// - The current thread is not handling a binder transaction
 ///   (`get_calling_uid()` / `get_calling_pid()` both `0`).
 /// - The `permission` service is unreachable (`system_server` absent or
@@ -78,7 +101,15 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// This matches AOSP's "if in doubt, deny" posture for missing
 /// PermissionManagerService — see Android `checkPermission` callers in
 /// `frameworks/native/services/` for the same pattern.
-pub fn check_permission(permission_name: &str) -> bool {
+pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
+    // RPC fail-closed: deny before reading uid or reaching PMS — uid 0 on
+    // the RPC path would otherwise read as root and PMS grants root. The
+    // deny is transport-driven (the reader knows it is an RPC parcel), so
+    // it is independent of Plan 2-16 Phase B uid wiring.
+    if reader.is_for_rpc() {
+        warn_enforce_permission_over_rpc();
+        return false;
+    }
     let calling_pid = crate::get_calling_pid();
     let calling_uid = crate::get_calling_uid();
     let Ok(pc) = default() else {
@@ -86,6 +117,21 @@ pub fn check_permission(permission_name: &str) -> bool {
     };
     pc.checkPermission(permission_name, calling_pid as i32, calling_uid as i32)
         .unwrap_or(false)
+}
+
+/// One-time `warn` the first time an `@EnforcePermission` method is denied
+/// because it was dispatched over RPC. Per-process, not per-interface —
+/// the message states the general rule, not a specific permission.
+fn warn_enforce_permission_over_rpc() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "@EnforcePermission is unsupported over RPC and denies every \
+             guarded method (Plan 2-16 Phase A); use PeerIdentity / \
+             set_authorizer or uid ACLs for RPC authorization"
+        );
+    });
 }
 
 #[cfg(test)]
@@ -115,5 +161,26 @@ mod tests {
     #[test]
     fn test_service_name_matches_system_server_registration() {
         assert_eq!(SERVICE_NAME, "permission");
+    }
+
+    /// Plan 2-16 Phase A unit-level proof: `check_permission` denies for
+    /// an RPC parcel **before** consulting PMS. A kernel parcel falls
+    /// through to the PMS path (which returns `false` here only because
+    /// `system_server` is unreachable in this hermetic build) — the RPC
+    /// arm is the new transport gate this asserts.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn check_permission_denies_rpc_parcel() {
+        let mut rpc_parcel = Parcel::new();
+        rpc_parcel.set_for_rpc(true);
+        assert!(
+            !check_permission(&rpc_parcel, "android.permission.INTERNET"),
+            "RPC parcel must fail-closed regardless of uid/PMS"
+        );
+
+        // Sanity: a kernel parcel takes the non-RPC branch (it does not
+        // short-circuit on `is_for_rpc`).
+        let kernel_parcel = Parcel::new();
+        assert!(!kernel_parcel.is_for_rpc());
     }
 }

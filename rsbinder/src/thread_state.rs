@@ -76,6 +76,87 @@ thread_local! {
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
 }
 
+// ---- RPC calling context (Plan 2-16 Phase B) ------------------------
+//
+// The kernel calling identity lives in `THREAD_STATE.transaction`, but
+// `ThreadState::new()` eagerly pulls `ProcessState::as_self()`, which
+// **panics in a pure-RPC process** (no kernel binder). The RPC dispatch
+// path therefore must NOT touch `THREAD_STATE`. Instead it stamps the
+// caller's uid/pid into this separate, ProcessState-independent
+// thread-local for the duration of one RPC `on_transact`, and the public
+// calling-identity accessors consult it *first* (so they work in a
+// pure-RPC process and never force the kernel thread-local).
+//
+// The store is a plain `Cell` — the value is `Copy` and never borrowed
+// across the user handler, so the R1 borrow discipline that governs
+// `THREAD_STATE`/`BINDER_DEREFS` does not apply here (set → run handler →
+// restore, no live borrow during the callout).
+#[cfg(feature = "rpc")]
+thread_local! {
+    static RPC_CALLING: std::cell::Cell<Option<RpcCallingContext>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Caller identity for an in-flight RPC transaction. `Copy` so the
+/// `Cell` swap in [`RpcCallingGuard`] needs no clone.
+#[cfg(feature = "rpc")]
+#[derive(Clone, Copy)]
+struct RpcCallingContext {
+    uid: binder::uid_t,
+    pid: binder::pid_t,
+}
+
+/// Fail-closed calling uid for RPC transports that carry **no** uid
+/// (`Vsock` cid, TLS `Certificate`, `Anonymous`). `u32::MAX`
+/// (`(uid_t)-1`) is never a real privileged uid, so a hand-rolled uid
+/// ACL (`if get_calling_uid() == AID_SYSTEM { … }`) can never
+/// accidentally match — and it is deliberately **not** `0`, so it can
+/// never be mistaken for root. See Plan 2-16 §1.2.
+#[cfg(feature = "rpc")]
+pub(crate) const RPC_UNKNOWN_CALLING_UID: binder::uid_t = binder::uid_t::MAX;
+
+/// Stamp the RPC caller's `(uid, pid)` into [`RPC_CALLING`] for the
+/// duration of one `on_transact`, restoring the previous value on drop
+/// (so nested re-entrant callbacks over the same connection nest
+/// correctly). Installed by the RPC dispatch path
+/// (`rpc::session::execute_dispatched`) around `rpc_transact`.
+#[cfg(feature = "rpc")]
+pub(crate) struct RpcCallingGuard {
+    previous: Option<RpcCallingContext>,
+}
+
+#[cfg(feature = "rpc")]
+impl RpcCallingGuard {
+    pub(crate) fn install(uid: binder::uid_t, pid: binder::pid_t) -> Self {
+        let previous = RPC_CALLING.with(|c| c.replace(Some(RpcCallingContext { uid, pid })));
+        RpcCallingGuard { previous }
+    }
+}
+
+#[cfg(feature = "rpc")]
+impl Drop for RpcCallingGuard {
+    fn drop(&mut self) {
+        RPC_CALLING.with(|c| c.set(self.previous));
+    }
+}
+
+/// The current RPC caller's `(uid, pid)`, or `None` when not dispatching
+/// an RPC transaction (always `None` without the `rpc` feature). Never
+/// touches `THREAD_STATE`/`ProcessState`, so it is safe to call in a
+/// pure-RPC process.
+#[inline]
+fn rpc_calling() -> Option<(binder::uid_t, binder::pid_t)> {
+    #[cfg(feature = "rpc")]
+    {
+        RPC_CALLING.with(|c| c.get()).map(|r| (r.uid, r.pid))
+    }
+    #[cfg(not(feature = "rpc"))]
+    {
+        None
+    }
+}
+
 // Freeze observer BR labels (nr=20/21/22).
 // `BR_TRANSACTION_SEC_CTX` (nr=2) is dispatched by the special-case
 // above `return_to_str`'s indexed lookup, so the nr=20 slot is free
@@ -1625,6 +1706,28 @@ pub struct CallingContext {
 
 impl std::default::Default for CallingContext {
     fn default() -> CallingContext {
+        // Plan 2-16 Phase B: an in-flight RPC transaction takes precedence
+        // and is read from the ProcessState-independent thread-local
+        // (works in a pure-RPC process). RPC has no SELinux context, so
+        // `sid` is always `None`.
+        if let Some((uid, pid)) = rpc_calling() {
+            return CallingContext {
+                pid,
+                uid,
+                sid: None,
+            };
+        }
+        // Kernel path. `THREAD_STATE`'s ctor pulls `ProcessState::as_self()`,
+        // which panics if uninitialized — so in a pure-RPC process with no
+        // in-flight RPC transaction, return the documented
+        // out-of-transaction self identity without forcing the thread-local.
+        if !ProcessState::is_initialized() {
+            return CallingContext {
+                pid: rustix::process::getpid().as_raw_nonzero().get() as _,
+                uid: rustix::process::getuid().as_raw(),
+                sid: None,
+            };
+        }
         THREAD_STATE.with(|thread_state| -> CallingContext {
             let thread_state = thread_state.borrow();
             match thread_state.transaction.as_ref() {
@@ -1658,7 +1761,14 @@ impl std::default::Default for CallingContext {
 }
 
 pub fn is_handling_transaction() -> bool {
-    THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.is_some())
+    // Plan 2-16 Phase B: an in-flight RPC transaction counts (and is
+    // detected without forcing the ProcessState-coupled `THREAD_STATE`,
+    // which would panic in a pure-RPC process).
+    if rpc_calling().is_some() {
+        return true;
+    }
+    ProcessState::is_initialized()
+        && THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.is_some())
 }
 
 /// SELinux security context of the caller for the current in-flight
@@ -1685,6 +1795,12 @@ pub fn is_handling_transaction() -> bool {
 /// pointer is lazily copied at every call, so leaking is not possible).
 ///
 pub fn get_calling_sid() -> Option<CString> {
+    // RPC carries no SELinux context (see `PeerIdentity`); during an RPC
+    // transaction return `None` without forcing `THREAD_STATE` (which
+    // would panic in a pure-RPC process).
+    if rpc_calling().is_some() || !ProcessState::is_initialized() {
+        return None;
+    }
     THREAD_STATE.with(|thread_state| {
         let thread_state = thread_state.borrow();
         let transaction = thread_state.transaction.as_ref()?;
@@ -1715,6 +1831,15 @@ pub fn get_calling_sid() -> Option<CString> {
 /// common case where only the PID is needed — avoids the
 /// `Option<CString>` allocation of the full context.
 pub fn get_calling_pid() -> binder::pid_t {
+    // Plan 2-16 Phase B: an RPC transaction's pid (Unix RPC; `-1`/unknown
+    // on transports without a pid) takes precedence and is read without
+    // forcing `THREAD_STATE` (pure-RPC safe).
+    if let Some((_, pid)) = rpc_calling() {
+        return pid;
+    }
+    if !ProcessState::is_initialized() {
+        return 0;
+    }
     THREAD_STATE.with(|thread_state| {
         thread_state
             .borrow()
@@ -1739,7 +1864,32 @@ pub fn get_calling_pid() -> binder::pid_t {
 /// replace it for a nested outbound call (the AOSP
 /// `clearCallingIdentity` pattern), see [`clear_calling_identity`] and
 /// [`restore_calling_identity`].
+///
+/// # RPC transports (Plan 2-16 Phase B)
+///
+/// Over a **Unix-domain RPC** connection this returns the kernel-vouched
+/// peer uid (`SO_PEERCRED` on Linux/Android, `getpeereid` on macOS/BSD) —
+/// so a hand-rolled uid ACL runs transport-agnostically on kernel binder
+/// *and* Unix RPC. The granularity is **connection-level**, not
+/// per-method (an RPC connection is opened once by one peer process).
+///
+/// Over RPC transports that carry **no** uid (`Vsock` cid, TLS
+/// `Certificate`, `Anonymous`) this returns a **fail-closed sentinel**
+/// (`u32::MAX`, never `0`/root and never a real privileged uid) — uid is
+/// the wrong authorization basis there; use `PeerIdentity` /
+/// `RpcServer::set_authorizer` instead. `@EnforcePermission` over RPC is
+/// always denied regardless of uid (Plan 2-16 Phase A).
 pub fn get_calling_uid() -> binder::uid_t {
+    // Plan 2-16 Phase B: an RPC transaction's uid takes precedence and is
+    // read without forcing `THREAD_STATE` (pure-RPC safe). Non-uid
+    // transports were stamped with `RPC_UNKNOWN_CALLING_UID` by the
+    // dispatch path, so this stays fail-closed there.
+    if let Some((uid, _)) = rpc_calling() {
+        return uid;
+    }
+    if !ProcessState::is_initialized() {
+        return 0;
+    }
     THREAD_STATE.with(|thread_state| {
         thread_state
             .borrow()
@@ -1757,6 +1907,15 @@ pub fn get_calling_uid() -> binder::uid_t {
 /// (e.g. per-uid accounting in [`crate::proxy_count`]) get the same
 /// attribution they would on real Android.
 pub fn get_calling_uid_or_self() -> binder::uid_t {
+    // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
+    // transaction; otherwise fall back to the process's own uid without
+    // forcing `THREAD_STATE` in a pure-RPC process.
+    if let Some((uid, _)) = rpc_calling() {
+        return uid;
+    }
+    if !ProcessState::is_initialized() {
+        return rustix::process::getuid().as_raw();
+    }
     THREAD_STATE
         .with(|thread_state| {
             thread_state
@@ -1990,6 +2149,53 @@ pub fn has_explicit_identity() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 2-16 Phase B: the RPC calling context is read by the public
+    /// accessors, restores on guard drop, nests correctly, and is
+    /// fail-closed for non-uid transports — all without a kernel
+    /// `ProcessState` (hermetic, runs on macOS). The `0`/`!handling`
+    /// outside the guard also proves the pure-RPC accessors are
+    /// panic-free with `ProcessState` uninitialized.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn rpc_calling_context_is_read_restored_and_failclosed() {
+        // Outside any transaction (pure-RPC, no ProcessState): defined,
+        // not a panic.
+        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_pid(), 0);
+        assert!(!is_handling_transaction());
+        assert!(get_calling_sid().is_none());
+
+        {
+            let _g = RpcCallingGuard::install(1234, 42);
+            assert_eq!(get_calling_uid(), 1234);
+            assert_eq!(get_calling_pid(), 42);
+            assert!(is_handling_transaction());
+            // RPC carries no SELinux context.
+            assert!(get_calling_sid().is_none());
+            assert_eq!(CallingContext::default().uid, 1234);
+            assert_eq!(CallingContext::default().pid, 42);
+
+            // Nested re-entrant callback over the same connection: a
+            // non-uid transport stamps the fail-closed sentinel; the
+            // outer identity is restored when it returns.
+            {
+                let _g2 = RpcCallingGuard::install(RPC_UNKNOWN_CALLING_UID, -1);
+                assert_eq!(get_calling_uid(), RPC_UNKNOWN_CALLING_UID);
+                assert_ne!(get_calling_uid(), 0, "sentinel must never read as root");
+                assert_eq!(get_calling_pid(), -1);
+            }
+            assert_eq!(
+                get_calling_uid(),
+                1234,
+                "outer identity restored after nesting"
+            );
+        }
+
+        // Fully restored.
+        assert_eq!(get_calling_uid(), 0);
+        assert!(!is_handling_transaction());
+    }
 
     #[test]
     fn test_return_to_str() {

@@ -499,6 +499,17 @@ impl Parcel {
         self.rpc.is_some()
     }
 
+    /// `false` always — without the `rpc` feature there is no RPC
+    /// serialization mode. This `cfg`-off arm exists so callers that
+    /// branch on transport (notably
+    /// [`crate::permission_controller::check_permission`], which denies
+    /// `@EnforcePermission` over RPC — Plan 2-16 Phase A) compile in any
+    /// feature configuration without a `cfg` of their own.
+    #[cfg(not(feature = "rpc"))]
+    pub fn is_for_rpc(&self) -> bool {
+        false
+    }
+
     /// Attach the RPC object-marshalling hooks and enter RPC mode
     /// (android `Parcel::markForRpc`/`mSession` equivalent).
     #[cfg(feature = "rpc")]

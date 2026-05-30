@@ -62,7 +62,7 @@ interface IFoo {
         "#,
     );
     let arm = arm_for("doNet", &out);
-    let needle = "rsbinder::permission_controller::check_permission(\"INTERNET\")";
+    let needle = "rsbinder::permission_controller::check_permission(_reader, \"INTERNET\")";
     assert!(
         arm.contains(needle),
         "missing single check `{needle}` in arm:\n{arm}"
@@ -87,7 +87,10 @@ interface IFoo {
         "#,
     );
     let arm = arm_for("doNet", &out);
-    assert!(arm.contains("check_permission(\"INTERNET\")"), "{arm}");
+    assert!(
+        arm.contains("check_permission(_reader, \"INTERNET\")"),
+        "{arm}"
+    );
     // Must NOT contain `&&` or `||` for the single form.
     assert!(
         !arm.contains(" && "),
@@ -107,9 +110,12 @@ interface IFoo {
         "#,
     );
     let arm = arm_for("doNetAndState", &out);
-    assert!(arm.contains("check_permission(\"INTERNET\")"), "{arm}");
     assert!(
-        arm.contains("check_permission(\"ACCESS_NETWORK_STATE\")"),
+        arm.contains("check_permission(_reader, \"INTERNET\")"),
+        "{arm}"
+    );
+    assert!(
+        arm.contains("check_permission(_reader, \"ACCESS_NETWORK_STATE\")"),
         "{arm}"
     );
     // The `&&` is the documented AOSP short-circuit shape.
@@ -129,9 +135,12 @@ interface IFoo {
         "#,
     );
     let arm = arm_for("doBluetooth", &out);
-    assert!(arm.contains("check_permission(\"BLUETOOTH\")"), "{arm}");
     assert!(
-        arm.contains("check_permission(\"BLUETOOTH_ADMIN\")"),
+        arm.contains("check_permission(_reader, \"BLUETOOTH\")"),
+        "{arm}"
+    );
+    assert!(
+        arm.contains("check_permission(_reader, \"BLUETOOTH_ADMIN\")"),
         "{arm}"
     );
     assert!(arm.contains(" || "), "AnyOf must join with `||`:\n{arm}");
@@ -157,7 +166,7 @@ interface IFoo {
     );
     let arm = arm_for("doNet", &out);
     let check_pos = arm
-        .find("check_permission(\"INTERNET\")")
+        .find("check_permission(_reader, \"INTERNET\")")
         .expect("check_permission must be emitted");
     let read_pos = arm.find("_reader.read");
     if let Some(read_pos) = read_pos {
@@ -300,7 +309,7 @@ interface IMixed {
     let arm_net = arm_for("doNet", &out);
     let arm_echo = arm_for("echo", &out);
     assert!(
-        arm_net.contains("check_permission(\"INTERNET\")"),
+        arm_net.contains("check_permission(_reader, \"INTERNET\")"),
         "{arm_net}"
     );
     assert!(

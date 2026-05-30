@@ -29,7 +29,7 @@ use crate::parcel::{Parcel, RpcParcelOps};
 use super::address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_ADDR_LEN};
 use super::proxy::RpcProxy;
 use super::state::RpcState;
-use super::transport::RpcTransport;
+use super::transport::{PeerIdentity, RpcTransport};
 use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
 use super::wire_android13::{
     client_connect_with_id, read_aosp_message, read_aosp_message_with_fds, server_accept,
@@ -1287,7 +1287,8 @@ impl RpcSessionInner {
                     // panic out of `dispatch_transact` can no longer
                     // leave the timeout desynchronized.
                     let _restore = NestedDeadlineGuard::lift(transport, deadline)?;
-                    self.dispatch_transact(t, in_fds)?;
+                    let peer = transport.peer_identity();
+                    self.dispatch_transact(t, in_fds, peer)?;
                 }
             }
         }
@@ -1423,15 +1424,22 @@ impl RpcSessionInner {
     /// callback while a client call is in flight) and send its reply.
     /// Shared by [`RpcSessionInner::serve_once`] and the nested-call
     /// arm of [`RpcSessionInner::client_transact`].
-    fn dispatch_transact(&self, t: WireTransaction, in_fds: Vec<OwnedFd>) -> Result<()> {
+    fn dispatch_transact(
+        &self,
+        t: WireTransaction,
+        in_fds: Vec<OwnedFd>,
+        peer: PeerIdentity,
+    ) -> Result<()> {
         let oneway = (t.flags & FLAG_ONEWAY) != 0;
         if t.address.is_zero() {
+            // Special zero-address transactions (GET_ROOT etc.) have no
+            // caller identity — they never reach a user handler.
             return self.serve_special(&t, oneway);
         }
         if oneway {
-            self.dispatch_oneway_ordered(t, in_fds)
+            self.dispatch_oneway_ordered(t, in_fds, peer)
         } else {
-            self.execute_dispatched(t, in_fds, false)
+            self.execute_dispatched(t, in_fds, false, peer)
         }
     }
 
@@ -1439,7 +1447,12 @@ impl RpcSessionInner {
     /// priority queue (AOSP `RpcState::processTransactInternal` enqueue and
     /// drain). The state lock is released before dispatch so a nested
     /// callback re-entry can reacquire it.
-    fn dispatch_oneway_ordered(&self, t: WireTransaction, in_fds: Vec<OwnedFd>) -> Result<()> {
+    fn dispatch_oneway_ordered(
+        &self,
+        t: WireTransaction,
+        in_fds: Vec<OwnedFd>,
+        peer: PeerIdentity,
+    ) -> Result<()> {
         let addr = t.address;
         let wire_async = t.async_number;
         let mut next = {
@@ -1466,7 +1479,9 @@ impl RpcSessionInner {
             }
         };
         while let Some((t, fds)) = next {
-            self.execute_dispatched(t, fds, true)?;
+            // All replayed oneways belong to this session, so the peer
+            // identity is the same for every drained entry.
+            self.execute_dispatched(t, fds, true, peer.clone())?;
             next = {
                 let mut state = self.shared.state.lock().expect("rpc state poisoned");
                 state.advance_and_pop_async(addr)
@@ -1484,6 +1499,7 @@ impl RpcSessionInner {
         t: WireTransaction,
         in_fds: Vec<OwnedFd>,
         oneway: bool,
+        peer: PeerIdentity,
     ) -> Result<()> {
         let target = self
             .shared
@@ -1556,8 +1572,20 @@ impl RpcSessionInner {
             self.records_fd_positions(),
         );
 
-        let result = consume_rpc_interface_token(&mut reader, target.descriptor())
-            .and_then(|()| target.rpc_transact(t.code, &mut reader, &mut reply));
+        // Plan 2-16 Phase B: stamp the caller's uid/pid into the RPC
+        // calling context for the duration of the user handler so
+        // `get_calling_uid()` / `get_calling_pid()` work over Unix RPC.
+        // Non-uid transports fail-closed to `RPC_UNKNOWN_CALLING_UID`. The
+        // guard restores on drop, so a nested re-entrant callback over the
+        // same connection nests correctly.
+        let (caller_uid, caller_pid) = match &peer {
+            PeerIdentity::Local { uid, pid } => (*uid, *pid),
+            _ => (crate::thread_state::RPC_UNKNOWN_CALLING_UID, -1),
+        };
+        let result = consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
+            let _calling = crate::thread_state::RpcCallingGuard::install(caller_uid, caller_pid);
+            target.rpc_transact(t.code, &mut reader, &mut reply)
+        });
 
         if oneway {
             if let Err(e) = result {
@@ -1596,7 +1624,10 @@ impl RpcSessionInner {
         };
         match self.profile.codec().decode_message(&frame)? {
             WireMessage::Transact(t) => {
-                self.dispatch_transact(t, in_fds)?;
+                // Resolve the connecting peer's identity (Plan 2-16
+                // Phase B) so the dispatch can stamp the calling uid/pid.
+                let peer = transport.peer_identity();
+                self.dispatch_transact(t, in_fds, peer)?;
                 Ok(true)
             }
             WireMessage::DecStrong(a) => {
