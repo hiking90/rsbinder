@@ -10,7 +10,7 @@ AIDL enums are backed by a specific integer type, declared using the `@Backing` 
 
 ### Defining Enums in AIDL
 
-The `@Backing(type=...)` annotation is required and specifies the underlying integer type. Here are examples for each supported backing type:
+The `@Backing(type=...)` annotation specifies the underlying integer type. It is optional — when omitted, the backing type defaults to `byte`. Here are examples for each supported backing type:
 
 **Byte-backed enum:**
 
@@ -59,7 +59,7 @@ The AIDL backing type determines the Rust integer type used inside the generated
 
 ### Using Enums in Rust
 
-Enum values are accessed as associated constants on the generated struct. The generated type implements `Default`, `Debug`, `PartialEq`, `Eq`, and serialization traits automatically.
+Enum values are accessed as associated constants on the generated struct. The generated type derives `Debug`, `Default`, `Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`, `Eq`, and `Hash`, plus serialization traits automatically.
 
 ```rust
 // Access enum values as associated constants
@@ -77,7 +77,7 @@ let mut repeated = vec![];
 let reversed = service.ReverseByteEnum(&input, &mut repeated)?;
 ```
 
-Each generated enum type provides an `enum_values()` method that returns a slice of all defined values, which is useful for iteration and validation:
+Each generated enum type provides an `enum_values()` method that returns a fixed-size array (`[Self; N]`) of all defined values, which is useful for iteration and validation:
 
 ```rust
 // enum_values() returns all defined values
@@ -205,7 +205,7 @@ In this example, the default value is the first field (`intEnum`) initialized to
 assert_eq!(EnumUnion::default(), EnumUnion::IntEnum(IntEnum::FOO));
 ```
 
-Note that the `@deprecated` Javadoc annotation on `deprecatedField` will generate a `#[deprecated]` attribute in the Rust code, so using that variant will produce a compiler warning.
+Note that AIDL accepts a `@deprecated` Javadoc tag on a field, but rsbinder's generator does not currently translate it into a Rust `#[deprecated]` attribute — the field is generated normally and using it produces no compiler warning.
 
 ### Nested Unions
 
@@ -222,7 +222,7 @@ This allows building complex tagged-value hierarchies that are fully type-safe o
 
 ## Tips and Best Practices
 
-- **Always specify `@Backing`** for enums. The AIDL compiler requires it, and the choice of backing type affects both the wire format and the Rust integer type.
+- **Specify `@Backing` explicitly** for enums. It is optional (the default is `byte`), but stating it makes the wire format and the Rust integer type unambiguous to readers.
 - **The union default is always the first field.** Order your fields accordingly, placing the most common or natural default first.
 - **Use `@RustDerive(Clone=true, PartialEq=true)`** on unions so they can be compared and cloned in Rust. Without this, you cannot use `==` or `.clone()` on union values.
 - **Union constants are module-level**, not variants. Access them as `Union::S1`, not through any variant.

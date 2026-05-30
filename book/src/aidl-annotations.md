@@ -235,15 +235,9 @@ parcelable VintfData {
 
 ### Stability Rules
 
-VINTF-stable types enforce the following constraints:
+In the upstream Android toolchain, VINTF-stable types are meant to contain only other VINTF-stable types so that their serialization format stays stable across independent system/vendor updates — critical for framework↔HAL compatibility.
 
-- A VINTF-stable parcelable can only contain fields whose types are also VINTF-stable.
-- A VINTF-stable interface can only use VINTF-stable types in its method signatures.
-- Attempting to embed a non-VINTF type inside a VINTF-stable type will produce a `StatusCode::BadValue` error at runtime.
-
-These rules exist to guarantee that the serialization format of VINTF types remains stable across system updates. On Android, this is critical for maintaining compatibility between the framework and vendor HAL implementations.
-
-On Linux, the `@VintfStability` annotation is recognized by the code generator but the stability enforcement depends on how the service manager is configured.
+rsbinder's generator **recognizes** `@VintfStability` and stamps the generated type/interface with `Stability::Vintf` (so it carries the right stability tier on the wire), but it does **not** statically or dynamically enforce the "fields must also be VINTF-stable" rule — there is no field-tree validation and no `BadValue` raised for embedding a non-VINTF type. Treat the constraint as a contract you are responsible for upholding, not one the compiler checks for you.
 
 ## @FixedSize
 
@@ -257,25 +251,21 @@ parcelable FixedPoint {
 }
 ```
 
-### Constraints
+### Intended constraints
 
-Fixed-size parcelables can only contain:
+In upstream Android, a fixed-size parcelable may only contain:
 
 - Primitive types (`boolean`, `byte`, `char`, `int`, `long`, `float`, `double`)
 - Other `@FixedSize` parcelables
 - Enums with a `@Backing` annotation
 
-They cannot contain:
+and may not contain `String`/`@utf8InCpp String`, arrays (`T[]`), `ParcelFileDescriptor`, `IBinder`, or any other variable-length type.
 
-- `String` or `@utf8InCpp String`
-- Arrays (`T[]`)
-- `ParcelFileDescriptor`
-- `IBinder`
-- Any variable-length type
+> **rsbinder note:** the generator accepts `@FixedSize` but currently treats it as a no-op — it neither validates these constraints nor changes the generated layout or wire format. The constraints above are the contract you should follow; rsbinder does not check them for you.
 
 ### Relationship with @RustDerive(Copy=true)
 
-The `@FixedSize` annotation is a prerequisite for deriving `Copy` in Rust, because only types with a fixed memory layout can be safely copied with a bitwise copy:
+`Copy` is derived purely from `@RustDerive(Copy=true)`; `@FixedSize` is **not** a prerequisite for it in rsbinder. Conceptually you should still only add `Copy` to types with a fixed layout, so pairing the two documents intent:
 
 ```aidl
 @RustDerive(Clone=true, Copy=true, PartialEq=true)
@@ -285,8 +275,6 @@ parcelable Coordinate {
     double longitude;
 }
 ```
-
-Without `@FixedSize`, adding `Copy` to the derive list may compile but violates the intended semantics. Always pair `Copy` with `@FixedSize` to make the intent explicit.
 
 ## Summary
 

@@ -6,21 +6,21 @@ This chapter covers the supported AIDL data types, how they map to Rust, and com
 
 ## Primitive Types
 
-The following table shows how AIDL primitive types map to Rust types. Input parameters (`in`) are passed by value or by reference, while output parameters (`out`) are passed as mutable references so the service can write results back to the caller.
+The following table shows how AIDL primitive types map to Rust types. Input parameters (`in`) are passed by value or by reference. Only *non-scalar* types — arrays, parcelables, and nullable references — may be `out`/`inout`; the generator rejects a primitive or a `String` marked `out`/`inout` at compile time (it has no fixed slot to write back into).
 
 | AIDL Type | Rust Type (in) | Rust Type (out) | Notes |
 |-----------|---------------|-----------------|-------|
-| boolean | bool | &mut bool | |
-| byte | i8 | &mut i8 | Single values use i8; array Reverse uses u8 |
-| char | u16 | &mut u16 | UTF-16 code unit |
-| int | i32 | &mut i32 | |
-| long | i64 | &mut i64 | |
-| float | f32 | &mut f32 | |
-| double | f64 | &mut f64 | |
-| String | &str | &mut String | |
-| @utf8InCpp String | &str | &mut String | Same mapping in rsbinder |
+| boolean | bool | — (not allowed) | |
+| byte | i8 | — (not allowed) | Single values use i8; array Reverse uses u8 |
+| char | u16 | — (not allowed) | UTF-16 code unit |
+| int | i32 | — (not allowed) | |
+| long | i64 | — (not allowed) | |
+| float | f32 | — (not allowed) | |
+| double | f64 | — (not allowed) | |
+| String | &str | — (not allowed) | `out`/`inout` String is rejected by the generator |
+| @utf8InCpp String | &str | — (not allowed) | Same mapping in rsbinder |
 | T[] | &[T] | &mut Vec\<T\> | |
-| @nullable T | Option\<&T\> | &mut Option\<T\> | |
+| @nullable T | Option\<&T\> | &mut Option\<T\> | A nullable `String` input is `Option<&str>` |
 | IBinder | &SIBinder | | |
 | ParcelFileDescriptor | &ParcelFileDescriptor | | |
 
@@ -177,7 +177,7 @@ void Transform(inout int[] data);
 
 Use `inout` when the service needs to read the existing value and modify it in place. Prefer `in` or `out` when data only needs to flow in one direction, as this avoids unnecessary serialization overhead.
 
-> **Note**: Primitive types (`boolean`, `byte`, `char`, `int`, `long`, `float`, `double`) do not require a direction tag. Direction tags are only meaningful for non-primitive types such as arrays, strings, and parcelable types.
+> **Note**: Primitive types (`boolean`, `byte`, `char`, `int`, `long`, `float`, `double`) and `String` cannot carry an `out`/`inout` direction tag — the generator rejects it. As scalar (or, for `String`, value-typed) parameters they only ever flow `in`. Direction tags are meaningful only for arrays and parcelable types.
 
 ## Tips
 

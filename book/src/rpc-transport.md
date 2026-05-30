@@ -310,18 +310,12 @@ kernel binder for, with a few extras specific to socket transport:
 ### Sessions with multiple connections
 
 `RpcServer::set_max_threads(N)` matches AOSP's
-`setMaxIncomingThreads`. The default `N == 1` (one connection per
-session) is fully supported and validated against real Android 13–16
-libbinder peers — this is the mode every example in the book
-uses.
-
-**`N ≥ 2` (multi-connection sessions) is currently experimental.**
-The hermetic rsbinder↔rsbinder tests pass, but the real-libbinder
-interop gate has not yet been cleared, so production code that needs
-to interoperate with a real Android `libbinder` peer should stay on
-the default. See the rustdoc on
+`setMaxIncomingThreads`. Both `N == 1` (the default — one connection
+per session, the mode every example in the book uses) and `N >= 2`
+(multi-connection sessions) are validated against real Android 13–16
+libbinder peers. See the rustdoc on
 [`RpcServer::set_max_threads`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_threads)
-for the current status.
+for the per-mode details.
 
 `set_max_threads` caps *incoming slots per session*. To cap
 *server-wide concurrent connections* — for example to bound the
