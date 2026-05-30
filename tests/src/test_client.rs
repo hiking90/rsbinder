@@ -70,6 +70,28 @@ fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
     )
 }
 
+/// Plan 2-16 Phase D — kernel-transport parity for the service facade.
+/// The `kernel::Broker` resolves the *same* running test service that the
+/// rest of this suite reaches via `hub::get_interface`, and the resolved
+/// binder is fully functional. This is the kernel half of the facade's
+/// transport-parity proof; the RPC half is `tests/service_facade.rs`
+/// (`rpc::{Host, Broker}`). Both drive the same `Registry`/`Broker`
+/// traits, so registration/lookup code is written once.
+#[test]
+fn test_facade_kernel_broker_parity() {
+    use rsbinder::service::{kernel, Broker as _};
+    init_test();
+    let broker = kernel::Broker::new().expect("kernel::Broker::new");
+    let service: rsbinder::Strong<dyn ITestService::ITestService> = broker
+        .get_interface(<BpTestService as ITestService::ITestService>::descriptor())
+        .expect("facade kernel::Broker must resolve the running test service");
+    // The facade-resolved binder behaves exactly like a `hub`-resolved one.
+    assert_eq!(
+        service.RepeatString(&"facade".to_string()),
+        Ok("facade".to_string())
+    );
+}
+
 #[test]
 fn test_constants() {
     assert_eq!(ITestService::A1, 1);

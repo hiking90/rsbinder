@@ -1175,6 +1175,20 @@ impl ProcessState {
         self.driver.clone()
     }
 
+    /// The binder driver path this process was initialized with. Used by
+    /// the [`crate::service::kernel::Host`] builder to detect a
+    /// conflicting re-init (Plan 2-16 §6) — `init`/`init_default` are
+    /// idempotent and keep the first config.
+    pub(crate) fn driver_name(&self) -> &std::path::Path {
+        &self.driver_name
+    }
+
+    /// The max-threads value this process was initialized with (`0` =
+    /// kernel default). See [`Self::driver_name`].
+    pub(crate) fn max_threads(&self) -> u32 {
+        self.max_threads
+    }
+
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
