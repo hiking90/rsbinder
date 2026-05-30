@@ -68,17 +68,22 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         // The hermetic transports report this process as the peer, so the
         // handler observes our own uid/pid — never the `0` (= root) that a
         // pre-Phase-B (unpopulated) RPC dispatch would have surfaced.
-        let expected_uid = rustix::process::getuid().as_raw() as i64; // peer == this process
+        let expected_uid = rustix::process::getuid().as_raw() as i64;
         assert_eq!(
             caller.r#callingUid().unwrap(),
             expected_uid,
             "RPC handler must observe the peer uid (here: this process)"
         );
-        assert_ne!(
-            caller.r#callingUid().unwrap(),
-            0,
-            "uid must be the real peer uid, not the pre-Phase-B root bypass"
-        );
+        // The pre-Phase-B bypass surfaced `0` (root). Guard against it only
+        // when we are not actually running as root, so the test is not
+        // self-contradictory under a root runner (where expected_uid == 0).
+        if expected_uid != 0 {
+            assert_ne!(
+                caller.r#callingUid().unwrap(),
+                0,
+                "uid must be the real peer uid, not the pre-Phase-B root bypass"
+            );
+        }
         assert_eq!(
             caller.r#callingPid().unwrap(),
             std::process::id() as i64,

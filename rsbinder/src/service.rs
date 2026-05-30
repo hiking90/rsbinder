@@ -92,7 +92,15 @@ pub trait Broker {
 
     /// Resolve `name` and cast it to the interface `T` (the
     /// `interface_cast` step), mirroring [`crate::hub::get_interface`].
-    fn get_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
+    ///
+    /// `where Self: Sized` keeps the trait object-safe: this generic
+    /// convenience stays callable on a concrete broker or an
+    /// `impl Broker` bound, while `&dyn Broker` remains usable via
+    /// [`Broker::lookup`] + a free [`FromIBinder::try_from`].
+    fn get_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>>
+    where
+        Self: Sized,
+    {
         FromIBinder::try_from(self.lookup(name)?)
     }
 }
@@ -129,7 +137,11 @@ pub mod kernel {
             let driver_mismatch = want_driver
                 .as_deref()
                 .is_some_and(|d| d != ps.driver_name());
-            let threads_mismatch = max_threads != 0 && max_threads != ps.max_threads();
+            // Compare the *clamped* requested value against what was
+            // actually stored, so re-requesting the same out-of-range
+            // `max_threads` (both clamped to the default) does not warn.
+            let threads_mismatch = max_threads != 0
+                && ProcessState::clamp_max_threads(max_threads) != ps.max_threads();
             if driver_mismatch || threads_mismatch {
                 log::warn!(
                     "kernel::Host: ProcessState already initialized; requested \
@@ -358,7 +370,9 @@ pub mod rpc {
                 server.set_max_connections(n);
             }
             if let Some(f) = self.authorizer {
-                server.set_authorizer(move |p| f(p));
+                // `Box<dyn Fn..>` already implements `Fn`, so hand it to
+                // `set_authorizer` directly — no second closure/box layer.
+                server.set_authorizer(f);
             }
             Ok(Host { server })
         }
@@ -388,5 +402,20 @@ pub mod rpc {
         fn lookup(&self, name: &str) -> Result<SIBinder> {
             self.session.get_service(name)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both facade traits are object-safe (the module/trait rustdoc says
+    /// so). `Broker::get_interface` is generic, so it must carry
+    /// `where Self: Sized` to stay out of the vtable — this lock-in fails
+    /// to compile if that bound is dropped (the original review finding).
+    #[test]
+    fn traits_are_object_safe() {
+        fn _registry(_: &dyn Registry) {}
+        fn _broker(_: &dyn Broker) {}
     }
 }

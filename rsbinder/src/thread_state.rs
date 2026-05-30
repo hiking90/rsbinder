@@ -1906,6 +1906,16 @@ pub fn get_calling_uid() -> binder::uid_t {
 /// `mCallingUid` to `getuid()` rather than zero — observers downstream
 /// (e.g. per-uid accounting in [`crate::proxy_count`]) get the same
 /// attribution they would on real Android.
+///
+/// # RPC transports (Plan 2-16 Phase B)
+///
+/// During an RPC transaction this returns the RPC caller uid, exactly as
+/// [`get_calling_uid`]: the kernel-vouched peer uid over Unix RPC, or the
+/// fail-closed sentinel (`u32::MAX`) over transports without a uid
+/// (`Vsock` / TLS `Certificate` / `Anonymous`). The self-uid fallback
+/// applies only outside any (kernel or RPC) transaction, so
+/// [`crate::proxy_count`] attribution over a uid-less RPC transport buckets
+/// under the `u32::MAX` sentinel rather than this process's uid.
 pub fn get_calling_uid_or_self() -> binder::uid_t {
     // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
     // transaction; otherwise fall back to the process's own uid without

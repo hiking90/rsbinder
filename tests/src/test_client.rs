@@ -86,10 +86,7 @@ fn test_facade_kernel_broker_parity() {
         .get_interface(<BpTestService as ITestService::ITestService>::descriptor())
         .expect("facade kernel::Broker must resolve the running test service");
     // The facade-resolved binder behaves exactly like a `hub`-resolved one.
-    assert_eq!(
-        service.RepeatString(&"facade".to_string()),
-        Ok("facade".to_string())
-    );
+    assert_eq!(service.RepeatString("facade"), Ok("facade".to_string()));
 }
 
 #[test]
