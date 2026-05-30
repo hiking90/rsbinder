@@ -173,11 +173,13 @@ impl RpcProxy {
     pub fn build_request(&self, descriptor: &str) -> Result<Parcel> {
         let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
         let mut data = Parcel::new();
-        data.attach_rpc_ops(inner.parcel_ops());
-        // So `ParcelFileDescriptor::serialize` applies the negotiated
-        // FD policy (default `None` ⇒ the categorical reject).
-        data.set_rpc_fd_mode(inner.fd_mode());
-        data.set_rpc_record_fd_positions(inner.records_fd_positions());
+        // Enter RPC mode + stamp the negotiated FD policy (default
+        // `None` ⇒ `ParcelFileDescriptor::serialize` rejects FDs).
+        data.configure_rpc(
+            inner.parcel_ops(),
+            inner.fd_mode(),
+            inner.records_fd_positions(),
+        );
         super::session::write_rpc_interface_token(&mut data, descriptor)?;
         Ok(data)
     }
@@ -205,9 +207,11 @@ impl crate::binder::RemoteProxy for RpcProxy {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
         let mut data = Parcel::new();
-        data.attach_rpc_ops(inner.parcel_ops());
-        data.set_rpc_fd_mode(inner.fd_mode());
-        data.set_rpc_record_fd_positions(inner.records_fd_positions());
+        data.configure_rpc(
+            inner.parcel_ops(),
+            inner.fd_mode(),
+            inner.records_fd_positions(),
+        );
         if write_header {
             super::session::write_rpc_interface_token(&mut data, self.descriptor_str())?;
         }
