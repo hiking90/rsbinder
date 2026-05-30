@@ -24,7 +24,7 @@
 //! between another's bump-and-rollback (the two-attacker hole the
 //! CAS-loop closes against a naive optimistic-bump shape). The typed
 //! enum makes the four reachable states explicit:
-//! a reviewer can grep [`SessionLifecycleSnapshot`] variants for every
+//! a reviewer can grep `SessionLifecycleSnapshot` variants for every
 //! point that branches on them.
 //!
 //! **Default single-connection sessions** never leave `Live(1)` until
@@ -35,6 +35,7 @@
 //! deadlocking on an empty pool; the prior `obituary_sent.load` only
 //! flipped after the obituary callback returned).
 
+#[cfg(test)]
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,14 +50,12 @@ const STATE_LIVE_TAG: u64 = 0;
 const STATE_DYING_TAG: u64 = 1;
 const STATE_DEAD_TAG: u64 = 2;
 
-/// A read-only snapshot of [`SessionLifecycle`] — the type the rest of
-/// the RPC crate matches against. Production code rarely needs every
-/// variant individually; the convenience helpers on `SessionLifecycle`
+/// A read-only snapshot of [`SessionLifecycle`] — the type the unit
+/// tests match against. Production code uses the boolean/count helpers
 /// ([`SessionLifecycle::is_torn_down`], [`SessionLifecycle::live_count`])
-/// cover the common cases. The unit tests below match against every
-/// variant explicitly.
-#[allow(dead_code)]
-// The hot path uses the boolean/count helpers; the typed snapshot is the grep-friendly exhaustive-match surface.
+/// for the hot path; the typed snapshot is the grep-friendly
+/// exhaustive-match surface and exists only in test builds.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLifecycleSnapshot {
     /// At least one connection is still driving the session. `n` is the
@@ -95,7 +94,7 @@ impl SessionLifecycle {
     /// [`live_count`](Self::live_count) (numeric) for the hot path;
     /// `snapshot` is the test surface that exhaustively matches every
     /// variant.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> SessionLifecycleSnapshot {
         decode(self.inner.load(Ordering::SeqCst))
     }
@@ -215,7 +214,7 @@ fn encode_dead() -> u64 {
     STATE_DEAD_TAG << STATE_SHIFT
 }
 
-#[allow(dead_code)] // used by snapshot(), itself test/grep surface
+#[cfg(test)] // used by snapshot(), itself the test exhaustive-match surface
 fn decode(v: u64) -> SessionLifecycleSnapshot {
     match v >> STATE_SHIFT {
         STATE_LIVE_TAG => {

@@ -19,7 +19,7 @@
 //! Tests are Linux+VM and `#[ignore]` by default (need a peer VM or
 //! `VMADDR_CID_LOCAL`).
 
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use vsock::{VsockAddr, VsockStream};
 
@@ -48,17 +48,11 @@ impl VsockTransport {
 
     /// Wrap a preconnected vsock `OwnedFd` (the
     /// `IAccessor::addConnection()` fd-adopt path, `AF_VSOCK` family).
-    /// The `vsock` crate has no public `From<OwnedFd>` for `VsockStream`
-    /// so this goes through `FromRawFd` after taking ownership; the
-    /// caller is responsible for asserting the fd's address family.
+    /// `vsock` provides `From<OwnedFd> for VsockStream` (safe ownership
+    /// transfer, mirroring std's `UnixStream::from(OwnedFd)`); the caller
+    /// is responsible for asserting the fd's address family.
     pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
-        // SAFETY: `fd` is moved (consumed) here; `VsockStream::from_raw_fd`
-        // adopts exclusive ownership for the lifetime of the stream. The
-        // `OwnedFd` is converted via `into_raw_fd()` which is the AOSP-
-        // sanctioned "transfer ownership without closing" path.
-        let raw = fd.into_raw_fd();
-        let stream = unsafe { VsockStream::from_raw_fd(raw) };
-        Self::from_stream(stream)
+        Self::from_stream(VsockStream::from(fd))
     }
 
     /// Wrap an accepted/connected `VsockStream`. The peer cid is
