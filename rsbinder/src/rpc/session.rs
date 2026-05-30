@@ -1255,11 +1255,13 @@ impl RpcSessionInner {
                         return Err(StatusCode::from(status));
                     }
                     let mut reply = Parcel::from_vec(data);
-                    reply.attach_rpc_ops(self.parcel_ops());
-                    reply.set_rpc_fd_mode(self.fd_mode());
-                    reply.set_rpc_record_fd_positions(self.records_fd_positions());
+                    reply.configure_rpc(
+                        self.parcel_ops(),
+                        self.fd_mode(),
+                        self.records_fd_positions(),
+                    );
                     reply.rpc_set_in_fds(in_fds);
-                    // Install the wire object table (after attach_rpc_ops
+                    // Install the wire object table (after configure_rpc
                     // sets RPC mode) so binder/FD reads can validate
                     // positions.
                     reply.rpc_set_object_positions(object_positions);
@@ -1531,24 +1533,28 @@ impl RpcSessionInner {
         }
 
         let mut reader = Parcel::from_vec(t.data);
-        reader.attach_rpc_ops(self.parcel_ops());
-        reader.set_rpc_fd_mode(self.fd_mode());
-        // The inbound *args* parcel must know it
-        // speaks the v1+ AOSP fd body too (the reply paths already set
-        // this; the args path did not — a v1+ fd *argument* would
-        // otherwise be read as the R34 `[present|idx]` legacy shape and
-        // desync). v1+ ⇒ `[not-null|hasComm|TYPE|idx]` + strict
-        // position read; R34/v0 ⇒ legacy, byte-unchanged.
-        reader.set_rpc_record_fd_positions(self.records_fd_positions());
+        // The inbound *args* parcel must know it speaks the v1+ AOSP fd
+        // body too (the reply paths already set this; the args path did
+        // not — a v1+ fd *argument* would otherwise be read as the R34
+        // `[present|idx]` legacy shape and desync). v1+ ⇒
+        // `[not-null|hasComm|TYPE|idx]` + strict position read; R34/v0 ⇒
+        // legacy, byte-unchanged.
+        reader.configure_rpc(
+            self.parcel_ops(),
+            self.fd_mode(),
+            self.records_fd_positions(),
+        );
         reader.rpc_set_in_fds(in_fds);
         // Install the inbound wire object table (position validation);
         // empty on R34 / v0 / no-object.
         reader.rpc_set_object_positions(t.object_positions);
         reader.set_data_position(0);
         let mut reply = Parcel::new();
-        reply.attach_rpc_ops(self.parcel_ops());
-        reply.set_rpc_fd_mode(self.fd_mode());
-        reply.set_rpc_record_fd_positions(self.records_fd_positions());
+        reply.configure_rpc(
+            self.parcel_ops(),
+            self.fd_mode(),
+            self.records_fd_positions(),
+        );
 
         let result = consume_rpc_interface_token(&mut reader, target.descriptor())
             .and_then(|()| target.rpc_transact(t.code, &mut reader, &mut reply));

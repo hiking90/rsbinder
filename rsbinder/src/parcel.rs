@@ -308,6 +308,52 @@ struct RpcFields {
     record_fd_positions: bool,
 }
 
+/// The behaviour of the RPC serialization state lives here so that the
+/// `impl Parcel` accessors stay thin `Option`-lifting wrappers and the
+/// real logic is unit-cohesive on `RpcFields`. These are private to
+/// `parcel.rs`: callers always go through the matching `Parcel::rpc_*`
+/// method (which decides the kernel-mode no-op / default), keeping each
+/// `&mut self` borrow short enough to interleave with `Parcel::write`.
+#[cfg(feature = "rpc")]
+impl RpcFields {
+    /// Record an RPC object's start offset, keeping the table sorted
+    /// (AOSP `mObjectPositions.insert(upper_bound(...), dataPos)`).
+    /// `upper_bound` ⇒ O(1) push on the common ascending-write path.
+    fn record_object_position(&mut self, pos: usize) {
+        let pos = pos as u32;
+        let at = self.object_positions.partition_point(|&p| p <= pos);
+        self.object_positions.insert(at, pos);
+    }
+
+    /// AOSP `unflattenBinder` v2 strict check: the position must be in
+    /// the (sorted) object table (`binary_search`). A forged/unsorted
+    /// table simply misses ⇒ caller returns `BAD_VALUE`.
+    fn object_position_present(&self, pos: usize) -> bool {
+        let Ok(pos) = u32::try_from(pos) else {
+            return false;
+        };
+        self.object_positions.binary_search(&pos).is_ok()
+    }
+
+    /// Stash an outgoing fd (already an owned dup); return its in-body
+    /// table index.
+    fn push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
+        let idx = self.fds_out.len() as i32;
+        self.fds_out.push(fd);
+        idx
+    }
+
+    /// Install the fds received out-of-band, before deserialization.
+    fn set_in_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
+        self.fds_in = fds.into_iter().map(Some).collect();
+    }
+
+    /// Take the received fd at table `index` (consumed once).
+    fn take_in_fd(&mut self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.fds_in.get_mut(index).and_then(Option::take)
+    }
+}
+
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
 ///
@@ -460,6 +506,27 @@ impl Parcel {
         self.rpc.get_or_insert_with(RpcFields::default).ops = Some(ops);
     }
 
+    /// Configure the session's RPC profile on this parcel in one call:
+    /// enter RPC mode + attach the object hooks, then stamp the
+    /// negotiated FD transport mode and position-recording flag.
+    /// Collapses the `attach_rpc_ops` + `set_rpc_fd_mode` +
+    /// `set_rpc_record_fd_positions` triple that every proxy/session
+    /// parcel-setup site otherwise repeats verbatim. The per-message
+    /// `rpc_set_in_fds` / `rpc_set_object_positions` stay separate —
+    /// they carry wire payload, not the session profile.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn configure_rpc(
+        &mut self,
+        ops: std::sync::Arc<dyn RpcParcelOps>,
+        fd_mode: crate::rpc::FileDescriptorTransportMode,
+        record_fd_positions: bool,
+    ) {
+        let rpc = self.rpc.get_or_insert_with(RpcFields::default);
+        rpc.ops = Some(ops);
+        rpc.fd_mode = fd_mode;
+        rpc.record_fd_positions = record_fd_positions;
+    }
+
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_ops(&self) -> Option<std::sync::Arc<dyn RpcParcelOps>> {
         self.rpc.as_ref().and_then(|r| r.ops.clone())
@@ -502,12 +569,9 @@ impl Parcel {
     /// simply fails the search ⇒ the caller returns `BAD_VALUE` (safe).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_position_present(&self, pos: usize) -> bool {
-        let Ok(pos) = u32::try_from(pos) else {
-            return false;
-        };
         self.rpc
             .as_ref()
-            .is_some_and(|r| r.object_positions.binary_search(&pos).is_ok())
+            .is_some_and(|r| r.object_position_present(pos))
     }
 
     /// Record the start offset of an RPC object just flattened into
@@ -523,15 +587,9 @@ impl Parcel {
     /// per-call version gate.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_object_position(&mut self, pos: usize) {
-        let Some(rpc) = self.rpc.as_mut() else {
-            return;
-        };
-        let pos = pos as u32;
-        // `upper_bound` ⇒ stable, AOSP-faithful sorted insert (positions
-        // are produced in ascending write order in practice, so this is
-        // an O(1) push on the common path).
-        let at = rpc.object_positions.partition_point(|&p| p <= pos);
-        rpc.object_positions.insert(at, pos);
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.record_object_position(pos);
+        }
     }
 
     // ---- FD-over-RPC (opt-in, Unix mode) ---------------------------
@@ -578,10 +636,10 @@ impl Parcel {
         // precondition — a stray kernel-parcel call is a programming
         // error, and returning a bogus index would be worse than a
         // clear panic.
-        let rpc = self.rpc.as_mut().expect("rpc_push_out_fd on kernel parcel");
-        let idx = rpc.fds_out.len() as i32;
-        rpc.fds_out.push(fd);
-        idx
+        self.rpc
+            .as_mut()
+            .expect("rpc_push_out_fd on kernel parcel")
+            .push_out_fd(fd)
     }
 
     /// Borrow the collected outgoing fds. The session sends them
@@ -597,16 +655,14 @@ impl Parcel {
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_in_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
         if let Some(rpc) = self.rpc.as_mut() {
-            rpc.fds_in = fds.into_iter().map(Some).collect();
+            rpc.set_in_fds(fds);
         }
     }
 
     /// Take the received fd at table `index` (consumed once).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_take_in_fd(&mut self, index: usize) -> Option<std::os::fd::OwnedFd> {
-        self.rpc
-            .as_mut()
-            .and_then(|r| r.fds_in.get_mut(index).and_then(Option::take))
+        self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
     pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
