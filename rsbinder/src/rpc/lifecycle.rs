@@ -313,15 +313,24 @@ mod tests {
                     let lc = Arc::clone(&lc);
                     thread::spawn(move || {
                         let ok = lc.try_bump_live();
-                        // Whoever bumped must un-bump (preserve the
-                        // arithmetic so the test asserts the final state
-                        // from `Dying` is reachable). Concurrent unbump
-                        // from Dying/Dead is also forbidden — only one
-                        // dropper here.
                         if ok {
-                            // Re-validate: count must still be Live.
+                            // Re-validate: count must still be Live (this
+                            // attacker holds its own bump, so count >= 1).
                             assert!(matches!(lc.snapshot(), SessionLifecycleSnapshot::Live(_)));
-                            let _ = lc.drop_connection();
+                            // Honor the `drop_connection` contract: whichever
+                            // connection observes the 1→0 edge — the founding
+                            // dropper OR a racing attacker whose un-bump won
+                            // that edge — must complete the teardown with
+                            // `mark_dead`. Discarding `was_last` here left the
+                            // session stuck in `Dying` whenever an attacker
+                            // (not the dropper) took the edge, tripping the
+                            // `Dying` assertion below ~2.5% of the time under
+                            // load. The production state machine is unchanged;
+                            // this only makes the test faithful to the
+                            // "edge-observer marks dead" contract.
+                            if lc.drop_connection() {
+                                lc.mark_dead();
+                            }
                         }
                         ok
                     })
