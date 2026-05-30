@@ -35,13 +35,13 @@ Implemented and validated, but the public-API shape is still under
 review for 1.0. Expect at most a single round of renames or signature
 tweaks; wire formats are already locked.
 
-- **RPC transport single-connection** — `RpcServer`, `RpcSession`
-  (single-conn role), `setup_unix_server`, `setup_unix_client*`,
-  `from_preconnected_fd`, `set_root`, `get_root`, `set_android13plus`,
-  `set_max_threads(1)` semantics, `set_max_connections`,
-  `set_supported_fd_modes(&[FdMode::Unix])`. Validated against real
-  android-13 / 14 / 15 / 16 `libbinder` (plans 2-1 … 2-11 / 2-13 / 2-14
-  STAGE3).
+- **RPC transport** — `RpcServer`, `RpcSession`, `setup_unix_server`,
+  `setup_unix_client*`, `from_preconnected_fd`, `set_root`, `get_root`,
+  `set_android13plus`, `set_max_threads(N)` (both `N == 1` and
+  `N >= 2` multi-connection), `set_max_connections`,
+  `set_supported_fd_modes(&[FileDescriptorTransportMode::Unix])`.
+  Validated against real android-13 / 14 / 15 / 16 `libbinder`
+  (plans 2-1 … 2-12 / 2-13 / 2-14 STAGE3).
 - **FD-over-RPC** (v1+ AOSP-faithful, AC-11.3 gate passed).
 - **RPC death notification** (session-disconnect, AOSP-faithful).
 - **IAccessor client / server** (plans 2-13 D.8 + 2-14 D.9 STAGE3
@@ -60,7 +60,6 @@ change without a deprecation cycle.
 | `rpc-tcp-debug` | `TcpDebugTransport` — plain TCP backend | Bring-up / interop only, never production. |
 | `rpc-vsock` | `VsockTransport` — host↔VM | Linux/Android only; loopback testing requires `vsock_loopback.ko`. |
 | `rpc-tls` | TLS over rustls, socket-orthogonal (tcp / unix / vsock) | Hermetic green; the `StreamOwned` decoupling (plan 2-15) has landed. Real-`libbinder` STAGE3 not yet attempted — stock emulator images ship no `libbinder_tls`. |
-| `rpc-experimental-multiconn` | `RpcServer::set_max_threads(N ≥ 2)` slot-cap > 1 | Hermetic passes; real-`libbinder` interop gate AC-12.6 not yet passed (plan 2-12 §3). Default builds clamp the attach-arm cap to 1 — see `RpcServer::set_max_threads` rustdoc. |
 
 ## Non-goals
 

@@ -43,7 +43,7 @@ assert_eq!(default_profile.age, 0);
 
 ## Constants in Parcelable
 
-Parcelable types can define constants, including numeric values and bit flags. These become associated constants on the generated Rust struct. This pattern is commonly used for configuration values and flag fields.
+Parcelable types can define constants, including numeric values and bit flags. These are emitted as module-level `pub const` items inside the generated parcelable module. Because the module shares its name with the struct, you still reach them with the familiar `TypeName::CONSTANT` path. This pattern is commonly used for configuration values and flag fields.
 
 ```aidl
 @RustDerive(Clone=true, PartialEq=true)
@@ -58,7 +58,7 @@ parcelable Config {
 }
 ```
 
-In Rust, the constants are accessed as associated constants on the struct:
+In Rust, the constants are accessed through the type path:
 
 ```rust
 use config::Config;
