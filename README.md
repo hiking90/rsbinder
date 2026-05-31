@@ -66,9 +66,7 @@ Disabled by default; zero-cost when off. Opt in with cargo features:
 | `rpc-vsock`      | host↔VM (Android Virtualization Framework / Microdroid).      |
 | `rpc-tls`        | TLS over rustls for untrusted networks.                       |
 
-Capabilities: FD-over-RPC (`ParcelFileDescriptor`), death notification (session disconnect, AOSP-faithful), Tokio async adapter, `IAccessor` client / server, and `rsb_hub` `addService` accessor auto-detect. See [`book/src/rpc-transport.md`](book/src/rpc-transport.md).
-
-> **Note**: `RpcServer::set_max_threads(N ≥ 2)` (multi-connection) is **experimental** — it requires the `rpc-experimental-multiconn` Cargo feature and is hermetic-only until the real-`libbinder` interop gate AC-12.6 passes. Default builds clamp the attach-arm slot cap to 1 (single-connection); the advertised `GET_MAX_THREADS` value is unchanged.
+Capabilities: FD-over-RPC (`ParcelFileDescriptor`), death notification (session disconnect, AOSP-faithful), Tokio async adapter, multi-connection, `IAccessor` client / server, and `rsb_hub` `addService` accessor auto-detect. See [`book/src/rpc-transport.md`](book/src/rpc-transport.md).
 
 ### Stability tiers
 
@@ -79,6 +77,12 @@ Quick try (no kernel config or root):
 $ cargo run -p example-hello --features rpc --bin rpc_hello_service
 $ cargo run -p example-hello --features rpc --bin rpc_hello_client
 ```
+
+## Cross-transport services & authorization
+
+Write service registration and lookup **once** and pick kernel binder or RPC by construction — the `rsbinder::service` facade (`Registry` / `Broker`) keeps the AIDL interface, generated stubs, and call sites transport-agnostic. Async works the same way over either transport. Calling identity and authorization stay coherent across the trust boundary: `get_calling_uid()` returns the kernel-vouched peer uid over Unix RPC, and `@EnforcePermission` methods fail closed (deny) over RPC rather than silently granting.
+
+See [Cross-Transport Services](book/src/cross-transport-services.md), [Security & Authorization](book/src/security.md), and [Async Service](book/src/async-service.md) in the book.
 
 ## Prerequisites to build and test
 
