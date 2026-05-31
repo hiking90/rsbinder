@@ -204,10 +204,12 @@ runtime.block_on(async {
 ```
 
 > The blocking bootstrap — `Broker::unix`, `get_interface` — is done *before* entering the
-> runtime; only the transacts themselves are `.await`ed. This mirrors the verified end-to-end
-> test `tests/tests/rpc_async.rs`, which drives the generated async `Bp*` against an async
-> service over a real Unix-socket session, including many in-flight calls on one shared
-> session under genuine async concurrency.
+> runtime; only the transacts themselves are `.await`ed. The async-over-RPC *bridge* shown
+> here (`new_async_binder` + `into_async::<Tokio>` over a real Unix-socket session, multi-thread
+> runtime) is verified end-to-end by `tests/tests/rpc_async.rs` — including many in-flight
+> calls on one shared session under genuine async concurrency. That test drives the bridge
+> through the lower-level `RpcSession` API directly rather than the `rpc::Host`/`Broker`
+> facade, but the facade is a thin wrapper over exactly that path.
 
 ### Switching transports
 

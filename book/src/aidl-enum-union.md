@@ -156,7 +156,7 @@ let u = Union::Union::S(Union::S1.to_string());
 
 ### Union Tags
 
-Each union has an associated `Tag` enum that identifies which variant is currently active. Tags are useful when you need to inspect or communicate which field a union holds without extracting the value itself.
+Each union has an associated `Tag` type that identifies which variant is currently active. (Like AIDL enums, it is generated as a newtype struct whose variants are exposed as associated constants such as `Union::Tag::n`.) Tags are useful when you need to inspect or communicate which field a union holds without extracting the value itself.
 
 ```rust
 let result = service.GetUnionTags(&[

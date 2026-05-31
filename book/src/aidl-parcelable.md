@@ -61,7 +61,7 @@ parcelable Config {
 In Rust, the constants are accessed through the type path:
 
 ```rust
-use config::Config;
+use Config::Config;
 
 let mut cfg = Config::default();
 assert_eq!(cfg.retryCount, 5);
