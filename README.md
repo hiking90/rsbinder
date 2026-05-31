@@ -45,13 +45,18 @@ $ mdbook serve
 
 ## Platform Support
 
-| Platform | Kernel binder (`/dev/binder`) | RPC transport (binder-over-socket) |
-|----------|:-----------------------------:|:----------------------------------:|
-| Linux    | ✅ (binderfs)                  | ✅                                  |
-| Android  | ✅ (API 29–36)                 | ✅ (`libbinder` RPC v1 / v2 interop) |
-| macOS    | —                             | ✅ (first-class)                    |
+rsbinder has two transports — pick the one that matches where your code runs:
 
-The RPC transport requires no kernel module, no root, and no special device file — making rsbinder usable as a general cross-platform Rust IPC layer in addition to its Android role.
+* **Kernel binder** uses the `/dev/binder` kernel driver. It is how Android's own services communicate, and it also works on Linux with a binderfs-enabled kernel. It is not available on macOS.
+* **RPC transport** runs binder over an ordinary socket — no kernel driver, no root, no special device file. It is the portable choice, and the only transport on macOS.
+
+| Platform | Kernel binder (`/dev/binder`) | RPC transport (over a socket) |
+|----------|:-----------------------------:|:-----------------------------:|
+| Linux    | ✅ (needs a binderfs kernel)   | ✅ |
+| Android  | ✅ (API 29–36, Android 10–16)  | ✅ (interoperates with Android `libbinder`) |
+| macOS    | — (no kernel binder)          | ✅ |
+
+If you are not specifically targeting Android's kernel binder, start with the RPC transport.
 
 ## RPC Transport (binder-over-socket)
 
