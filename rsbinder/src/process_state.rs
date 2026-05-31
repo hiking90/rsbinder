@@ -373,15 +373,24 @@ impl ProcessState {
             .expect("Call restriction lock poisoned")
     }
 
+    /// The effective max-threads `inner_init` will store for a requested
+    /// value: `0` and any value `>= DEFAULT_MAX_BINDER_THREADS` clamp to
+    /// the default. Shared with the [`crate::service::kernel`] re-init
+    /// check so its "requested differs from stored" comparison matches
+    /// what was actually stored.
+    pub(crate) fn clamp_max_threads(max_threads: u32) -> u32 {
+        if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
+            max_threads
+        } else {
+            DEFAULT_MAX_BINDER_THREADS
+        }
+    }
+
     fn inner_init(
         driver_name: &str,
         max_threads: u32,
     ) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
-        let max_threads = if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
-            max_threads
-        } else {
-            DEFAULT_MAX_BINDER_THREADS
-        };
+        let max_threads = Self::clamp_max_threads(max_threads);
 
         let driver_name = PathBuf::from(driver_name);
 
@@ -1173,6 +1182,20 @@ impl ProcessState {
 
     pub fn driver(&self) -> Arc<File> {
         self.driver.clone()
+    }
+
+    /// The binder driver path this process was initialized with. Used by
+    /// the [`crate::service::kernel::Host`] builder to detect a
+    /// conflicting re-init (Plan 2-16 §6) — `init`/`init_default` are
+    /// idempotent and keep the first config.
+    pub(crate) fn driver_name(&self) -> &std::path::Path {
+        &self.driver_name
+    }
+
+    /// The max-threads value this process was initialized with (`0` =
+    /// kernel default). See [`Self::driver_name`].
+    pub(crate) fn max_threads(&self) -> u32 {
+        self.max_threads
     }
 
     pub fn start_thread_pool() {

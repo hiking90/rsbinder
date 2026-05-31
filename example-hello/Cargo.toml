@@ -27,6 +27,32 @@ required-features = ["rpc"]
 name = "rpc_hello_client"
 required-features = ["rpc"]
 
+# Plan 2-16 Phase D — the cross-transport facade example: identical
+# service/registration/call code, kernel vs RPC chosen by one line. Uses
+# `rsbinder::service::rpc`, so it is gated on the `rpc` feature.
+#   cargo run -p example-hello --features rpc --bin unified_service rpc
+#   cargo run -p example-hello --features rpc --bin unified_client rpc
+[[bin]]
+name = "unified_service"
+required-features = ["rpc"]
+
+[[bin]]
+name = "unified_client"
+required-features = ["rpc"]
+
+# Plan 2-16 handler-side authorization example: the service impl authorizes
+# each call via `rsbinder::calling_caller()` and denies with EX_SECURITY.
+# Uses `rsbinder::Caller` / `rpc::PeerIdentity`, so gated on the `rpc` feature.
+#   cargo run -p example-hello --features rpc --bin authz_service
+#   cargo run -p example-hello --features rpc --bin authz_client
+[[bin]]
+name = "authz_service"
+required-features = ["rpc"]
+
+[[bin]]
+name = "authz_client"
+required-features = ["rpc"]
+
 # Subplan 2-13 D.8 STAGE3 — rsbinder side of the IAccessor bridge
 # real-libbinder interop. Cross-compile with
 #   cargo ndk -t arm64-v8a -p 36 build -p example-hello \

@@ -719,9 +719,14 @@ fn render_enforce_permission_check(
     // everywhere else (`crate::` for AIDL compiled inside the rsbinder crate
     // via `set_crate_support(true)`, `rsbinder::` otherwise) — a hardcoded
     // `rsbinder::` would not resolve for internally-compiled AIDL.
+    // Pass the inbound `_reader` parcel so the runtime can fail-closed when
+    // the transaction arrived over RPC (Plan 2-16 Phase A): `@EnforcePermission`
+    // is kernel-only and must deny over RPC instead of silently granting
+    // (uid 0 on the RPC path reads as root, which PMS unconditionally grants).
+    // `_reader` is in scope at the `on_transact` arm where this renders.
     let call = |p: &str| {
         format!(
-            "{crate_name}::permission_controller::check_permission(\"{}\")",
+            "{crate_name}::permission_controller::check_permission(_reader, \"{}\")",
             lit(p)
         )
     };

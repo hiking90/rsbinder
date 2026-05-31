@@ -202,8 +202,13 @@ const TX_GET_SERVICE: TransactionCode = crate::binder::FIRST_CALL_TRANSACTION;
 /// (android RPC has a single root object; this *is* that root when
 /// named services are registered). Reused, unmodified, via the same
 /// `Remotable::on_transact` server path as any AIDL stub.
+///
+/// The map is **shared** (`Arc<Mutex<…>>`) with [`RpcServer::named`], so
+/// the directory binder is built once and every later
+/// [`RpcServer::add_service`] is an O(1) insert visible through this same
+/// directory — no per-call rebuild or root swap.
 struct ServiceDirectory {
-    services: HashMap<String, SIBinder>,
+    services: Arc<Mutex<HashMap<String, SIBinder>>>,
 }
 
 impl Remotable for ServiceDirectory {
@@ -219,10 +224,17 @@ impl Remotable for ServiceDirectory {
         match code {
             TX_GET_SERVICE => {
                 let name: String = reader.read()?;
-                match self.services.get(&name) {
+                // Clone the binder out from under the lock before writing.
+                let found = self
+                    .services
+                    .lock()
+                    .expect("named poisoned")
+                    .get(&name)
+                    .cloned();
+                match found {
                     Some(b) => {
                         reply.write(&crate::Status::from(StatusCode::Ok))?;
-                        reply.write(b)
+                        reply.write(&b)
                     }
                     None => reply.write(&crate::Status::from(StatusCode::NameNotFound)),
                 }
@@ -260,7 +272,15 @@ pub struct RpcServer {
     #[cfg(feature = "rpc-tls")]
     tls_config: TlsServerConfigCell,
     root: Mutex<Option<SIBinder>>,
-    named: Mutex<HashMap<String, SIBinder>>,
+    /// Named services backing [`add_service`](RpcServer::add_service).
+    /// `Arc` so the single [`ServiceDirectory`] root (`directory`) shares
+    /// this exact map — each later `add_service` is an O(1) insert, no
+    /// rebuild. Per-server instance state, not a process global.
+    named: Arc<Mutex<HashMap<String, SIBinder>>>,
+    /// The directory root binder, built once at construction over the
+    /// shared `named` map (so it reads later inserts live) and installed
+    /// as the root on the first `add_service`. Per-server instance state.
+    directory: SIBinder,
     max_threads: Mutex<u32>,
     /// Whether per-connection sessions advertise `Unix` FD support
     /// (default false ⇒ FD reject everywhere).
@@ -408,13 +428,20 @@ impl RpcServer {
     /// factories) funnel through here so the field set stays in one
     /// place.
     fn wrap(listener: ServerListener, bind: BindAddress) -> Arc<RpcServer> {
+        // Build the directory root once over the shared `named` map; later
+        // `add_service` inserts are seen through it with no rebuild.
+        let named: Arc<Mutex<HashMap<String, SIBinder>>> = Arc::new(Mutex::new(HashMap::new()));
+        let directory = Interface::as_binder(&Binder::new(ServiceDirectory {
+            services: Arc::clone(&named),
+        }));
         Arc::new(RpcServer {
             listener,
             bind,
             #[cfg(feature = "rpc-tls")]
             tls_config: Mutex::new(None),
             root: Mutex::new(None),
-            named: Mutex::new(HashMap::new()),
+            named,
+            directory,
             max_threads: Mutex::new(1),
             fd_unix_supported: AtomicBool::new(false),
             wire_max_version: Mutex::new(None),
@@ -505,18 +532,21 @@ impl RpcServer {
         *self.root.lock().expect("root poisoned") = Some(binder);
     }
 
-    /// Register a named service. The first call makes the root a
-    /// built-in `ServiceDirectory` (rebuilt on each call so the set
-    /// is consistent); clients reach it via
+    /// Register a named service. The first call installs a built-in
+    /// `ServiceDirectory` as the root; that directory shares this server's
+    /// service map, so every later call is an O(1) insert seen through the
+    /// same root — no rebuild or root swap. Clients reach it via
     /// [`RpcSession::get_service`].
     pub fn add_service(&self, name: &str, binder: SIBinder) -> Result<()> {
-        let mut named = self.named.lock().expect("named poisoned");
-        named.insert(name.to_string(), binder);
-        let dir = ServiceDirectory {
-            services: named.clone(),
-        };
-        let root = Interface::as_binder(&Binder::new(dir));
-        *self.root.lock().expect("root poisoned") = Some(root);
+        self.named
+            .lock()
+            .expect("named poisoned")
+            .insert(name.to_string(), binder);
+        // Install the once-built directory as the root (idempotent; shares
+        // `named`, so the just-inserted entry is already visible through
+        // it). Reinstalling makes `add_service` win over any prior
+        // `set_root`.
+        *self.root.lock().expect("root poisoned") = Some(self.directory.clone());
         Ok(())
     }
 

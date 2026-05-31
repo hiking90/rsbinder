@@ -276,6 +276,38 @@ parcelable Coordinate {
 }
 ```
 
+## @EnforcePermission
+
+`@EnforcePermission` declares the Android permission(s) a method requires.
+The generated `on_transact` arm checks the caller against
+`PermissionManagerService` **before** your handler runs and returns
+`EX_SECURITY` if the check fails — so the handler body needs no
+authorization code:
+
+```aidl
+interface IExample {
+    @EnforcePermission("android.permission.INTERNET")
+    void doNetworking();
+
+    @EnforcePermission(allOf = {"android.permission.A", "android.permission.B"})
+    void needsBoth();
+
+    @EnforcePermission(anyOf = {"android.permission.A", "android.permission.B"})
+    void needsEither();
+}
+```
+
+The companion documentation-only annotations `@PermissionManuallyEnforced`
+and `@RequiresNoPermission` are recognized and emit no runtime check (they
+exist so every method can declare its permission posture).
+
+> **Kernel-only.** Android permissions are a kernel-binder concept. Over
+> the [RPC transport](./rpc-transport.md) an `@EnforcePermission` method is
+> **denied** (`EX_SECURITY`) unconditionally — granting would mean granting
+> *root* to an anonymous peer. For RPC authorization use the
+> transport-native mechanisms, or inject a `PermissionAuthority` to back the
+> check with your own policy. See [Security & Authorization](./security.md).
+
 ## Summary
 
 The following table provides a quick reference for all annotations covered in this chapter.
@@ -290,5 +322,6 @@ The following table provides a quick reference for all annotations covered in th
 | `@Descriptor` | interface | Overrides the wire descriptor string |
 | `@VintfStability` | parcelable, interface | Enforces VINTF stability rules |
 | `@FixedSize` | parcelable | Restricts fields to fixed-size types, enables `Copy` |
+| `@EnforcePermission` | interface method | Generates a `PermissionManagerService` check (kernel-only; denied over RPC) |
 
 When writing AIDL files for rsbinder, the most commonly used annotations are `@RustDerive` (for ergonomic Rust types), `@Backing` (for enums), and `@nullable` (for optional values). The remaining annotations are important for interoperability with Android or for specific use cases like recursive types and interface migration.

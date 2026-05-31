@@ -195,9 +195,14 @@ pub mod hub;
 /// (`android.os.IPermissionController`). See module doc for the
 /// AOSP-faithful surface and fail-closed `check_permission` helper.
 pub mod permission_controller;
+
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
+/// Cross-transport service facade (Plan 2-16 Phase D): register/look up
+/// services once, choosing kernel binder or RPC by construction. Additive
+/// layer over `ProcessState`/`hub`/`RpcServer`/`RpcSession`.
+pub mod service;
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
@@ -232,10 +237,10 @@ pub use native::{is_handling_transaction, Binder, BinderFeatures};
 // `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
 // its own `PeerIdentity` model under `rpc::PeerIdentity`.
 pub use thread_state::{
-    clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
+    calling_caller, clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
     get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
-    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, CallingContext,
-    ExtendedError,
+    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, Caller,
+    CallingContext, ExtendedError,
 };
 
 pub use parcel::Parcel;

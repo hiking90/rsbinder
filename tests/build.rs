@@ -143,5 +143,22 @@ fn main() {
             .output(PathBuf::from("rpc_smoke.rs"))
             .generate()
             .unwrap();
+
+        // Plan 2-16 Phase A: an `@EnforcePermission` interface served over
+        // RPC, used by `tests/rpc_enforce_permission_deny.rs` to prove
+        // every guarded method denies (the RPC root-bypass close).
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/rpc_perm/IRpcPermGuard.aidl"))
+            .output(PathBuf::from("rpc_perm_guard.rs"))
+            .generate()
+            .unwrap();
+
+        // Plan 2-16 Phase B: a service that reports the calling identity it
+        // observes inside its handler, for `tests/rpc_calling_identity.rs`.
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/rpc_perm/IRpcCaller.aidl"))
+            .output(PathBuf::from("rpc_caller.rs"))
+            .generate()
+            .unwrap();
     }
 }
