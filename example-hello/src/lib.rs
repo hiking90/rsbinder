@@ -48,3 +48,12 @@ pub mod rt_inherit {
     pub use self::rt_inherit::IRtCheck::*;
     pub const SERVICE_NAME: &str = "rsbinder.test.rt_inherit";
 }
+
+/// Plan 2-16 handler-side authorization example (`bin/authz_{service,client}`).
+pub mod authz {
+    include!(concat!(env!("OUT_DIR"), "/authz.rs"));
+    pub use self::authz::IAuthz::*;
+    pub const SERVICE_NAME: &str = "example.authz";
+    /// Unix-domain socket the example service binds and client connects to.
+    pub const RPC_SOCKET: &str = "/tmp/rsb_authz.sock";
+}
