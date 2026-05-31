@@ -187,10 +187,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let broker = kernel::Broker::new()?;
 
     // The service-manager extras below — listing, notifications, death
-    // recipients — are kernel-only. They live on `hub` / `ProcessState`,
-    // not on the cross-transport `Broker` (which only does lookup), and
-    // they need the thread pool running to deliver their callbacks.
-    ProcessState::start_thread_pool();
+    // recipients — are kernel-only: they live on `hub` / `ProcessState`,
+    // not on the cross-transport `Broker` (which only does lookup). The
+    // `join_thread_pool()` at the end keeps this process alive so the
+    // notification and death callbacks can be delivered.
 
     println!("list services:");
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
