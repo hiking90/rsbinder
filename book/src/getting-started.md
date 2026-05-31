@@ -87,7 +87,11 @@ Before diving into development, ensure you have:
 1. Define your service interface in an `.aidl` file
 2. Use `rsbinder-aidl` to generate Rust code
 3. Implement your service logic
-4. Register the service with the service manager
-5. Create clients that discover and use your service
+4. Build a `kernel::Host` (via its builder) and register the service with it
+5. Create clients that discover the service through a `kernel::Broker`
+
+Steps 4–5 use the `rsbinder::service` host/broker facade — the recommended entry point,
+which also lets you switch to the [RPC transport](./rpc-transport.md) by changing one line.
+See [Service Patterns](./service-patterns.md) and [Cross-Transport Services](./cross-transport-services.md).
 
 Ready to start? Head to the [Overview](./overview.md) section to learn the fundamentals!
