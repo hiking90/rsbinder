@@ -54,12 +54,20 @@ fn talk<B: Broker>(broker: &B) -> rsbinder::Result<Strong<dyn IHello>> {
 }
 ```
 
-Picking the transport is one line:
+Picking the transport — and its options — is the host **builder**. Each transport has its
+own builder with only the options that transport supports:
 
 ```rust
-// Server
-let host = kernel::Host::new()?;            // kernel binder (process-global)
-// let host = rpc::Host::unix("/tmp/x.sock")?;  // RPC over a Unix socket
+// Server — kernel binder
+let host = kernel::Host::builder()
+    .max_threads(8)                 // kernel-only options
+    .build()?;
+// Server — RPC over a Unix socket
+// let host = rpc::Host::builder()
+//     .unix("/tmp/x.sock")
+//     .max_connections(64)         // RPC-only options
+//     .build()?;
+
 register_all(&host, BnHello::new_binder(MyService).as_binder())?;
 host.serve()?;                              // see "serve()" below
 
@@ -67,6 +75,13 @@ host.serve()?;                              // see "serve()" below
 let broker = kernel::Broker::new()?;        // or rpc::Broker::unix("/tmp/x.sock")?
 let hello = talk(&broker)?;
 hello.echo("hi")?;
+```
+
+When you need no options, the simple constructors are the shorthand for an empty builder:
+
+```rust
+let host = kernel::Host::new()?;            // == kernel::Host::builder().build()?
+let host = rpc::Host::unix("/tmp/x.sock")?; // == rpc::Host::builder().unix(path).build()?
 ```
 
 ### Why typed pairs, not one `Endpoint` enum

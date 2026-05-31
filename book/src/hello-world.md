@@ -95,6 +95,9 @@ Let's configure the src/bin/hello_service.rs file as follows.
 ```rust
 use env_logger::Env;
 use rsbinder::*;
+// The `service` facade gives us the cross-transport host builder.
+// `Registry` brings the `add_service` method into scope.
+use rsbinder::service::{kernel, Registry};
 
 use hello::*;
 
@@ -121,26 +124,26 @@ impl IHello for IHelloService {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    println!("Initializing ProcessState...");
-    ProcessState::init_default()?;
-
-    // Start the thread pool.
-    // This is optional. If you don't call this, only one thread will be created to handle the binder transactions.
-    println!("Starting thread pool...");
-    ProcessState::start_thread_pool();
+    // Build a kernel-binder host. The builder is the primary entry point;
+    // `build()` initializes the process-wide binder state (opening the
+    // binder device with the default path). Chain options such as
+    // `.max_threads(n)` or `.driver(path)` before `build()` when you need
+    // them. With no options, `kernel::Host::new()` is the shorthand.
+    println!("Building host...");
+    let host = kernel::Host::builder().build()?;
 
     // Create a binder service.
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService{});
 
-    // Add the service to binder service manager.
-    println!("Adding service to hub...");
-    hub::add_service(SERVICE_NAME, service.as_binder())?;
+    // Register the service under SERVICE_NAME so clients can look it up.
+    println!("Adding service...");
+    host.add_service(SERVICE_NAME, service.as_binder())?;
 
-    // Join the thread pool.
-    // This is a blocking call. It will return when the thread pool is terminated.
-    Ok(ProcessState::join_thread_pool()?)
+    // Start the thread pool and block, serving transactions until the pool
+    // terminates.
+    println!("Serving...");
+    Ok(host.serve()?)
 }
 ```
 
@@ -151,6 +154,8 @@ Create the src/bin/hello_client.rs file and configure it as follows.
 
 use env_logger::Env;
 use rsbinder::*;
+// `Broker` brings the `get_interface` lookup method into scope.
+use rsbinder::service::{kernel, Broker};
 use hello::*;
 use hub::{BnServiceCallback, IServiceCallback};
 use std::sync::Arc;
@@ -177,11 +182,17 @@ impl DeathRecipient for MyDeathRecipient {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    ProcessState::init_default()?;
+    // The broker initializes the process state (idempotent) and gives us a
+    // typed lookup handle. There is no builder on the client side.
+    let broker = kernel::Broker::new()?;
+
+    // The service-manager extras below — listing, notifications, death
+    // recipients — are kernel-only: they live on `hub` / `ProcessState`,
+    // not on the cross-transport `Broker` (which only does lookup). The
+    // `join_thread_pool()` at the end keeps this process alive so the
+    // notification and death callbacks can be delivered.
 
     println!("list services:");
-    // This is an example of how to use service manager.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
         println!("{name}");
     }
@@ -189,8 +200,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
     hub::register_for_notifications(SERVICE_NAME, &service_callback)?;
 
-    // Create a Hello proxy from binder service manager.
-    let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
+    // Resolve and cast the service in one call via the facade Broker.
+    let hello: rsbinder::Strong<dyn IHello> = broker.get_interface(SERVICE_NAME)
         .unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
 
     let recipient = Arc::new(MyDeathRecipient {});
@@ -247,10 +258,10 @@ $ cargo run --bin hello_client
 
 **hello_service** output:
 ```
-Initializing ProcessState...
-Starting thread pool...
+Building host...
 Creating service...
-Adding service to hub...
+Adding service...
+Serving...
 ```
 
 **hello_client** output:
@@ -272,7 +283,7 @@ The client demonstrates several advanced features:
 
 If you encounter issues:
 
-1. **"ProcessState is not initialized!"** - `ProcessState::init_default()` (or `ProcessState::init()`) must be called in `main()` before using any other rsbinder APIs
+1. **"ProcessState is not initialized!"** - the process state must be initialized before any other rsbinder API. Building a `kernel::Host`/`kernel::Broker` does this for you; if you use the low-level path instead, call `ProcessState::init_default()` (or `ProcessState::init()`) first
 2. **"environment variable OUT_DIR not defined"** - `build.rs` must be placed in the project root directory (next to `Cargo.toml`), not inside `src/`
 3. **"Can't find my.hello"** - Ensure the service is running and registered
 4. **Permission errors** - Check that binder device has correct permissions (0666)
