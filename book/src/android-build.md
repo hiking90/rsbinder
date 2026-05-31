@@ -144,13 +144,15 @@ The `envsetup.sh` script also provides functions for remote Linux testing (`remo
 
 ### Configuration File: REMOTE_ANDROID
 
-Create a `REMOTE_ANDROID` file in the project root to configure your Android target:
+Create a `REMOTE_ANDROID` file in the project root to configure your Android target.
+It must contain **exactly three bare lines** in this order — the cargo-ndk target,
+the Rust target architecture, and the remote directory on the device. The file is
+read line by line, so do **not** add inline comments or blank lines:
 
-```bash
-# Example REMOTE_ANDROID file
-arm64-v8a           # cargo-ndk target
-aarch64             # rust target architecture
-/data/rsbinder      # remote directory on device
+```text
+arm64-v8a
+aarch64
+/data/rsbinder
 ```
 
 Common target configurations:

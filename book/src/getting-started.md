@@ -48,9 +48,10 @@ If you are new to Binder IPC, we recommend following this learning path:
 
 **rsbinder** ships two parallel stacks — pick by platform and use case:
 
-- **Kernel binder** (the default in this guide): Linux 4.17+ with
-  binderfs enabled, or Android. Talks to the kernel binder driver
-  through `/dev/binderfs/binder` (Linux) or `/dev/binder` (Android).
+- **Kernel binder** (the default in this guide): Linux 5.0+ with
+  binderfs enabled (the `binderfs` filesystem landed in 5.0), or
+  Android. Talks to the kernel binder driver through
+  `/dev/binderfs/binder` (Linux) or `/dev/binder` (Android).
 - **RPC transport** (binder-over-socket, opt-in via the `rpc`
   feature): pure user-space, no kernel binder driver. Runs on
   **Linux, Android, and macOS** over Unix-domain sockets, vsock, or

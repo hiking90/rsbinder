@@ -276,7 +276,9 @@ Each transport defines its own trust boundary, surfaced as a
   ACL basis on its own — the trust comes from hypervisor isolation).
 - **`Certificate(CertId)`** — TLS peer authenticated by its leaf cert.
 - **`Anonymous`** — no identity at all. ACL is impossible against an
-  anonymous peer. Only the debug TCP backend returns this.
+  anonymous peer. The debug TCP backend always returns this, and **any**
+  backend falls back to it (logged loudly) if peer-credential resolution
+  fails — so an authorizer must treat `Anonymous` as deny.
 
 Use [`RpcServer::set_authorizer`] to enforce a per-connection policy.
 The closure runs once on accept, **before any RPC byte is exchanged**:

@@ -3,9 +3,9 @@ Welcome to **rsbinder**!
 
 **rsbinder** is a Rust library and toolset that enables you to utilize Binder IPC on Linux and Android OS. It provides pure Rust implementations that make Binder IPC available across both platforms.
 
-Binder IPC is an object-oriented IPC (Inter-Process Communication) mechanism that Google added to the Linux kernel for Android. Android uses Binder IPC for all process communication, and it has been part of the mainline Linux kernel since version 4.17, making it available on all modern Linux systems.
+Binder IPC is an object-oriented IPC (Inter-Process Communication) mechanism that Google added to the Linux kernel for Android. Android uses Binder IPC for all process communication, and the binder driver has been part of the mainline Linux kernel since version 4.17 (with the `binderfs` filesystem rsbinder uses arriving in 5.0).
 
-However, since it is rarely used outside of Android, it is disabled by default in most Linux distributions.
+However, since it is rarely used outside of Android, it is disabled by default in most Linux distributions, so you typically need a kernel built with binder support to use the kernel-binder path (see [Enable binder for Linux](./enable-binder-for-linux.md)).
 
 **rsbinder ships two parallel stacks:**
 

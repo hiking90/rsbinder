@@ -50,7 +50,8 @@ $ cargo install rsbinder-tools
 Create a binder device and test the setup:
 
 ```bash
-# Create binder device
+# Create binder device (binderfs devices are not persistent —
+# re-run this after each reboot)
 $ sudo rsb_device binder
 
 # Verify device creation
