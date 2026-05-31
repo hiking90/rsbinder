@@ -23,6 +23,13 @@ fn generate(input: &str) -> String {
     gen.document(&document).expect("generate").1
 }
 
+fn generate_async(input: &str) -> String {
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+    let gen = rsbinder_aidl::Generator::new(true, false); // enabled_async = true
+    gen.document(&document).expect("generate").1
+}
+
 fn arm_for(method_id: &str, generated: &str) -> String {
     // Extract from `transactions::r#<method> => {` up to the matching
     // `}` brace of the arm. The arms are emitted single-level inside a
@@ -315,5 +322,49 @@ interface IMixed {
     assert!(
         !arm_echo.contains("check_permission"),
         "echo arm should not contain check_permission:\n{arm_echo}"
+    );
+}
+
+#[test]
+fn enforce_permission_emitted_for_async_service() {
+    // The async service stub dispatches through the *same* generated
+    // `on_transact` (the `Bn*Adapter` calls `on_transact(self.as_sync(), …)`),
+    // so an `@EnforcePermission` method served by an *async* impl must still
+    // be checked before the handler runs. This guards against a regression
+    // where the deny would be emitted only on the sync path — an async
+    // service would otherwise silently skip authorization.
+    let input = r#"
+package test;
+interface IFoo {
+    @EnforcePermission("INTERNET")
+    void doNet(in String url);
+}
+        "#;
+    let out = generate_async(input);
+    let arm = arm_for("doNet", &out);
+    assert!(
+        arm.contains("check_permission(_reader, \"INTERNET\")"),
+        "async-enabled codegen must still emit the deny in on_transact:\n{arm}"
+    );
+    assert!(
+        arm.contains("rsbinder::ExceptionCode::Security"),
+        "async deny branch missing:\n{arm}"
+    );
+    // And it must precede argument deserialization, same as sync.
+    let check_pos = arm
+        .find("check_permission(_reader,")
+        .expect("check present");
+    if let Some(read_pos) = arm.find("_reader.read") {
+        assert!(
+            check_pos < read_pos,
+            "check must precede arg deserialization in async codegen:\n{arm}"
+        );
+    }
+
+    // Sanity: the async path is actually generated (so this isn't silently
+    // testing the sync output).
+    assert!(
+        out.contains("AsyncService"),
+        "expected async service stub in async-enabled generation"
     );
 }
