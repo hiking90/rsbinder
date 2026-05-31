@@ -597,17 +597,6 @@ impl RpcParcelOps for SessionParcelOps {
     }
 }
 
-/// Resolve an inbound peer to the `(uid, pid)` stamped into the RPC
-/// calling context (Plan 2-16 Phase B). Unix peers carry a kernel-vouched
-/// uid/pid; uid-less transports (`Vsock` / `Certificate` / `Anonymous`)
-/// fail-closed to the `RPC_UNKNOWN_CALLING_UID` sentinel, never `0`/root.
-fn caller_ids(peer: &PeerIdentity) -> (u32, i32) {
-    match peer {
-        PeerIdentity::Local { uid, pid } => (*uid, *pid),
-        _ => (crate::thread_state::RPC_UNKNOWN_CALLING_UID, -1),
-    }
-}
-
 impl RpcSessionInner {
     /// AOSP `RpcSession::ExclusiveConnection::find`. Selects
     /// **a** connection slot for this thread to drive (outgoing
@@ -1447,14 +1436,15 @@ impl RpcSessionInner {
             // caller identity — they never reach a user handler.
             return self.serve_special(&t, oneway);
         }
-        // Resolve the caller's (uid, pid) once (Plan 2-16 Phase B). The
-        // resolved pair is `Copy`, so the oneway drain reuses it without
-        // cloning the (possibly `String`-bearing) `PeerIdentity` per entry.
-        let caller = caller_ids(&peer);
+        // Wrap the peer once (Plan 2-16 Phase B / Phase C): handlers can
+        // read the full identity via `calling_caller()`, and the `Arc`
+        // keeps the oneway drain's per-entry install a cheap refcount bump
+        // (no `String`-bearing `PeerIdentity` clone).
+        let peer = Arc::new(peer);
         if oneway {
-            self.dispatch_oneway_ordered(t, in_fds, caller)
+            self.dispatch_oneway_ordered(t, in_fds, peer)
         } else {
-            self.execute_dispatched(t, in_fds, false, caller)
+            self.execute_dispatched(t, in_fds, false, peer)
         }
     }
 
@@ -1466,7 +1456,7 @@ impl RpcSessionInner {
         &self,
         t: WireTransaction,
         in_fds: Vec<OwnedFd>,
-        caller: (u32, i32),
+        peer: Arc<PeerIdentity>,
     ) -> Result<()> {
         let addr = t.address;
         let wire_async = t.async_number;
@@ -1495,8 +1485,8 @@ impl RpcSessionInner {
         };
         while let Some((t, fds)) = next {
             // All replayed oneways belong to this session, so the caller
-            // identity is the same for every drained entry (`Copy`, no clone).
-            self.execute_dispatched(t, fds, true, caller)?;
+            // identity is the same for every drained entry (cheap `Arc` clone).
+            self.execute_dispatched(t, fds, true, Arc::clone(&peer))?;
             next = {
                 let mut state = self.shared.state.lock().expect("rpc state poisoned");
                 state.advance_and_pop_async(addr)
@@ -1514,7 +1504,7 @@ impl RpcSessionInner {
         t: WireTransaction,
         in_fds: Vec<OwnedFd>,
         oneway: bool,
-        caller: (u32, i32),
+        peer: Arc<PeerIdentity>,
     ) -> Result<()> {
         let target = self
             .shared
@@ -1587,15 +1577,14 @@ impl RpcSessionInner {
             self.records_fd_positions(),
         );
 
-        // Plan 2-16 Phase B: stamp the caller's uid/pid (resolved once in
-        // `dispatch_transact` via `caller_ids`) into the RPC calling context
-        // for the duration of the user handler so `get_calling_uid()` /
-        // `get_calling_pid()` work over Unix RPC. The guard restores on
-        // drop, so a nested re-entrant callback over the same connection
-        // nests correctly.
-        let (caller_uid, caller_pid) = caller;
+        // Plan 2-16 Phase B/C: stamp the caller's peer identity into the
+        // RPC calling context for the duration of the user handler, so
+        // `get_calling_uid()`/`get_calling_pid()` work over Unix RPC and
+        // `calling_caller()` exposes the full peer (uid / cert / vsock) for
+        // authorization. The guard restores on drop, so a nested re-entrant
+        // callback over the same connection nests correctly.
         let result = consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
-            let _calling = crate::thread_state::RpcCallingGuard::install(caller_uid, caller_pid);
+            let _calling = crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer));
             target.rpc_transact(t.code, &mut reader, &mut reply)
         });
 

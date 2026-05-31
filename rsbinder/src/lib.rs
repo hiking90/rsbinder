@@ -237,10 +237,10 @@ pub use native::{is_handling_transaction, Binder, BinderFeatures};
 // `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
 // its own `PeerIdentity` model under `rpc::PeerIdentity`.
 pub use thread_state::{
-    clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
+    calling_caller, clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
     get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
-    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, CallingContext,
-    ExtendedError,
+    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, Caller,
+    CallingContext, ExtendedError,
 };
 
 pub use parcel::Parcel;

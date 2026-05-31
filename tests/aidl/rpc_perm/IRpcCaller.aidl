@@ -17,4 +17,12 @@ interface IRpcCaller {
 
     /** Returns `is_handling_transaction()` observed inside this handler. */
     boolean handlingTransaction();
+
+    /**
+     * Classifies `calling_caller()` observed inside this handler
+     * (Plan 2-16 Phase C): `"rpc-local:<uid>"` for a Unix RPC peer,
+     * `"rpc-other"` for a uid-less RPC transport, `"kernel"` for kernel
+     * binder, or `"none"` outside a transaction.
+     */
+    String callerKind();
 }

@@ -45,6 +45,18 @@ impl IRpcCaller for CallerSvc {
     fn r#handlingTransaction(&self) -> rsbinder::status::Result<bool> {
         Ok(rsbinder::is_handling_transaction())
     }
+    fn r#callerKind(&self) -> rsbinder::status::Result<String> {
+        use rsbinder::rpc::PeerIdentity;
+        use rsbinder::Caller;
+        Ok(match rsbinder::calling_caller() {
+            Some(Caller::Rpc(PeerIdentity::Local { uid, .. })) => format!("rpc-local:{uid}"),
+            Some(Caller::Kernel { .. }) => "kernel".to_string(),
+            // `Caller` / `PeerIdentity` are `#[non_exhaustive]`: a uid-less
+            // RPC transport (or a future variant) lands here.
+            Some(_) => "rpc-other".to_string(),
+            None => "none".to_string(),
+        })
+    }
 }
 
 fn root() -> SIBinder {
@@ -92,6 +104,13 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         assert!(
             caller.r#handlingTransaction().unwrap(),
             "is_handling_transaction() must be true inside an RPC handler"
+        );
+        // Phase C: `calling_caller()` exposes the full transport-tagged
+        // peer — here a Unix RPC local peer with this process's uid.
+        assert_eq!(
+            caller.r#callerKind().unwrap(),
+            format!("rpc-local:{}", rustix::process::getuid().as_raw()),
+            "calling_caller() must surface Caller::Rpc(PeerIdentity::Local) over Unix RPC"
         );
 
         // Outside any handler the calling context is clear.
