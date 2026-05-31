@@ -159,9 +159,15 @@ let echo: Strong<dyn IEcho> =
     <dyn IEcho  as FromIBinder>::try_from(session.get_service("echo")?)?;
 ```
 
+`add_service` is O(1) per call: the directory is built once and shares
+the server's service map, so later registrations — even after the server
+is already serving — are seen through the same root with no rebuild.
 Mixing `set_root` with `add_service` on the same server is **not**
-supported — `add_service` rebuilds the root each call to keep the set
-consistent. Pick one publishing model per server.
+supported (the last one installed wins); pick one publishing model per
+server.
+
+> For registering and looking up services with the *same* code over
+> kernel binder or RPC, see [Cross-Transport Services](./cross-transport-services.md).
 
 ## Wire-protocol profiles
 
@@ -254,8 +260,12 @@ your own `Cargo.toml`.
 ## Security
 
 > **RPC is not a drop-in for kernel binder's security model.** Kernel
-> binder gives you `getCallingUid()` and SELinux for free. RPC does
-> not.
+> binder gives you a kernel-vouched uid/pid and SELinux for free; RPC's
+> trust boundary is the transport itself. This section covers the RPC
+> trust boundaries; for the full handler-side authorization story across
+> both transports — `calling_caller()`, `@EnforcePermission` over RPC,
+> uid ACLs, `PermissionAuthority` — see
+> [Security & Authorization](./security.md).
 
 Each transport defines its own trust boundary, surfaced as a
 [`PeerIdentity`](https://docs.rs/rsbinder/latest/rsbinder/rpc/enum.PeerIdentity.html):
@@ -282,6 +292,15 @@ server.set_authorizer(|peer| {
 A rejected peer's socket is closed; its next operation sees
 `DeadObject`. The hook is opt-in — without it, every connection is
 accepted (matching the prior behaviour).
+
+`set_authorizer` is **connection-level** (decided once, at handshake) —
+the right granularity for vsock and TLS, which carry no per-call uid. For
+**per-method** authorization, a handler can also read the caller directly:
+over a Unix-domain RPC connection `rsbinder::get_calling_uid()` returns the
+kernel-vouched peer uid (and `calling_caller()` the full transport-tagged
+identity), exactly as on kernel binder — so a uid ACL written once runs on
+both. Over a uid-less transport `get_calling_uid()` is the fail-closed
+`u32::MAX` sentinel. See [Security & Authorization](./security.md).
 
 ## Capabilities
 

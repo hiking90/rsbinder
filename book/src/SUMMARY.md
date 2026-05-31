@@ -20,6 +20,8 @@
     - [Error Handling](./error-handling.md)
     - [Service Manager (HUB)](./service-manager.md)
 - [RPC Transport (binder-over-socket)](./rpc-transport.md)
+- [Cross-Transport Services](./cross-transport-services.md)
+- [Security & Authorization](./security.md)
 - [Stability Tiers](./stability-tiers.md)
 - [Enable binder for Linux](./enable-binder-for-linux.md)
     - [Arch Linux](./arch-linux.md)
