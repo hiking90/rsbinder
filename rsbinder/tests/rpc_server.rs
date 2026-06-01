@@ -530,6 +530,51 @@ fn max_connections_admission_bound() {
     // _cu handles teardown.
 }
 
+/// A connected-but-silent **r34** peer (the default profile, which has no
+/// separate handshake — first contact is the first serve-loop frame) must
+/// be torn down by the handshake/admission read deadline so it cannot pin
+/// its worker + admission slot forever.
+///
+/// Mutant: clearing the read deadline *before* the r34 serve loop (the
+/// pre-fix behavior) leaves the silent c1 worker blocked in `recv` with no
+/// deadline ⇒ the single `max_connections` slot is never freed ⇒ c2's
+/// bounded `get_root` times out, failing this test.
+#[test]
+fn silent_r34_peer_released_by_handshake_deadline() {
+    let path = tmp_sock("silent_r34");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    // One slot so a pinned silent peer is directly observable, and a short
+    // deadline to keep the test fast + deterministic.
+    server.set_max_connections(1);
+    server.set_handshake_timeout(Some(Duration::from_millis(300)));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // c1 connects but sends nothing: r34 connect performs no wire, so this
+    // is the silent first-contact peer. It occupies the single worker slot.
+    let c1 = RpcSession::setup_unix_client(&path).expect("connect c1 (silent)");
+
+    // c2 connects into the backlog; it can only be served once c1's worker
+    // exits on the first-frame deadline and frees the slot. A deadline
+    // comfortably larger than the handshake timeout proves the slot is
+    // released (and not that c2 merely raced ahead).
+    let c2 = RpcSession::setup_unix_client(&path).expect("connect c2");
+    c2.set_timeout(Some(Duration::from_secs(5)));
+    assert_eq!(
+        EchoProxy(c2.get_root().expect("c2 get_root after c1 deadline"))
+            .echo("c2")
+            .unwrap(),
+        "c2",
+        "silent r34 peer's worker must release its slot on the handshake deadline"
+    );
+
+    drop(c1);
+    drop(c2);
+    // _cu handles teardown.
+}
+
 // ---- oneway FIFO + non-blocking send -------------------------------
 
 #[test]

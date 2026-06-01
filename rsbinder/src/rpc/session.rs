@@ -827,6 +827,24 @@ impl RpcSessionInner {
         }
     }
 
+    /// Lift the read deadline on a slot's transport (best-effort). Used by
+    /// the r34 serve path to clear the handshake/admission deadline after
+    /// the first frame so an established session idles unbounded.
+    fn clear_slot_read_timeout(&self, slot_id: u64) {
+        let transport = {
+            let st = self.conn_state.lock().expect("conn_state poisoned");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| Arc::clone(&s.transport))
+        };
+        if let Some(t) = transport {
+            if let Err(e) = t.set_read_timeout(None) {
+                log::debug!("RPC: failed to clear first-frame read deadline: {e:?}");
+            }
+        }
+    }
+
     pub(crate) fn parcel_ops(&self) -> Arc<dyn RpcParcelOps> {
         Arc::new(SessionParcelOps(
             self.self_weak.lock().expect("self_weak").clone(),
@@ -2259,12 +2277,40 @@ impl RpcSession {
     /// [`serve_blocking`](RpcSession::serve_blocking) is exactly this
     /// on the founding slot (`FOUNDING_SLOT_ID`).
     pub fn serve_blocking_on(&self, slot_id: u64) -> Result<()> {
+        self.serve_blocking_on_inner(slot_id, false)
+    }
+
+    /// Like [`serve_blocking`](RpcSession::serve_blocking), but the
+    /// handshake/admission read deadline armed before the call is left in
+    /// place for the **first** frame only and cleared once that frame is
+    /// read (or a clean EOF arrives). Used by the r34 server path, where
+    /// there is no separate handshake: the first serve-loop frame *is* the
+    /// first contact, so a connected-but-silent peer's worker must still be
+    /// bounded by the deadline, while an established two-way session idles
+    /// unbounded between requests after that first frame.
+    pub fn serve_blocking_clearing_deadline_after_first(&self) -> Result<()> {
+        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true)
+    }
+
+    fn serve_blocking_on_inner(&self, slot_id: u64, clear_deadline_after_first: bool) -> Result<()> {
         let result = {
             let mut r = Ok(());
+            let mut first = clear_deadline_after_first;
             loop {
                 match self.inner.serve_once_on_slot(slot_id) {
-                    Ok(true) => continue,
-                    Ok(false) => break,
+                    Ok(cont) => {
+                        // First-frame-only deadline: once the first frame is
+                        // read (or a clean EOF arrives), lift the admission
+                        // deadline so subsequent idle waits are unbounded.
+                        if first {
+                            self.inner.clear_slot_read_timeout(slot_id);
+                            first = false;
+                        }
+                        if cont {
+                            continue;
+                        }
+                        break;
+                    }
                     Err(e) => {
                         r = Err(e);
                         break;

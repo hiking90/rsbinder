@@ -632,10 +632,12 @@ impl RpcServer {
     /// the accept loop. `None` disables the deadline (a hung peer may
     /// then hold a slot indefinitely).
     ///
-    /// The deadline bounds **only** the pre-serve handshake/first-contact
-    /// phase; it is cleared once serving begins, so an established
-    /// two-way session may sit idle between requests unbounded (the
-    /// per-call reply deadline is managed separately via
+    /// The deadline bounds **only** the handshake/first-contact phase. For
+    /// the android-13+ profile it is cleared after the explicit handshake;
+    /// for the default r34 profile (no separate handshake) it covers the
+    /// first serve-loop frame and is cleared once that frame is read. Either
+    /// way an established two-way session may then sit idle between requests
+    /// unbounded (the per-call reply deadline is managed separately via
     /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
     pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) {
         *self
@@ -1201,10 +1203,12 @@ impl RpcServer {
                 // free first-contact shape) + serve inline. We're
                 // already on the worker thread — no nested spawn.
                 // r34 has no separate handshake (first contact is the
-                // first serve-loop frame); lift the admission deadline
-                // before serving so an established idle session is not
-                // torn down by it.
-                Self::clear_handshake_timeout(transport.as_ref());
+                // first serve-loop frame), so the admission deadline must
+                // cover that first frame: a silent peer times out and
+                // releases its Arc + slot. `make_session`/`RpcSession::new`
+                // do no blocking read, so the still-armed deadline reaches
+                // the serve loop, which clears it after the first frame so
+                // an established idle session is not torn down by it.
                 let session = match server.make_session(transport) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1212,7 +1216,7 @@ impl RpcServer {
                         return;
                     }
                 };
-                if let Err(e) = session.serve_blocking() {
+                if let Err(e) = session.serve_blocking_clearing_deadline_after_first() {
                     log::debug!("RPC session ended: {e:?}");
                 }
             }
