@@ -619,7 +619,12 @@ impl RpcSessionInner {
     ///     here, return the guard.
     ///  4. **Pool exhausted** — `wait` on `slot_cv` (released on slot
     ///     drop OR `add_*_slot`). **Block-and-wait, never busy
-    ///     try-loop**.
+    ///     try-loop**. Each wakeup (and the first park) rechecks the
+    ///     session lifecycle and pool (mirroring
+    ///     [`find_conn_for_reaper`]) and returns
+    ///     `Err(StatusCode::DeadObject)` if the session is torn down or
+    ///     the pool has drained — `add_*_slot` can never refill a dead
+    ///     session, so re-`wait` would park forever.
     ///
     /// Single-slot default: step 3 always succeeds
     /// without `wait`; the `DRIVING`-keyed reentrancy bypass collapses
@@ -632,7 +637,7 @@ impl RpcSessionInner {
     /// the per-`mNodeForAddress` `asyncNumber` send-side counter +
     /// receive-side priority replay (see [`super::state`]), not by
     /// pinning oneway sends to a fixed slot.
-    fn find_conn(&self) -> ConnGuard<'_> {
+    fn find_conn(&self) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
         // (1) Reentrant: a slot of this session is already driven by
@@ -651,15 +656,22 @@ impl RpcSessionInner {
                     .map(|s| Arc::clone(&s.transport))
                     .expect("DRIVING slot present")
             };
-            return ConnGuard {
+            return Ok(ConnGuard {
                 inner: self,
                 slot_id,
                 transport,
                 reentrant: true,
-            };
+            });
         }
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
+            // Torn-down/drained recheck (mirrors `find_conn_for_reaper`):
+            // a concurrent peer-close can drain the last slot, and
+            // `add_*_slot` can never refill a dead session, so re-`wait`
+            // would park forever. Surface a typed dead-pool error instead.
+            if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
+                return Err(StatusCode::DeadObject);
+            }
             // (2) Defensive exclusive match (shouldn't fire if (1) is correct).
             // (3) First available.
             if let Some(s) = st
@@ -671,12 +683,12 @@ impl RpcSessionInner {
                 let slot_id = s.id;
                 let transport = Arc::clone(&s.transport);
                 DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
-                return ConnGuard {
+                return Ok(ConnGuard {
                     inner: self,
                     slot_id,
                     transport,
                     reentrant: false,
-                };
+                });
             }
             // (4) Pool exhausted — wait. The `Condvar` is woken on
             //     slot release (ConnGuard drop) or slot addition
@@ -812,6 +824,24 @@ impl RpcSessionInner {
                 });
             }
             st = self.slot_cv.wait(st).expect("slot_cv poisoned");
+        }
+    }
+
+    /// Lift the read deadline on a slot's transport (best-effort). Used by
+    /// the r34 serve path to clear the handshake/admission deadline after
+    /// the first frame so an established session idles unbounded.
+    fn clear_slot_read_timeout(&self, slot_id: u64) {
+        let transport = {
+            let st = self.conn_state.lock().expect("conn_state poisoned");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| Arc::clone(&s.transport))
+        };
+        if let Some(t) = transport {
+            if let Err(e) = t.set_read_timeout(None) {
+                log::debug!("RPC: failed to clear first-frame read deadline: {e:?}");
+            }
         }
     }
 
@@ -1206,7 +1236,7 @@ impl RpcSessionInner {
         // if the pool is exhausted. Concurrent transacts on *other*
         // slots run unblocked.
         let oneway = (flags & FLAG_ONEWAY) != 0;
-        let conn = self.find_conn();
+        let conn = self.find_conn()?;
         let transport = conn.transport();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = if oneway {
@@ -1353,7 +1383,7 @@ impl RpcSessionInner {
         // `find_conn` picks an available slot (or — if this thread is
         // already driving one of the session's slots — reuses it via
         // `DRIVING`, the documented "interleaved DEC_STRONG" path).
-        let conn = self.find_conn();
+        let conn = self.find_conn()?;
         let frame = self.profile.codec().encode_dec_strong(&addr);
         self.send_msg(conn.transport(), &frame, &[])?;
         Ok(())
@@ -1416,7 +1446,7 @@ impl RpcSessionInner {
         // `find_conn`). For an outermost server reply
         // (`serve_once_on_slot` pinned the slot before dispatch) this
         // is the same slot the request arrived on.
-        let conn = self.find_conn();
+        let conn = self.find_conn()?;
         Ok(self.send_msg(conn.transport(), &frame, fds)?)
     }
 
@@ -2247,12 +2277,44 @@ impl RpcSession {
     /// [`serve_blocking`](RpcSession::serve_blocking) is exactly this
     /// on the founding slot (`FOUNDING_SLOT_ID`).
     pub fn serve_blocking_on(&self, slot_id: u64) -> Result<()> {
+        self.serve_blocking_on_inner(slot_id, false)
+    }
+
+    /// Like [`serve_blocking`](RpcSession::serve_blocking), but the
+    /// handshake/admission read deadline armed before the call is left in
+    /// place for the **first** frame only and cleared once that frame is
+    /// read (or a clean EOF arrives). Used by the r34 server path, where
+    /// there is no separate handshake: the first serve-loop frame *is* the
+    /// first contact, so a connected-but-silent peer's worker must still be
+    /// bounded by the deadline, while an established two-way session idles
+    /// unbounded between requests after that first frame.
+    pub fn serve_blocking_clearing_deadline_after_first(&self) -> Result<()> {
+        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true)
+    }
+
+    fn serve_blocking_on_inner(
+        &self,
+        slot_id: u64,
+        clear_deadline_after_first: bool,
+    ) -> Result<()> {
         let result = {
             let mut r = Ok(());
+            let mut first = clear_deadline_after_first;
             loop {
                 match self.inner.serve_once_on_slot(slot_id) {
-                    Ok(true) => continue,
-                    Ok(false) => break,
+                    Ok(cont) => {
+                        // First-frame-only deadline: once the first frame is
+                        // read (or a clean EOF arrives), lift the admission
+                        // deadline so subsequent idle waits are unbounded.
+                        if first {
+                            self.inner.clear_slot_read_timeout(slot_id);
+                            first = false;
+                        }
+                        if cont {
+                            continue;
+                        }
+                        break;
+                    }
                     Err(e) => {
                         r = Err(e);
                         break;

@@ -202,13 +202,22 @@ fn commit_new_acquired(
 /// alive" invariant could otherwise break.
 ///
 /// `generation` is a process-wide monotonic counter snapshotted at
-/// case-(a) insertion. It enables `WIBinder::upgrade()` to detect when
-/// the same handle id has been recycled to a different `binder_node` —
-/// resurrection through case (b) is only safe when the snapshot taken
-/// at `SIBinder::downgrade` time still matches the live entry's
-/// generation. Case (b) preserves the existing entry's generation
-/// (same kernel slot, just user-space resurrection); only case (a)
-/// allocates a new generation.
+/// case-(a) insertion. A proxy `WIBinder` records the generation it
+/// observed at `SIBinder::downgrade` time so `WIBinder` identity
+/// (`PartialEq`) is stable across case-(b) re-lookups (a fresh
+/// `Arc<ProxyHandle>` is a new allocation, but the `(handle,
+/// generation)` pair is unchanged), and so a recycled handle id
+/// (different `binder_node`) is distinguishable. Case (b) preserves
+/// the existing entry's generation (same kernel slot, fresh
+/// wire-delivered strong ref re-establishes transactability); only
+/// case (a) allocates a new generation.
+///
+/// Case-(b) re-lookup here (via `strong_proxy_for_handle_stability`)
+/// is driven by a fresh wire delivery of the handle — e.g. servicemanager
+/// `checkService` or an incoming transaction carrying it — which gives
+/// the new `BC_ACQUIRE` a kernel strong count it can transact on. This
+/// is distinct from `WIBinder::upgrade()`, which is purely weak: it
+/// never re-`BC_ACQUIRE`s a strong-0 handle (see `WIBinder::upgrade`).
 pub(crate) struct CacheEntry {
     pub(crate) weak: sync::Weak<ProxyHandle>,
     pub(crate) descriptor: String,
@@ -789,76 +798,6 @@ impl ProcessState {
             .expect("Handle to proxy lock poisoned")
             .get(&handle)
             .map(|e| e.generation)
-    }
-
-    /// Resurrection-only proxy lookup. Companion to
-    /// `strong_proxy_for_handle_stability` but **never** enters
-    /// case (a) (fresh `BC_INCREFS` pin) — if no cache entry exists for
-    /// `handle`, returns `Err(StatusCode::DeadObject)`.
-    ///
-    /// Used by `WIBinder::upgrade` to promote a weak proxy reference to
-    /// a strong one without reissuing the cache pin. Three outcomes:
-    ///
-    ///   - `expected_generation` mismatch ⟹ the original binder_node
-    ///     was obituary'd and the handle id was recycled. Return
-    ///     `DeadObject`.
-    ///   - cache entry alive (some other thread/holder has a strong
-    ///     `Arc<ProxyHandle>`) ⟹ reuse it (analogous to case (c)).
-    ///   - cache entry's `weak` is dangling ⟹ resurrection (case (b)):
-    ///     allocate a fresh `Arc<ProxyHandle>`, issue `BC_ACQUIRE`. The
-    ///     cache pin invariant guarantees the kernel `binder_ref` slot
-    ///     is still alive, so this `BC_ACQUIRE` cannot race against a
-    ///     freed slot.
-    pub(crate) fn resurrect_proxy_for_handle_stability(
-        &self,
-        handle: u32,
-        stability: Stability,
-        expected_generation: u64,
-    ) -> Result<SIBinder> {
-        // Read fast path with generation check.
-        if let Some(arc) = self
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
-            .get(&handle)
-            .filter(|e| e.generation == expected_generation)
-            .and_then(|e| e.weak.upgrade())
-        {
-            return Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>));
-        }
-
-        // Slow path: write lock so insert in case (b) is atomic against
-        // concurrent resurrections / lookups.
-        let mut handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
-
-        let (descriptor, generation) = match handle_to_proxy.get(&handle) {
-            None => return Err(StatusCode::DeadObject),
-            Some(entry) if entry.generation != expected_generation => {
-                return Err(StatusCode::DeadObject);
-            }
-            Some(entry) => {
-                if let Some(arc) = entry.weak.upgrade() {
-                    return Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>));
-                }
-                (entry.descriptor.clone(), entry.generation)
-            }
-        };
-
-        // Case (b) resurrection. Cache pin (BC_INCREFS) is still active
-        // for this entry, so BC_ACQUIRE will succeed.
-        let arc = ProxyHandle::new_acquired(handle, descriptor.clone(), stability)?;
-        handle_to_proxy.insert(
-            handle,
-            CacheEntry {
-                weak: Arc::downgrade(&arc),
-                descriptor,
-                generation,
-            },
-        );
-        Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
     }
 
     /// Phase 1 of obituary teardown: remove the cache entry under write
