@@ -2292,7 +2292,11 @@ impl RpcSession {
         self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true)
     }
 
-    fn serve_blocking_on_inner(&self, slot_id: u64, clear_deadline_after_first: bool) -> Result<()> {
+    fn serve_blocking_on_inner(
+        &self,
+        slot_id: u64,
+        clear_deadline_after_first: bool,
+    ) -> Result<()> {
         let result = {
             let mut r = Ok(());
             let mut first = clear_deadline_after_first;
