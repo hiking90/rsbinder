@@ -30,6 +30,61 @@ struct Service {
     is_accessor: bool,
 }
 
+/// A callback invocation deferred until after the `Inner` mutex guard is
+/// dropped. Collected while holding the lock, fired afterwards — outbound
+/// binder transactions must never run while holding state (R1), and AOSP's
+/// servicemanager likewise fans out callbacks without holding its lock.
+enum PendingCallback {
+    Registration {
+        callback:
+            rsbinder::Strong<dyn hub::android_16::android::os::IServiceCallback::IServiceCallback>,
+        name: String,
+        binder: SIBinder,
+    },
+    Clients {
+        callback:
+            rsbinder::Strong<dyn hub::android_16::android::os::IClientCallback::IClientCallback>,
+        binder: SIBinder,
+        has_clients: bool,
+    },
+}
+
+impl PendingCallback {
+    fn fire(self) -> rsbinder::status::Result<()> {
+        match self {
+            PendingCallback::Registration {
+                callback,
+                name,
+                binder,
+            } => callback.onRegistration(&name, &binder),
+            PendingCallback::Clients {
+                callback,
+                binder,
+                has_clients,
+            } => callback.onClients(&binder, has_clients),
+        }
+    }
+}
+
+/// Fire each collected callback after the caller has dropped the `Inner`
+/// guard. Order is preserved (collection order = invocation order). Errors
+/// are logged and swallowed — matches the prior in-lock notification paths.
+fn fire_pending(pending: Vec<PendingCallback>) {
+    for cb in pending {
+        cb.fire()
+            .unwrap_or_else(|e| log::error!("Failed to notify client callback: {e:?}"));
+    }
+}
+
+/// Like [`fire_pending`] but propagates the first callback error, preserving
+/// `addService`'s original error-propagating semantics for `onRegistration`.
+fn fire_pending_propagate(pending: Vec<PendingCallback>) -> rsbinder::status::Result<()> {
+    for cb in pending {
+        cb.fire()?;
+    }
+    Ok(())
+}
+
 struct DeathRecipientWrapper(mpsc::Sender<rsbinder::WIBinder>);
 
 impl rsbinder::DeathRecipient for DeathRecipientWrapper {
@@ -86,11 +141,15 @@ impl Inner {
         Ok(())
     }
 
+    /// Mutate `service.has_clients` under the lock and *collect* (do not
+    /// invoke) the resulting `onClients` notifications into `pending`. The
+    /// caller fires them via [`fire_pending`] after dropping the guard (R1).
     fn send_client_callback_notification(
         &mut self,
         service_name: &str,
         has_clients: bool,
         context: &str,
+        pending: &mut Vec<PendingCallback>,
     ) {
         let service = if let Some(service) = self.name_to_service.get_mut(service_name) {
             service
@@ -122,25 +181,35 @@ impl Inner {
             context
         );
 
-        self.name_to_client_callbacks.get(service_name).map(|callbacks| {
-            for callback in callbacks {
-                callback.onClients(&service.binder, has_clients)
-                    .unwrap_or_else(|e| {
-                        log::error!("Failed to notify client callback: {e:?}");
+        let binder = service.binder.clone();
+        match self.name_to_client_callbacks.get(service_name) {
+            Some(callbacks) => {
+                for callback in callbacks {
+                    pending.push(PendingCallback::Clients {
+                        callback: callback.clone(),
+                        binder: binder.clone(),
+                        has_clients,
                     });
+                }
             }
-        }).unwrap_or_else(|| {
-            log::warn!("send_client_callback_notification could not find callbacks for service when {context}");
-        });
+            None => {
+                log::warn!("send_client_callback_notification could not find callbacks for service when {context}");
+            }
+        }
 
-        service.has_clients = has_clients;
+        if let Some(service) = self.name_to_service.get_mut(service_name) {
+            service.has_clients = has_clients;
+        }
     }
 
+    /// Like its name suggests, but collects callbacks into `pending` instead
+    /// of invoking them (see [`Inner::send_client_callback_notification`]).
     fn handle_service_client_callback(
         &mut self,
         known_clients: usize,
         service_name: &str,
         is_called_on_interval: bool,
+        pending: &mut Vec<PendingCallback>,
     ) -> Result<bool> {
         let service = if let Some(service) = self.name_to_service.get(service_name) {
             if self
@@ -183,6 +252,7 @@ impl Inner {
                     service_name,
                     true,
                     "service is guaranteed to be in use",
+                    pending,
                 );
             }
 
@@ -206,6 +276,7 @@ impl Inner {
                 service_name,
                 true,
                 "we now have a record of a client",
+                pending,
             );
             if let Some(service) = self.name_to_service.get(service_name) {
                 has_clients = service.has_clients;
@@ -217,6 +288,7 @@ impl Inner {
                 service_name,
                 false,
                 "we now have no record of a client",
+                pending,
             );
             if let Some(service) = self.name_to_service.get(service_name) {
                 has_clients = service.has_clients;
@@ -236,6 +308,7 @@ impl Inner {
         &mut self,
         name: &str,
         _start_if_not_found: bool,
+        pending: &mut Vec<PendingCallback>,
     ) -> rsbinder::status::Result<Option<(SIBinder, bool)>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
             service
@@ -246,7 +319,7 @@ impl Inner {
         let out = service.binder.clone();
         let is_accessor = service.is_accessor;
         service.guarantee_client = true;
-        self.handle_service_client_callback(Self::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
+        self.handle_service_client_callback(Self::KNOWN_CLIENTS_ON_DEMAND, name, false, pending)?;
 
         if let Some(service) = self.name_to_service.get_mut(name) {
             service.guarantee_client = true;
@@ -395,13 +468,19 @@ impl ServiceManager {
                 // (one entry per registered service) — a transient `Vec`
                 // is cheaper than the alternative refactor.
                 let names: Vec<String> = inner.name_to_service.keys().cloned().collect();
+                let mut pending = Vec::new();
                 for name in &names {
-                    if let Err(e) =
-                        inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_PERIODIC, name, true)
-                    {
+                    if let Err(e) = inner.handle_service_client_callback(
+                        Inner::KNOWN_CLIENTS_PERIODIC,
+                        name,
+                        true,
+                        &mut pending,
+                    ) {
                         log::error!("client callback poll failed for {name}: {e:?}");
                     }
                 }
+                drop(inner);
+                fire_pending(pending);
             });
         if let Err(e) = spawn_result {
             log::error!("Failed to spawn client callback poller thread: {e}");
@@ -471,12 +550,15 @@ impl IServiceManager for ServiceManager {
     /// callers that want it lives in
     /// [`getService2`](Self::getService2)/[`checkService2`](Self::checkService2).
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .try_get_binder(name, false)?
-            .map(|(b, _)| b))
+        let mut pending = Vec::new();
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .try_get_binder(name, false, &mut pending)?
+                .map(|(b, _)| b)
+        };
+        fire_pending(pending);
+        Ok(result)
     }
 
     fn addService(
@@ -490,23 +572,6 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
-        let mut inner = self.inner.lock().unwrap();
-
-        // Only if the service is a proxy, link to death.
-        // Because the native service does not support death notification.
-        if service.as_proxy().is_some() {
-            service.link_to_death(Arc::downgrade(
-                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-            ))?;
-        }
-
-        let mut prev_clients = false;
-        {
-            if let Some(service) = inner.name_to_service.get(name) {
-                prev_clients = service.has_clients;
-            }
-        }
-
         // Detect `IAccessor` binders by interface descriptor at registration.
         // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
         // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
@@ -518,39 +583,73 @@ impl IServiceManager for ServiceManager {
         // sandbox UID range to gate on.
         let _ = allowIsolated;
 
-        inner.add_service(
-            name,
-            Service {
-                binder: service.clone(),
-                dump_priority: dumpPriority,
-                has_clients: prev_clients,
-                guarantee_client: false,
-                context: rsbinder::thread_state::CallingContext::default(),
-                is_accessor,
-            },
-        )?;
+        // `client_pending` errors are swallowed (prior `onClients` path),
+        // `reg_pending` errors are propagated (prior `onRegistration` used `?`).
+        let mut client_pending = Vec::new();
+        let mut reg_pending = Vec::new();
+        let result: rsbinder::status::Result<()> = (|| {
+            let mut inner = self.inner.lock().unwrap();
 
-        if inner.name_to_registration_callbacks.contains_key(name) {
-            if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarantee_client = true;
+            // Only if the service is a proxy, link to death.
+            // Because the native service does not support death notification.
+            if service.as_proxy().is_some() {
+                service.link_to_death(Arc::downgrade(
+                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+                ))?;
             }
 
-            inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
-
-            if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarantee_client = true;
+            let mut prev_clients = false;
+            if let Some(service) = inner.name_to_service.get(name) {
+                prev_clients = service.has_clients;
             }
 
-            let callbacks = inner
-                .name_to_registration_callbacks
-                .get(name)
-                .expect("name_to_registration_callbacks must have key");
-            for callback in callbacks {
-                callback.onRegistration(name, service)?;
-            }
-        }
+            inner.add_service(
+                name,
+                Service {
+                    binder: service.clone(),
+                    dump_priority: dumpPriority,
+                    has_clients: prev_clients,
+                    guarantee_client: false,
+                    context: rsbinder::thread_state::CallingContext::default(),
+                    is_accessor,
+                },
+            )?;
 
-        Ok(())
+            if inner.name_to_registration_callbacks.contains_key(name) {
+                if let Some(service) = inner.name_to_service.get_mut(name) {
+                    service.guarantee_client = true;
+                }
+
+                inner.handle_service_client_callback(
+                    Inner::KNOWN_CLIENTS_ON_DEMAND,
+                    name,
+                    false,
+                    &mut client_pending,
+                )?;
+
+                if let Some(service) = inner.name_to_service.get_mut(name) {
+                    service.guarantee_client = true;
+                }
+
+                let callbacks = inner
+                    .name_to_registration_callbacks
+                    .get(name)
+                    .expect("name_to_registration_callbacks must have key");
+                for callback in callbacks {
+                    reg_pending.push(PendingCallback::Registration {
+                        callback: callback.clone(),
+                        name: name.to_owned(),
+                        binder: service.clone(),
+                    });
+                }
+            }
+
+            Ok(())
+        })();
+
+        result?;
+        fire_pending(client_pending);
+        fire_pending_propagate(reg_pending)
     }
 
     /// Linux note: identical to [`getService`](Self::getService) —
@@ -558,12 +657,15 @@ impl IServiceManager for ServiceManager {
     /// (no lazy-service infrastructure). See `getService`'s rustdoc for
     /// the rationale.
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .try_get_binder(name, false)?
-            .map(|(b, _)| b))
+        let mut pending = Vec::new();
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .try_get_binder(name, false, &mut pending)?
+                .map(|(b, _)| b)
+        };
+        fire_pending(pending);
+        Ok(result)
     }
 
     fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
@@ -591,25 +693,29 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut pending = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
 
-        arg_callback.as_binder().link_to_death(Arc::downgrade(
-            &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-        ))?;
+            arg_callback.as_binder().link_to_death(Arc::downgrade(
+                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+            ))?;
 
-        inner
-            .name_to_registration_callbacks
-            .entry(name.to_string())
-            .or_default()
-            .push(arg_callback.clone());
+            inner
+                .name_to_registration_callbacks
+                .entry(name.to_string())
+                .or_default()
+                .push(arg_callback.clone());
 
-        if let Some(service) = inner.name_to_service.get(name) {
-            arg_callback
-                .onRegistration(name, &service.binder)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to notify client callback: {e:?}");
+            if let Some(service) = inner.name_to_service.get(name) {
+                pending.push(PendingCallback::Registration {
+                    callback: arg_callback.clone(),
+                    name: name.to_owned(),
+                    binder: service.binder.clone(),
                 });
+            }
         }
+        fire_pending(pending);
 
         Ok(())
     }
@@ -690,51 +796,63 @@ impl IServiceManager for ServiceManager {
             dyn hub::android_16::android::os::IClientCallback::IClientCallback,
         >,
     ) -> rsbinder::status::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut pending = Vec::new();
+        let result: rsbinder::status::Result<()> = (|| {
+            let mut inner = self.inner.lock().unwrap();
 
-        let service = if let Some(service) = inner.name_to_service.get(name) {
-            service
-        } else {
-            let msg = format!("registerClientCallback could not find service {name}");
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
-        };
+            let service = if let Some(service) = inner.name_to_service.get(name) {
+                service
+            } else {
+                let msg = format!("registerClientCallback could not find service {name}");
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+            };
 
-        if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
-            let msg = format!(
-                "{:?} Only a server can register for client callbacks (for {})",
-                service.context, name
-            );
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::Security, msg.as_str()).into());
-        }
+            if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
+                let msg = format!(
+                    "{:?} Only a server can register for client callbacks (for {})",
+                    service.context, name
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::Security, msg.as_str()).into());
+            }
 
-        if service.binder != *arg_service {
-            let msg = format!("registerClientCallback called with wrong service {name}");
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
-        }
+            if service.binder != *arg_service {
+                let msg = format!("registerClientCallback called with wrong service {name}");
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+            }
 
-        arg_callback.as_binder().link_to_death(Arc::downgrade(
-            &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-        ))?;
+            arg_callback.as_binder().link_to_death(Arc::downgrade(
+                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+            ))?;
 
-        if service.has_clients {
-            arg_callback
-                .onClients(&service.binder, true)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to notify client callback: {e:?}");
+            if service.has_clients {
+                pending.push(PendingCallback::Clients {
+                    callback: arg_callback.clone(),
+                    binder: service.binder.clone(),
+                    has_clients: true,
                 });
-        }
+            }
 
-        inner
-            .name_to_client_callbacks
-            .entry(name.to_string())
-            .or_default()
-            .push(arg_callback.clone());
+            inner
+                .name_to_client_callbacks
+                .entry(name.to_string())
+                .or_default()
+                .push(arg_callback.clone());
 
-        inner.handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)?;
+            inner.handle_service_client_callback(
+                Inner::KNOWN_CLIENTS_ON_DEMAND,
+                name,
+                false,
+                &mut pending,
+            )?;
 
+            Ok(())
+        })();
+
+        result?;
+        fire_pending(pending);
         Ok(())
     }
 
@@ -745,66 +863,77 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<()> {
         let context = rsbinder::thread_state::CallingContext::default();
 
-        let mut inner = self.inner.lock().unwrap();
-        let service = if let Some(service) = inner.name_to_service.get(name) {
-            service
-        } else {
-            let msg = format!(
-                "{context:?} Tried to unregister {name}, but that service wasn't registered to begin with."
-            );
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
-        };
+        let mut pending = Vec::new();
+        let result: rsbinder::status::Result<()> = (|| {
+            let mut inner = self.inner.lock().unwrap();
+            let service = if let Some(service) = inner.name_to_service.get(name) {
+                service
+            } else {
+                let msg = format!(
+                    "{context:?} Tried to unregister {name}, but that service wasn't registered to begin with."
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+            };
 
-        if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
-            let msg = format!(
-                "{:?} Only a server can register for client callbacks (for {})",
-                service.context, name
-            );
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::Security, msg.as_str()).into());
-        }
-
-        if service.binder != *arg_service {
-            let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
-        }
-
-        if service.guarantee_client {
-            let msg = format!(
-                "{context:?} Tried to unregister {name}, but there is about to be a client."
-            );
-            log::warn!("{}", &msg);
-            return Err((ExceptionCode::IllegalState, msg.as_str()).into());
-        }
-
-        // AOSP `ServiceManager.cpp:1111` checks the *return value*
-        // (`bool` → "this service has clients, refuse to unregister").
-        // The earlier port checked `res.is_err()` instead — but
-        // `handle_service_client_callback` never returns `Err` in
-        // current rsbinder (all "can't determine" paths fall back to
-        // `Ok(true)`), so the refusal branch was dead and every
-        // unregister request silently succeeded even with live clients.
-        // `unwrap_or(true)` is defensive — if a future change makes
-        // `Err` reachable, we conservatively treat it as "clients
-        // present" (matches AOSP `ServiceManager.cpp:1001` `if (count
-        // == -1) return true;`).
-        let has_clients = inner
-            .handle_service_client_callback(Inner::KNOWN_CLIENTS_ON_DEMAND, name, false)
-            .unwrap_or(true);
-        if has_clients {
-            let msg = format!("{context:?} Tried to unregister {name}, but there are clients.");
-            log::warn!("{}", &msg);
-            if let Some(service) = inner.name_to_service.get_mut(name) {
-                service.guarantee_client = true;
+            if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
+                let msg = format!(
+                    "{:?} Only a server can register for client callbacks (for {})",
+                    service.context, name
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::Security, msg.as_str()).into());
             }
-            return Err((ExceptionCode::IllegalState, msg.as_str()).into());
-        }
 
-        inner.name_to_service.remove(name);
+            if service.binder != *arg_service {
+                let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+            }
 
-        Ok(())
+            if service.guarantee_client {
+                let msg = format!(
+                    "{context:?} Tried to unregister {name}, but there is about to be a client."
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
+            }
+
+            // AOSP `ServiceManager.cpp:1111` checks the *return value*
+            // (`bool` → "this service has clients, refuse to unregister").
+            // The earlier port checked `res.is_err()` instead — but
+            // `handle_service_client_callback` never returns `Err` in
+            // current rsbinder (all "can't determine" paths fall back to
+            // `Ok(true)`), so the refusal branch was dead and every
+            // unregister request silently succeeded even with live clients.
+            // `unwrap_or(true)` is defensive — if a future change makes
+            // `Err` reachable, we conservatively treat it as "clients
+            // present" (matches AOSP `ServiceManager.cpp:1001` `if (count
+            // == -1) return true;`).
+            let has_clients = inner
+                .handle_service_client_callback(
+                    Inner::KNOWN_CLIENTS_ON_DEMAND,
+                    name,
+                    false,
+                    &mut pending,
+                )
+                .unwrap_or(true);
+            if has_clients {
+                let msg = format!("{context:?} Tried to unregister {name}, but there are clients.");
+                log::warn!("{}", &msg);
+                if let Some(service) = inner.name_to_service.get_mut(name) {
+                    service.guarantee_client = true;
+                }
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
+            }
+
+            inner.name_to_service.remove(name);
+
+            Ok(())
+        })();
+
+        fire_pending(pending);
+        result
     }
 
     fn getServiceDebugInfo(
@@ -835,7 +964,12 @@ impl IServiceManager for ServiceManager {
         // Routing logic lives in `classify_for_service_union` so
         // `checkService2` stays byte-identical without re-stating the
         // match arms.
-        let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
+        let mut pending = Vec::new();
+        let lookup = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.try_get_binder(name, false, &mut pending)?
+        };
+        fire_pending(pending);
         Ok(classify_for_service_union(lookup))
     }
 
@@ -845,7 +979,12 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
         // See `getService2` — both route through
         // `classify_for_service_union`.
-        let lookup = self.inner.lock().unwrap().try_get_binder(name, false)?;
+        let mut pending = Vec::new();
+        let lookup = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.try_get_binder(name, false, &mut pending)?
+        };
+        fire_pending(pending);
         Ok(classify_for_service_union(lookup))
     }
 

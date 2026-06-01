@@ -198,6 +198,13 @@ impl RawAccepted {
 const DIRECTORY_DESC: &str = "rsbinder.rpc.IServiceDirectory";
 const TX_GET_SERVICE: TransactionCode = crate::binder::FIRST_CALL_TRANSACTION;
 
+/// Default handshake/admission read deadline (see
+/// [`RpcServer::set_handshake_timeout`]). Bounds only the pre-serve
+/// phase; a connected peer that never sends its handshake is dropped
+/// after this so it cannot hold a `max_connections` slot (or pin the
+/// server's `Arc`) forever.
+const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Built-in name → binder directory, used to back [`RpcServer::add_service`]
 /// (android RPC has a single root object; this *is* that root when
 /// named services are registered). Reused, unmodified, via the same
@@ -303,6 +310,16 @@ pub struct RpcServer {
     /// and does **not** reduce workers below the connection count
     /// (that would require I/O multiplexing — explicitly out of scope).
     max_connections: Mutex<Option<usize>>,
+    /// Handshake/admission read deadline applied to each accepted
+    /// connection *before* it enters the blocking serve loop.
+    /// `Some(d)` (the default — see [`DEFAULT_HANDSHAKE_TIMEOUT`]) ⇒ a
+    /// connected-but-silent peer that never sends its handshake surfaces
+    /// as a worker-loop error after `d`, releasing both its
+    /// `Arc<RpcServer>` and its `max_connections` admission slot. `None`
+    /// ⇒ no deadline (a hung peer can hold a slot indefinitely). The
+    /// deadline is cleared once serving begins, so an established
+    /// two-way session may idle between requests unbounded.
+    handshake_timeout: Mutex<Option<std::time::Duration>>,
     /// Opt-in authorization hook. `None`
     /// (default) ⇒ accept-all = byte-for-byte a server without the hook
     /// (additive invariant). When set, it runs at
@@ -446,6 +463,7 @@ impl RpcServer {
             fd_unix_supported: AtomicBool::new(false),
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
+            handshake_timeout: Mutex::new(Some(DEFAULT_HANDSHAKE_TIMEOUT)),
             authorizer: Mutex::new(None),
             attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
@@ -589,11 +607,41 @@ impl RpcServer {
     /// AOSP `RpcServer`'s bounded server limits, **not** a wire/semantic
     /// port. It does not (and structurally cannot, without I/O
     /// multiplexing) make workers fewer than connections.
+    ///
+    /// **Slot exhaustion**: each worker holds its admission slot until it
+    /// exits, so a connected-but-silent peer would pin a slot forever
+    /// without a read deadline. The default
+    /// [`set_handshake_timeout`](RpcServer::set_handshake_timeout) guards
+    /// against this; do not set it to `None` together with a small `n`
+    /// unless the peer set is trusted.
     pub fn set_max_connections(&self, n: usize) {
         *self
             .max_connections
             .lock()
             .expect("max_connections poisoned") = Some(n.max(1));
+    }
+
+    /// Set (or disable) the **handshake/admission read deadline** applied
+    /// to each accepted connection before it enters the blocking serve
+    /// loop. Default [`DEFAULT_HANDSHAKE_TIMEOUT`] (10s). `Some(d)` ⇒ a
+    /// connected-but-silent peer that never sends its handshake is
+    /// dropped after `d`, releasing both its `Arc<RpcServer>` (so the
+    /// server's `Drop` cleanup can run) and its
+    /// [`set_max_connections`](RpcServer::set_max_connections) admission
+    /// slot — without it, a few idle peers can exhaust the cap and wedge
+    /// the accept loop. `None` disables the deadline (a hung peer may
+    /// then hold a slot indefinitely).
+    ///
+    /// The deadline bounds **only** the pre-serve handshake/first-contact
+    /// phase; it is cleared once serving begins, so an established
+    /// two-way session may sit idle between requests unbounded (the
+    /// per-call reply deadline is managed separately via
+    /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
+    pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) {
+        *self
+            .handshake_timeout
+            .lock()
+            .expect("handshake_timeout poisoned") = timeout;
     }
 
     /// Reap finished worker handles and return the live (concurrent)
@@ -899,6 +947,15 @@ impl RpcServer {
         raw.into_transport()
     }
 
+    /// Lift the admission read deadline (best-effort) once a connection
+    /// reaches the serving phase, so an established two-way session may
+    /// idle between requests unbounded.
+    fn clear_handshake_timeout(transport: &dyn RpcTransport) {
+        if let Err(e) = transport.set_read_timeout(None) {
+            log::debug!("RPC: failed to clear handshake read timeout: {e:?}");
+        }
+    }
+
     /// Runs **inside** the worker thread after the transport has been
     /// wrapped (native or TLS). Performs authorization, then dispatches
     /// to the r34 / android-13+ branch and serves the session inline
@@ -923,6 +980,20 @@ impl RpcServer {
             if !authz(&peer) {
                 log::warn!("RPC connection rejected by authorizer: peer {peer:?}");
                 return;
+            }
+        }
+        // Bound the pre-serve handshake/first-contact phase so a
+        // connected-but-silent peer can't pin its `Arc<RpcServer>` +
+        // admission slot forever. Cleared by `clear_handshake_timeout`
+        // before any long-lived serve so an established session idles
+        // unbounded. Best-effort: a set failure just means no deadline.
+        if let Some(d) = *server
+            .handshake_timeout
+            .lock()
+            .expect("handshake_timeout poisoned")
+        {
+            if let Err(e) = transport.set_read_timeout(Some(d)) {
+                log::debug!("RPC: failed to arm handshake read timeout: {e:?}");
             }
         }
         let a13_max = *server
@@ -955,6 +1026,9 @@ impl RpcServer {
                             return;
                         }
                     };
+                // Handshake done: lift the admission deadline so the
+                // serve loop / pooled callback slot is not bounded by it.
+                Self::clear_handshake_timeout(transport.as_ref());
                 if incoming {
                     // Attach + incoming (`server_accept` already
                     // rejected new + incoming): resolve the session,
@@ -1126,6 +1200,11 @@ impl RpcServer {
                 // r34 (default): build session (incl. its handshake-
                 // free first-contact shape) + serve inline. We're
                 // already on the worker thread — no nested spawn.
+                // r34 has no separate handshake (first contact is the
+                // first serve-loop frame); lift the admission deadline
+                // before serving so an established idle session is not
+                // torn down by it.
+                Self::clear_handshake_timeout(transport.as_ref());
                 let session = match server.make_session(transport) {
                     Ok(s) => s,
                     Err(e) => {

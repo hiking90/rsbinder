@@ -431,7 +431,7 @@ pub mod {{mod}} {
             };
             let binder = self.binder.clone();
             P::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
+                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
                     self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
@@ -1214,7 +1214,16 @@ pub mod {mod} {{
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
             {
-                members.push((enumerator.identifier.to_owned(), expr.to_i64().unwrap_or(0)));
+                let value = expr.to_i64().map_err(|e| {
+                    parser::make_invalid_operation_error(
+                        format!(
+                            "enum '{}' member '{}' has a non-integral discriminant: {e}",
+                            decl.name, enumerator.identifier
+                        ),
+                        decl.name_span,
+                    )
+                })?;
+                members.push((enumerator.identifier.to_owned(), value));
             }
         }
 

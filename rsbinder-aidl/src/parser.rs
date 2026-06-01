@@ -415,20 +415,31 @@ pub(crate) fn enum_member_const_expr_from_lookup(
 
     // Resolve inside the enum declaration, not through a global member name.
     for enumerator in &enum_decl.enumerator_list {
+        // A genuinely non-integral explicit value (String/Array — not an
+        // unresolved Name) must not be swallowed into the auto-increment
+        // counter: that would fabricate a wrong, silently-zeroed wire
+        // discriminant. Carry the raw value out so `decl_enum`'s `to_i64()`
+        // guard surfaces the diagnostic.
+        let mut non_integral: Option<ConstExpr> = None;
         if let Some(const_expr) = &enumerator.const_expr {
             if let Ok(calculated) = const_expr.calculate() {
                 if !matches!(calculated.value, ValueType::Name(_)) {
-                    enum_val = calculated.to_i64().unwrap_or(enum_val);
+                    match calculated.to_i64() {
+                        Ok(v) => enum_val = v,
+                        Err(_) => non_integral = Some(calculated),
+                    }
                 }
             }
         }
 
         if enumerator.identifier == member_name {
-            result = Some(ConstExpr::new(ValueType::Reference {
-                enum_type: enum_type.clone(),
-                enum_name: enum_decl.name.clone(),
-                member_name: member_name.to_string(),
-                value: enum_val,
+            result = Some(non_integral.unwrap_or_else(|| {
+                ConstExpr::new(ValueType::Reference {
+                    enum_type: enum_type.clone(),
+                    enum_name: enum_decl.name.clone(),
+                    member_name: member_name.to_string(),
+                    value: enum_val,
+                })
             }));
             break;
         }
@@ -1104,7 +1115,10 @@ fn make_invalid_backing_type_error(type_name: String, span: Option<(usize, usize
 }
 
 /// Builds an `InvalidOperation` diagnostic from the active source context.
-fn make_invalid_operation_error(message: String, span: Option<(usize, usize)>) -> AidlError {
+pub(crate) fn make_invalid_operation_error(
+    message: String,
+    span: Option<(usize, usize)>,
+) -> AidlError {
     let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
     let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
     let (start, end) = span.unwrap_or((0, 0));

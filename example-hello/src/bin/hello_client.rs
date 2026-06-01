@@ -4,20 +4,9 @@
 
 use env_logger::Env;
 use example_hello::*;
-use hub::{BnServiceCallback, IServiceCallback};
 use rsbinder::*;
 use std::sync::Arc;
-
-struct MyServiceCallback {}
-
-impl Interface for MyServiceCallback {}
-
-impl IServiceCallback for MyServiceCallback {
-    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::status::Result<()> {
-        println!("MyServiceCallback: {name}");
-        Ok(())
-    }
-}
+use std::time::Duration;
 
 struct MyDeathRecipient {}
 
@@ -39,12 +28,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("{name}");
     }
 
-    let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
-    hub::register_for_notifications(SERVICE_NAME, &service_callback)?;
-
-    // Create a Hello proxy from binder service manager.
-    let hello: rsbinder::Strong<dyn IHello> =
-        hub::get_interface(SERVICE_NAME).unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
+    // Create a Hello proxy from the binder service manager. If this client
+    // starts before the service has finished registering, the lookup fails, so
+    // retry a few times before giving up and surfacing the real Status error.
+    let hello: rsbinder::Strong<dyn IHello> = {
+        const RETRIES: u32 = 5;
+        let mut attempt = 0;
+        loop {
+            match hub::get_interface(SERVICE_NAME) {
+                Ok(hello) => break hello,
+                Err(e) if attempt < RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                    println!("Waiting for {SERVICE_NAME}... (retry {attempt}/{RETRIES}): {e}");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
 
     let recipient = Arc::new(MyDeathRecipient {});
     hello
