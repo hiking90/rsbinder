@@ -2352,22 +2352,47 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
     }
 }
 
-/// `WIBinder::upgrade()` for proxies must succeed across user-side
-/// `drop(strong)` as long as the cache entry (and therefore the
-/// kernel `binder_ref` slot's `BC_INCREFS` pin) is alive — matching
-/// Android `wp<BpBinder>::promote()` semantics.
+/// `WIBinder::upgrade()` for proxies is genuinely weak, matching
+/// Android `wp<BpBinder>::promote()`: once every user-side `Strong`
+/// is dropped — sending `BC_RELEASE` and driving the kernel strong
+/// count to 0 — `upgrade()` returns `Err(DeadObject)`.
 ///
-/// Pre-PR `WIBinder::upgrade()` succeeded *unconditionally* because
-/// `WIBinder` held a strong Arc in disguise. The cache-pin refactor
-/// initially made it `sync::Weak::upgrade` only, which returned
-/// `DeadObject` once every user-side `Strong` was dropped — too
-/// strict, because the cache pin had already structurally guaranteed
-/// the kernel slot stayed alive. This test verifies the corrected
-/// semantics: `upgrade()` routes through the proxy cache and yields
-/// a freshly resurrected `Arc<ProxyHandle>` (different allocation,
-/// same kernel binder_node).
+/// `BpBinder` is `OBJECT_LIFETIME_WEAK`, so a weak→strong promote at
+/// strong == 0 routes through `IPCThreadState::attemptIncStrongHandle`,
+/// which returns `INVALID_OPERATION` and refuses the promote
+/// (RefBase.cpp:627-703, BpBinder.cpp:267). AOSP never revives a
+/// strong ref from weak-only on a binder handle.
+///
+/// rsbinder previously tried to "resurrect" the proxy by re-issuing
+/// `BC_ACQUIRE` (strong 0→1) on the cache-pinned handle and then
+/// transacting. That was a bug: empirically the kernel rejects the
+/// transaction on a ref that went through strong == 0 with
+/// `BR_FAILED_REPLY` (confirmed on the emulator — see the trace
+/// `inc_strong → dec_strong → inc_strong → BR_FAILED_REPLY`). The
+/// `BC_INCREFS` cache pin keeps the `binder_ref` slot from being
+/// freed, but does NOT make a strong-0 ref transactable again.
+///
+/// The correct recovery, exercised below, is to re-resolve the
+/// service by name through the service manager (a fresh wire delivery
+/// of the handle that re-establishes a transactable kernel strong
+/// ref).
+///
+/// Marked `#[ignore]` because it asserts the test is the *sole* strong
+/// holder of the shared `test_service` handle: it drops its `Strong`
+/// and requires the kernel strong count to reach 0. Run in parallel
+/// with the rest of the suite, a concurrent test holding its own
+/// `Strong` on the same handle keeps the kernel strong count > 0, so
+/// the weak `upgrade()` fast path legitimately succeeds (a live
+/// `Arc<ProxyHandle>` exists). Run explicitly with a fresh service:
+///
+/// ```text
+/// cargo test --package tests \
+///   test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works \
+///   -- --ignored
+/// ```
 #[test]
-fn test_weak_upgrade_resurrects_proxy_after_strong_drop() {
+#[ignore]
+fn test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works() {
     init_test();
 
     let canonical = <BpTestService as ITestService::ITestService>::descriptor().to_string();
@@ -2375,27 +2400,33 @@ fn test_weak_upgrade_resurrects_proxy_after_strong_drop() {
     let weak: WIBinder = SIBinder::downgrade(&svc.as_binder());
     drop(svc);
 
-    // After `drop(svc)` the only `Arc<ProxyHandle>` is gone, but the
-    // cache entry is still there with its BC_INCREFS pin keeping
-    // `binder_ref(handle).weak >= 1`. `upgrade()` must succeed via
-    // case-(b) resurrection.
-    let resurrected = weak
-        .upgrade()
-        .expect("weak.upgrade must succeed while cache entry alive");
+    // After `drop(svc)` the only `Arc<ProxyHandle>` is gone (its
+    // `BC_RELEASE` drove the kernel strong count to 0). `upgrade()`
+    // is purely weak — it must report `DeadObject`, never silently
+    // resurrect an untransactable ref.
+    match weak.upgrade() {
+        Err(rsbinder::StatusCode::DeadObject) => {}
+        Err(other) => panic!("expected DeadObject after sole Strong drop, got {other:?}"),
+        Ok(_) => panic!(
+            "regression: WIBinder::upgrade resurrected a strong-0 proxy \
+             (the kernel rejects transactions on such a ref with BR_FAILED_REPLY)"
+        ),
+    }
 
-    // Descriptor preserved across resurrection (cached, no new
-    // INTERFACE_TRANSACTION).
+    // AOSP-faithful recovery: re-resolve by name. A fresh
+    // `checkService`/`getService` delivers the handle anew and gives
+    // the new proxy a transactable kernel strong ref.
+    let resolved: rsbinder::Strong<dyn ITestService::ITestService> =
+        hub::get_interface(&canonical).expect("re-resolve by name must succeed");
     assert_eq!(
-        resurrected.descriptor(),
+        resolved.as_binder().descriptor(),
         canonical,
-        "resurrected proxy must carry the original descriptor"
+        "re-resolved proxy must carry the original descriptor"
     );
-
-    // Transaction succeeds, proving the resurrected proxy refers to
-    // the same kernel binder_node.
-    resurrected
+    resolved
+        .as_binder()
         .ping_binder()
-        .expect("ping after resurrection must succeed");
+        .expect("ping on a freshly re-resolved proxy must succeed");
 }
 
 /// Two `WIBinder` clones for the same underlying handle compare

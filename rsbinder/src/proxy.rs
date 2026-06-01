@@ -398,9 +398,12 @@ impl Drop for ProxyHandle {
     fn drop(&mut self) {
         // The cache pin's BC_INCREFS keeps `binder_ref(handle).weak >= 1`,
         // so this BC_RELEASE is safe regardless of concurrent lookups: the
-        // kernel slot is alive on entry, and a future lookup that arrives
-        // after the strong count returns to 0 will resurrect a fresh
-        // `Arc<ProxyHandle>` via slow-path case (b).
+        // kernel slot is alive on entry. A future lookup that arrives after
+        // the strong count returns to 0 re-acquires a transactable strong
+        // ref only when a fresh wire delivery (e.g. servicemanager
+        // checkService) re-establishes kernel strong via slow-path case (b);
+        // a purely in-process `WIBinder::upgrade()` does not (it is weak and
+        // returns DeadObject once strong hits 0 — see `WIBinder::upgrade`).
         if let Err(err) = thread_state::dec_strong_handle(self.handle) {
             log::error!(
                 "BC_RELEASE for handle {} failed during Drop: {err:?}",
