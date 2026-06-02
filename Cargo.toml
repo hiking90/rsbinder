@@ -44,7 +44,7 @@ downcast-rs = "2.0"
 rustix = "1.1"
 libc = "0.2"
 clap = "4.6"
-rsproperties = "0.3"
+rsproperties = "0.4"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2"
 # dev-only: serializes the handful of rsbinder unit tests that share the
