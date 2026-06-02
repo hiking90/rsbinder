@@ -36,6 +36,7 @@ use std::time::Instant;
 use example_hello::*;
 use rsbinder::hub::android_16::android::os::IClientCallback::{BnClientCallback, IClientCallback};
 use rsbinder::hub::android_16::IServiceManager;
+use rsbinder::service::{kernel, Registry as _};
 use rsbinder::*;
 
 struct IHelloService;
@@ -61,12 +62,16 @@ impl IClientCallback for MyClientCallback {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    ProcessState::init_default()?;
+    // Init + register via the facade. The thread pool is started
+    // explicitly (not via `Host::serve()`) because this demo must run the
+    // kernel-only `registerClientCallback` extra *before* it blocks on
+    // `join_thread_pool()`.
+    let host = kernel::Host::new()?;
     ProcessState::start_thread_pool();
 
     let service = BnHello::new_binder(IHelloService {});
     let service_binder = service.as_binder();
-    hub::add_service(SERVICE_NAME, service_binder.clone())?;
+    host.add_service(SERVICE_NAME, service_binder.clone())?;
     println!("Registered service: {SERVICE_NAME}");
 
     let start = Instant::now();

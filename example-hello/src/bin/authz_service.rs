@@ -34,7 +34,8 @@
 
 use env_logger::Env;
 use example_hello::authz::*;
-use rsbinder::rpc::{PeerIdentity, RpcServer};
+use rsbinder::rpc::PeerIdentity;
+use rsbinder::service::{rpc, Registry as _};
 use rsbinder::{Caller, ExceptionCode, Interface, Status};
 
 struct AuthzService;
@@ -77,13 +78,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // The same `AuthzService` impl would also work over kernel binder
-    // (`ProcessState` + `hub::add_service`); served here over RPC so the
+    // (`kernel::Host` + `add_service`); served here over RPC so the
     // transport-aware authorization is demonstrable without `/dev/binder`.
     let _ = std::fs::remove_file(RPC_SOCKET);
-    let server = RpcServer::setup_unix_server(RPC_SOCKET)?;
-    server.set_root(BnAuthz::new_binder(AuthzService).as_binder());
+    let host = rpc::Host::unix(RPC_SOCKET)?;
+    host.add_service(SERVICE_NAME, BnAuthz::new_binder(AuthzService).as_binder())?;
 
     println!("authz_service listening on {RPC_SOCKET}");
-    server.run()?;
+    host.serve()?;
     Ok(())
 }

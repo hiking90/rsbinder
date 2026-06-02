@@ -16,6 +16,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use rsbinder::service::{kernel, Broker as _};
 use rsbinder::*;
 
 use example_hello::update_txn::{IUpdateTxnDedup, ONRECORD_CODE, SERVICE_NAME};
@@ -133,15 +134,22 @@ fn extended_error_round() -> std::result::Result<(), String> {
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    if let Err(e) = ProcessState::init_default() {
-        eprintln!("init_default failed: {e}");
-        return ExitCode::from(2);
-    }
+    let broker = match kernel::Broker::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("kernel::Broker init failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
-    let binder = match hub::get_service(SERVICE_NAME) {
-        Some(b) => b,
-        None => {
-            eprintln!("get_service({SERVICE_NAME}) returned None");
+    // This client needs the raw `SIBinder` (to hand-build oneway parcels
+    // with `FLAG_UPDATE_TXN`, which the generated `Bp*` stub cannot
+    // express) *and* the typed proxy, so use `Broker::lookup` + an
+    // explicit cast rather than `get_interface`.
+    let binder = match broker.lookup(SERVICE_NAME) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("lookup({SERVICE_NAME}) failed: {e:?}");
             return ExitCode::from(3);
         }
     };

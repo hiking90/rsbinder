@@ -15,6 +15,7 @@
 
 use std::process::ExitCode;
 
+use rsbinder::service::{kernel, Broker as _};
 use rsbinder::*;
 
 use example_hello::calling_identity::{ICallingIdentity, SERVICE_NAME};
@@ -25,11 +26,15 @@ use example_hello::calling_identity::{ICallingIdentity, SERVICE_NAME};
 /// before/after-clear/after-restore triple matched `false / true /
 /// false`.
 fn describe_caller_round_trip() -> Result<()> {
-    let binder = hub::get_service(SERVICE_NAME).ok_or(StatusCode::NameNotFound)?;
-    let svc = <dyn ICallingIdentity>::try_from(binder).map_err(|e| {
-        eprintln!("interface_cast failed: {e:?}");
-        StatusCode::BadType
-    })?;
+    // `kernel::Broker::new()` is idempotent — `ProcessState` is already
+    // initialized in `main`. `get_interface` does lookup + cast.
+    let broker = kernel::Broker::new()?;
+    let svc = broker
+        .get_interface::<dyn ICallingIdentity>(SERVICE_NAME)
+        .map_err(|e| {
+            eprintln!("interface_cast/lookup failed: {e:?}");
+            StatusCode::BadType
+        })?;
 
     let line = svc.describeCaller().map_err(|status| {
         eprintln!("describeCaller failed: {status:?}");
