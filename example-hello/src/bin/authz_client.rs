@@ -14,14 +14,15 @@
 
 use env_logger::Env;
 use example_hello::authz::*;
-use rsbinder::rpc::RpcSession;
-use rsbinder::{FromIBinder, Strong};
+use rsbinder::service::{rpc, Broker as _};
+use rsbinder::Strong;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    let session = RpcSession::setup_unix_client(RPC_SOCKET)?;
-    let authz: Strong<dyn IAuthz> = FromIBinder::try_from(session.get_root()?)?;
+    // `rpc::Broker` owns the `RpcSession`; keep it alive for the calls.
+    let broker = rpc::Broker::unix(RPC_SOCKET)?;
+    let authz: Strong<dyn IAuthz> = broker.get_interface(SERVICE_NAME)?;
 
     // Allowed: an identifiable Unix-RPC peer (this process).
     match authz.whoami() {

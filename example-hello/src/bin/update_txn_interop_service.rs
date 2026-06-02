@@ -13,6 +13,7 @@
 
 use std::sync::Mutex;
 
+use rsbinder::service::{kernel, Registry as _};
 use rsbinder::*;
 
 use example_hello::update_txn::{BnUpdateTxnDedup, IUpdateTxnDedup, SERVICE_NAME};
@@ -54,15 +55,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // then becomes the sole consumer once it enters
     // `join_thread_pool()`.
     eprintln!("STAGE3 4-4 server: init ProcessState (max_threads=1, single worker)");
-    ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 1)?;
+    let host = kernel::Host::builder()
+        .driver(rsbinder::DEFAULT_BINDER_PATH)
+        .max_threads(1)
+        .build()?;
 
     let service = BnUpdateTxnDedup::new_binder(Recorder {
         recorded: Mutex::new(Vec::new()),
     });
 
     eprintln!("STAGE3 4-4 server: register `{SERVICE_NAME}`");
-    hub::add_service(SERVICE_NAME, service.as_binder())?;
+    host.add_service(SERVICE_NAME, service.as_binder())?;
 
+    // NOTE: kept low-level on purpose — the facade's `Host::serve()`
+    // calls `start_thread_pool()`, but this dedup test must NOT pre-spawn
+    // a looper. With `max_threads=1` and no `start_thread_pool()`, the
+    // main thread becomes the sole consumer once it enters
+    // `join_thread_pool()`, which is exactly the single-worker window in
+    // which `TF_UPDATE_TXN` collapses queued duplicates.
     eprintln!("STAGE3 4-4 server: join thread pool");
     Ok(ProcessState::join_thread_pool()?)
 }

@@ -218,6 +218,36 @@ jobs:
             --skip test_vintf_parcelable_holder_cannot_contain_not_vintf_parcelable \
             --skip test_versioned_unknown_union_field_triggers_error
 
+      - name: Run mesh integration tests (kernel binder + RPC mixed mesh)
+        run: |
+          # One AIDL served over BOTH kernel binder and RPC, exercised by
+          # a ~10-20 process mesh that hammers every peer for a fixed
+          # window and verifies every exchange round-tripped intact.
+          #
+          #  * mesh_rpc      — hermetic 10-process pure-RPC mesh (no kernel
+          #                    binder); always runnable.
+          #  * mesh_kernel   — #[ignore]'d 20-process mixed mesh: one kernel
+          #                    binder service + clients, several nodes also
+          #                    fronting RPC. Needs /dev/binder + a running
+          #                    rsb_hub (both already set up above). It spawns
+          #                    its own kernel-server/clients (independent of
+          #                    the shared test_service).
+          #
+          # Both require the `rpc` feature. A node that briefly can't reach
+          # an RPC peer under load counts it as peer_gone (not an error);
+          # the gate is errors==0 + integrity_fail==0 + the kernel service
+          # observing real inbound traffic.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test mesh_rpc || {
+            echo "::error::mesh_rpc (pure-RPC mesh) failed"
+            exit 1
+          }
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test mesh_kernel -- --ignored || {
+            echo "::error::mesh_kernel (kernel+RPC mixed mesh) failed"
+            sudo dmesg | tee artifacts/mesh-dmesg.log 2>/dev/null || true
+            cp -f rsb_hub.log artifacts/mesh-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live
@@ -643,6 +673,15 @@ jobs:
               exit 1
             fi
           done
+
+      - name: RPC mesh integration test (10-process hermetic mesh)
+        run: |
+          # Self-contained: the test spawns its own ~10 `mesh_node`
+          # processes wired into a full RPC unix-socket mesh and verifies
+          # every exchange round-tripped intact. No kernel binder, so it
+          # runs on macOS. (The kernel+RPC mixed mesh `mesh_kernel` is
+          # Linux/Android-only and runs in the linux-binder-test job.)
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test mesh_rpc -- --nocapture
 
       - name: Stop rpc_hello_service
         if: always()

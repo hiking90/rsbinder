@@ -14,11 +14,17 @@
 
 use env_logger::Env;
 use example_hello::*;
-use rsbinder::rpc::RpcServer;
+use rsbinder::service::{rpc, Registry as _};
 use rsbinder::*;
 
 /// Unix-domain socket the server binds and the client connects to.
 const RPC_SOCKET: &str = "/tmp/rsb_hello_rpc.sock";
+
+/// Name the service is published under on the RPC session's in-process
+/// directory; the client resolves the same name. The RPC facade uses the
+/// named-service model (`add_service`/`get_interface`), not the bare root
+/// object.
+const SERVICE_NAME: &str = "hello";
 
 struct IHelloService;
 
@@ -35,13 +41,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // No `ProcessState` / `hub`: RPC does not touch the kernel binder
-    // singleton. Bind a UDS, publish the generated `BnHello` as the
-    // session's root object, then serve until killed.
+    // singleton. The `rpc::Host` facade binds the UDS; `add_service`
+    // publishes the generated `BnHello` under a name, and `serve()`
+    // drives this one socket until killed.
     let _ = std::fs::remove_file(RPC_SOCKET);
-    let server = RpcServer::setup_unix_server(RPC_SOCKET)?;
-    server.set_root(BnHello::new_binder(IHelloService {}).as_binder());
+    let host = rpc::Host::unix(RPC_SOCKET)?;
+    host.add_service(
+        SERVICE_NAME,
+        BnHello::new_binder(IHelloService {}).as_binder(),
+    )?;
 
     println!("rpc_hello_service listening on {RPC_SOCKET}");
-    server.run()?;
+    host.serve()?;
     Ok(())
 }
