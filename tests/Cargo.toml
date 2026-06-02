@@ -23,5 +23,13 @@ rustix = { workspace = true, features = ["pipe"] }
 async-trait = { workspace = true }
 log.workspace = true
 
+# Mesh integration node: one binary, configured by argv into a kernel
+# and/or RPC role. Driven by `tests/mesh_rpc.rs` (+ `mesh_kernel.rs`).
+# Requires `rpc` because every node fronts at least one RPC endpoint.
+[[bin]]
+name = "mesh_node"
+path = "src/bin/mesh_node.rs"
+required-features = ["rpc"]
+
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

@@ -128,6 +128,21 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Mesh integration fixture (`mesh_node` bin + `tests/mesh_rpc.rs` /
+    // `tests/mesh_kernel.rs`). One AIDL package served over both kernel
+    // binder and RPC. Generation is transport-agnostic, so it is emitted
+    // unconditionally (the kernel-only `cargo test -p tests` build uses
+    // the same module for its kernel mesh node).
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/mesh/mesh/NodeKind.aidl"))
+        .source(PathBuf::from("aidl/mesh/mesh/MeshValue.aidl"))
+        .source(PathBuf::from("aidl/mesh/mesh/MeshMessage.aidl"))
+        .source(PathBuf::from("aidl/mesh/mesh/IMeshObserver.aidl"))
+        .source(PathBuf::from("aidl/mesh/mesh/IMeshNode.aidl"))
+        .output(PathBuf::from("mesh.rs"))
+        .generate()
+        .unwrap();
+
     // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen
