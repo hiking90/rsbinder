@@ -964,18 +964,16 @@ impl Parcel {
             return Err(StatusCode::NotEnoughData);
         }
 
-        let mut result = Vec::with_capacity(len as usize);
         let pos = self.pos;
-        // SAFETY: `parcel` storage is aligned to at least 4 bytes (binder
-        // ABI guarantee, see `Parcel::write_aligned`), and the
-        // `pos..pos + size` slice was just bounds-checked above. `i32`
-        // and `u8` have compatible bit patterns for the values written
-        // here. The `align_to` middle slice is therefore a valid view of
-        // the requested element count.
-        let (_, ints, _) = unsafe { self.data.as_slice()[pos..pos + size].align_to::<i32>() };
-        for i in ints {
-            result.push(D::from(i));
-        }
+        // The parcel's `Vec<u8>` has only 1-byte base alignment, so
+        // `align_to::<i32>()` would silently drop a mis-aligned prefix
+        // (data corruption, not UB). Copy each 4-byte element out by
+        // value instead — `size == len * 4` exactly (checked above), so
+        // `chunks_exact` yields exactly `len` elements with no remainder.
+        let result = self.data.as_slice()[pos..pos + size]
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|c| D::from(&i32::from_ne_bytes([c[0], c[1], c[2], c[3]])))
+            .collect();
 
         self.set_data_position(pos + padded);
 

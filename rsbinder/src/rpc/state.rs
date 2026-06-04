@@ -81,6 +81,20 @@ pub enum DropReason {
     StaleAsyncNumber,
 }
 
+/// AOSP `RpcState.cpp` `kArbitraryOnewayCallTerminateLevel`: once this
+/// many out-of-order oneways are parked on a single node, the peer is
+/// treated as hostile/buggy — the node's parked backlog is flushed
+/// (reclaiming its memory + held fds at once) and the delivering
+/// connection is torn down, rather than letting the per-node
+/// `async_todo` queue grow without bound (memory + fd exhaustion DoS).
+/// This bounds a node to at most this many parked entries at any instant.
+const ASYNC_TODO_TERMINATE_LEVEL: usize = 10000;
+/// AOSP `kArbitraryOnewayCallWarnLevel` / `kArbitraryOnewayCallWarnPer`
+/// (both 1000): emit a warning at each multiple of this once the queue
+/// is this deep, so a building backlog is observable before the
+/// terminate watermark.
+const ASYNC_TODO_WARN_PER: usize = 1000;
+
 /// Outcome of [`RpcState::dispatch_async_or_enqueue`] for an inbound
 /// oneway. Caller dispatches the [`AsyncDecision::Dispatch`] variant
 /// outside the state lock, then calls
@@ -91,6 +105,14 @@ pub enum AsyncDecision {
     Dispatch(WireTransaction, Vec<OwnedFd>),
     Enqueued,
     Drop(DropReason),
+    /// The per-node `async_todo` queue reached the terminate watermark
+    /// (count carried for logging); the backlog has already been flushed
+    /// here. The caller must tear the delivering connection down with
+    /// `FAILED_TRANSACTION`. Unlike AOSP `shutdownAndWait` this is
+    /// connection-level, not whole-session — but the flush above means
+    /// the backlog is reclaimed regardless of how many connections the
+    /// session has.
+    Terminate(usize),
 }
 
 /// A local object exposed to the peer under [`RpcAddress`].
@@ -340,6 +362,27 @@ impl RpcState {
                 transaction: txn,
                 in_fds,
             }));
+            // AOSP RpcState.cpp lines 1109–1129: bound the out-of-order
+            // backlog so a peer that addresses a known node with
+            // ever-increasing future async numbers (while the expected
+            // one never arrives) cannot grow this heap — and the fds it
+            // owns — without limit.
+            let num_pending = node.async_todo.len();
+            if num_pending >= ASYNC_TODO_TERMINATE_LEVEL {
+                // Flush the abusive node's backlog now so its memory +
+                // any held fds are reclaimed immediately, independent of
+                // the caller's connection teardown. Without this, on a
+                // multi-connection session the heap would persist (and a
+                // reconnecting peer could re-accrete one entry per
+                // terminate); flushing keeps the bound tight.
+                node.async_todo.clear();
+                return AsyncDecision::Terminate(num_pending);
+            }
+            if num_pending % ASYNC_TODO_WARN_PER == 0 {
+                log::warn!(
+                    "RPC: {num_pending} pending out-of-order oneway transactions on {addr:?}"
+                );
+            }
             AsyncDecision::Enqueued
         } else {
             AsyncDecision::Drop(DropReason::StaleAsyncNumber)
@@ -780,6 +823,43 @@ mod tests {
         // After draining 4 (the last one), counter still advances
         // once for the dispatch of 4 — so expected is now 5.
         assert_eq!(st.next_async_number(&a), 5);
+    }
+
+    /// A peer that parks out-of-order oneways while withholding the
+    /// expected `async_number` cannot grow a node's `async_todo` without
+    /// bound: at the AOSP terminate watermark the decision flips to
+    /// `Terminate` and the backlog is flushed (memory + any held fds
+    /// reclaimed), bounding the node to `ASYNC_TODO_TERMINATE_LEVEL`
+    /// entries at any instant.
+    #[test]
+    fn phase_c_async_todo_terminate_caps_and_flushes_backlog() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b);
+
+        // Expected is 0 and never arrives; 1..watermark all park.
+        for n in 1..ASYNC_TODO_TERMINATE_LEVEL as u64 {
+            let txn = mk_txn(a, n);
+            assert!(
+                matches!(
+                    st.dispatch_async_or_enqueue(a, n, txn, vec![]),
+                    AsyncDecision::Enqueued
+                ),
+                "async_number {n} below the watermark must park"
+            );
+        }
+        assert_eq!(st.async_todo_len(&a), ASYNC_TODO_TERMINATE_LEVEL - 1);
+
+        // The push that reaches the watermark terminates and flushes.
+        let n = ASYNC_TODO_TERMINATE_LEVEL as u64;
+        let txn = mk_txn(a, n);
+        match st.dispatch_async_or_enqueue(a, n, txn, vec![]) {
+            AsyncDecision::Terminate(pending) => {
+                assert_eq!(pending, ASYNC_TODO_TERMINATE_LEVEL)
+            }
+            other => panic!("watermark must terminate, got {other:?}"),
+        }
+        assert_eq!(st.async_todo_len(&a), 0, "backlog flushed on terminate");
     }
 
     /// Unknown address: AOSP `RpcState` only enqueues if

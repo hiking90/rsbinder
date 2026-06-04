@@ -114,6 +114,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Add binder device.
     let device_name = app.get_one::<String>("device_name").unwrap();
 
+    // This runs as root and the name is interpolated into binderfs and
+    // /dev paths below, so require a single path component — otherwise a
+    // name like "../etc/foo" would redirect the chmod'd device or the
+    // /dev symlink outside its intended directory.
+    if device_name.is_empty()
+        || device_name == "."
+        || device_name == ".."
+        || device_name.contains('/')
+        || device_name.contains('\0')
+    {
+        log_err(&format!("Invalid binder device name: {device_name:?}"));
+    }
+
     match binderfs::add_device(control_path, device_name) {
         Ok((_, _)) => log_ok(&format!(
             "New binder device allocated:\n\t- Device name: {device_name}\n\t- Accessible path: /dev/binderfs/{device_name}"

@@ -343,6 +343,11 @@ pub fn default() -> Result<Arc<ServiceManager>> {
 
         match sdk_version {
             sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
+            // Android 15 (SDK 35) shares Android 14's service-manager wire
+            // format, so it is served by the `android_14` feature — there
+            // is no separate `android_15` feature. A build that enables
+            // only `android_16` therefore returns `InvalidOperation` on an
+            // Android 15 device; enable `android_14` to cover 14 *and* 15.
             #[cfg(feature = "android_14")]
             sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => {
                 create_service_manager!(Android14, android_14)

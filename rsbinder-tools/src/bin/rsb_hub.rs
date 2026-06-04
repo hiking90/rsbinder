@@ -561,6 +561,20 @@ impl IServiceManager for ServiceManager {
         Ok(result)
     }
 
+    /// Security note (Linux): unlike AOSP's `servicemanager`, this
+    /// implementation performs **no add-time access control**. AOSP
+    /// rejects app UIDs (`multiuser_get_app_id(uid) >= AID_APP`) and
+    /// runs the SELinux `canAddService` hook; both depend on Android's
+    /// UID model / policy and have no equivalent on a plain Linux host.
+    /// Consequently any client can register, or silently overwrite, any
+    /// service name — and a binder that reports the
+    /// `android.os.IAccessor` descriptor is trusted as an accessor on
+    /// the registrant's word alone (AOSP instead derives the accessor
+    /// relationship from a signed VINTF `<accessor>` manifest entry).
+    /// As a minimal mitigation we log a loud warning when a registration
+    /// overwrites an entry owned by a different uid/pid (the signature of
+    /// a hijack). Vendors needing real enforcement must wrap this with
+    /// their own authorization layer.
     fn addService(
         &self,
         name: &str,
@@ -575,8 +589,13 @@ impl IServiceManager for ServiceManager {
         // Detect `IAccessor` binders by interface descriptor at registration.
         // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
         // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
-        // `rpc` feature.
+        // `rpc` feature. NOTE: self-asserted by the registrant — see the fn
+        // rustdoc for the trust caveat vs. AOSP's VINTF-derived accessors.
         let is_accessor = service.descriptor() == "android.os.IAccessor";
+
+        // Capture the registrant's identity once on this binder thread, so
+        // we can both stamp the new entry and detect cross-identity overwrites.
+        let caller = rsbinder::thread_state::CallingContext::default();
 
         // `allowIsolated` is accepted by AIDL for AOSP source
         // compatibility but unused on Linux — there is no isolated-app
@@ -599,8 +618,22 @@ impl IServiceManager for ServiceManager {
             }
 
             let mut prev_clients = false;
-            if let Some(service) = inner.name_to_service.get(name) {
-                prev_clients = service.has_clients;
+            if let Some(existing) = inner.name_to_service.get(name) {
+                prev_clients = existing.has_clients;
+                // No add-time access control on Linux (see fn rustdoc): we
+                // cannot reject a hijack, but overwriting an entry owned by
+                // a different uid/pid is its signature, so make it loud
+                // rather than silent (AOSP logs the same mismatch).
+                if existing.context.uid != caller.uid || existing.context.pid != caller.pid {
+                    log::warn!(
+                        "addService: '{name}' overwritten by uid={} pid={} \
+                         (previously registered by uid={} pid={})",
+                        caller.uid,
+                        caller.pid,
+                        existing.context.uid,
+                        existing.context.pid
+                    );
+                }
             }
 
             inner.add_service(
@@ -610,7 +643,7 @@ impl IServiceManager for ServiceManager {
                     dump_priority: dumpPriority,
                     has_clients: prev_clients,
                     guarantee_client: false,
-                    context: rsbinder::thread_state::CallingContext::default(),
+                    context: caller,
                     is_accessor,
                 },
             )?;

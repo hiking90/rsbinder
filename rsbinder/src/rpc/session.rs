@@ -1511,6 +1511,20 @@ impl RpcSessionInner {
                     );
                     None
                 }
+                super::state::AsyncDecision::Terminate(num_pending) => {
+                    // The out-of-order oneway backlog hit the terminate
+                    // watermark; `dispatch_async_or_enqueue` already
+                    // flushed the node's queue. Returning Err breaks the
+                    // serve loop and tears this connection down
+                    // (FAILED_TRANSACTION). This is connection-level, not
+                    // AOSP's whole-session shutdownAndWait, but the flush
+                    // already reclaimed the backlog.
+                    log::error!(
+                        "RPC: {num_pending} pending oneway transactions on {addr:?}; \
+                         flushing backlog and tearing down connection"
+                    );
+                    return Err(StatusCode::FailedTransaction);
+                }
             }
         };
         while let Some((t, fds)) = next {

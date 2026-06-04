@@ -523,7 +523,13 @@ impl ValueType {
             ValueType::Unary { operator, expr } => {
                 format!("{} {}", operator, expr.to_value_string())
             }
-            _ => unimplemented!(),
+            // Map/IBinder/FileDescriptor/Holder/UserDefined have no
+            // value-literal form and are unreachable from parsed const
+            // expressions today (callers route them through their own
+            // `Default::default()` fallback first). Emit an empty string
+            // rather than `unimplemented!()` so a future caller can never
+            // turn this into a panic on user input.
+            _ => String::new(),
         }
     }
 
