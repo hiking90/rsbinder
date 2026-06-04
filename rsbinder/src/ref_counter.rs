@@ -46,9 +46,9 @@ impl RefCounter {
         // We don't need to synchronize with previous operations here
         let c = self.count.fetch_add(1, Ordering::Relaxed);
         if c == INITIAL_STRONG_VALUE {
-            // Android uses Relaxed here, but we use Release to be more conservative.
-            // This ensures the initialization (calling f()) is visible to other threads.
-            // Note: Android's onFirstRef() may have internal synchronization that we don't.
+            // Relaxed matches AOSP RefBase: this only clears the sentinel
+            // bias on the first strong ref; any synchronization the
+            // first-ref initializer needs is provided by `f()` itself.
             self.count
                 .fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
             f()?;

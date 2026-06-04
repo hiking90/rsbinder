@@ -561,6 +561,20 @@ impl IServiceManager for ServiceManager {
         Ok(result)
     }
 
+    /// Security note (Linux): unlike AOSP's `servicemanager`, this
+    /// implementation performs **no add-time access control**. AOSP
+    /// rejects app UIDs (`multiuser_get_app_id(uid) >= AID_APP`) and
+    /// runs the SELinux `canAddService` hook; both depend on Android's
+    /// UID model / policy and have no equivalent on a plain Linux host.
+    /// Consequently any client can register, or silently overwrite, any
+    /// service name — and a binder that reports the
+    /// `android.os.IAccessor` descriptor is trusted as an accessor on
+    /// the registrant's word alone (AOSP instead derives the accessor
+    /// relationship from a signed VINTF `<accessor>` manifest entry).
+    /// As a minimal mitigation we log a loud warning when a registration
+    /// overwrites an entry owned by a different uid/pid (the signature of
+    /// a hijack). Vendors needing real enforcement must wrap this with
+    /// their own authorization layer.
     fn addService(
         &self,
         name: &str,
@@ -575,8 +589,13 @@ impl IServiceManager for ServiceManager {
         // Detect `IAccessor` binders by interface descriptor at registration.
         // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
         // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
-        // `rpc` feature.
+        // `rpc` feature. NOTE: self-asserted by the registrant — see the fn
+        // rustdoc for the trust caveat vs. AOSP's VINTF-derived accessors.
         let is_accessor = service.descriptor() == "android.os.IAccessor";
+
+        // Capture the registrant's identity once on this binder thread, so
+        // we can both stamp the new entry and detect cross-identity overwrites.
+        let caller = rsbinder::thread_state::CallingContext::default();
 
         // `allowIsolated` is accepted by AIDL for AOSP source
         // compatibility but unused on Linux — there is no isolated-app
@@ -589,18 +608,61 @@ impl IServiceManager for ServiceManager {
         let mut reg_pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
             let mut inner = self.inner.lock().unwrap();
-
-            // Only if the service is a proxy, link to death.
-            // Because the native service does not support death notification.
-            if service.as_proxy().is_some() {
-                service.link_to_death(Arc::downgrade(
-                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-                ))?;
-            }
+            let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
 
             let mut prev_clients = false;
-            if let Some(service) = inner.name_to_service.get(name) {
-                prev_clients = service.has_clients;
+            // `SIBinder: PartialEq` is `Arc::ptr_eq`, so this is binder
+            // identity: is the *same* object being re-registered under this
+            // name?
+            let mut same_binder = false;
+            // The old binder being replaced, captured (cheap Arc clone) so it
+            // can be unlinked *after* the new one is linked — see below.
+            let mut old_to_unlink: Option<SIBinder> = None;
+            if let Some(existing) = inner.name_to_service.get(name) {
+                prev_clients = existing.has_clients;
+                same_binder = existing.binder == *service;
+                // No add-time access control on Linux (see fn rustdoc): we
+                // cannot reject a hijack, but overwriting an entry owned by
+                // a different uid/pid is its signature, so make it loud
+                // rather than silent (AOSP logs the same mismatch).
+                if existing.context.uid != caller.uid || existing.context.pid != caller.pid {
+                    log::warn!(
+                        "addService: '{name}' overwritten by uid={} pid={} \
+                         (previously registered by uid={} pid={})",
+                        caller.uid,
+                        caller.pid,
+                        existing.context.uid,
+                        existing.context.pid
+                    );
+                }
+                if !same_binder && existing.binder.as_proxy().is_some() {
+                    old_to_unlink = Some(existing.binder.clone());
+                }
+            }
+
+            // Link the new binder FIRST (proxies only — native binders have
+            // no death notification), before unlinking the old one: a link
+            // failure then leaves the existing registration and its death
+            // link intact (clean no-op), instead of stranding an unmonitored
+            // entry. Skip when the same binder is re-registered (already
+            // linked; relinking would stack a duplicate recipient that fires
+            // `binder_died` once per copy).
+            if !same_binder && service.as_proxy().is_some() {
+                service.link_to_death(Arc::downgrade(&recipient))?;
+            }
+
+            // New link is in place: unlink the old binder we are about to
+            // drop. `ProxyHandle::Drop` does *not* clear death notifications,
+            // so without this its kernel subscription would leak until that
+            // binder dies. (AOSP drops the link in `~Service`; rsbinder has
+            // no such dtor hook.)
+            if let Some(old) = old_to_unlink {
+                if let Err(e) = old.unlink_to_death(Arc::downgrade(&recipient)) {
+                    log::warn!(
+                        "addService: failed to unlink death notification for \
+                         replaced '{name}': {e:?}"
+                    );
+                }
             }
 
             inner.add_service(
@@ -610,7 +672,7 @@ impl IServiceManager for ServiceManager {
                     dump_priority: dumpPriority,
                     has_clients: prev_clients,
                     guarantee_client: false,
-                    context: rsbinder::thread_state::CallingContext::default(),
+                    context: caller,
                     is_accessor,
                 },
             )?;

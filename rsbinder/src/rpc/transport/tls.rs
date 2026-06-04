@@ -222,6 +222,11 @@ impl TlsTransport {
     /// Server side over **any** stream: TLS-handshake per `config`. With
     /// an mTLS config the client certificate is required + verified by
     /// rustls; its absence/invalidity fails the handshake here.
+    ///
+    /// Note: a non-mTLS `ServerConfig` (no client-auth verifier) yields a
+    /// [`PeerIdentity::Anonymous`] connection — encrypted but with no
+    /// authenticated peer. Authorization of such peers must be enforced
+    /// by the caller's `set_authorizer` chokepoint.
     pub fn accept_stream(
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,

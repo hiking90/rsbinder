@@ -61,3 +61,31 @@ fn enum_autoincrement_overflow_does_not_panic() {
     // No panic / abort is the assertion.
     let _ = generate_ok(src);
 }
+
+/// An empty `{}` initializer used to `unwrap()`-panic in five parser
+/// positions where an aggregate initializer is not a valid value
+/// (enumerator value, nested array element, annotation argument, named
+/// annotation parameter, array dimension). Each must now surface as a
+/// recoverable parse diagnostic. Reaching the assertions without aborting
+/// is itself the regression guard: a revert reintroduces the panic and
+/// fails the test. The legitimate empty-array initializer `int[] x = {}`
+/// (the one position where `{}` is valid) must still parse + generate.
+#[test]
+fn empty_brace_initializer_is_rejected_not_panicked() {
+    for src in [
+        "enum E { A = {} }",                    // enumerator value
+        "parcelable P { int[] x = {{}}; }",     // nested array element
+        "@Foo({}) parcelable P { int x; }",     // annotation argument
+        "@Foo(bar={}) parcelable P { int x; }", // named annotation parameter
+        "parcelable P { int[{}] x; }",          // array dimension
+    ] {
+        assert!(
+            !generate_ok(src),
+            "empty `{{}}` initializer must error, not panic: {src:?}"
+        );
+    }
+    assert!(
+        generate_ok("parcelable P { int[] x = {}; }"),
+        "a legitimate empty-array initializer must still generate"
+    );
+}

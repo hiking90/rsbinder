@@ -90,7 +90,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             binderfs_path.display()
         )),
         Ok(false) => {
-            let status = Command::new("mount")
+            // Absolute path, not `mount` via `$PATH`: this runs as root,
+            // so resolving the binary through `$PATH` would let a planted
+            // `mount` earlier on the path execute as root. `/bin/mount`
+            // is the util-linux location on both merged- and split-`/usr`
+            // systems.
+            let status = Command::new("/bin/mount")
                 .arg("-t")
                 .arg("binder")
                 .arg("binder")
@@ -113,6 +118,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Add binder device.
     let device_name = app.get_one::<String>("device_name").unwrap();
+
+    // This runs as root and the name is interpolated into binderfs and
+    // /dev paths below, so require a single path component — otherwise a
+    // name like "../etc/foo" would redirect the chmod'd device or the
+    // /dev symlink outside its intended directory.
+    if device_name.is_empty()
+        || device_name == "."
+        || device_name == ".."
+        || device_name.contains('/')
+        || device_name.contains('\0')
+    {
+        log_err(&format!("Invalid binder device name: {device_name:?}"));
+    }
 
     match binderfs::add_device(control_path, device_name) {
         Ok((_, _)) => log_ok(&format!(

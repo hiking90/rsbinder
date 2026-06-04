@@ -418,8 +418,8 @@ impl DeserializeOption for String {
             // only 1-byte aligned, so reinterpreting it as `&[u16]` via
             // `from_raw_parts(_ as *const u16, _)` would construct an
             // under-aligned reference (UB; Miri-detectable). Copy the bytes
-            // into an aligned `Vec<u16>` instead — mirroring the safe
-            // `align_to` idiom used by `read_array_char`.
+            // into an aligned `Vec<u16>` instead — mirroring the
+            // `chunks_exact` copy used by `read_array_char`.
             let u16_data: Vec<u16> = data[..len as usize * std::mem::size_of::<u16>()]
                 .chunks_exact(std::mem::size_of::<u16>())
                 .map(|c| u16::from_ne_bytes([c[0], c[1]]))
