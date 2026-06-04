@@ -149,6 +149,27 @@ impl ServerListener {
 }
 
 impl RawAccepted {
+    /// Arm a read deadline on the raw stream *before* it is wrapped, so
+    /// the pre-wrap TLS handshake (driven inside [`into_transport`],
+    /// which performs blocking reads on this socket) is itself bounded.
+    /// Without this, the [`run_connection_in_worker`] deadline — armed
+    /// only after the wrap returns — never covers the handshake, so a
+    /// connected-but-silent TLS peer would pin its worker thread (and,
+    /// under [`set_max_connections`](RpcServer::set_max_connections), the
+    /// whole accept loop) indefinitely. Best-effort: a set failure just
+    /// means no deadline. Harmless on the plain (UDS/vsock) path — that
+    /// wrap performs no I/O and the same deadline is re-armed before the
+    /// native handshake reads.
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            RawAccepted::Unix(s) => s.set_read_timeout(timeout),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            RawAccepted::Vsock(s) => s.set_read_timeout(timeout),
+            #[cfg(feature = "rpc-tls")]
+            RawAccepted::Tcp(s) => s.set_read_timeout(timeout),
+        }
+    }
+
     /// Wrap the raw stream as `RpcTransport`, on the
     /// worker thread. `tls_config = Some(cfg)` ⇒ drive a server-side
     /// TLS handshake via [`TlsTransport::accept_stream`] over the raw
@@ -919,6 +940,22 @@ impl RpcServer {
     fn serve_connection_raw(self: &Arc<Self>, raw: RawAccepted) {
         let server = Arc::clone(self);
         let handle = std::thread::spawn(move || {
+            // Bound the pre-wrap handshake phase on the raw socket before
+            // any blocking I/O. The TLS handshake runs inside
+            // `wrap_accepted` (below), *before* `run_connection_in_worker`
+            // arms its deadline, so a silent peer would otherwise pin this
+            // worker — and, with `set_max_connections`, the accept loop —
+            // forever. `run_connection_in_worker` re-arms (idempotent) and
+            // clears it before the long-lived serve.
+            if let Some(d) = *server
+                .handshake_timeout
+                .lock()
+                .expect("handshake_timeout poisoned")
+            {
+                if let Err(e) = raw.set_read_timeout(Some(d)) {
+                    log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
+                }
+            }
             let transport = match server.wrap_accepted(raw) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1061,6 +1098,30 @@ impl RpcServer {
                                 log::warn!(
                                     "android-13+ RPC: incoming attach after server \
                                      shutdown; rejecting"
+                                );
+                                drop(transport);
+                                return;
+                            }
+                            // Bound callback (incoming) slots. Unlike outgoing
+                            // attaches — which carry a serve loop and are
+                            // reclaimed by `remove_slot` on disconnect — a
+                            // callback slot has no read loop and lives until
+                            // the whole session tears down, so without a cap a
+                            // peer holding the session id could grow the slot
+                            // pool (and its held fds) without bound. AOSP opens
+                            // symmetric incoming+outgoing connections (each
+                            // bounded by the negotiated max-threads), so cap the
+                            // shared pool at `2 * max_threads` — tight enough to
+                            // bound the DoS, loose enough never to refuse a
+                            // well-behaved client's callback connections.
+                            let incoming_cap =
+                                (inner.max_threads_value() as usize).saturating_mul(2);
+                            if inner.slot_count() >= incoming_cap {
+                                server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                                log::warn!(
+                                    "android-13+ RPC: incoming callback attach refused \
+                                     (slot cap reached: slot_count={}, cap={incoming_cap})",
+                                    inner.slot_count()
                                 );
                                 drop(transport);
                                 return;

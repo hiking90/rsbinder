@@ -1372,7 +1372,20 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
             for pair in pair.into_inner() {
                 match pair.as_rule() {
                     Rule::const_expr => {
-                        value_list.push(parse_const_expr(pair.into_inner().next().unwrap())?);
+                        // An empty `{}` parses to a `const_expr` with no
+                        // inner pair; reject it with a diagnostic rather
+                        // than `unwrap()`-panicking on user input.
+                        let span = pair.as_span();
+                        match pair.into_inner().next() {
+                            Some(inner) => value_list.push(parse_const_expr(inner)?),
+                            None => {
+                                return Err(make_parse_error(
+                                    "empty `{}` is not a valid constant expression",
+                                    span.start(),
+                                    span.end(),
+                                ))
+                            }
+                        }
                     }
                     _ => unreachable!("Unexpected rule in Rule::constant_value_list: {}", pair),
                 }
@@ -1436,7 +1449,17 @@ fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Result<Parameter, Aid
                 parameter.identifier = pair.as_str().into();
             }
             Rule::const_expr => {
-                parameter.const_expr = parse_const_expr(pair.into_inner().next().unwrap())?;
+                let span = pair.as_span();
+                match pair.into_inner().next() {
+                    Some(inner) => parameter.const_expr = parse_const_expr(inner)?,
+                    None => {
+                        return Err(make_parse_error(
+                            "empty `{}` is not a valid annotation parameter value",
+                            span.start(),
+                            span.end(),
+                        ))
+                    }
+                }
             }
             _ => unreachable!("Unexpected rule in parse_parameter(): {}", pair),
         }
@@ -1467,7 +1490,17 @@ fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, A
             }
 
             Rule::const_expr => {
-                annotation.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
+                let span = pair.as_span();
+                match pair.into_inner().next() {
+                    Some(inner) => annotation.const_expr = Some(parse_const_expr(inner)?),
+                    None => {
+                        return Err(make_parse_error(
+                            "empty `{}` is not a valid annotation argument",
+                            span.start(),
+                            span.end(),
+                        ))
+                    }
+                }
             }
 
             Rule::parameter_list => {
@@ -1574,7 +1607,17 @@ fn parse_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<ArrayType, Ai
     for pair in pairs {
         match pair.as_rule() {
             Rule::const_expr => {
-                array_type.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
+                let span = pair.as_span();
+                match pair.into_inner().next() {
+                    Some(inner) => array_type.const_expr = Some(parse_const_expr(inner)?),
+                    None => {
+                        return Err(make_parse_error(
+                            "empty `{}` is not a valid array dimension",
+                            span.start(),
+                            span.end(),
+                        ))
+                    }
+                }
             }
             _ => unreachable!("Unexpected rule in parse_array_type(): {}", pair),
         }
@@ -1964,7 +2007,17 @@ fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, A
                 res.identifier = pair.as_str().into();
             }
             Rule::const_expr => {
-                res.const_expr = Some(parse_const_expr(pair.into_inner().next().unwrap())?);
+                let span = pair.as_span();
+                match pair.into_inner().next() {
+                    Some(inner) => res.const_expr = Some(parse_const_expr(inner)?),
+                    None => {
+                        return Err(make_parse_error(
+                            "empty `{}` is not a valid enumerator value",
+                            span.start(),
+                            span.end(),
+                        ))
+                    }
+                }
             }
             _ => unreachable!("Unexpected rule in parse_enumerator(): {}", pair),
         }

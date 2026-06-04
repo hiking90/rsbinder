@@ -90,7 +90,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             binderfs_path.display()
         )),
         Ok(false) => {
-            let status = Command::new("mount")
+            // Absolute path, not `mount` via `$PATH`: this runs as root,
+            // so resolving the binary through `$PATH` would let a planted
+            // `mount` earlier on the path execute as root. `/bin/mount`
+            // is the util-linux location on both merged- and split-`/usr`
+            // systems.
+            let status = Command::new("/bin/mount")
                 .arg("-t")
                 .arg("binder")
                 .arg("binder")
