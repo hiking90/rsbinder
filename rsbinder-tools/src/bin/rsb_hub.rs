@@ -375,14 +375,20 @@ impl Inner {
 
 struct ServiceManager {
     inner: Arc<Mutex<Inner>>,
+    /// When `false` (the default), `addService` refuses to overwrite a live
+    /// registration owned by a different UID — the signature of a
+    /// service-name hijack. `--allow-cross-uid-overwrite` sets it `true`
+    /// for deployments that intentionally re-register across UIDs.
+    allow_cross_uid_overwrite: bool,
 }
 
 impl ServiceManager {
-    fn new() -> Self {
+    fn new(allow_cross_uid_overwrite: bool) -> Self {
         let (death_sender, death_receiver) = mpsc::channel();
 
         let this = Self {
             inner: Arc::new(Mutex::new(Inner::new(death_sender))),
+            allow_cross_uid_overwrite,
         };
 
         this.run_death_receiver(death_receiver);
@@ -509,6 +515,26 @@ impl ServiceManager {
 
         true
     }
+
+    /// Add-time access-control decision for an `addService` that would
+    /// overwrite an existing registration: returns `true` when the
+    /// overwrite must be rejected as a likely service-name hijack.
+    ///
+    /// Rejected iff the operator has NOT opted into cross-UID overwrites,
+    /// the incoming binder is a *different* object than the one registered
+    /// (`!same_binder`), AND the caller's UID differs from the registrant's.
+    /// A same-UID overwrite (e.g. a service restart under a new PID) and a
+    /// re-registration of the identical binder are always allowed. Pure and
+    /// total so the security-relevant branch is unit-testable without two
+    /// real OS UIDs.
+    fn is_cross_uid_overwrite_rejected(
+        allow_cross_uid_overwrite: bool,
+        same_binder: bool,
+        existing_uid: u32,
+        caller_uid: u32,
+    ) -> bool {
+        !allow_cross_uid_overwrite && !same_binder && existing_uid != caller_uid
+    }
 }
 
 impl Interface for ServiceManager {}
@@ -621,14 +647,43 @@ impl IServiceManager for ServiceManager {
             if let Some(existing) = inner.name_to_service.get(name) {
                 prev_clients = existing.has_clients;
                 same_binder = existing.binder == *service;
-                // No add-time access control on Linux (see fn rustdoc): we
-                // cannot reject a hijack, but overwriting an entry owned by
-                // a different uid/pid is its signature, so make it loud
-                // rather than silent (AOSP logs the same mismatch).
-                if existing.context.uid != caller.uid || existing.context.pid != caller.pid {
+                // Add-time access control (see fn rustdoc and
+                // `is_cross_uid_overwrite_rejected`). A cross-UID overwrite of
+                // a *different* live binder is the signature of a service-name
+                // hijack (MITM): AOSP rejects app UIDs and runs the SELinux
+                // canAddService hook, neither of which exists on a plain Linux
+                // host, so reject it by default. A same-UID re-registration
+                // (e.g. a service restart under a new PID) and re-registering
+                // the identical binder are always allowed; the owning UID
+                // dying frees the name via the death recipient, after which
+                // any UID may claim it. `--allow-cross-uid-overwrite` opts
+                // back into the prior permissive (warn-only) behavior.
+                if Self::is_cross_uid_overwrite_rejected(
+                    self.allow_cross_uid_overwrite,
+                    same_binder,
+                    existing.context.uid,
+                    caller.uid,
+                ) {
                     log::warn!(
-                        "addService: '{name}' overwritten by uid={} pid={} \
-                         (previously registered by uid={} pid={})",
+                        "addService: rejecting cross-uid overwrite of '{name}' by uid={} \
+                         pid={} (registered by uid={} pid={}); pass \
+                         --allow-cross-uid-overwrite to permit",
+                        caller.uid,
+                        caller.pid,
+                        existing.context.uid,
+                        existing.context.pid
+                    );
+                    return Err(ExceptionCode::Security.into());
+                }
+                // The opt-in cross-uid overwrite path: proceed but log loudly.
+                if self.allow_cross_uid_overwrite
+                    && !same_binder
+                    && existing.context.uid != caller.uid
+                {
+                    log::warn!(
+                        "addService: '{name}' overwritten across uid by uid={} pid={} \
+                         (previously uid={} pid={}); permitted by \
+                         --allow-cross-uid-overwrite",
                         caller.uid,
                         caller.pid,
                         existing.context.uid,
@@ -1072,6 +1127,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .help("Name of the binder device to use (e.g., 'binder', 'mybinder')")
                 .default_value("binder"),
         )
+        .arg(
+            clap::Arg::new("allow-cross-uid-overwrite")
+                .long("allow-cross-uid-overwrite")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Permit a client to overwrite a service name registered by a \
+                     different UID. Off by default: a cross-UID overwrite is the \
+                     signature of a service-name hijack, so it is rejected unless \
+                     this flag is set.",
+                ),
+        )
         .after_help(
             "Examples:\n    \
             Run with the default binder device:\n    \
@@ -1089,13 +1155,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .get_one::<String>("device")
         .expect("device has a default value");
     let binder_path = format!("{}/{}", DEFAULT_BINDERFS_PATH, device_name);
+    let allow_cross_uid_overwrite = matches.get_flag("allow-cross-uid-overwrite");
+    if allow_cross_uid_overwrite {
+        log::warn!(
+            "rsb_hub: --allow-cross-uid-overwrite is set; clients may overwrite \
+             services registered by other UIDs (service-hijack protection disabled)"
+        );
+    }
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
     ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.
-    let service = BnServiceManager::new_binder(ServiceManager::new());
+    let service = BnServiceManager::new_binder(ServiceManager::new(allow_cross_uid_overwrite));
     service.addService(
         "manager",
         &service.as_binder(),
@@ -1111,6 +1184,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Add-time access control: a cross-UID overwrite of a different live
+    /// binder is rejected by default; same-UID restarts, identical-binder
+    /// re-registration, and the explicit opt-in are all allowed. (The
+    /// real two-UID transaction path is exercised by deployment; this pins
+    /// the decision predicate deterministically.)
+    #[test]
+    fn cross_uid_overwrite_decision() {
+        // Reject: different UID, different binder, flag off (hijack).
+        assert!(ServiceManager::is_cross_uid_overwrite_rejected(
+            false, false, 1000, 2000
+        ));
+        // Allow: same UID (e.g. a service restart under a new PID).
+        assert!(!ServiceManager::is_cross_uid_overwrite_rejected(
+            false, false, 1000, 1000
+        ));
+        // Allow: re-registering the identical binder, even across UIDs.
+        assert!(!ServiceManager::is_cross_uid_overwrite_rejected(
+            false, true, 1000, 2000
+        ));
+        // Allow: operator opted into cross-UID overwrites.
+        assert!(!ServiceManager::is_cross_uid_overwrite_rejected(
+            true, false, 1000, 2000
+        ));
+        // Allow: opt-in + same UID (trivially permitted).
+        assert!(!ServiceManager::is_cross_uid_overwrite_rejected(
+            true, false, 1000, 1000
+        ));
+    }
 
     #[test]
     fn test_is_valid_service_name_accepts_valid() {

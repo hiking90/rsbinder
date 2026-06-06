@@ -187,13 +187,25 @@ impl RpcState {
     /// dedups; see the module doc). Returning without bumping would let
     /// the first connection's DEC free a node still referenced over a
     /// sibling connection (`DeadObject`).
-    pub fn on_binder_leaving(&mut self, binder: &SIBinder) -> RpcAddress {
+    pub fn on_binder_leaving(&mut self, binder: &SIBinder) -> crate::Result<RpcAddress> {
         let ptr = binder_ptr(binder);
         if let Some(&addr) = self.local_by_ptr.get(&ptr) {
             if let Some(node) = self.local_nodes.get_mut(&addr) {
                 node.strong += 1;
             }
-            return addr;
+            return Ok(addr);
+        }
+        // The android-13+ wire encodes only the low 32 bits of the address
+        // counter (`encode_addr`), so past `u32::MAX` two live nodes would
+        // alias to one `RpcWireAddress` and mis-dispatch. Hard-stop rather
+        // than alias (vs. the async-number wrap, an ordering-only concern that
+        // only warns); ~2^32 live local objects per session is unreachable.
+        if self.addr_counter >= u32::MAX as u64 {
+            log::error!(
+                "RPC: local address counter exhausted (>= u32::MAX) on one session; \
+                 refusing to mint an aliasing address"
+            );
+            return Err(crate::StatusCode::FailedTransaction);
         }
         let addr = RpcAddress::unique(&mut self.addr_counter, self.space);
         self.local_nodes.insert(
@@ -206,7 +218,7 @@ impl RpcState {
             },
         );
         self.local_by_ptr.insert(ptr, addr);
-        addr
+        Ok(addr)
     }
 
     /// The local object registered at `addr`, if any (an address that
@@ -512,8 +524,8 @@ mod tests {
     fn leaving_is_idempotent_by_identity() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a1 = st.on_binder_leaving(&b);
-        let a2 = st.on_binder_leaving(&b);
+        let a1 = st.on_binder_leaving(&b).unwrap();
+        let a2 = st.on_binder_leaving(&b).unwrap();
         assert_eq!(a1, a2, "same object → same address");
         assert_eq!(st.local_node_count(), 1);
         assert!(st.lookup_local(&a1).is_some());
@@ -524,13 +536,33 @@ mod tests {
     fn dec_strong_releases_node() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = st.on_binder_leaving(&b);
+        let a = st.on_binder_leaving(&b).unwrap();
         assert_eq!(st.local_node_count(), 1);
         assert!(st.dec_strong_local(&a), "node removed at strong 0");
         assert_eq!(st.local_node_count(), 0, "no leak");
         assert!(st.lookup_local(&a).is_none());
         // DEC_STRONG on an unknown address is safe (idempotent).
         assert!(!st.dec_strong_local(&a));
+    }
+
+    /// The android-13+ wire encodes only the low 32 bits of the address
+    /// counter, so once it reaches `u32::MAX` two distinct live nodes would
+    /// alias to one `RpcWireAddress`. `on_binder_leaving` must refuse to
+    /// mint a *new* address past that bound (a hard error) rather than
+    /// silently aliasing — while still serving a resend of an already
+    /// registered object (no new mint).
+    #[test]
+    fn address_counter_exhaustion_is_rejected_not_aliased() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        // Just below the bound: minting still succeeds.
+        st.addr_counter = (u32::MAX as u64) - 1;
+        let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        assert!(st.on_binder_leaving(&b1).is_ok());
+        // At the bound: a *new* object cannot be minted (would alias).
+        let b2 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        assert!(st.on_binder_leaving(&b2).is_err());
+        // A resend of the already-registered object reuses its address.
+        assert!(st.on_binder_leaving(&b1).is_ok());
     }
 
     /// Two `RpcState` instances have **independent**
@@ -544,7 +576,7 @@ mod tests {
         let mut s1 = RpcState::new(AddressSpace::Acceptor);
         let s2 = RpcState::new(AddressSpace::Acceptor); // fresh, empty, independent table
         let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a1 = s1.on_binder_leaving(&b1);
+        let a1 = s1.on_binder_leaving(&b1).unwrap();
 
         // s2 registered nothing → it does not resolve s1's address,
         // even though a per-session counter could mint the same bytes.
@@ -675,9 +707,9 @@ mod tests {
         //     excess DECs + 1 at proxy drop = N.
         let mut srv = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = srv.on_binder_leaving(&b);
-        let a2 = srv.on_binder_leaving(&b);
-        let a3 = srv.on_binder_leaving(&b);
+        let a = srv.on_binder_leaving(&b).unwrap();
+        let a2 = srv.on_binder_leaving(&b).unwrap();
+        let a3 = srv.on_binder_leaving(&b).unwrap();
         assert_eq!((a, a), (a2, a3), "identity ⇒ same address on re-send");
         assert_eq!(srv.local_node_count(), 1, "one node, strong = timesSent");
         // Peer side: 3 receipts of the same addr, proxy stays live ⇒
@@ -705,8 +737,8 @@ mod tests {
         //     survive until the 2nd.
         let mut s = RpcState::new(AddressSpace::Acceptor);
         let o = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let x = s.on_binder_leaving(&o); // conn #1 send
-        let _ = s.on_binder_leaving(&o); // conn #2 send (timesSent ⇒ 2)
+        let x = s.on_binder_leaving(&o).unwrap(); // conn #1 send
+        let _ = s.on_binder_leaving(&o).unwrap(); // conn #2 send (timesSent ⇒ 2)
         assert!(
             !s.dec_strong_local(&x),
             "conn #1 proxy drop must NOT free a node conn #2 still holds (F7)"
@@ -756,7 +788,7 @@ mod tests {
     fn phase_c_in_order_dispatches_and_advances_counter() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = st.on_binder_leaving(&b);
+        let a = st.on_binder_leaving(&b).unwrap();
         assert_eq!(st.next_async_number(&a), 0);
         for i in 0..5u64 {
             let txn = mk_txn(a, i);
@@ -785,7 +817,7 @@ mod tests {
     fn phase_c_out_of_order_enqueues_then_drains_in_priority_order() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = st.on_binder_leaving(&b);
+        let a = st.on_binder_leaving(&b).unwrap();
 
         // Wire arrival: 2, 4, 1, 3, 0 (libbinder round-robin against
         // 2 outgoing slots delivers this kind of interleave). Expected
@@ -835,7 +867,7 @@ mod tests {
     fn phase_c_async_todo_terminate_caps_and_flushes_backlog() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = st.on_binder_leaving(&b);
+        let a = st.on_binder_leaving(&b).unwrap();
 
         // Expected is 0 and never arrives; 1..watermark all park.
         for n in 1..ASYNC_TODO_TERMINATE_LEVEL as u64 {
@@ -893,7 +925,7 @@ mod tests {
     fn phase_c_stale_arrival_drops_and_heap_drains_below_expected() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a = st.on_binder_leaving(&b);
+        let a = st.on_binder_leaving(&b).unwrap();
 
         // Advance expected to 3 by dispatching 0,1,2 in order.
         for i in 0..3u64 {
@@ -938,8 +970,8 @@ mod tests {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let b2 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let a1 = st.on_binder_leaving(&b1);
-        let a2 = st.on_binder_leaving(&b2);
+        let a1 = st.on_binder_leaving(&b1).unwrap();
+        let a2 = st.on_binder_leaving(&b2).unwrap();
 
         // Node a1: arrival 1 enqueued (expected 0).
         let txn = mk_txn(a1, 1);

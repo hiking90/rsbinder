@@ -826,29 +826,45 @@ impl ProcessState {
     /// `DeathRecipient::binder_died` callbacks, which can issue nested
     /// binder calls. See [`thread_state`](super::thread_state) module doc.
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        let entry = {
+        // Downgrade to `who` BEFORE removing the cache entry: afterwards
+        // `cache_generation_for` returns `None` and `downgrade` yields a
+        // `Native` `WIBinder` that compares unequal to the registered `Proxy`,
+        // breaking `binder_died` identity matching. The read guard is dropped
+        // first — `downgrade` re-acquires the same (non-reentrant) RwLock read.
+        let arc = {
+            let handle_to_proxy = self
+                .handle_to_proxy
+                .read()
+                .expect("Handle to proxy lock poisoned");
+            // The entry's `weak` may or may not still upgrade. Recipients are
+            // only meaningful while a live proxy exists, since `link_to_death`
+            // requires an `Arc<ProxyHandle>` to hand out recipients.
+            handle_to_proxy
+                .get(&handle)
+                .and_then(|entry| entry.weak.upgrade())
+        };
+        let who = arc.as_ref().map(|arc| {
+            let sibinder = SIBinder::from_arc(arc.clone() as Arc<dyn IBinder>);
+            SIBinder::downgrade(&sibinder)
+        });
+
+        let existed = {
             let mut handle_to_proxy = self
                 .handle_to_proxy
                 .write()
                 .expect("Handle to proxy lock poisoned");
-            handle_to_proxy.remove(&handle)
+            handle_to_proxy.remove(&handle).is_some()
         };
 
-        if let Some(entry) = entry {
-            // The entry's `weak` may or may not still upgrade. Recipients
-            // are only meaningful while a live proxy exists, since
-            // `link_to_death` requires an `Arc<ProxyHandle>` to hand out
-            // recipients. If the Arc is gone, no recipients can be
-            // pending and we simply drop the cache entry.
-            if let Some(arc) = entry.weak.upgrade() {
-                let sibinder = SIBinder::from_arc(arc.clone() as Arc<dyn IBinder>);
-                let who = SIBinder::downgrade(&sibinder);
-                arc.send_obituary(&who)?;
-            } else {
+        // `send_obituary` runs user callbacks, so it is invoked with no
+        // `handle_to_proxy` lock held (and it is idempotent, so a racing
+        // double obituary for the same handle is harmless).
+        match (arc, who) {
+            (Some(arc), Some(who)) => arc.send_obituary(&who)?,
+            _ if existed => {
                 log::trace!("Object for handle {handle} already destroyed at obituary time");
             }
-        } else {
-            log::trace!("Handle {handle} was not in cache during obituary");
+            _ => log::trace!("Handle {handle} was not in cache during obituary"),
         }
 
         Ok(())
