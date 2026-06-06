@@ -92,6 +92,29 @@ pub struct ParseError {
     pub help: Option<String>,
 }
 
+impl ParseError {
+    /// Error for input rejected by the pre-parse nesting guard. Both
+    /// pest's recursive-descent parser and the recursive AST walkers
+    /// recurse once per nesting level, so deeply nested brackets/generics
+    /// in untrusted/attacker-influenced AIDL would overflow the stack and
+    /// abort the process (an uncatchable SIGABRT). This surfaces it as a
+    /// normal, catchable diagnostic instead.
+    pub fn nesting_too_deep(filename: &str, source: &str, offset: usize, limit: usize) -> Self {
+        let len = if offset >= source.len() { 0 } else { 1 };
+        Self {
+            src: NamedSource::new(filename, source.to_string()),
+            span: SourceSpan::new(offset.into(), len),
+            message: format!(
+                "nesting too deep (exceeds {limit}); refusing to parse to avoid stack overflow"
+            ),
+            help: Some(
+                "deeply nested types or expressions are rejected as a denial-of-service guard"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 /// Semantic errors (type validation, transaction codes, etc.)
 #[allow(unused)]
 #[derive(Error, Debug, Diagnostic)]
@@ -157,6 +180,21 @@ pub enum SemanticError {
         #[source_code]
         src: NamedSource<String>,
         #[label("overflowing code here")]
+        span: SourceSpan,
+    },
+
+    #[error("Interface '{interface}': method '{method}' has transaction code {code} in the reserved meta-method range")]
+    #[diagnostic(
+        code(aidl::transaction_code_reserved),
+        help("user-defined transaction codes must be between 0 and 16777114 inclusive; the top 100 IDs are reserved for AIDL meta methods (getInterfaceVersion/Hash, ...)")
+    )]
+    TransactionCodeReserved {
+        interface: String,
+        method: String,
+        code: i64,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("reserved code here")]
         span: SourceSpan,
     },
 

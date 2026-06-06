@@ -164,6 +164,31 @@ impl TypeGenerator {
         let mut this = Self::new(&_type.non_array_type)?;
 
         if !_type.array_types.is_empty() {
+            // An array of `List<T>` (`List<T>[]`): the non-array type is
+            // already a List (stored as `ValueType::Array`), so the
+            // trailing `[]` would be silently dropped by `array()`'s
+            // early-return — generating code byte-identical to a bare
+            // `List<T>`. AOSP rejects arrays of lists.
+            if matches!(this.value_type, ValueType::Array(_)) {
+                return Err(make_type_error(
+                    "an array of List is not supported",
+                    _type.non_array_type.name_span,
+                ));
+            }
+            // A variable-length array must be one-dimensional; multi-
+            // dimensional arrays must be fixed-size in *every* dimension.
+            // Otherwise the extra dimensions silently collapse into one
+            // (`int[][]`/`int[3][]`/`int[][3]` all become `Vec<i32>`),
+            // dropping wire length-prefixes. AOSP rejects this.
+            if _type.array_types.len() > 1
+                && _type.array_types.iter().any(|a| a.const_expr.is_none())
+            {
+                return Err(make_type_error(
+                    "a variable-length array must be one-dimensional \
+                     (multi-dimensional arrays must be fixed-size)",
+                    _type.non_array_type.name_span,
+                ));
+            }
             this = this.array(&_type.array_types);
         }
 
@@ -561,6 +586,25 @@ impl TypeGenerator {
         }
     }
 
+    /// True when a *struct field* of this type is stored as `Option<T>`
+    /// only because the type has no `Default` (IBinder / interface `Strong`
+    /// / `ParcelFileDescriptor`), not because it is `@nullable`. AOSP
+    /// serializes such a non-nullable field by unwrapping it with
+    /// `UNEXPECTED_NULL` on `None` instead of writing a null marker, so a
+    /// real peer never sees an unexpected null. Mirrors the exact condition
+    /// under which [`type_declaration`](Self::type_declaration) wraps the
+    /// field in `Option` for `is_struct == true`.
+    pub fn is_option_but_not_nullable(&self) -> bool {
+        if self.is_nullable {
+            return false;
+        }
+        match &self.value_type {
+            // Array element nullability is handled separately.
+            ValueType::Array(_) => false,
+            vt => !Self::can_be_defaulted(vt, true),
+        }
+    }
+
     fn func_list_type_decl_fixed(&self, array_info: &ArrayInfo) -> String {
         let fixed_array = self.make_fixed_array(array_info, false);
 
@@ -717,7 +761,11 @@ impl TypeGenerator {
         self.check_identifier();
 
         let (mutable, init) = match self.direction {
-            Direction::Out => ("mut ", "Default::default()".to_owned()),
+            Direction::Out => (
+                "mut ",
+                self.fixed_array_default()
+                    .unwrap_or_else(|| "Default::default()".to_owned()),
+            ),
             Direction::Inout => ("mut ", format!("{reader}.read()?")),
             _ => ("", format!("{reader}.read()?")),
         };
@@ -729,7 +777,33 @@ impl TypeGenerator {
         )
     }
 
+    /// Initializer for a fixed-size array whose `Default::default()` would
+    /// not compile. `Default` is only implemented for arrays up to length
+    /// 32, so a non-nullable fixed-size array with any dimension > 32 needs
+    /// an explicit `std::array::from_fn` (one per dimension; sizes inferred
+    /// from the field/param type annotation). Returns `None` (keep
+    /// `Default::default()`, unchanged output) for nullable arrays
+    /// (`Option<[T;N]>::default()` is `None`) and for arrays whose every
+    /// dimension is <= 32.
+    fn fixed_array_default(&self) -> Option<String> {
+        if self.is_nullable {
+            return None;
+        }
+        let info = self.array_types.first()?;
+        if !info.is_fixed() || info.sizes.iter().all(|&n| n <= 32) {
+            return None;
+        }
+        let mut init = "Default::default()".to_string();
+        for _ in 0..info.sizes.len() {
+            init = format!("std::array::from_fn(|_| {init})");
+        }
+        Some(init)
+    }
+
     pub fn default_value(&self) -> String {
+        if let Some(init) = self.fixed_array_default() {
+            return init;
+        }
         match &self.value_type {
             ValueType::UserDefined(name) => {
                 match lookup_decl_from_name(name, crate::Namespace::AIDL) {
@@ -961,6 +1035,16 @@ impl TypeGenerator {
         param: InitParam,
     ) -> Result<String, AidlError> {
         let Some(expr) = const_expr else {
+            // A non-nullable fixed-size array with any dimension > 32 cannot
+            // use `Default::default()` (Default is only implemented up to
+            // length 32). This is the parcelable struct-field path (the most
+            // common place such a field appears); `default_value` /
+            // `transaction_decl` handle the other sites. Returns `None` for
+            // nullable (`Option<[T;N]>::default()` is `None`) and for arrays
+            // whose every dimension is <= 32, so output is unchanged there.
+            if let Some(init) = self.fixed_array_default() {
+                return Ok(init);
+            }
             return Ok(ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)));
         };
 
@@ -1191,6 +1275,46 @@ mod tests {
             nullable_array_gen.type_decl_for_func().unwrap(),
             "Option<&[Option<String>]>"
         );
+    }
+
+    #[test]
+    fn fixed_array_over_32_uses_array_from_fn_default() {
+        // A non-nullable `int[40]` field cannot use `Default::default()`
+        // (Default is only implemented for arrays up to length 32), so every
+        // default-emission path must use `std::array::from_fn`. Covers the
+        // parcelable struct-field path (`init_value(None)`) — the most common
+        // site — plus `default_value` (out-params / union members).
+        let big = TypeGenerator::new(&NonArrayType {
+            name: "int".to_owned(),
+            generic: None,
+            name_span: None,
+        })
+        .unwrap()
+        .array(&[crate::parser::ArrayType {
+            const_expr: Some(ConstExpr::new(ValueType::Int32(40))),
+        }]);
+
+        let field_default = big
+            .init_value(None, InitParam::builder().with_const(false))
+            .unwrap();
+        assert!(
+            field_default.contains("std::array::from_fn"),
+            "parcelable field default must not be bare Default::default(): {field_default}"
+        );
+        assert!(big.default_value().contains("std::array::from_fn"));
+
+        // A fixed array whose every dimension is <= 32 keeps Default::default()
+        // (Default is implemented there) — no codegen churn.
+        let small = TypeGenerator::new(&NonArrayType {
+            name: "int".to_owned(),
+            generic: None,
+            name_span: None,
+        })
+        .unwrap()
+        .array(&[crate::parser::ArrayType {
+            const_expr: Some(ConstExpr::new(ValueType::Int32(8))),
+        }]);
+        assert_eq!(small.default_value(), "Default::default()");
     }
 
     #[test]

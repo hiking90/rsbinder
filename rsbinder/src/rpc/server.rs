@@ -170,6 +170,22 @@ impl RawAccepted {
         }
     }
 
+    /// Companion to [`set_read_timeout`](Self::set_read_timeout): bound the
+    /// pre-wrap handshake's *write* side too. A peer that completes enough
+    /// of the handshake to be admitted but then stops reading would stall
+    /// our blocking handshake-reply `write_all` once its receive window
+    /// fills, pinning this worker (and its admission slot) — symmetric to
+    /// the read-side Slowloris. Best-effort.
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            RawAccepted::Unix(s) => s.set_write_timeout(timeout),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            RawAccepted::Vsock(s) => s.set_write_timeout(timeout),
+            #[cfg(feature = "rpc-tls")]
+            RawAccepted::Tcp(s) => s.set_write_timeout(timeout),
+        }
+    }
+
     /// Wrap the raw stream as `RpcTransport`, on the
     /// worker thread. `tls_config = Some(cfg)` ⇒ drive a server-side
     /// TLS handshake via [`TlsTransport::accept_stream`] over the raw
@@ -664,7 +680,11 @@ impl RpcServer {
     /// [`set_max_connections`](RpcServer::set_max_connections) admission
     /// slot — without it, a few idle peers can exhaust the cap and wedge
     /// the accept loop. `None` disables the deadline (a hung peer may
-    /// then hold a slot indefinitely).
+    /// then hold a slot indefinitely). The deadline is armed on **both**
+    /// the read and write sides of the handshake, so a peer that is
+    /// admitted but then refuses to read our handshake reply (stalling our
+    /// blocking `write_all` once its receive window fills) is bounded too,
+    /// not just a peer that refuses to send.
     ///
     /// The deadline bounds **only** the handshake/first-contact phase. For
     /// the android-13+ profile it is cleared after the explicit handshake;
@@ -697,6 +717,12 @@ impl RpcServer {
     /// keepalive/timeouts are otherwise the only backstop. (Currently
     /// honored on the android-13+ serve path; the r34 profile already
     /// bounds its first frame via the handshake deadline.)
+    ///
+    /// The serve phase arms this value on the **write** side too, so a peer
+    /// that stops draining replies is evicted as well — but a consumer that
+    /// legitimately reads a large reply slower than `d` is also dropped
+    /// mid-send (the connection is torn down, not desynced). Size `d`
+    /// against the slowest acceptable consumer, not just the idle gap.
     pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) {
         *self.idle_timeout.lock().expect("idle_timeout poisoned") = timeout;
     }
@@ -989,6 +1015,9 @@ impl RpcServer {
                 if let Err(e) = raw.set_read_timeout(Some(d)) {
                     log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
                 }
+                if let Err(e) = raw.set_write_timeout(Some(d)) {
+                    log::debug!("RPC: failed to arm pre-wrap handshake write timeout: {e:?}");
+                }
             }
             let transport = match server.wrap_accepted(raw) {
                 Ok(t) => t,
@@ -1021,19 +1050,28 @@ impl RpcServer {
     }
 
     /// Transition a connection from the bounded handshake/admission phase
-    /// to the long-lived serving phase (best-effort). By default this
-    /// lifts the read deadline entirely (`None`), so an established
-    /// two-way session may idle between requests unbounded — byte-identical
-    /// to prior behavior. If [`set_idle_timeout`](Self::set_idle_timeout)
-    /// was called, the serve loop instead inherits that idle read deadline,
-    /// so a peer that completes the handshake and then goes silent (a
+    /// to the long-lived serving phase (best-effort), arming **both** the
+    /// read and write deadlines. By default both are lifted (`None`), so an
+    /// established two-way session may idle between requests unbounded —
+    /// byte-identical to prior behavior. If
+    /// [`set_idle_timeout`](Self::set_idle_timeout) was called, the serve
+    /// loop inherits that value on each side, so a peer that completes the
+    /// handshake and then goes silent (or stops reading our replies) — a
     /// post-handshake Slowloris that would otherwise pin a
     /// [`set_max_connections`](Self::set_max_connections) admission slot
-    /// forever) surfaces as a serve-loop read error and is evicted.
-    fn arm_serve_read_timeout(&self, transport: &dyn RpcTransport) {
+    /// forever — surfaces as a serve-loop error and is evicted.
+    fn arm_serve_timeouts(&self, transport: &dyn RpcTransport) {
         let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
         if let Err(e) = transport.set_read_timeout(idle) {
             log::debug!("RPC: failed to set serve-phase read timeout: {e:?}");
+        }
+        // Mirror the deadline onto the write side so a peer that idles
+        // *and* stops reading can't pin the worker via a blocked reply
+        // send. `None` (the default) leaves writes unbounded — byte-
+        // identical to prior behavior; a configured idle timeout now
+        // bounds both directions.
+        if let Err(e) = transport.set_write_timeout(idle) {
+            log::debug!("RPC: failed to set serve-phase write timeout: {e:?}");
         }
     }
 
@@ -1066,7 +1104,7 @@ impl RpcServer {
         // Bound the pre-serve handshake/first-contact phase so a
         // connected-but-silent peer can't pin its `Arc<RpcServer>` +
         // admission slot forever. Transitioned to the serve-phase deadline
-        // by `arm_serve_read_timeout` before any long-lived serve (`None`
+        // by `arm_serve_timeouts` before any long-lived serve (`None`
         // ⇒ idle unbounded, or the configured `set_idle_timeout`).
         // Best-effort: a set failure just means no deadline.
         if let Some(d) = *server
@@ -1076,6 +1114,9 @@ impl RpcServer {
         {
             if let Err(e) = transport.set_read_timeout(Some(d)) {
                 log::debug!("RPC: failed to arm handshake read timeout: {e:?}");
+            }
+            if let Err(e) = transport.set_write_timeout(Some(d)) {
+                log::debug!("RPC: failed to arm handshake write timeout: {e:?}");
             }
         }
         let a13_max = *server
@@ -1112,7 +1153,7 @@ impl RpcServer {
                 // serve-phase deadline — `None` (default, unbounded idle) or
                 // the configured `set_idle_timeout` so a post-handshake
                 // silent peer is evicted instead of pinning its slot.
-                server.arm_serve_read_timeout(transport.as_ref());
+                server.arm_serve_timeouts(transport.as_ref());
                 if incoming {
                     // Attach + incoming (`server_accept` already
                     // rejected new + incoming): resolve the session,
@@ -1377,6 +1418,31 @@ impl RpcServer {
                     // whole server down for all future clients.
                     log::warn!("transient accept error, continuing: {e}");
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(code)
+                            if code == libc::EMFILE
+                                || code == libc::ENFILE
+                                || code == libc::ENOMEM
+                                || code == libc::ENOBUFS
+                    ) =>
+                {
+                    // Resource exhaustion: the process or system fd table
+                    // is full (EMFILE/ENFILE) or the kernel is out of
+                    // memory/buffers (ENOMEM/ENOBUFS). A peer that churns
+                    // connections can drive us to RLIMIT_NOFILE, at which
+                    // point `accept` returns EMFILE. These map to
+                    // `ErrorKind::Uncategorized`/`OutOfMemory`, so without
+                    // this arm they fall through to the fatal branch and
+                    // kill the listener for ALL future clients — turning a
+                    // transient overload into a permanent outage. The
+                    // condition is self-healing as in-flight sessions close
+                    // their fds, so back off (longer than the EINTR case to
+                    // give descriptors time to free) and keep serving.
+                    log::warn!("accept resource exhaustion, backing off: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => {
                     // Fatal (e.g. the listener was closed): surface it.

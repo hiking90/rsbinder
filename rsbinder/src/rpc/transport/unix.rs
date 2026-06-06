@@ -244,7 +244,16 @@ impl RpcTransport for UnixTransport {
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         let mut r = &self.stream;
-        r.read(buf).map_err(RpcError::from)
+        match r.read(buf) {
+            Ok(n) => Ok(n),
+            // A read deadline (`SO_RCVTIMEO` via `set_read_timeout`)
+            // elapsed. Surface it as `Timeout` rather than a generic `Io`
+            // so the android-13+ reader (`read_exact_raw`) can honor the
+            // `Timeout`/`Truncated` contract and a caller matching
+            // `Timeout`/`StatusCode::TimedOut` sees it.
+            Err(e) if super::is_timeout(&e) => Err(RpcError::Timeout),
+            Err(e) => Err(RpcError::from(e)),
+        }
     }
 
     /// Raw, **unframed** write + `SCM_RIGHTS` (the android-13+ v1+
@@ -327,7 +336,17 @@ impl RpcTransport for UnixTransport {
                 Ok(r) => break r,
                 // EINTR retry, symmetric with read_header.
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(std::io::Error::from(e).into()),
+                Err(e) => {
+                    let io_err = std::io::Error::from(e);
+                    // A read deadline elapsed (EAGAIN/EWOULDBLOCK from
+                    // `SO_RCVTIMEO`): surface `Timeout` (the accumulating
+                    // reader downgrades to `Truncated` if it was already
+                    // mid-message), not a generic `Io`.
+                    if super::is_timeout(&io_err) {
+                        return Err(RpcError::Timeout);
+                    }
+                    return Err(io_err.into());
+                }
             }
         };
         for msg in anc.drain() {
@@ -355,6 +374,11 @@ impl RpcTransport for UnixTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_write_timeout(timeout)?;
         Ok(())
     }
 

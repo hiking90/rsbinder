@@ -97,4 +97,9 @@ impl RpcTransport for VsockTransport {
         self.stream.set_read_timeout(timeout)?;
         Ok(())
     }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
 }

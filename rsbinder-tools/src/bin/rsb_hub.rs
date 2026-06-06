@@ -95,6 +95,31 @@ impl rsbinder::DeathRecipient for DeathRecipientWrapper {
     }
 }
 
+/// Lock the registry mutex, recovering from poisoning instead of
+/// propagating it. The service manager is the single point of failure for
+/// the whole device's IPC: every transaction handler runs under
+/// `catch_unwind`, so a panic *under* the guard poisons the mutex rather
+/// than crashing the process — and a plain `.lock().unwrap()` would then
+/// turn that one panic into a permanent outage (every subsequent request,
+/// and the death-notification thread, would panic on the poison).
+/// `into_inner` always yields a type-valid `Inner`, and the worst surviving
+/// inconsistency from a panic mid-section is a leaked death link or a
+/// skipped notification — never a corrupted map or a deadlock — so
+/// continuing on the recovered state degrades gracefully rather than
+/// wedging device IPC.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Upper bound on registration / client callbacks held per service name.
+/// `registerForNotifications` has no uid gating on Linux, so without a cap
+/// (and identity de-duplication) a client could loop-register to grow the
+/// heap without bound and multiply every per-service notification by the
+/// duplicate count. AOSP relies on SELinux/uid admission that rsb_hub does
+/// not have; this is the defense in its place. Generous enough that no
+/// legitimate caller hits it.
+const MAX_CALLBACKS_PER_NAME: usize = 256;
+
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
     name_to_service: HashMap<String, Service>,
@@ -403,7 +428,7 @@ impl ServiceManager {
             .name("rsb_hub:death".to_owned())
             .spawn(move || {
                 for who in death_receiver {
-                    let mut inner = inner_clone.lock().unwrap();
+                    let mut inner = lock_recover(&inner_clone);
 
                     inner
                         .name_to_service
@@ -457,15 +482,12 @@ impl ServiceManager {
                     return;
                 };
 
-                let mut inner = match inner_arc.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        log::error!(
-                            "client callback poller: Inner mutex poisoned by another thread, exiting"
-                        );
-                        return;
-                    }
-                };
+                // Recover from poisoning rather than exiting: if the poller
+                // gave up here, lazy services would never again receive their
+                // periodic `onClients(false)` and could never shut down. The
+                // guarded state is a self-contained map mutation, so the
+                // recovered state is safe to continue from.
+                let mut inner = lock_recover(&inner_arc);
 
                 // Snapshot the names before iterating so we don't hold a
                 // borrow into `name_to_service` across calls that may
@@ -560,7 +582,17 @@ fn classify_for_service_union(
                 isLazyService: false,
             })
         }
-        None => Service::Service::Accessor(None),
+        // Not found. AOSP returns `serviceWithMetadata(nullptr)` for a
+        // missing non-accessor name, which an AOSP client routes into its
+        // local `getInjectedAccessor(name)` fallback; an `accessor(nullptr)`
+        // reply would instead just log and return null, skipping that
+        // fallback. rsbinder's own consume side runs
+        // `try_process_local_fallback` on this arm too (it handles
+        // `swm.service.is_none()` identically).
+        None => Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
+            service: None,
+            isLazyService: false,
+        }),
     }
 }
 
@@ -578,7 +610,7 @@ impl IServiceManager for ServiceManager {
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
         let mut pending = Vec::new();
         let result = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             inner
                 .try_get_binder(name, false, &mut pending)?
                 .map(|(b, _)| b)
@@ -633,7 +665,7 @@ impl IServiceManager for ServiceManager {
         let mut client_pending = Vec::new();
         let mut reg_pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
 
             let mut prev_clients = false;
@@ -776,7 +808,7 @@ impl IServiceManager for ServiceManager {
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
         let mut pending = Vec::new();
         let result = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             inner
                 .try_get_binder(name, false, &mut pending)?
                 .map(|(b, _)| b)
@@ -786,7 +818,7 @@ impl IServiceManager for ServiceManager {
     }
 
     fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_recover(&self.inner);
 
         let mut services = Vec::new();
 
@@ -812,7 +844,24 @@ impl IServiceManager for ServiceManager {
 
         let mut pending = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
+
+            // Drop idempotent re-registrations and cap the list before
+            // taking a death link or storing the callback (so neither leaks
+            // on the rejected paths). See `MAX_CALLBACKS_PER_NAME`.
+            if let Some(existing) = inner.name_to_registration_callbacks.get(name) {
+                let cb_binder = arg_callback.as_binder();
+                if existing.iter().any(|c| c.as_binder() == cb_binder) {
+                    return Ok(());
+                }
+                if existing.len() >= MAX_CALLBACKS_PER_NAME {
+                    let msg = format!(
+                        "registerForNotifications: too many callbacks for {name} (max {MAX_CALLBACKS_PER_NAME})"
+                    );
+                    log::warn!("{}", &msg);
+                    return Err((ExceptionCode::IllegalState, msg.as_str()).into());
+                }
+            }
 
             arg_callback.as_binder().link_to_death(Arc::downgrade(
                 &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
@@ -844,7 +893,7 @@ impl IServiceManager for ServiceManager {
             dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
     ) -> rsbinder::status::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_recover(&self.inner);
 
         if inner
             .remove_registration_callback(Some(name), &SIBinder::downgrade(&callback.as_binder()))
@@ -915,7 +964,7 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<()> {
         let mut pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
 
             let service = if let Some(service) = inner.name_to_service.get(name) {
                 service
@@ -938,6 +987,23 @@ impl IServiceManager for ServiceManager {
                 let msg = format!("registerClientCallback called with wrong service {name}");
                 log::warn!("{}", &msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+            }
+
+            // Drop idempotent re-registrations and cap the list before
+            // taking a death link or storing the callback. See
+            // `MAX_CALLBACKS_PER_NAME`.
+            if let Some(existing) = inner.name_to_client_callbacks.get(name) {
+                let cb_binder = arg_callback.as_binder();
+                if existing.iter().any(|c| c.as_binder() == cb_binder) {
+                    return Ok(());
+                }
+                if existing.len() >= MAX_CALLBACKS_PER_NAME {
+                    let msg = format!(
+                        "registerClientCallback: too many callbacks for {name} (max {MAX_CALLBACKS_PER_NAME})"
+                    );
+                    log::warn!("{}", &msg);
+                    return Err((ExceptionCode::IllegalState, msg.as_str()).into());
+                }
             }
 
             arg_callback.as_binder().link_to_death(Arc::downgrade(
@@ -982,7 +1048,7 @@ impl IServiceManager for ServiceManager {
 
         let mut pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             let service = if let Some(service) = inner.name_to_service.get(name) {
                 service
             } else {
@@ -1044,6 +1110,22 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
+            // Drop the death subscription before removing the entry.
+            // `ProxyHandle::Drop` does not clear the kernel death
+            // notification (rsbinder has no `~Service` hook), so — exactly
+            // as addService's replace path does — an explicit unlink is
+            // required. Otherwise every register→tryUnregister cycle (e.g.
+            // a lazy service idling and reactivating) leaks a kernel
+            // `BC_REQUEST_DEATH_NOTIFICATION` plus a `DeathRecipient` entry.
+            if arg_service.as_proxy().is_some() {
+                let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
+                if let Err(e) = arg_service.unlink_to_death(Arc::downgrade(&recipient)) {
+                    log::warn!(
+                        "tryUnregisterService: failed to unlink death notification for '{name}': {e:?}"
+                    );
+                }
+            }
+
             inner.name_to_service.remove(name);
 
             Ok(())
@@ -1058,7 +1140,7 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<
         Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>,
     > {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_recover(&self.inner);
 
         let mut out = Vec::with_capacity(inner.name_to_service.len());
 
@@ -1083,7 +1165,7 @@ impl IServiceManager for ServiceManager {
         // match arms.
         let mut pending = Vec::new();
         let lookup = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             inner.try_get_binder(name, false, &mut pending)?
         };
         fire_pending(pending);
@@ -1098,7 +1180,7 @@ impl IServiceManager for ServiceManager {
         // `classify_for_service_union`.
         let mut pending = Vec::new();
         let lookup = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_recover(&self.inner);
             inner.try_get_binder(name, false, &mut pending)?
         };
         fire_pending(pending);

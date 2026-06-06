@@ -145,6 +145,13 @@ impl Deserialize for ExceptionCode {
 /// `Status` combines an exception code, status code, and optional message
 /// to provide comprehensive error information for binder transactions.
 /// It can represent both successful operations and various failure modes.
+///
+/// `Clone` is derived (every field is `Clone`) so callers can fan a
+/// failed result out to multiple handlers, copy it while logging, or
+/// re-surface it on retry — mirroring AOSP's copyable `Status`. `PartialEq`
+/// is a manual impl (it deliberately ignores `message`), so it is not part
+/// of the derive.
+#[derive(Clone)]
 pub struct Status {
     code: StatusCode,
     exception: ExceptionCode,

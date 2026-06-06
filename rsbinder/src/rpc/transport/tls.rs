@@ -75,6 +75,8 @@ pub trait TlsStream: Send + Sync {
     fn flush(&self) -> std::io::Result<()>;
     /// Set the read deadline for subsequent `read`s (`None` = blocking).
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
+    /// Set the write deadline for subsequent `write`s (`None` = blocking).
+    fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
 }
 
 // All std stream types implement `Read`/`Write` for `&Stream`, so the
@@ -92,6 +94,9 @@ impl TlsStream for TcpStream {
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_read_timeout(self, t)
     }
+    fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, t)
+    }
 }
 
 impl TlsStream for UnixStream {
@@ -106,6 +111,9 @@ impl TlsStream for UnixStream {
     }
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         UnixStream::set_read_timeout(self, t)
+    }
+    fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, t)
     }
 }
 
@@ -122,6 +130,9 @@ impl TlsStream for vsock::VsockStream {
     }
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         vsock::VsockStream::set_read_timeout(self, t)
+    }
+    fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        vsock::VsockStream::set_write_timeout(self, t)
     }
 }
 
@@ -409,6 +420,11 @@ impl RpcTransport for TlsTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_write_timeout(timeout)?;
         Ok(())
     }
 }

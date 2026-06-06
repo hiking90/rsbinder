@@ -53,20 +53,41 @@ impl BpServiceManager {
 
 /// Retrieve an existing service, blocking for a few seconds if it doesn't yet
 /// exist.
+///
+/// The Android 10 C service manager's `GET_SERVICE` transaction is itself
+/// **non-blocking** (it answers immediately whether or not the service is
+/// registered). AOSP's libbinder provides the documented "block a few
+/// seconds for a not-yet-registered service" behavior entirely client-side,
+/// by polling roughly once per second for ~5s
+/// (`BpServiceManager::getService`). This mirrors that so early-boot
+/// lookups of a service that is about to register don't spuriously return
+/// `None` — matching the API 30+ path and stock Android 10.
 pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
-    let result = (|| -> Result<Option<SIBinder>> {
-        let mut data = sm.proxy().prepare_transact(true)?;
-        data.write(name)?;
-        sm.transact(GET_SERVICE, &data)?.read()
-    })();
+    // ~5s total: one immediate attempt plus up to 5 once-per-second retries.
+    const RETRIES: u32 = 5;
+    for attempt in 0..=RETRIES {
+        let result = (|| -> Result<Option<SIBinder>> {
+            let mut data = sm.proxy().prepare_transact(true)?;
+            data.write(name)?;
+            sm.transact(GET_SERVICE, &data)?.read()
+        })();
 
-    match result {
-        Ok(binder) => binder,
-        Err(err) => {
-            log::error!("Failed to get service {name}: {err:?}");
-            None
+        match result {
+            Ok(Some(binder)) => return Some(binder),
+            // Not yet registered (the C SM's not-found reply also surfaces
+            // here as a short read). Retry. Logged at debug so a benign
+            // boot-time miss doesn't flood logcat across all attempts.
+            Ok(None) => {}
+            Err(err) => {
+                log::debug!("get_service({name}) attempt {attempt} failed, retrying: {err:?}");
+            }
+        }
+
+        if attempt < RETRIES {
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+    None
 }
 
 /// Retrieve an existing service called @a name from the service

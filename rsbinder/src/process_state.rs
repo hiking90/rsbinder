@@ -262,6 +262,28 @@ pub(crate) struct PublishedNative {
     /// `BR_DECREFS` decrement (deferred via `pending_*_derefs`,
     /// processed FIFO).
     pub(crate) kernel_refs: u32,
+    /// Number of `publish_native` dedup hits whose matching
+    /// `acquire` (`incref_publish`) has not landed yet. A dedup
+    /// returns an existing id but `publish_count` is only bumped by
+    /// the immediately-following `acquire`; without this reservation
+    /// a concurrent `decref_publish`/`deref_native_kernel` that drives
+    /// the counters to zero in that gap would remove the entry, and
+    /// the pending `acquire` would then ship a `binder` id the kernel
+    /// can no longer resolve. Bumped under the write lock on dedup,
+    /// consumed by the next `incref_publish`, and required to be zero
+    /// before any removal.
+    ///
+    /// Best-effort: the reservation is keyed by id, not by the specific
+    /// dedup, so an `append_from`-clone `acquire` on the same id can
+    /// consume it. That closes the common window (a `decref`/`deref`
+    /// racing a dedup) but not the pathological one where a clone's entire
+    /// `acquire`..`release` lifetime nests inside a single dedup's
+    /// `publish_native`..`acquire` gap — that gap is two adjacent
+    /// statements with no blocking call, so it is not reachable in
+    /// practice. Fully closing it would require threading "is-dedup" into
+    /// `flat_binder_object::acquire` (a `binder_object.rs` protocol
+    /// change); deferred.
+    pub(crate) pending_reservations: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -896,10 +918,12 @@ impl ProcessState {
     /// encoding (replacing the data half of the old fat-pointer pair).
     ///
     /// Dedup is by `Arc::ptr_eq` against existing `binder_pin` entries —
-    /// publishing the same `Arc` twice returns the same id without any
-    /// counter side effects, matching Android's behavior where a single
-    /// `binder_node` is allocated per `weakref_type*` regardless of how
-    /// many times it is sent.
+    /// publishing the same `Arc` twice returns the same id, matching
+    /// Android's behavior where a single `binder_node` is allocated per
+    /// `weakref_type*` regardless of how many times it is sent. A dedup
+    /// hit bumps `pending_reservations` (the only counter side effect)
+    /// to pin the entry against a concurrent removal until the matching
+    /// `acquire` lands; see that field's doc.
     ///
     /// On a fresh insert, `RefCounter.strong` is driven 0→1 via
     /// `SIBinder::from_arc` (which calls `inc_strong` once on the inner
@@ -923,8 +947,14 @@ impl ProcessState {
             .published_natives
             .write()
             .expect("Published natives lock poisoned");
-        for (existing_id, entry) in map.iter() {
+        for (existing_id, entry) in map.iter_mut() {
             if Arc::ptr_eq(entry.binder_pin.as_arc(), &arc) {
+                // Reserve the entry against a concurrent removal until
+                // the matching `acquire` (incref_publish) lands; see
+                // `PublishedNative::pending_reservations`. `saturating_add`
+                // for symmetry with every decrement in this file (a wrap
+                // to 0 would defeat the reservation).
+                entry.pending_reservations = entry.pending_reservations.saturating_add(1);
                 return *existing_id;
             }
         }
@@ -945,6 +975,7 @@ impl ProcessState {
                 binder_pin,
                 publish_count: 0,
                 kernel_refs: 0,
+                pending_reservations: 0,
             },
         );
         id
@@ -966,6 +997,12 @@ impl ProcessState {
         match map.get_mut(&id) {
             Some(entry) => {
                 entry.publish_count += 1;
+                // Consume one outstanding reservation if any. The reservation
+                // is keyed by id, not by a specific dedup, so this closes the
+                // common window (a `decref`/`deref` racing a dedup before its
+                // acquire) but is best-effort: see the residual note on
+                // `PublishedNative::pending_reservations`.
+                entry.pending_reservations = entry.pending_reservations.saturating_sub(1);
                 true
             }
             None => false,
@@ -999,7 +1036,9 @@ impl ProcessState {
                          flat_binder_object::release pairing)"
                     );
                     entry.publish_count = entry.publish_count.saturating_sub(1);
-                    entry.publish_count == 0 && entry.kernel_refs == 0
+                    entry.publish_count == 0
+                        && entry.kernel_refs == 0
+                        && entry.pending_reservations == 0
                 }
                 None => return false,
             }
@@ -1063,7 +1102,9 @@ impl ProcessState {
             // in multi-pair scenarios; left as a follow-up.
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
-            let trigger = entry.publish_count == 0 && entry.kernel_refs == 0;
+            let trigger = entry.publish_count == 0
+                && entry.kernel_refs == 0
+                && entry.pending_reservations == 0;
             (arc, trigger)
         };
         if trigger_remove {
@@ -1105,7 +1146,7 @@ impl ProcessState {
                 .expect("Published natives lock poisoned");
             let needs_remove = map
                 .get(&id)
-                .map(|e| e.publish_count == 0 && e.kernel_refs == 0)
+                .map(|e| e.publish_count == 0 && e.kernel_refs == 0 && e.pending_reservations == 0)
                 .unwrap_or(false);
             if !needs_remove {
                 return;
@@ -1674,6 +1715,44 @@ mod tests {
             process.lookup_native(id1).is_none(),
             "entry must be removed after the last release fires"
         );
+
+        drop(arc);
+    }
+
+    /// A dedup hit reserves the entry against a concurrent removal that
+    /// drives `publish_count` to zero before the dedup's matching
+    /// `acquire` lands. This replays the dangerous interleaving
+    /// deterministically: without `pending_reservations` the `decref`
+    /// below would remove the entry and the trailing `incref` would
+    /// fail (the kernel would be handed an unresolvable id).
+    #[test]
+    #[serial_test::serial(binder)]
+    fn test_native_dedup_reserves_against_concurrent_removal() {
+        let process = ProcessState::init_default().expect("init_default");
+        let arc: Arc<dyn IBinder> = Arc::new(MockNative);
+
+        // Thread A publishes and serializes (acquire): publish_count = 1.
+        let id = process.publish_native(Arc::clone(&arc));
+        assert!(process.incref_publish(id));
+
+        // Thread B publishes the same Arc (dedup) — its acquire is still
+        // pending at this point.
+        let id_b = process.publish_native(Arc::clone(&arc));
+        assert_eq!(id, id_b);
+
+        // Thread A's parcel is freed (release) -> publish_count = 0. The
+        // entry must NOT be removed, because B's dedup acquire is pending.
+        assert!(process.decref_publish(id));
+        assert!(
+            process.lookup_native(id).is_some(),
+            "dedup reservation must keep the entry alive across the acquire gap"
+        );
+
+        // Thread B's acquire finally lands, consuming the reservation.
+        assert!(process.incref_publish(id));
+        // Thread B's release -> now genuinely zero -> removed.
+        assert!(process.decref_publish(id));
+        assert!(process.lookup_native(id).is_none());
 
         drop(arc);
     }

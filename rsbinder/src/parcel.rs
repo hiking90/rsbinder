@@ -1062,14 +1062,22 @@ impl Parcel {
         // SAFETY: `reserve(pos + padded)` above guarantees the destination
         // has at least `pos + padded` bytes of capacity, so `add(pos)` and
         // the `size`-byte copy (size <= padded) stay in-bounds and the
-        // ranges do not overlap (distinct allocations). `set_len` only grows
-        // up to the just-reserved capacity over now-initialized `u8` bytes.
+        // ranges do not overlap (distinct allocations). The 0-3 trailing pad
+        // bytes are then zeroed so that `set_len` exposes only initialized
+        // memory: `reserve` allocates but does not initialize, and the pad is
+        // transmitted (it is counted in `data_size`), so without this we would
+        // both hit UB and leak uninitialized process memory to the peer. AOSP
+        // masks the pad to zero as well. `set_len` only grows up to the
+        // just-reserved capacity over now-initialized `u8` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 parcelable.as_ptr() as _,
                 self.data.as_mut_ptr().add(pos),
                 size,
             );
+            if padded > size {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(pos + size), 0, padded - size);
+            }
             if self.data.len() < pos + padded {
                 self.data.set_len(pos + padded);
             }
@@ -1128,14 +1136,24 @@ impl Parcel {
         // SAFETY: `reserve(pos + aligned)` guarantees capacity for `add(pos)`
         // and the `unaligned`-byte copy (unaligned <= aligned). Source `data`
         // and the parcel buffer are distinct allocations (non-overlapping).
-        // `set_len` only grows up to the reserved capacity over `u8` bytes
-        // just initialized by the copy.
+        // The 0-3 trailing pad bytes are zeroed before `set_len`: `reserve`
+        // does not initialize, and the pad is transmitted (counted in
+        // `data_size`), so leaving it uninitialized is both UB and an
+        // info-leak to the peer. AOSP masks the pad to zero too. `set_len`
+        // only grows up to the reserved capacity over now-initialized `u8`.
         unsafe {
             std::ptr::copy_nonoverlapping::<u8>(
                 data.as_ptr(),
                 self.data.as_mut_ptr().add(pos),
                 unaligned,
             );
+            if aligned > unaligned {
+                std::ptr::write_bytes(
+                    self.data.as_mut_ptr().add(pos + unaligned),
+                    0,
+                    aligned - unaligned,
+                );
+            }
             if pos + aligned > self.data.len() {
                 self.data.set_len(pos + aligned);
             }
@@ -1451,6 +1469,29 @@ mod tests {
         // proving the returned `&mut [T]` actually aliases the
         // underlying storage (not a copy).
         assert_eq!(pd.as_slice(), &[99u8, 1, 2, 200][..]);
+    }
+
+    #[test]
+    fn write_array_zeroes_trailing_pad() {
+        // A byte array whose length is not a multiple of 4 leaves 1-3
+        // trailing pad bytes inside the (4-byte aligned) parcel slot. That
+        // pad is part of the transmitted payload (it is counted in
+        // `data_size`), so it must be zeroed — matching AOSP — otherwise
+        // `reserve`+`set_len` would mark uninitialized/leftover memory as
+        // initialized (UB) and leak it to the peer.
+        let mut parcel = Parcel::new();
+        // Poison the first 8 bytes with 0xFF so a missing zero-fill is
+        // observable as leftover bytes rather than incidental zeros.
+        parcel.write(&(-1i32)).unwrap();
+        parcel.write(&(-1i32)).unwrap();
+        parcel.set_data_position(0);
+
+        // 1-byte payload -> [i32 len=1][1 data byte][3 pad bytes].
+        let payload: &[u8] = &[0xAB];
+        SerializeArray::serialize_array(payload, &mut parcel).unwrap();
+
+        let bytes = parcel.data.as_slice();
+        assert_eq!(&bytes[4..8], &[0xAB, 0x00, 0x00, 0x00]);
     }
 
     #[test]
