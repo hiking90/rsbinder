@@ -341,6 +341,18 @@ pub struct RpcServer {
     /// deadline is cleared once serving begins, so an established
     /// two-way session may idle between requests unbounded.
     handshake_timeout: Mutex<Option<std::time::Duration>>,
+    /// Optional per-connection *idle* read deadline applied to the
+    /// android-13+ serve loop **after** the handshake completes. `None`
+    /// (the default) ⇒ an established session idles between requests
+    /// unbounded (byte-identical to prior behavior). `Some(d)` ⇒ a peer
+    /// that completes the handshake and then goes silent surfaces as a
+    /// serve-loop read error after `d`, releasing its worker and its
+    /// [`set_max_connections`](Self::set_max_connections) admission slot —
+    /// the post-handshake Slowloris defense that
+    /// [`set_handshake_timeout`](Self::set_handshake_timeout) (handshake
+    /// phase only) does not cover. Set this only when the protocol has
+    /// regular traffic or idle eviction is acceptable.
+    idle_timeout: Mutex<Option<std::time::Duration>>,
     /// Opt-in authorization hook. `None`
     /// (default) ⇒ accept-all = byte-for-byte a server without the hook
     /// (additive invariant). When set, it runs at
@@ -485,6 +497,7 @@ impl RpcServer {
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
             handshake_timeout: Mutex::new(Some(DEFAULT_HANDSHAKE_TIMEOUT)),
+            idle_timeout: Mutex::new(None),
             authorizer: Mutex::new(None),
             attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
@@ -665,6 +678,27 @@ impl RpcServer {
             .handshake_timeout
             .lock()
             .expect("handshake_timeout poisoned") = timeout;
+    }
+
+    /// Set (or disable) the **idle read deadline** applied to the
+    /// android-13+ serve loop *after* the handshake completes. Default
+    /// `None` ⇒ an established session may idle between requests unbounded
+    /// (byte-identical to prior behavior).
+    ///
+    /// [`set_handshake_timeout`](Self::set_handshake_timeout) only bounds
+    /// the handshake/first-contact phase; once a peer completes the
+    /// handshake it can then go silent and hold its worker — and, under
+    /// [`set_max_connections`](Self::set_max_connections), an admission
+    /// slot — indefinitely (a post-handshake Slowloris that starves the
+    /// accept loop). Setting a `Some(d)` idle timeout evicts such a peer
+    /// after `d` of silence, freeing the slot. Use it when the protocol
+    /// has regular traffic or idle eviction is acceptable; pair it with
+    /// `set_max_connections` for untrusted peers, since OS-level TCP
+    /// keepalive/timeouts are otherwise the only backstop. (Currently
+    /// honored on the android-13+ serve path; the r34 profile already
+    /// bounds its first frame via the handshake deadline.)
+    pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) {
+        *self.idle_timeout.lock().expect("idle_timeout poisoned") = timeout;
     }
 
     /// Reap finished worker handles and return the live (concurrent)
@@ -986,12 +1020,20 @@ impl RpcServer {
         raw.into_transport()
     }
 
-    /// Lift the admission read deadline (best-effort) once a connection
-    /// reaches the serving phase, so an established two-way session may
-    /// idle between requests unbounded.
-    fn clear_handshake_timeout(transport: &dyn RpcTransport) {
-        if let Err(e) = transport.set_read_timeout(None) {
-            log::debug!("RPC: failed to clear handshake read timeout: {e:?}");
+    /// Transition a connection from the bounded handshake/admission phase
+    /// to the long-lived serving phase (best-effort). By default this
+    /// lifts the read deadline entirely (`None`), so an established
+    /// two-way session may idle between requests unbounded — byte-identical
+    /// to prior behavior. If [`set_idle_timeout`](Self::set_idle_timeout)
+    /// was called, the serve loop instead inherits that idle read deadline,
+    /// so a peer that completes the handshake and then goes silent (a
+    /// post-handshake Slowloris that would otherwise pin a
+    /// [`set_max_connections`](Self::set_max_connections) admission slot
+    /// forever) surfaces as a serve-loop read error and is evicted.
+    fn arm_serve_read_timeout(&self, transport: &dyn RpcTransport) {
+        let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
+        if let Err(e) = transport.set_read_timeout(idle) {
+            log::debug!("RPC: failed to set serve-phase read timeout: {e:?}");
         }
     }
 
@@ -1023,9 +1065,10 @@ impl RpcServer {
         }
         // Bound the pre-serve handshake/first-contact phase so a
         // connected-but-silent peer can't pin its `Arc<RpcServer>` +
-        // admission slot forever. Cleared by `clear_handshake_timeout`
-        // before any long-lived serve so an established session idles
-        // unbounded. Best-effort: a set failure just means no deadline.
+        // admission slot forever. Transitioned to the serve-phase deadline
+        // by `arm_serve_read_timeout` before any long-lived serve (`None`
+        // ⇒ idle unbounded, or the configured `set_idle_timeout`).
+        // Best-effort: a set failure just means no deadline.
         if let Some(d) = *server
             .handshake_timeout
             .lock()
@@ -1065,9 +1108,11 @@ impl RpcServer {
                             return;
                         }
                     };
-                // Handshake done: lift the admission deadline so the
-                // serve loop / pooled callback slot is not bounded by it.
-                Self::clear_handshake_timeout(transport.as_ref());
+                // Handshake done: transition the admission deadline to the
+                // serve-phase deadline — `None` (default, unbounded idle) or
+                // the configured `set_idle_timeout` so a post-handshake
+                // silent peer is evicted instead of pinning its slot.
+                server.arm_serve_read_timeout(transport.as_ref());
                 if incoming {
                     // Attach + incoming (`server_accept` already
                     // rejected new + incoming): resolve the session,
@@ -1114,24 +1159,21 @@ impl RpcServer {
                             // shared pool at `2 * max_threads` — tight enough to
                             // bound the DoS, loose enough never to refuse a
                             // well-behaved client's callback connections.
+                            //
+                            // The cap is enforced atomically inside
+                            // `add_callback_slot` (check-and-push under the
+                            // `conn_state` lock) rather than via a separate
+                            // pre-check, so concurrent attach workers cannot
+                            // each clear an advisory check and overshoot it.
                             let incoming_cap =
                                 (inner.max_threads_value() as usize).saturating_mul(2);
-                            if inner.slot_count() >= incoming_cap {
+                            let session = RpcSession::wrap_inner(inner);
+                            if let Err(e) = session.add_callback_slot(transport, incoming_cap) {
                                 server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                                 log::warn!(
                                     "android-13+ RPC: incoming callback attach refused \
-                                     (slot cap reached: slot_count={}, cap={incoming_cap})",
-                                    inner.slot_count()
-                                );
-                                drop(transport);
-                                return;
-                            }
-                            let session = RpcSession::wrap_inner(inner);
-                            if let Err(e) = session.add_callback_slot(transport) {
-                                server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
-                                log::warn!(
-                                    "android-13+ RPC: incoming attach raced session \
-                                     teardown; rejecting: {e:?}"
+                                     (slot cap {incoming_cap} reached or session torn \
+                                     down): {e:?}"
                                 );
                             }
                         }

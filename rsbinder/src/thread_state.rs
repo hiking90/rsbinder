@@ -1102,38 +1102,63 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }
                 };
                 let flags = tr_secctx.transaction_data.flags;
-                if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-                    let flags = flags & transaction_flags_TF_CLEAR_BUF;
-                    let status: i32 = match result {
-                        Ok(_) => StatusCode::Ok.into(),
-                        Err(err) => err.into(),
-                    };
-                    thread_state.borrow_mut().write_transaction_data(
-                        binder::BC_REPLY,
-                        flags,
-                        u32::MAX,
-                        0,
-                        &reply,
-                        &status,
-                    )?;
-                    wait_for_response(UntilResponse::TransactionComplete)?;
-                } else if let Err(err) = result {
-                    let mut log = format!(
-                        "oneway function results for code {} on binder at {:X}",
-                        tr_secctx.transaction_data.code,
-                        // SAFETY: kernel-delivered transaction; `target.ptr`
-                        // is the active union variant. Read-only (logging).
-                        unsafe { tr_secctx.transaction_data.target.ptr }
-                    );
-                    log += &format!(" will be dropped but finished with status {err}");
+                // Restore the saved transaction state on every exit (an `Err`
+                // or panic must not leak it into the next command), and contain
+                // a panic from the reply flush/await — `talk_with_driver` or a
+                // nested dispatch; OOM aborts and is not catchable — rather than
+                // unwinding the worker loop (mirrors `dispatch_transact_caught`;
+                // a dropped reply reaches a sync caller as BR_DEAD_REPLY).
+                let reply_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                        if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+                            let flags = flags & transaction_flags_TF_CLEAR_BUF;
+                            let status: i32 = match result {
+                                Ok(_) => StatusCode::Ok.into(),
+                                Err(err) => err.into(),
+                            };
+                            thread_state.borrow_mut().write_transaction_data(
+                                binder::BC_REPLY,
+                                flags,
+                                u32::MAX,
+                                0,
+                                &reply,
+                                &status,
+                            )?;
+                            wait_for_response(UntilResponse::TransactionComplete)?;
+                        } else if let Err(err) = result {
+                            let mut log = format!(
+                                "oneway function results for code {} on binder at {:X}",
+                                tr_secctx.transaction_data.code,
+                                // SAFETY: kernel-delivered transaction; `target.ptr`
+                                // is the active union variant. Read-only (logging).
+                                unsafe { tr_secctx.transaction_data.target.ptr }
+                            );
+                            log += &format!(" will be dropped but finished with status {err}");
 
-                    if reply.data_size() != 0 {
-                        log += &format!(" and reply parcel size {}", reply.data_size());
-                    }
-                    log::error!("{log}");
-                }
+                            if reply.data_size() != 0 {
+                                log += &format!(" and reply parcel size {}", reply.data_size());
+                            }
+                            log::error!("{log}");
+                        }
+                        Ok(())
+                    }));
 
                 thread_state.borrow_mut().transaction = transaction_old;
+
+                match reply_result {
+                    Ok(inner) => inner?,
+                    Err(_payload) => {
+                        // A caught panic may leave `out_parcel` holding an
+                        // unflushed/partial BC_REPLY; drop it so the next IPC
+                        // does not flush a malformed command.
+                        let _ = thread_state.borrow_mut().out_parcel.set_data_size(0);
+                        log::error!(
+                            "reply path panicked for code {}; reply dropped",
+                            tr_secctx.transaction_data.code
+                        );
+                        return Err(StatusCode::Unknown);
+                    }
+                }
             }
 
             binder::BR_INCREFS => {

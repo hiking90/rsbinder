@@ -894,6 +894,33 @@ impl RpcSessionInner {
         self.add_slot_inner(transport)
     }
 
+    /// Like [`add_slot_inner`](Self::add_slot_inner) but enforces a
+    /// maximum pool size **atomically** under the `conn_state` lock:
+    /// returns `None` (adding nothing, closing `transport`) when the pool
+    /// already holds `cap` slots. Used for the server callback-slot
+    /// admission cap — callback slots have no serve loop and are only
+    /// reclaimed at session teardown, so a separate pre-check + add would
+    /// let concurrent attach workers each pass the check and overshoot the
+    /// cap, letting an untrusted peer grow the pool (and its held fds)
+    /// unbounded. Folding the check into the push closes that TOCTOU.
+    fn add_slot_inner_capped(&self, transport: Box<dyn RpcTransport>, cap: usize) -> Option<u64> {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        if st.slots.len() >= cap {
+            return None;
+        }
+        let transport: Arc<dyn RpcTransport> = Arc::from(transport);
+        let id = st.next_slot_id;
+        st.next_slot_id += 1;
+        st.slots.push(ConnSlot {
+            transport,
+            exclusive_tid: None,
+            id,
+        });
+        drop(st);
+        self.slot_cv.notify_all();
+        Some(id)
+    }
+
     /// Remove a slot from the pool on its worker's
     /// `serve_blocking_on` exit. Called by the slot's *own* worker
     /// (self-remove), so `find_conn_pinned(slot_id)`'s
@@ -1101,7 +1128,7 @@ impl RpcSessionInner {
                         .state
                         .lock()
                         .expect("rpc state poisoned")
-                        .on_binder_leaving(b)
+                        .on_binder_leaving(b)?
                 };
                 // AOSP `Parcel::flattenBinder`: `dataPos = mDataPos`
                 // is captured **before** `writeInt32(TYPE_BINDER)` —
@@ -1628,8 +1655,32 @@ impl RpcSessionInner {
         // authorization. The guard restores on drop, so a nested re-entrant
         // callback over the same connection nests correctly.
         let result = consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
-            let _calling = crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer));
-            target.rpc_transact(t.code, &mut reader, &mut reply)
+            // Mirror the kernel server entrypoint's `dispatch_transact_caught`
+            // (thread_state.rs): a panic in the user `on_transact` handler
+            // must NOT unwind through the serve loop, because that would skip
+            // the `serve_blocking_on_inner` cleanup (drop_connection /
+            // send_session_obituaries / remove_slot) and leave a slot pinned
+            // to a dead worker — deadlock + session-lifecycle corruption +
+            // missed obituaries. Catch it here and turn it into a
+            // deterministic error reply, symmetric with the kernel path. The
+            // `RpcCallingGuard` is created inside the closure so its `Drop`
+            // (which restores the calling context) still runs on unwind. On
+            // the error path the reply parcel is unused (`send_reply` sends an
+            // empty body with the status), so a partially-written `reply`
+            // cannot leak to the peer.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _calling = crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer));
+                target.rpc_transact(t.code, &mut reader, &mut reply)
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                log::error!("RPC on_transact panicked for code {}: {msg}", t.code);
+                Err(crate::StatusCode::Unknown)
+            })
         });
 
         if oneway {
@@ -1909,15 +1960,27 @@ impl RpcSession {
     /// the lifecycle count (callback slots are not serve-driven; AOSP
     /// also does not gate session lifetime on `mOutgoing.size()`).
     /// `Err(DeadObject)` if the session is already torn down (the
-    /// lifecycle covers both `Dying` and `Dead` in a single check).
-    pub(crate) fn add_callback_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
+    /// lifecycle covers both `Dying` and `Dead` in a single check), or
+    /// `Err(FailedTransaction)` if the pool is already at `cap` slots.
+    ///
+    /// `cap` is enforced atomically inside [`add_slot_inner_capped`]
+    /// (`RpcSessionInner`) so concurrent attach workers cannot each clear
+    /// an advisory pre-check and overshoot it — callback slots are never
+    /// serve-reclaimed, so an unbounded pool is a peer-driven DoS.
+    pub(crate) fn add_callback_slot(
+        &self,
+        transport: Box<dyn RpcTransport>,
+        cap: usize,
+    ) -> Result<u64> {
         // Snapshot gate, not CAS — a concurrent founding death after
         // this read is race-acceptable: the slot sits unused in a
         // dead session and is reclaimed via `Arc<RpcSessionInner>`.
         if self.inner.shared.lifecycle.is_torn_down() {
             return Err(StatusCode::DeadObject);
         }
-        Ok(self.inner.add_slot_inner(transport))
+        self.inner
+            .add_slot_inner_capped(transport, cap)
+            .ok_or(StatusCode::FailedTransaction)
     }
 
     /// This session's full inner state — including
@@ -2936,5 +2999,48 @@ mod tests {
             RpcSession::from_preconnected_fd(fd, 2).is_err(),
             "non-socket fd must reject before any handshake I/O"
         );
+    }
+
+    /// The incoming callback-slot admission cap is enforced **atomically**
+    /// inside `add_callback_slot` (check-and-push under the `conn_state`
+    /// lock), so concurrent attaches cannot clear an advisory pre-check and
+    /// overshoot it. Callback slots are never serve-reclaimed, so an
+    /// unbounded pool would be a peer-driven fd/memory DoS. This single-
+    /// threaded gate proves the cap is hard (never exceeded) and refuses
+    /// past it.
+    #[test]
+    fn callback_slot_cap_is_enforced() {
+        use crate::rpc::transport::MemTransport;
+        // Server-side post-handshake session form (no wire I/O).
+        let (t0, _p0) = MemTransport::pair();
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+            None,
+        )
+        .expect("build session");
+
+        let base = session.inner.slot_count();
+        let cap = base + 2;
+        let mut peers = Vec::new();
+        let mut admitted = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..5 {
+            let (t, p) = MemTransport::pair();
+            peers.push(p); // keep peer halves alive
+            match session.add_callback_slot(Box::new(t), cap) {
+                Ok(_) => admitted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        assert_eq!(
+            session.inner.slot_count(),
+            cap,
+            "pool never exceeds the cap"
+        );
+        assert_eq!(admitted, cap - base, "exactly cap-base slots admitted");
+        assert!(refused >= 1, "attaches past the cap are refused");
     }
 }

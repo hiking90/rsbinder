@@ -413,7 +413,18 @@ impl DeserializeOption for String {
         let len = parcel.read::<i32>()?;
 
         if (0..i32::MAX).contains(&len) {
-            let data = parcel.read_aligned_data((len as usize + 1) * std::mem::size_of::<u16>())?;
+            // String16 wire = `len + 1` UTF-16 code units (the trailing
+            // NUL terminator is sent too). Route the byte count through
+            // `checked_array_layout` so a hostile near-`i32::MAX` `len`
+            // cannot wrap `(len + 1) * 2` — nor the `+ 3` inside
+            // `read_aligned_data`'s `pad_size` — past `usize::MAX` on
+            // 32-bit targets (armv7 Android, i686 Linux) and slip past
+            // the bounds check into a slice-index panic (remote DoS).
+            // `len + 1` is in `1..=i32::MAX` here, and 64-bit is
+            // byte-identical to the previous unchecked arithmetic.
+            let (byte_count, _) =
+                crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>())?;
+            let data = parcel.read_aligned_data(byte_count)?;
             // `data` is borrowed from the parcel's `Vec<u8>` whose base is
             // only 1-byte aligned, so reinterpreting it as `&[u16]` via
             // `from_raw_parts(_ as *const u16, _)` would construct an
@@ -858,3 +869,48 @@ impl<T: std::fmt::Debug + DeserializeArray, const N: usize> DeserializeOption fo
 }
 
 impl<T: DeserializeArray, const N: usize> DeserializeArray for [T; N] {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hostile String16 length (untrusted parcel input) must surface an
+    /// error rather than panic. On 32-bit targets the `(len + 1) * 2` byte
+    /// count — and the `+ 3` inside `pad_size` — could wrap `usize` and slip
+    /// past the bounds check into a slice-index panic; routing through
+    /// `checked_array_layout` rejects it as `BadValue` instead. (64-bit
+    /// surfaces it as `NotEnoughData`; either way it is an `Err`, not a
+    /// panic.)
+    #[test]
+    fn hostile_string16_length_returns_err_not_panic() {
+        let mut p = Parcel::new();
+        // Near-`i32::MAX` declared length with no following payload.
+        p.write::<i32>(&(i32::MAX - 1)).unwrap();
+        p.set_data_position(0);
+        let r = <String as DeserializeOption>::deserialize_option(&mut p);
+        assert!(r.is_err());
+    }
+
+    /// A normal string still round-trips byte-identically.
+    #[test]
+    fn string16_round_trip() {
+        let mut p = Parcel::new();
+        let s = "héllo".to_string();
+        p.write(&s).unwrap();
+        p.set_data_position(0);
+        let got: String = p.read::<String>().unwrap();
+        assert_eq!(got, s);
+    }
+
+    /// The empty-string boundary (len == 0 ⇒ only the NUL terminator) must
+    /// also round-trip without tripping the `len + 1` layout check.
+    #[test]
+    fn empty_string16_round_trip() {
+        let mut p = Parcel::new();
+        let s = String::new();
+        p.write(&s).unwrap();
+        p.set_data_position(0);
+        let got: String = p.read::<String>().unwrap();
+        assert_eq!(got, s);
+    }
+}

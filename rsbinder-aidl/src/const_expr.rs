@@ -4,6 +4,16 @@
 use crate::error::ConstExprError;
 use crate::parser;
 
+/// Maximum structural nesting depth for constant-expression evaluation.
+///
+/// `.aidl` source is untrusted input to the compiler; a pathologically
+/// nested expression (e.g. thousands of parentheses) would otherwise
+/// recurse `calculate_with_visited` until the thread stack overflows and
+/// aborts the process. Real AIDL constants nest only a handful of levels,
+/// so this bound is far above any legitimate input while staying well
+/// below the frame budget that triggers a stack overflow.
+const MAX_EXPR_DEPTH: usize = 256;
+
 macro_rules! arithmetic_bit_op {
     ($lhs:expr, $op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
@@ -538,6 +548,7 @@ impl ValueType {
         operator: &str,
         rhs: &ConstExpr,
         visited: &mut std::collections::HashSet<String>,
+        depth: usize,
     ) -> Result<ConstExpr, ConstExprError> {
         // Thread the cycle-guard `visited` set through operand resolution so
         // a reference cycle that crosses a binary operator (e.g.
@@ -545,8 +556,12 @@ impl ValueType {
         // of recursing until the stack overflows. Each operand gets its OWN
         // clone of the current resolution path so that sibling references to
         // a common (non-cyclic) constant are not mistaken for a cycle.
-        let lhs = lhs.value.calculate_with_visited(&mut visited.clone())?;
-        let rhs = rhs.value.calculate_with_visited(&mut visited.clone())?;
+        let lhs = lhs
+            .value
+            .calculate_with_visited(&mut visited.clone(), depth + 1)?;
+        let rhs = rhs
+            .value
+            .calculate_with_visited(&mut visited.clone(), depth + 1)?;
 
         let promoted = type_conversion(
             integral_promotion(lhs.value.clone()),
@@ -654,16 +669,27 @@ impl ValueType {
     }
 
     pub fn calculate(&self) -> Result<ConstExpr, ConstExprError> {
-        self.calculate_with_visited(&mut std::collections::HashSet::new())
+        self.calculate_with_visited(&mut std::collections::HashSet::new(), 0)
     }
 
     fn calculate_with_visited(
         &self,
         visited: &mut std::collections::HashSet<String>,
+        depth: usize,
     ) -> Result<ConstExpr, ConstExprError> {
+        // The `visited` set only breaks *name-reference* cycles; it does
+        // nothing for a deeply nested expression tree (e.g. thousands of
+        // parentheses) parsed from an untrusted `.aidl` file, which would
+        // otherwise recurse until the thread stack overflows and aborts
+        // the compiler. Bound the structural recursion depth as well.
+        if depth > MAX_EXPR_DEPTH {
+            return Err(ConstExprError::new(
+                "constant expression nested too deeply (exceeded recursion limit)",
+            ));
+        }
         match self {
             ValueType::Unary { operator, expr } => {
-                let expr = expr.value.calculate_with_visited(visited)?;
+                let expr = expr.value.calculate_with_visited(visited, depth + 1)?;
                 if operator == "-" {
                     expr.value.unary_minus()
                 } else if operator == "~" || operator == "!" {
@@ -673,13 +699,13 @@ impl ValueType {
                 }
             }
             ValueType::Expr { lhs, operator, rhs } => {
-                ValueType::calc_expr(lhs, operator, rhs, visited)
+                ValueType::calc_expr(lhs, operator, rhs, visited, depth)
             }
             ValueType::Array(v) => {
                 let mut array = Vec::new();
 
                 for value in v {
-                    array.push(value.value.calculate_with_visited(visited)?);
+                    array.push(value.value.calculate_with_visited(visited, depth + 1)?);
                 }
 
                 Ok(ConstExpr::new(ValueType::Array(array)))
@@ -691,7 +717,7 @@ impl ValueType {
                     visited.insert(name.clone());
                     let expr = parser::name_to_const_expr(name);
                     match expr {
-                        Some(expr) => expr.value.calculate_with_visited(visited),
+                        Some(expr) => expr.value.calculate_with_visited(visited, depth + 1),
                         None => Ok(ConstExpr::new(self.clone())),
                     }
                 }
@@ -1000,5 +1026,33 @@ mod tests {
         let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
         let result = arr.to_f64();
         assert!(result.is_err());
+    }
+
+    // A pathologically deep expression tree (e.g. thousands of parens in an
+    // untrusted `.aidl`) must surface a diagnostic error rather than recurse
+    // until the thread stack overflows and aborts the compiler.
+    #[test]
+    fn deeply_nested_expr_returns_error_not_stack_overflow() {
+        let mut e = ConstExpr::new(ValueType::Int32(1));
+        for _ in 0..(MAX_EXPR_DEPTH + 16) {
+            e = ConstExpr::new(ValueType::Unary {
+                operator: "~".to_string(),
+                expr: Box::new(e),
+            });
+        }
+        assert!(e.value.calculate().is_err());
+    }
+
+    // A modest nesting depth (well under the limit) must still fold normally.
+    #[test]
+    fn moderately_nested_expr_still_evaluates() {
+        let mut e = ConstExpr::new(ValueType::Int32(0));
+        for _ in 0..8 {
+            e = ConstExpr::new(ValueType::Unary {
+                operator: "~".to_string(),
+                expr: Box::new(e),
+            });
+        }
+        assert!(e.value.calculate().is_ok());
     }
 }
