@@ -229,7 +229,7 @@ Each backend implements the
 [`RpcTransport`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html)
 trait — you can implement your own if you need a custom carrier.
 
-### TLS example
+### TLS client
 
 ```rust
 use rsbinder::rpc::{rustls, RpcSession};
@@ -256,6 +256,71 @@ let root = session.get_root()?;
 `rsbinder::rpc::rustls` is the **exact** `rustls` version the `rpc-tls`
 backend links against, re-exported so you don't have to track it in
 your own `Cargo.toml`.
+
+### TLS server
+
+The server side takes a `rustls::ServerConfig` carrying its certificate
+chain and private key. `RpcServer::setup_tcp_server_tls` runs the TLS
+handshake on each connection's own worker thread (so a slow-handshake
+peer stalls only its worker, never the accept loop), then serves the
+same session as any other backend:
+
+```rust
+use rsbinder::rpc::{rustls, RpcServer};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::sync::Arc;
+
+// Server certificate chain + private key, loaded from PEM.
+let certs: Vec<_> =
+    CertificateDer::pem_slice_iter(SERVER_CERT_PEM.as_bytes()).collect::<Result<_, _>>()?;
+let key = PrivateKeyDer::from_pem_slice(SERVER_KEY_PEM.as_bytes())?;
+
+let config = Arc::new(
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()              // one-way TLS — see "Who needs a key?"
+        .with_single_cert(certs, key)?,
+);
+
+// TCP is TLS-only by design: there is no plaintext-TCP server constructor.
+let server = RpcServer::setup_tcp_server_tls("0.0.0.0:9999", config)?;
+server.set_root(my_root_binder);
+server.run()?;                              // or server.run_background()
+```
+
+`RpcServer::setup_unix_server_tls` and (with `rpc-vsock`)
+`RpcServer::setup_vsock_server_tls` do the same over a Unix socket /
+vsock — TLS is orthogonal to the socket kind (it mirrors AOSP's
+`RpcTransportCtx::newTransport(fd)`).
+
+### Who needs a key?
+
+| Mode | Server | Client |
+|------|--------|--------|
+| One-way TLS (default) | cert chain **+ private key** (always) | trusted roots only — **no key** |
+| mTLS (mutual)         | cert chain + private key **and** a client-cert verifier | cert chain **+ private key** |
+
+- **One-way TLS** is the common case. The server proves its identity
+  with its certificate; the client only verifies that certificate
+  against its `RootCertStore` (`with_no_client_auth()` on both configs
+  above). The client needs **no** key of its own — exactly like a
+  browser connecting to an HTTPS site.
+
+- **mTLS** additionally authenticates the *client*. Build the server
+  config with a client-cert verifier
+  (`rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?`
+  → `.with_client_cert_verifier(verifier)`) instead of
+  `.with_no_client_auth()`, and give the client a cert + key
+  (`.with_client_auth_cert(client_certs, client_key)?` instead of the
+  client's `.with_no_client_auth()`). The handshake then fails unless
+  the client presents a certificate the verifier trusts, and the server
+  sees that client's leaf cert as its `PeerIdentity::Certificate`.
+
+Either way the certificate check happens **during the TLS handshake**:
+an untrusted, missing, or expired certificate fails the connection
+before a single RPC byte is exchanged. rsbinder never invents crypto —
+all key / cert / root management and verification are your `rustls`
+config and rustls itself.
 
 ## Security
 
