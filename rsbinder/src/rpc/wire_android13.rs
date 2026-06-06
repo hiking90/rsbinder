@@ -742,15 +742,28 @@ fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let mut got = 0;
     while got < n {
-        match r.read(&mut buf[got..]).map_err(map_io)? {
-            0 => {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => {
                 return Err(if got == 0 {
                     RpcError::PeerClosed
                 } else {
                     RpcError::Truncated
                 })
             }
-            k => got += k,
+            Ok(k) => got += k,
+            // A read deadline elapsed (`RawTransportIo` surfaces
+            // `recv_raw`'s `Timeout` as `ErrorKind::TimedOut`): a clean
+            // `Timeout` before any byte of this read, else mid-frame
+            // `Truncated` — honoring the `set_read_timeout` contract rather
+            // than collapsing to a generic `Io` via `map_io`.
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(if got == 0 {
+                    RpcError::Timeout
+                } else {
+                    RpcError::Truncated
+                });
+            }
+            Err(e) => return Err(map_io(e)),
         }
     }
     Ok(buf)
@@ -791,7 +804,15 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_size);
     out.extend_from_slice(&header);
     if body_size > 0 {
-        out.extend_from_slice(&read_exact_raw(r, body_size)?);
+        // The header is already consumed, so a deadline that elapses at the
+        // start of the body is mid-message, not frame-synchronized: report
+        // `Truncated`, not `Timeout` (matches `read_aosp_message_with_fds`,
+        // which carries `total_read` across header+body).
+        let body = read_exact_raw(r, body_size).map_err(|e| match e {
+            RpcError::Timeout => RpcError::Truncated,
+            other => other,
+        })?;
+        out.extend_from_slice(&body);
     }
     Ok(out)
 }
@@ -844,7 +865,20 @@ pub fn read_aosp_message_with_fds(
         let mut buf = vec![0u8; want];
         let mut got = 0;
         while got < want {
-            let (n, mut more) = t.recv_raw_with_fds(&mut buf[got..])?;
+            let (n, mut more) = match t.recv_raw_with_fds(&mut buf[got..]) {
+                Ok(v) => v,
+                // A read deadline elapsed: a clean `Timeout` only before any
+                // byte of the message was read; otherwise the message is
+                // mid-flight ⇒ `Truncated` (same split as the EOF case below).
+                Err(RpcError::Timeout) => {
+                    return Err(if total_read == 0 {
+                        RpcError::Timeout
+                    } else {
+                        RpcError::Truncated
+                    });
+                }
+                Err(e) => return Err(e),
+            };
             fds.append(&mut more);
             // Enforce the per-message `MAX_FDS_PER_FRAME` cap *across*
             // the multiple recvmsgs that read one message. The
@@ -1088,9 +1122,13 @@ pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0
-            .recv_raw(buf)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        self.0.recv_raw(buf).map_err(|e| match e {
+            // Preserve the timeout kind across the `Read` boundary so
+            // `read_exact_raw` can honor the `Timeout`/`Truncated`
+            // contract; other errors keep their string form.
+            RpcError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut),
+            other => std::io::Error::other(other.to_string()),
+        })
     }
 }
 

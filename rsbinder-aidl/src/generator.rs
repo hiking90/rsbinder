@@ -126,7 +126,11 @@ pub mod {{mod}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
+                {%- if member.4 %}
+                _sub_parcel.write(self.r#{{ member.0 }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)?;
+                {%- else %}
                 _sub_parcel.write(&self.r#{{ member.0 }})?;
+                {%- endif %}
                 {%- endfor %}
                 Ok(())
             })
@@ -805,6 +809,24 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
             }
             .into());
         }
+        // AOSP reserves the top 100 transaction IDs for auto-generated meta
+        // methods (getInterfaceVersion = 16777214, getInterfaceHash =
+        // 16777213, ...). A user code in that range silently collides with
+        // a meta method, producing two `on_transact` arms with the same
+        // value (the user-vs-user dup check below cannot catch it). Reject
+        // codes above `kMaxUserSetMethodId` (16777114), mirroring AOSP
+        // `aidl.cpp` (`system/tools/aidl/include/aidl/transaction_ids.h`).
+        const K_MAX_USER_SET_METHOD_ID: i64 = 16_777_114;
+        if code > K_MAX_USER_SET_METHOD_ID {
+            return Err(SemanticError::TransactionCodeReserved {
+                interface: decl.name.clone(),
+                method: method.identifier.clone(),
+                code,
+                src: NamedSource::new(&source_name, source_text.clone()),
+                span: span_of(method.intvalue_span),
+            }
+            .into());
+        }
         if let Some((prev_name, prev_span)) =
             seen.insert(code, (method.identifier.clone(), method.identifier_span))
         {
@@ -1131,6 +1153,12 @@ pub mod {mod} {{
                             // pre-set stability survives (see ParcelableHolder
                             // ::deserialize_from).
                             matches!(generator.value_type, ValueType::Holder),
+                            // needs_unexpected_null: a non-nullable
+                            // IBinder/interface/PFD field is stored as
+                            // `Option<T>` only for lack of `Default`; on
+                            // write, unwrap with `UNEXPECTED_NULL` instead of
+                            // emitting a null marker (AOSP-faithful).
+                            generator.is_option_but_not_nullable(),
                         ))
                     }
                 } else {

@@ -197,14 +197,21 @@ FALSE_LITERAL = { "false" }
 // CHARVALUE = @{ !"\n" ~ ANY }
 // CHARVALUE = @{ "'" ~ (!("'" | "\n") ~ ANY) ~ "'" }
 CHARVALUE = @{ "'" ~ ("\\" ~ ANY | !"'" ~ ANY) ~ "'" }
-INTVALUE = @{ ASCII_DIGIT+ ~ ("l" | "L" | "u8")? }
-// int_value = @{ ASCII_DIGIT+ }
-// int_suffix = @{ ("l" | "L") | "u8" }
-// FLOATVALUE = @{ float_value ~ float_suffix? }
-// float_value = @{ ASCII_DIGIT* ~ "."? ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? }
-// float_suffix = @{ "f" }
-FLOATVALUE = @{ ASCII_DIGIT* ~ "."? ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"? }
-HEXVALUE = @{ "0" ~ ("x" | "X") ~ (ASCII_DIGIT | 'a'..'f' | 'A'..'F')+ ~ ("l" | "L" | "u8")? }
+INT_SUFFIX = _{ "l" | "L" | "u8" | "u32" | "u64" }
+// Digits with optional `_` separators between digits (AOSP allows e.g.
+// `1_000_000`); the suffixes match AOSP's u8/u32/u64/l/L set.
+INTVALUE = @{ ASCII_DIGIT ~ ("_"? ~ ASCII_DIGIT)* ~ INT_SUFFIX? }
+HEXVALUE = @{ "0" ~ ("x" | "X") ~ ASCII_HEX_DIGIT ~ ("_"? ~ ASCII_HEX_DIGIT)* ~ INT_SUFFIX? }
+// A PEG cannot backtrack a leading `ASCII_DIGIT*`, so each float shape is
+// spelled out with a fixed trailing requirement (a dot, an exponent, or an
+// `f`) — covering `5f` / `10f` / `1e10` — while a bare integer still falls
+// through to INTVALUE.
+FLOATVALUE = @{
+    (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"?)
+  | ("." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"?)
+  | (ASCII_DIGIT+ ~ ("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+ ~ "f"?)
+  | (ASCII_DIGIT+ ~ "f")
+}
 // HEXVALUE = @{ hex_value ~ int_suffix? }
 // hex_value = @{ "0" ~ ("x" | "X") ~ (ASCII_DIGIT | 'a'..'f' | 'A'..'F')+ }
 C_STR = @{ "\"" ~ ( !("\"") ~ ANY | "\\" ~ ANY)* ~ "\"" }

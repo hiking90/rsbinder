@@ -416,6 +416,18 @@ impl ConnGuard<'_> {
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
+        if self.reentrant {
+            // A reentrant guard reused the outer frame's slot *and* its
+            // `DRIVING` marker — it pushed neither the marker nor claimed
+            // `exclusive_tid`, so it must remove neither. Removing a
+            // `DRIVING` entry here would delete the OUTER frame's marker
+            // (the key (session, slot) matches), so a later same-thread
+            // nested call would no longer see it, re-claim the slot as
+            // non-reentrant, and on *its* drop clear an `exclusive_tid`
+            // the outer frame still owns — corrupting exclusivity on
+            // multi-slot sessions.
+            return;
+        }
         let key = (self.inner as *const _ as usize, self.slot_id);
         DRIVING.with(|d| {
             let mut v = d.borrow_mut();
@@ -423,7 +435,7 @@ impl Drop for ConnGuard<'_> {
                 v.remove(pos);
             }
         });
-        if !self.reentrant {
+        {
             // Release exclusive ownership and wake waiters. We use
             // `notify_all` to match [`add_slot_inner`] / [`remove_slot`]:
             // a slot release benefits (a) `find_conn` any-available
@@ -842,6 +854,23 @@ impl RpcSessionInner {
             if let Err(e) = t.set_read_timeout(None) {
                 log::debug!("RPC: failed to clear first-frame read deadline: {e:?}");
             }
+        }
+    }
+
+    /// Lift any read/write deadlines on every slot transport
+    /// (best-effort). Used after a bounded handshake (e.g. an
+    /// Accessor-supplied preconnected fd) so the established session
+    /// reverts to the normal blocking-with-per-call-deadline behavior
+    /// rather than inheriting the handshake's sticky `SO_RCVTIMEO`/
+    /// `SO_SNDTIMEO`.
+    fn clear_handshake_timeouts(&self) {
+        let transports: Vec<Arc<dyn RpcTransport>> = {
+            let st = self.conn_state.lock().expect("conn_state poisoned");
+            st.slots.iter().map(|s| Arc::clone(&s.transport)).collect()
+        };
+        for t in transports {
+            let _ = t.set_read_timeout(None);
+            let _ = t.set_write_timeout(None);
         }
     }
 
@@ -2803,16 +2832,33 @@ impl RpcSession {
             }
         };
 
-        // (c) Run the android-13+ versioned handshake. No FD-over-RPC —
+        // (c) Bound the handshake. The fd comes from an Accessor returned
+        //     by the service manager (`resolve_accessor`), i.e. a peer we
+        //     do not trust. After clearing `O_NONBLOCK` above the handshake
+        //     `read`/`write_all` are fully blocking, so a peer that accepts
+        //     the connection but never sends (or never reads) the handshake
+        //     would otherwise hang `getService`/`get_root` forever — there
+        //     is no `SO_RCVTIMEO` here (the per-call session timeout only
+        //     applies inside `client_transact`). Arm a deadline on both
+        //     directions for the handshake, then clear it on the
+        //     established session so steady-state I/O is unbounded as
+        //     before. Best-effort: a set failure just means no deadline.
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+        let _ = transport.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+        let _ = transport.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+        // (d) Run the android-13+ versioned handshake. No FD-over-RPC —
         //     the Accessor-fd carries no fd-mode metadata of its own and
         //     the consumer (the eventual proxy returned by `get_root`)
         //     drives any later FD passing through the negotiated wire
         //     directly.
-        RpcSession::connect_android13plus_fd(
+        let session = RpcSession::connect_android13plus_fd(
             transport,
             max_version,
             FileDescriptorTransportMode::None,
-        )
+        )?;
+        session.inner.clear_handshake_timeouts();
+        Ok(session)
     }
 
     /// Test/diagnostic: live local-node count (leak check).

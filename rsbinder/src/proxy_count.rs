@@ -212,9 +212,15 @@ pub(crate) fn on_proxy_create(uid: u32) {
 
 /// Internal hook called from `ProxyHandle::drop`. Decrements the
 /// global counter and, if per-uid tracking is enabled, decrements the
-/// uid map entry and clears the watermark debounce flags as the count
-/// drops below `low` (`limit_fired`) and `warning` (`warning_fired`).
-/// Symmetric with [`on_proxy_create`].
+/// uid map entry and clears **both** watermark debounce flags together
+/// once the count falls to/below `low`. Symmetric with
+/// [`on_proxy_create`].
+///
+/// AOSP (`BpBinder.cpp`) resets `LIMIT_REACHED_MASK | WARNING_REACHED_MASK`
+/// jointly at `count <= low`. Clearing them at separate thresholds (warning
+/// at `< warning`, limit at `< low`) let the `Warning` callback re-fire on a
+/// `low <-> warning` oscillation, which AOSP never does — so we mirror the
+/// joint reset.
 pub(crate) fn on_proxy_drop(uid: u32) {
     PROXY_COUNT.fetch_sub(1, Ordering::Relaxed);
     if !COUNT_BY_UID_ENABLED.load(Ordering::Relaxed) {
@@ -222,13 +228,10 @@ pub(crate) fn on_proxy_drop(uid: u32) {
     }
     let mut state = STATE.lock().expect("proxy_count state poisoned");
     let low = state.low;
-    let warning = state.warning;
     if let Some(entry) = state.per_uid.get_mut(&uid) {
         entry.count = entry.count.saturating_sub(1);
-        if entry.count < low {
+        if entry.count <= low {
             entry.limit_fired = false;
-        }
-        if entry.count < warning {
             entry.warning_fired = false;
         }
         if entry.count == 0 {

@@ -225,7 +225,13 @@ impl Deserialize for ParcelableHolder {
 
 impl Parcelable for ParcelableHolder {
     fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
-        parcel.write(&(self.stability as i32))?;
+        // AOSP serializes the stability Level *bitmask* (0/3/12/63 via
+        // `From<Stability> for i32`), not the enum discriminant. Using
+        // `as i32` here wrote 0/1/2/3, so any non-Local holder (e.g. Vintf
+        // wrote 3 instead of 63) was rejected with BAD_VALUE by a real
+        // peer. Mirror the `.into()` used on the SIBinder path.
+        let stability: i32 = self.stability.into();
+        parcel.write(&stability)?;
 
         let mut data = self.data.lock().expect("Parcelable holder lock poisoned");
         match *data {
@@ -261,7 +267,8 @@ impl Parcelable for ParcelableHolder {
 
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
         let wire_stability: i32 = parcel.read()?;
-        if self.stability as i32 != wire_stability {
+        let local_stability: i32 = self.stability.into();
+        if local_stability != wire_stability {
             log::error!(
                 "ParcelableHolder::read_from_parcel: parcelable stability mismatch: {:?} != {:?}",
                 self.stability,
@@ -306,5 +313,32 @@ impl Parcelable for ParcelableHolder {
         parcel.set_data_position(data_end);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_holder_serializes_stability_bitmask_not_discriminant() {
+        // A Vintf holder must serialize the AOSP Level bitmask (63), not
+        // the enum discriminant (3). An empty holder writes the stability
+        // followed by a 0 length; a real peer rejects a wrong stability
+        // value with BAD_VALUE, so this guards wire compatibility.
+        let holder = ParcelableHolder::new(Stability::Vintf);
+        let mut parcel = Parcel::new();
+        holder.write_to_parcel(&mut parcel).unwrap();
+
+        parcel.set_data_position(0);
+        let wire_stability: i32 = parcel.read().unwrap();
+        assert_eq!(wire_stability, 0b111111, "Vintf must serialize as 63");
+        let expected: i32 = Stability::Vintf.into();
+        assert_eq!(wire_stability, expected);
+
+        // And the round-trip back into a same-stability holder accepts it.
+        parcel.set_data_position(0);
+        let mut dst = ParcelableHolder::new(Stability::Vintf);
+        dst.read_from_parcel(&mut parcel).unwrap();
     }
 }

@@ -192,13 +192,35 @@ fn test_unicode_in_string_constant() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// 5.5q: Transaction code at u32::MAX should succeed
+// A transaction code in the reserved meta-method range (the top 100 IDs,
+// i.e. > kMaxUserSetMethodId = 16777114) must be rejected — AOSP reserves
+// them for getInterfaceVersion/getInterfaceHash etc. (`u32::MAX` is well
+// inside that range).
 #[test]
-fn test_transaction_code_u32_max() -> Result<(), Box<dyn Error>> {
-    let input = r#"
+fn test_transaction_code_reserved_range() {
+    let err = expect_generation_error(
+        r#"
 interface IFoo {
     void m1() = 4294967295;
-    void m2() = 4294967294;
+}
+        "#,
+        "test.aidl",
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("reserved") || msg.contains("16777114"),
+        "Error should mention the reserved meta-method range: {msg}"
+    );
+}
+
+// The largest user-settable transaction code (kMaxUserSetMethodId =
+// 16777114) and below are accepted.
+#[test]
+fn test_transaction_code_max_user_id_accepted() -> Result<(), Box<dyn Error>> {
+    let input = r#"
+interface IFoo {
+    void m1() = 16777114;
+    void m2() = 16777113;
 }
     "#;
     let ctx = SourceContext::new("test.aidl", input);

@@ -95,6 +95,19 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
+    /// Set a write deadline for subsequent sends. `None` clears it. The
+    /// default is a no-op for backends with no write-timeout notion
+    /// (`mem`'s send never blocks on a peer); socket-backed transports
+    /// (`unix` / `vsock` / `tcp_debug` / `tls`) override it. This bounds
+    /// the reply-send phase so a peer that completes the handshake/
+    /// admission and then stops reading cannot pin its worker thread (and,
+    /// under [`set_max_connections`](super::server::RpcServer::set_max_connections),
+    /// its admission slot) forever by stalling our blocking `write_all`
+    /// once the kernel send buffer fills.
+    fn set_write_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        Ok(())
+    }
+
     /// Send one frame plus passed file descriptors out-of-band (opt-in
     /// `FileDescriptorTransportMode::Unix`).
     ///

@@ -248,8 +248,30 @@ impl ValueType {
                 Ok(ConstExpr::new(ValueType::Array(list)))
             }
             _ => Err(ConstExprError::new(format!(
-                "can't apply unary operator '~' or '!' to {self:?}"
+                "can't apply unary operator '~' to {self:?}"
             ))),
+        }
+    }
+
+    /// Logical negation (`!`). Unlike `~` (bitwise complement) this yields
+    /// a boolean: `!5 == false` (0 when coerced to an integer target) and
+    /// `!0 == true` (1) — matching AIDL/C++ semantics. Routed separately
+    /// from [`unary_not`](Self::unary_not) (which is `~`) so an integer `!`
+    /// is not mistakenly bit-complemented.
+    fn logical_not(&self) -> Result<ConstExpr, ConstExprError> {
+        match self {
+            ValueType::Expr { .. } | ValueType::Unary { .. } => {
+                let expr = self.calculate()?;
+                expr.value.logical_not()
+            }
+            ValueType::Array(v) => {
+                let mut list = Vec::new();
+                for expr in v {
+                    list.push(expr.value.logical_not()?)
+                }
+                Ok(ConstExpr::new(ValueType::Array(list)))
+            }
+            _ => Ok(ConstExpr::new(ValueType::Bool(!self.to_bool()?))),
         }
     }
 
@@ -403,7 +425,14 @@ impl ValueType {
             '\"' => String::from("\\\""),
             '\n' => String::from("\\n"),
             '\t' => String::from("\\t"),
-            // ... add other special characters as needed ...
+            '\r' => String::from("\\r"),
+            '\0' => String::from("\\0"),
+            // Any other control / non-printable character has no single-
+            // character Rust escape (`\a`/`\b`/`\f`/`\v` do not exist in
+            // Rust), so emit a unicode escape — otherwise the raw byte lands
+            // inside a `'...'` char literal and the generated code fails to
+            // compile. AOSP `PrintCharLiteral` likewise hex-escapes these.
+            c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
             _ => ch.to_string(),
         }
     }
@@ -692,8 +721,10 @@ impl ValueType {
                 let expr = expr.value.calculate_with_visited(visited, depth + 1)?;
                 if operator == "-" {
                     expr.value.unary_minus()
-                } else if operator == "~" || operator == "!" {
+                } else if operator == "~" {
                     expr.value.unary_not()
+                } else if operator == "!" {
+                    expr.value.logical_not()
                 } else {
                     Ok(expr)
                 }

@@ -1194,15 +1194,57 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
         (arg_value, 10)
     };
 
-    let value = if value.ends_with('l') || value.ends_with('L') {
-        is_long = true;
-        &value[..value.len() - 1]
+    // Strip the integer suffix. AOSP accepts u8 / u32 / u64 / l / L; check
+    // the multi-character unsigned suffixes before the single-char `l`/`L`.
+    let mut is_u32 = false;
+    let mut is_u64 = false;
+    let value = if let Some(stripped) = value.strip_suffix("u64") {
+        is_u64 = true;
+        stripped
+    } else if let Some(stripped) = value.strip_suffix("u32") {
+        is_u32 = true;
+        stripped
     } else if let Some(stripped) = value.strip_suffix("u8") {
         is_u8 = true;
         stripped
+    } else if value.ends_with('l') || value.ends_with('L') {
+        is_long = true;
+        &value[..value.len() - 1]
     } else {
         value
     };
+
+    // AOSP permits `_` digit separators (e.g. `1_000_000`, `0xFF_FF`);
+    // Rust's `from_str_radix` rejects them, so strip them before parsing.
+    let cleaned;
+    let value: &str = if value.contains('_') {
+        cleaned = value.replace('_', "");
+        &cleaned
+    } else {
+        value
+    };
+
+    // Explicit u32 / u64 suffixes pin the target size regardless of radix.
+    if is_u32 {
+        let parsed_value = u32::from_str_radix(value, radix).map_err(|err| {
+            make_parse_error(
+                format!("invalid u32 literal '{arg_value}': {err}"),
+                span.0,
+                span.1,
+            )
+        })?;
+        return Ok(ConstExpr::new(ValueType::Int32(parsed_value as i32 as _)));
+    }
+    if is_u64 {
+        let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
+            make_parse_error(
+                format!("invalid u64 literal '{arg_value}': {err}"),
+                span.0,
+                span.1,
+            )
+        })?;
+        return Ok(ConstExpr::new(ValueType::Int64(parsed_value as i64 as _)));
+    }
 
     if radix == 16 {
         if is_u8 {
@@ -2180,8 +2222,100 @@ fn calculate_namespace(
     }
 }
 
+/// Maximum bracket/generic nesting depth accepted before parsing.
+/// Orders of magnitude above any legitimate AIDL, well below the stack-
+/// overflow threshold of the recursive parser/walkers — see
+/// [`check_nesting_depth`].
+const MAX_NESTING_DEPTH: usize = 256;
+
+/// Pre-parse denial-of-service guard. pest's recursive-descent parser and
+/// the recursive AST walkers recurse once per nesting level, so deeply
+/// nested input (`((((...))))` or `List<List<...>>`) would overflow the
+/// stack and abort the whole process (an uncatchable SIGABRT) on
+/// untrusted or build-pipeline-influenced AIDL — `MAX_EXPR_DEPTH` only
+/// guards the post-parse expression evaluator, too late to help. This
+/// scans the raw source (skipping string/char literals and comments) and
+/// returns the byte offset at which `()[]{}` or `<>` nesting first exceeds
+/// [`MAX_NESTING_DEPTH`], so the caller can reject it as an ordinary
+/// diagnostic. Angle-bracket depth is reset at `;` (a generic type never
+/// crosses a statement boundary) so shift/comparison operators in const
+/// expressions cannot drift the count into a false positive.
+fn check_nesting_depth(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut bracket_depth: usize = 0; // () [] {}
+    let mut angle_depth: usize = 0; // <> generics
+    let next = |i: usize| bytes.get(i + 1).copied();
+    while i < bytes.len() {
+        match bytes[i] {
+            // Skip string / char literals (with escapes) so brackets in
+            // text are not counted.
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        c if c == q => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                continue;
+            }
+            b'/' if next(i) == Some(b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if next(i) == Some(b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'(' | b'[' | b'{' => bracket_depth += 1,
+            b')' | b']' | b'}' => bracket_depth = bracket_depth.saturating_sub(1),
+            // `<<` shift / `<=` are not generic openers.
+            b'<' if matches!(next(i), Some(b'<') | Some(b'=')) => {
+                i += 2;
+                continue;
+            }
+            b'<' => angle_depth += 1,
+            // `>>` shift / `>=` are not generic closers.
+            b'>' if matches!(next(i), Some(b'>') | Some(b'=')) => {
+                i += 2;
+                continue;
+            }
+            b'>' => angle_depth = angle_depth.saturating_sub(1),
+            b';' => angle_depth = 0,
+            _ => {}
+        }
+        if bracket_depth > MAX_NESTING_DEPTH || angle_depth > MAX_NESTING_DEPTH {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
     let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
+    // DoS guard: reject pathologically nested input *before* handing it to
+    // the recursive pest parser, which would otherwise overflow the stack.
+    if let Some(offset) = check_nesting_depth(&ctx.source) {
+        return Err(ParseError::nesting_too_deep(
+            &ctx.filename,
+            &ctx.source,
+            offset,
+            MAX_NESTING_DEPTH,
+        )
+        .into());
+    }
     reset_enum_resolution_state();
     // Take any leftover warnings from a previous call so this document's
     // warning set is scoped to its own parse.
@@ -2203,6 +2337,27 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                                 Some(idx) => &import[(idx + 1)..],
                                 None => &import,
                             };
+                            // Two imports with the same simple name but
+                            // different fully-qualified names: the map is
+                            // keyed by simple name, so the later wins
+                            // silently and an unqualified reference would
+                            // resolve to the wrong type. AOSP errors on the
+                            // conflict; warn here (idempotent re-imports of
+                            // the same FQN stay silent).
+                            if let Some(existing) = document.imports.get(key) {
+                                if existing != &import {
+                                    CURRENT_WARNINGS.with(|w| {
+                                        w.borrow_mut().push(crate::error::AidlWarning::new(
+                                            format!(
+                                                "duplicate import of simple name '{key}': \
+                                                 '{existing}' is shadowed by '{import}'; an \
+                                                 unqualified reference to '{key}' resolves to \
+                                                 the latter"
+                                            ),
+                                        ));
+                                    });
+                                }
+                            }
                             document.imports.insert(key.into(), import);
                         }
                     }
@@ -2335,6 +2490,64 @@ mod tests {
             ConstExpr::new(ValueType::Int64(-20))
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_nesting_depth_guard_rejects_deep_input() {
+        // Deeply nested parens / generics would overflow the recursive
+        // parser; the pre-scan must flag them (returns the offending
+        // offset) before they reach pest.
+        let deep_parens = format!("{}1{}", "(".repeat(1000), ")".repeat(1000));
+        assert!(check_nesting_depth(&deep_parens).is_some());
+        let deep_generics = format!("{}int{}", "List<".repeat(1000), ">".repeat(1000));
+        assert!(check_nesting_depth(&deep_generics).is_some());
+        // A normal document (and shift/comparison operators) must not trip.
+        assert!(check_nesting_depth("interface IFoo { void m(); }").is_none());
+        assert!(check_nesting_depth("const int X = 1 << 8 >> 2; const int Y = 3;").is_none());
+    }
+
+    #[test]
+    fn test_intvalue_underscores_and_unsigned_suffixes() -> Result<(), Box<dyn Error>> {
+        // AOSP digit separators and u32/u64 suffixes.
+        assert_eq!(
+            parse_intvalue("1_000_000", (0, 0))?.value,
+            ValueType::Int32(1_000_000)
+        );
+        assert_eq!(
+            parse_intvalue("0xFF_FF", (0, 0))?.value,
+            ValueType::Int32(0xFFFF)
+        );
+        assert_eq!(parse_intvalue("10u32", (0, 0))?.value, ValueType::Int32(10));
+        assert_eq!(parse_intvalue("10u64", (0, 0))?.value, ValueType::Int64(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_floatvalue_without_decimal_point() {
+        // `5f`, `10f`, `1e10`, `1E5` must parse as floats — the PEG cannot
+        // backtrack leading digits, so each shape is spelled out explicitly.
+        for s in ["5f", "10f", "1e10", "1E5", "3.14", ".5"] {
+            assert!(
+                AIDLParser::parse(Rule::FLOATVALUE, s).is_ok(),
+                "FLOATVALUE should accept {s}"
+            );
+        }
+        // A bare integer is NOT a float (must fall through to INTVALUE).
+        assert!(AIDLParser::parse(Rule::FLOATVALUE, "5").is_err());
+    }
+
+    #[test]
+    fn test_logical_not_is_not_bitwise() -> Result<(), Box<dyn Error>> {
+        // `!5` is logical negation (false), not bitwise complement (-6);
+        // `!0` is true.
+        let mut res = AIDLParser::parse(Rule::expression, "!5")?;
+        let calc = parse_expression(res.next().unwrap().into_inner())?.calculate()?;
+        assert_eq!(calc.value, ValueType::Bool(false));
+
+        let mut res0 = AIDLParser::parse(Rule::expression, "!0")?;
+        let calc0 = parse_expression(res0.next().unwrap().into_inner())?.calculate()?;
+        assert_eq!(calc0.value, ValueType::Bool(true));
         Ok(())
     }
 
