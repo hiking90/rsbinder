@@ -32,9 +32,14 @@ impl flat_binder_object {
             hdr: binder_object_header {
                 type_: BINDER_TYPE_FD,
             },
-            flags: 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            // Init via the 8-byte `binder` field (not the u32 `handle`) so the upper bytes are zeroed:
-            // mirrors AOSP Parcel.cpp `obj.binder = 0; obj.handle = fd;`, avoids leaking uninit stack to the remote.
+            // AOSP `Parcel::writeFileDescriptor` (kernel arm) sets `obj.flags = 0`
+            // for a `BINDER_TYPE_FD` object: it bypasses `flattenBinder`, so neither
+            // schedBits nor `ACCEPTS_FDS` apply. The kernel ignores this field for FD
+            // objects (it rewrites the object on delivery), but match AOSP exactly.
+            flags: 0,
+            // Init via the 8-byte `binder` field (not the u32 `handle`) so the upper bytes
+            // are zeroed: mirrors AOSP `obj.binder = 0; obj.handle = fd;`, avoids leaking
+            // uninit stack to the remote.
             __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
                 binder: (fd as u32) as u64,
             },
@@ -203,6 +208,9 @@ impl From<&SIBinder> for flat_binder_object {
                 hdr: binder_object_header {
                     type_: BINDER_TYPE_HANDLE,
                 },
+                // AOSP-correct: `flattenBinder`'s HANDLE arm sets `obj.flags = 0`,
+                // then applies `obj.flags |= schedBits` after both arms, so the
+                // final value is `0 | schedBits` == `sched_bits`. Do not "fix" to 0.
                 flags: sched_bits,
                 __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
                     handle: proxy.handle(),
@@ -303,45 +311,36 @@ pub(crate) fn write_flat_binder(
 mod tests {
     use super::*;
 
-    /// Regression guard for the `new_with_fd` construction fix.
+    /// Regression guard for `new_with_fd`.
     ///
-    /// Two distinct defects were present before the fix:
+    /// `flags` must be `0`: AOSP `Parcel::writeFileDescriptor` (kernel arm)
+    /// writes `obj.flags = 0` for a `BINDER_TYPE_FD` object — it bypasses
+    /// `flattenBinder`, so no schedBits / `ACCEPTS_FDS`. An earlier change set
+    /// `0x7F | ACCEPTS_FDS` (= `0x17F`) and this test asserted it as
+    /// "byte-identical to AOSP" — it was not. The kernel ignores the field for
+    /// FD objects so nothing broke functionally, but it diverged on the wire.
+    /// Like the ParcelableHolder stability case, an rsbinder<->rsbinder round
+    /// trip cannot catch a wrong-but-symmetric flags value, so this asserts the
+    /// AOSP golden byte (`0`) directly.
     ///
-    ///  1. `flags: 0x7F & FLAT_BINDER_FLAG_ACCEPTS_FDS` — a bitwise AND
-    ///     between disjoint bit ranges (`0x7F` vs `0x100`) is always 0,
-    ///     so every FD object went on the wire with `flags == 0`. The
-    ///     fix is `0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS`, byte-identical
-    ///     to AOSP `Parcel::writeFileDescriptor`.
-    ///  2. The union was initialized via the u32 `handle` variant, so
-    ///     the upper 4 bytes of the 8-byte `binder` field were left
-    ///     uninitialized and leaked uninitialized stack to the remote
-    ///     (Rust UB). The fix initializes the full-width `binder` field
-    ///     so the upper bytes are guaranteed zero.
+    /// Also guards the full-width union init: the 8-byte `binder` field must be
+    /// written (not the u32 `handle` variant) so the upper 4 bytes are zero and
+    /// no uninitialized stack leaks to the remote.
     #[test]
-    fn new_with_fd_flags_and_full_width_init() {
+    fn new_with_fd_flags_zero_and_full_width_init() {
         let fd: i32 = 7;
         let obj = flat_binder_object::new_with_fd(fd, false);
 
         assert_eq!(obj.header_type(), BINDER_TYPE_FD, "must be a FD object");
 
-        // Defect 1: flags must be the OR (0x7F | 0x100 == 0x17F), never 0.
+        // AOSP writeFileDescriptor sets flags = 0 for FD objects.
         assert_eq!(
-            obj.flags,
-            0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            "flags must be 0x7F | FLAT_BINDER_FLAG_ACCEPTS_FDS (regression: was 0x7F & ... == 0)"
-        );
-        assert_ne!(
             obj.flags, 0,
-            "AND-instead-of-OR regression: flags collapsed to 0"
-        );
-        assert_eq!(
-            obj.flags & FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            FLAT_BINDER_FLAG_ACCEPTS_FDS,
-            "ACCEPTS_FDS bit must be set"
+            "FD object flags must be 0 (AOSP Parcel::writeFileDescriptor)"
         );
 
-        // Defect 2: the full 8-byte union must equal exactly `fd` with a
-        // zeroed upper half — no uninitialized stack bytes leaked.
+        // The full 8-byte union must equal exactly `fd` with a zeroed upper
+        // half — no uninitialized stack bytes leaked.
         assert_eq!(
             obj.pointer(),
             fd as u32 as u64,
