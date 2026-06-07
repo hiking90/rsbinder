@@ -120,6 +120,24 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// legitimate caller hits it.
 const MAX_CALLBACKS_PER_NAME: usize = 256;
 
+/// Upper bound on the number of *distinct service names* held in each registry
+/// map (`name_to_service`, `name_to_registration_callbacks`,
+/// `name_to_client_callbacks`). `MAX_CALLBACKS_PER_NAME` caps callbacks per
+/// name but not the number of names, so without this a single client could
+/// loop over distinct names (`addService("svc.{i}")`,
+/// `registerForNotifications("svc.{i}")`, ...) and grow the heap without bound.
+/// Like `MAX_CALLBACKS_PER_NAME`, this is the defense in place of the
+/// SELinux/uid admission AOSP relies on and rsb_hub lacks. Generous enough that
+/// no real device (a few hundred services) hits it.
+const MAX_DISTINCT_NAMES: usize = 10_000;
+
+/// True when inserting `name` would add a *new* distinct key to a registry
+/// `map` that already holds `MAX_DISTINCT_NAMES` names. Overwriting an existing
+/// key never grows the map, so it is always allowed. Factored out for testing.
+fn distinct_name_cap_exceeded<V>(map: &HashMap<String, V>, name: &str) -> bool {
+    !map.contains_key(name) && map.len() >= MAX_DISTINCT_NAMES
+}
+
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
     name_to_service: HashMap<String, Service>,
@@ -668,6 +686,17 @@ impl IServiceManager for ServiceManager {
             let mut inner = lock_recover(&self.inner);
             let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
 
+            // distinct-name DoS cap: refuse a *new* service name once the
+            // registry is full (overwriting an existing name never grows the
+            // map, so it is still allowed). See `MAX_DISTINCT_NAMES`.
+            if distinct_name_cap_exceeded(&inner.name_to_service, name) {
+                log::warn!(
+                    "addService: service registry full (max {MAX_DISTINCT_NAMES} names), \
+                     rejecting new name '{name}'"
+                );
+                return Err(ExceptionCode::IllegalState.into());
+            }
+
             let mut prev_clients = false;
             // `SIBinder: PartialEq` is `Arc::ptr_eq`, so this is binder
             // identity: is the *same* object being re-registered under this
@@ -863,6 +892,16 @@ impl IServiceManager for ServiceManager {
                 }
             }
 
+            // distinct-name DoS cap (orthogonal to the per-name cap above):
+            // refuse a *new* name once the map is full. See `MAX_DISTINCT_NAMES`.
+            if distinct_name_cap_exceeded(&inner.name_to_registration_callbacks, name) {
+                let msg = format!(
+                    "registerForNotifications: name registry full (max {MAX_DISTINCT_NAMES})"
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
+            }
+
             arg_callback.as_binder().link_to_death(Arc::downgrade(
                 &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
             ))?;
@@ -1004,6 +1043,18 @@ impl IServiceManager for ServiceManager {
                     log::warn!("{}", &msg);
                     return Err((ExceptionCode::IllegalState, msg.as_str()).into());
                 }
+            }
+
+            // distinct-name DoS cap. Defense-in-depth: client callbacks require
+            // a registered service (checked above), so this map's names are
+            // already a subset of the service-name map, which is itself capped —
+            // but bound it explicitly to stay robust. See `MAX_DISTINCT_NAMES`.
+            if distinct_name_cap_exceeded(&inner.name_to_client_callbacks, name) {
+                let msg = format!(
+                    "registerClientCallback: name registry full (max {MAX_DISTINCT_NAMES})"
+                );
+                log::warn!("{}", &msg);
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
             arg_callback.as_binder().link_to_death(Arc::downgrade(
@@ -1351,5 +1402,35 @@ mod tests {
         // Non-ASCII (Unicode lowercase letters not in `[a-z]`).
         assert!(!ServiceManager::is_valid_service_name("테스트"));
         assert!(!ServiceManager::is_valid_service_name("café"));
+    }
+
+    /// HUB-1: the distinct-name cap rejects a *new* name once a registry map is
+    /// full, but always allows overwriting an existing name (which does not
+    /// grow the map). Bounds the unbounded heap growth a client could cause by
+    /// looping over distinct service names — the per-name cap does not cover
+    /// the distinct-name axis.
+    #[test]
+    fn distinct_name_cap_rejects_new_but_allows_existing() {
+        // Below capacity: any name is allowed.
+        let mut small: HashMap<String, ()> = HashMap::new();
+        small.insert("a".to_owned(), ());
+        assert!(!distinct_name_cap_exceeded(&small, "a"));
+        assert!(!distinct_name_cap_exceeded(&small, "brand-new"));
+
+        // Fill exactly to capacity with distinct names.
+        let mut full: HashMap<String, ()> = HashMap::new();
+        for i in 0..MAX_DISTINCT_NAMES {
+            full.insert(format!("svc.{i}"), ());
+        }
+        assert_eq!(full.len(), MAX_DISTINCT_NAMES);
+
+        // A new name is rejected once full...
+        assert!(distinct_name_cap_exceeded(&full, "one-too-many"));
+        // ...but overwriting an existing name is still allowed.
+        assert!(!distinct_name_cap_exceeded(&full, "svc.0"));
+        assert!(!distinct_name_cap_exceeded(
+            &full,
+            &format!("svc.{}", MAX_DISTINCT_NAMES - 1)
+        ));
     }
 }
