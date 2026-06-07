@@ -484,7 +484,15 @@ impl ValueType {
                     "vec![".to_owned()
                 };
                 for v in v {
-                    let init_str = v.value.to_init(param.clone());
+                    let init_str = match &v.value {
+                        // AOSP `aidl_to_rust.cpp` re-emits a byte inside an array
+                        // as its unsigned `u8` representation (e.g. -1 -> 255):
+                        // the array's Rust element type is `u8` (i8 maps to u8 via
+                        // `array_type_name`), and Rust rejects a negated literal in
+                        // a `u8` array. Positive bytes are unchanged by the cast.
+                        ValueType::Byte(b) => (*b as u8).to_string(),
+                        _ => v.value.to_init(param.clone()),
+                    };
 
                     let some_str = if let ValueType::Array(_) = v.value {
                         init_str
