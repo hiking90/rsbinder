@@ -208,10 +208,10 @@ impl Deserialize for ParcelableHolder {
 
     /// Read ONTO `self`, preserving its already-set stability. Plain
     /// `deserialize()` constructs a fresh `Local` holder, which then rejects a
-    /// higher wire stability — losing the `@VintfStability` (or vendor/system)
-    /// level a generated parcelable's `Default` assigned to a holder field.
-    /// Generated `read_from_parcel` reads holder fields via `read_onto` so this
-    /// override runs; mirrors AOSP's `field.readFromParcel(parcel)`.
+    /// `@VintfStability` wire stability — losing the level a generated
+    /// parcelable's `Default` assigned to a holder field. Generated
+    /// `read_from_parcel` reads holder fields via `read_onto` so this override
+    /// runs; mirrors AOSP's `field.readFromParcel(parcel)`.
     fn deserialize_from(&mut self, parcel: &mut Parcel) -> Result<()> {
         let status: i32 = parcel.read()?;
         if status == NULL_PARCELABLE_FLAG {
@@ -223,14 +223,31 @@ impl Deserialize for ParcelableHolder {
     }
 }
 
+/// Encode a holder's stability as AOSP's `Parcelable::Stability` enum
+/// (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`).
+///
+/// This is a *different* wire value from the binder-object
+/// `internal::Stability::Level` bitmask (0/3/12/63 via `From<Stability> for
+/// i32`) used on the `writeStrongBinder` path, and it is version-independent:
+/// `frameworks/native/libs/binder/ParcelableHolder.cpp` writes
+/// `writeInt32(static_cast<int32_t>(getStability()))` unchanged on every
+/// Android version (verified byte-identical between android-12 and android-16),
+/// with no `Category` repr or Android-12 `0x0c000000` adjustment. The AIDL
+/// `@VintfStability` annotation maps a holder field to `STABILITY_VINTF`
+/// (`system/tools/aidl` `generate_cpp.cpp`); everything else is
+/// `STABILITY_LOCAL`. Reusing the binder-object encoding here put 63 (and
+/// `0x0c00003f` on Android 12) on the wire where a real libbinder peer expects
+/// 1, so any `@VintfStability` holder field was rejected with `BAD_VALUE`.
+fn parcelable_stability_repr(stability: Stability) -> i32 {
+    match stability {
+        Stability::Vintf => 1, // STABILITY_VINTF
+        _ => 0,                // STABILITY_LOCAL
+    }
+}
+
 impl Parcelable for ParcelableHolder {
     fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
-        // AOSP serializes the stability Level *bitmask* (0/3/12/63 via
-        // `From<Stability> for i32`), not the enum discriminant. Using
-        // `as i32` here wrote 0/1/2/3, so any non-Local holder (e.g. Vintf
-        // wrote 3 instead of 63) was rejected with BAD_VALUE by a real
-        // peer. Mirror the `.into()` used on the SIBinder path.
-        let stability: i32 = self.stability.into();
+        let stability = parcelable_stability_repr(self.stability);
         parcel.write(&stability)?;
 
         let mut data = self.data.lock().expect("Parcelable holder lock poisoned");
@@ -267,7 +284,7 @@ impl Parcelable for ParcelableHolder {
 
     fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
         let wire_stability: i32 = parcel.read()?;
-        let local_stability: i32 = self.stability.into();
+        let local_stability = parcelable_stability_repr(self.stability);
         if local_stability != wire_stability {
             log::error!(
                 "ParcelableHolder::read_from_parcel: parcelable stability mismatch: {:?} != {:?}",
@@ -321,24 +338,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_holder_serializes_stability_bitmask_not_discriminant() {
-        // A Vintf holder must serialize the AOSP Level bitmask (63), not
-        // the enum discriminant (3). An empty holder writes the stability
-        // followed by a 0 length; a real peer rejects a wrong stability
-        // value with BAD_VALUE, so this guards wire compatibility.
-        let holder = ParcelableHolder::new(Stability::Vintf);
-        let mut parcel = Parcel::new();
-        holder.write_to_parcel(&mut parcel).unwrap();
+    fn holder_serializes_parcelable_stability_not_binder_level_bitmask() {
+        // A `ParcelableHolder` writes AOSP's `Parcelable::Stability` enum
+        // (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`), NOT the binder-object
+        // `internal::Stability::Level` bitmask (0/3/12/63). A `@VintfStability`
+        // holder therefore puts `1` on the wire; a real libbinder peer rejects
+        // any other value (the old 63, or `0x0c00003f` on Android 12) with
+        // BAD_VALUE. Golden values verified against android-12 and android-16
+        // `frameworks/native/libs/binder/ParcelableHolder.cpp` + `Parcelable.h`
+        // and `system/tools/aidl` `generate_cpp.cpp` (vintf holder field init).
+        //
+        // This cannot be caught by rsbinder<->rsbinder round trips: both ends
+        // share the same encoding, so a wrong-but-symmetric value always
+        // agrees. Only a fixed golden byte (or real-libbinder interop) detects
+        // it — hence the explicit `== 1` / `== 0` assertions below.
+        let vintf = ParcelableHolder::new(Stability::Vintf);
+        let mut vp = Parcel::new();
+        vintf.write_to_parcel(&mut vp).unwrap();
+        vp.set_data_position(0);
+        let vintf_wire: i32 = vp.read().unwrap();
+        assert_eq!(
+            vintf_wire, 1,
+            "Vintf holder must serialize as STABILITY_VINTF (1)"
+        );
 
-        parcel.set_data_position(0);
-        let wire_stability: i32 = parcel.read().unwrap();
-        assert_eq!(wire_stability, 0b111111, "Vintf must serialize as 63");
-        let expected: i32 = Stability::Vintf.into();
-        assert_eq!(wire_stability, expected);
+        let local = ParcelableHolder::default();
+        let mut lp = Parcel::new();
+        local.write_to_parcel(&mut lp).unwrap();
+        lp.set_data_position(0);
+        let local_wire: i32 = lp.read().unwrap();
+        assert_eq!(
+            local_wire, 0,
+            "Local holder must serialize as STABILITY_LOCAL (0)"
+        );
 
-        // And the round-trip back into a same-stability holder accepts it.
-        parcel.set_data_position(0);
+        // Round-trip back into a same-stability holder accepts it.
+        vp.set_data_position(0);
         let mut dst = ParcelableHolder::new(Stability::Vintf);
-        dst.read_from_parcel(&mut parcel).unwrap();
+        dst.read_from_parcel(&mut vp).unwrap();
+
+        // The stability-mismatch guard still holds: a fresh Local holder must
+        // reject a Vintf (1) wire value with BadValue.
+        vp.set_data_position(0);
+        let mut local_dst = ParcelableHolder::default();
+        assert!(matches!(
+            local_dst.read_from_parcel(&mut vp),
+            Err(StatusCode::BadValue)
+        ));
     }
 }
