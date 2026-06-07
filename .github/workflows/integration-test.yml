@@ -120,8 +120,7 @@ jobs:
         run: |
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to start"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run rsbinder unit tests (slow-path / hardening regression gate)
         run: |
@@ -206,8 +205,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service_async > test_service_async.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service_async failed to start"; cat test_service_async.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service_async.log test_service.pid
 
       - name: Run cargo test (async) — 1 iteration
         run: |
@@ -259,8 +257,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run test_death_recipient (destructive)
         run: |
@@ -268,7 +265,16 @@ jobs:
           # callback + post-obituary unlink_to_death returning
           # DeadObject. Wired into CI here as part of the cache-pin
           # follow-up so its coverage is no longer manual-only.
-          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+          #
+          # `--exact` is REQUIRED here: the filter `test_death_recipient` is a
+          # prefix of `test_death_recipient_panic_does_not_starve_others`, so a
+          # substring match would run BOTH in one process. Both are destructive
+          # (each kills the shared test_service), so running them together is an
+          # order-dependent race — whichever kills the service first leaves the
+          # other unable to resolve it ("did not get binder service"). That was
+          # the intermittent CI flake. Each destructive test must run alone
+          # against its own freshly-restarted, registration-verified service.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_death_recipient
 
       - name: Restart test_service for test_wibinder_upgrade_after_obituary
@@ -277,8 +283,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run test_wibinder_upgrade_after_obituary (destructive)
         run: |
@@ -286,7 +291,7 @@ jobs:
           # coverage on a real obituary path. The exact-path filter
           # (test_client::test_wibinder_upgrade_after_obituary) avoids
           # cargo's substring matching from picking up unrelated tests.
-          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_wibinder_upgrade_after_obituary
 
       - name: Restart test_service for test_death_recipient_panic_does_not_starve_others
@@ -295,8 +300,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run test_death_recipient_panic_does_not_starve_others (destructive)
         run: |
@@ -306,7 +310,7 @@ jobs:
           # `proxy.rs` covers the dispatch-loop in isolation, this
           # one verifies the same guarantee end-to-end through the
           # kernel BR_DEAD_BINDER handshake.
-          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_death_recipient_panic_does_not_starve_others
 
       - name: Restart test_service for test_unlink_to_death_single_remove_via_obituary
@@ -315,8 +319,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run test_unlink_to_death_single_remove_via_obituary (destructive)
         run: |
@@ -325,7 +328,7 @@ jobs:
           # `BpBinder::unlinkToDeath`'s `removeAt(i)`. Register the
           # same recipient twice, unlink once, then verify exactly
           # one `binder_died` fires after killService.
-          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_unlink_to_death_single_remove_via_obituary
 
       - name: Restart test_service for test_dump_fast_fails_on_dead_proxy_closes_fd
@@ -334,8 +337,7 @@ jobs:
           sleep 1
           RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
           echo $! > test_service.pid
-          sleep 2
-          kill -0 "$(cat test_service.pid)" || { echo "::error::test_service failed to restart"; cat test_service.log; exit 1; }
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
 
       - name: Run test_dump_fast_fails_on_dead_proxy_closes_fd (destructive)
         run: |
@@ -343,7 +345,7 @@ jobs:
           # must fast-fail with DeadObject before consuming the fd,
           # so the caller's fd is closed via RAII. Verified via pipe
           # EOF on the read end after `dump` drops the write end.
-          RUST_BACKTRACE=1 cargo test --package tests -- --ignored \
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_dump_fast_fails_on_dead_proxy_closes_fd
 
       - name: Stop background services

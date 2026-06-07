@@ -917,6 +917,11 @@ fn main() {
         hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
         .expect("Could not register service");
 
+        // Readiness signal for the integration harness (see test_service.rs):
+        // all services registered; stderr is unbuffered so it reaches a
+        // redirected log before `pending().await` blocks forever.
+        eprintln!("TEST_SERVICE_READY: all services registered");
+
         // By awaiting `pending`, we yield to the runtime. This results in the current-thread
         // runtime being driven by the current thread (the main thread in this case). E.g., this
         // means that anything spawned with `tokio::spawn` will run on this thread.

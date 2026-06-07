@@ -1377,13 +1377,33 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr
     Ok(lhs)
 }
 
-fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> ConstExpr {
+fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
         Rule::C_STR => {
-            let string = pair.as_str();
-            ConstExpr::new(ValueType::String(string[1..string.len() - 1].into()))
+            let span = pair.as_span();
+            let raw = pair.as_str();
+            let inner = &raw[1..raw.len() - 1];
+            // The string is emitted verbatim into a generated Rust `"..."`.
+            // rsbinder intentionally allows non-ASCII (UTF-8) here — e.g.
+            // `const String MSG = "한글";` — because it round-trips as a valid
+            // Rust string literal (more lenient than AOSP `isValidLiteralChar`,
+            // which rejects non-ASCII). But a control byte or a backslash would
+            // be emitted verbatim and fail to compile (a raw `\X` is not
+            // necessarily a valid Rust escape; rsbinder does not decode string
+            // escapes). Reject only those at parse time.
+            if let Some(bad) = inner.bytes().find(|&b| b < 0x20 || b == 0x7f || b == b'\\') {
+                return Err(make_parse_error(
+                    format!(
+                        "invalid byte 0x{bad:02x} in string literal: control characters and \
+                         backslash escapes are not allowed (non-ASCII text is permitted)"
+                    ),
+                    span.start(),
+                    span.end(),
+                ));
+            }
+            Ok(ConstExpr::new(ValueType::String(inner.into())))
         }
-        Rule::qualified_name => ConstExpr::new(ValueType::Name(pair.as_str().into())),
+        Rule::qualified_name => Ok(ConstExpr::new(ValueType::Name(pair.as_str().into()))),
         _ => unreachable!("Unexpected rule in Rule::parse_string_term: {}", pair),
     }
 }
@@ -1394,7 +1414,7 @@ fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, A
     for pair in pairs {
         match pair.as_rule() {
             Rule::string_term => {
-                let term = parse_string_term(pair.into_inner().next().unwrap());
+                let term = parse_string_term(pair.into_inner().next().unwrap())?;
                 expr = match expr {
                     Some(expr) => Some(ConstExpr::new_expr(expr, "+", term)),
                     None => Some(term),
@@ -1450,8 +1470,13 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                     .chars()
                     .next()
                     .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
-                // Map the common C/AIDL escape sequences to their actual code
+                // Map the supported C/AIDL escape sequences to their actual code
                 // points (e.g. `'\n'` becomes newline, not the literal 'n').
+                // rsbinder intentionally supports these (more lenient than AOSP,
+                // which only allows `'\0'`). An unrecognized escape used to fall
+                // through to the post-backslash char verbatim — silently
+                // producing the wrong code point (`'\a'` -> 'a' = 97, not bell).
+                // Reject it instead.
                 match esc {
                     'n' => '\n',
                     't' => '\t',
@@ -1460,7 +1485,13 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                     '\\' => '\\',
                     '\'' => '\'',
                     '"' => '"',
-                    other => other,
+                    other => {
+                        return Err(make_parse_error(
+                            format!("unsupported char escape '\\{other}'"),
+                            start,
+                            end,
+                        ))
+                    }
                 }
             } else {
                 inner

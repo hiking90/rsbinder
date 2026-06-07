@@ -884,5 +884,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     )
     .expect("Could not register service");
 
+    // Readiness signal for the integration harness: every service is now
+    // registered, so a client `getService` will resolve. Printed to stderr
+    // (unbuffered) so it reaches a redirected log immediately — `join_thread_pool`
+    // below never returns, so a buffered stdout line might never flush. CI
+    // restart steps poll for this marker instead of merely checking the process
+    // is alive, closing the restart→query race that fail-fast tests would lose.
+    eprintln!("TEST_SERVICE_READY: all services registered");
+
     Ok(ProcessState::join_thread_pool()?)
 }
