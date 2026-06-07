@@ -446,8 +446,32 @@ impl ValueType {
                     format!("\"{}\".into()", self.to_value_string())
                 }
             }
-            ValueType::Float(_) => format!("{}f32", self.to_value_string()),
-            ValueType::Double(_) => format!("{}f64", self.to_value_string()),
+            // A non-finite fold (e.g. `1.0e400` parses to infinity) would emit
+            // `inff32` / `NaNf64` — not valid Rust. Emit the proper float
+            // constant instead; finite values keep the suffixed-decimal form.
+            ValueType::Float(v) => {
+                let f = *v as f32;
+                if f.is_finite() {
+                    format!("{f}f32")
+                } else if f.is_nan() {
+                    "f32::NAN".to_owned()
+                } else if f > 0.0 {
+                    "f32::INFINITY".to_owned()
+                } else {
+                    "f32::NEG_INFINITY".to_owned()
+                }
+            }
+            ValueType::Double(v) => {
+                if v.is_finite() {
+                    format!("{v}f64")
+                } else if v.is_nan() {
+                    "f64::NAN".to_owned()
+                } else if *v > 0.0 {
+                    "f64::INFINITY".to_owned()
+                } else {
+                    "f64::NEG_INFINITY".to_owned()
+                }
+            }
             ValueType::Char(_) => format!("'{}' as u16", self.to_value_string()),
             ValueType::Name(_) => self.to_value_string(),
             ValueType::Reference {

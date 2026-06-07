@@ -119,3 +119,32 @@ fn negative_byte_array_default_emits_unsigned() {
         "no negated literal may remain in a u8 byte array (got: {packed})"
     );
 }
+
+/// AIDL-2: a float/double field default that folds to a non-finite value
+/// (e.g. `1.0e400` parses to infinity) must emit a valid Rust float constant
+/// (`f64::INFINITY` / `f32::INFINITY` / `NAN`), not `inff64` / `NaNf32` which
+/// do not compile. Finite defaults keep the suffixed-decimal form.
+#[test]
+fn non_finite_float_default_emits_valid_constant() {
+    let out =
+        generate_str("parcelable P { double d = 1.0e400; float f = 1.0e400; double n = 1.0; }")
+            .expect("must generate");
+    let packed = out.replace([' ', '\n'], "");
+    assert!(
+        packed.contains("f64::INFINITY"),
+        "double infinity default must emit f64::INFINITY (got: {packed})"
+    );
+    assert!(
+        packed.contains("f32::INFINITY"),
+        "float infinity default must emit f32::INFINITY (got: {packed})"
+    );
+    assert!(
+        !packed.contains("inff64") && !packed.contains("inff32"),
+        "no `inff64`/`inff32` token may remain (got: {packed})"
+    );
+    // A finite default is untouched.
+    assert!(
+        packed.contains("1f64") || packed.contains("1.0f64") || packed.contains("1f64"),
+        "finite double default keeps suffixed-decimal form (got: {packed})"
+    );
+}
