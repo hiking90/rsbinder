@@ -118,3 +118,60 @@ fn test_error_span_points_to_correct_location() {
         panic!("Expected AidlError::Parse, got: {err:?}");
     }
 }
+
+// AIDL-3 / AIDL-5: a backslash or control byte in a String constant would be
+// emitted verbatim into the generated Rust `"..."` and fail to compile (a raw
+// `\X` is not necessarily a valid Rust escape; rsbinder does not decode string
+// escapes). They are rejected at parse time. Non-ASCII (UTF-8) text stays
+// valid — rsbinder is intentionally more lenient than AOSP there.
+#[test]
+fn test_string_constant_backslash_or_control_rejected() {
+    for src in [
+        r#"parcelable P { const String S = "a\nb"; }"#, // backslash-n (not decoded)
+        r#"parcelable P { const String S = "a\\b"; }"#, // literal backslash
+        r#"parcelable P { const String S = "a\"b"; }"#, // escaped quote (AIDL-5 grammar)
+    ] {
+        let err = expect_parse_error(src, "test.aidl");
+        assert!(matches!(&err, AidlError::Parse(_)), "src: {src}");
+    }
+    // Non-ASCII text and plain ASCII stay valid.
+    for src in [
+        r#"parcelable P { const String S = "한글 테스트"; }"#,
+        r#"parcelable P { const String S = "plain ascii"; }"#,
+    ] {
+        let ctx = SourceContext::new("test.aidl", src);
+        assert!(
+            parse_document(&ctx).is_ok(),
+            "string constant must still parse: {src}"
+        );
+    }
+}
+
+// AIDL-4: an unsupported char escape used to fall through to the post-backslash
+// char verbatim, silently producing the wrong code point (`'\a'` -> 'a' = 97,
+// not bell = 7). It is now rejected. The supported escapes still decode and a
+// plain char still parses.
+#[test]
+fn test_char_constant_unknown_escape_rejected() {
+    for src in [
+        r#"interface I { const char C = '\a'; }"#,
+        r#"interface I { const char C = '\f'; }"#,
+        r#"interface I { const char C = '\v'; }"#,
+        r#"interface I { const char C = '\b'; }"#,
+    ] {
+        let err = expect_parse_error(src, "test.aidl");
+        assert!(matches!(&err, AidlError::Parse(_)), "src: {src}");
+    }
+    for src in [
+        r#"interface I { const char C = '\n'; }"#,
+        r#"interface I { const char C = '\t'; }"#,
+        r#"interface I { const char C = '\0'; }"#,
+        r#"interface I { const char C = 'A'; }"#,
+    ] {
+        let ctx = SourceContext::new("test.aidl", src);
+        assert!(
+            parse_document(&ctx).is_ok(),
+            "supported char literal must still parse: {src}"
+        );
+    }
+}
