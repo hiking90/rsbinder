@@ -173,12 +173,18 @@ pub fn clear_count_by_uid() {
 /// the global counter (lock-free) and, if per-uid tracking is enabled,
 /// updates the uid map under the state mutex.
 ///
+/// Returns `true` iff the per-uid map was incremented (tracking was
+/// enabled at create time). The caller records this on the proxy so its
+/// `Drop` decrements the per-uid map iff this create did — binding the
+/// decision per-object (AOSP `mTrackedUid`) rather than re-reading the
+/// global flag, which would desync if tracking is toggled mid-flight.
+///
 /// Watermark callbacks fire after the mutex is dropped to support
 /// reentrant callback bodies (AOSP `postTask` discipline).
-pub(crate) fn on_proxy_create(uid: u32) {
+pub(crate) fn on_proxy_create(uid: u32) -> bool {
     PROXY_COUNT.fetch_add(1, Ordering::Relaxed);
     if !COUNT_BY_UID_ENABLED.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
     let event = {
         let mut state = STATE.lock().expect("proxy_count state poisoned");
@@ -208,22 +214,29 @@ pub(crate) fn on_proxy_create(uid: u32) {
     if let Some((cb, event)) = event {
         cb(event);
     }
+    true
 }
 
 /// Internal hook called from `ProxyHandle::drop`. Decrements the
-/// global counter and, if per-uid tracking is enabled, decrements the
-/// uid map entry and clears **both** watermark debounce flags together
-/// once the count falls to/below `low`. Symmetric with
-/// [`on_proxy_create`].
+/// global counter and, iff this proxy's `on_proxy_create` incremented the
+/// per-uid map (`counted_by_uid`), decrements that entry and clears **both**
+/// watermark debounce flags together once the count falls to/below `low`.
+/// Symmetric with [`on_proxy_create`].
+///
+/// `counted_by_uid` is captured per-proxy at create time rather than
+/// re-reading `COUNT_BY_UID_ENABLED` here: if tracking is toggled off while a
+/// proxy is live, re-reading the live flag would skip the matching decrement
+/// and permanently inflate the uid's count (and latch its watermark). AOSP
+/// avoids this by deciding per-object via `BpBinder::mTrackedUid`.
 ///
 /// AOSP (`BpBinder.cpp`) resets `LIMIT_REACHED_MASK | WARNING_REACHED_MASK`
 /// jointly at `count <= low`. Clearing them at separate thresholds (warning
 /// at `< warning`, limit at `< low`) let the `Warning` callback re-fire on a
 /// `low <-> warning` oscillation, which AOSP never does — so we mirror the
 /// joint reset.
-pub(crate) fn on_proxy_drop(uid: u32) {
+pub(crate) fn on_proxy_drop(uid: u32, counted_by_uid: bool) {
     PROXY_COUNT.fetch_sub(1, Ordering::Relaxed);
-    if !COUNT_BY_UID_ENABLED.load(Ordering::Relaxed) {
+    if !counted_by_uid {
         return;
     }
     let mut state = STATE.lock().expect("proxy_count state poisoned");
@@ -270,10 +283,10 @@ mod tests {
         on_proxy_create(1000);
         on_proxy_create(2000);
         assert_eq!(get_binder_proxy_count(), 3);
-        on_proxy_drop(1000);
+        on_proxy_drop(1000, false);
         assert_eq!(get_binder_proxy_count(), 2);
-        on_proxy_drop(1000);
-        on_proxy_drop(2000);
+        on_proxy_drop(1000, false);
+        on_proxy_drop(2000, false);
         assert_eq!(get_binder_proxy_count(), 0);
     }
 
@@ -287,8 +300,8 @@ mod tests {
         assert_eq!(get_binder_proxy_count(), 2);
         assert_eq!(get_binder_proxy_count_for_uid(1000), 0);
         assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
-        on_proxy_drop(1000);
-        on_proxy_drop(2000);
+        on_proxy_drop(1000, false);
+        on_proxy_drop(2000, false);
     }
 
     #[test]
@@ -305,9 +318,9 @@ mod tests {
         let mut snap = get_binder_proxy_counts_by_uid();
         snap.sort_by_key(|(uid, _)| *uid);
         assert_eq!(snap, vec![(1000, 2), (2000, 1)]);
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
-        on_proxy_drop(2000);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(2000, true);
         // All counts at 0 → map entries removed.
         assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
     }
@@ -338,7 +351,7 @@ mod tests {
 
         // Drop to below low=2 → debounce clears; next climb fires again.
         for _ in 0..6 {
-            on_proxy_drop(1000);
+            on_proxy_drop(1000, true);
         }
         assert_eq!(get_binder_proxy_count_for_uid(1000), 1);
         on_proxy_create(1000); // 2
@@ -348,11 +361,11 @@ mod tests {
         let snap: Vec<_> = fired.lock().unwrap().clone();
         assert_eq!(snap.len(), 4, "re-fire after below-low reset: {snap:?}");
 
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
     }
 
     #[test]
@@ -370,8 +383,8 @@ mod tests {
         })));
         on_proxy_create(1000);
         on_proxy_create(1000); // should not deadlock
-        on_proxy_drop(1000);
-        on_proxy_drop(1000);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(1000, true);
     }
 
     #[test]
@@ -387,7 +400,43 @@ mod tests {
         // Global counter is unaffected — it tracks live `ProxyHandle`s,
         // not the per-uid statistic.
         assert_eq!(get_binder_proxy_count(), 2);
-        on_proxy_drop(1000);
-        on_proxy_drop(2000);
+        on_proxy_drop(1000, true);
+        on_proxy_drop(2000, true);
+    }
+
+    #[test]
+    fn per_uid_count_survives_tracking_toggled_off_while_live() {
+        // Regression: `on_proxy_drop` must mirror what the proxy's
+        // `on_proxy_create` did (captured per-object), not re-read the live
+        // `COUNT_BY_UID_ENABLED`. Toggling tracking off while a counted proxy
+        // is alive previously skipped its decrement and permanently inflated
+        // the uid's count.
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        enable_count_by_uid(true);
+        // Two proxies created while enabled → each captures counted_by_uid=true.
+        let c1 = on_proxy_create(1000);
+        let c2 = on_proxy_create(1000);
+        assert!(c1 && c2);
+        assert_eq!(get_binder_proxy_count_for_uid(1000), 2);
+
+        // Tracking turned off while both proxies are still live.
+        enable_count_by_uid(false);
+
+        // A proxy created *now* captures counted_by_uid=false.
+        let c3 = on_proxy_create(1000);
+        assert!(!c3);
+
+        // Drop all three using each proxy's captured decision. The two
+        // enabled-era proxies decrement the per-uid map even though tracking
+        // is now off; the disabled-era proxy does not touch it.
+        on_proxy_drop(1000, c3); // disabled-era: no per-uid effect
+        on_proxy_drop(1000, c2);
+        on_proxy_drop(1000, c1);
+
+        // Count is back to exactly 0 (entry removed) — no inflation.
+        assert_eq!(get_binder_proxy_count_for_uid(1000), 0);
+        assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
     }
 }

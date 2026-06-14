@@ -67,7 +67,15 @@ impl Namespace {
         curr_ns.drain(0..index_to_remove);
         target_ns.drain(0..index_to_remove);
 
-        "super::".repeat(curr_ns.len()) + &target_ns.join(Self::RUST)
+        // Escape any path segment that is a Rust keyword (an AIDL type used as
+        // a module here, e.g. a parcelable named `match`) so the reference
+        // compiles; non-keyword segments are unchanged.
+        let target_path = target_ns
+            .iter()
+            .map(|seg| escape_rust_keyword(seg))
+            .collect::<Vec<_>>()
+            .join(Self::RUST);
+        "super::".repeat(curr_ns.len()) + &target_path
     }
 }
 
@@ -81,6 +89,34 @@ impl Namespace {
 /// import still surfaces as `ResolutionError::ImportNotFound`.
 pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
     matches!(fqcn, "android.os.ParcelFileDescriptor")
+}
+
+/// Wrap `ident` as a Rust raw identifier (`r#ident`) iff it is a Rust keyword
+/// that would otherwise fail to compile as a plain identifier.
+///
+/// AIDL's identifier grammar permits type and member names that are Rust
+/// keywords (`type`, `loop`, `match`, `move`, `impl`, …); the generated
+/// `mod` / `struct` / `trait` declarations and the `::`-joined reference paths
+/// that name them must escape those, exactly as AOSP's Rust backend does
+/// (`pub struct r#<Name>`, `::r#<segment>`). `crate`, `self`, `Self` and
+/// `super` cannot be raw identifiers — and are meaningful path keywords — so
+/// they are returned unchanged. Non-keyword identifiers are returned unchanged,
+/// so generated output for ordinary names is byte-for-byte identical.
+pub(crate) fn escape_rust_keyword(ident: &str) -> std::borrow::Cow<'_, str> {
+    // Strict + reserved Rust 2021 keywords, minus `crate`/`self`/`Self`/`super`
+    // (invalid as raw identifiers; never need escaping in our output).
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "dyn", "else", "enum", "extern",
+        "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+        "pub", "ref", "return", "static", "struct", "trait", "true", "type", "unsafe", "use",
+        "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+        "typeof", "unsized", "virtual", "yield", "try",
+    ];
+    if KEYWORDS.contains(&ident) {
+        std::borrow::Cow::Owned(format!("r#{ident}"))
+    } else {
+        std::borrow::Cow::Borrowed(ident)
+    }
 }
 
 pub fn indent_space(step: usize) -> String {

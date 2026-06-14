@@ -323,12 +323,20 @@ impl ValueType {
                     Some(expr) => {
                         let calculated = expr.calculate()?;
                         if let ValueType::Name(_) = calculated.value {
+                            // Still a name after resolution ⇒ a circular
+                            // reference broke the cycle (tested graceful
+                            // degradation); fold to a neutral value.
                             Ok(false)
                         } else {
                             calculated.to_bool()
                         }
                     }
-                    None => Ok(false),
+                    // Genuinely unresolvable (typo / missing import). AOSP
+                    // rejects this at build time; surface a diagnostic instead
+                    // of fabricating `false`.
+                    None => Err(ConstExprError::new(format!(
+                        "cannot resolve constant reference '{name}'"
+                    ))),
                 }
             }
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
@@ -365,7 +373,10 @@ impl ValueType {
                             calculated.to_f64()
                         }
                     }
-                    None => Ok(0.0),
+                    // See `to_bool`: unresolvable reference ⇒ diagnostic, not 0.
+                    None => Err(ConstExprError::new(format!(
+                        "cannot resolve constant reference '{name}'"
+                    ))),
                 }
             }
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
@@ -404,7 +415,10 @@ impl ValueType {
                             calculated.to_i64()
                         }
                     }
-                    None => Ok(0),
+                    // See `to_bool`: unresolvable reference ⇒ diagnostic, not 0.
+                    None => Err(ConstExprError::new(format!(
+                        "cannot resolve constant reference '{name}'"
+                    ))),
                 }
             }
             ValueType::Reference { value, .. } => Ok(*value),
@@ -673,6 +687,24 @@ impl ValueType {
                 } else {
                     rhs_value as _
                 };
+
+                // The shift is computed in `i64` below but stored in the
+                // promoted operand type. AOSP rejects a shift amount
+                // `>= sizeof(T)*8` as "Constant expression computation
+                // overflows"; computing in i64 and truncating to the operand
+                // type instead silently miscompiles (e.g. `1 << 40` folds to
+                // 0). Reject an out-of-range amount up front to match AOSP.
+                let bits: u32 = match &promoted {
+                    ValueType::Int64(_) | ValueType::Reference { .. } => 64,
+                    // Int32 / Byte both integral-promote to `int` for the shift.
+                    _ => 32,
+                };
+                if rhs_value >= bits {
+                    return Err(ConstExprError::new(format!(
+                        "shift amount {rhs_value} out of range for operator '{operator}' \
+                         (operand width {bits} bits)"
+                    )));
+                }
 
                 let value = if is_shl {
                     lhs_value.wrapping_shl(rhs_value)

@@ -848,6 +848,17 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                                 log::warn!("binder::BR_REPLY ({status})");
                                 return Err(status);
                             }
+                            // AOSP `IPCThreadState::waitForResponse` ends the
+                            // status-code branch with an unconditional `goto
+                            // finish` (`return err`, even for NO_ERROR), so a
+                            // `TF_STATUS_CODE` reply carrying status 0 yields a
+                            // successful empty reply — it never loops. Falling
+                            // through here instead would re-enter the outer
+                            // `loop` and block in `talk_with_driver` waiting for
+                            // a command a conforming peer never sends, hanging
+                            // (potentially the main thread) on a malformed or
+                            // hostile reply. Return the empty reply to match.
+                            return Ok(Some(Parcel::new()));
                         }
                     } else {
                         free_buffer(

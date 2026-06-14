@@ -1152,12 +1152,18 @@ impl RpcSessionInner {
                     // reuse its existing address (no new local node).
                     rp.address()
                 } else {
-                    // A local object leaving this process.
-                    self.shared
+                    // A local object leaving this process: `on_binder_leaving`
+                    // bumps its `timesSent`. Record the address so a send
+                    // failure can roll the bump back (`cancel_binder_leaving`)
+                    // — the unreceived binder is never DEC'd by the peer.
+                    let addr = self
+                        .shared
                         .state
                         .lock()
                         .expect("rpc state poisoned")
-                        .on_binder_leaving(b)?
+                        .on_binder_leaving(b)?;
+                    parcel.rpc_record_leaving_addr(addr);
+                    addr
                 };
                 // AOSP `Parcel::flattenBinder`: `dataPos = mDataPos`
                 // is captured **before** `writeInt32(TYPE_BINDER)` —
@@ -1277,6 +1283,22 @@ impl RpcSessionInner {
     /// Client outbound transaction. Returns the reply parcel (or `None`
     /// for oneway). Applies any interleaved `DEC_STRONG` and loops to
     /// the matching `REPLY`.
+    /// Undo the reservations a failed outgoing transaction took before the
+    /// send actually happened: the per-node oneway `async_number` (when
+    /// `oneway_addr` is `Some((addr, consumed))`) and every local-binder
+    /// `timesSent` bump recorded in `data` while it was serialized. Invoked
+    /// only on an encode/send error, so the success path is untouched and the
+    /// wire is byte-unchanged.
+    fn rollback_outgoing(&self, data: &Parcel, oneway_addr: Option<(RpcAddress, u64)>) {
+        let mut state = self.shared.state.lock().expect("rpc state poisoned");
+        if let Some((addr, consumed)) = oneway_addr {
+            state.cancel_send_async_number(addr, consumed);
+        }
+        for &addr in data.rpc_leaving_addrs() {
+            state.cancel_binder_leaving(&addr);
+        }
+    }
+
     pub(crate) fn client_transact(
         &self,
         addr: RpcAddress,
@@ -1316,10 +1338,27 @@ impl RpcSessionInner {
             // wire when empty.
             object_positions: data.rpc_object_positions().to_vec(),
         };
-        let frame = self.profile.codec().encode_transact(&txn)?;
+        // From here the request has consumed reservations (a oneway
+        // `async_number`, and each local binder's `timesSent` bump recorded
+        // while `data` was serialized). If the encode or send fails, roll them
+        // back: the peer never received the transaction, and — unlike AOSP —
+        // rsbinder does not tear the (possibly multi-connection) session down
+        // on a send failure, so without rollback the reservations would leak
+        // (a stranded local node, a permanent oneway-ordering gap).
+        let rollback = || self.rollback_outgoing(data, oneway.then_some((addr, async_number)));
+        let frame = match self.profile.codec().encode_transact(&txn) {
+            Ok(frame) => frame,
+            Err(e) => {
+                rollback();
+                return Err(e.into());
+            }
+        };
         // Out-of-band fds collected while serializing the request
         // (empty unless `Unix` fd-mode).
-        self.send_msg(transport, &frame, data.rpc_out_fds())?;
+        if let Err(e) = self.send_msg(transport, &frame, data.rpc_out_fds()) {
+            rollback();
+            return Err(e.into());
+        }
         if oneway {
             return Ok(None);
         }
@@ -1719,12 +1758,22 @@ impl RpcSessionInner {
             return Ok(());
         }
         match result {
-            Ok(()) => self.send_reply(
-                0,
-                reply.rpc_data_bytes(),
-                reply.rpc_object_positions(),
-                reply.rpc_out_fds(),
-            ),
+            Ok(()) => {
+                let sent = self.send_reply(
+                    0,
+                    reply.rpc_data_bytes(),
+                    reply.rpc_object_positions(),
+                    reply.rpc_out_fds(),
+                );
+                if sent.is_err() {
+                    // The reply (with any binders the handler returned) never
+                    // reached the peer; roll back their `timesSent` bumps so the
+                    // returned local nodes do not leak. No oneway counter here —
+                    // a reply is always twoway.
+                    self.rollback_outgoing(&reply, None);
+                }
+                sent
+            }
             Err(e) => self.send_reply(e.into(), &[], &[], &[]),
         }
     }

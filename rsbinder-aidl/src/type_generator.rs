@@ -262,15 +262,16 @@ impl TypeGenerator {
             .expect("type must be resolved during code generation");
         let curr_ns = current_namespace();
         let ns = curr_ns.relative_mod(&lookup_decl.ns);
+        // Escape the simple type name if it is a Rust keyword (AIDL allows it)
+        // so the generated path / `Strong<dyn …>` / `Box<…>` compiles. The
+        // `relative_mod` module path is already keyword-escaped.
+        let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let name = if !ns.is_empty() {
-            format!("{}::{}", ns, lookup_decl.name.ns.last().unwrap())
+            format!("{ns}::{simple}")
+        } else if curr_ns.ns.last().unwrap() == lookup_decl.name.ns.last().unwrap().as_str() {
+            format!("Box<{simple}>") // To avoid, recursive type issue.
         } else {
-            let name: String = lookup_decl.name.ns.last().unwrap().to_owned();
-            if curr_ns.ns.last().unwrap() == name.as_str() {
-                format!("Box<{name}>") // To avoid, recursive type issue.
-            } else {
-                name
-            }
+            simple.into_owned()
         };
 
         match lookup_decl.decl {
@@ -1009,23 +1010,36 @@ impl TypeGenerator {
         }
 
         let scalar_param = param.with_fixed_array(false).with_nullable(false);
-        Ok(match expr.calculate() {
-            Ok(calculated) => match &calculated.value {
-                // An enum reference whose target is the enum type keeps the
-                // symbolic member; a primitive target (e.g. int) takes its value.
-                ValueType::Reference { value, .. } => {
-                    if matches!(&self.value_type, ValueType::UserDefined(_)) {
-                        calculated.value.to_init(scalar_param)
-                    } else {
-                        ValueType::Int64(*value).to_init(scalar_param)
-                    }
+        // Propagate an evaluation failure (an unresolvable reference inside a
+        // sub-expression, an overflowing shift, too-deep nesting) as a
+        // diagnostic instead of silently emitting a `0` default — AOSP rejects
+        // these at build time.
+        let calculated = expr
+            .calculate()
+            .map_err(|e| make_type_error(e.message, self.type_span))?;
+        // A value that is *still* a bare name means the reference does not
+        // resolve at all (typo / missing import); diagnose rather than baking a
+        // fabricated constant into the generated IPC code.
+        if let ValueType::Name(name) = &calculated.value {
+            return Err(make_type_error(
+                format!("cannot resolve constant reference '{name}'"),
+                self.type_span,
+            ));
+        }
+        Ok(match &calculated.value {
+            // An enum reference whose target is the enum type keeps the
+            // symbolic member; a primitive target (e.g. int) takes its value.
+            ValueType::Reference { value, .. } => {
+                if matches!(&self.value_type, ValueType::UserDefined(_)) {
+                    calculated.value.to_init(scalar_param)
+                } else {
+                    ValueType::Int64(*value).to_init(scalar_param)
                 }
-                _ => match calculated.convert_to(&self.value_type) {
-                    Ok(converted) => converted.value.to_init(scalar_param),
-                    Err(_) => calculated.value.to_init(scalar_param),
-                },
+            }
+            _ => match calculated.convert_to(&self.value_type) {
+                Ok(converted) => converted.value.to_init(scalar_param),
+                Err(_) => calculated.value.to_init(scalar_param),
             },
-            Err(_) => ValueType::Void.to_init(scalar_param),
         })
     }
 

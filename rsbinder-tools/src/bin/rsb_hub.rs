@@ -902,9 +902,30 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            arg_callback.as_binder().link_to_death(Arc::downgrade(
-                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-            ))?;
+            // Death-link dedup. rsb_hub links every accepted registration to a
+            // single shared `death_recipient`, and `ProxyHandle::link_to_death`
+            // does not dedup recipients, so linking the same callback binder
+            // under K distinct names would stack K identical death
+            // subscriptions and fire `binder_died` K times on death — K full
+            // O(maps) cleanup sweeps in the single death thread (a self-DoS
+            // bounded only by `MAX_DISTINCT_NAMES`). Link at most once per
+            // distinct callback binder; the per-name list still records it
+            // under every name, so cleanup still finds and removes all entries.
+            // The scan short-circuits on the first match, so the amplification
+            // case (one binder, many names) stays O(1) per registration after
+            // the initial link. Mirrors the `same_binder` relink guard in
+            // `addService`.
+            let cb_binder = arg_callback.as_binder();
+            let already_linked = inner
+                .name_to_registration_callbacks
+                .values()
+                .flatten()
+                .any(|c| c.as_binder() == cb_binder);
+            if !already_linked {
+                cb_binder.link_to_death(Arc::downgrade(
+                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+                ))?;
+            }
 
             inner
                 .name_to_registration_callbacks
@@ -1057,9 +1078,21 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            arg_callback.as_binder().link_to_death(Arc::downgrade(
-                &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-            ))?;
+            // Death-link dedup, same rationale as `registerForNotifications`:
+            // link the shared `death_recipient` at most once per distinct
+            // callback binder so registering one binder across K service names
+            // cannot stack K death subscriptions (K cleanup sweeps on death).
+            let cb_binder = arg_callback.as_binder();
+            let already_linked = inner
+                .name_to_client_callbacks
+                .values()
+                .flatten()
+                .any(|c| c.as_binder() == cb_binder);
+            if !already_linked {
+                cb_binder.link_to_death(Arc::downgrade(
+                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
+                ))?;
+            }
 
             if service.has_clients {
                 pending.push(PendingCallback::Clients {

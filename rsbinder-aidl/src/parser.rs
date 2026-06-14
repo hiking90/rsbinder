@@ -2259,6 +2259,15 @@ fn calculate_namespace(
 /// [`check_nesting_depth`].
 const MAX_NESTING_DEPTH: usize = 256;
 
+/// Maximum number of operator tokens accepted in a single statement/element
+/// (reset at `; , ( ) [ ] { }`). A const expression made of a long operator
+/// chain — `~~~~…~5` or `1+1+…+1` — contains no brackets, so it slips past the
+/// bracket/angle guard yet still drives one parser/walker recursion per
+/// operator and overflows the stack. This bounds that chain length: far above
+/// any legitimate expression (a few dozen OR'd flags at most), far below the
+/// multi-thousand recursion depth that aborts the process.
+const MAX_OPERATOR_RUN: usize = 1024;
+
 /// Pre-parse denial-of-service guard. pest's recursive-descent parser and
 /// the recursive AST walkers recurse once per nesting level, so deeply
 /// nested input (`((((...))))` or `List<List<...>>`) would overflow the
@@ -2276,6 +2285,7 @@ fn check_nesting_depth(source: &str) -> Option<usize> {
     let mut i = 0;
     let mut bracket_depth: usize = 0; // () [] {}
     let mut angle_depth: usize = 0; // <> generics
+    let mut op_run: usize = 0; // operator tokens in the current statement/element
     let next = |i: usize| bytes.get(i + 1).copied();
     while i < bytes.len() {
         match bytes[i] {
@@ -2309,24 +2319,49 @@ fn check_nesting_depth(source: &str) -> Option<usize> {
                 i += 2;
                 continue;
             }
-            b'(' | b'[' | b'{' => bracket_depth += 1,
-            b')' | b']' | b'}' => bracket_depth = bracket_depth.saturating_sub(1),
+            // A bracket / element / statement boundary begins a fresh
+            // sub-expression, so the operator run restarts here.
+            b'(' | b'[' | b'{' => {
+                bracket_depth += 1;
+                op_run = 0;
+            }
+            b')' | b']' | b'}' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                op_run = 0;
+            }
+            b',' => op_run = 0,
             // `<<` shift / `<=` are not generic openers.
             b'<' if matches!(next(i), Some(b'<') | Some(b'=')) => {
+                if bytes[i + 1] == b'<' {
+                    op_run += 1; // `<<` drives one shift-recursion level
+                }
                 i += 2;
                 continue;
             }
             b'<' => angle_depth += 1,
             // `>>` shift / `>=` are not generic closers.
             b'>' if matches!(next(i), Some(b'>') | Some(b'=')) => {
+                if bytes[i + 1] == b'>' {
+                    op_run += 1;
+                }
                 i += 2;
                 continue;
             }
             b'>' => angle_depth = angle_depth.saturating_sub(1),
-            b';' => angle_depth = 0,
+            b';' => {
+                angle_depth = 0;
+                op_run = 0;
+            }
+            // Unary / binary operator tokens. Each drives one
+            // parser/walker recursion level, so a long unbracketed chain
+            // would overflow the stack — bound it via `op_run`.
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'!' | b'~' => op_run += 1,
             _ => {}
         }
-        if bracket_depth > MAX_NESTING_DEPTH || angle_depth > MAX_NESTING_DEPTH {
+        if bracket_depth > MAX_NESTING_DEPTH
+            || angle_depth > MAX_NESTING_DEPTH
+            || op_run > MAX_OPERATOR_RUN
+        {
             return Some(i);
         }
         i += 1;

@@ -318,7 +318,7 @@ impl RpcTransport for UnixTransport {
     /// fds across those `recvmsg`s (AOSP
     /// `RpcTransportRaw::interruptableReadFully`).
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
@@ -349,6 +349,17 @@ impl RpcTransport for UnixTransport {
                 }
             }
         };
+        // The kernel sets `MSG_CTRUNC` when an SCM_RIGHTS batch did not fit
+        // the ancillary buffer: it installs as many fds as fit and silently
+        // drops the rest. Continuing would leave the parcel's fd object table
+        // referencing fds we never received, so fail the connection instead —
+        // matching AOSP `OS_unix_base.cpp` which rejects truncation with EPIPE
+        // rather than proceeding with a half-delivered message.
+        if r.flags.contains(ReturnFlags::CTRUNC) {
+            return Err(RpcError::Protocol(
+                "SCM_RIGHTS control message truncated (too many fds in one message)",
+            ));
+        }
         for msg in anc.drain() {
             if let RecvAncillaryMessage::ScmRights(iter) = msg {
                 for fd in iter {
@@ -443,7 +454,7 @@ impl RpcTransport for UnixTransport {
     /// Connections in `Unix` fd-mode use this for *every* frame, so
     /// `recvmsg` and `Read` are never mixed on one fd.
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
@@ -498,6 +509,16 @@ impl RpcTransport for UnixTransport {
                     }
                 }
             };
+            // `MSG_CTRUNC` ⇒ the kernel dropped surplus fds that did not fit
+            // the ancillary buffer; the frame's fd indices would then point at
+            // fds we never received. Reject rather than proceed, matching AOSP
+            // `OS_unix_base.cpp` (EPIPE on truncation). Same guard as
+            // `recv_raw_with_fds`.
+            if r.flags.contains(ReturnFlags::CTRUNC) {
+                return Err(RpcError::Protocol(
+                    "SCM_RIGHTS control message truncated (too many fds in one message)",
+                ));
+            }
             for msg in anc.drain() {
                 if let RecvAncillaryMessage::ScmRights(iter) = msg {
                     for fd in iter {

@@ -285,6 +285,116 @@ fn test_unknown_type_is_diagnostic_not_panic() {
 }
 
 #[test]
+fn test_operator_chain_rejected_before_stack_overflow() {
+    // A long *unbracketed* operator chain bypasses the bracket/angle nesting
+    // guard yet still drives one parser/walker recursion per operator. It must
+    // be rejected as an ordinary diagnostic, never overflow the stack (the
+    // chains here stay under the stack-overflow threshold but exceed
+    // `MAX_OPERATOR_RUN`, so the pre-parse guard rejects them).
+    let unary = "~".repeat(4000);
+    let unary_input = format!("package test.dos;\ninterface IFoo {{ const int X = {unary}5; }}");
+    assert!(
+        test_aidl_generation(&unary_input).is_err(),
+        "long unary operator chain must be rejected"
+    );
+
+    let binary = "1+".repeat(4000);
+    let binary_input = format!("package test.dos;\ninterface IFoo {{ const int X = {binary}1; }}");
+    assert!(
+        test_aidl_generation(&binary_input).is_err(),
+        "long binary operator chain must be rejected"
+    );
+
+    // A short chain still generates fine.
+    let ok =
+        test_aidl_generation("package test.dos;\ninterface IFoo { const int Y = 1 + 2 + 3 + 4; }")
+            .expect("short expression should generate");
+    assert!(ok.contains("r#Y"));
+}
+
+#[test]
+fn test_unresolvable_const_reference_is_diagnostic() {
+    // A typo'd / missing constant reference must surface a diagnostic instead
+    // of silently folding to 0 (AOSP hard-fails with "Can't find <name>").
+    // Covers both a bare reference and one inside an arithmetic expression.
+    for input in [
+        "package test.u;\ninterface IFoo { const int A = TYPO_NAME; }",
+        "package test.u;\ninterface IFoo { const int A = TYPO_NAME + 1; }",
+    ] {
+        assert!(
+            test_aidl_generation(input).is_err(),
+            "unresolvable const reference must error, input: {input}"
+        );
+    }
+
+    // A *circular* reference is still handled gracefully (it resolves to a
+    // neutral 0 via cycle-breaking, not a hard error) — distinct code path.
+    let circular = test_aidl_generation(
+        "package test.c;\ninterface IFoo { const int A = B; const int B = A; }",
+    );
+    assert!(
+        circular.is_ok(),
+        "circular reference must degrade gracefully, got: {circular:?}"
+    );
+}
+
+#[test]
+fn test_overflowing_shift_is_diagnostic() {
+    // `1 << 40` overflows the int32 shift operand type and is rejected by
+    // AOSP; rsbinder must not silently truncate it to 0. The declared `long`
+    // does not widen the shift (operands promote to int independently).
+    assert!(
+        test_aidl_generation("package test.s;\ninterface IFoo { const long C = 1 << 40; }")
+            .is_err(),
+        "out-of-range shift in a long const must error"
+    );
+    assert!(
+        test_aidl_generation("package test.s;\ninterface IFoo { const int A = 1 << 40; }").is_err(),
+        "out-of-range shift in an int const must error"
+    );
+
+    // An in-range shift still generates the correct value.
+    let ok = test_aidl_generation("package test.s;\ninterface IFoo { const int B = 1 << 4; }")
+        .expect("in-range shift should generate");
+    assert!(ok.contains("r#B"));
+    // `1L << 40` is valid (64-bit operand) and must keep working.
+    let wide = test_aidl_generation("package test.s;\ninterface IFoo { const long D = 1L << 40; }")
+        .expect("64-bit shift should generate");
+    assert!(wide.contains("r#D"));
+}
+
+#[test]
+fn test_rust_keyword_type_names_are_escaped() {
+    // AIDL permits type names that are Rust keywords (`type`, `loop`,
+    // `match`, …); the generated mod/struct/trait declarations AND the
+    // reference paths that name them must `r#`-escape so the output compiles
+    // (AOSP's Rust backend does the same). Previously only member names were
+    // escaped, so a keyword-named type emitted non-compiling Rust.
+    let parc = test_aidl_generation("package test.kw;\nparcelable type { int a; }")
+        .expect("keyword parcelable should generate");
+    assert!(parc.contains("pub mod r#type"), "got:\n{parc}");
+    assert!(parc.contains("pub struct r#type"), "got:\n{parc}");
+
+    let iface = test_aidl_generation("package test.kw;\ninterface loop { void foo(); }")
+        .expect("keyword interface should generate");
+    assert!(iface.contains("pub mod r#loop"), "got:\n{iface}");
+    assert!(iface.contains("pub trait r#loop"), "got:\n{iface}");
+
+    // Cross-reference: a field typed as a keyword-named parcelable must
+    // produce a fully `r#`-escaped path, never a bare keyword path.
+    let xref = test_aidl_generation(
+        "package test.kw;\nparcelable match { int a; }\nparcelable Holder { match m; }",
+    )
+    .expect("cross-reference to keyword type should generate");
+    assert!(
+        xref.contains("super::r#match::r#match"),
+        "cross-reference path not escaped, got:\n{xref}"
+    );
+    // An ordinary (non-keyword) name is untouched — no spurious escaping.
+    assert!(xref.contains("pub mod Holder"), "got:\n{xref}");
+}
+
+#[test]
 fn test_enum_array_default_initializers() {
     // Characterization: no golden test covered `init_enum_array_value` (enum
     // array field defaults). Pins both the non-nullable and nullable forms so
