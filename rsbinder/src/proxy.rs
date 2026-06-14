@@ -87,6 +87,12 @@ pub struct ProxyHandle {
     /// (`synthetic_proxy`) and by the construction-failure path where
     /// `inc_strong_handle` errored before the counter was bumped.
     count_acquired: AtomicBool,
+    /// True iff `on_proxy_create` incremented the per-uid tracking map for
+    /// this proxy (i.e. tracking was enabled at construction). `Drop` uses
+    /// this — not the live `COUNT_BY_UID_ENABLED` flag — to decide whether to
+    /// decrement the per-uid map, so toggling tracking off while the proxy is
+    /// live cannot desync the count (AOSP `BpBinder::mTrackedUid`).
+    counted_by_uid: AtomicBool,
     stability: Stability,
     /// Set once when `send_obituary` runs to publish "this proxy is
     /// dead" to all observers.
@@ -135,12 +141,13 @@ impl ProxyHandle {
         // a proxy that never reached `on_proxy_create`. The
         // `count_acquired` guard below is how `Drop` knows.
         thread_state::inc_strong_handle(handle)?;
-        crate::proxy_count::on_proxy_create(tracked_uid);
+        let counted_by_uid = crate::proxy_count::on_proxy_create(tracked_uid);
         Ok(Arc::new(Self {
             handle,
             descriptor,
             tracked_uid,
             count_acquired: AtomicBool::new(true),
+            counted_by_uid: AtomicBool::new(counted_by_uid),
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
@@ -415,7 +422,10 @@ impl Drop for ProxyHandle {
         // and the `inc_strong_handle`-failure path leave the guard
         // `false`, so the proxy_count globals never see a phantom drop.
         if self.count_acquired.load(Ordering::Relaxed) {
-            crate::proxy_count::on_proxy_drop(self.tracked_uid);
+            crate::proxy_count::on_proxy_drop(
+                self.tracked_uid,
+                self.counted_by_uid.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -671,6 +681,7 @@ mod tests {
             // `proxy_count::on_proxy_drop`, matching this constructor's
             // skip of `new_acquired`'s `on_proxy_create`.
             count_acquired: AtomicBool::new(false),
+            counted_by_uid: AtomicBool::new(false),
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),

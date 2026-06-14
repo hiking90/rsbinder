@@ -1037,8 +1037,12 @@ impl Generator {
 
         let mut context = self.new_context();
 
-        context.insert("mod", &decl.name);
-        context.insert("name", &decl.name);
+        // Escape a Rust-keyword interface name (AIDL permits it) so the
+        // generated `pub mod` / `pub trait` compiles. `bn_name`/`bp_name` are
+        // `Bn`/`Bp`-prefixed and thus never keywords.
+        let escaped_name = crate::escape_rust_keyword(&decl.name);
+        context.insert("mod", &escaped_name);
+        context.insert("name", &escaped_name);
         context.insert("namespace", &namespace);
         context.insert("const_members", &const_members);
         context.insert("fn_members", &fn_members);
@@ -1173,8 +1177,11 @@ pub mod {mod} {{
 
         let mut context = self.new_context();
 
-        context.insert("mod", &decl.name);
-        context.insert("name", &decl.name);
+        // Escape a Rust-keyword parcelable name so `pub mod` / `pub struct`
+        // compiles.
+        let escaped_name = crate::escape_rust_keyword(&decl.name);
+        context.insert("mod", &escaped_name);
+        context.insert("name", &escaped_name);
         context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
         context.insert("namespace", &namespace);
         context.insert("members", &members);
@@ -1257,7 +1264,9 @@ pub mod {mod} {{
 
         let mut context = self.new_context();
 
-        context.insert("mod", &decl.name);
+        // The enum *name* is `r#`-escaped in the template; escape the module
+        // name (which is not) for a Rust-keyword enum name.
+        context.insert("mod", &crate::escape_rust_keyword(&decl.name));
         context.insert("enum_name", &decl.name);
         context.insert(
             "enum_type",
@@ -1340,7 +1349,9 @@ pub mod {mod} {{
 
         let mut context = self.new_context();
 
-        context.insert("mod", &decl.name);
+        // The union *name* is `r#`-escaped in the template; escape the module
+        // name (which is not) for a Rust-keyword union name.
+        context.insert("mod", &crate::escape_rust_keyword(&decl.name));
         context.insert("union_name", &decl.name);
         context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
         context.insert("namespace", &namespace);

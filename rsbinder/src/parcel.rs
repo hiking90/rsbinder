@@ -209,13 +209,6 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    fn resize(&mut self, len: usize) {
-        match self {
-            ParcelData::Vec(v) => v.resize_with(len, Default::default),
-            _ => panic!("&[u8] can't support resize()."),
-        }
-    }
-
     fn capacity(&self) -> usize {
         match self {
             ParcelData::Vec(v) => v.capacity(),
@@ -306,6 +299,13 @@ struct RpcFields {
     /// recorded by the session directly (it owns the profile); only
     /// the FD path needs this Parcel-side flag.
     record_fd_positions: bool,
+    /// Session addresses of local binders that bumped their `timesSent`
+    /// (`RpcState::on_binder_leaving`) while being flattened into this
+    /// outgoing parcel. If the send then fails, the session rolls each back
+    /// (`cancel_binder_leaving`) so the unreceived binder's node does not leak.
+    /// Write-only on the success path (the peer's DEC balances the bumps), so
+    /// the wire is byte-unchanged.
+    leaving_addrs: Vec<crate::rpc::RpcAddress>,
 }
 
 /// The behaviour of the RPC serialization state lives here so that the
@@ -571,6 +571,26 @@ impl Parcel {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.object_positions = positions;
         }
+    }
+
+    /// Record that flattening a local binder into this outgoing RPC parcel
+    /// bumped its `timesSent` for the address `addr`, so a later send failure
+    /// can roll the bump back. No-op kernel-side.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_record_leaving_addr(&mut self, addr: crate::rpc::RpcAddress) {
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.leaving_addrs.push(addr);
+        }
+    }
+
+    /// The local-binder addresses whose `timesSent` this parcel bumped while
+    /// serializing (see [`Parcel::rpc_record_leaving_addr`]). Empty kernel-side
+    /// or when no local binder was flattened.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_leaving_addrs(&self) -> &[crate::rpc::RpcAddress] {
+        self.rpc
+            .as_ref()
+            .map_or(&[], |r| r.leaving_addrs.as_slice())
     }
 
     /// AOSP `Parcel::unflattenBinder` v2 strict check: a binder may
@@ -1070,6 +1090,14 @@ impl Parcel {
         // masks the pad to zero as well. `set_len` only grows up to the
         // just-reserved capacity over now-initialized `u8` bytes.
         unsafe {
+            // Zero any `[len..pos]` gap left by a forward `set_data_position`
+            // before `set_len`, so an uninitialized hole is never exposed via
+            // `as_slice()` / transmitted to the peer (UB + info-leak). See
+            // `write_aligned_data` for the full rationale.
+            let old_len = self.data.len();
+            if pos > old_len {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
+            }
             std::ptr::copy_nonoverlapping::<u8>(
                 parcelable.as_ptr() as _,
                 self.data.as_mut_ptr().add(pos),
@@ -1142,6 +1170,16 @@ impl Parcel {
         // info-leak to the peer. AOSP masks the pad to zero too. `set_len`
         // only grows up to the reserved capacity over now-initialized `u8`.
         unsafe {
+            // If the write cursor sits past the current end (a forward
+            // `set_data_position`), the skipped `[len..pos]` bytes were never
+            // initialized; zero them before `set_len` marks the region
+            // initialized, otherwise `as_slice()` / `data_size()` would expose
+            // uninitialized heap to the peer (UB + info-leak). AOSP `growData`
+            // zero-fills grown capacity the same way.
+            let old_len = self.data.len();
+            if pos > old_len {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
+            }
             std::ptr::copy_nonoverlapping::<u8>(
                 data.as_ptr(),
                 self.data.as_mut_ptr().add(pos),
@@ -1303,6 +1341,13 @@ impl Parcel {
         // are distinct parcels (non-overlapping). `set_len` only grows up to
         // the reserved capacity over the `u8` bytes just copied.
         unsafe {
+            // Zero any `[len..pos]` gap from a forward `set_data_position`
+            // before `set_len` so an uninitialized hole is never exposed /
+            // transmitted (UB + info-leak). See `write_aligned_data`.
+            let old_len = self.data.len();
+            if self.pos > old_len {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, self.pos - old_len);
+            }
             std::ptr::copy_nonoverlapping::<u8>(
                 other.data.as_slice()[offset..offset + size].as_ptr(),
                 self.data.as_mut_ptr().add(self.pos),
@@ -1324,26 +1369,43 @@ impl Parcel {
         let skip_objects = false;
 
         if num_objects > 0 && !skip_objects {
-            let start = self.objects.len();
-            self.objects.resize(start + (num_objects as usize));
+            self.objects.reserve(num_objects as usize);
 
             // Recompute each offset from the SOURCE table position
-            // (`other.objects`), then store the relocated offset into the
-            // destination table. AOSP: `off = pos - offset + startPos`.
+            // (`other.objects`). AOSP: `off = pos - offset + startPos`.
+            //
+            // Commit the relocated offset into `self.objects` only AFTER the
+            // object is fully acquired and (for FDs) dup'd + rewritten with the
+            // destination's own fd. If `acquire()` or the FD dup fails, the
+            // offset is never committed, so this parcel's `Drop`
+            // (`release_objects`) only ever iterates fully-acquired entries.
+            // Committing first (as before) left a half-built entry that still
+            // held the SOURCE's fd/handle bytes; on the drop that follows the
+            // `?` it would `release()` the source's still-owned fd
+            // (double-close) or decrement a refcount that was never incremented
+            // (underflow). AOSP's `appendFrom` is double-close-safe because it
+            // never aborts the loop; this push-after-success ordering achieves
+            // the same invariant by construction.
             let src_objects = other.objects.as_slice();
-            let dst_objects = self.objects.as_mut_slice();
-            for (idx, i) in (start..).zip(first_idx..=last_idx) {
+            for i in first_idx..=last_idx {
                 let off = src_objects[i as usize] as usize - offset + start_pos;
-                dst_objects[idx] = off as _;
                 let mut flat = read_flat_binder(self.data.as_slice(), off)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
-                    flat.set_handle(
-                        rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0)?.into_raw_fd() as _,
-                    );
+                    let newfd = match rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0) {
+                        Ok(newfd) => newfd,
+                        Err(e) => {
+                            // FD `acquire()` is a no-op, so nothing to undo; the
+                            // source's fd at `off` stays owned by the source
+                            // parcel (no double-close). Offset not committed.
+                            return Err(std::io::Error::from(e).into());
+                        }
+                    };
+                    flat.set_handle(newfd.into_raw_fd() as _);
                     flat.set_cookie(1);
                     write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
                 }
+                self.objects.push(off as _);
             }
         }
 

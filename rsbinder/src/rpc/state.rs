@@ -228,6 +228,25 @@ impl RpcState {
         self.local_nodes.get(addr).map(|n| n.binder.clone())
     }
 
+    /// Roll back one `on_binder_leaving` strong bump for `addr` when the
+    /// transaction that would have carried the binder fails to send (AOSP
+    /// `cancelBinderLeaving`). The peer never received the binder, so it will
+    /// never send the matching `DEC_STRONG`; without this the node (and the
+    /// strong `SIBinder` it pins) would leak for the rest of a multi-connection
+    /// session, which — unlike AOSP — rsbinder does not tear down on a send
+    /// failure. The bump and this rollback are a commutative ±1 on a count, so
+    /// this is safe even if another thread concurrently sends the same binder.
+    /// Drops the node once the count reaches 0, exactly like an inbound DEC.
+    pub fn cancel_binder_leaving(&mut self, addr: &RpcAddress) {
+        if let Some(node) = self.local_nodes.get_mut(addr) {
+            node.strong -= 1;
+            if node.strong <= 0 {
+                self.local_nodes.remove(addr);
+                self.local_by_ptr.retain(|_, a| a != addr);
+            }
+        }
+    }
+
     /// Apply an inbound `DEC_STRONG` for `addr`. Drops the node (and
     /// its strong `SIBinder`) once the count reaches 0 — no leak.
     /// Returns `true` if the node was removed.
@@ -347,6 +366,24 @@ impl RpcState {
             warn_async_wrap(&addr);
         }
         n
+    }
+
+    /// Roll back a `next_send_async_number(addr)` reservation when the oneway
+    /// transaction that consumed it fails to send. The peer's receive-side
+    /// counter expects a contiguous sequence, so a consumed-but-never-sent
+    /// number leaves a permanent gap that parks every later oneway to `addr`
+    /// in the peer's `async_todo` (rsbinder, unlike AOSP, does not tear the
+    /// session down on a send failure). Unlike the strong-count rollback this
+    /// is an *ordering* sequence, so only roll back when we were the last
+    /// consumer (`counter == consumed + 1`); if another thread already reserved
+    /// the next number, rolling back would hand it out twice, so we leave the
+    /// gap (the existing `ASYNC_TODO_TERMINATE_LEVEL` watermark is the backstop).
+    pub fn cancel_send_async_number(&mut self, addr: RpcAddress, consumed: u64) {
+        if let Some(counter) = self.remote_send_async_counters.get_mut(&addr) {
+            if *counter == consumed.wrapping_add(1) {
+                *counter = consumed;
+            }
+        }
     }
 
     /// Decide whether to dispatch an inbound oneway now
@@ -543,6 +580,61 @@ mod tests {
         assert!(st.lookup_local(&a).is_none());
         // DEC_STRONG on an unknown address is safe (idempotent).
         assert!(!st.dec_strong_local(&a));
+    }
+
+    /// A send failure rolls back exactly one `on_binder_leaving` bump; the
+    /// node survives while other sends still reference it and is removed only
+    /// when the last bump is cancelled (no leak, no double-free).
+    #[test]
+    fn cancel_binder_leaving_rolls_back_one_bump() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b).unwrap(); // strong 1
+        let a2 = st.on_binder_leaving(&b).unwrap(); // strong 2 (resend)
+        assert_eq!(a, a2);
+        assert_eq!(st.local_node_count(), 1);
+
+        st.cancel_binder_leaving(&a);
+        assert_eq!(
+            st.local_node_count(),
+            1,
+            "still referenced by the other send"
+        );
+        assert!(st.lookup_local(&a).is_some());
+
+        st.cancel_binder_leaving(&a);
+        assert_eq!(st.local_node_count(), 0, "last bump cancelled → node freed");
+        assert!(st.lookup_local(&a).is_none());
+
+        // Cancel on an unknown / already-freed address is safe.
+        st.cancel_binder_leaving(&a);
+    }
+
+    /// A oneway send failure rolls back its reserved `async_number` only when
+    /// it was the last reservation; if another send already advanced past it,
+    /// rolling back would hand the same number out twice, so it must not.
+    #[test]
+    fn cancel_send_async_number_only_when_last_consumer() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b).unwrap();
+
+        assert_eq!(st.next_send_async_number(a), 0);
+        let consumed = st.next_send_async_number(a); // 1
+        assert_eq!(consumed, 1);
+        // We were the last consumer → rollback; the number is handed out again.
+        st.cancel_send_async_number(a, consumed);
+        assert_eq!(st.next_send_async_number(a), 1, "rolled back");
+
+        // Now simulate a concurrent send advancing past us before we cancel.
+        let consumed2 = st.next_send_async_number(a); // 2
+        let _other = st.next_send_async_number(a); // 3 (another in-flight send)
+        st.cancel_send_async_number(a, consumed2);
+        assert_eq!(
+            st.next_send_async_number(a),
+            4,
+            "no rollback when not the last consumer"
+        );
     }
 
     /// The android-13+ wire encodes only the low 32 bits of the address
