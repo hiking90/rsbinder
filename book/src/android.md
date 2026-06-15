@@ -67,7 +67,7 @@ println!("Running on Android {}", version);
 Add `rsproperties` to your dependencies:
 ```toml
 [dependencies]
-rsproperties = "0.3"
+rsproperties = "0.5"
 ```
 
 ### Using Android's Existing Binder Devices
