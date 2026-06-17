@@ -265,6 +265,8 @@ pub use android_16::{
 /// Android SDK version constants
 #[cfg(target_os = "android")]
 pub mod sdk_versions {
+    /// Android 17 (API level 37)
+    pub const ANDROID_17: u32 = 37;
     /// Android 16 (API level 36)
     pub const ANDROID_16: u32 = 36;
     /// Android 15 (API level 35)
@@ -285,7 +287,7 @@ pub mod sdk_versions {
     /// Minimum supported Android SDK version
     pub const MIN_SUPPORTED: u32 = ANDROID_10;
     /// Maximum supported Android SDK version
-    pub const MAX_SUPPORTED: u32 = ANDROID_16;
+    pub const MAX_SUPPORTED: u32 = ANDROID_17;
 }
 
 /// ServiceManager provides a unified interface to interact with Android's Service Manager
@@ -342,7 +344,14 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         }
 
         match sdk_version {
-            sdk_versions::ANDROID_16 => create_service_manager!(Android16, android_16),
+            // Android 17 (SDK 37) shares Android 16's service-manager wire
+            // format — the `android/os/*` AIDL is byte-identical between
+            // android-16.0.0_r4 and android-17.0.0_r1 (and the kernel binder
+            // UAPI is unchanged), so it is served by the `android_16` module,
+            // mirroring how Android 15 is served by `android_14`.
+            sdk_versions::ANDROID_16 | sdk_versions::ANDROID_17 => {
+                create_service_manager!(Android16, android_16)
+            }
             // Android 15 (SDK 35) shares Android 14's service-manager wire
             // format, so it is served by the `android_14` feature — there
             // is no separate `android_15` feature. A build that enables
