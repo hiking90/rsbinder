@@ -37,7 +37,7 @@ pest = "2.8"
 pest_derive = "2.8"
 convert_case = "0.11"
 serde = { version = "1.0", features = ["derive"] }
-tera = "1.20.*"
+tera = { version = "1.20.*", default-features = false }
 similar = "3.1"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
 downcast-rs = "2.0"
@@ -52,6 +52,3 @@ thiserror = "2"
 # `binder`). default-features = false drops the `logging`/`async` features
 # (and the `futures` dep) — every gated test is a sync `#[test]`.
 serial_test = { version = "3", default-features = false }
-
-[patch.crates-io]
-chrono = { git = "https://github.com/chronotope/chrono", tag = "v0.4.41" }
