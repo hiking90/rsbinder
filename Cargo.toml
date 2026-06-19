@@ -40,7 +40,6 @@ serde = { version = "1.0", features = ["derive"] }
 tera = { version = "1.20.*", default-features = false }
 similar = "3.1"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
-downcast-rs = "2.0"
 rustix = "1.1"
 libc = "0.2"
 clap = "4.6"

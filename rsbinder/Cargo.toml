@@ -67,7 +67,6 @@ android_16_plus = ["android_16"]
 rustix = { workspace = true, features = ["process", "param", "mm"] }
 log = { workspace = true }
 pretty_hex = { workspace = true }
-downcast-rs = { workspace = true }
 async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 rsproperties.workspace = true

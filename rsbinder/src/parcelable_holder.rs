@@ -30,13 +30,20 @@ use crate::{
     NULL_PARCELABLE_FLAG,
 };
 
-use downcast_rs::{impl_downcast, DowncastSync};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-trait AnyParcelable: DowncastSync + Parcelable + std::fmt::Debug {}
-impl_downcast!(sync AnyParcelable);
-impl<T> AnyParcelable for T where T: DowncastSync + Parcelable + std::fmt::Debug {}
+trait AnyParcelable: Parcelable + std::fmt::Debug + Send + Sync + 'static {
+    // Upcast to `dyn Any` so the holder can `Arc::downcast` back to the
+    // concrete parcelable type in `get_parcelable`. `Arc<Self>` is an
+    // object-safe receiver, so this works through the trait object.
+    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+}
+impl<T: Parcelable + std::fmt::Debug + Send + Sync + 'static> AnyParcelable for T {
+    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+}
 
 #[derive(Debug)]
 enum ParcelableHolderData {
@@ -151,7 +158,7 @@ impl ParcelableHolder {
                     return Err(StatusCode::BadValue);
                 }
 
-                match Arc::clone(parcelable).downcast_arc::<T>() {
+                match Arc::clone(parcelable).into_any_arc().downcast::<T>() {
                     Err(_) => {
                         log::error!("ParcelableHolder::get_parcelable: parcelable type mismatch: {parcelable:?} != {parcelable_desc:?}");
                         Err(StatusCode::BadValue)
