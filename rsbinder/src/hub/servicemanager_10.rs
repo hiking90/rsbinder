@@ -90,6 +90,29 @@ pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
     None
 }
 
+/// Single `GET_SERVICE` (one attempt — the caller's wait loop owns the retry
+/// cadence), shaped like the 11+ `try_get_service`.
+///
+/// The legacy C service manager's not-found reply is indistinguishable from a
+/// transport hiccup (both can surface as a short read), so a failure is
+/// reported as `Ok(None)` ("not registered, retry"), never `Err`. A waiter
+/// therefore never *gives up* on Android 10 — it polls until the service
+/// appears. (11+ can distinguish the two and so propagates `Err`.)
+pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
+    let result = (|| -> Result<Option<SIBinder>> {
+        let mut data = sm.proxy().prepare_transact(true)?;
+        data.write(name)?;
+        sm.transact(GET_SERVICE, &data)?.read()
+    })();
+    match result {
+        Ok(found) => Ok(found),
+        Err(err) => {
+            log::debug!("try_get_service({name}) on Android 10: {err:?}; treating as not-found");
+            Ok(None)
+        }
+    }
+}
+
 /// Retrieve an existing service called @a name from the service
 /// manager. Non-blocking. Returns null if the service does not
 /// exist.

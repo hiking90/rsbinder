@@ -6,7 +6,6 @@ use env_logger::Env;
 use example_hello::*;
 use rsbinder::*;
 use std::sync::Arc;
-use std::time::Duration;
 
 struct MyDeathRecipient {}
 
@@ -22,30 +21,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize ProcessState with the default binder path and the default max threads.
     ProcessState::init_default()?;
 
+    // Start the thread pool so the `onRegistration` callback that drives
+    // `wait_for_interface` is delivered promptly (event-driven). Without it
+    // the wait still works but degrades to ~1s polling.
+    ProcessState::start_thread_pool();
+
     println!("list services:");
     // This is an example of how to use service manager.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
         println!("{name}");
     }
 
-    // Create a Hello proxy from the binder service manager. If this client
-    // starts before the service has finished registering, the lookup fails, so
-    // retry a few times before giving up and surfacing the real Status error.
-    let hello: rsbinder::Strong<dyn IHello> = {
-        const RETRIES: u32 = 5;
-        let mut attempt = 0;
-        loop {
-            match hub::get_interface(SERVICE_NAME) {
-                Ok(hello) => break hello,
-                Err(e) if attempt < RETRIES => {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(500));
-                    println!("Waiting for {SERVICE_NAME}... (retry {attempt}/{RETRIES}): {e}");
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
+    // Block until the Hello service is registered, then cast it to the
+    // interface — the event-driven AOSP `waitForService` equivalent. This
+    // replaces the old hand-rolled retry loop: no polling, no fixed attempt
+    // cap, and the register-after-miss race is handled by the hub.
+    let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
 
     let recipient = Arc::new(MyDeathRecipient {});
     hello

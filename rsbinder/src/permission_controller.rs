@@ -92,6 +92,7 @@ pub fn clear_permission_authority() {
 ///
 /// This is a thin wrapper; consumers needing custom error mapping or
 /// caching should call [`crate::hub::get_service`] directly.
+#[allow(deprecated)] // single-shot lookup of the permission service is intended
 pub fn default() -> Result<Strong<dyn IPermissionController>> {
     let binder = hub::get_service(SERVICE_NAME).ok_or(crate::StatusCode::NameNotFound)?;
     <dyn IPermissionController>::try_from(binder)

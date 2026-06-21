@@ -132,8 +132,9 @@ fn dispatch_typed_service(
     }
 }
 
-/// Retrieve an existing service, blocking for a few seconds if it doesn't yet
-/// exist.
+/// Retrieve an existing service via a single `getService` wire call (one
+/// attempt; not blocking). Use the hub's `wait_for_service` to block until the
+/// service appears, or `check_service` for an explicit non-blocking lookup.
 pub fn get_service(
     sm: &BpServiceManager,
     name: &str,
@@ -145,6 +146,19 @@ pub fn get_service(
             None
         }
     }
+}
+
+/// Error-preserving variant of `get_service`: returns `Err` on a transport
+/// failure instead of `None`, so a waiter can distinguish "not registered"
+/// (`Ok(None)`) from "service manager unreachable" (`Err`). Mirrors AOSP
+/// `realGetService`'s `Status` return.
+pub fn try_get_service(
+    sm: &BpServiceManager,
+    name: &str,
+) -> Result<Option<android::os::ServiceWithMetadata::ServiceWithMetadata>> {
+    sm.getService2(name)
+        .map(|service| dispatch_typed_service(name, service))
+        .map_err(|e| e.into())
 }
 
 /// Retrieve an existing service called @a name from the service

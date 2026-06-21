@@ -116,6 +116,37 @@ interface IFoo {
 }
 
 #[test]
+fn oneway_read_response_propagates_transport_error() {
+    // F4: a oneway proxy call must surface a `submit_transact` transport
+    // failure (dead object, bad type) rather than swallow it as `Ok(())`.
+    // AOSP `generate_rust.cpp` emits `let _aidl_reply = _aidl_reply?;` for
+    // oneway too — the `?` sits *outside* its oneway guard — so the generated
+    // `read_response` must propagate before returning `Ok(())`.
+    let ctx = SourceContext::new(
+        "test.aidl",
+        r#"
+interface IFoo {
+    oneway void notify(in int code);
+}
+"#,
+    );
+    let document = parse_document(&ctx).expect("parse");
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect("generate")
+        .1;
+
+    // The all-oneway interface's only `read_response` must propagate the
+    // reply Result via `?` (`_aidl_reply?;`); the non-oneway form would be
+    // `_aidl_reply?.ok_or(...)` instead, and the old buggy form was a bare
+    // `Ok(())` with no `?` at all.
+    assert!(
+        out.contains("_aidl_reply?;"),
+        "oneway read_response must propagate transport errors via `?`; generated:\n{out}"
+    );
+}
+
+#[test]
 fn multiple_oneway_violations_are_all_reported() {
     // Mirrors AOSP error-collection style — one violation should not
     // mask the others in the same interface.

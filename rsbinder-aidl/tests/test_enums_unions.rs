@@ -365,7 +365,7 @@ pub mod ITestService {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     pub trait ITestService: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "ITestService" }
-        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum>;
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum>;
         fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
@@ -374,7 +374,7 @@ pub mod ITestService {
         }
     }
     pub trait ITestServiceDefault: Send + Sync {
-        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
     }
@@ -397,7 +397,7 @@ pub mod ITestService {
             data.write(&_arg_token)?;
             Ok(data)
         }
-        fn read_response_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
+        fn read_response_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#RepeatByteEnum(_arg_token);
@@ -411,14 +411,14 @@ pub mod ITestService {
         }
     }
     impl ITestService for BpTestService {
-        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             let _aidl_data = self.build_parcel_RepeatByteEnum(_arg_token)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }
     impl ITestService for rsbinder::Binder<BnTestService> {
-        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::status::Result<super::ByteEnum::ByteEnum> {
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             self.0.r#RepeatByteEnum(_arg_token)
         }
     }

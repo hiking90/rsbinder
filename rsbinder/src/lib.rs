@@ -57,8 +57,7 @@
 //! use rsbinder::*;
 //!
 //! // Include the generated code
-//! include!(concat!(env!("OUT_DIR"), "/hello.rs"));
-//! pub use crate::hello::IHello::*;
+//! rsbinder::include_aidl!("hello", crate::hello::IHello::*);
 //!
 //! // Implement the service
 //! struct HelloService;
@@ -66,7 +65,7 @@
 //! impl Interface for HelloService {}
 //!
 //! impl IHello for HelloService {
-//!     fn echo(&self, message: &str) -> rsbinder::status::Result<String> {
+//!     fn echo(&self, message: &str) -> rsbinder::BinderResult<String> {
 //!         Ok(format!("Echo: {}", message))
 //!     }
 //! }
@@ -96,16 +95,15 @@
 //! use rsbinder::*;
 //!
 //! // Include the same generated code
-//! include!(concat!(env!("OUT_DIR"), "/hello.rs"));
-//! pub use crate::hello::IHello::*;
+//! rsbinder::include_aidl!("hello", crate::hello::IHello::*);
 //!
 //! # fn main() -> Result<()> {
 //! // Initialize the process state
 //! ProcessState::init_default()?;
 //!
-//! // Get service from service manager
-//! let service = hub::get_service("hello_service")?;
-//! let hello_service = BpHello::new(service)?;
+//! // Wait for the service to be registered, then cast it to the interface.
+//! let hello_service: rsbinder::Strong<dyn IHello> =
+//!     hub::wait_for_interface("hello_service")?;
 //!
 //! // Call remote method
 //! let result = hello_service.echo("Hello, World!")?;
@@ -259,7 +257,7 @@ pub use proxy::{Proxy, ProxyHandle};
 
 #[cfg(feature = "tokio")]
 pub use rt::*;
-pub use status::{ExceptionCode, Status};
+pub use status::{BinderResult, ExceptionCode, Status};
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

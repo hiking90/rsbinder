@@ -24,8 +24,8 @@
 //! ```rust,no_run
 //! use rsbinder::hub;
 //!
-//! // Get a service by name
-//! let service = hub::get_service("example_service");
+//! // Get a service by name (non-blocking; use `wait_for_service` to wait)
+//! let service = hub::check_service("example_service");
 //!
 //! // List all available services
 //! let services = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL);
@@ -75,8 +75,10 @@ macro_rules! impl_sm_module_body {
         };
         pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 
-        /// Retrieve an existing service, blocking for a few seconds if
-        /// it doesn't yet exist.
+        /// Retrieve an existing service via a single `getService` wire call
+        /// (one attempt; not blocking). Use `wait_for_service` to block until
+        /// the service appears, or `check_service` for an explicit
+        /// non-blocking lookup.
         pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
             match sm.getService(name) {
                 Ok(result) => result,
@@ -85,6 +87,14 @@ macro_rules! impl_sm_module_body {
                     None
                 }
             }
+        }
+
+        /// Like `get_service` but preserves a transport error instead of
+        /// collapsing it to `None`, so a waiter can tell "not yet registered"
+        /// (`Ok(None)`) from "service manager unreachable" (`Err`) — the
+        /// distinction AOSP `realGetService` carries in its `Status`.
+        pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
+            sm.getService(name).map_err(|e| e.into())
         }
 
         /// Retrieve an existing service called @a name from the service
@@ -499,9 +509,22 @@ forward_service_callback_impl!(android_13, "android_13");
 forward_service_callback_impl!(android_14, "android_14");
 
 impl ServiceManager {
-    /// Retrieves a service by name.
+    /// Resolve a service by name through the `getService` wire call.
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// On Android 11+ this is a **single attempt** — the wire call answers
+    /// with whatever is registered *now* (AOSP's "block a few seconds" was a
+    /// libbinder client-side poll, not the wire semantics). On the Android 10
+    /// legacy C service manager, whose `GET_SERVICE` wire call is itself
+    /// non-blocking, it polls ~5s client-side to mirror AOSP. That
+    /// inconsistency is why this is deprecated: use
+    /// [`wait_for_service`](Self::wait_for_service) to block until the service
+    /// appears, or [`check_service`](Self::check_service) for a uniformly
+    /// non-blocking lookup.
+    #[deprecated(
+        note = "inconsistent wait behavior across versions; use `wait_for_service` \
+                to block until the service appears, or `check_service` for a \
+                non-blocking lookup"
+    )]
     pub fn get_service(&self, name: &str) -> Option<SIBinder> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
@@ -520,9 +543,20 @@ impl ServiceManager {
         }
     }
 
-    /// Retrieves a service by name and attempts to cast it to the specified interface type.
+    /// Resolve a service by name and cast it to the interface `T`, using the
+    /// same `getService` wire call as [`get_service`](Self::get_service).
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// Inherits `get_service`'s version-dependent wait behavior (single
+    /// attempt on Android 11+, ~5s client poll on Android 10), so it is
+    /// deprecated for the same reason: use
+    /// [`wait_for_interface`](Self::wait_for_interface) to block until the
+    /// service appears, or [`check_interface`](Self::check_interface) for a
+    /// non-blocking lookup.
+    #[deprecated(
+        note = "inconsistent wait behavior across versions; use `wait_for_interface` \
+                to block until the service appears, or `check_interface` for a \
+                non-blocking lookup"
+    )]
     pub fn get_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
@@ -557,6 +591,20 @@ impl ServiceManager {
             ServiceManager::Android16(sm) => {
                 android_16::check_service(sm, name).and_then(|s| s.service)
             }
+        }
+    }
+
+    /// Resolve a service by name **without blocking** and cast it to the
+    /// interface `T` — the `interface_cast(check_service(name))` of AOSP.
+    ///
+    /// Returns [`StatusCode::NameNotFound`] immediately if the service is not
+    /// registered, in contrast to
+    /// [`wait_for_interface`](Self::wait_for_interface), which blocks until it
+    /// appears.
+    pub fn check_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
+        match self.check_service(name) {
+            Some(binder) => FromIBinder::try_from(binder),
+            None => Err(StatusCode::NameNotFound),
         }
     }
 
@@ -743,6 +791,211 @@ impl ServiceManager {
             }
         }
     }
+
+    /// Error-preserving lookup: `Ok(Some)` found, `Ok(None)` not registered,
+    /// `Err` on a transport/SM failure — the distinction the public
+    /// [`get_service`](Self::get_service) collapses to `None`. Used by
+    /// [`wait_for_service`](Self::wait_for_service) so it can give up on a dead
+    /// service manager instead of looping forever (AOSP `realGetService`). The
+    /// Android 10 legacy C SM cannot tell not-found from a transport error, so
+    /// its arm reports any failure as `Ok(None)` and never `Err`.
+    fn try_get_service(&self, name: &str) -> Result<Option<SIBinder>> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::try_get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::try_get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::try_get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::try_get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::try_get_service(sm, name),
+            ServiceManager::Android16(sm) => {
+                Ok(android_16::try_get_service(sm, name)?.and_then(|s| s.service))
+            }
+        }
+    }
+
+    /// Block until the service named `name` is registered, then return it —
+    /// the event-driven equivalent of AOSP
+    /// `IServiceManager::waitForService`
+    /// (`frameworks/native/libs/binder/IServiceManager.cpp`).
+    ///
+    /// A single `getService` fast path is tried first. If the service is
+    /// absent, an [`IServiceCallback`] is registered and this thread blocks on
+    /// a condition variable until the service manager fires `onRegistration` —
+    /// the SM fires it immediately when the service is already present, so the
+    /// register-after-miss race is covered. Each second the wait also re-polls
+    /// `getService`, mirroring AOSP's per-tick `realGetService` retry for lazy
+    /// services.
+    ///
+    /// The wait is **unbounded** on every supported version (matching AOSP's
+    /// `while(true)`): it returns when the service appears, or `None` when the
+    /// service manager itself is unreachable — a transport error on the lookup,
+    /// mirroring AOSP's `realGetService`-error → `nullptr`.
+    ///
+    /// # Thread pool: event-driven vs. polling
+    ///
+    /// `onRegistration` arrives as an inbound transaction, so it is delivered
+    /// promptly only when a binder worker thread is reading commands — call
+    /// [`crate::ProcessState::start_thread_pool`] for that. Without a thread
+    /// pool this does **not** deadlock: the 1-second condvar timeout re-polls
+    /// the service on the calling thread each tick, so it degrades to ~1s
+    /// polling and still resolves within ~1s of registration. AOSP
+    /// `waitForService` behaves identically — the per-tick re-poll and its
+    /// "no guaranteed threads" warning are about *efficiency*, not correctness.
+    ///
+    /// # Android 10
+    ///
+    /// The legacy C service manager has no registration notifications, so the
+    /// event path is unavailable and the wait transparently falls back to ~1s
+    /// polling. The contract is the same (unbounded until the service appears),
+    /// except that the legacy protocol cannot distinguish "not registered" from
+    /// a transport error, so the wait does not give up early there — it keeps
+    /// polling.
+    pub fn wait_for_service(&self, name: &str) -> Option<SIBinder> {
+        // Fast path: already registered — no callback needed. A transport error
+        // means the SM is unreachable, so give up (AOSP's initial
+        // `realGetService` error → `nullptr`).
+        match self.try_get_service(name) {
+            Ok(Some(binder)) => return Some(binder),
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!("wait_for_service: lookup for {name} failed ({err:?})");
+                return None;
+            }
+        }
+
+        let state = Arc::new(WaiterState::default());
+        let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
+
+        if let Err(err) = self.register_for_notifications(name, &callback) {
+            // Notifications unsupported (Android 10) or the SM is unreachable;
+            // either way fall back to polling.
+            log::warn!(
+                "wait_for_service: notifications unavailable for {name} ({err:?}); \
+                 falling back to polling"
+            );
+            return self.poll_for_service(name);
+        }
+        // Always unregister, even on early return / panic (AOSP's `Defer`).
+        let _unregister = UnregisterOnDrop {
+            sm: self,
+            name,
+            callback: &callback,
+        };
+
+        let mut waited_secs: u64 = 0;
+        loop {
+            {
+                let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let (guard, _) = state
+                    .cv
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(1), |binder| {
+                        binder.is_none()
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(binder) = guard.as_ref() {
+                    return Some(binder.clone());
+                }
+            }
+            // Throttle to ~every 10s so a slow/missing service stays visible
+            // without flooding the log every second.
+            if waited_secs % 10 == 0 {
+                log::warn!("wait_for_service: still waiting for {name} ({waited_secs}s)...");
+            }
+            waited_secs += 1;
+            // Lazy-service race: re-poll each tick (AOSP `realGetService`),
+            // giving up if the service manager has become unreachable.
+            match self.try_get_service(name) {
+                Ok(Some(binder)) => return Some(binder),
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!("wait_for_service: lookup for {name} failed ({err:?})");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Interface-typed [`wait_for_service`](Self::wait_for_service): block
+    /// until `name` is registered, then cast it to `T`. The event-driven
+    /// equivalent of AOSP `waitForService` + `interface_cast` (the binding's
+    /// `wait_for_interface`). Returns [`StatusCode::NameNotFound`] only when
+    /// the wait gives up — see [`wait_for_service`](Self::wait_for_service).
+    pub fn wait_for_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
+        match self.wait_for_service(name) {
+            Some(binder) => FromIBinder::try_from(binder),
+            None => Err(StatusCode::NameNotFound),
+        }
+    }
+
+    /// Unbounded fallback poll used by
+    /// [`wait_for_service`](Self::wait_for_service) when the service manager
+    /// has no registration notifications (Android 10) or the notification
+    /// registration failed. Polls once per second until the service appears
+    /// (`Some`) or a transport error shows the service manager is unreachable
+    /// (`None`) — the same contract as the event path. On Android 10 a failure
+    /// is reported as not-found, so it keeps polling rather than giving up.
+    fn poll_for_service(&self, name: &str) -> Option<SIBinder> {
+        loop {
+            match self.try_get_service(name) {
+                Ok(Some(binder)) => return Some(binder),
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!("poll_for_service: lookup for {name} failed ({err:?}); giving up");
+                    return None;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+/// Shared state between a [`Waiter`] callback (registered with the service
+/// manager) and the thread blocked in [`ServiceManager::wait_for_service`].
+/// `onRegistration` stores the binder and signals `cv`; the waiter observes
+/// it under `inner`.
+#[derive(Default)]
+struct WaiterState {
+    inner: std::sync::Mutex<Option<SIBinder>>,
+    cv: std::sync::Condvar,
+}
+
+/// One-shot [`IServiceCallback`] that records the registered binder and wakes
+/// [`ServiceManager::wait_for_service`]. Mirrors the local `Waiter` class
+/// inside AOSP `IServiceManager::waitForService`.
+struct Waiter(Arc<WaiterState>);
+
+impl Interface for Waiter {}
+
+impl IServiceCallback for Waiter {
+    fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
+        let mut guard = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(service.clone());
+        drop(guard);
+        // Exactly one thread waits on this state (the matching
+        // `wait_for_service` call), mirroring AOSP's `mCv.notify_one()`.
+        self.0.cv.notify_one();
+        Ok(())
+    }
+}
+
+/// RAII: unregister the wait callback when the wait ends (success, error, or
+/// panic), mirroring the `Defer unregister` in AOSP `waitForService`.
+struct UnregisterOnDrop<'a> {
+    sm: &'a ServiceManager,
+    name: &'a str,
+    callback: &'a Strong<dyn IServiceCallback>,
+}
+
+impl Drop for UnregisterOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .sm
+            .unregister_for_notifications(self.name, self.callback);
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -752,7 +1005,16 @@ impl ServiceManager {
 
 /// Convenience function to get an interface from the default ServiceManager.
 ///
-/// This is equivalent to `default().get_interface(name)`.
+/// Equivalent to `default().get_interface(name)`; see
+/// [`ServiceManager::get_interface`] for its version-dependent wait behavior.
+/// Use [`wait_for_interface`] to block until the service appears, or
+/// [`check_interface`] for a non-blocking lookup.
+#[deprecated(
+    note = "inconsistent wait behavior across versions; use `wait_for_interface` \
+            to block until the service appears, or `check_interface` for a \
+            non-blocking lookup"
+)]
+#[allow(deprecated)]
 #[inline]
 pub fn get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     default()?.get_interface(name)
@@ -803,10 +1065,43 @@ pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<()
 
 /// Convenience function to get a service from the default ServiceManager.
 ///
-/// This is equivalent to `default().get_service(name)`.
+/// Equivalent to `default().get_service(name)`; see
+/// [`ServiceManager::get_service`] for its version-dependent wait behavior.
+/// Use [`wait_for_service`] to block until the service appears, or
+/// [`check_service`] for a non-blocking lookup.
+#[deprecated(
+    note = "inconsistent wait behavior across versions; use `wait_for_service` \
+            to block until the service appears, or `check_service` for a \
+            non-blocking lookup"
+)]
+#[allow(deprecated)]
 #[inline]
 pub fn get_service(name: &str) -> Option<SIBinder> {
     default().ok()?.get_service(name)
+}
+
+/// Convenience function to wait for a service from the default
+/// ServiceManager.
+///
+/// Equivalent to `default().wait_for_service(name)`; returns `None` if the
+/// default service manager is unavailable. The event-driven replacement for
+/// hand-rolled client retry loops — see
+/// [`ServiceManager::wait_for_service`] for the blocking and thread-pool
+/// contract.
+#[inline]
+pub fn wait_for_service(name: &str) -> Option<SIBinder> {
+    default().ok()?.wait_for_service(name)
+}
+
+/// Convenience function to wait for an interface from the default
+/// ServiceManager.
+///
+/// Equivalent to `default().wait_for_interface(name)` — the event-driven,
+/// AOSP `waitForService`-style replacement for polling around
+/// [`get_interface`]. See [`ServiceManager::wait_for_service`].
+#[inline]
+pub fn wait_for_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
+    default()?.wait_for_interface(name)
 }
 
 /// Convenience function to check if a service is available from the default ServiceManager.
@@ -815,6 +1110,17 @@ pub fn get_service(name: &str) -> Option<SIBinder> {
 #[inline]
 pub fn check_service(name: &str) -> Option<SIBinder> {
     default().ok()?.check_service(name)
+}
+
+/// Convenience function to resolve an interface **without blocking** from the
+/// default ServiceManager.
+///
+/// Equivalent to `default().check_interface(name)` — the immediate,
+/// non-blocking counterpart to [`wait_for_interface`]. Returns
+/// [`StatusCode::NameNotFound`] at once if the service is not registered.
+#[inline]
+pub fn check_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
+    default()?.check_interface(name)
 }
 
 /// Convenience function to check if a service is declared from the default ServiceManager.

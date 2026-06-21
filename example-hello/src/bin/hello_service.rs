@@ -21,7 +21,7 @@ impl Interface for IHelloService {
 // Implement the IHello interface for the IHelloService.
 impl IHello for IHelloService {
     // Implement the echo method.
-    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         Ok(echo.to_owned())
     }
 }

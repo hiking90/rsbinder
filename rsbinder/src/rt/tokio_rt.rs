@@ -34,8 +34,11 @@
 use crate::{hub, BinderAsyncPool, BinderAsyncRuntime, BoxFuture, FromIBinder, StatusCode, Strong};
 use std::future::Future;
 
-/// Retrieve an existing service for a particular interface, sleeping for a few
-/// seconds if it doesn't yet exist.
+/// Retrieve an existing service for a particular interface — a single
+/// `getService` wire call on Android 11+ (see [`crate::hub::get_interface`]).
+/// For an event-driven wait use [`crate::hub::wait_for_interface`]; for a
+/// non-blocking lookup use [`crate::hub::check_interface`].
+#[allow(deprecated)] // wraps the deprecated single-shot hub::get_interface
 pub async fn get_interface<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {

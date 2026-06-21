@@ -639,6 +639,56 @@ macro_rules! declare_binder_enum {
     };
 }
 
+/// Include AIDL-generated Rust and (optionally) flatten an interface's items
+/// into the current module — the one-call form of the
+/// `include!(concat!(env!("OUT_DIR"), …))` + `pub use …::*` pair that every
+/// AIDL consumer otherwise writes by hand.
+///
+/// Pass the **output file stem** you gave to `rsbinder_aidl::Builder::output`
+/// (without the `.rs`). `env!("OUT_DIR")` and `include!` are expanded at the
+/// call site, so the file resolves against the *consumer* crate's build
+/// output — exactly as a hand-written `include!` would.
+///
+/// # Forms
+///
+/// ```ignore
+/// // 1. include + re-export an interface's items (trait, Bn*, Bp*, …):
+/// rsbinder::include_aidl!("hello", hello::IHello::*);
+/// // expands to:
+/// //   include!(concat!(env!("OUT_DIR"), "/hello.rs"));
+/// //   pub use hello::IHello::*;
+///
+/// // 2. include only — re-export yourself (e.g. several interfaces in one file):
+/// rsbinder::include_aidl!("multi");
+/// pub use multi::IFoo::*;
+/// pub use multi::IBar::*;
+/// ```
+///
+/// The re-export path is taken verbatim as token trees, so it can be a glob
+/// (`pkg::IFoo::*`), a selective list (`pkg::IFoo::{IFoo, BnFoo, BpFoo}`), or
+/// start with `self::` inside a nested module.
+///
+/// The two-argument form emits `pub use`, so the interface's items become part
+/// of the enclosing module's public surface. For any other visibility, use the
+/// single-argument (include-only) form and write your own `use` / `pub use`.
+///
+/// # What it does not do
+///
+/// The interface name is not derivable from the file stem (`"hello"` →
+/// `IHello` is only a naming convention), so the re-export path is still given
+/// explicitly. The `build.rs` codegen step (`Builder`) is unaffected — this
+/// replaces only the `lib.rs` include/`use` boilerplate.
+#[macro_export]
+macro_rules! include_aidl {
+    ($file:literal, $($use_path:tt)+) => {
+        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+        pub use $($use_path)+;
+    };
+    ($file:literal $(,)?) => {
+        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Binder, Interface, Parcel, Result, TransactionCode};
