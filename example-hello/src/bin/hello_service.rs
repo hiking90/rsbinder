@@ -33,13 +33,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Initializing ProcessState...");
     ProcessState::init_default()?;
 
-    // Start the thread pool.
-    // Spawns extra binder worker threads. It is only safe to skip for a service
-    // that handles calls strictly one-at-a-time: without it, the lone
-    // `join_thread_pool` thread below is the only one reading commands, so a
-    // re-entrant call (handling a transaction that triggers an inbound callback,
-    // e.g. a death/service notification) or a second concurrent client would
-    // block. Most services should keep this.
+    // Start the thread pool — required for any service that handles incoming
+    // calls: it lets the kernel add workers, so a re-entrant or concurrent call
+    // won't block on the lone `join_thread_pool` thread below. See
+    // `ProcessState::start_thread_pool` for the precise rule.
     println!("Starting thread pool...");
     ProcessState::start_thread_pool();
 

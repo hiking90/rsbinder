@@ -21,9 +21,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize ProcessState with the default binder path and the default max threads.
     ProcessState::init_default()?;
 
-    // Start the thread pool so the `onRegistration` callback that drives
-    // `wait_for_interface` is delivered promptly (event-driven). Without it
-    // the wait still works but degrades to ~1s polling.
+    // Start the thread pool so this client's inbound transactions — the
+    // event-driven `onRegistration` (wait_for_interface) and the death
+    // notification below — are delivered promptly; without it the wait still
+    // works but degrades to ~1s polling. See `ProcessState::start_thread_pool`.
     ProcessState::start_thread_pool();
 
     println!("list services:");

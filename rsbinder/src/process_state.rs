@@ -1194,6 +1194,22 @@ impl ProcessState {
         self.max_threads
     }
 
+    /// Start the binder thread pool: spawn one worker now and **enable
+    /// kernel-driven spawning** for the rest of the process's life.
+    ///
+    /// This flips an internal flag that gates *all* dynamic worker creation —
+    /// including the kernel's own `BR_SPAWN_LOOPER` requests under load. Until
+    /// it is called, binder commands are served only on threads that manually
+    /// [`join_thread_pool`](Self::join_thread_pool), and the kernel cannot add
+    /// more, so the process is effectively single-threaded.
+    ///
+    /// Call it from **any process that receives an inbound transaction**: a
+    /// service handling incoming calls, or a client that receives a callback, a
+    /// notification, an event-driven [`crate::hub::wait_for_service`]
+    /// registration, or a [`crate::DeathRecipient`]. Only a fire-and-forget
+    /// client that makes synchronous outbound calls and receives nothing back
+    /// can safely skip it. Idempotent — the first call wins, later calls are
+    /// no-ops.
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
