@@ -640,8 +640,10 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 
     fn try_from(ibinder: SIBinder) -> Result<Self> {
         if B::descriptor() != ibinder.descriptor() {
+            // The single funnel for every failed interface cast (into_interface,
+            // Strong::try_from, hub::*_interface) — the one place BadType is explained.
             log::error!(
-                "Binder type mismatch: expected {}, got {}",
+                "binder interface cast mismatch: expected `{}`, got `{}`",
                 B::descriptor(),
                 ibinder.descriptor()
             );

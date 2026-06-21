@@ -652,12 +652,15 @@ impl ServiceManager {
 
     /// Registers a service with the service manager.
     ///
-    /// This method is version-agnostic and works across all supported Android versions.
+    /// This method is version-agnostic and works across all supported Android
+    /// versions. `binder` accepts anything convertible into [`SIBinder`] — a
+    /// typed `Strong<dyn IFoo>` goes in directly, no `.as_binder()` needed.
     pub fn add_service(
         &self,
         identifier: &str,
-        binder: SIBinder,
+        binder: impl Into<SIBinder>,
     ) -> std::result::Result<(), Status> {
+        let binder = binder.into();
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(sm) => android_10::add_service(sm, identifier, binder),
@@ -792,14 +795,19 @@ impl ServiceManager {
         }
     }
 
-    /// Error-preserving lookup: `Ok(Some)` found, `Ok(None)` not registered,
-    /// `Err` on a transport/SM failure — the distinction the public
-    /// [`get_service`](Self::get_service) collapses to `None`. Used by
-    /// [`wait_for_service`](Self::wait_for_service) so it can give up on a dead
-    /// service manager instead of looping forever (AOSP `realGetService`). The
-    /// Android 10 legacy C SM cannot tell not-found from a transport error, so
-    /// its arm reports any failure as `Ok(None)` and never `Err`.
-    fn try_get_service(&self, name: &str) -> Result<Option<SIBinder>> {
+    /// Error-preserving, non-blocking lookup: `Ok(Some)` found, `Ok(None)` not
+    /// registered, `Err` on a transport/SM failure — the distinction that
+    /// [`check_service`](Self::check_service) and the deprecated
+    /// [`get_service`](Self::get_service) both collapse to `None`. Reach for
+    /// this when you must tell "the service isn't there" apart from "the
+    /// service manager is unreachable" (e.g. to fail fast instead of retrying).
+    ///
+    /// It is also what [`wait_for_service`](Self::wait_for_service) uses to give
+    /// up on a dead service manager instead of looping forever (AOSP
+    /// `realGetService`). The Android 10 legacy C SM cannot tell not-found from
+    /// a transport error, so its arm reports any failure as `Ok(None)` and never
+    /// `Err`.
+    pub fn try_get_service(&self, name: &str) -> Result<Option<SIBinder>> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(sm) => android_10::try_get_service(sm, name),
@@ -814,6 +822,28 @@ impl ServiceManager {
             ServiceManager::Android16(sm) => {
                 Ok(android_16::try_get_service(sm, name)?.and_then(|s| s.service))
             }
+        }
+    }
+
+    /// Interface-typed [`try_get_service`](Self::try_get_service): a
+    /// non-blocking lookup that preserves the not-found vs. SM-unreachable
+    /// distinction and casts the result to `T`.
+    ///
+    /// `Ok(Some(strong))` found and cast, `Ok(None)` not registered, `Err` on a
+    /// transport/SM failure *or* a descriptor mismatch. A name registered under
+    /// the wrong interface stays distinguishable from an unreachable service
+    /// manager: the former is exactly [`StatusCode::BadType`], the latter a
+    /// transport code (the lookup never yields `BadType` itself). Contrast
+    /// [`check_interface`](Self::check_interface), which folds not-found into
+    /// `Err(NameNotFound)`, and [`wait_for_interface`](Self::wait_for_interface),
+    /// which blocks until the service appears.
+    pub fn try_get_interface<T: FromIBinder + ?Sized>(
+        &self,
+        name: &str,
+    ) -> Result<Option<Strong<T>>> {
+        match self.try_get_service(name)? {
+            Some(binder) => FromIBinder::try_from(binder).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -1056,9 +1086,14 @@ pub fn unregister_for_notifications(
 
 /// Convenience function to add a service to the default ServiceManager.
 ///
-/// This is equivalent to `default().add_service(identifier, binder)`.
+/// This is equivalent to `default().add_service(identifier, binder)`. `binder`
+/// accepts anything convertible into [`SIBinder`], so a typed
+/// `Strong<dyn IFoo>` can be passed directly without `.as_binder()`.
 #[inline]
-pub fn add_service(identifier: &str, binder: SIBinder) -> std::result::Result<(), Status> {
+pub fn add_service(
+    identifier: &str,
+    binder: impl Into<SIBinder>,
+) -> std::result::Result<(), Status> {
     // `?` converts a StatusCode init failure into Status via From<StatusCode>.
     default()?.add_service(identifier, binder)
 }
@@ -1121,6 +1156,30 @@ pub fn check_service(name: &str) -> Option<SIBinder> {
 #[inline]
 pub fn check_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     default()?.check_interface(name)
+}
+
+/// Convenience function for an error-preserving, non-blocking lookup from the
+/// default ServiceManager.
+///
+/// Equivalent to `default().try_get_service(name)`, except a ServiceManager
+/// that cannot be reached at all surfaces as `Err` rather than `Ok(None)`. Use
+/// this (over [`check_service`]) when you must distinguish "service not
+/// registered" (`Ok(None)`) from "service manager unreachable" (`Err`). See
+/// [`ServiceManager::try_get_service`].
+#[inline]
+pub fn try_get_service(name: &str) -> Result<Option<SIBinder>> {
+    default()?.try_get_service(name)
+}
+
+/// Convenience function for an error-preserving, non-blocking interface lookup
+/// from the default ServiceManager.
+///
+/// Equivalent to `default().try_get_interface(name)`. `Ok(Some)` found and
+/// cast, `Ok(None)` not registered, `Err` on a transport/SM failure or a
+/// descriptor mismatch. See [`ServiceManager::try_get_interface`].
+#[inline]
+pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<Strong<T>>> {
+    default()?.try_get_interface(name)
 }
 
 /// Convenience function to check if a service is declared from the default ServiceManager.

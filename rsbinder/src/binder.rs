@@ -22,6 +22,25 @@
 //! This module provides the fundamental types and traits for binder IPC,
 //! including interface definitions, binder object management, and transaction
 //! handling. It forms the foundation for all binder communication.
+//!
+//! # Which handle type do I use?
+//!
+//! The binder object zoo collapses to a few rules in practice. Almost all
+//! application code only ever touches the first two rows; the rest are
+//! plumbing the AIDL generator and the runtime fill in for you.
+//!
+//! | Type / trait | What it is | When you reach for it |
+//! |---|---|---|
+//! | [`Strong<dyn IFoo>`](Strong) | Owning, ref-counted handle to a service implementing interface `IFoo`. | The normal way to hold a service. Returned by `BnFoo::new_binder`, `hub::*_interface`, and `FromIBinder::try_from`; call interface methods directly on it. |
+//! | [`Weak<dyn IFoo>`](Weak) | Non-owning handle that does not keep the object alive. | Break reference cycles / caches; [`upgrade`](Weak::upgrade) back to a `Strong` when you need to call it. |
+//! | [`SIBinder`] | Type-erased strong handle (no interface type). | The raw currency passed to/from the kernel and APIs like [`crate::hub::add_service`]. Get one with `Into::into`/[`Interface::as_binder`]; recover a typed handle with [`SIBinder::into_interface`] / `FromIBinder::try_from`. |
+//! | [`WIBinder`] | Type-erased *weak* handle. | The erased counterpart of `Weak`, used internally by death recipients and notification registries. |
+//! | [`Interface`] | Base trait every binder interface (and service impl) implements. | Implement it on your service struct (often empty); its [`as_binder`](Interface::as_binder) is how you erase to `SIBinder`. |
+//! | [`Remotable`] | Trait for a *local* object that can receive transactions (a server). | Implemented by the generated `BnFoo`; you supply the behavior via `impl IFoo for …`. |
+//! | [`FromIBinder`] | Trait for casting an `SIBinder` to a typed interface. | Used through [`SIBinder::into_interface`] / `Strong::try_from`; the generator implements it per interface. |
+//! | [`crate::Proxy`] / [`crate::ProxyHandle`] | Client-side stand-in for a remote object (`BpFoo` wraps these). | You rarely name these; they back the `Strong<dyn IFoo>` you get for a *remote* service. |
+//! | [`RemoteProxy`] | Trait exposing remote-only ops (ping, link-to-death, …) on a handle. | Reach for it to ping a service or register a [`DeathRecipient`]. |
+//! | [`IBinder`] / [`Transactable`] | The low-level object and raw-`transact` traits. | Only when writing a transport or hand-rolling wire calls below the generated stubs. |
 
 use std::any::Any;
 use std::borrow::Borrow;
@@ -1025,6 +1044,24 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
         // object is also valid for the target type.
         FromIBinder::try_from(self.0.as_binder())
             .expect("ToSyncInterface guarantees binder compatibility")
+    }
+}
+
+/// Drop the interface type and recover the underlying [`SIBinder`].
+///
+/// Lets APIs that take a raw binder — e.g. [`crate::hub::add_service`] — accept
+/// a `Strong<dyn IFoo>` directly via `impl Into<SIBinder>`, so callers no longer
+/// spell out `.as_binder()`. `&Strong<I>` is also accepted so the handle can be
+/// reused afterwards.
+impl<I: FromIBinder + ?Sized> From<Strong<I>> for SIBinder {
+    fn from(strong: Strong<I>) -> SIBinder {
+        strong.as_binder()
+    }
+}
+
+impl<I: FromIBinder + ?Sized> From<&Strong<I>> for SIBinder {
+    fn from(strong: &Strong<I>) -> SIBinder {
+        strong.as_binder()
     }
 }
 

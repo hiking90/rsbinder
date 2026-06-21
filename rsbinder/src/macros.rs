@@ -751,9 +751,95 @@ mod tests {
         }
     }
 
+    // A second, unrelated interface used only to exercise a wrong-type cast.
+    // Mirrors `IEcho` (adapter + async) so it is a fully-formed interface in
+    // both sync and async builds.
+    pub trait IBye: Interface {
+        #[allow(dead_code)]
+        fn bye(&self) -> Result<()>;
+    }
+
+    pub trait IByeAsyncService: Interface {
+        #[allow(dead_code)]
+        fn bye(&self) -> Result<()>;
+    }
+
+    declare_binder_interface! {
+        IBye["my.bye"] {
+            native: {
+                BnBye(on_transact_bye),
+                adapter: BnByeAdapter,
+                r#async: IByeAsyncService,
+            },
+            proxy: BpBye{},
+        }
+    }
+
+    #[allow(dead_code)]
+    impl IBye for Binder<BnBye> {
+        #[cfg(feature = "async")]
+        fn bye(&self) -> Result<()> {
+            self.0.as_sync().bye()
+        }
+        #[cfg(not(feature = "async"))]
+        fn bye(&self) -> Result<()> {
+            self.0.bye()
+        }
+    }
+
+    impl IBye for BpBye {
+        fn bye(&self) -> Result<()> {
+            unimplemented!("BpBye::bye")
+        }
+    }
+
+    fn on_transact_bye(
+        _service: &dyn IBye,
+        _code: TransactionCode,
+        _data: &mut Parcel,
+        _reply: &mut Parcel,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    struct ByeService {}
+
+    impl Interface for ByeService {}
+
+    impl IBye for ByeService {
+        fn bye(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_declare_binder_interface() {
         let _ = BnEcho::new_binder(EchoService {});
+    }
+
+    // F6: a cross-interface cast must fail with `BadType` (not silently
+    // succeed), and the single diagnostic funnel in `native::try_from` is what
+    // names the expected vs. actual descriptor in the log.
+    #[test]
+    fn test_cast_mismatch_is_bad_type() {
+        // `Into<SIBinder>` drops the interface type — no `.as_binder()`.
+        let echo: crate::SIBinder = BnEcho::new_binder(EchoService {}).into();
+        let bye: crate::SIBinder = BnBye::new_binder(ByeService {}).into();
+
+        // The matching interface round-trips both ways.
+        assert!(<dyn IEcho as crate::FromIBinder>::try_from(echo.clone()).is_ok());
+        assert!(<dyn IBye as crate::FromIBinder>::try_from(bye.clone()).is_ok());
+
+        // The wrong interface is rejected (symmetrically) as `BadType` — opaque
+        // in the value, but with expected/actual descriptors in the diagnostic.
+        assert_eq!(
+            <dyn IBye as crate::FromIBinder>::try_from(echo).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
+        assert_eq!(
+            <dyn IEcho as crate::FromIBinder>::try_from(bye).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
     }
 
     #[cfg(feature = "async")]
