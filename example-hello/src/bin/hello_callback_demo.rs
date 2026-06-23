@@ -34,8 +34,7 @@
 use std::time::Instant;
 
 use example_hello::*;
-use rsbinder::hub::android_16::android::os::IClientCallback::{BnClientCallback, IClientCallback};
-use rsbinder::hub::android_16::IServiceManager;
+use rsbinder::hub::{BnClientCallback, IClientCallback};
 use rsbinder::service::{kernel, Registry as _};
 use rsbinder::*;
 
@@ -77,36 +76,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let callback = BnClientCallback::new_binder(MyClientCallback { start });
 
-    // `hub::default()` returns the version-dispatching enum. On
-    // non-Android the only active arm is `Android16` (cfg-gated enum
-    // in `rsbinder/src/hub/mod.rs`) → the match is single-arm
-    // exhaustive. On Android the older SDK variants (`Android10`–
-    // `Android14`) also compile in, requiring the `cfg`-gated
-    // catch-all. The non-Android single-arm form trips
-    // `clippy::infallible_destructuring_match` (suggests `let
-    // X(bp) = ...`), but that alternative trips
-    // `irrefutable_let_patterns` for the same reason — neither lint
-    // can accommodate both targets, so we allow the destructuring-
-    // match lint only where it fires. We reach into the
-    // `BpServiceManager` directly because `registerClientCallback`
-    // isn't surfaced as a hub-level convenience function.
-    let sm = hub::default()?;
-    #[cfg_attr(
-        not(target_os = "android"),
-        allow(clippy::infallible_destructuring_match)
-    )]
-    let bp = match &*sm {
-        hub::ServiceManager::Android16(bp) => bp,
-        #[cfg(target_os = "android")]
-        _ => {
-            return Err(
-                "hello_callback_demo expects the Android 16 ServiceManager variant \
-                 (Linux default, or an Android target whose detected SDK is 36)"
-                    .into(),
-            );
-        }
-    };
-    bp.registerClientCallback(SERVICE_NAME, &service_binder, &callback)
+    // `hub::register_client_callback` hides the per-version ServiceManager
+    // dispatch, so the demo no longer reaches into a `BpServiceManager`
+    // variant by hand.
+    hub::register_client_callback(SERVICE_NAME, &service_binder, &callback)
         .map_err(|e| format!("registerClientCallback failed: {e:?}"))?;
     println!(
         "[+{:5.1}s] Registered client callback; awaiting transitions...",

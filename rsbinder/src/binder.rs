@@ -22,6 +22,25 @@
 //! This module provides the fundamental types and traits for binder IPC,
 //! including interface definitions, binder object management, and transaction
 //! handling. It forms the foundation for all binder communication.
+//!
+//! # Which handle type do I use?
+//!
+//! The binder object zoo collapses to a few rules in practice. Almost all
+//! application code only ever touches the first two rows; the rest are
+//! plumbing the AIDL generator and the runtime fill in for you.
+//!
+//! | Type / trait | What it is | When you reach for it |
+//! |---|---|---|
+//! | [`Strong<dyn IFoo>`](Strong) | Owning, ref-counted handle to a service implementing interface `IFoo`. | The normal way to hold a service. Returned by `BnFoo::new_binder`, `hub::*_interface`, and `FromIBinder::try_from`; call interface methods directly on it. |
+//! | [`Weak<dyn IFoo>`](Weak) | Non-owning handle that does not keep the object alive. | Break reference cycles / caches; [`upgrade`](Weak::upgrade) back to a `Strong` when you need to call it. |
+//! | [`SIBinder`] | Type-erased strong handle (no interface type). | The raw currency passed to/from the kernel and APIs like [`crate::hub::add_service`]. Get one with `Into::into`/[`Interface::as_binder`]; recover a typed handle with [`SIBinder::into_interface`] / `FromIBinder::try_from`. |
+//! | [`WIBinder`] | Type-erased *weak* handle. | The erased counterpart of `Weak`, used internally by death recipients and notification registries. |
+//! | [`Interface`] | Base trait every binder interface (and service impl) implements. | Implement it on your service struct (often empty); its [`as_binder`](Interface::as_binder) is how you erase to `SIBinder`. |
+//! | [`Remotable`] | Trait for a *local* object that can receive transactions (a server). | Implemented by the generated `BnFoo`; you supply the behavior via `impl IFoo for …`. |
+//! | [`FromIBinder`] | Trait for casting an `SIBinder` to a typed interface. | Used through [`SIBinder::into_interface`] / `Strong::try_from`; the generator implements it per interface. |
+//! | [`crate::Proxy`] / [`crate::ProxyHandle`] | Client-side stand-in for a remote object (`BpFoo` wraps these). | You rarely name these; they back the `Strong<dyn IFoo>` you get for a *remote* service. |
+//! | [`RemoteProxy`] | Trait exposing remote-only ops (ping, link-to-death, …) on a handle. | Reach for it to ping a service or register a [`DeathRecipient`]. |
+//! | [`IBinder`] / [`Transactable`] | The low-level object and raw-`transact` traits. | Only when writing a transport or hand-rolling wire calls below the generated stubs. |
 
 use std::any::Any;
 use std::borrow::Borrow;
@@ -212,7 +231,15 @@ pub trait IBinder: Any + Send + Sync {
     /// Trying to use this function on a local binder will result in an
     /// INVALID_OPERATION code being returned and nothing happening.
     ///
-    /// This link always holds a weak reference to its recipient.
+    /// This link always holds a weak reference to its recipient, so the
+    /// caller must keep its own strong `Arc` to the recipient alive for the
+    /// duration of the link — otherwise the notification silently never fires.
+    ///
+    /// Over the RPC transport, death is detected as a dropped session
+    /// connection rather than a kernel `BR_DEAD_BINDER`, so notifications
+    /// only fire while the session is actively served (the peer must run a
+    /// serve loop, e.g. via `RpcServer::run`); see the `rpc` proxy
+    /// implementation for details.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.
@@ -785,6 +812,31 @@ impl SIBinder {
     pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         FromIBinder::try_from(self)
     }
+
+    /// Register a death notification, accepting an `Arc<R>` of the concrete
+    /// recipient type directly so callers need not spell out
+    /// `Arc::downgrade(&(x as Arc<dyn DeathRecipient>))`.
+    ///
+    /// The link stores only a weak reference (see [`IBinder::link_to_death`]):
+    /// **keep `recipient` (your own strong `Arc`) alive for the duration of
+    /// the link, or the notification silently never fires.** Equivalent to
+    /// `self.link_to_death(Arc::downgrade(&recipient))` after unsizing.
+    pub fn link_to_death_arc<R: DeathRecipient + 'static>(&self, recipient: &Arc<R>) -> Result<()> {
+        // Bind `Weak<R>` first so the unsize fires at the call, not on downgrade's arg.
+        let weak: sync::Weak<R> = Arc::downgrade(recipient);
+        self.link_to_death(weak)
+    }
+
+    /// Remove a death notification previously registered with
+    /// [`link_to_death_arc`](Self::link_to_death_arc). Counterpart that takes
+    /// the concrete `Arc<R>` directly.
+    pub fn unlink_to_death_arc<R: DeathRecipient + 'static>(
+        &self,
+        recipient: &Arc<R>,
+    ) -> Result<()> {
+        let weak: sync::Weak<R> = Arc::downgrade(recipient);
+        self.unlink_to_death(weak)
+    }
 }
 
 impl Debug for SIBinder {
@@ -1025,6 +1077,56 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
         // object is also valid for the target type.
         FromIBinder::try_from(self.0.as_binder())
             .expect("ToSyncInterface guarantees binder compatibility")
+    }
+
+    /// Register a death notification on the underlying binder, taking the
+    /// concrete `Arc<R>` recipient directly. Convenience for
+    /// `self.as_binder().link_to_death_arc(recipient)`; see
+    /// [`SIBinder::link_to_death_arc`] for the weak-reference caveat.
+    pub fn link_to_death_arc<R: DeathRecipient + 'static>(&self, recipient: &Arc<R>) -> Result<()> {
+        self.0.as_binder().link_to_death_arc(recipient)
+    }
+
+    /// Remove a death notification registered with
+    /// [`link_to_death_arc`](Self::link_to_death_arc).
+    pub fn unlink_to_death_arc<R: DeathRecipient + 'static>(
+        &self,
+        recipient: &Arc<R>,
+    ) -> Result<()> {
+        self.0.as_binder().unlink_to_death_arc(recipient)
+    }
+}
+
+/// Drop the interface type and recover the underlying [`SIBinder`].
+///
+/// Lets APIs that take a raw binder — e.g. [`crate::hub::add_service`] — accept
+/// a `Strong<dyn IFoo>` directly via `impl Into<SIBinder>`, so callers no longer
+/// spell out `.as_binder()`. `&Strong<I>` is also accepted so the handle can be
+/// reused afterwards.
+impl<I: FromIBinder + ?Sized> From<Strong<I>> for SIBinder {
+    fn from(strong: Strong<I>) -> SIBinder {
+        strong.as_binder()
+    }
+}
+
+impl<I: FromIBinder + ?Sized> From<&Strong<I>> for SIBinder {
+    fn from(strong: &Strong<I>) -> SIBinder {
+        strong.as_binder()
+    }
+}
+
+impl<I: FromIBinder + ?Sized> TryFrom<SIBinder> for Strong<I> {
+    type Error = StatusCode;
+
+    /// Casts an [`SIBinder`] to a typed [`Strong<I>`] — the fallible inverse
+    /// of converting a [`Strong<I>`](Strong) back into an [`SIBinder`].
+    ///
+    /// Equivalent to [`SIBinder::into_interface`] and to the
+    /// [`FromIBinder::try_from`] trait method; provided so the idiomatic
+    /// `Strong::<dyn IFoo>::try_from(binder)` spelling resolves. Returns
+    /// [`StatusCode::BadType`] when the binder does not implement `I`.
+    fn try_from(ibinder: SIBinder) -> Result<Strong<I>> {
+        FromIBinder::try_from(ibinder)
     }
 }
 

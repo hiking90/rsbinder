@@ -639,6 +639,56 @@ macro_rules! declare_binder_enum {
     };
 }
 
+/// Include AIDL-generated Rust and (optionally) flatten an interface's items
+/// into the current module — the one-call form of the
+/// `include!(concat!(env!("OUT_DIR"), …))` + `pub use …::*` pair that every
+/// AIDL consumer otherwise writes by hand.
+///
+/// Pass the **output file stem** you gave to `rsbinder_aidl::Builder::output`
+/// (without the `.rs`). `env!("OUT_DIR")` and `include!` are expanded at the
+/// call site, so the file resolves against the *consumer* crate's build
+/// output — exactly as a hand-written `include!` would.
+///
+/// # Forms
+///
+/// ```ignore
+/// // 1. include + re-export an interface's items (trait, Bn*, Bp*, …):
+/// rsbinder::include_aidl!("hello", hello::IHello::*);
+/// // expands to:
+/// //   include!(concat!(env!("OUT_DIR"), "/hello.rs"));
+/// //   pub use hello::IHello::*;
+///
+/// // 2. include only — re-export yourself (e.g. several interfaces in one file):
+/// rsbinder::include_aidl!("multi");
+/// pub use multi::IFoo::*;
+/// pub use multi::IBar::*;
+/// ```
+///
+/// The re-export path is taken verbatim as token trees, so it can be a glob
+/// (`pkg::IFoo::*`), a selective list (`pkg::IFoo::{IFoo, BnFoo, BpFoo}`), or
+/// start with `self::` inside a nested module.
+///
+/// The two-argument form emits `pub use`, so the interface's items become part
+/// of the enclosing module's public surface. For any other visibility, use the
+/// single-argument (include-only) form and write your own `use` / `pub use`.
+///
+/// # What it does not do
+///
+/// The interface name is not derivable from the file stem (`"hello"` →
+/// `IHello` is only a naming convention), so the re-export path is still given
+/// explicitly. The `build.rs` codegen step (`Builder`) is unaffected — this
+/// replaces only the `lib.rs` include/`use` boilerplate.
+#[macro_export]
+macro_rules! include_aidl {
+    ($file:literal, $($use_path:tt)+) => {
+        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+        pub use $($use_path)+;
+    };
+    ($file:literal $(,)?) => {
+        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Binder, Interface, Parcel, Result, TransactionCode};
@@ -701,9 +751,142 @@ mod tests {
         }
     }
 
+    // A second, unrelated interface used only to exercise a wrong-type cast.
+    // Mirrors `IEcho` (adapter + async) so it is a fully-formed interface in
+    // both sync and async builds.
+    pub trait IBye: Interface {
+        #[allow(dead_code)]
+        fn bye(&self) -> Result<()>;
+    }
+
+    pub trait IByeAsyncService: Interface {
+        #[allow(dead_code)]
+        fn bye(&self) -> Result<()>;
+    }
+
+    declare_binder_interface! {
+        IBye["my.bye"] {
+            native: {
+                BnBye(on_transact_bye),
+                adapter: BnByeAdapter,
+                r#async: IByeAsyncService,
+            },
+            proxy: BpBye{},
+        }
+    }
+
+    #[allow(dead_code)]
+    impl IBye for Binder<BnBye> {
+        #[cfg(feature = "async")]
+        fn bye(&self) -> Result<()> {
+            self.0.as_sync().bye()
+        }
+        #[cfg(not(feature = "async"))]
+        fn bye(&self) -> Result<()> {
+            self.0.bye()
+        }
+    }
+
+    impl IBye for BpBye {
+        fn bye(&self) -> Result<()> {
+            unimplemented!("BpBye::bye")
+        }
+    }
+
+    fn on_transact_bye(
+        _service: &dyn IBye,
+        _code: TransactionCode,
+        _data: &mut Parcel,
+        _reply: &mut Parcel,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    struct ByeService {}
+
+    impl Interface for ByeService {}
+
+    impl IBye for ByeService {
+        fn bye(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_declare_binder_interface() {
         let _ = BnEcho::new_binder(EchoService {});
+    }
+
+    // F6: a cross-interface cast must fail with `BadType` (not silently
+    // succeed), and the single diagnostic funnel in `native::try_from` is what
+    // names the expected vs. actual descriptor in the log.
+    #[test]
+    fn test_cast_mismatch_is_bad_type() {
+        // `Into<SIBinder>` drops the interface type — no `.as_binder()`.
+        let echo: crate::SIBinder = BnEcho::new_binder(EchoService {}).into();
+        let bye: crate::SIBinder = BnBye::new_binder(ByeService {}).into();
+
+        // The matching interface round-trips both ways.
+        assert!(<dyn IEcho as crate::FromIBinder>::try_from(echo.clone()).is_ok());
+        assert!(<dyn IBye as crate::FromIBinder>::try_from(bye.clone()).is_ok());
+
+        // The wrong interface is rejected (symmetrically) as `BadType` — opaque
+        // in the value, but with expected/actual descriptors in the diagnostic.
+        assert_eq!(
+            <dyn IBye as crate::FromIBinder>::try_from(echo).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
+        assert_eq!(
+            <dyn IEcho as crate::FromIBinder>::try_from(bye).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
+    }
+
+    // C1: `Strong::<dyn IFoo>::try_from(sib)` is the idiomatic cast spelling and
+    // must behave exactly like `FromIBinder::try_from` / `into_interface`.
+    #[test]
+    fn test_strong_try_from() {
+        let echo: crate::SIBinder = BnEcho::new_binder(EchoService {}).into();
+
+        // The matching interface round-trips via the TryFrom impl.
+        assert!(crate::Strong::<dyn IEcho>::try_from(echo.clone()).is_ok());
+
+        // The wrong interface is rejected as `BadType`, matching the funnel.
+        assert_eq!(
+            crate::Strong::<dyn IBye>::try_from(echo).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
+    }
+
+    // E4: link_to_death_arc accepts a concrete `Arc<R>` with no
+    // `as Arc<dyn DeathRecipient>` cast, on both `Strong<I>` and `SIBinder`.
+    // A native (local) binder rejects the link with InvalidOperation, which
+    // exercises the unsizing + delegation end-to-end.
+    #[test]
+    fn test_link_to_death_arc_no_cast() {
+        struct Rec;
+        impl crate::DeathRecipient for Rec {
+            fn binder_died(&self, _who: &crate::WIBinder) {}
+        }
+        let recipient = std::sync::Arc::new(Rec);
+
+        // Strong<dyn IEcho> path (no cast at the call site).
+        let strong = BnEcho::new_binder(EchoService {});
+        assert_eq!(
+            strong.link_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
+
+        // SIBinder path.
+        let sib: crate::SIBinder = strong.into();
+        assert_eq!(
+            sib.link_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
+        assert_eq!(
+            sib.unlink_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
     }
 
     #[cfg(feature = "async")]

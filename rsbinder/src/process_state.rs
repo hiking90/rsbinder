@@ -1194,6 +1194,28 @@ impl ProcessState {
         self.max_threads
     }
 
+    /// Start the binder thread pool: spawn one worker now and **enable
+    /// kernel-driven spawning** for the rest of the process's life.
+    ///
+    /// This flips an internal flag that gates *all* dynamic worker creation —
+    /// including the kernel's own `BR_SPAWN_LOOPER` requests under load. Until
+    /// it is called, binder commands are served only on threads that manually
+    /// [`join_thread_pool`](Self::join_thread_pool), and the kernel cannot add
+    /// more, so the process is effectively single-threaded.
+    ///
+    /// Call it from **any process that receives an inbound transaction**: a
+    /// service handling incoming calls, or a client that receives a callback, a
+    /// notification, an event-driven [`crate::hub::wait_for_service`]
+    /// registration, or a [`crate::DeathRecipient`]. Only a fire-and-forget
+    /// client that makes synchronous outbound calls and receives nothing back
+    /// can safely skip it. Idempotent — the first call wins, later calls are
+    /// no-ops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process state has not been initialized — call
+    /// [`ProcessState::init`](Self::init) or
+    /// [`init_default`](Self::init_default) first.
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
@@ -1238,11 +1260,10 @@ impl ProcessState {
                 self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
             }
         }
-        // TODO: if startThreadPool is called on another thread after the process
-        // starts up, the kernel might think that it already requested those
-        // binder threads, and additional won't be started. This is likely to
-        // cause deadlocks, and it will also cause getThreadPoolMaxTotalThreadCount
-        // to return too high of a value.
+        // AOSP's late-startThreadPool desync TODO can't arise here: BC_REGISTER_LOOPER is
+        // emitted only from the BR_SPAWN_LOOPER handler (1:1 with a kernel request), the
+        // main/manual loopers use BC_ENTER_LOOPER (untracked), and start_thread_pool is
+        // CAS-idempotent. See frameworks/native/libs/binder/ProcessState.cpp spawnPooledThread.
     }
 
     pub fn strong_ref_count_for_node(&self, node: &ProxyHandle) -> Result<usize> {

@@ -6,7 +6,6 @@ use env_logger::Env;
 use example_hello::*;
 use rsbinder::*;
 use std::sync::Arc;
-use std::time::Duration;
 
 struct MyDeathRecipient {}
 
@@ -22,35 +21,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize ProcessState with the default binder path and the default max threads.
     ProcessState::init_default()?;
 
+    // Start the thread pool so this client's inbound transactions — the
+    // event-driven `onRegistration` (wait_for_interface) and the death
+    // notification below — are delivered promptly; without it the wait still
+    // works but degrades to ~1s polling. See `ProcessState::start_thread_pool`.
+    ProcessState::start_thread_pool();
+
     println!("list services:");
     // This is an example of how to use service manager.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
         println!("{name}");
     }
 
-    // Create a Hello proxy from the binder service manager. If this client
-    // starts before the service has finished registering, the lookup fails, so
-    // retry a few times before giving up and surfacing the real Status error.
-    let hello: rsbinder::Strong<dyn IHello> = {
-        const RETRIES: u32 = 5;
-        let mut attempt = 0;
-        loop {
-            match hub::get_interface(SERVICE_NAME) {
-                Ok(hello) => break hello,
-                Err(e) if attempt < RETRIES => {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(500));
-                    println!("Waiting for {SERVICE_NAME}... (retry {attempt}/{RETRIES}): {e}");
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
+    // Block until the Hello service is registered, then cast it to the
+    // interface — the event-driven AOSP `waitForService` equivalent. This
+    // replaces the old hand-rolled retry loop: no polling, no fixed attempt
+    // cap, and the register-after-miss race is handled by the hub.
+    let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
 
+    // `link_to_death_arc` takes the concrete `Arc<MyDeathRecipient>` directly —
+    // no `Arc::downgrade(&(x as Arc<dyn DeathRecipient>))` incantation. Keep
+    // `recipient` alive for the link's lifetime (the link holds only a weak ref).
     let recipient = Arc::new(MyDeathRecipient {});
-    hello
-        .as_binder()
-        .link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
+    hello.link_to_death_arc(&recipient)?;
 
     // Call echo method of Hello proxy.
     let echo = hello.echo("Hello World!")?;

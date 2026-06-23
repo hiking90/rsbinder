@@ -95,6 +95,7 @@ required-features = ["rpc"]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 env_logger = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rustix = { workspace = true, features = ["process"] }
 libc = { workspace = true }
 

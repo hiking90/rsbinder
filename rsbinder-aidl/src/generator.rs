@@ -184,17 +184,17 @@ pub mod {{mod}} {
     pub trait {{name}}: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
         {%- if version %}
         // Server-side default returns the module's VERSION constant.
         // `Bp{{name}}` overrides this with a cache+transact pattern.
-        fn r#getInterfaceVersion(&self) -> {{crate}}::status::Result<i32> {
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             Ok(VERSION)
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::status::Result<String> {
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
             Ok(HASH.into())
         }
         {%- endif %}
@@ -206,21 +206,42 @@ pub mod {{mod}} {
         }
     }
     {%- if enabled_async %}
+    /// Asynchronous **client** view of `{{name}}` (`.await`-able methods).
+    ///
+    /// `P` selects the async pool that drives the underlying blocking transact;
+    /// with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
+    /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
+    /// directly via `rsbinder::get_interface::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
+    /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
+    /// for `Tokio`, `tokio`) feature.
     pub trait {{name}}Async<P>: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>>;
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
     }
+    /// Asynchronous **server** view of `{{name}}`: implement this (with
+    /// `#[async_trait]`) on your service, then wrap it with
+    /// [`{{bn_name}}::new_async_binder`] to publish it as a binder.
     #[::async_trait::async_trait]
     pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
-        async fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}>;
+        async fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
     }
     impl {{bn_name}}
     {
+        /// Wrap an async service impl (`{{name}}AsyncService`) into a binder,
+        /// bridging it onto the synchronous binder dispatch via `rt`.
+        ///
+        /// `rt` is a `BinderAsyncRuntime` — e.g. `rsbinder::TokioRuntime(handle)`
+        /// with the default `tokio` feature — and each inbound call is driven to
+        /// completion with `rt.block_on(..)`. The returned handle is typed as the
+        /// **sync** `Strong<dyn {{name}}>` because a binder is transport-neutral:
+        /// the async-ness lives in the server impl, not the handle. Clients still
+        /// reach it as either `{{name}}` or `{{name}}Async<P>`.
         pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
         where
             T: {{name}}AsyncService + Sync + Send + 'static,
@@ -252,7 +273,7 @@ pub mod {{mod}} {
                 R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
             {
                 {%- for member in fn_members %}
-                fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
+                fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
                     self._rt.block_on(self._inner.r#{{ member.identifier }}({{ member.func_call_params }}))
                 }
                 {%- endfor %}
@@ -269,7 +290,7 @@ pub mod {{mod}} {
     {%- endif %}
     pub trait {{ name }}Default: Send + Sync {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             Err({{crate}}::StatusCode::UnknownTransaction.into())
         }
         {%- endfor %}
@@ -335,8 +356,9 @@ pub mod {{mod}} {
             {%- endif %}
             Ok(data)
         }
-        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<{{ member.return_type }}> {
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             {%- if oneway or member.oneway %}
+            _aidl_reply?; // propagate transport errors (e.g. dead object); oneway has no reply body
             Ok(())
             {%- else %}
             if let Err({{crate}}::StatusCode::UnknownTransaction) = _aidl_reply {
@@ -366,7 +388,7 @@ pub mod {{mod}} {
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             Ok(data)
         }
-        fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<i32> {
+        fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
             let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
             if !_status.is_ok() { return Err(_status); }
@@ -380,7 +402,7 @@ pub mod {{mod}} {
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             Ok(data)
         }
-        fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::status::Result<String> {
+        fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<String> {
             let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
             if !_status.is_ok() { return Err(_status); }
@@ -392,7 +414,7 @@ pub mod {{mod}} {
     }
     impl {{ name }} for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
             let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF);
             {%- if member.func_call_params|length > 0 %}
@@ -403,7 +425,7 @@ pub mod {{mod}} {
         }
         {%- endfor %}
         {%- if version %}
-        fn r#getInterfaceVersion(&self) -> {{crate}}::status::Result<i32> {
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
             if _aidl_version != -1 { return Ok(_aidl_version); }
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
@@ -412,7 +434,7 @@ pub mod {{mod}} {
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::status::Result<String> {
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
             {
                 let _aidl_hash_lock = self.cached_hash.lock().unwrap();
                 if let Some(ref _aidl_hash) = *_aidl_hash_lock {
@@ -428,7 +450,7 @@ pub mod {{mod}} {
     {%- if enabled_async %}
     impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>> {
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
             let _aidl_data = match self.build_parcel_{{ member.identifier }}({{ member.func_call_params }}) {
                 Ok(_aidl_data) => _aidl_data,
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
@@ -450,7 +472,7 @@ pub mod {{mod}} {
     impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{crate}}::Binder<{{bn_name}}>
     {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::status::Result<{{ member.return_type }}>> {
+        fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
             self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
@@ -458,7 +480,7 @@ pub mod {{mod}} {
     {%- endif %}
     impl {{ name }} for {{crate}}::Binder<{{ bn_name }}> {
         {%- for member in fn_members %}
-        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::status::Result<{{ member.return_type }}> {
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             {%- if enabled_async %}
             self.0.as_sync().r#{{ member.identifier }}({{ member.func_call_params }})
             {%- else %}

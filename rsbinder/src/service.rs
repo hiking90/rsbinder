@@ -252,6 +252,9 @@ pub mod kernel {
     }
 
     impl super::Broker for Broker {
+        // Immediate lookup mirrors the RPC `Broker::lookup`; single-shot is
+        // the intended facade semantics (no implicit wait).
+        #[allow(deprecated)]
         fn lookup(&self, name: &str) -> Result<SIBinder> {
             crate::hub::get_service(name).ok_or(StatusCode::NameNotFound)
         }

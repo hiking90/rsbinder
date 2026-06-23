@@ -16,6 +16,23 @@ use std::fmt::{Debug, Display, Formatter};
 /// Result type for operations that can return a `Status` error.
 pub type Result<T> = std::result::Result<T, Status>;
 
+/// Result alias for **binder interface methods** — the type returned by the
+/// generated `Bp*` proxy / `Bn*` native stubs and by your `impl` of an AIDL
+/// trait.
+///
+/// The error type is the rich [`Status`] (exception code + service-specific
+/// code + optional message) — what crosses the wire as a method's failure
+/// and what a service returns to raise an application-level error (see
+/// [`Status::new_service_specific_error`]).
+///
+/// This is the *same type* as [`Result`] in this module; it exists under a
+/// distinct, intention-revealing name so it does not read as a collision
+/// with the crate-root [`crate::Result`], whose error is the flat
+/// transport-level [`StatusCode`]. The two interoperate through `?` in both
+/// directions (`From<Status> for StatusCode` and `From<StatusCode> for
+/// Status`), and `?` on `std::io::Error` works in either context.
+pub type BinderResult<T> = std::result::Result<T, Status>;
+
 /// Exception codes for binder operations.
 ///
 /// These codes represent different types of exceptions that can occur
@@ -286,6 +303,24 @@ impl From<StatusCode> for Status {
     }
 }
 
+/// Mirrors `From<std::io::Error> for StatusCode` so a [`BinderResult`]
+/// method can `?` an I/O error directly. `?` does not chain `From` impls,
+/// so the transitive `io::Error → StatusCode → Status` path is not enough
+/// on its own — this direct impl is required.
+impl From<std::io::Error> for Status {
+    fn from(err: std::io::Error) -> Self {
+        StatusCode::from(err).into()
+    }
+}
+
+/// Mirrors `From<std::array::TryFromSliceError> for StatusCode` for the same
+/// `?`-ergonomics reason as `From<std::io::Error> for Status`.
+impl From<std::array::TryFromSliceError> for Status {
+    fn from(err: std::array::TryFromSliceError) -> Self {
+        StatusCode::from(err).into()
+    }
+}
+
 impl Serialize for Status {
     fn serialize(&self, parcel: &mut Parcel) -> error::Result<()> {
         // Mirrors AOSP `Status::writeToParcel`: on EX_TRANSACTION_FAILED
@@ -473,6 +508,31 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // `From<std::io::Error>` / `From<TryFromSliceError> for Status` let a
+    // `BinderResult` method `?` those errors directly. `?` does not chain
+    // `From`, so the StatusCode hop is not enough on its own — lock the
+    // direct impls in (and exercise the `BinderResult` alias while at it).
+    #[test]
+    fn binder_result_question_marks_io_and_slice_errors() {
+        // io::Error path: ENOENT → NameNotFound, surfaced through Status.
+        fn open_missing() -> BinderResult<std::fs::File> {
+            Ok(std::fs::File::open("/nonexistent/rsbinder/regression")?)
+        }
+        assert_eq!(
+            StatusCode::from(open_missing().unwrap_err()),
+            StatusCode::NameNotFound,
+        );
+
+        // TryFromSliceError path: wrong-length slice → NotEnoughData.
+        fn take_four(bytes: &[u8]) -> BinderResult<[u8; 4]> {
+            Ok(bytes.try_into()?)
+        }
+        assert_eq!(
+            StatusCode::from(take_four(&[1, 2, 3]).unwrap_err()),
+            StatusCode::NotEnoughData,
+        );
     }
 
     // Regression: a non-zero, size-INCLUSIVE remote stack-trace header

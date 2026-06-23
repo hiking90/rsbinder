@@ -43,9 +43,9 @@ pub mod ITestService {
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     pub trait ITestService: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>>;
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>>;
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()>;
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>>;
+        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>>;
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()>;
         fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
@@ -54,13 +54,13 @@ pub mod ITestService {
         }
     }
     pub trait ITestServiceDefault: Send + Sync {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
     }
@@ -86,7 +86,7 @@ pub mod ITestService {
             data.write_slice_size(Some(_arg_repeated))?;
             Ok(data)
         }
-        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<Vec<bool>> {
+        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Vec<bool>> {
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#ReverseBoolean(_arg_input, _arg_repeated);
@@ -104,7 +104,7 @@ pub mod ITestService {
             data.write(&_arg_input)?;
             Ok(data)
         }
-        fn read_response_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<Option<Vec<i32>>> {
+        fn read_response_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#RepeatNullableIntArray(_arg_input);
@@ -121,7 +121,7 @@ pub mod ITestService {
             data.write(_arg_parcel)?;
             Ok(data)
         }
-        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<()> {
+        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<()> {
             if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#FillOutStructuredParcelable(_arg_parcel);
@@ -135,30 +135,30 @@ pub mod ITestService {
         }
     }
     impl ITestService for BpTestService {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
             let _aidl_data = self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
             let _aidl_data = self.build_parcel_RepeatNullableIntArray(_arg_input)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             let _aidl_data = self.build_parcel_FillOutStructuredParcelable(_arg_parcel)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
         }
     }
     impl ITestService for rsbinder::Binder<BnTestService> {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::status::Result<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
             self.0.r#ReverseBoolean(_arg_input, _arg_repeated)
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::status::Result<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
             self.0.r#RepeatNullableIntArray(_arg_input)
         }
-        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::status::Result<()> {
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             self.0.r#FillOutStructuredParcelable(_arg_parcel)
         }
     }
@@ -334,7 +334,7 @@ pub mod FixedSizeArrayExample {
         #![allow(non_upper_case_globals, non_snake_case, dead_code)]
         pub trait IRepeatFixedSizeArray: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
-            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]>;
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]>;
             fn getDefaultImpl() -> Option<IRepeatFixedSizeArrayDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
@@ -343,7 +343,7 @@ pub mod FixedSizeArrayExample {
             }
         }
         pub trait IRepeatFixedSizeArrayDefault: Send + Sync {
-            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 Err(rsbinder::StatusCode::UnknownTransaction.into())
             }
         }
@@ -366,7 +366,7 @@ pub mod FixedSizeArrayExample {
                 data.write(_arg_input)?;
                 Ok(data)
             }
-            fn read_response_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2], _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+            fn read_response_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2], _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                     if let Some(_aidl_default_impl) = <Self as IRepeatFixedSizeArray>::getDefaultImpl() {
                       return _aidl_default_impl.r#Repeat2dParcelables(_arg_input, _arg_repeated);
@@ -381,14 +381,14 @@ pub mod FixedSizeArrayExample {
             }
         }
         impl IRepeatFixedSizeArray for BpRepeatFixedSizeArray {
-            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 let _aidl_data = self.build_parcel_Repeat2dParcelables(_arg_input, _arg_repeated)?;
                 let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
                 self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
             }
         }
         impl IRepeatFixedSizeArray for rsbinder::Binder<BnRepeatFixedSizeArray> {
-            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::status::Result<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 self.0.r#Repeat2dParcelables(_arg_input, _arg_repeated)
             }
         }

@@ -1,4 +1,4 @@
-#![allow(non_snake_case, dead_code, unused_imports, unused_macros)]
+#![allow(non_snake_case, dead_code, unused_imports, unused_macros, deprecated)]
 
 use env_logger::Env;
 
@@ -87,6 +87,33 @@ fn test_facade_kernel_broker_parity() {
         .expect("facade kernel::Broker must resolve the running test service");
     // The facade-resolved binder behaves exactly like a `hub`-resolved one.
     assert_eq!(service.RepeatString("facade"), Ok("facade".to_string()));
+}
+
+/// `wait_for_interface` (the event-driven AOSP `waitForService` equivalent,
+/// review F2) resolves the already-running test service through its
+/// `get_service` fast path and returns a fully functional binder — the
+/// drop-in replacement for hand-rolled client retry loops. `init_test`
+/// started the thread pool, so the `onRegistration` callback path is
+/// serviceable even when the slow path is taken.
+#[test]
+fn test_wait_for_interface_resolves_running_service() {
+    init_test();
+    let service: rsbinder::Strong<dyn ITestService::ITestService> =
+        hub::wait_for_interface(<BpTestService as ITestService::ITestService>::descriptor())
+            .expect("wait_for_interface must resolve the running test service");
+    assert_eq!(service.RepeatString("wait"), Ok("wait".to_string()));
+}
+
+/// `check_interface` is the non-blocking counterpart to `wait_for_interface`
+/// (AOSP `interface_cast(check_service(name))`). The test service is already
+/// registered, so it resolves immediately to a functional binder.
+#[test]
+fn test_check_interface_resolves_running_service() {
+    init_test();
+    let service: rsbinder::Strong<dyn ITestService::ITestService> =
+        hub::check_interface(<BpTestService as ITestService::ITestService>::descriptor())
+            .expect("check_interface must resolve the running test service");
+    assert_eq!(service.RepeatString("check"), Ok("check".to_string()));
 }
 
 #[test]
@@ -1807,6 +1834,17 @@ fn test_death_recipient() {
             &(recipient.clone() as Arc<dyn DeathRecipient>),
         ));
         assert_eq!(result, Err(rsbinder::StatusCode::DeadObject));
+
+        // F4: a oneway call on the now-dead object must surface the transport
+        // failure, not silently return `Ok(())`. Pre-fix, the generated oneway
+        // `read_response` ignored `_aidl_reply` entirely; now it propagates it
+        // via `?` (matching AOSP `generate_rust.cpp`, whose `?` sits outside
+        // the oneway guard).
+        assert_eq!(
+            test_service.TestOneway(),
+            Err(rsbinder::StatusCode::DeadObject.into()),
+            "oneway call to a dead object must propagate DeadObject (F4)"
+        );
     }
 
     let mut buf = String::new();

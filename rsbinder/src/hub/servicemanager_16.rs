@@ -10,6 +10,7 @@ pub use android::os::IServiceManager::{
     DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO, FLAG_IS_LAZY_SERVICE,
 };
 
+pub use android::os::IClientCallback::{BnClientCallback, IClientCallback};
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
@@ -132,8 +133,9 @@ fn dispatch_typed_service(
     }
 }
 
-/// Retrieve an existing service, blocking for a few seconds if it doesn't yet
-/// exist.
+/// Retrieve an existing service via a single `getService` wire call (one
+/// attempt; not blocking). Use the hub's `wait_for_service` to block until the
+/// service appears, or `check_service` for an explicit non-blocking lookup.
 pub fn get_service(
     sm: &BpServiceManager,
     name: &str,
@@ -145,6 +147,19 @@ pub fn get_service(
             None
         }
     }
+}
+
+/// Error-preserving variant of `get_service`: returns `Err` on a transport
+/// failure instead of `None`, so a waiter can distinguish "not registered"
+/// (`Ok(None)`) from "service manager unreachable" (`Err`). Mirrors AOSP
+/// `realGetService`'s `Status` return.
+pub fn try_get_service(
+    sm: &BpServiceManager,
+    name: &str,
+) -> Result<Option<android::os::ServiceWithMetadata::ServiceWithMetadata>> {
+    sm.getService2(name)
+        .map(|service| dispatch_typed_service(name, service))
+        .map_err(|e| e.into())
 }
 
 /// Retrieve an existing service called @a name from the service
@@ -200,6 +215,24 @@ pub fn unregister_for_notifications(
 ) -> Result<()> {
     sm.unregisterForNotifications(name, callback)
         .map_err(|e| e.into())
+}
+
+/// Register a callback for client (proxy) presence transitions on a lazy
+/// service. AOSP `IServiceManager::registerClientCallback`.
+pub fn register_client_callback(
+    sm: &BpServiceManager,
+    name: &str,
+    service: &SIBinder,
+    callback: &crate::Strong<dyn IClientCallback>,
+) -> Result<()> {
+    sm.registerClientCallback(name, service, callback)
+        .map_err(|e| e.into())
+}
+
+/// Attempt to unregister a service previously registered with `add_service`.
+/// AOSP `IServiceManager::tryUnregisterService`.
+pub fn try_unregister_service(sm: &BpServiceManager, name: &str, service: &SIBinder) -> Result<()> {
+    sm.tryUnregisterService(name, service).map_err(|e| e.into())
 }
 
 /// Returns whether a given interface is declared on the device, even if it

@@ -353,6 +353,7 @@ dependencies = [
  "rsbinder",
  "rsbinder-aidl",
  "rustix",
+ "tokio",
 ]
 
 [[package]]
