@@ -24,12 +24,43 @@
 //! ```rust,no_run
 //! use rsbinder::hub;
 //!
-//! // Get a service by name (non-blocking; use `wait_for_service` to wait)
-//! let service = hub::check_service("example_service");
+//! // Client startup: block until the service is registered, then use it.
+//! let service = hub::wait_for_service("example_service");
 //!
-//! // List all available services
+//! // Non-blocking probe: returns immediately, `None` if not registered yet.
+//! let maybe = hub::check_service("example_service");
+//!
+//! // List all registered services.
 //! let services = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL);
 //! ```
+//!
+//! The typed variants (`*_interface`) cast straight to a `Strong<dyn IFoo>`:
+//!
+//! ```ignore
+//! let foo: Strong<dyn IFoo> = hub::wait_for_interface("example_service")?;
+//! ```
+//!
+//! ### Choosing a lookup function
+//!
+//! The lookup family differs only in *how it waits* and *how it encodes
+//! "not registered"*. Pick by the column you need:
+//!
+//! | Function | Returns | Not registered | SM unreachable | Cast mismatch |
+//! |---|---|---|---|---|
+//! | [`check_service`](crate::hub::check_service) | `Option<SIBinder>` | `None` | `None` | — |
+//! | [`check_interface`](crate::hub::check_interface) | `Result<Strong<T>>` | `Err(NameNotFound)` | `Err(NameNotFound)` | `Err(BadType)` |
+//! | [`try_get_service`](crate::hub::try_get_service) | `Result<Option<SIBinder>>` | `Ok(None)` | `Err(..)` | — |
+//! | [`try_get_interface`](crate::hub::try_get_interface) | `Result<Option<Strong<T>>>` | `Ok(None)` | `Err(..)` | `Err(BadType)` |
+//! | [`wait_for_service`](crate::hub::wait_for_service) | `Option<SIBinder>` | *blocks*; `None` on give-up | `None` | — |
+//! | [`wait_for_interface`](crate::hub::wait_for_interface) | `Result<Strong<T>>` | *blocks*; `Err(NameNotFound)` on give-up | `Err(NameNotFound)` | `Err(BadType)` |
+//!
+//! Use `wait_*` for a dependency expected to appear (client startup),
+//! `check_*` for an optional service probed once, and `try_*` when you must
+//! tell "not registered" (`Ok(None)`) apart from "service manager
+//! unreachable" (`Err`). The deprecated `get_service`/`get_interface` are
+//! superseded by these. On the Android 10 legacy C service manager, which
+//! cannot distinguish not-found from a transport failure, the `try_*`
+//! functions map any failure to `Ok(None)`.
 //!
 //! ### Version-Specific API
 //!
@@ -74,6 +105,7 @@ macro_rules! impl_sm_module_body {
             DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
         };
         pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
+        pub use android::os::IClientCallback::{BnClientCallback, IClientCallback};
 
         /// Retrieve an existing service via a single `getService` wire call
         /// (one attempt; not blocking). Use `wait_for_service` to block until
@@ -145,6 +177,27 @@ macro_rules! impl_sm_module_body {
             callback: &crate::Strong<dyn IServiceCallback>,
         ) -> Result<()> {
             sm.unregisterForNotifications(name, callback).map_err(|e| e.into())
+        }
+
+        /// Register a callback for client (proxy) presence transitions on a
+        /// lazy service. AOSP `IServiceManager::registerClientCallback`.
+        pub fn register_client_callback(
+            sm: &BpServiceManager,
+            name: &str,
+            service: &SIBinder,
+            callback: &crate::Strong<dyn IClientCallback>,
+        ) -> Result<()> {
+            sm.registerClientCallback(name, service, callback).map_err(|e| e.into())
+        }
+
+        /// Attempt to unregister a service previously registered with
+        /// `add_service`. AOSP `IServiceManager::tryUnregisterService`.
+        pub fn try_unregister_service(
+            sm: &BpServiceManager,
+            name: &str,
+            service: &SIBinder,
+        ) -> Result<()> {
+            sm.tryUnregisterService(name, service).map_err(|e| e.into())
         }
 
         /// Returns whether a given interface is declared on the device,
@@ -267,9 +320,9 @@ use crate::*;
 
 // Export Android 16 types as the default public API
 pub use android_16::{
-    BnServiceCallback, IServiceCallback, ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL,
-    DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH,
-    DUMP_FLAG_PRIORITY_NORMAL,
+    BnClientCallback, BnServiceCallback, IClientCallback, IServiceCallback, ServiceDebugInfo,
+    DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
+    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
 };
 
 /// Android SDK version constants
@@ -507,6 +560,84 @@ forward_service_callback_impl!(android_11, "android_11");
 forward_service_callback_impl!(android_12, "android_12");
 forward_service_callback_impl!(android_13, "android_13");
 forward_service_callback_impl!(android_14, "android_14");
+
+/// `IClientCallback` analogue of [`ForwardServiceCallback`], used by
+/// `register_client_callback` on Android 11–14. Same rationale: the
+/// per-version `android_N::IClientCallback` trait types have distinct
+/// vtables, but `registerClientCallback` only serializes the callback as
+/// its underlying `SIBinder`, so forwarding that binder is wire- and
+/// behavior-identical. `onClients` is unreachable on the serialize-only
+/// path (the kernel delivers notifications to the original binder node).
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+struct ForwardClientCallback(crate::SIBinder);
+
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14"
+    )
+))]
+impl crate::Interface for ForwardClientCallback {
+    fn as_binder(&self) -> crate::SIBinder {
+        self.0.clone()
+    }
+}
+
+/// Build a per-version `Strong<dyn IClientCallback>` wrapping the unified
+/// callback into [`ForwardClientCallback`]. Used by the
+/// `register_client_callback` dispatch arms on Android 11–14.
+#[cfg(all(
+    target_os = "android",
+    any(
+        feature = "android_11",
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14",
+    )
+))]
+macro_rules! wrap_client_callback {
+    ($modu:ident, $callback:expr) => {
+        crate::Strong::<dyn $modu::IClientCallback>::new(Box::new(ForwardClientCallback(
+            $callback.as_binder(),
+        )))
+    };
+}
+
+/// Emits the per-version `IClientCallback` impl for [`ForwardClientCallback`]
+/// (one per supported pre-16 version).
+macro_rules! forward_client_callback_impl {
+    ($modu:ident, $feat:literal) => {
+        #[cfg(all(target_os = "android", feature = $feat))]
+        impl $modu::IClientCallback for ForwardClientCallback {
+            fn r#onClients(
+                &self,
+                _registered: &crate::SIBinder,
+                _has_clients: bool,
+            ) -> crate::status::Result<()> {
+                // Unreachable on the serialize-only path; see the
+                // ForwardClientCallback doc. Return an error rather than
+                // panic in library code if it is ever reached.
+                Err(crate::StatusCode::UnknownTransaction.into())
+            }
+        }
+    };
+}
+
+forward_client_callback_impl!(android_11, "android_11");
+forward_client_callback_impl!(android_12, "android_12");
+forward_client_callback_impl!(android_13, "android_13");
+forward_client_callback_impl!(android_14, "android_14");
 
 impl ServiceManager {
     /// Resolve a service by name through the `getService` wire call.
@@ -792,6 +923,85 @@ impl ServiceManager {
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
             }
+        }
+    }
+
+    /// Registers a callback that fires when the set of clients holding a
+    /// reference to `service` changes — the building block for lazy
+    /// (on-demand) services. AOSP `IServiceManager::registerClientCallback`.
+    ///
+    /// `service` is the binder previously handed to [`add_service`](Self::add_service)
+    /// (e.g. `my_binder.as_binder()`); `callback` is a `BnClientCallback`.
+    ///
+    /// Note: not supported on Android 10 — returns an error on that version.
+    pub fn register_client_callback(
+        &self,
+        name: &str,
+        service: &SIBinder,
+        callback: &crate::Strong<dyn IClientCallback>,
+    ) -> Result<()> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("register_client_callback: not supported on Android 10");
+                Err(StatusCode::UnknownTransaction)
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::register_client_callback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_11, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::register_client_callback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_12, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::register_client_callback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_13, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::register_client_callback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_14, callback),
+            ),
+            ServiceManager::Android16(sm) => {
+                android_16::register_client_callback(sm, name, service, callback)
+            }
+        }
+    }
+
+    /// Attempts to unregister a service previously added with
+    /// [`add_service`](Self::add_service); the service manager honors it only
+    /// if no clients currently hold a reference. AOSP
+    /// `IServiceManager::tryUnregisterService`.
+    ///
+    /// Note: not supported on Android 10 — returns an error on that version.
+    pub fn try_unregister_service(&self, name: &str, service: &SIBinder) -> Result<()> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("try_unregister_service: not supported on Android 10");
+                Err(StatusCode::UnknownTransaction)
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::try_unregister_service(sm, name, service),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::try_unregister_service(sm, name, service),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::try_unregister_service(sm, name, service),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::try_unregister_service(sm, name, service),
+            ServiceManager::Android16(sm) => android_16::try_unregister_service(sm, name, service),
         }
     }
 
@@ -1082,6 +1292,30 @@ pub fn unregister_for_notifications(
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> Result<()> {
     default()?.unregister_for_notifications(name, callback)
+}
+
+/// Convenience function to register a client-presence callback on the default
+/// ServiceManager.
+///
+/// Equivalent to `default().register_client_callback(name, service, callback)`.
+/// See [`ServiceManager::register_client_callback`].
+#[inline]
+pub fn register_client_callback(
+    name: &str,
+    service: &SIBinder,
+    callback: &crate::Strong<dyn IClientCallback>,
+) -> Result<()> {
+    default()?.register_client_callback(name, service, callback)
+}
+
+/// Convenience function to attempt unregistering a service from the default
+/// ServiceManager.
+///
+/// Equivalent to `default().try_unregister_service(name, service)`.
+/// See [`ServiceManager::try_unregister_service`].
+#[inline]
+pub fn try_unregister_service(name: &str, service: &SIBinder) -> Result<()> {
+    default()?.try_unregister_service(name, service)
 }
 
 /// Convenience function to add a service to the default ServiceManager.

@@ -842,6 +842,53 @@ mod tests {
         );
     }
 
+    // C1: `Strong::<dyn IFoo>::try_from(sib)` is the idiomatic cast spelling and
+    // must behave exactly like `FromIBinder::try_from` / `into_interface`.
+    #[test]
+    fn test_strong_try_from() {
+        let echo: crate::SIBinder = BnEcho::new_binder(EchoService {}).into();
+
+        // The matching interface round-trips via the TryFrom impl.
+        assert!(crate::Strong::<dyn IEcho>::try_from(echo.clone()).is_ok());
+
+        // The wrong interface is rejected as `BadType`, matching the funnel.
+        assert_eq!(
+            crate::Strong::<dyn IBye>::try_from(echo).unwrap_err(),
+            crate::StatusCode::BadType,
+        );
+    }
+
+    // E4: link_to_death_arc accepts a concrete `Arc<R>` with no
+    // `as Arc<dyn DeathRecipient>` cast, on both `Strong<I>` and `SIBinder`.
+    // A native (local) binder rejects the link with InvalidOperation, which
+    // exercises the unsizing + delegation end-to-end.
+    #[test]
+    fn test_link_to_death_arc_no_cast() {
+        struct Rec;
+        impl crate::DeathRecipient for Rec {
+            fn binder_died(&self, _who: &crate::WIBinder) {}
+        }
+        let recipient = std::sync::Arc::new(Rec);
+
+        // Strong<dyn IEcho> path (no cast at the call site).
+        let strong = BnEcho::new_binder(EchoService {});
+        assert_eq!(
+            strong.link_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
+
+        // SIBinder path.
+        let sib: crate::SIBinder = strong.into();
+        assert_eq!(
+            sib.link_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
+        assert_eq!(
+            sib.unlink_to_death_arc(&recipient).unwrap_err(),
+            crate::StatusCode::InvalidOperation,
+        );
+    }
+
     #[cfg(feature = "async")]
     #[test]
     fn test_try_from() {

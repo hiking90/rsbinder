@@ -29,7 +29,7 @@ use crate::{
     Serialize, SerializeArray, SerializeOption,
 };
 
-use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 
 /// File descriptor wrapper for binder IPC.
 ///
@@ -41,8 +41,22 @@ pub struct ParcelFileDescriptor(OwnedFd);
 
 impl ParcelFileDescriptor {
     /// Create a new `ParcelFileDescriptor` from any type that can be converted to `OwnedFd`.
+    ///
+    /// For the common concrete cases prefer the `From` impls
+    /// (`ParcelFileDescriptor::from(owned_fd)` / `from(file)`); this generic
+    /// constructor covers any other `Into<OwnedFd>` source.
     pub fn new<F: Into<OwnedFd>>(fd: F) -> Self {
         Self(fd.into())
+    }
+
+    /// Duplicate the underlying file descriptor into a new owned
+    /// `ParcelFileDescriptor`. The new fd is `O_CLOEXEC` (`fcntl(F_DUPFD_CLOEXEC)`,
+    /// which always sets it regardless of the source's flag), matching AOSP
+    /// `ParcelFileDescriptor::dup`. Useful when you must both keep an fd and
+    /// hand a copy to a parcel.
+    pub fn try_clone(&self) -> Result<Self> {
+        let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
+        Ok(Self(dup))
     }
 }
 
@@ -52,9 +66,27 @@ impl AsRef<OwnedFd> for ParcelFileDescriptor {
     }
 }
 
+impl AsFd for ParcelFileDescriptor {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 impl From<ParcelFileDescriptor> for OwnedFd {
     fn from(fd: ParcelFileDescriptor) -> OwnedFd {
         fd.0
+    }
+}
+
+impl From<OwnedFd> for ParcelFileDescriptor {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl From<std::fs::File> for ParcelFileDescriptor {
+    fn from(file: std::fs::File) -> Self {
+        Self(file.into())
     }
 }
 
@@ -344,6 +376,32 @@ mod tests {
         let pfd = ParcelFileDescriptor::new(owned_fd);
 
         assert_eq!(pfd.into_raw_fd(), 1);
+    }
+
+    // E9: From<File>/From<OwnedFd>, AsFd, and try_clone (dup) ergonomics.
+    #[test]
+    fn test_pfd_conversions_and_try_clone() {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .expect("/dev/null");
+        // From<std::fs::File>
+        let pfd: ParcelFileDescriptor = f.into();
+        // AsFd delegates to the inner OwnedFd.
+        let _borrowed: BorrowedFd<'_> = pfd.as_fd();
+        assert!(pfd.as_raw_fd() >= 0);
+
+        // try_clone dups (O_CLOEXEC) into a distinct fd.
+        let cloned = pfd.try_clone().expect("try_clone");
+        assert_ne!(
+            pfd.as_raw_fd(),
+            cloned.as_raw_fd(),
+            "dup must allocate a new fd"
+        );
+
+        // From<OwnedFd> round-trips through OwnedFd.
+        let owned: OwnedFd = cloned.into();
+        let _pfd2: ParcelFileDescriptor = owned.into();
     }
 
     // ---- AOSP-faithful FD-over-RPC Parcel body ----

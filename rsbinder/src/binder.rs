@@ -231,7 +231,15 @@ pub trait IBinder: Any + Send + Sync {
     /// Trying to use this function on a local binder will result in an
     /// INVALID_OPERATION code being returned and nothing happening.
     ///
-    /// This link always holds a weak reference to its recipient.
+    /// This link always holds a weak reference to its recipient, so the
+    /// caller must keep its own strong `Arc` to the recipient alive for the
+    /// duration of the link — otherwise the notification silently never fires.
+    ///
+    /// Over the RPC transport, death is detected as a dropped session
+    /// connection rather than a kernel `BR_DEAD_BINDER`, so notifications
+    /// only fire while the session is actively served (the peer must run a
+    /// serve loop, e.g. via `RpcServer::run`); see the `rpc` proxy
+    /// implementation for details.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.
@@ -804,6 +812,31 @@ impl SIBinder {
     pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         FromIBinder::try_from(self)
     }
+
+    /// Register a death notification, accepting an `Arc<R>` of the concrete
+    /// recipient type directly so callers need not spell out
+    /// `Arc::downgrade(&(x as Arc<dyn DeathRecipient>))`.
+    ///
+    /// The link stores only a weak reference (see [`IBinder::link_to_death`]):
+    /// **keep `recipient` (your own strong `Arc`) alive for the duration of
+    /// the link, or the notification silently never fires.** Equivalent to
+    /// `self.link_to_death(Arc::downgrade(&recipient))` after unsizing.
+    pub fn link_to_death_arc<R: DeathRecipient + 'static>(&self, recipient: &Arc<R>) -> Result<()> {
+        // Bind `Weak<R>` first so the unsize fires at the call, not on downgrade's arg.
+        let weak: sync::Weak<R> = Arc::downgrade(recipient);
+        self.link_to_death(weak)
+    }
+
+    /// Remove a death notification previously registered with
+    /// [`link_to_death_arc`](Self::link_to_death_arc). Counterpart that takes
+    /// the concrete `Arc<R>` directly.
+    pub fn unlink_to_death_arc<R: DeathRecipient + 'static>(
+        &self,
+        recipient: &Arc<R>,
+    ) -> Result<()> {
+        let weak: sync::Weak<R> = Arc::downgrade(recipient);
+        self.unlink_to_death(weak)
+    }
 }
 
 impl Debug for SIBinder {
@@ -1045,6 +1078,23 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
         FromIBinder::try_from(self.0.as_binder())
             .expect("ToSyncInterface guarantees binder compatibility")
     }
+
+    /// Register a death notification on the underlying binder, taking the
+    /// concrete `Arc<R>` recipient directly. Convenience for
+    /// `self.as_binder().link_to_death_arc(recipient)`; see
+    /// [`SIBinder::link_to_death_arc`] for the weak-reference caveat.
+    pub fn link_to_death_arc<R: DeathRecipient + 'static>(&self, recipient: &Arc<R>) -> Result<()> {
+        self.0.as_binder().link_to_death_arc(recipient)
+    }
+
+    /// Remove a death notification registered with
+    /// [`link_to_death_arc`](Self::link_to_death_arc).
+    pub fn unlink_to_death_arc<R: DeathRecipient + 'static>(
+        &self,
+        recipient: &Arc<R>,
+    ) -> Result<()> {
+        self.0.as_binder().unlink_to_death_arc(recipient)
+    }
 }
 
 /// Drop the interface type and recover the underlying [`SIBinder`].
@@ -1062,6 +1112,21 @@ impl<I: FromIBinder + ?Sized> From<Strong<I>> for SIBinder {
 impl<I: FromIBinder + ?Sized> From<&Strong<I>> for SIBinder {
     fn from(strong: &Strong<I>) -> SIBinder {
         strong.as_binder()
+    }
+}
+
+impl<I: FromIBinder + ?Sized> TryFrom<SIBinder> for Strong<I> {
+    type Error = StatusCode;
+
+    /// Casts an [`SIBinder`] to a typed [`Strong<I>`] — the fallible inverse
+    /// of converting a [`Strong<I>`](Strong) back into an [`SIBinder`].
+    ///
+    /// Equivalent to [`SIBinder::into_interface`] and to the
+    /// [`FromIBinder::try_from`] trait method; provided so the idiomatic
+    /// `Strong::<dyn IFoo>::try_from(binder)` spelling resolves. Returns
+    /// [`StatusCode::BadType`] when the binder does not implement `I`.
+    fn try_from(ibinder: SIBinder) -> Result<Strong<I>> {
+        FromIBinder::try_from(ibinder)
     }
 }
 

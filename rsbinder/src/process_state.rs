@@ -1210,6 +1210,12 @@ impl ProcessState {
     /// client that makes synchronous outbound calls and receives nothing back
     /// can safely skip it. Idempotent — the first call wins, later calls are
     /// no-ops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process state has not been initialized — call
+    /// [`ProcessState::init`](Self::init) or
+    /// [`init_default`](Self::init_default) first.
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
@@ -1254,11 +1260,10 @@ impl ProcessState {
                 self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
             }
         }
-        // TODO: if startThreadPool is called on another thread after the process
-        // starts up, the kernel might think that it already requested those
-        // binder threads, and additional won't be started. This is likely to
-        // cause deadlocks, and it will also cause getThreadPoolMaxTotalThreadCount
-        // to return too high of a value.
+        // AOSP's late-startThreadPool desync TODO can't arise here: BC_REGISTER_LOOPER is
+        // emitted only from the BR_SPAWN_LOOPER handler (1:1 with a kernel request), the
+        // main/manual loopers use BC_ENTER_LOOPER (untracked), and start_thread_pool is
+        // CAS-idempotent. See frameworks/native/libs/binder/ProcessState.cpp spawnPooledThread.
     }
 
     pub fn strong_ref_count_for_node(&self, node: &ProxyHandle) -> Result<usize> {

@@ -39,10 +39,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // cap, and the register-after-miss race is handled by the hub.
     let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
 
+    // `link_to_death_arc` takes the concrete `Arc<MyDeathRecipient>` directly —
+    // no `Arc::downgrade(&(x as Arc<dyn DeathRecipient>))` incantation. Keep
+    // `recipient` alive for the link's lifetime (the link holds only a weak ref).
     let recipient = Arc::new(MyDeathRecipient {});
-    hello
-        .as_binder()
-        .link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
+    hello.link_to_death_arc(&recipient)?;
 
     // Call echo method of Hello proxy.
     let echo = hello.echo("Hello World!")?;

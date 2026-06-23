@@ -762,6 +762,82 @@ impl Parcel {
         x.deserialize_from(self)
     }
 
+    // Thin by-value wrappers over the generic read/write; wire-identical, names mirror AOSP.
+
+    /// Write an `i32` (AOSP `writeInt32`).
+    pub fn write_i32(&mut self, val: i32) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write a `u32` (AOSP `writeUint32`).
+    pub fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write an `i64` (AOSP `writeInt64`).
+    pub fn write_i64(&mut self, val: i64) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write a `u64` (AOSP `writeUint64`).
+    pub fn write_u64(&mut self, val: u64) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write an `f32` (AOSP `writeFloat`).
+    pub fn write_f32(&mut self, val: f32) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write an `f64` (AOSP `writeDouble`).
+    pub fn write_f64(&mut self, val: f64) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write a `bool` as an `i32` (AOSP `writeBool`).
+    pub fn write_bool(&mut self, val: bool) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write an `i8`, widened to a 4-byte word (AOSP `writeByte`).
+    pub fn write_i8(&mut self, val: i8) -> Result<()> {
+        self.write(&val)
+    }
+    /// Write a `u8`, widened to a 4-byte word.
+    pub fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(&val)
+    }
+
+    /// Read an `i32` (AOSP `readInt32`).
+    pub fn read_i32(&mut self) -> Result<i32> {
+        self.read()
+    }
+    /// Read a `u32` (AOSP `readUint32`).
+    pub fn read_u32(&mut self) -> Result<u32> {
+        self.read()
+    }
+    /// Read an `i64` (AOSP `readInt64`).
+    pub fn read_i64(&mut self) -> Result<i64> {
+        self.read()
+    }
+    /// Read a `u64` (AOSP `readUint64`).
+    pub fn read_u64(&mut self) -> Result<u64> {
+        self.read()
+    }
+    /// Read an `f32` (AOSP `readFloat`).
+    pub fn read_f32(&mut self) -> Result<f32> {
+        self.read()
+    }
+    /// Read an `f64` (AOSP `readDouble`).
+    pub fn read_f64(&mut self) -> Result<f64> {
+        self.read()
+    }
+    /// Read a `bool` (AOSP `readBool`).
+    pub fn read_bool(&mut self) -> Result<bool> {
+        self.read()
+    }
+    /// Read an `i8` (AOSP `readByte`).
+    pub fn read_i8(&mut self) -> Result<i8> {
+        self.read()
+    }
+    /// Read a `u8`.
+    pub fn read_u8(&mut self) -> Result<u8> {
+        self.read()
+    }
+
     pub fn data_avail(&self) -> usize {
         // `pos` can legitimately be moved past `len` (set_data_position is
         // unbounded), so saturate instead of underflow-panicking: nothing
@@ -1135,6 +1211,12 @@ impl Parcel {
     ///
     /// This is used in AIDL-generated client side code to indicate the
     /// allocated space for an output array parameter.
+    ///
+    /// Wire encoding (the convention shared by every array codec here): an
+    /// array is a leading `i32` element count, where `-1` denotes a *null*
+    /// array. The read side decodes this in [`resize_out_vec`](Self::resize_out_vec)
+    /// (rejects `< 0` as `UnexpectedNull`) and
+    /// [`resize_nullable_out_vec`](Self::resize_nullable_out_vec) (`-1` → `None`).
     pub fn write_slice_size<T>(&mut self, slice: Option<&[T]>) -> Result<()> {
         if let Some(slice) = slice {
             let len: i32 = slice.len().try_into().or(Err(StatusCode::BadValue))?;
@@ -1753,6 +1835,39 @@ mod tests {
 
     #[test]
     fn test_errors() -> Result<()> {
+        Ok(())
+    }
+
+    // E8: typed scalar helpers must round-trip and stay wire-identical to the
+    // generic read::<T>/write::<T> path they wrap.
+    #[test]
+    fn test_typed_scalar_helpers() -> Result<()> {
+        let mut p = Parcel::new();
+        p.write_i32(-7)?;
+        p.write_u32(7)?;
+        p.write_i64(-8)?;
+        p.write_u64(8)?;
+        p.write_f32(1.5)?;
+        p.write_f64(2.5)?;
+        p.write_bool(true)?;
+        p.write_i8(-9)?;
+        p.write_u8(9)?;
+        p.set_data_position(0);
+        assert_eq!(p.read_i32()?, -7);
+        assert_eq!(p.read_u32()?, 7);
+        assert_eq!(p.read_i64()?, -8);
+        assert_eq!(p.read_u64()?, 8);
+        assert_eq!(p.read_f32()?, 1.5);
+        assert_eq!(p.read_f64()?, 2.5);
+        assert!(p.read_bool()?);
+        assert_eq!(p.read_i8()?, -9);
+        assert_eq!(p.read_u8()?, 9);
+
+        // write_i32 is byte-identical to write::<i32>: a generic read decodes it.
+        let mut q = Parcel::new();
+        q.write_i32(0x1234_5678)?;
+        q.set_data_position(0);
+        assert_eq!(q.read::<i32>()?, 0x1234_5678);
         Ok(())
     }
 

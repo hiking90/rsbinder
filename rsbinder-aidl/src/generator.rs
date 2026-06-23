@@ -206,12 +206,24 @@ pub mod {{mod}} {
         }
     }
     {%- if enabled_async %}
+    /// Asynchronous **client** view of `{{name}}` (`.await`-able methods).
+    ///
+    /// `P` selects the async pool that drives the underlying blocking transact;
+    /// with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
+    /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
+    /// directly via `rsbinder::get_interface::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
+    /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
+    /// for `Tokio`, `tokio`) feature.
     pub trait {{name}}Async<P>: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
     }
+    /// Asynchronous **server** view of `{{name}}`: implement this (with
+    /// `#[async_trait]`) on your service, then wrap it with
+    /// [`{{bn_name}}::new_async_binder`] to publish it as a binder.
     #[::async_trait::async_trait]
     pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
@@ -221,6 +233,15 @@ pub mod {{mod}} {
     }
     impl {{bn_name}}
     {
+        /// Wrap an async service impl (`{{name}}AsyncService`) into a binder,
+        /// bridging it onto the synchronous binder dispatch via `rt`.
+        ///
+        /// `rt` is a `BinderAsyncRuntime` — e.g. `rsbinder::TokioRuntime(handle)`
+        /// with the default `tokio` feature — and each inbound call is driven to
+        /// completion with `rt.block_on(..)`. The returned handle is typed as the
+        /// **sync** `Strong<dyn {{name}}>` because a binder is transport-neutral:
+        /// the async-ness lives in the server impl, not the handle. Clients still
+        /// reach it as either `{{name}}` or `{{name}}Async<P>`.
         pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
         where
             T: {{name}}AsyncService + Sync + Send + 'static,

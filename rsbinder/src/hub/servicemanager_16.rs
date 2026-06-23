@@ -10,6 +10,7 @@ pub use android::os::IServiceManager::{
     DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO, FLAG_IS_LAZY_SERVICE,
 };
 
+pub use android::os::IClientCallback::{BnClientCallback, IClientCallback};
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
 
@@ -214,6 +215,24 @@ pub fn unregister_for_notifications(
 ) -> Result<()> {
     sm.unregisterForNotifications(name, callback)
         .map_err(|e| e.into())
+}
+
+/// Register a callback for client (proxy) presence transitions on a lazy
+/// service. AOSP `IServiceManager::registerClientCallback`.
+pub fn register_client_callback(
+    sm: &BpServiceManager,
+    name: &str,
+    service: &SIBinder,
+    callback: &crate::Strong<dyn IClientCallback>,
+) -> Result<()> {
+    sm.registerClientCallback(name, service, callback)
+        .map_err(|e| e.into())
+}
+
+/// Attempt to unregister a service previously registered with `add_service`.
+/// AOSP `IServiceManager::tryUnregisterService`.
+pub fn try_unregister_service(sm: &BpServiceManager, name: &str, service: &SIBinder) -> Result<()> {
+    sm.tryUnregisterService(name, service).map_err(|e| e.into())
 }
 
 /// Returns whether a given interface is declared on the device, even if it
