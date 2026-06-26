@@ -977,10 +977,13 @@ impl Parcel {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
-            return Err(StatusCode::BadValue);
+            return Err(StatusCode::UnexpectedNull);
         }
-        if len <= 0 {
+        if len == -1 {
             return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(Vec::new()));
         }
 
         // Checked arithmetic — protects 32-bit `usize` targets (armv7
@@ -1037,10 +1040,13 @@ impl Parcel {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
-            return Err(StatusCode::BadValue);
+            return Err(StatusCode::UnexpectedNull);
         }
-        if len <= 0 {
+        if len == -1 {
             return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(Vec::new()));
         }
 
         // See `read_array` — checked arithmetic guards 32-bit `usize`
@@ -1770,6 +1776,32 @@ mod tests {
         assert_eq!(array, res.unwrap());
         let res = parcel.read_array::<u8>().unwrap();
         assert_eq!(reverse, res.unwrap());
+    }
+
+    #[test]
+    fn parcel_array_empty_is_not_null() {
+        let mut parcel = Parcel::new();
+        parcel.write_array::<u8>(&[]).unwrap();
+        parcel.write_array_char::<u16>(&[]).unwrap();
+        parcel.set_data_position(0);
+
+        assert_eq!(parcel.read_array::<u8>(), Ok(Some(Vec::new())));
+        assert_eq!(parcel.read_array_char::<u16>(), Ok(Some(Vec::new())));
+    }
+
+    #[test]
+    fn vec_deserialize_rejects_null_but_accepts_empty() {
+        let mut parcel = Parcel::new();
+        parcel.write(&-1i32).unwrap();
+        parcel.write(&0i32).unwrap();
+        parcel.write(&0i32).unwrap();
+        parcel.write(&-2i32).unwrap();
+        parcel.set_data_position(0);
+
+        assert_eq!(parcel.read::<Vec<u8>>(), Err(StatusCode::UnexpectedNull));
+        assert_eq!(parcel.read::<Vec<u8>>(), Ok(Vec::new()));
+        assert_eq!(parcel.read::<Option<Vec<u8>>>(), Ok(Some(Vec::<u8>::new())));
+        assert_eq!(parcel.read::<Vec<u8>>(), Err(StatusCode::UnexpectedNull));
     }
 
     #[test]

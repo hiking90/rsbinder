@@ -762,10 +762,13 @@ pub trait DeserializeArray: Deserialize {
         let len: i32 = parcel.read()?;
         if len < -1 {
             log::error!("Negative array size given in parcel: {len}");
-            return Err(StatusCode::BadValue);
+            return Err(StatusCode::UnexpectedNull);
         }
-        if len <= 0 {
+        if len == -1 {
             return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(Vec::new()));
         }
         // Cap the *speculative* pre-allocation at the bytes still left
         // in the parcel: every element consumes >= 1 wire byte, so a
@@ -816,7 +819,7 @@ impl<T: SerializeArray> SerializeOption for Vec<T> {
 
 impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        DeserializeArray::deserialize_array(parcel).map(|v| v.unwrap_or_default())
+        DeserializeArray::deserialize_array(parcel)?.ok_or(StatusCode::UnexpectedNull)
     }
 }
 
