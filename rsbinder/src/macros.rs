@@ -505,9 +505,11 @@ macro_rules! impl_deserialize_for_parcelable {
                 let status: i32 = parcel.read()?;
                 if status == $crate::NULL_PARCELABLE_FLAG {
                     Err($crate::StatusCode::UnexpectedNull.into())
-                } else {
+                } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
                     use $crate::Parcelable;
                     self.read_from_parcel(parcel)
+                } else {
+                    Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }
@@ -528,10 +530,12 @@ macro_rules! impl_deserialize_for_parcelable {
                 if status == $crate::NULL_PARCELABLE_FLAG {
                     *this = None;
                     Ok(())
-                } else {
+                } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
                     use $crate::Parcelable;
                     this.get_or_insert_with(Self::default)
                         .read_from_parcel(parcel)
+                } else {
+                    Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }

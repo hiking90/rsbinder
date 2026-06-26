@@ -206,10 +206,12 @@ impl Deserialize for ParcelableHolder {
         if status == NULL_PARCELABLE_FLAG {
             log::error!("ParcelableHolder::deserialize: unexpected null");
             Err(StatusCode::UnexpectedNull)
-        } else {
+        } else if status == NON_NULL_PARCELABLE_FLAG {
             let mut parcelable = ParcelableHolder::default();
             parcelable.read_from_parcel(parcel)?;
             Ok(parcelable)
+        } else {
+            Err(StatusCode::UnexpectedNull)
         }
     }
 
@@ -224,8 +226,10 @@ impl Deserialize for ParcelableHolder {
         if status == NULL_PARCELABLE_FLAG {
             log::error!("ParcelableHolder::deserialize_from: unexpected null");
             Err(StatusCode::UnexpectedNull)
-        } else {
+        } else if status == NON_NULL_PARCELABLE_FLAG {
             self.read_from_parcel(parcel)
+        } else {
+            Err(StatusCode::UnexpectedNull)
         }
     }
 }
