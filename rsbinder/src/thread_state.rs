@@ -761,6 +761,10 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                         break;
                     }
                 }
+                binder::BR_TRANSACTION_PENDING_FROZEN => {
+                    log::warn!("Sending oneway calls to frozen process.");
+                    break;
+                }
                 binder::BR_DEAD_REPLY => {
                     return Err(StatusCode::DeadObject);
                 }
@@ -1392,7 +1396,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 Ok(_) => break,
                 Err(errno) if errno != rustix::io::Errno::INTR => {
                     log::error!("binder::write_read() error : {errno}");
-                    return Err(StatusCode::Errno(errno.raw_os_error()));
+                    return Err(StatusCode::from(errno));
                 }
                 _ => {}
             }
@@ -1728,7 +1732,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         break;
                     }
                     StatusCode::Errno(errno)
-                        if errno == (rustix::io::Errno::CONNREFUSED.raw_os_error()) =>
+                        if errno == -(rustix::io::Errno::CONNREFUSED.raw_os_error()) =>
                     {
                         result = e;
                         break;
@@ -2172,11 +2176,12 @@ pub fn get_current_scheduler_policy() -> Result<i32> {
         // on a library or kernel bug, so prefer `EINVAL` over `0`
         // (which is itself a valid "success" errno and would mislead
         // the caller).
-        return Err(StatusCode::Errno(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EINVAL),
-        ));
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL);
+        return Err(StatusCode::from(rustix::io::Errno::from_raw_os_error(
+            errno,
+        )));
     }
     Ok(raw)
 }
@@ -2242,7 +2247,7 @@ pub fn get_extended_error() -> Result<ExtendedError> {
             // Pre-Android-12 driver — feature unavailable.
             StatusCode::InvalidOperation
         } else {
-            StatusCode::Errno(errno.raw_os_error())
+            StatusCode::from(errno)
         }
     })?;
     Ok(ExtendedError {
