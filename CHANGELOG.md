@@ -13,6 +13,22 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Fixed
+
+- Parcel array decoding now distinguishes a null array (length `-1`) from an
+  empty array (length `0`): an empty `Vec<T>` no longer deserializes as `None`,
+  and a non-null `Vec<T>` rejects a null array with `UnexpectedNull` instead of
+  silently yielding an empty vector. Matches AOSP `Parcel` decoding. (#162)
+- Nullable decoders reject malformed sentinels instead of treating them as
+  null/present: `String16` accepts only `-1` for null, and parcelable /
+  `ParcelableHolder` presence accepts only `0` (null) / `1` (non-null). Other
+  values now surface `UnexpectedNull`. (#162)
+- Binder reply status handling aligned with AOSP: malformed status /
+  remote-stack-trace reply headers now report `Unknown` (AOSP `UNKNOWN_ERROR`)
+  rather than `BadValue`, `BR_TRANSACTION_PENDING_FROZEN` is treated as a
+  successful oneway completion, and driver `errno` values are normalized to
+  negative `status_t` form so callers never observe positive `errno`s. (#162)
+
 ## [0.9.0] - 2026-06-15
 
 The headline of this release is a complete **RPC transport** (binder over

@@ -397,4 +397,23 @@ mod tests {
             Err(StatusCode::BadValue)
         ));
     }
+
+    /// `ParcelableHolder` is non-nullable: only `NON_NULL_PARCELABLE_FLAG`
+    /// (`1`) is accepted. Null (`0`) and any other sentinel are rejected as
+    /// `UnexpectedNull`, never silently treated as present.
+    #[test]
+    fn holder_rejects_null_and_garbage_sentinels() {
+        for status in [NULL_PARCELABLE_FLAG, 2, -1] {
+            let mut p = Parcel::new();
+            p.write(&status).unwrap();
+            p.set_data_position(0);
+            assert!(
+                matches!(
+                    ParcelableHolder::deserialize(&mut p),
+                    Err(StatusCode::UnexpectedNull)
+                ),
+                "status {status} must be rejected as UnexpectedNull",
+            );
+        }
+    }
 }
