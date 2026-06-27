@@ -412,6 +412,10 @@ impl DeserializeOption for String {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let len = parcel.read::<i32>()?;
 
+        if len == -1 {
+            return Ok(None);
+        }
+
         if (0..i32::MAX).contains(&len) {
             // String16 wire = `len + 1` UTF-16 code units (the trailing
             // NUL terminator is sent too). Route the byte count through
@@ -440,10 +444,10 @@ impl DeserializeOption for String {
                 StatusCode::BadValue
             })?;
 
-            Ok(Some(res))
-        } else {
-            Ok(None)
+            return Ok(Some(res));
         }
+
+        Err(StatusCode::UnexpectedNull)
     }
 }
 
@@ -631,10 +635,10 @@ pub trait DeserializeOption: Deserialize {
     /// Deserialize an Option of this type from the given parcel.
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let null: i32 = parcel.read()?;
-        if null == NULL_PARCELABLE_FLAG {
-            Ok(None)
-        } else {
-            parcel.read().map(Some)
+        match null {
+            NULL_PARCELABLE_FLAG => Ok(None),
+            NON_NULL_PARCELABLE_FLAG => parcel.read().map(Some),
+            _ => Err(StatusCode::UnexpectedNull),
         }
     }
 
@@ -762,10 +766,13 @@ pub trait DeserializeArray: Deserialize {
         let len: i32 = parcel.read()?;
         if len < -1 {
             log::error!("Negative array size given in parcel: {len}");
-            return Err(StatusCode::BadValue);
+            return Err(StatusCode::UnexpectedNull);
         }
-        if len <= 0 {
+        if len == -1 {
             return Ok(None);
+        }
+        if len == 0 {
+            return Ok(Some(Vec::new()));
         }
         // Cap the *speculative* pre-allocation at the bytes still left
         // in the parcel: every element consumes >= 1 wire byte, so a
@@ -816,7 +823,7 @@ impl<T: SerializeArray> SerializeOption for Vec<T> {
 
 impl<T: DeserializeArray> Deserialize for Vec<T> {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        DeserializeArray::deserialize_array(parcel).map(|v| v.unwrap_or_default())
+        DeserializeArray::deserialize_array(parcel)?.ok_or(StatusCode::UnexpectedNull)
     }
 }
 
@@ -883,12 +890,13 @@ mod tests {
     /// panic.)
     #[test]
     fn hostile_string16_length_returns_err_not_panic() {
-        let mut p = Parcel::new();
-        // Near-`i32::MAX` declared length with no following payload.
-        p.write::<i32>(&(i32::MAX - 1)).unwrap();
-        p.set_data_position(0);
-        let r = <String as DeserializeOption>::deserialize_option(&mut p);
-        assert!(r.is_err());
+        for len in [-2, i32::MAX - 1, i32::MAX] {
+            let mut p = Parcel::new();
+            p.write::<i32>(&len).unwrap();
+            p.set_data_position(0);
+            let r = <String as DeserializeOption>::deserialize_option(&mut p);
+            assert!(r.is_err(), "len {len} returned {r:?}");
+        }
     }
 
     /// A normal string still round-trips byte-identically.

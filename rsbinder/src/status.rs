@@ -362,7 +362,7 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
     // Check for negative values first
     if header_size < 0 {
         log::error!("0x534e4554:132650049 Negative header_size({header_size}).");
-        return Err(StatusCode::BadValue);
+        return Err(StatusCode::Unknown);
     }
 
     // Safe conversion after negativity check
@@ -373,13 +373,13 @@ fn read_check_header_size(parcel: &mut Parcel) -> error::Result<()> {
         log::error!(
             "0x534e4554:132650049 Invalid header_size({header_size}) exceeds available({header_avail})."
         );
-        return Err(StatusCode::BadValue);
+        return Err(StatusCode::Unknown);
     }
 
     // Prevent integer overflow in position calculation
     let new_position = header_start.checked_add(header_size_usize).ok_or_else(|| {
         log::error!("0x534e4554:132650049 Position overflow with header_size({header_size})");
-        StatusCode::BadValue
+        StatusCode::Unknown
     })?;
 
     parcel.set_data_position(new_position);
@@ -430,7 +430,7 @@ impl Deserialize for Status {
                 log::error!(
                     "0x534e4554:132650049 Negative remote_stack_trace_header_size({remote_stack_trace_header_size})."
                 );
-                return Err(StatusCode::BadValue);
+                return Err(StatusCode::Unknown);
             }
 
             // Safe conversion after negativity check
@@ -442,7 +442,7 @@ impl Deserialize for Status {
                 log::error!(
                     "0x534e4554:132650049 Invalid remote_stack_trace_header_size({remote_stack_trace_header_size}) exceeds available({header_avail})."
                 );
-                return Err(StatusCode::BadValue);
+                return Err(StatusCode::Unknown);
             }
 
             if trace_size_usize != 0 {
@@ -451,7 +451,7 @@ impl Deserialize for Status {
                     log::error!(
                         "0x534e4554:132650049 Position overflow with remote_stack_trace_header_size({remote_stack_trace_header_size})"
                     );
-                    StatusCode::BadValue
+                    StatusCode::Unknown
                 })?;
 
                 parcel.set_data_position(new_position);
