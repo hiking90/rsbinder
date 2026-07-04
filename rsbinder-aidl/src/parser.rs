@@ -1872,10 +1872,6 @@ fn parse_interface_members(
                     .push(parse_variable_decl(pair.into_inner(), true)?);
             }
 
-            Rule::interface_members => {
-                parse_interface_members(pair.into_inner(), interface)?;
-            }
-
             Rule::decl => {
                 interface
                     .members
@@ -2556,6 +2552,50 @@ mod tests {
             ConstExpr::new(ValueType::Int64(-20))
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_bitwise_precedence_matches_aosp() -> Result<(), Box<dyn Error>> {
+        // AOSP's yacc (aidl_language_y.yy) gives bitwise |/^/& LOWER
+        // precedence than ==/!= and relational operators (C-style). The same
+        // AIDL text must fold to the same constant on both toolchains.
+        for (src, expected) in [
+            ("1 & 2 == 2", 1),       // 1 & (2 == 2), not (1 & 2) == 2
+            ("4 | 2 != 2", 4),       // 4 | (2 != 2), not (4 | 2) != 2
+            ("(1 & 2) == 2", 0),     // explicit parens keep the old grouping
+            ("1 | 2 ^ 3 & 2", 1),    // | < ^ < & among themselves
+            ("1 << 2 < 8", 1),       // shift still binds tighter than comparison
+            ("1 == 1 && 2 == 2", 1), // && stays looser than bitwise/equality
+        ] {
+            let mut res = AIDLParser::parse(Rule::expression, src)?;
+            let calc = parse_expression(res.next().unwrap().into_inner())?.calculate()?;
+            assert_eq!(calc.value.to_i64()?, expected, "{src}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_flat_interface_with_thousands_of_members_parses() -> Result<(), Box<dyn Error>> {
+        // The old right-recursive `interface_members` grammar recursed once
+        // per member and aborted the whole process with a stack overflow at a
+        // few thousand methods — flat input that `check_nesting_depth` (which
+        // only counts brackets/generics) cannot catch.
+        let mut src = String::from("package test.pkg;\ninterface IBig {\n    const int K = 1;\n");
+        for i in 0..5000 {
+            src.push_str(&format!("    void method{i}();\n"));
+        }
+        src.push_str("}\n");
+
+        let ctx = SourceContext::new("big.aidl", src);
+        let doc = parse_document(&ctx)?;
+        match &doc.decls[0] {
+            Declaration::Interface(interface) => {
+                assert_eq!(interface.method_list.len(), 5000);
+                assert_eq!(interface.constant_list.len(), 1);
+            }
+            decl => panic!("expected interface, got {decl:?}"),
+        }
         Ok(())
     }
 
