@@ -2743,6 +2743,10 @@ mod tests {
     /// `process_state` M4 tests; surfaces under
     /// `.github/workflows/integration-test.yml`.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_pending_derefs_handles_reentrant_push_from_drop() {
         use std::sync::atomic::AtomicU64;

@@ -1358,12 +1358,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_state() {
         assert_process_state_initialized();
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_state_context_object() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1371,6 +1379,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_state_strong_proxy_for_handle() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1385,6 +1397,10 @@ mod tests {
     /// (c) re-check, P3's case (c) re-check, or P3's
     /// `(CaseA, Some(_))` cross-thread arm.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_concurrent_strong_proxy_same_handle_returns_same_arc() {
         let _ = ProcessState::init_default();
@@ -1425,6 +1441,10 @@ mod tests {
     /// the winner's Arc. Verifies the case (b) generation-preservation
     /// invariant survives concurrent resurrection.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_concurrent_strong_proxy_case_b_resurrection() {
         let _ = ProcessState::init_default();
@@ -1499,6 +1519,10 @@ mod tests {
     /// to short-circuit at case (c) and the hook to never fire
     /// (vacuous pass).
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1559,6 +1583,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_state_disable_background_scheduling() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1567,6 +1595,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_process_state_start_thread_pool() {
         // Observe `main_thread_spawned` — incremented **only** by
@@ -1658,6 +1690,10 @@ mod tests {
     ///      are zero and the entry is removed → `lookup_native` returns
     ///      `None`.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_native_uaf_window_closed() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1711,6 +1747,10 @@ mod tests {
     /// `acquire`/`release` independently keeps the entry alive until
     /// the last `release` fires.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_native_dedup_same_arc() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1747,6 +1787,10 @@ mod tests {
     /// below would remove the entry and the trailing `incref` would
     /// fail (the kernel would be handed an unresolvable id).
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_native_dedup_reserves_against_concurrent_removal() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1782,6 +1826,10 @@ mod tests {
     /// e.g. `MockNative` being a unit struct — `Arc::ptr_eq` keys on
     /// allocation, not type).
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_native_distinct_arcs_get_distinct_ids() {
         let process = ProcessState::init_default().expect("init_default");
@@ -1806,6 +1854,10 @@ mod tests {
     /// `deserialize_option` round-trip path where the kernel routes a
     /// previously-published binder back to its publisher.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     #[serial_test::serial(binder)]
     fn test_native_lookup_does_not_change_counts() {
         let process = ProcessState::init_default().expect("init_default");
