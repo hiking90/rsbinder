@@ -1,14 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Clippy's `missing_const_for_thread_local` is a false positive for our
-// `HashMap` / `HashSet` / `Document` (transitively HashMap) initializers
-// — they are not `const fn` (need `RandomState` at runtime), so the
-// suggested `const { ... }` wrap fails with E0015. The lint fires against
-// the whole `thread_local!` block, and neither macro-invocation-level nor
-// per-static `#[allow]` reaches that scope, so suppression is file-scope.
-#![allow(clippy::missing_const_for_thread_local)]
-
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
