@@ -135,11 +135,8 @@ constant_value_list = { const_expr ~ ("," ~ const_expr)* ~ ","? }
 
 const_expr = {
     "{" ~ constant_value_list? ~ "}" |
-    CHARVALUE | expression | string_expr
+    CHARVALUE | expression
 }
-
-string_expr = { string_term ~ ("+" ~ string_term)* }
-string_term = { C_STR | qualified_name }
 
 // Precedence matches AOSP's C-style yacc levels (aidl_language_y.yy):
 // || < && < | < ^ < & < (== !=) < (< > <= >=) < (<< >>) < (+ -) < (* / %).
@@ -169,9 +166,12 @@ factor = { "(" ~ expression ~ ")" | unary | value }
 unary = { unary_op ~ factor }
 unary_op = { "+" | "-" | "!" | "~" }
 
+// C_STR participates in the ordinary expression grammar (AOSP has a single
+// expression grammar): `A + "y"` and parenthesized concat chains parse here;
+// type mixing is rejected at const-expr evaluation, exactly as AOSP does.
 value = {
     TRUE_LITERAL | FALSE_LITERAL | HEXVALUE | FLOATVALUE | INTVALUE |
-    qualified_name
+    C_STR | qualified_name
 }
 
 ANNOTATION = @{ "@" ~ identifier }
@@ -229,7 +229,9 @@ LT = @{ !"<<" ~ "<" }
 GT = @{ !">>" ~ ">" }
 
 LONG_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
-LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n" }
+// A `//` comment may be terminated by end-of-input as well as a newline —
+// a file whose last line is a comment without a trailing newline is valid.
+LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 COMMENT = _{ LONG_COMMENT | LINE_COMMENT }
 WHITESPACE = _{ (" " | "\t" | "\r" | "\n")+ }
 

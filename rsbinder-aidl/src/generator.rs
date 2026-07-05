@@ -53,7 +53,11 @@ pub mod {{mod}} {
     {%- for member in members %}
                 Self::r#{{member.0}}(v) => {
                     parcel.write(&{{counter}}i32)?;
+    {%- if member.4 %}
+                    parcel.write(v.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)
+    {%- else %}
                     parcel.write(v)
+    {%- endif %}
                 }
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
@@ -66,6 +70,9 @@ pub mod {{mod}} {
     {%- for member in members %}
                 {{counter}} => {
                     let value: {{member.1}} = parcel.read()?;
+    {%- if member.4 %}
+                    if value.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+    {%- endif %}
                     *self = Self::r#{{member.0}}(value);
                     Ok(())
                 }
@@ -143,6 +150,9 @@ pub mod {{mod}} {
                 _sub_parcel.read_onto(&mut self.r#{{ member.0 }})?;
                 {%- else %}
                 self.r#{{ member.0 }} = _sub_parcel.read()?;
+                {%- if member.4 %}
+                if self.r#{{ member.0 }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                {%- endif %}
                 {%- endif %}
                 {%- endfor %}
                 Ok(())
@@ -188,7 +198,7 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version %}
         // Server-side default returns the module's VERSION constant.
-        // `Bp{{name}}` overrides this with a cache+transact pattern.
+        // `{{bp_name}}` overrides this with a cache+transact pattern.
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             Ok(VERSION)
         }
@@ -220,6 +230,19 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
+        {%- if version %}
+        // Default returns the module's VERSION constant (correct for a local
+        // service); `{{bp_name}}` overrides it with the cache+transact pattern.
+        // Mirrors AOSP's versioned-interface Rust backend.
+        fn r#getInterfaceVersion<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<i32>> {
+            Box::pin(std::future::ready(Ok(VERSION)))
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<String>> {
+            Box::pin(std::future::ready(Ok(HASH.into())))
+        }
+        {%- endif %}
     }
     /// Asynchronous **server** view of `{{name}}`: implement this (with
     /// `#[async_trait]`) on your service, then wrap it with
@@ -468,6 +491,44 @@ pub mod {{mod}} {
             )
         }
         {%- endfor %}
+        {%- if version %}
+        fn r#getInterfaceVersion<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<i32>> {
+            let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
+            if _aidl_version != -1 { return Box::pin(std::future::ready(Ok(_aidl_version))); }
+            let _aidl_data = match self.build_parcel_getInterfaceVersion() {
+                Ok(_aidl_data) => _aidl_data,
+                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+            };
+            let binder = self.binder.clone();
+            P::spawn(
+                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+                move |_aidl_reply| async move {
+                    self.read_response_getInterfaceVersion(_aidl_reply)
+                }
+            )
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<String>> {
+            {
+                let _aidl_hash_lock = self.cached_hash.lock().unwrap();
+                if let Some(ref _aidl_hash) = *_aidl_hash_lock {
+                    return Box::pin(std::future::ready(Ok(_aidl_hash.clone())));
+                }
+            }
+            let _aidl_data = match self.build_parcel_getInterfaceHash() {
+                Ok(_aidl_data) => _aidl_data,
+                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+            };
+            let binder = self.binder.clone();
+            P::spawn(
+                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+                move |_aidl_reply| async move {
+                    self.read_response_getInterfaceHash(_aidl_reply)
+                }
+            )
+        }
+        {%- endif %}
     }
     impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{crate}}::Binder<{{bn_name}}>
     {
@@ -890,6 +951,11 @@ pub struct Generator {
 
 impl Generator {
     pub fn new(enabled_async: bool, is_crate: bool) -> Self {
+        // Single source of truth for the crate prefix: templates read
+        // `self.is_crate`, type paths read the thread-local — asserting it
+        // here keeps both in sync for direct `Generator` users and for
+        // Builders constructed on a different thread.
+        crate::type_generator::set_crate_support(is_crate);
         Self {
             enabled_async,
             is_crate,
@@ -929,6 +995,11 @@ impl Generator {
     /// Pre-register all enum member symbols from a document into the symbol table.
     /// This ensures enum symbols are available before any code generation begins,
     /// preventing incorrect resolution when multiple enums share the same member names.
+    ///
+    /// Interface constants are registered first: an enum discriminant may
+    /// reference a sibling constant (`const int X = 5; enum E { A = X, B }`),
+    /// and resolving enums before the constants exist would poison the enum
+    /// value cache with unresolved expressions.
     pub fn pre_register_enums(document: &parser::Document) {
         parser::set_current_document(document);
         Self::pre_register_enum_decls(&document.decls);
@@ -942,7 +1013,19 @@ impl Generator {
                     Self::register_enum_members(enum_decl);
                 }
                 parser::Declaration::Parcelable(d) => Self::pre_register_enum_decls(&d.members),
-                parser::Declaration::Interface(d) => Self::pre_register_enum_decls(&d.members),
+                parser::Declaration::Interface(d) => {
+                    for constant in &d.constant_list {
+                        if let Some(expr) = &constant.const_expr {
+                            parser::register_symbol(
+                                &constant.identifier,
+                                expr.clone(),
+                                parser::SymbolType::InterfaceConstant,
+                                Some(&d.name),
+                            );
+                        }
+                    }
+                    Self::pre_register_enum_decls(&d.members)
+                }
                 parser::Declaration::Union(d) => Self::pre_register_enum_decls(&d.members),
                 _ => {}
             }
@@ -1068,8 +1151,19 @@ impl Generator {
         context.insert("namespace", &namespace);
         context.insert("const_members", &const_members);
         context.insert("fn_members", &fn_members);
-        context.insert("bn_name", &format!("Bn{}", &decl.name[1..]));
-        context.insert("bp_name", &format!("Bp{}", &decl.name[1..]));
+        // AOSP `ClassName` (aidl_to_cpp_common.cpp): strip the leading `I`
+        // only when it is followed by an uppercase letter. `interface Foo3`
+        // must become `BnFoo3`/`BpFoo3`, not `Bnoo3`/`Bpoo3`.
+        let stem = if decl.name.len() >= 2
+            && decl.name.starts_with('I')
+            && decl.name.as_bytes()[1].is_ascii_uppercase()
+        {
+            &decl.name[1..]
+        } else {
+            decl.name.as_str()
+        };
+        context.insert("bn_name", &format!("Bn{stem}"));
+        context.insert("bp_name", &format!("Bp{stem}"));
         context.insert("oneway", &decl.oneway);
         context.insert("nested", &nested.trim());
         context.insert("enabled_async", &enabled_async);
@@ -1271,15 +1365,33 @@ pub mod {mod} {{
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
             {
-                let value = expr.to_i64().map_err(|e| {
+                let diag = |detail: String| {
                     parser::make_invalid_operation_error(
                         format!(
-                            "enum '{}' member '{}' has a non-integral discriminant: {e}",
+                            "enum '{}' member '{}' has an invalid discriminant: {detail}",
                             decl.name, enumerator.identifier
                         ),
                         decl.name_span,
                     )
-                })?;
+                };
+                let calculated = expr.calculate().map_err(|e| diag(e.message))?;
+                // Only integral kinds (bool included, per AOSP
+                // `AreCompatibleOperandTypes`) may become a discriminant;
+                // `to_i64` alone would lossily accept float/char.
+                let value = match &calculated.value {
+                    ValueType::Byte(_)
+                    | ValueType::Int32(_)
+                    | ValueType::Int64(_)
+                    | ValueType::Bool(_)
+                    | ValueType::Reference { .. }
+                    | ValueType::Name(_) => calculated.to_i64().map_err(|e| diag(e.message))?,
+                    other => {
+                        return Err(diag(format!(
+                            "non-integral value ({})",
+                            other.to_value_string()
+                        )))
+                    }
+                };
                 members.push((enumerator.identifier.to_owned(), value));
             }
         }
@@ -1358,6 +1470,9 @@ pub mod {mod} {{
                         generator.type_declaration(true),
                         var.identifier(),
                         default_expr,
+                        // needs_unexpected_null: see
+                        // `TypeGenerator::is_option_but_not_nullable` rustdoc.
+                        generator.is_option_but_not_nullable(),
                     ));
                 }
             } else {

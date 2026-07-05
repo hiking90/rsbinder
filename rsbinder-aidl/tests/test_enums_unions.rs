@@ -144,7 +144,7 @@ pub mod Union {
     pub const r#S1: &str = "a string constant in union";
     impl Default for r#Union {
         fn default() -> Self {
-            Self::Ns(Default::default())
+            Self::Ns(vec![])
         }
     }
     impl rsbinder::Parcelable for r#Union {

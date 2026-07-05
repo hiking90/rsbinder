@@ -281,9 +281,19 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
             }
         }
 
-        let curr_ns = current_namespace();
-        if let Some(decl) = hashmap.borrow().get(&curr_ns) {
-            return Some((decl.clone(), curr_ns));
+        // Lexical-scope fallback: a *simple* (dot-free) name that matched no
+        // namespace candidate may still be a member of the declaration
+        // currently being generated (e.g. a parcelable constant referencing a
+        // sibling constant before any symbol registration). A qualified name
+        // must NOT take this fallback — `foo.Missing.X` would silently
+        // resolve against the current declaration, fabricating enum
+        // discriminants and phantom self-referential `Box<Self>` fields for
+        // types that do not exist.
+        if namespace.ns.len() == 1 {
+            let curr_ns = current_namespace();
+            if let Some(decl) = hashmap.borrow().get(&curr_ns) {
+                return Some((decl.clone(), curr_ns));
+            }
         }
 
         None
@@ -414,33 +424,59 @@ pub(crate) fn enum_member_const_expr_from_lookup(
     let mut result = None;
 
     // Resolve inside the enum declaration, not through a global member name.
+    //
+    // `carried` holds an explicit value that could NOT be folded into the
+    // auto-increment counter: a non-integral value (String/Array), an
+    // expression whose evaluation failed (`1/0`, overflowing shift), or a
+    // reference that stays unresolved (typo / circular chain). Any of these
+    // would otherwise fabricate a wrong, silently-zeroed wire discriminant —
+    // both for the member itself and for every auto-increment member after
+    // it — so the raw value is carried out (poisoning the counter until the
+    // next successfully-folded explicit value) and `decl_enum`'s `to_i64()`
+    // guard surfaces the diagnostic. AOSP rejects all of these at build time.
+    let mut carried: Option<ConstExpr> = None;
+    let mut result_is_carried = false;
     for enumerator in &enum_decl.enumerator_list {
-        // A genuinely non-integral explicit value (String/Array — not an
-        // unresolved Name) must not be swallowed into the auto-increment
-        // counter: that would fabricate a wrong, silently-zeroed wire
-        // discriminant. Carry the raw value out so `decl_enum`'s `to_i64()`
-        // guard surfaces the diagnostic.
-        let mut non_integral: Option<ConstExpr> = None;
         if let Some(const_expr) = &enumerator.const_expr {
-            if let Ok(calculated) = const_expr.calculate() {
-                if !matches!(calculated.value, ValueType::Name(_)) {
-                    match calculated.to_i64() {
-                        Ok(v) => enum_val = v,
-                        Err(_) => non_integral = Some(calculated),
-                    }
-                }
+            match const_expr.calculate() {
+                Ok(calculated) => match &calculated.value {
+                    ValueType::Name(_) => carried = Some(const_expr.clone()),
+                    // AOSP treats bool as integral in const expressions
+                    // (`AreCompatibleOperandTypes`); float/char/string/array
+                    // enumerators are rejected there, so they poison instead
+                    // of being lossily folded (`A = 1.5` must not become 1).
+                    ValueType::Byte(_)
+                    | ValueType::Int32(_)
+                    | ValueType::Int64(_)
+                    | ValueType::Bool(_)
+                    | ValueType::Reference { .. } => match calculated.to_i64() {
+                        Ok(v) => {
+                            enum_val = v;
+                            carried = None;
+                        }
+                        Err(_) => carried = Some(calculated),
+                    },
+                    _ => carried = Some(calculated),
+                },
+                Err(_) => carried = Some(const_expr.clone()),
             }
         }
 
         if enumerator.identifier == member_name {
-            result = Some(non_integral.unwrap_or_else(|| {
-                ConstExpr::new(ValueType::Reference {
-                    enum_type: enum_type.clone(),
-                    enum_name: enum_decl.name.clone(),
-                    member_name: member_name.to_string(),
-                    value: enum_val,
-                })
-            }));
+            match carried.take() {
+                Some(expr) => {
+                    result = Some(expr);
+                    result_is_carried = true;
+                }
+                None => {
+                    result = Some(ConstExpr::new(ValueType::Reference {
+                        enum_type: enum_type.clone(),
+                        enum_name: enum_decl.name.clone(),
+                        member_name: member_name.to_string(),
+                        value: enum_val,
+                    }))
+                }
+            }
             break;
         }
 
@@ -455,10 +491,17 @@ pub(crate) fn enum_member_const_expr_from_lookup(
         stack.borrow_mut().remove(&resolution_key);
     });
 
+    // A carried (poisoned) result must NOT be cached: it may have been
+    // computed before all symbols were registered, and a cache hit would
+    // freeze the unresolved expression — every later member re-reading it
+    // through the auto-increment path would silently duplicate one wire
+    // discriminant. Recomputing either resolves correctly or diagnoses.
     if let Some(expr) = &result {
-        ENUM_VALUE_CACHE.with(|cache| {
-            cache.borrow_mut().insert(resolution_key, expr.clone());
-        });
+        if !result_is_carried {
+            ENUM_VALUE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(resolution_key, expr.clone());
+            });
+        }
     }
 
     result
@@ -669,8 +712,10 @@ impl VariableDecl {
         self.identifier.to_owned()
     }
 
+    /// Constant names are emitted verbatim, matching AOSP's Rust backend —
+    /// any renaming would collide distinct-case constants (`foo` / `FOO`).
     pub fn const_identifier(&self) -> String {
-        self.identifier.to_uppercase()
+        self.identifier.to_owned()
     }
 
     pub fn union_identifier(&self) -> String {
@@ -1311,6 +1356,9 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
 fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
         Rule::qualified_name => Ok(ConstExpr::new(ValueType::Name(pair.as_str().into()))),
+        // A string literal inside an ordinary expression (`A + "y"`,
+        // `("y" + "z")`); shares validation with `parse_string_term`.
+        Rule::C_STR => parse_c_str(pair),
         Rule::HEXVALUE | Rule::INTVALUE => {
             let span = pair.as_span();
             parse_intvalue(pair.as_str(), (span.start(), span.end()))
@@ -1377,54 +1425,31 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr
     Ok(lhs)
 }
 
-fn parse_string_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
-    match pair.as_rule() {
-        Rule::C_STR => {
-            let span = pair.as_span();
-            let raw = pair.as_str();
-            let inner = &raw[1..raw.len() - 1];
-            // The string is emitted verbatim into a generated Rust `"..."`.
-            // rsbinder intentionally allows non-ASCII (UTF-8) here — e.g.
-            // `const String MSG = "한글";` — because it round-trips as a valid
-            // Rust string literal (more lenient than AOSP `isValidLiteralChar`,
-            // which rejects non-ASCII). But a control byte or a backslash would
-            // be emitted verbatim and fail to compile (a raw `\X` is not
-            // necessarily a valid Rust escape; rsbinder does not decode string
-            // escapes). Reject only those at parse time.
-            if let Some(bad) = inner.bytes().find(|&b| b < 0x20 || b == 0x7f || b == b'\\') {
-                return Err(make_parse_error(
-                    format!(
-                        "invalid byte 0x{bad:02x} in string literal: control characters and \
-                         backslash escapes are not allowed (non-ASCII text is permitted)"
-                    ),
-                    span.start(),
-                    span.end(),
-                ));
-            }
-            Ok(ConstExpr::new(ValueType::String(inner.into())))
-        }
-        Rule::qualified_name => Ok(ConstExpr::new(ValueType::Name(pair.as_str().into()))),
-        _ => unreachable!("Unexpected rule in Rule::parse_string_term: {}", pair),
+/// Parses a `C_STR` token into a `ValueType::String`, validating its bytes.
+///
+/// The string is emitted verbatim into a generated Rust `"..."`.
+/// rsbinder intentionally allows non-ASCII (UTF-8) here — e.g.
+/// `const String MSG = "한글";` — because it round-trips as a valid
+/// Rust string literal (more lenient than AOSP `isValidLiteralChar`,
+/// which rejects non-ASCII). But a control byte or a backslash would
+/// be emitted verbatim and fail to compile (a raw `\X` is not
+/// necessarily a valid Rust escape; rsbinder does not decode string
+/// escapes). Reject only those at parse time.
+fn parse_c_str(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
+    let span = pair.as_span();
+    let raw = pair.as_str();
+    let inner = &raw[1..raw.len() - 1];
+    if let Some(bad) = inner.bytes().find(|&b| b < 0x20 || b == 0x7f || b == b'\\') {
+        return Err(make_parse_error(
+            format!(
+                "invalid byte 0x{bad:02x} in string literal: control characters and \
+                 backslash escapes are not allowed (non-ASCII text is permitted)"
+            ),
+            span.start(),
+            span.end(),
+        ));
     }
-}
-
-fn parse_string_expr(pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
-    let mut expr: Option<ConstExpr> = None;
-
-    for pair in pairs {
-        match pair.as_rule() {
-            Rule::string_term => {
-                let term = parse_string_term(pair.into_inner().next().unwrap())?;
-                expr = match expr {
-                    Some(expr) => Some(ConstExpr::new_expr(expr, "+", term)),
-                    None => Some(term),
-                }
-            }
-            _ => unreachable!("Unexpected rule in Rule::parse_string_expr: {}", pair),
-        }
-    }
-
-    Ok(expr.expect("internal: empty string_expr"))
+    Ok(ConstExpr::new(ValueType::String(inner.into())))
 }
 
 fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
@@ -1503,8 +1528,6 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
         }
 
         Rule::expression => parse_expression(pair.into_inner()),
-
-        Rule::string_expr => parse_string_expr(pair.into_inner()),
 
         _ => unreachable!("Unexpected rule in parse_const_expr(): {}", pair),
     }
@@ -1742,11 +1765,30 @@ fn parse_variable_decl(
                 decl.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
-                decl.identifier = pair.as_str().into();
+                let span = pair.as_span();
+                let ident = pair.as_str();
+                // These four cannot be emitted: `r#self` etc. are not valid
+                // Rust raw identifiers (see `escape_rust_keyword` rustdoc).
+                if matches!(ident, "self" | "Self" | "super" | "crate") {
+                    return Err(make_parse_error(
+                        format!(
+                            "'{ident}' cannot be used as a member name \
+                             (not representable as a Rust raw identifier)"
+                        ),
+                        span.start(),
+                        span.end(),
+                    ));
+                }
+                decl.identifier = ident.into();
             }
             Rule::const_expr => match pair.into_inner().next() {
                 Some(pair) => decl.const_expr = Some(parse_const_expr(pair)?),
-                None => decl.const_expr = None,
+                // An explicit empty initializer (`const T[] X = {};` or
+                // `T[] f = {};`) is a valid empty array literal in AOSP.
+                // Mapping it to "no initializer" silently produced
+                // `Default::default()` — which is not a const expression for
+                // a `&[T]` constant (E0658/E0015 at the rustc stage).
+                None => decl.const_expr = Some(ConstExpr::new(ValueType::Array(Vec::new()))),
             },
             _ => unreachable!(
                 "Unexpected rule in parse_variable_decl(): {}\t{}",
@@ -2489,21 +2531,18 @@ mod tests {
     use std::error::Error;
 
     #[test]
-    fn test_parse_string_expr() -> Result<(), Box<dyn Error>> {
+    fn test_parse_string_concat_expression() -> Result<(), Box<dyn Error>> {
+        // String literals participate in the ordinary expression grammar.
         let mut res =
-            AIDLParser::parse(Rule::string_expr, r##""Hello" + " World""##).map_err(|err| {
+            AIDLParser::parse(Rule::expression, r##""Hello" + " World""##).map_err(|err| {
                 println!("{err}");
                 err
             })?;
 
-        let expr = parse_string_expr(res.next().unwrap().into_inner())?;
+        let expr = parse_expression(res.next().unwrap().into_inner())?;
         assert_eq!(
-            expr,
-            ConstExpr::new_expr(
-                ConstExpr::new(ValueType::String("Hello".into())),
-                "+",
-                ConstExpr::new(ValueType::String(" World".into()))
-            )
+            expr.calculate()?,
+            ConstExpr::new(ValueType::String("Hello World".into()))
         );
 
         Ok(())
@@ -2512,7 +2551,7 @@ mod tests {
     #[test]
     fn test_parse_expression() -> Result<(), Box<dyn Error>> {
         let mut res =
-            AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2 | 4"##).map_err(|err| {
+            AIDLParser::parse(Rule::expression, r##"1 + 3 * 2 << 2 | 4"##).map_err(|err| {
                 println!("{err}");
                 err
             })?;
@@ -2547,10 +2586,17 @@ mod tests {
         //     ConstExpr::default(),
         // );
 
+        // ((1 + 3*2) << 2) | 4 = 28 | 4 = 28
         assert_eq!(
             expr.calculate().unwrap(),
-            ConstExpr::new(ValueType::Int64(-20))
+            ConstExpr::new(ValueType::Int64(28))
         );
+
+        // A negative left shift operand is an AOSP overflow diagnostic
+        // (OverflowGuard), so the old `1 + -3 * 2 << 2` form now errors.
+        let mut res = AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2"##)?;
+        let expr = parse_expression(res.next().unwrap().into_inner())?;
+        assert!(expr.calculate().is_err());
 
         Ok(())
     }

@@ -240,3 +240,52 @@ interface IHelper {
          not being tracked: {deps:?}"
     );
 }
+
+/// An import that resolves under more than one include directory is rejected
+/// as ambiguous (AOSP `import_resolver.cpp` "Duplicate files found") — picking
+/// one silently could compile a stale copy of the type.
+#[test]
+fn ambiguous_import_across_include_dirs_is_diagnostic() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let dep = r#"
+package com.example;
+parcelable Dep {
+    int x;
+}
+"#;
+    write_aidl(&root.join("inc_a/com/example/Dep.aidl"), dep);
+    write_aidl(&root.join("inc_b/com/example/Dep.aidl"), dep);
+
+    let main_aidl = root.join("src/com/example/IMain.aidl");
+    write_aidl(
+        &main_aidl,
+        r#"
+package com.example;
+import com.example.Dep;
+interface IMain {
+    void foo(in Dep d);
+}
+"#,
+    );
+
+    let err = Builder::new()
+        .source(&main_aidl)
+        .include_dir(root.join("inc_a"))
+        .include_dir(root.join("inc_b"))
+        .collect_aidl_dependencies()
+        .expect_err("duplicate import must be an error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("multiple include directories") || msg.contains("Dep"),
+        "expected ambiguous-import diagnostic, got: {msg}"
+    );
+
+    // With a single include directory the same import resolves cleanly.
+    Builder::new()
+        .source(&main_aidl)
+        .include_dir(root.join("inc_a"))
+        .collect_aidl_dependencies()
+        .expect("single include dir must resolve");
+}

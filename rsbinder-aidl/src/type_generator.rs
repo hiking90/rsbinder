@@ -1,8 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::OnceLock;
-
 use miette::{NamedSource, SourceSpan};
 
 use crate::const_expr::{ConstExpr, InitParam, ValueType};
@@ -36,20 +34,23 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
     })
 }
 
-static CRATE_NAME: OnceLock<String> = OnceLock::new();
+thread_local! {
+    // Thread-local like the rest of the compiler state (parser.rs); kept in
+    // sync by `Generator::new` (single source of truth) and reset by
+    // `Builder::new`.
+    static IS_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub fn crate_name() -> &'static str {
-    CRATE_NAME.get_or_init(|| "rsbinder".to_owned()).as_str()
+    if IS_CRATE.with(|c| c.get()) {
+        "crate"
+    } else {
+        "rsbinder"
+    }
 }
 
 pub fn set_crate_support(support: bool) {
-    CRATE_NAME.get_or_init(|| {
-        if support {
-            "crate".to_owned()
-        } else {
-            "rsbinder".to_owned()
-        }
-    });
+    IS_CRATE.with(|c| c.set(support));
 }
 
 #[derive(Clone, Debug)]
@@ -60,26 +61,80 @@ struct ArrayInfo {
 }
 
 impl ArrayInfo {
-    fn new(value_type: &ValueType, array_types: &[parser::ArrayType]) -> Self {
-        Self {
-            sizes: array_types
-                .iter()
-                .map(|t| {
-                    t.const_expr.clone().map_or_else(
-                        || 0,
-                        |v| v.calculate().and_then(|c| c.to_i64()).unwrap_or(0),
-                    )
-                })
-                .collect(),
+    fn new(
+        value_type: &ValueType,
+        array_types: &[parser::ArrayType],
+        span: Option<(usize, usize)>,
+    ) -> Result<Self, AidlError> {
+        let mut sizes = Vec::with_capacity(array_types.len());
+        for t in array_types {
+            match &t.const_expr {
+                // `T[]` — variable-length dimension; 0 marks "not fixed".
+                None => sizes.push(0),
+                Some(expr) => {
+                    // A dimension that fails to evaluate must be a diagnostic:
+                    // folding it to 0 would silently demote the fixed array to
+                    // `Vec<T>`, changing the wire format. AOSP rejects failing,
+                    // negative, and non-integral dimensions; rsbinder also
+                    // rejects 0 (used internally as the "not fixed" sentinel).
+                    let calculated = expr.calculate().map_err(|e| {
+                        make_type_error(
+                            format!("cannot evaluate fixed-size array dimension: {}", e.message),
+                            span,
+                        )
+                    })?;
+                    let size = match &calculated.value {
+                        ValueType::Byte(_)
+                        | ValueType::Int32(_)
+                        | ValueType::Int64(_)
+                        | ValueType::Reference { .. } => calculated.to_i64().map_err(|e| {
+                            make_type_error(
+                                format!(
+                                    "cannot evaluate fixed-size array dimension: {}",
+                                    e.message
+                                ),
+                                span,
+                            )
+                        })?,
+                        other => {
+                            return Err(make_type_error(
+                                format!(
+                                    "fixed-size array dimension must be an integral constant \
+                                     (got {})",
+                                    other.to_value_string()
+                                ),
+                                span,
+                            ))
+                        }
+                    };
+                    if size <= 0 || size > i32::MAX as i64 {
+                        return Err(make_type_error(
+                            format!(
+                                "fixed-size array dimension must be a positive constant that \
+                                 fits in int (got {size})"
+                            ),
+                            span,
+                        ));
+                    }
+                    sizes.push(size);
+                }
+            }
+        }
+        Ok(Self {
+            sizes,
             value_type: value_type.clone(),
             is_list: false,
-        }
+        })
     }
 
-    fn new_list(value_type: &ValueType, array_types: &[parser::ArrayType]) -> Self {
-        let mut this = Self::new(value_type, array_types);
+    fn new_list(
+        value_type: &ValueType,
+        array_types: &[parser::ArrayType],
+        span: Option<(usize, usize)>,
+    ) -> Result<Self, AidlError> {
+        let mut this = Self::new(value_type, array_types, span)?;
         this.is_list = true;
-        this
+        Ok(this)
     }
 
     fn is_fixed(&self) -> bool {
@@ -126,7 +181,11 @@ impl TypeGenerator {
                             aidl_type.name_span,
                         ));
                     }
-                    array_types.push(ArrayInfo::new_list(&elem, &Vec::new()));
+                    array_types.push(ArrayInfo::new_list(
+                        &elem,
+                        &Vec::new(),
+                        aidl_type.name_span,
+                    )?);
                     ValueType::Array(Vec::new())
                 }
                 None => {
@@ -189,7 +248,7 @@ impl TypeGenerator {
                     _type.non_array_type.name_span,
                 ));
             }
-            this = this.array(&_type.array_types);
+            this = this.array(&_type.array_types)?;
         }
 
         if has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
@@ -430,14 +489,17 @@ impl TypeGenerator {
     }
 
     // Switch to array type.
-    pub fn array(mut self, array_types: &[parser::ArrayType]) -> Self {
+    pub fn array(mut self, array_types: &[parser::ArrayType]) -> Result<Self, AidlError> {
         match self.value_type {
-            ValueType::Array(_) => self,
+            ValueType::Array(_) => Ok(self),
             _ => {
-                self.array_types
-                    .push(ArrayInfo::new(&self.value_type, array_types));
+                self.array_types.push(ArrayInfo::new(
+                    &self.value_type,
+                    array_types,
+                    self.type_span,
+                )?);
                 self.value_type = ValueType::Array(Vec::new());
-                self
+                Ok(self)
             }
         }
     }
@@ -722,6 +784,16 @@ impl TypeGenerator {
     }
 
     pub fn const_type_decl(&self) -> Result<String, AidlError> {
+        // A String-element const array renders as `&[&str]`: its initializer
+        // elements are emitted as string literals, which do not coerce to a
+        // `&[String]` slice in const position.
+        if matches!(self.value_type, ValueType::Array(_)) {
+            if let Some(info) = self.array_types.first() {
+                if matches!(info.value_type, ValueType::String(_)) && !info.is_fixed() {
+                    return Ok("&[&str]".into());
+                }
+            }
+        }
         self.clone().direction(&Direction::In)?.type_decl_for_func()
     }
 
@@ -950,6 +1022,9 @@ impl TypeGenerator {
         for value in values {
             enum_values.push(self.validate_enum_value(&value, target_lookup)?);
         }
+        if let Some(info) = self.array_types.first() {
+            self.check_fixed_arity(&enum_values, &info.sizes)?;
+        }
 
         Ok(ValueType::Array(enum_values).to_init(
             param
@@ -958,23 +1033,58 @@ impl TypeGenerator {
         ))
     }
 
+    /// A fixed-size array default must supply exactly the declared number of
+    /// elements per dimension — a mismatched literal would emit a
+    /// non-compiling `[T; N]` initializer instead of an AIDL diagnostic.
+    fn check_fixed_arity(&self, values: &[ConstExpr], sizes: &[i64]) -> Result<(), AidlError> {
+        let Some((&dim, rest)) = sizes.split_first() else {
+            return Ok(());
+        };
+        if dim <= 0 {
+            return Ok(()); // variable-length dimension
+        }
+        if values.len() as i64 != dim {
+            return Err(make_type_error(
+                format!(
+                    "fixed-size array default has {} element(s), expected {dim}",
+                    values.len()
+                ),
+                self.type_span,
+            ));
+        }
+        for v in values {
+            if let ValueType::Array(inner) = &v.value {
+                self.check_fixed_arity(inner, rest)?;
+            }
+        }
+        Ok(())
+    }
+
     fn init_array_value(
+        &self,
         expr: &ConstExpr,
         array_info: &ArrayInfo,
         param: InitParam,
         is_nullable: bool,
-    ) -> String {
-        match expr
+    ) -> Result<String, AidlError> {
+        // Evaluation/conversion failure is a user-facing diagnostic (AOSP
+        // rejects), never a silent `Default::default()`.
+        let converted = expr
             .calculate()
             .and_then(|c| c.convert_to(&array_info.value_type))
-        {
-            Ok(converted) => converted.value.to_init(
-                param
-                    .with_fixed_array(array_info.is_fixed())
-                    .with_nullable(is_nullable),
-            ),
-            Err(_) => ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)),
-        }
+            .map_err(|e| make_type_error(e.message, self.type_span))?;
+        let ValueType::Array(values) = &converted.value else {
+            return Err(make_type_error(
+                "an array type requires an array literal default",
+                self.type_span,
+            ));
+        };
+        self.check_fixed_arity(values, &array_info.sizes)?;
+        Ok(converted.value.to_init(
+            param
+                .with_fixed_array(array_info.is_fixed())
+                .with_nullable(is_nullable),
+        ))
     }
 
     /// Renders the initializer for an array-typed field/const default.
@@ -997,7 +1107,7 @@ impl TypeGenerator {
                 }
             }
         }
-        Ok(Self::init_array_value(expr, array_info, param, is_nullable))
+        self.init_array_value(expr, array_info, param, is_nullable)
     }
 
     /// Renders the initializer for a scalar (non-array) field/const default.
@@ -1010,19 +1120,27 @@ impl TypeGenerator {
         }
 
         let scalar_param = param.with_fixed_array(false).with_nullable(false);
-        // Propagate an evaluation failure (an unresolvable reference inside a
-        // sub-expression, an overflowing shift, too-deep nesting) as a
-        // diagnostic instead of silently emitting a `0` default — AOSP rejects
-        // these at build time.
+        // Evaluation failures below are user-facing diagnostics (AOSP rejects
+        // all of them at build time), never a fabricated default.
         let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
         // A value that is *still* a bare name means the reference does not
-        // resolve at all (typo / missing import); diagnose rather than baking a
-        // fabricated constant into the generated IPC code.
+        // resolve at all (typo / missing import).
         if let ValueType::Name(name) = &calculated.value {
             return Err(make_type_error(
                 format!("cannot resolve constant reference '{name}'"),
+                self.type_span,
+            ));
+        }
+        // An array literal on a scalar target would sail through the
+        // element-wise `convert_to` below and emit a slice initializer.
+        if matches!(calculated.value, ValueType::Array(_)) {
+            return Err(make_type_error(
+                format!(
+                    "an array literal cannot initialize the non-array type {}",
+                    self.type_decl(&self.value_type)
+                ),
                 self.type_span,
             ));
         }
@@ -1036,10 +1154,13 @@ impl TypeGenerator {
                     ValueType::Int64(*value).to_init(scalar_param)
                 }
             }
-            _ => match calculated.convert_to(&self.value_type) {
-                Ok(converted) => converted.value.to_init(scalar_param),
-                Err(_) => calculated.value.to_init(scalar_param),
-            },
+            // A type-mismatched default (e.g. `const int A = "x";`) fails
+            // `convert_to` and is diagnosed here, matching AOSP.
+            _ => calculated
+                .convert_to(&self.value_type)
+                .map_err(|e| make_type_error(e.message, self.type_span))?
+                .value
+                .to_init(scalar_param),
         })
     }
 
@@ -1094,7 +1215,7 @@ mod tests {
         let nullable_gen = gen.clone().nullable().unwrap();
         assert_eq!(nullable_gen.type_declaration(false), "Option<String>");
 
-        let array_gen = gen.array(&Vec::new());
+        let array_gen = gen.array(&Vec::new()).unwrap();
         assert_eq!(array_gen.type_declaration(false), "Vec<String>");
         assert_eq!(
             array_gen
@@ -1152,7 +1273,7 @@ mod tests {
             "Option<rsbinder::SIBinder>"
         );
 
-        let array_gen = gen.array(&Vec::new());
+        let array_gen = gen.array(&Vec::new()).unwrap();
         assert_eq!(array_gen.type_declaration(false), "Vec<rsbinder::SIBinder>");
         assert_eq!(
             array_gen
@@ -1213,7 +1334,7 @@ mod tests {
             "Option<&rsbinder::ParcelFileDescriptor>"
         );
 
-        let array_gen = gen.array(&Vec::new());
+        let array_gen = gen.array(&Vec::new()).unwrap();
         assert_eq!(
             array_gen.type_decl_for_func().unwrap(),
             "&[rsbinder::ParcelFileDescriptor]"
@@ -1266,7 +1387,7 @@ mod tests {
             name_span: None,
         })
         .unwrap();
-        let array_gen = gen.array(&Vec::new());
+        let array_gen = gen.array(&Vec::new()).unwrap();
         assert_eq!(
             array_gen
                 .direction(&Direction::Out)
@@ -1284,7 +1405,7 @@ mod tests {
             name_span: None,
         })
         .unwrap();
-        let nullable_array_gen = gen.array(&Vec::new()).nullable().unwrap();
+        let nullable_array_gen = gen.array(&Vec::new()).unwrap().nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_decl_for_func().unwrap(),
             "Option<&[Option<String>]>"
@@ -1306,7 +1427,8 @@ mod tests {
         .unwrap()
         .array(&[crate::parser::ArrayType {
             const_expr: Some(ConstExpr::new(ValueType::Int32(40))),
-        }]);
+        }])
+        .unwrap();
 
         let field_default = big
             .init_value(None, InitParam::builder().with_const(false))
@@ -1327,7 +1449,8 @@ mod tests {
         .unwrap()
         .array(&[crate::parser::ArrayType {
             const_expr: Some(ConstExpr::new(ValueType::Int32(8))),
-        }]);
+        }])
+        .unwrap();
         assert_eq!(small.default_value(), "Default::default()");
     }
 
@@ -1355,7 +1478,7 @@ mod tests {
         .identifier("type");
         assert_eq!(gen.func_call_param(), "&_arg_type");
 
-        let array_gen = gen.array(&Vec::new());
+        let array_gen = gen.array(&Vec::new()).unwrap();
         assert_eq!(
             array_gen.clone().nullable().unwrap().func_call_param(),
             "_arg_type.as_deref()"
@@ -1390,6 +1513,7 @@ mod tests {
             .array(&[ArrayType {
                 const_expr: Some(ConstExpr::new(ValueType::Byte(2))),
             }])
+            .unwrap()
             .nullable()
             .unwrap();
         assert_eq!(array_nullable.type_declaration(true), "Option<[bool; 2]>");

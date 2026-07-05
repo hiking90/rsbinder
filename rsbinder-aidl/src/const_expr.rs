@@ -47,9 +47,14 @@ macro_rules! arithmetic_bit_op {
     }
 }
 
-// `$int_op` performs the i64 arithmetic (AOSP aidl wraps two's-complement for
-// `+`/`-`/`*`; `/`/`%` are checked so divide-by-zero and `INT_MIN / -1` become a
-// diagnostic instead of a panic). `$float_op` is the plain operator for f32/f64.
+// `$int_op` performs the arithmetic in i64 (`/`/`%` are checked so
+// divide-by-zero becomes a diagnostic instead of a panic); the result is then
+// range-checked against the *promoted* operand type, mirroring AOSP's
+// `OverflowGuard<T>` (aidl_const_expressions.cpp) which computes `+ - * / %`
+// in the promoted type with `__builtin_*_overflow` and hard-fails on
+// overflow ("Constant expression computation overflows."). `$float_op` is
+// the plain operator for f32/f64 — rsbinder intentionally keeps float
+// binary expressions working (AOSP rejects them outright, b/313951203).
 macro_rules! arithmetic_basic_op {
     ($lhs:expr, $int_op:expr, $float_op:tt, $rhs:expr, $desc:expr, $promoted:expr) => {
         {
@@ -59,15 +64,62 @@ macro_rules! arithmetic_basic_op {
 
             match $promoted {
                 ValueType::Void => Ok(ConstExpr::default()),
-                ValueType::String(_) | ValueType::Char(_) => {
-                    let value = format!("{}{}", lhs.to_value_string(), rhs.to_value_string());
-                    Ok(ConstExpr::new(ValueType::String(value)))
+                // AOSP only accepts `String + String` as a string expression;
+                // any other operator (or a non-string operand promoted into a
+                // string context, e.g. `"a" + 'c'`) is a build error.
+                ValueType::String(_) => {
+                    if $desc != "+" {
+                        Err(ConstExprError::new(format!(
+                            "only '+' is supported for strings, not '{}'", $desc
+                        )))
+                    } else if !matches!($lhs.value, ValueType::String(_))
+                        || !matches!($rhs.value, ValueType::String(_))
+                    {
+                        Err(ConstExprError::new(format!(
+                            "cannot concatenate a non-string operand: {} + {}",
+                            $lhs.to_value_string(), $rhs.to_value_string()
+                        )))
+                    } else {
+                        let value = format!("{}{}", lhs.to_value_string(), rhs.to_value_string());
+                        Ok(ConstExpr::new(ValueType::String(value)))
+                    }
                 }
+                // AOSP rejects char operands in binary expressions
+                // (`AreCompatibleOperandTypes` has no CHARACTER case). The
+                // old string-concat fold silently produced e.g. `"a1"` for
+                // `'a' + 1` — a wrong, non-compiling constant.
+                ValueType::Char(_) => Err(ConstExprError::new(format!(
+                    "cannot perform operation '{}' on a char in a constant expression", $desc
+                ))),
+                // Defensive: binary operands integral-promote past Byte
+                // (`integral_promotion` yields Int32 minimum), so this arm is
+                // unreachable from `calc_expr`.
                 ValueType::Byte(_) => {
-                    Ok(ConstExpr::new(ValueType::Byte(int_op(lhs.to_i64()?, rhs.to_i64()?)? as u8 as _)))
+                    let value = int_op(lhs.to_i64()?, rhs.to_i64()?)?;
+                    if value > i8::MAX as i64 || value < i8::MIN as i64 {
+                        Err(ConstExprError::new(format!(
+                            "constant expression computation overflows ('{}' on byte)", $desc
+                        )))
+                    } else {
+                        Ok(ConstExpr::new(ValueType::Byte(value as _)))
+                    }
                 }
                 ValueType::Int32(_) => {
-                    Ok(ConstExpr::new(ValueType::Int32(int_op(lhs.to_i64()?, rhs.to_i64()?)? as i32 as _)))
+                    let (a, b) = (lhs.to_i64()?, rhs.to_i64()?);
+                    let value = int_op(a, b)?;
+                    // `INT32_MIN % -1` overflows in the promoted width (AOSP
+                    // OverflowGuard<int32_t>) even though the i64 remainder
+                    // (0) is in range; `/` is caught by the range check.
+                    if value > i32::MAX as i64
+                        || value < i32::MIN as i64
+                        || ($desc == "%" && a == i32::MIN as i64 && b == -1)
+                    {
+                        Err(ConstExprError::new(format!(
+                            "constant expression computation overflows ('{}' on int)", $desc
+                        )))
+                    } else {
+                        Ok(ConstExpr::new(ValueType::Int32(value as _)))
+                    }
                 }
                 ValueType::Int64(_) => {
                     Ok(ConstExpr::new(ValueType::Int64(int_op(lhs.to_i64()?, rhs.to_i64()?)? as _)))
@@ -229,9 +281,12 @@ impl ValueType {
 
     fn unary_not(&self) -> Result<ConstExpr, ConstExprError> {
         match self {
-            ValueType::Void | ValueType::String(_) | ValueType::Char(_) => {
-                Ok(ConstExpr::new(self.clone()))
-            }
+            // AOSP `IsCompatibleType` rejects unary operators on strings; a
+            // silent pass-through would emit the operand unchanged.
+            ValueType::String(_) => Err(ConstExprError::new(
+                "can't apply unary operator '~' to a string",
+            )),
+            ValueType::Void | ValueType::Char(_) => Ok(ConstExpr::new(self.clone())),
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(!*v))),
             ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(!*v))),
             ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(!*v))),
@@ -276,13 +331,31 @@ impl ValueType {
     }
 
     fn unary_minus(&self) -> Result<ConstExpr, ConstExprError> {
+        // Checked negation mirrors AOSP `OverflowGuard::operator-`: negating
+        // the type's minimum has no representable result and is a build error
+        // instead of a silent wrap back to itself.
+        fn overflow<T: std::fmt::Display>(v: T) -> ConstExprError {
+            ConstExprError::new(format!(
+                "constant expression computation overflows: cannot negate {v}"
+            ))
+        }
         match self {
-            ValueType::Void | ValueType::String(_) | ValueType::Bool(_) | ValueType::Char(_) => {
+            // See `unary_not`: AOSP rejects unary operators on strings.
+            ValueType::String(_) => Err(ConstExprError::new(
+                "can't apply unary operator '-' to a string",
+            )),
+            ValueType::Void | ValueType::Bool(_) | ValueType::Char(_) => {
                 Ok(ConstExpr::new(self.clone()))
             }
-            ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte((*v).wrapping_neg() as _))),
-            ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32((*v).wrapping_neg() as _))),
-            ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(v.wrapping_neg()))),
+            ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(
+                v.checked_neg().ok_or_else(|| overflow(*v))?,
+            ))),
+            ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(
+                v.checked_neg().ok_or_else(|| overflow(*v))?,
+            ))),
+            ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(
+                v.checked_neg().ok_or_else(|| overflow(*v))?,
+            ))),
             ValueType::Float(v) => Ok(ConstExpr::new(ValueType::Float(-(*v as f32) as _))),
             ValueType::Double(v) => Ok(ConstExpr::new(ValueType::Double(-*v))),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
@@ -322,11 +395,14 @@ impl ValueType {
                 match expr {
                     Some(expr) => {
                         let calculated = expr.calculate()?;
-                        if let ValueType::Name(_) = calculated.value {
-                            // Still a name after resolution ⇒ a circular
-                            // reference broke the cycle (tested graceful
-                            // degradation); fold to a neutral value.
-                            Ok(false)
+                        if let ValueType::Name(n) = calculated.value {
+                            // Still a name after resolution ⇒ the chain
+                            // dead-ends on an unresolvable reference. AOSP
+                            // rejects this; folding to `false` would bake a
+                            // fabricated constant into the generated code.
+                            Err(ConstExprError::new(format!(
+                                "cannot resolve constant reference '{n}'"
+                            )))
                         } else {
                             calculated.to_bool()
                         }
@@ -367,8 +443,11 @@ impl ValueType {
                 match expr {
                     Some(expr) => {
                         let calculated = expr.calculate()?;
-                        if let ValueType::Name(_) = calculated.value {
-                            Ok(0.0)
+                        if let ValueType::Name(n) = calculated.value {
+                            // See `to_bool`: dead-end resolution ⇒ diagnostic.
+                            Err(ConstExprError::new(format!(
+                                "cannot resolve constant reference '{n}'"
+                            )))
                         } else {
                             calculated.to_f64()
                         }
@@ -409,8 +488,11 @@ impl ValueType {
                 match expr {
                     Some(expr) => {
                         let calculated = expr.calculate()?;
-                        if let ValueType::Name(_) = calculated.value {
-                            Ok(0)
+                        if let ValueType::Name(n) = calculated.value {
+                            // See `to_bool`: dead-end resolution ⇒ diagnostic.
+                            Err(ConstExprError::new(format!(
+                                "cannot resolve constant reference '{n}'"
+                            )))
                         } else {
                             calculated.to_i64()
                         }
@@ -516,8 +598,13 @@ impl ValueType {
                 }
             }
             ValueType::Array(v) => {
+                // A `const T[]` renders as `pub const X: &[T]`, so its
+                // initializer must be a slice literal (`&[...]`) — `vec![]`
+                // is not a const expression and never compiled.
                 let mut res = if param.is_fixed_array {
                     "[".to_owned()
+                } else if param.is_const {
+                    "&[".to_owned()
                 } else {
                     "vec![".to_owned()
                 };
@@ -680,12 +767,17 @@ impl ValueType {
                 let mut is_shl = operator == "<<";
 
                 let lhs_value = lhs.to_i64()?;
-                let rhs_value = rhs.to_i64()?;
-                let rhs_value: u32 = if rhs_value < 0 {
+                // The shift amount is range-checked in u64 BEFORE narrowing to
+                // u32 — `1 << 4294967296` must not truncate to a 0-bit shift
+                // and slip past the guards below. A negative amount shifts in
+                // the other direction (AIDL-defined, AOSP
+                // `AidlBinaryConstExpression::evaluate`).
+                let raw_amount = rhs.to_i64()?;
+                let amount: u64 = if raw_amount < 0 {
                     is_shl = !is_shl;
-                    rhs_value.wrapping_neg() as _
+                    raw_amount.unsigned_abs()
                 } else {
-                    rhs_value as _
+                    raw_amount as u64
                 };
 
                 // The shift is computed in `i64` below but stored in the
@@ -699,11 +791,38 @@ impl ValueType {
                     // Int32 / Byte both integral-promote to `int` for the shift.
                     _ => 32,
                 };
-                if rhs_value >= bits {
+                if amount >= bits as u64 {
                     return Err(ConstExprError::new(format!(
-                        "shift amount {rhs_value} out of range for operator '{operator}' \
+                        "shift amount {amount} out of range for operator '{operator}' \
                          (operand width {bits} bits)"
                     )));
+                }
+                let rhs_value = amount as u32;
+
+                // AOSP `OverflowGuard::operator<<`/`>>`: a negative left
+                // operand never shifts, and a left shift may move bits only
+                // into (not past) the sign position — the shift amount must
+                // not exceed the operand's leading-zero count. `1 << 31` and
+                // `1L << 63` remain legal (amount == CLZ); `2 << 31` (which
+                // silently folded to 0) and `-8 >> 1` are diagnostics.
+                if lhs_value < 0 {
+                    return Err(ConstExprError::new(format!(
+                        "constant expression computation overflows: cannot shift the negative \
+                         value {lhs_value}"
+                    )));
+                }
+                if is_shl {
+                    let clz = if bits == 64 {
+                        (lhs_value as u64).leading_zeros()
+                    } else {
+                        (lhs_value as u32).leading_zeros()
+                    };
+                    if rhs_value > clz {
+                        return Err(ConstExprError::new(format!(
+                            "constant expression computation overflows: {lhs_value} << {rhs_value} \
+                             does not fit in {bits} bits"
+                        )));
+                    }
                 }
 
                 let value = if is_shl {
@@ -724,19 +843,33 @@ impl ValueType {
                     ))),
                 }
             }
+            // Checked ops mirror AOSP's OverflowGuard: `i64::MAX + 1` etc. is
+            // "Constant expression computation overflows.", not a silent wrap.
             "+" => arithmetic_basic_op!(
                 lhs,
-                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_add(b)) },
+                |a: i64, b: i64| -> Result<i64, ConstExprError> {
+                    a.checked_add(b).ok_or_else(|| {
+                        ConstExprError::new("constant expression computation overflows ('+' on long)")
+                    })
+                },
                 +, rhs, "+", &promoted
             ),
             "-" => arithmetic_basic_op!(
                 lhs,
-                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_sub(b)) },
+                |a: i64, b: i64| -> Result<i64, ConstExprError> {
+                    a.checked_sub(b).ok_or_else(|| {
+                        ConstExprError::new("constant expression computation overflows ('-' on long)")
+                    })
+                },
                 -, rhs, "-", &promoted
             ),
             "*" => arithmetic_basic_op!(
                 lhs,
-                |a: i64, b: i64| -> Result<i64, ConstExprError> { Ok(a.wrapping_mul(b)) },
+                |a: i64, b: i64| -> Result<i64, ConstExprError> {
+                    a.checked_mul(b).ok_or_else(|| {
+                        ConstExprError::new("constant expression computation overflows ('*' on long)")
+                    })
+                },
                 *, rhs, "*", &promoted
             ),
             "/" => arithmetic_basic_op!(
@@ -789,6 +922,13 @@ impl ValueType {
                     expr.value.unary_not()
                 } else if operator == "!" {
                     expr.value.logical_not()
+                } else if matches!(expr.value, ValueType::String(_)) {
+                    // Unary `+` on a string: AOSP rejects all unary operators
+                    // on strings; passing the operand through would silently
+                    // drop the operator.
+                    Err(ConstExprError::new(
+                        "can't apply a unary operator to a string",
+                    ))
                 } else {
                     Ok(expr)
                 }
@@ -807,7 +947,13 @@ impl ValueType {
             }
             ValueType::Name(name) => {
                 if visited.contains(name) {
-                    Ok(ConstExpr::new(ValueType::Int32(0)))
+                    // A reference cycle (`const int A = B; const int B = A;`)
+                    // has no well-defined value; AOSP rejects it at build
+                    // time. Folding to a neutral 0 here would silently bake a
+                    // fabricated constant into the generated IPC code.
+                    Err(ConstExprError::new(format!(
+                        "circular reference detected while resolving constant '{name}'"
+                    )))
                 } else {
                     visited.insert(name.clone());
                     let expr = parser::name_to_const_expr(name);
@@ -980,11 +1126,33 @@ impl ConstExpr {
                 ValueType::String(_) => {
                     Ok(ConstExpr::new(ValueType::String(self.to_value_string())))
                 }
+                // Narrowing checks mirror AOSP `ValueString` (aidl_const_
+                // expressions.cpp): a value outside the declared type's range
+                // is a build error, not a silent two's-complement wrap —
+                // `const byte A = 128;` must not become `-128`. int/long-width
+                // hex literals already wrapped into the signed range at parse
+                // time (`0x80000000` is Int32 == INT32_MIN), the AOSP
+                // carve-out for bit patterns; byte-width bit patterns need
+                // the `u8` suffix (`0xFFu8`), exactly as in AOSP.
                 ValueType::Byte(_) => {
-                    Ok(ConstExpr::new(ValueType::Byte(self.to_i64()? as i8 as _)))
+                    let v = self.to_i64()?;
+                    if v > i8::MAX as i64 || v < i8::MIN as i64 {
+                        return Err(ConstExprError::new(format!(
+                            "value {v} is out of range for byte (-128..=127); for a bit \
+                             pattern, use the u8 suffix (e.g. 0xFFu8)"
+                        )));
+                    }
+                    Ok(ConstExpr::new(ValueType::Byte(v as i8 as _)))
                 }
                 ValueType::Int32(_) => {
-                    Ok(ConstExpr::new(ValueType::Int32(self.to_i64()? as i32 as _)))
+                    let v = self.to_i64()?;
+                    if v > i32::MAX as i64 || v < i32::MIN as i64 {
+                        return Err(ConstExprError::new(format!(
+                            "value {v} is out of range for int; for a bit pattern, use a \
+                             hex literal or the u32 suffix"
+                        )));
+                    }
+                    Ok(ConstExpr::new(ValueType::Int32(v as i32 as _)))
                 }
                 ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(self.to_i64()?))),
                 ValueType::Float(_) => {
@@ -1079,12 +1247,112 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_overflow_wraps_not_panic() {
-        // i64::MAX + 1 must wrap to i64::MIN (two's-complement) rather than panic.
+    fn test_integer_overflow_is_diagnostic() {
+        // AOSP OverflowGuard: arithmetic overflow in the promoted type is
+        // "Constant expression computation overflows.", never a silent wrap.
         let expr = ValueType::new_expr(ValueType::Int64(i64::MAX), "+", ValueType::Int64(1));
+        assert!(
+            expr.calculate().is_err(),
+            "i64::MAX + 1 must be a diagnostic"
+        );
+
+        let expr = ValueType::new_expr(ValueType::Int32(i32::MAX), "+", ValueType::Int32(1));
+        assert!(
+            expr.calculate().is_err(),
+            "int32 overflow must be a diagnostic"
+        );
+
+        let expr = ValueType::new_expr(ValueType::Int64(i64::MIN), "/", ValueType::Int64(-1));
+        assert!(
+            expr.calculate().is_err(),
+            "i64::MIN / -1 must be a diagnostic"
+        );
+
+        // In-range arithmetic still folds.
+        let expr = ValueType::new_expr(ValueType::Int32(i32::MAX), "+", ValueType::Int32(0));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(i32::MAX))
+        );
+    }
+
+    #[test]
+    fn test_shift_overflow_guard_matches_aosp() {
+        // Legal carve-outs: shift amount == CLZ(lhs) is allowed, so `1 << 31`
+        // is INT32_MIN and `1L << 63` is INT64_MIN (bit patterns, AOSP-legal).
+        let expr = ValueType::new_expr(ValueType::Int32(1), "<<", ValueType::Int32(31));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(i32::MIN))
+        );
+        let expr = ValueType::new_expr(ValueType::Int64(1), "<<", ValueType::Int32(63));
         assert_eq!(
             expr.calculate().unwrap(),
             ConstExpr::new(ValueType::Int64(i64::MIN))
+        );
+
+        // `2 << 31` silently folded to 0 before; AOSP rejects (amount > CLZ).
+        let expr = ValueType::new_expr(ValueType::Int32(2), "<<", ValueType::Int32(31));
+        assert!(expr.calculate().is_err(), "2 << 31 must be a diagnostic");
+
+        // A negative left operand never shifts (AOSP OverflowGuard).
+        let expr = ValueType::new_expr(ValueType::Int32(-8), ">>", ValueType::Int32(1));
+        assert!(expr.calculate().is_err(), "-8 >> 1 must be a diagnostic");
+
+        // A negative shift amount shifts in the other direction (AIDL-defined).
+        let expr = ValueType::new_expr(ValueType::Int32(8), "<<", ValueType::Int32(-1));
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::Int32(4))
+        );
+    }
+
+    #[test]
+    fn test_char_binary_operand_is_diagnostic() {
+        // AOSP rejects char operands in binary const expressions; the old
+        // string-concat fold produced e.g. "a1" for `'a' + 1`.
+        let expr = ValueType::new_expr(ValueType::Char('a'), "+", ValueType::Int32(1));
+        assert!(expr.calculate().is_err(), "'a' + 1 must be a diagnostic");
+    }
+
+    #[test]
+    fn test_string_concat_requires_plus_and_strings() {
+        let expr = ValueType::new_expr(
+            ValueType::String("a".into()),
+            "+",
+            ValueType::String("b".into()),
+        );
+        assert_eq!(
+            expr.calculate().unwrap(),
+            ConstExpr::new(ValueType::String("ab".into()))
+        );
+        let expr = ValueType::new_expr(
+            ValueType::String("a".into()),
+            "-",
+            ValueType::String("b".into()),
+        );
+        assert!(
+            expr.calculate().is_err(),
+            "\"a\" - \"b\" must be a diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_narrowing_out_of_range_is_diagnostic() {
+        // `byte A = 128` / decimal int overflow: AOSP errors with a range
+        // diagnostic; hex bit patterns already wrapped at parse time.
+        assert!(ConstExpr::new(ValueType::Int32(128))
+            .convert_to(&ValueType::Byte(0))
+            .is_err());
+        assert!(ConstExpr::new(ValueType::Int64(2_147_483_648))
+            .convert_to(&ValueType::Int32(0))
+            .is_err());
+        // In-range narrowing still converts.
+        assert_eq!(
+            ConstExpr::new(ValueType::Int32(127))
+                .convert_to(&ValueType::Byte(0))
+                .unwrap(),
+            ConstExpr::new(ValueType::Byte(127))
         );
     }
 
