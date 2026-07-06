@@ -11,7 +11,13 @@
 //! tests, and a `connect(path)` convenience.
 
 use std::io::{Read, Write};
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -96,6 +102,13 @@ impl UnixTransport {
         // `RpcError: From<std::io::Error>` — `?` does the conversion.
         let stream = UnixStream::connect(path)?;
         Self::from_stream(stream)
+    }
+
+    /// Connect to a Linux/Android abstract Unix socket.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn connect_abstract(name: &[u8]) -> RpcResult<Self> {
+        let addr = UnixSocketAddr::from_abstract_name(name)?;
+        Self::from_stream(UnixStream::connect_addr(&addr)?)
     }
 }
 

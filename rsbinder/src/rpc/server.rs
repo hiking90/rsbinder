@@ -17,6 +17,12 @@
 use std::collections::HashMap;
 #[cfg(feature = "rpc-tls")]
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -67,11 +73,12 @@ enum ServerListener {
 }
 
 /// Backend-agnostic bind metadata. `Drop` branches on this for the
-/// per-backend cleanup: `Unix` removes the socket file, `Vsock`/`Tcp`
-/// have no filesystem cleanup (the kernel reclaims the bind on `Drop`
-/// of the listener fd itself).
+/// per-backend cleanup: path `Unix` removes the socket file;
+/// abstract Unix, `Vsock`, and `Tcp` have no filesystem cleanup (the
+/// kernel reclaims the bind on `Drop` of the listener fd itself).
 enum BindAddress {
     Unix(PathBuf),
+    UnixAbstract,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock {
         cid: u32,
@@ -459,6 +466,17 @@ impl RpcServer {
         // Non-blocking accept so the loop can observe `shutdown`.
         listener.set_nonblocking(true)?;
         Ok(Self::wrap(listener, BindAddress::Unix(path)))
+    }
+
+    /// Bind + listen on a Linux/Android abstract Unix-domain socket.
+    /// Abstract sockets have no filesystem entry, so there is no stale
+    /// path to remove and no drop-time unlink.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_unix_server_abstract(name: &[u8]) -> Result<Arc<RpcServer>> {
+        let addr = UnixSocketAddr::from_abstract_name(name)?;
+        let listener = ServerListener::Unix(UnixListener::bind_addr(&addr)?);
+        listener.set_nonblocking(true)?;
+        Ok(Self::wrap(listener, BindAddress::UnixAbstract))
     }
 
     /// Bind + listen on a vsock `(cid, port)`. The
@@ -1491,6 +1509,7 @@ impl RpcServer {
     pub fn path(&self) -> Option<&Path> {
         match &self.bind {
             BindAddress::Unix(p) => Some(p.as_path()),
+            BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
             #[cfg(feature = "rpc-tls")]
@@ -1506,6 +1525,7 @@ impl RpcServer {
         match &self.bind {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
             BindAddress::Unix(_) => None,
+            BindAddress::UnixAbstract => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
         }
@@ -1520,6 +1540,7 @@ impl RpcServer {
         match &self.bind {
             BindAddress::Tcp(addr) => Some(*addr),
             BindAddress::Unix(_) => None,
+            BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
         }
@@ -1557,6 +1578,7 @@ impl Drop for RpcServer {
                 // on the same path doesn't see a stale ENOENT/EADDRINUSE.
                 let _ = std::fs::remove_file(p);
             }
+            BindAddress::UnixAbstract => {}
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
                 // vsock has no filesystem entry; the kernel reclaims the

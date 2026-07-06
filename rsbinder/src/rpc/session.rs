@@ -2572,6 +2572,13 @@ impl RpcSession {
         RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
     }
 
+    /// Client: connect to a Linux/Android abstract Unix-domain RPC server.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_unix_client_abstract(name: &[u8]) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect_abstract(name)?;
+        RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
+    }
+
     /// Client: connect to a Unix-domain RPC server speaking the
     /// **android-13+ versioned wire**. Connects
     /// the UDS, then runs the AOSP handshake via
@@ -2583,6 +2590,17 @@ impl RpcSession {
         max_version: u32,
     ) -> Result<RpcSession> {
         let t = super::transport::UnixTransport::connect(path)?;
+        RpcSession::connect_android13plus(Box::new(t), max_version)
+    }
+
+    /// Client: connect to a Linux/Android abstract Unix-domain RPC
+    /// server speaking the **android-13+ versioned wire**.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_unix_client_android13plus_abstract(
+        name: &[u8],
+        max_version: u32,
+    ) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect_abstract(name)?;
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 

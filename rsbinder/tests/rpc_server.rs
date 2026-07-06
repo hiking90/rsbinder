@@ -285,7 +285,7 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
 struct ServeCleanup {
     server: Arc<RpcServer>,
     bg: Option<std::thread::JoinHandle<()>>,
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
 }
 impl ServeCleanup {
     fn new(
@@ -296,7 +296,7 @@ impl ServeCleanup {
         Self {
             server,
             bg: Some(bg),
-            path,
+            path: Some(path),
         }
     }
 }
@@ -328,7 +328,9 @@ impl Drop for ServeCleanup {
             }
         }
         self.server.join_workers();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -766,6 +768,45 @@ fn android13plus_profile_e2e() {
         // is dropped here as the for-loop body scope ends, in the same
         // order the explicit shutdown/join/remove_file ran before.
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn abstract_unix_socket_e2e() {
+    let r34_name = format!("rsb_rpc_abs_r34_{}", std::process::id()).into_bytes();
+    let server = RpcServer::setup_unix_server_abstract(&r34_name).expect("bind abstract r34");
+    assert!(server.path().is_none());
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu_r34 = ServeCleanup {
+        server: Arc::clone(&server),
+        bg: Some(bg),
+        path: None,
+    };
+
+    let client = RpcSession::setup_unix_client_abstract(&r34_name).expect("connect abstract r34");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("abstract-r34").unwrap(), "abstract-r34");
+
+    let a13_name = format!("rsb_rpc_abs_a13_{}", std::process::id()).into_bytes();
+    let server = RpcServer::setup_unix_server_abstract(&a13_name).expect("bind abstract a13");
+    assert!(server.path().is_none());
+    server.set_android13plus(2);
+    server.set_max_threads(2);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu_a13 = ServeCleanup {
+        server: Arc::clone(&server),
+        bg: Some(bg),
+        path: None,
+    };
+
+    let client = RpcSession::setup_unix_client_android13plus_abstract(&a13_name, 2)
+        .expect("connect abstract android13plus");
+    assert_eq!(client.wire_protocol_version(), Some(2));
+    assert_eq!(client.negotiate(8).expect("negotiate"), 2);
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("abstract-a13").unwrap(), "abstract-a13");
 }
 
 /// The decoupled `TlsTransport`
