@@ -23,7 +23,6 @@ use std::thread;
 use rsbinder::rpc::transport::MemTransport;
 use rsbinder::rpc::{
     AddressSpace, FileDescriptorTransportMode as FdMode, RpcProxy, RpcServer, RpcSession,
-    RpcUnixClientConfig,
 };
 use rsbinder::{
     Binder, Interface, Parcel, ParcelFileDescriptor, Remotable, Result, SIBinder, Status,
@@ -368,6 +367,8 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn fd_v1_abstract_unix_roundtrip_arg() {
+    use rsbinder::rpc::RpcUnixClientConfig;
+
     let name = format!("rsb_rpcfd_abs_{}", std::process::id()).into_bytes();
     let server = RpcServer::setup_unix_server_abstract(&name).expect("bind abstract fd");
     server.set_android13plus(1);

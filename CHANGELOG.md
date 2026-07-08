@@ -13,8 +13,20 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-08
+
 ### Changed
 
+- **rsbinder (breaking):** `AccessorSockAddr` gained the `UnixAbstract`
+  variant. The enum is intentionally not `#[non_exhaustive]` (its shape is
+  part of the documented contract), so downstream exhaustive `match`es
+  need a new arm. (#166)
+- **rpc (AOSP alignment):** additional outgoing connections opened by
+  `add_outgoing_connection_android13plus` now carry the session's fd
+  transport mode in the connection header (previously hardcoded to none),
+  matching AOSP `RpcSession::setupOneSocketConnection`; the session id is
+  also validated as exactly 32 bytes up front (`BadValue`) instead of
+  being sent malformed. (#166)
 - **rsbinder-aidl (breaking, AOSP alignment):** expression precedence now
   matches AOSP's C-style grammar — bitwise `|`/`^`/`&` bind looser than
   `==`/`!=` and relational operators. An unparenthesized expression mixing
@@ -100,6 +112,20 @@ This changelog starts at 0.9.0. For earlier releases, see the
   constants render as `&[&str]` (the previous `&[String]` type did not
   accept string-literal initializers); crate-level rustdoc and README
   updated.
+- **rpc:** abstract Unix-domain socket support (Linux/Android):
+  `RpcServer::setup_unix_server_abstract`,
+  `RpcSession::setup_unix_client_abstract` (R34 wire),
+  `setup_unix_client_android13plus_abstract`, and the
+  `AccessorSockAddr::UnixAbstract` variant for accessor addressing.
+  Abstract sockets have no filesystem entry (nothing to unlink) — and no
+  filesystem permissions; see the `setup_unix_server_abstract` rustdoc
+  for the `set_authorizer` guidance. (#166, thanks @qwq233)
+- **rpc:** `RpcUnixClientConfig` builder plus
+  `RpcSession::setup_unix_client_android13plus_with_config` /
+  `add_outgoing_connection_android13plus_with_config`: a single client
+  entry point combining path or abstract addressing, session-id attach,
+  fan-out (`outgoing_connections`), and fd transport mode. The existing
+  `with_id` / `fan_out` helpers delegate to it (wire-identical). (#166)
 
 ### Fixed
 
@@ -248,5 +274,6 @@ A large body of correctness work from multiple review and audit rounds
 - Addressed RUSTSEC-2025-0134 by replacing `rustls-pemfile` with
   `rustls-pki-types`.
 
-[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/hiking90/rsbinder/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hiking90/rsbinder/compare/v0.8.0...v0.9.0

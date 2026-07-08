@@ -78,6 +78,7 @@ enum ServerListener {
 /// kernel reclaims the bind on `Drop` of the listener fd itself).
 enum BindAddress {
     Unix(PathBuf),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     UnixAbstract,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock {
@@ -471,6 +472,15 @@ impl RpcServer {
     /// Bind + listen on a Linux/Android abstract Unix-domain socket.
     /// Abstract sockets have no filesystem entry, so there is no stale
     /// path to remove and no drop-time unlink.
+    ///
+    /// **Security**: unlike a path-bound socket, an abstract socket has
+    /// no filesystem permissions — *any* process in the same network
+    /// namespace can connect (subject only to LSM policy such as
+    /// SELinux). A path-bound [`setup_unix_server`](Self::setup_unix_server)
+    /// can rely on directory modes for access control; an abstract
+    /// server cannot. When exposure matters, install a
+    /// [`set_authorizer`](Self::set_authorizer) hook and check the
+    /// peer identity (uid/gid/pid) it receives.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn setup_unix_server_abstract(name: &[u8]) -> Result<Arc<RpcServer>> {
         let addr = UnixSocketAddr::from_abstract_name(name)?;
@@ -1509,6 +1519,7 @@ impl RpcServer {
     pub fn path(&self) -> Option<&Path> {
         match &self.bind {
             BindAddress::Unix(p) => Some(p.as_path()),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
@@ -1540,6 +1551,7 @@ impl RpcServer {
         match &self.bind {
             BindAddress::Tcp(addr) => Some(*addr),
             BindAddress::Unix(_) => None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
@@ -1578,6 +1590,7 @@ impl Drop for RpcServer {
                 // on the same path doesn't see a stale ENOENT/EADDRINUSE.
                 let _ = std::fs::remove_file(p);
             }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => {}
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
