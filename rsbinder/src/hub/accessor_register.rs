@@ -17,20 +17,27 @@
 //! Cross-platform: the [`Unix`](AccessorSockAddr::Unix) variant is
 //! always present so macOS host hermetic tests can exercise the
 //! register-side path without `rpc-vsock` / `rpc-tcp-debug` features.
-//! `Vsock`/`Inet` variants are present in the type at all times for ABI
-//! stability; whether they can be *connected* is a runtime check
-//! inside the [`AccessorSockAddr::connect_owned_fd`] family of helpers
-//! — feature-disabled variants map to `ERROR_UNSUPPORTED_SOCKET_FAMILY`
-//! so an instance configured for a backend the binary wasn't built with
-//! surfaces as the same AOSP-faithful service-specific error a
-//! wrong-family `addConnection` returns.
+//! Abstract Unix, `Vsock`, and `Inet` variants are present in the type
+//! at all times for ABI stability; whether they can be *connected* is a
+//! runtime check inside the [`AccessorSockAddr::connect_owned_fd`]
+//! family of helpers — unavailable variants map to
+//! `ERROR_UNSUPPORTED_SOCKET_FAMILY` so an instance configured for a
+//! backend the binary/target cannot use surfaces as the same AOSP-
+//! faithful service-specific error a wrong-family `addConnection`
+//! returns.
 
 // cfg lives on the mod decl in super — duplicating here trips
 // clippy::duplicated_attributes.
 
 use std::io;
 use std::net::SocketAddrV4;
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::path::PathBuf;
 
 use crate::error::Result;
@@ -41,11 +48,11 @@ use crate::error::Result;
 /// `sockaddr_vm` / `sockaddr_in`; this enum is the strongly-typed
 /// equivalent.
 ///
-/// All three variants exist regardless of build features so the enum's
-/// shape stays stable across feature flags (matching exhaustively in
+/// All variants exist regardless of build features so the enum's shape
+/// stays stable across feature flags (matching exhaustively in
 /// downstream `match` is therefore predictable). The
 /// `connect_*_owned_fd` helpers gate the *connect path* on the
-/// matching `rpc-vsock`/`rpc-tcp-debug` feature and return
+/// matching target or `rpc-vsock`/`rpc-tcp-debug` feature and return
 /// `ERROR_UNSUPPORTED_SOCKET_FAMILY` otherwise.
 ///
 /// `Debug`/`Clone` are provided so a provider closure can build the
@@ -57,6 +64,9 @@ use crate::error::Result;
 pub enum AccessorSockAddr {
     /// AF_UNIX path. Cross-platform — works on Linux + macOS host.
     Unix(PathBuf),
+    /// AF_UNIX abstract name. Variant is always present for enum-shape
+    /// stability; connect is supported only on Linux / Android.
+    UnixAbstract(Vec<u8>),
     /// AF_VSOCK `(cid, port)`. Only usable when the binary was built
     /// with the `rpc-vsock` feature; otherwise the connect helper
     /// returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
@@ -75,6 +85,7 @@ impl AccessorSockAddr {
     pub fn family_str(&self) -> &'static str {
         match self {
             AccessorSockAddr::Unix(_) => "AF_UNIX",
+            AccessorSockAddr::UnixAbstract(_) => "AF_UNIX",
             AccessorSockAddr::Vsock { .. } => "AF_VSOCK",
             AccessorSockAddr::Inet(_) => "AF_INET",
         }
@@ -108,6 +119,7 @@ impl AccessorSockAddr {
     pub fn connect_owned_fd(&self) -> std::result::Result<OwnedFd, AccessorConnectError> {
         match self {
             AccessorSockAddr::Unix(path) => connect_unix_owned_fd(path),
+            AccessorSockAddr::UnixAbstract(name) => connect_unix_abstract_owned_fd(name),
             AccessorSockAddr::Vsock { cid, port } => connect_vsock_owned_fd(*cid, *port),
             AccessorSockAddr::Inet(addr) => connect_inet_owned_fd(*addr),
         }
@@ -127,7 +139,7 @@ impl AccessorSockAddr {
 pub enum AccessorConnectError {
     /// AOSP `ERROR_UNSUPPORTED_SOCKET_FAMILY` — the address family
     /// either isn't valid (none of `AF_UNIX/AF_VSOCK/AF_INET`) or the
-    /// crate wasn't built with the matching backend feature.
+    /// target / crate features cannot connect that backend.
     UnsupportedFamily,
     /// AOSP `ERROR_FAILED_TO_CREATE_SOCKET` — `socket(2)` failed
     /// before `connect(2)` was even attempted.
@@ -185,6 +197,29 @@ fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, Accesso
         // `socket(2)` is a distinct syscall the helper can inspect.
         Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn connect_unix_abstract_owned_fd(
+    name: &[u8],
+) -> std::result::Result<OwnedFd, AccessorConnectError> {
+    use std::os::unix::net::UnixStream;
+    let addr =
+        UnixSocketAddr::from_abstract_name(name).map_err(AccessorConnectError::ConnectFailed)?;
+    match UnixStream::connect_addr(&addr) {
+        Ok(stream) => Ok(OwnedFd::from(stream)),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(AccessorConnectError::ConnectFailedEacces)
+        }
+        Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn connect_unix_abstract_owned_fd(
+    _name: &[u8],
+) -> std::result::Result<OwnedFd, AccessorConnectError> {
+    Err(AccessorConnectError::UnsupportedFamily)
 }
 
 /// AF_VSOCK connect helper. Behind `rpc-vsock`; when the feature is
@@ -667,9 +702,11 @@ mod tests {
     #[test]
     fn family_str_covers_all_variants() {
         let unix = AccessorSockAddr::Unix(PathBuf::from("/tmp/rsbinder-test-2-14.sock"));
+        let unix_abstract = AccessorSockAddr::UnixAbstract(b"rsbinder-test-2-14".to_vec());
         let vsock = AccessorSockAddr::Vsock { cid: 2, port: 5555 };
         let inet = AccessorSockAddr::Inet("127.0.0.1:5555".parse().expect("addr"));
         assert_eq!(unix.family_str(), "AF_UNIX");
+        assert_eq!(unix_abstract.family_str(), "AF_UNIX");
         assert_eq!(vsock.family_str(), "AF_VSOCK");
         assert_eq!(inet.family_str(), "AF_INET");
     }
@@ -749,6 +786,38 @@ mod tests {
 
         server_handle.join().expect("server join");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn connect_owned_fd_unix_abstract_roundtrips() {
+        use std::io::{Read, Write};
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+
+        let name = format!("rsb_a02_abs_{}", std::process::id()).into_bytes();
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).expect("addr");
+        let listener = UnixListener::bind_addr(&addr).expect("bind");
+        let server_handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1];
+            s.read_exact(&mut buf).expect("read");
+            s.write_all(&buf).expect("write");
+        });
+
+        let fd = AccessorSockAddr::UnixAbstract(name)
+            .connect_owned_fd()
+            .expect("connect");
+        let mut stream = UnixStream::from(fd);
+        stream.write_all(&[0x42]).expect("client write");
+        let mut got = [0u8; 1];
+        stream.read_exact(&mut got).expect("client read");
+        assert_eq!(got, [0x42]);
+
+        drop(stream);
+        server_handle.join().expect("server join");
     }
 
     /// Unix path — connect to a non-existent path surfaces as

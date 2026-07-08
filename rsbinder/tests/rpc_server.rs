@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rsbinder::rpc::{RpcProxy, RpcServer, RpcSession};
+use rsbinder::rpc::{RpcProxy, RpcServer, RpcSession, RpcUnixClientConfig};
 use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
     FIRST_CALL_TRANSACTION,
@@ -285,7 +285,7 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
 struct ServeCleanup {
     server: Arc<RpcServer>,
     bg: Option<std::thread::JoinHandle<()>>,
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
 }
 impl ServeCleanup {
     fn new(
@@ -296,7 +296,7 @@ impl ServeCleanup {
         Self {
             server,
             bg: Some(bg),
-            path,
+            path: Some(path),
         }
     }
 }
@@ -328,7 +328,9 @@ impl Drop for ServeCleanup {
             }
         }
         self.server.join_workers();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -356,6 +358,10 @@ fn real_process_e2e_and_negotiation() {
 
     {
         let client = RpcSession::setup_unix_client(&path).expect("connect");
+        assert!(matches!(
+            client.add_outgoing_connection_android13plus(tmp_sock("r34bad"), 1, &[0u8; 32]),
+            Err(StatusCode::BadType)
+        ));
         // Explicit negotiation, local=8, server advertises 2.
         assert_eq!(client.negotiate(8).expect("negotiate"), 2);
         assert_eq!(client.negotiated_max_threads(), 2);
@@ -376,6 +382,78 @@ fn real_process_e2e_and_negotiation() {
     child.kill().expect("kill server child");
     child.wait().expect("reap server child");
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn real_process_abstract_unix_socket_e2e() {
+    if let Ok(name) = std::env::var("RSB_RPC_ABSTRACT_SERVER") {
+        let server = RpcServer::setup_unix_server_abstract(name.as_bytes()).expect("bind abstract");
+        server.set_android13plus(2);
+        server.set_max_threads(3);
+        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        let _ = server.run();
+        std::process::exit(0);
+    }
+
+    let name = format!("rsb_rpc_abs_proc_{}", std::process::id());
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "real_process_abstract_unix_socket_e2e",
+            "--nocapture",
+        ])
+        .env("RSB_RPC_ABSTRACT_SERVER", &name)
+        .spawn()
+        .expect("spawn abstract server child");
+
+    let client = 'connect: {
+        for _ in 0..400 {
+            if let Ok(c) = RpcSession::setup_unix_client_android13plus_with_config(
+                RpcUnixClientConfig::abstract_name(name.as_bytes(), 2),
+            ) {
+                break 'connect c;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("connect abstract server child");
+    };
+
+    assert_eq!(client.wire_protocol_version(), Some(2));
+    assert_eq!(client.negotiate(8).expect("negotiate"), 3);
+    let sid = client.get_session_id().expect("get_session_id");
+    let attached = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::abstract_name(name.as_bytes(), 2).session_id(&sid),
+    )
+    .expect("attach abstract child session");
+    assert_eq!(attached.get_session_id().expect("attached id"), sid);
+    let root = EchoProxy(attached.get_root().expect("attached get_root"));
+    assert_eq!(root.echo("abstract-process").unwrap(), "abstract-process");
+
+    let fan = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::abstract_name(name.as_bytes(), 2).outgoing_connections(3),
+    )
+    .expect("abstract child fan-out");
+    assert_eq!(fan.negotiated_max_threads(), 3);
+    let root = Arc::new(EchoProxy(fan.get_root().expect("fan get_root")));
+    let t0 = std::time::Instant::now();
+    let handles: Vec<_> = (0..3)
+        .map(|_| {
+            let root = Arc::clone(&root);
+            std::thread::spawn(move || root.slow(150).expect("slow round-trip"))
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("thread");
+    }
+    assert!(
+        t0.elapsed() < Duration::from_millis(420),
+        "abstract fan-out across process must run 3 slow calls in parallel"
+    );
+
+    child.kill().expect("kill abstract server child");
+    child.wait().expect("reap abstract server child");
 }
 
 // ---- concurrency: many threads, ONE shared session ----------------
@@ -766,6 +844,83 @@ fn android13plus_profile_e2e() {
         // is dropped here as the for-loop body scope ends, in the same
         // order the explicit shutdown/join/remove_file ran before.
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn abstract_unix_socket_e2e() {
+    let r34_name = format!("rsb_rpc_abs_r34_{}", std::process::id()).into_bytes();
+    let server = RpcServer::setup_unix_server_abstract(&r34_name).expect("bind abstract r34");
+    assert!(server.path().is_none());
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu_r34 = ServeCleanup {
+        server: Arc::clone(&server),
+        bg: Some(bg),
+        path: None,
+    };
+
+    let client = RpcSession::setup_unix_client_abstract(&r34_name).expect("connect abstract r34");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("abstract-r34").unwrap(), "abstract-r34");
+
+    let a13_name = format!("rsb_rpc_abs_a13_{}", std::process::id()).into_bytes();
+    let server = RpcServer::setup_unix_server_abstract(&a13_name).expect("bind abstract a13");
+    assert!(server.path().is_none());
+    server.set_android13plus(2);
+    server.set_max_threads(2);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu_a13 = ServeCleanup {
+        server: Arc::clone(&server),
+        bg: Some(bg),
+        path: None,
+    };
+
+    let client = RpcSession::setup_unix_client_android13plus_abstract(&a13_name, 2)
+        .expect("connect abstract android13plus");
+    assert_eq!(client.wire_protocol_version(), Some(2));
+    assert_eq!(client.negotiate(8).expect("negotiate"), 2);
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("abstract-a13").unwrap(), "abstract-a13");
+
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    let attached = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::abstract_name(&a13_name, 2).session_id(&sid),
+    )
+    .expect("attach abstract android13plus");
+    assert_eq!(attached.get_session_id().expect("attached id"), sid);
+    assert!(
+        poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
+        "abstract with_id attach shares the founding session"
+    );
+
+    let fan_name = format!("rsb_rpc_abs_fan_{}", std::process::id()).into_bytes();
+    let fan_server = RpcServer::setup_unix_server_abstract(&fan_name).expect("bind fan-out");
+    fan_server.set_android13plus(2);
+    fan_server.set_max_threads(3);
+    fan_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let fan_bg = fan_server.run_background();
+    let _cu_fan = ServeCleanup {
+        server: Arc::clone(&fan_server),
+        bg: Some(fan_bg),
+        path: None,
+    };
+
+    let fan_client = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::abstract_name(&fan_name, 2).outgoing_connections(3),
+    )
+    .expect("abstract fan-out");
+    assert_eq!(fan_client.negotiated_max_threads(), 3);
+    let fan_sid = fan_client.get_session_id().expect("fan-out id");
+    let fan_sid_arr: [u8; 32] = fan_sid.as_slice().try_into().expect("32-byte session id");
+    assert!(
+        poll_until(|| fan_server.session_slot_count(&fan_sid_arr) == Some(3)),
+        "abstract fan-out created founding + 2 attached slots"
+    );
+    let fan_root = EchoProxy(fan_client.get_root().expect("fan get_root"));
+    assert_eq!(fan_root.echo("abstract-fan").unwrap(), "abstract-fan");
 }
 
 /// The decoupled `TlsTransport`
@@ -1323,6 +1478,10 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
 
     let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 3)
         .expect("setupClient fan-out");
+    assert!(matches!(
+        client.add_outgoing_connection_android13plus(tmp_sock("badid"), 1, b"bad"),
+        Err(StatusCode::BadValue)
+    ));
     // `negotiate` was the second step of the helper ⇒ negotiated value
     // is recorded on the session and equals the fan-out pool size.
     assert_eq!(
@@ -1331,6 +1490,14 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
         "helper performed GET_MAX_THREADS and recorded min(local=3, server=3) = 3"
     );
     let sid = client.get_session_id().expect("get_session_id");
+    assert!(matches!(
+        client.add_outgoing_connection_android13plus_with_config(
+            RpcUnixClientConfig::path(&tmp_sock("badfd"), 1)
+                .session_id(&sid)
+                .fd_mode(rsbinder::rpc::FileDescriptorTransportMode::Unix),
+        ),
+        Err(StatusCode::BadValue)
+    ));
     let sid_arr: [u8; 32] = sid
         .as_slice()
         .try_into()

@@ -97,7 +97,7 @@ pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_N
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
-pub use session::RpcSession;
+pub use session::{RpcSession, RpcUnixClientConfig};
 pub use state::RpcState;
 pub use transport::{CertId, PeerIdentity, RpcTransport};
 

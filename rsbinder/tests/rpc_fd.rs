@@ -23,6 +23,7 @@ use std::thread;
 use rsbinder::rpc::transport::MemTransport;
 use rsbinder::rpc::{
     AddressSpace, FileDescriptorTransportMode as FdMode, RpcProxy, RpcServer, RpcSession,
+    RpcUnixClientConfig,
 };
 use rsbinder::{
     Binder, Interface, Parcel, ParcelFileDescriptor, Remotable, Result, SIBinder, Status,
@@ -362,4 +363,39 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         let _ = bg.join();
         let _ = std::fs::remove_file(&path);
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn fd_v1_abstract_unix_roundtrip_arg() {
+    let name = format!("rsb_rpcfd_abs_{}", std::process::id()).into_bytes();
+    let server = RpcServer::setup_unix_server_abstract(&name).expect("bind abstract fd");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_supported_fd_modes(&[FdMode::Unix]);
+    server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+    let bg = server.run_background();
+
+    let client = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::abstract_name(&name, 1)
+            .fd_mode(FdMode::Unix)
+            .outgoing_connections(2),
+    )
+    .expect("abstract fd connect");
+    assert_eq!(client.negotiated_max_threads(), 2);
+    let root = client.get_root().expect("get_root");
+
+    let mut tf = tempfile();
+    tf.write_all(b"abstract-fd").unwrap();
+    tf.rewind().unwrap();
+    let pfd = ParcelFileDescriptor::new(tf);
+    assert_eq!(
+        call_len_of(&root, &pfd).unwrap(),
+        "abstract-fd".len() as i32
+    );
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
 }

@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -43,6 +44,66 @@ use super::{RpcError, RpcResult};
 /// mode, the client-supplied `session_id`, and the
 /// `RPC_CONNECTION_OPTION_INCOMING` flag.
 type Android13PlusAccept = (Box<dyn RpcTransport>, Android13PlusCodec, u8, Vec<u8>, bool);
+
+enum RpcUnixAddr<'a> {
+    Path(&'a Path),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Abstract(&'a [u8]),
+}
+
+/// Unix-domain android-13+ RPC client configuration.
+pub struct RpcUnixClientConfig<'a> {
+    addr: RpcUnixAddr<'a>,
+    max_version: u32,
+    session_id: &'a [u8],
+    outgoing_connections: u32,
+    fd_mode: Option<FileDescriptorTransportMode>,
+}
+
+impl<'a> RpcUnixClientConfig<'a> {
+    fn new(addr: RpcUnixAddr<'a>, max_version: u32) -> Self {
+        Self {
+            addr,
+            max_version,
+            session_id: &[],
+            outgoing_connections: 1,
+            fd_mode: None,
+        }
+    }
+
+    pub fn path(path: &'a Path, max_version: u32) -> Self {
+        Self::new(RpcUnixAddr::Path(path), max_version)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn abstract_name(name: &'a [u8], max_version: u32) -> Self {
+        Self::new(RpcUnixAddr::Abstract(name), max_version)
+    }
+
+    pub fn session_id(mut self, session_id: &'a [u8]) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    pub fn outgoing_connections(mut self, n: u32) -> Self {
+        self.outgoing_connections = n;
+        self
+    }
+
+    pub fn fd_mode(mut self, mode: FileDescriptorTransportMode) -> Self {
+        self.fd_mode = Some(mode);
+        self
+    }
+
+    fn connect(&self) -> Result<super::transport::UnixTransport> {
+        match &self.addr {
+            RpcUnixAddr::Path(path) => super::transport::UnixTransport::connect(path),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            RpcUnixAddr::Abstract(name) => super::transport::UnixTransport::connect_abstract(name),
+        }
+        .map_err(StatusCode::from)
+    }
+}
 
 /// Which RPC wire profile a session speaks.
 ///
@@ -2572,6 +2633,13 @@ impl RpcSession {
         RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
     }
 
+    /// Client: connect to a Linux/Android abstract Unix-domain RPC server.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_unix_client_abstract(name: &[u8]) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect_abstract(name)?;
+        RpcSession::new(Box::new(t), AddressSpace::Initiator).map_err(StatusCode::from)
+    }
+
     /// Client: connect to a Unix-domain RPC server speaking the
     /// **android-13+ versioned wire**. Connects
     /// the UDS, then runs the AOSP handshake via
@@ -2583,6 +2651,17 @@ impl RpcSession {
         max_version: u32,
     ) -> Result<RpcSession> {
         let t = super::transport::UnixTransport::connect(path)?;
+        RpcSession::connect_android13plus(Box::new(t), max_version)
+    }
+
+    /// Client: connect to a Linux/Android abstract Unix-domain RPC
+    /// server speaking the **android-13+ versioned wire**.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn setup_unix_client_android13plus_abstract(
+        name: &[u8],
+        max_version: u32,
+    ) -> Result<RpcSession> {
+        let t = super::transport::UnixTransport::connect_abstract(name)?;
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 
@@ -2645,13 +2724,45 @@ impl RpcSession {
         max_version: u32,
         session_id: &[u8],
     ) -> Result<RpcSession> {
-        let t = super::transport::UnixTransport::connect(path)?;
-        RpcSession::connect_android13plus_fd_with_id(
-            Box::new(t),
-            max_version,
-            FileDescriptorTransportMode::None,
-            session_id,
+        Self::setup_unix_client_android13plus_with_config(
+            RpcUnixClientConfig::path(path.as_ref(), max_version).session_id(session_id),
         )
+    }
+
+    /// Client: connect to a Unix-domain android-13+ server using a config object.
+    pub fn setup_unix_client_android13plus_with_config(
+        config: RpcUnixClientConfig,
+    ) -> Result<RpcSession> {
+        let local = config.outgoing_connections.max(1);
+        if local > 1 && !config.session_id.is_empty() {
+            return Err(StatusCode::BadValue);
+        }
+
+        let session = RpcSession::connect_android13plus_fd_with_id(
+            Box::new(config.connect()?),
+            config.max_version,
+            config.fd_mode.unwrap_or(FileDescriptorTransportMode::None),
+            config.session_id,
+        )?;
+        if local == 1 {
+            return Ok(session);
+        }
+
+        let negotiated = session.negotiate(local)?;
+        if negotiated <= 1 {
+            return Ok(session);
+        }
+        let session_id = session.get_session_id()?;
+        let fd_mode = session.fd_transport_mode();
+        for _ in 1..negotiated {
+            session.add_outgoing_connection_android13plus_transport(
+                || config.connect(),
+                config.max_version,
+                &session_id,
+                fd_mode,
+            )?;
+        }
+        Ok(session)
     }
 
     /// Client multi-outgoing: open one *additional*
@@ -2675,6 +2786,38 @@ impl RpcSession {
         max_version: u32,
         session_id: &[u8],
     ) -> Result<u64> {
+        self.add_outgoing_connection_android13plus_with_config(
+            RpcUnixClientConfig::path(path.as_ref(), max_version).session_id(session_id),
+        )
+    }
+
+    /// Client multi-outgoing using a [`RpcUnixClientConfig`].
+    pub fn add_outgoing_connection_android13plus_with_config(
+        &self,
+        config: RpcUnixClientConfig,
+    ) -> Result<u64> {
+        if config.outgoing_connections.max(1) != 1 || config.session_id.len() != 32 {
+            return Err(StatusCode::BadValue);
+        }
+        let fd_mode = self.fd_transport_mode();
+        if config.fd_mode.is_some_and(|mode| mode != fd_mode) {
+            return Err(StatusCode::BadValue);
+        }
+        self.add_outgoing_connection_android13plus_transport(
+            || config.connect(),
+            config.max_version,
+            config.session_id,
+            fd_mode,
+        )
+    }
+
+    fn add_outgoing_connection_android13plus_transport(
+        &self,
+        connect: impl FnOnce() -> Result<super::transport::UnixTransport>,
+        max_version: u32,
+        session_id: &[u8],
+        fd_mode: FileDescriptorTransportMode,
+    ) -> Result<u64> {
         // Profile uniformity (AOSP requires same version across a
         // session). Refuse R34 / a higher caller-supplied `max_version`
         // **before** the handshake so a mismatch doesn't burn a server
@@ -2695,10 +2838,15 @@ impl RpcSession {
             WireProfile::R34(_) => return Err(StatusCode::BadType),
         };
         let effective_max = max_version.min(session_version);
-        let t = super::transport::UnixTransport::connect(path)?;
+        let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
+            FD_MODE_UNIX
+        } else {
+            FD_MODE_NONE
+        };
+        let t = connect()?;
         let codec = {
             let mut io = RawTransportIo(&t);
-            client_connect_with_id(&mut io, effective_max, false, FD_MODE_NONE, session_id)
+            client_connect_with_id(&mut io, effective_max, false, hdr_fd_mode, session_id)
                 .map_err(StatusCode::from)?
         };
         if codec.version() != session_version {
@@ -2753,36 +2901,10 @@ impl RpcSession {
         max_version: u32,
         local_max_outgoing: u32,
     ) -> Result<RpcSession> {
-        // Borrow the path once for the founding connect; clone to
-        // `PathBuf` to drive the fan-out loop without forcing
-        // `impl AsRef<Path> + Clone` on the caller (each
-        // `add_outgoing_connection_android13plus` takes a fresh
-        // `impl AsRef<Path>`).
-        let path: std::path::PathBuf = path.as_ref().to_owned();
-        let session = Self::setup_unix_client_android13plus(&path, max_version)?;
-        let local = local_max_outgoing.max(1);
-        if local == 1 {
-            // Single-connection: skip GET_MAX_THREADS entirely so the
-            // wire is bit-identical to the founding-only helper.
-            return Ok(session);
-        }
-        // `negotiate(local)` exchanges GET_MAX_THREADS, records the
-        // `min(local, remote)` on the session, and returns that exact
-        // value — which is AOSP `setupClient`'s `outgoingConnections`
-        // by construction (it computes the same `min` then mints the
-        // pool against it).
-        let negotiated = session.negotiate(local)?;
-        if negotiated <= 1 {
-            return Ok(session);
-        }
-        let session_id = session.get_session_id()?;
-        // `1..negotiated` ⇒ exactly `negotiated - 1` extras; the
-        // founding connection counts as the first slot. AOSP loop:
-        // `for (i = 0; i + 1 < outgoingConnections; i++)`.
-        for _ in 1..negotiated {
-            session.add_outgoing_connection_android13plus(&path, max_version, &session_id)?;
-        }
-        Ok(session)
+        Self::setup_unix_client_android13plus_with_config(
+            RpcUnixClientConfig::path(path.as_ref(), max_version)
+                .outgoing_connections(local_max_outgoing),
+        )
     }
 
     /// Client: connect to a Unix-domain android-13+ RPC server **with

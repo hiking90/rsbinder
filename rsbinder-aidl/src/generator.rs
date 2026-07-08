@@ -1116,7 +1116,7 @@ pub mod {mod} {{
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     pub type {name} = {rust_type};
 }}
-"#, mod = &decl.name, name = &decl.name, rust_type = &decl.rust_type);
+"#, mod = decl.name, name = decl.name, rust_type = decl.rust_type);
             return Ok(add_indent(indent, rendered.trim()));
         }
 
