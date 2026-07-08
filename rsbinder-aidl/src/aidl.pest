@@ -33,11 +33,10 @@ interface_decl = {
     ONEWAY* ~ INTERFACE ~ qualified_name ~ "{" ~ interface_members? ~ "}"
 }
 
-interface_members = {
-    method_decl ~ interface_members* |
-    constant_decl ~ interface_members* |
-    decl ~ interface_members*
-}
+// Iterative like `parcelable_members`; a per-member recursive rule would
+// overflow the stack on interfaces with a few thousand methods, bypassing
+// the bracket-based `check_nesting_depth` guard.
+interface_members = { (method_decl | constant_decl | decl)+ }
 
 constant_decl = {
     annotation_list* ~ CONST ~ type ~ identifier ~ "=" ~ const_expr ~ ";"
@@ -136,31 +135,28 @@ constant_value_list = { const_expr ~ ("," ~ const_expr)* ~ ","? }
 
 const_expr = {
     "{" ~ constant_value_list? ~ "}" |
-    CHARVALUE | expression | string_expr
+    CHARVALUE | expression
 }
 
-string_expr = { string_term ~ ("+" ~ string_term)* }
-string_term = { C_STR | qualified_name }
-
+// Precedence matches AOSP's C-style yacc levels (aidl_language_y.yy):
+// || < && < | < ^ < & < (== !=) < (< > <= >=) < (<< >>) < (+ -) < (* / %).
+// Bitwise operators bind LOOSER than comparisons, so `a & M == M` folds to
+// the same constant as AOSP's aidl.
 expression = { logical_or ~ (logical_or_op ~ logical_or)* }
 logical_or_op = { LOGICAL_OR }
 logical_or = { logical_and ~ (logical_and_op ~ logical_and)* }
 logical_and_op = { LOGICAL_AND }
-logical_and = { equality ~ (equality_op ~ equality)* }
-
-equality_op = { EQUALITY | NEQ }
-equality = { comparison ~ (comparison_op ~ comparison)* }
-comparison_op = { LEQ | GEQ | LT | GT }
-comparison = { bitwise_or ~ (bitwise_or_op ~ bitwise_or)* }
-// In Android's AIDL parser, bitwise operators have lower precedence than comparison operators.
-// However, in rsbinder, bitwise operators are defined to have higher precedence,
-// consistent with other programming languages.
+logical_and = { bitwise_or ~ (bitwise_or_op ~ bitwise_or)* }
 bitwise_or_op = { "|" }
 bitwise_or = { bitwise_xor ~ (bitwise_xor_op ~ bitwise_xor)* }
 bitwise_xor_op = { "^" }
 bitwise_xor = { bitwise_and ~ (bitwise_and_op ~ bitwise_and)* }
 bitwise_and_op = { "&" }
-bitwise_and = { shift ~ (shift_op ~ shift)* }
+bitwise_and = { equality ~ (equality_op ~ equality)* }
+equality_op = { EQUALITY | NEQ }
+equality = { comparison ~ (comparison_op ~ comparison)* }
+comparison_op = { LEQ | GEQ | LT | GT }
+comparison = { shift ~ (shift_op ~ shift)* }
 shift_op = { LSHIFT | RSHIFT }
 shift = { arith ~ (arith_op ~ arith)* }
 arith_op = { "+" | "-" }
@@ -170,9 +166,12 @@ factor = { "(" ~ expression ~ ")" | unary | value }
 unary = { unary_op ~ factor }
 unary_op = { "+" | "-" | "!" | "~" }
 
+// C_STR participates in the ordinary expression grammar (AOSP has a single
+// expression grammar): `A + "y"` and parenthesized concat chains parse here;
+// type mixing is rejected at const-expr evaluation, exactly as AOSP does.
 value = {
     TRUE_LITERAL | FALSE_LITERAL | HEXVALUE | FLOATVALUE | INTVALUE |
-    qualified_name
+    C_STR | qualified_name
 }
 
 ANNOTATION = @{ "@" ~ identifier }
@@ -230,7 +229,9 @@ LT = @{ !"<<" ~ "<" }
 GT = @{ !">>" ~ ">" }
 
 LONG_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
-LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n" }
+// A `//` comment may be terminated by end-of-input as well as a newline —
+// a file whose last line is a comment without a trailing newline is valid.
+LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 COMMENT = _{ LONG_COMMENT | LINE_COMMENT }
 WHITESPACE = _{ (" " | "\t" | "\r" | "\n")+ }
 

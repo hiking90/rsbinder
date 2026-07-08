@@ -1,7 +1,53 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-// #[macro_use]
-// extern crate lazy_static;
+
+//! AIDL compiler for [rsbinder](https://crates.io/crates/rsbinder).
+//!
+//! Translates Android AIDL (`.aidl`) files into Rust source implementing the
+//! binder interfaces, parcelables, unions, and enums they declare. It is
+//! intended to be driven from a `build.rs` via [`Builder`]:
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//!
+//! rsbinder_aidl::Builder::new()
+//!     .source(PathBuf::from("aidl/hello/IHello.aidl")) // a file or a directory
+//!     .output(PathBuf::from("hello.rs"))               // under OUT_DIR
+//!     .generate()
+//!     .unwrap_or_else(|err| {
+//!         // miette renders the file/line/snippet diagnostics.
+//!         eprintln!("{:?}", miette::Report::new(err));
+//!         std::process::exit(1);
+//!     });
+//! ```
+//!
+//! The consuming crate then includes the generated module with rsbinder's
+//! `include_aidl!` macro:
+//!
+//! ```text
+//! rsbinder::include_aidl!("hello", crate::hello::IHello::*);
+//! ```
+//!
+//! # Builder options
+//!
+//! - [`Builder::source`] — add a `.aidl` file, or a directory scanned
+//!   recursively for `*.aidl`. May be called multiple times.
+//! - [`Builder::include_dir`] — add an import search directory (AOSP `-I`
+//!   equivalent). All directories (user-supplied first, then package-derived
+//!   ones inferred from parsed sources) are scanned deterministically; an
+//!   import that resolves under more than one directory is rejected as
+//!   ambiguous, matching AOSP.
+//! - [`Builder::output`] — the generated file name, written under
+//!   `OUT_DIR` (falls back to `aidl_gen/` outside cargo).
+//! - [`Builder::version`] / [`Builder::hash`] — stamp the **most recently
+//!   added file source** with stable-AIDL version metadata (AOSP
+//!   `aidl --version N --hash <s>` equivalent), emitting
+//!   `getInterfaceVersion()` / `getInterfaceHash()` meta methods.
+//! - [`Builder::set_async_support`] — also emit `.await`-able async
+//!   client/server traits (defaults to the crate's `async` feature).
+//!
+//! Compatibility notes, supported AIDL constructs, and diagnostics examples
+//! live in the repository README and <https://hiking90.github.io/rsbinder/>.
 
 use miette::{NamedSource, SourceSpan};
 use std::collections::{HashMap, HashSet};
@@ -186,6 +232,9 @@ impl Default for Builder {
 impl Builder {
     pub fn new() -> Self {
         parser::reset();
+        // Each Builder starts from the default `rsbinder::` prefix; a
+        // previous Builder's `set_crate_support(true)` must not leak in.
+        type_generator::set_crate_support(false);
         Self {
             sources: Vec::new(),
             includes: Vec::new(),
@@ -224,6 +273,14 @@ impl Builder {
             .last()
             .cloned()
             .expect("Builder::version() called before any source()");
+        // Version metadata is keyed by the exact file path; a directory
+        // source expands to individual files that would never match the key,
+        // silently dropping the version.
+        assert!(
+            !last.is_dir(),
+            "Builder::version() applies to a single .aidl file source, but the preceding \
+             source() is a directory: {last:?}"
+        );
         self.version_meta.entry(last).or_default().version = Some(v);
         self
     }
@@ -241,6 +298,12 @@ impl Builder {
             .last()
             .cloned()
             .expect("Builder::hash() called before any source()");
+        // See `version()`: directory sources never match the per-file key.
+        assert!(
+            !last.is_dir(),
+            "Builder::hash() applies to a single .aidl file source, but the preceding \
+             source() is a directory: {last:?}"
+        );
         self.version_meta.entry(last).or_default().hash = Some(h.into());
         self
     }
@@ -355,11 +418,19 @@ impl Builder {
     ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
-        let initial_includes = take(&mut self.includes);
-        for dir in &initial_includes {
-            self.dependencies.push(dir.clone());
+        // `includes` keeps insertion order (user `include_dir()`s first,
+        // package-derived directories after) so the scan is deterministic;
+        // an import found under more than one directory is rejected as
+        // ambiguous, matching AOSP `import_resolver.cpp` ("Duplicate files
+        // found").
+        let mut includes: Vec<PathBuf> = Vec::new();
+        let mut include_seen: HashSet<PathBuf> = HashSet::new();
+        for dir in take(&mut self.includes) {
+            if include_seen.insert(dir.clone()) {
+                self.dependencies.push(dir.clone());
+                includes.push(dir);
+            }
         }
-        let mut includes = initial_includes.into_iter().collect::<HashSet<_>>();
         let mut document_list = Vec::new();
         let mut errors = Vec::new();
 
@@ -388,7 +459,8 @@ impl Builder {
                                 .as_ref()
                                 .and_then(|p| strip_package(path.parent()?, p))
                             {
-                                if includes.insert(dir.clone()) {
+                                if include_seen.insert(dir.clone()) {
+                                    includes.push(dir.clone());
                                     self.dependencies.push(dir);
                                 }
                             }
@@ -407,33 +479,55 @@ impl Builder {
                                 }
                                 let rel_path =
                                     PathBuf::from(import.replace('.', "/")).with_extension("aidl");
-                                let mut found = false;
-                                for include_dir in &includes {
-                                    let path = include_dir.join(&rel_path);
-                                    if path.exists() {
-                                        sources.push(path);
-                                        found = true;
-                                        break;
-                                    }
-                                }
+                                let mut candidates: Vec<PathBuf> = includes
+                                    .iter()
+                                    .map(|dir| dir.join(&rel_path))
+                                    .filter(|p| p.exists())
+                                    .collect();
 
-                                if !found {
-                                    // The exact byte offset of an import statement is not preserved in the AST,
-                                    // so search the source text for the import string to approximate the span.
+                                // The exact byte offset of an import statement
+                                // is not preserved in the AST, so search the
+                                // source text for the import string to
+                                // approximate the diagnostic span.
+                                let import_span = || {
                                     let source_text = fs::read_to_string(&path).unwrap_or_default();
-                                    let import_offset = source_text.find(import).unwrap_or(0);
-                                    let import_len =
-                                        if import_offset > 0 { import.len() } else { 0 };
-                                    errors.push(AidlError::from(
-                                        error::ResolutionError::ImportNotFound {
-                                            import: import.clone(),
-                                            src: NamedSource::new(
-                                                path.to_string_lossy().as_ref(),
-                                                source_text,
-                                            ),
-                                            span: SourceSpan::new(import_offset.into(), import_len),
-                                        },
-                                    ));
+                                    let offset = source_text.find(import).unwrap_or(0);
+                                    let len = if offset > 0 { import.len() } else { 0 };
+                                    (
+                                        NamedSource::new(
+                                            path.to_string_lossy().as_ref(),
+                                            source_text,
+                                        ),
+                                        SourceSpan::new(offset.into(), len),
+                                    )
+                                };
+                                match candidates.len() {
+                                    1 => sources.push(candidates.pop().expect("len checked")),
+                                    0 => {
+                                        let (src, span) = import_span();
+                                        errors.push(AidlError::from(
+                                            error::ResolutionError::ImportNotFound {
+                                                import: import.clone(),
+                                                src,
+                                                span,
+                                            },
+                                        ));
+                                    }
+                                    _ => {
+                                        let (src, span) = import_span();
+                                        errors.push(AidlError::from(
+                                            error::ResolutionError::AmbiguousImport {
+                                                import: import.clone(),
+                                                candidates: candidates
+                                                    .iter()
+                                                    .map(|p| p.display().to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(", "),
+                                                src,
+                                                span,
+                                            },
+                                        ));
+                                    }
                                 }
                             }
 
@@ -483,6 +577,33 @@ impl Builder {
 
     pub fn generate(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
+        // No documents means no `.source()` calls, or only directories with
+        // no `.aidl` files in them — almost certainly a build-script typo.
+        // Writing an empty output file would defer the failure to a confusing
+        // "unresolved import" at the include_aidl! site.
+        if documents.is_empty() {
+            return Err(AidlError::Config {
+                message: "no .aidl sources found: add Builder::source(<file-or-dir>) entries \
+                          (directories are scanned recursively for *.aidl)"
+                    .into(),
+            });
+        }
+        // `version()`/`hash()` metadata is keyed by the exact source path;
+        // an entry that matches no parsed file would silently emit an
+        // unversioned interface.
+        for meta_path in self.version_meta.keys() {
+            if !documents
+                .iter()
+                .any(|doc| Path::new(&doc.2.filename) == meta_path)
+            {
+                return Err(AidlError::Config {
+                    message: format!(
+                        "version()/hash() was applied to source {meta_path:?}, which is not \
+                         among the parsed .aidl files"
+                    ),
+                });
+            }
+        }
         self.emit_rerun_if_changed();
         Self::emit_warnings(&documents);
 

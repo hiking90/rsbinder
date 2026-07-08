@@ -32,6 +32,13 @@ pub enum AidlError {
     #[diagnostic(code(aidl::template_error))]
     Template { message: String },
 
+    /// A [`Builder`](crate::Builder) misconfiguration detected without any
+    /// I/O having failed (e.g. `generate()` with no sources, version
+    /// metadata that matches no parsed file).
+    #[error("builder configuration error: {message}")]
+    #[diagnostic(code(aidl::config_error))]
+    Config { message: String },
+
     /// Aggregates multiple errors when processing several AIDL files
     #[error("{} error(s) occurred during AIDL compilation", errors.len())]
     #[diagnostic(code(aidl::multiple_errors))]
@@ -315,6 +322,23 @@ pub enum ResolutionError {
         #[source_code]
         src: NamedSource<String>,
         #[label("referenced here")]
+        span: SourceSpan,
+    },
+
+    /// The same import resolves under more than one include directory.
+    /// Mirrors AOSP `import_resolver.cpp` ("Duplicate files found") — picking
+    /// one silently could compile a stale copy of the type.
+    #[error("import '{import}' found in multiple include directories: {candidates}")]
+    #[diagnostic(
+        code(aidl::ambiguous_import),
+        help("remove the stale copy or drop one of the overlapping include_dir() entries")
+    )]
+    AmbiguousImport {
+        import: String,
+        candidates: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("imported here")]
         span: SourceSpan,
     },
 }

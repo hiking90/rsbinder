@@ -39,6 +39,12 @@ macro_rules! __declare_binder_interface {
                 fn as_sync(&self) -> &dyn $interface;
                 #[allow(dead_code)]
                 fn as_async(&self) -> &dyn $native_async;
+                /// `Some` only for an async-backed service; `None` for a
+                /// sync-only one. Lets the async [`$crate::FromIBinder`] cast
+                /// reject a sync-only local binder up front instead of letting
+                /// [`Self::as_async`] panic when a method is later called.
+                #[allow(dead_code)]
+                fn try_as_async(&self) -> Option<&dyn $native_async>;
             }
 
             pub struct $native(Box<dyn $native_adapter + Send + Sync + 'static>);
@@ -67,8 +73,12 @@ macro_rules! __declare_binder_interface {
                     {
                         fn as_sync(&self) -> &dyn $interface { &self._inner }
                         fn as_async(&self) -> &dyn $native_async {
+                            // Unreachable: the async `FromIBinder` cast gates on
+                            // `try_as_async()` (below) and refuses a sync-only
+                            // native, so no `dyn Async` handle ever reaches here.
                             unreachable!("{} doesn't support async interface.", stringify!($interface))
                         }
+                        fn try_as_async(&self) -> Option<&dyn $native_async> { None }
                     }
                     let binder = $crate::native::Binder::new_with_stability_and_features(
                         $native(Box::new(Wrapper {_inner: inner})),
@@ -103,7 +113,16 @@ macro_rules! __declare_binder_interface {
                         None => {
                             match $crate::native::Binder::<$native>::try_from(ibinder) {
                                 Ok(native) => {
-                                    Ok($crate::Strong::new(Box::new(native.clone())))
+                                    // A local binder can back the async view only if it
+                                    // was published as an async service. A sync-only
+                                    // service's adapter answers `None` here, so reject
+                                    // the cast now rather than panic in `as_async()` at
+                                    // the first method call (AOSP returns `BadType` too).
+                                    if native.0.try_as_async().is_some() {
+                                        Ok($crate::Strong::new(Box::new(native.clone())))
+                                    } else {
+                                        Err($crate::StatusCode::BadType)
+                                    }
                                 }
                                 Err(err) => Err(err),
                             }

@@ -33,6 +33,10 @@ fn setup() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_add_service() -> rsbinder::Result<()> {
     setup();
 
@@ -58,6 +62,10 @@ fn test_add_service() -> rsbinder::Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_get_check_list_service() -> rsbinder::Result<()> {
     setup();
 
@@ -84,6 +92,10 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_notifications() -> rsbinder::Result<()> {
     setup();
 
@@ -125,6 +137,10 @@ fn test_notifications() -> rsbinder::Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_others() -> rsbinder::Result<()> {
     setup();
 

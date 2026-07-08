@@ -921,4 +921,77 @@ mod tests {
         let got: String = p.read::<String>().unwrap();
         assert_eq!(got, s);
     }
+
+    /// The generic `DeserializeArray::deserialize_array` default — the path
+    /// taken by `String` / `bool` / parcelable elements, distinct from the
+    /// `u8` / `u16` fast paths in `parcel.rs` — must also distinguish a null
+    /// array (`-1`) from an empty one (`0`) and reject other negatives. A
+    /// non-null `Vec<T>` rejects null; an `Option<Vec<T>>` maps `0` to
+    /// `Some(empty)`, not `None`.
+    #[test]
+    fn generic_vec_deserialize_rejects_null_but_accepts_empty() {
+        let mut p = Parcel::new();
+        p.write(&-1i32).unwrap(); // null
+        p.write(&-1i32).unwrap(); // null
+        p.write(&0i32).unwrap(); // empty
+        p.write(&0i32).unwrap(); // empty
+        p.write(&-2i32).unwrap(); // malformed
+        p.set_data_position(0);
+
+        assert_eq!(p.read::<Vec<String>>(), Err(StatusCode::UnexpectedNull));
+        assert_eq!(p.read::<Option<Vec<String>>>(), Ok(None));
+        assert_eq!(p.read::<Vec<String>>(), Ok(Vec::new()));
+        assert_eq!(p.read::<Option<Vec<String>>>(), Ok(Some(Vec::new())));
+        assert_eq!(p.read::<Vec<String>>(), Err(StatusCode::UnexpectedNull));
+    }
+
+    /// The default `DeserializeOption::deserialize_option` (used by primitive
+    /// `Option<T>` such as `Option<i32>`) accepts only `0` (null) / `1`
+    /// (present); any other sentinel is `UnexpectedNull`, matching AOSP's
+    /// `readData(Parcelable*)` `present != kNonNullParcelableFlag`.
+    #[test]
+    fn default_option_rejects_garbage_sentinel() {
+        let mut p = Parcel::new();
+        p.write(&NULL_PARCELABLE_FLAG).unwrap(); // 0 → None
+        p.write(&NON_NULL_PARCELABLE_FLAG).unwrap(); // 1 → present
+        p.write(&42i32).unwrap(); //     payload
+        p.write(&2i32).unwrap(); // garbage sentinel
+        p.set_data_position(0);
+
+        assert_eq!(p.read::<Option<i32>>(), Ok(None));
+        assert_eq!(p.read::<Option<i32>>(), Ok(Some(42)));
+        assert_eq!(p.read::<Option<i32>>(), Err(StatusCode::UnexpectedNull));
+    }
+
+    /// The `impl_deserialize_for_parcelable!` macro — the code path real
+    /// AIDL-generated parcelables use — must reject a presence sentinel other
+    /// than `0` / `1`, just like the trait defaults above.
+    #[test]
+    fn macro_parcelable_rejects_garbage_sentinel() {
+        #[derive(Default, Debug, PartialEq)]
+        struct Tiny {
+            x: i32,
+        }
+        impl Parcelable for Tiny {
+            fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
+                parcel.write(&self.x)
+            }
+            fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
+                self.x = parcel.read()?;
+                Ok(())
+            }
+        }
+        crate::impl_deserialize_for_parcelable!(Tiny);
+
+        let mut p = Parcel::new();
+        p.write(&NON_NULL_PARCELABLE_FLAG).unwrap(); // 1 → present
+        p.write(&7i32).unwrap(); //     payload
+        p.write(&NULL_PARCELABLE_FLAG).unwrap(); // 0 → None
+        p.write(&2i32).unwrap(); // garbage sentinel
+        p.set_data_position(0);
+
+        assert_eq!(p.read::<Tiny>(), Ok(Tiny { x: 7 }));
+        assert_eq!(p.read::<Option<Tiny>>(), Ok(None));
+        assert_eq!(p.read::<Option<Tiny>>(), Err(StatusCode::UnexpectedNull));
+    }
 }

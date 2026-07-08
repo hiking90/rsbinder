@@ -327,14 +327,15 @@ fn test_unresolvable_const_reference_is_diagnostic() {
         );
     }
 
-    // A *circular* reference is still handled gracefully (it resolves to a
-    // neutral 0 via cycle-breaking, not a hard error) — distinct code path.
+    // A *circular* reference has no well-defined value: AOSP hard-fails, and
+    // folding to a neutral 0 would silently bake a fabricated constant into
+    // the generated IPC code. It must be a diagnostic too.
     let circular = test_aidl_generation(
         "package test.c;\ninterface IFoo { const int A = B; const int B = A; }",
     );
     assert!(
-        circular.is_ok(),
-        "circular reference must degrade gracefully, got: {circular:?}"
+        circular.is_err(),
+        "circular constant reference must be a diagnostic, got: {circular:?}"
     );
 }
 
@@ -392,6 +393,63 @@ fn test_rust_keyword_type_names_are_escaped() {
     );
     // An ordinary (non-keyword) name is untouched — no spurious escaping.
     assert!(xref.contains("pub mod Holder"), "got:\n{xref}");
+}
+
+#[test]
+fn test_enum_discriminant_eval_failure_is_diagnostic() {
+    // `A = 1/0` previously fell through `if let Ok` into the auto-increment
+    // counter and generated `A = 0` — a silently wrong wire discriminant.
+    // AOSP rejects the expression at build time.
+    let result = test_aidl_generation("package test.e;\nenum E { A = 1/0 }");
+    assert!(
+        result.is_err(),
+        "enum discriminant with failing evaluation must error, got: {result:?}"
+    );
+
+    // A later auto-increment member is poisoned by the earlier failure and
+    // must not silently receive a fabricated value either.
+    let result = test_aidl_generation("package test.e;\nenum E { A = 1/0, B }");
+    assert!(
+        result.is_err(),
+        "auto-increment after failing discriminant must error, got: {result:?}"
+    );
+}
+
+#[test]
+fn test_enum_discriminant_unresolved_reference_is_diagnostic() {
+    // `A = foo.Missing.X` previously resolved through the current-declaration
+    // lookup fallback (or stayed an unresolved Name and was skipped) and
+    // generated `A = 0`. AOSP rejects the reference at build time.
+    let result = test_aidl_generation("package test.e;\nenum E { A = foo.Missing.X }");
+    assert!(
+        result.is_err(),
+        "enum discriminant with unresolvable reference must error, got: {result:?}"
+    );
+}
+
+#[test]
+fn test_enum_discriminant_circular_reference_is_diagnostic() {
+    // `enum E { A = B, B = A }` previously generated the fabricated values
+    // A=1, B=1. A discriminant cycle has no well-defined value; AOSP errors.
+    let result = test_aidl_generation("package test.e;\nenum E { A = B, B = A }");
+    assert!(
+        result.is_err(),
+        "circular enum discriminants must error, got: {result:?}"
+    );
+}
+
+#[test]
+fn test_phantom_package_type_is_diagnostic_not_self_reference() {
+    // A field typed as `<missing-package>.P` where the simple name equals the
+    // enclosing parcelable previously resolved to the parcelable itself via
+    // the lookup fallback and generated a self-referential `Box<P>` field.
+    let result = test_aidl_generation("package test.p;\nparcelable P { no.such.pkg.P other; }");
+    let err = result.expect_err("phantom package type must produce an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no.such.pkg.P"),
+        "expected UnknownType diagnostic naming the phantom type, got: {msg}"
+    );
 }
 
 #[test]

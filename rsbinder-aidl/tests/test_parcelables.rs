@@ -590,7 +590,7 @@ pub mod StructuredParcelable {
                 r#floatDefaultsToPi: 3.14f32,
                 r#doubleWithDefault: -314000000000000000f64,
                 r#arrayDefaultsTo123: vec![1,2,3,],
-                r#arrayDefaultsToEmpty: Default::default(),
+                r#arrayDefaultsToEmpty: vec![],
                 r#boolDefault: Default::default(),
                 r#byteDefault: Default::default(),
                 r#intDefault: Default::default(),
@@ -907,7 +907,7 @@ pub mod Union {
     pub const r#S1: &str = "a string constant in union";
     impl Default for r#Union {
         fn default() -> Self {
-            Self::Ns(Default::default())
+            Self::Ns(vec![])
         }
     }
     impl rsbinder::Parcelable for r#Union {

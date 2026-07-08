@@ -137,17 +137,17 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
             let _aidl_data = self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
         }
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
             let _aidl_data = self.build_parcel_RepeatNullableIntArray(_arg_input)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             let _aidl_data = self.build_parcel_FillOutStructuredParcelable(_arg_parcel)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
         }
     }
@@ -383,7 +383,7 @@ pub mod FixedSizeArrayExample {
         impl IRepeatFixedSizeArray for BpRepeatFixedSizeArray {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 let _aidl_data = self.build_parcel_Repeat2dParcelables(_arg_input, _arg_repeated)?;
-                let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF);
+                let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
                 self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
             }
         }

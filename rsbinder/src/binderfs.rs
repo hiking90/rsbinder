@@ -75,6 +75,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
     fn test_add_device() {
         let driver = Path::new("/dev/binder");
         let name = "rsbinder";

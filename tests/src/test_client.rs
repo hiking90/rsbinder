@@ -78,6 +78,10 @@ fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
 /// (`rpc::{Host, Broker}`). Both drive the same `Registry`/`Broker`
 /// traits, so registration/lookup code is written once.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_facade_kernel_broker_parity() {
     use rsbinder::service::{kernel, Broker as _};
     init_test();
@@ -96,6 +100,10 @@ fn test_facade_kernel_broker_parity() {
 /// started the thread pool, so the `onRegistration` callback path is
 /// serviceable even when the slow path is taken.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_wait_for_interface_resolves_running_service() {
     init_test();
     let service: rsbinder::Strong<dyn ITestService::ITestService> =
@@ -108,12 +116,39 @@ fn test_wait_for_interface_resolves_running_service() {
 /// (AOSP `interface_cast(check_service(name))`). The test service is already
 /// registered, so it resolves immediately to a functional binder.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_check_interface_resolves_running_service() {
     init_test();
     let service: rsbinder::Strong<dyn ITestService::ITestService> =
         hub::check_interface(<BpTestService as ITestService::ITestService>::descriptor())
             .expect("check_interface must resolve the running test service");
     assert_eq!(service.RepeatString("check"), Ok("check".to_string()));
+}
+
+/// Casting a *sync-only* local service to its async interface view must fail
+/// with `BadType` at cast time — not succeed and then panic (`unreachable!`)
+/// at the first method call. A local `Binder<BnOldName>` published from a sync
+/// `new_binder` has no async server behind it, so the async `FromIBinder` gates
+/// on the adapter's `try_as_async()` and rejects the cast (AOSP returns
+/// `BadType` for the same sync/async mismatch). Hermetic — no `/dev/binder`.
+#[test]
+fn sync_only_service_cannot_cast_to_async_interface() {
+    struct OldName;
+    impl rsbinder::Interface for OldName {}
+    impl IOldName::IOldName for OldName {
+        fn RealName(&self) -> std::result::Result<String, Status> {
+            Ok("OldName".into())
+        }
+    }
+
+    let sync: rsbinder::Strong<dyn IOldName::IOldName> = IOldName::BnOldName::new_binder(OldName);
+    let cast = sync
+        .as_binder()
+        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>();
+    assert_eq!(cast.err(), Some(rsbinder::StatusCode::BadType));
 }
 
 #[test]
@@ -178,6 +213,10 @@ fn test_constants() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_oneway() {
     let result = get_test_service().TestOneway();
     assert_eq!(result, Ok(()));
@@ -186,6 +225,10 @@ fn test_oneway() {
 macro_rules! test_primitive {
     ($test:ident, $func:ident, $value:expr) => {
         #[test]
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "android")),
+            ignore = "requires /dev/binder"
+        )]
         fn $test() {
             let value = $value;
             let result = get_test_service().$func(value);
@@ -289,6 +332,10 @@ fn test_enum_shift() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_repeat_string() {
     let service = get_test_service();
     let inputs = [
@@ -311,6 +358,10 @@ fn test_repeat_string() {
 macro_rules! test_reverse_array {
     ($test:ident, $func:ident, $array:expr) => {
         #[test]
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "android")),
+            ignore = "requires /dev/binder"
+        )]
         fn $test() {
             let mut array = $array.to_vec();
 
@@ -386,6 +437,10 @@ test_reverse_array! {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_exchange() {
     const NAME: &str = "Smythe";
     let service = get_test_service();
@@ -397,6 +452,10 @@ fn test_binder_exchange() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_array_exchange() {
     let names = vec!["Fizz".into(), "Buzz".into()];
     let service = get_test_service();
@@ -416,6 +475,10 @@ fn test_binder_array_exchange() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_nullable_array_exchange() {
     let names = vec![Some("Fizz".into()), None, Some("Buzz".into())];
     let service = get_test_service();
@@ -438,6 +501,10 @@ fn test_binder_nullable_array_exchange() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_interface_list_exchange() {
     let names = vec![Some("Fizz".into()), None, Some("Buzz".into())];
     let service = get_test_service();
@@ -485,6 +552,10 @@ fn file_from_pfd(fd: &rsbinder::ParcelFileDescriptor) -> File {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_parcel_file_descriptor() {
     let service = get_test_service();
     let (mut read_file, write_file) = build_pipe();
@@ -507,6 +578,10 @@ fn test_parcel_file_descriptor() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_parcel_file_descriptor_array() {
     let service = get_test_service();
 
@@ -555,6 +630,10 @@ fn test_parcel_file_descriptor_array() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_service_specific_exception() {
     let service = get_test_service();
 
@@ -574,6 +653,10 @@ fn test_service_specific_exception() {
 macro_rules! test_nullable {
     ($test:ident, $func:ident, $value:expr) => {
         #[test]
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "android")),
+            ignore = "requires /dev/binder"
+        )]
         fn $test() {
             let service = get_test_service();
             let value = Some($value);
@@ -617,6 +700,10 @@ test_nullable! {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_repeat_parcelable() {
     let service = get_test_service();
     let input = SimpleParcelable {
@@ -630,6 +717,10 @@ fn test_repeat_parcelable() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_reverse_simple_parcelables() {
     let service = get_test_service();
     let input: Vec<SimpleParcelable> = (0..3)
@@ -649,6 +740,10 @@ fn test_reverse_simple_parcelables() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_nullable_parcelable() {
     let value = Empty {};
 
@@ -680,6 +775,10 @@ test_nullable! {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder() {
     let service = get_test_service();
     assert!(service
@@ -721,6 +820,10 @@ macro_rules! test_reverse_nullable_array {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_utf8_string() {
     let service = get_test_service();
     let inputs = [
@@ -774,6 +877,10 @@ fn test_utf8_string() {
 #[allow(clippy::approx_constant)]
 #[allow(clippy::float_cmp)]
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_parcelable() {
     let service = get_test_service();
     let mut parcelable = StructuredParcelable::StructuredParcelable::default();
@@ -850,6 +957,10 @@ fn test_parcelable() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_repeat_extendable_parcelable() {
     let service = get_test_service();
 
@@ -927,6 +1038,10 @@ fn test_vintf_holder_in_local_holder_roundtrip_in_process() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_repeat_extendable_parcelable_vintf() {
     let service = get_test_service();
 
@@ -1124,6 +1239,10 @@ fn check_extension_content(ep: &ExtendableParcelable, ext: &MyExt, ext2: &MyExt2
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_reverse_recursive_list() {
     let service = get_test_service();
 
@@ -1149,6 +1268,10 @@ fn test_reverse_recursive_list() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_get_union_tags() {
     let service = get_test_service();
     let result = service.GetUnionTags(&[]);
@@ -1178,6 +1301,10 @@ impl ITestServiceDefault for TestDefaultImpl {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_default_impl() {
     let service = get_test_service();
     let di: ITestServiceDefaultRef = Arc::new(TestDefaultImpl);
@@ -1188,6 +1315,10 @@ fn test_default_impl() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_versioned_interface_version() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -1199,6 +1330,10 @@ fn test_versioned_interface_version() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_versioned_interface_hash() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -1213,6 +1348,10 @@ fn test_versioned_interface_hash() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_versioned_known_union_field_is_ok() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -1230,6 +1369,10 @@ fn test_versioned_known_union_field_is_ok() {
 const FOO_V1_SERVICE_NAME: &str = "android.aidl.versioned.tests.IFooInterface-v1";
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_calling_v2_api_triggers_error() {
     init_test();
     // Connect the V2 proxy (which has `newApi`) to the *V1* service. Calling
@@ -1268,6 +1411,10 @@ fn get_trunk_service() -> rsbinder::Strong<dyn ITrunkStableTestV2> {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_parcelable() {
     let service = get_trunk_service();
     let version = service.getInterfaceVersion().expect("version");
@@ -1291,6 +1438,10 @@ fn test_trunk_stable_parcelable() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_enum() {
     let service = get_trunk_service();
     // Enums are newtype-wrapped i32 on the wire; THREE (=3) round-trips even
@@ -1301,6 +1452,10 @@ fn test_trunk_stable_enum() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_union() {
     let service = get_trunk_service();
     let version = service.getInterfaceVersion().expect("version");
@@ -1316,6 +1471,10 @@ fn test_trunk_stable_union() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_unimplemented() {
     let service = get_trunk_service();
     let version = service.getInterfaceVersion().expect("version");
@@ -1331,6 +1490,10 @@ fn test_trunk_stable_unimplemented() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_hash() {
     let service = get_trunk_service();
     let version = service.getInterfaceVersion().expect("version");
@@ -1385,6 +1548,10 @@ impl IMyCallback::IMyCallback for MyCallback {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_trunk_stable_callback() {
     let service = get_trunk_service();
     let version = service.getInterfaceVersion().expect("version");
@@ -1434,6 +1601,10 @@ fn test_trunk_stable_callback() {
 // }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_array_of_parcelable_with_new_field() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -1446,6 +1617,10 @@ fn test_array_of_parcelable_with_new_field() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_read_data_correctly_after_parcelable_with_new_field() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -1480,6 +1655,10 @@ where
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_renamed_interface_old_as_old() {
     test_renamed_interface(|old_name, _| {
         assert_eq!(
@@ -1493,6 +1672,10 @@ fn test_renamed_interface_old_as_old() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_renamed_interface_new_as_new() {
     test_renamed_interface(|_, new_name| {
         assert_eq!(
@@ -1506,6 +1689,10 @@ fn test_renamed_interface_new_as_new() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_renamed_interface_old_as_new() {
     test_renamed_interface(|old_name, _| {
         let new_name = old_name
@@ -1519,6 +1706,10 @@ fn test_renamed_interface_old_as_new() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_renamed_interface_new_as_old() {
     test_renamed_interface(|_, new_name| {
         let old_name = new_name
@@ -1546,6 +1737,10 @@ impl INestedService::ICallback::ICallback for Callback {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_nested_type() {
     let service: rsbinder::Strong<dyn INestedService::INestedService> = hub::get_interface(
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor(),
@@ -1575,6 +1770,10 @@ fn test_nested_type() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_nonnull_binder() {
     let service = get_test_service();
     let result = service.TakesAnIBinder(&service.as_binder());
@@ -1582,6 +1781,10 @@ fn test_nonnull_binder() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_list_without_null() {
     let service = get_test_service();
     let result = service.TakesAnIBinderList(&[service.as_binder()]);
@@ -1589,6 +1792,10 @@ fn test_binder_list_without_null() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_null_binder_to_annotated_method() {
     let service = get_test_service();
     let result = service.TakesANullableIBinder(None);
@@ -1596,6 +1803,10 @@ fn test_null_binder_to_annotated_method() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_list_with_null_to_annotated_method() {
     let service = get_test_service();
     let result = service.TakesANullableIBinderList(Some(&[Some(service.as_binder()), None]));
@@ -1603,6 +1814,10 @@ fn test_binder_list_with_null_to_annotated_method() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_array() {
     let service = get_test_service();
     let callback = service
@@ -1625,6 +1840,10 @@ fn test_binder_array() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_nullable_binder_array() {
     let service = get_test_service();
     let mut array = vec![Some(service.as_binder()), None];
@@ -1711,6 +1930,10 @@ macro_rules! test_repeat_fixed_size_array_2d_binder {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_fixed_size_array_over_binder() {
     let test_service = get_test_service();
     let service: rsbinder::Strong<dyn IRepeatFixedSizeArray> =
@@ -1758,12 +1981,20 @@ fn test_fixed_size_array_over_binder() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_ping() {
     let test_service = get_test_service();
     assert_eq!(test_service.as_binder().ping_binder(), Ok(()));
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_dump() {
     let test_service = get_test_service();
     let (mut read_file, write_file) = build_pipe();
@@ -1853,6 +2084,10 @@ fn test_death_recipient() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_hub() {
     hub::get_service(ITestService::BpTestService::descriptor()).unwrap();
     let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
@@ -1897,6 +2132,10 @@ fn test_hub() {
 /// so it also accumulates cross-iteration cache state (case (b)
 /// resurrection).
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_concurrent_service_resolution_slow_path_no_deadlock() {
     init_test();
     let name = ITestService::BpTestService::descriptor();
@@ -1963,6 +2202,10 @@ fn test_concurrent_service_resolution_slow_path_no_deadlock() {
 /// re-introduces a code path where `dec_weak` is non-trivial on
 /// proxies, this test will exercise it.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_issue_47_cached_interface_string() {
     init_test();
 
@@ -2081,6 +2324,10 @@ fn test_binder_extension_local_default_none() {
 
 // Test 3: Remote get_extension with extension set (EXTENSION_TRANSACTION round-trip)
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_extension_get_from_remote() {
     let service = get_test_service();
     let binder = service.as_binder();
@@ -2102,6 +2349,10 @@ fn test_binder_extension_get_from_remote() {
 
 // Test 4: Remote get_extension without extension (null binder round-trip)
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_extension_none_from_remote() {
     init_test();
     // The versioned service does NOT set any extension
@@ -2119,6 +2370,10 @@ fn test_binder_extension_none_from_remote() {
 
 // Test 5: Proxy cache hit (extension exists)
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_extension_proxy_cache_with_ext() {
     let service = get_test_service();
     let binder = service.as_binder();
@@ -2137,6 +2392,10 @@ fn test_binder_extension_proxy_cache_with_ext() {
 
 // Test 6: Proxy cache hit (no extension)
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_extension_proxy_cache_without_ext() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
@@ -2155,6 +2414,10 @@ fn test_binder_extension_proxy_cache_without_ext() {
 
 // Test 8: Extension binder can be used as a typed interface
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_binder_extension_use_as_interface() {
     let service = get_test_service();
     let ext = service.as_binder().get_extension().unwrap().unwrap();
@@ -2192,6 +2455,10 @@ fn test_binder_extension_use_as_interface() {
 /// round-trip) before each `strong_ref_count_for_node` query. This is
 /// the test-side analog of a `barrier_then_sample`.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     init_test();
 
@@ -2296,6 +2563,10 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
 /// - **Immediate drop** drives the cache `Weak` to dangling between
 ///   iterations, so subsequent lookups exercise case (b).
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
     init_test();
 
@@ -2368,6 +2639,10 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
 /// resurrection succeeds and yields a binder with the original
 /// descriptor.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_cache_pin_case_b_resurrection_round_trip() {
     init_test();
     let canonical = <BpTestService as ITestService::ITestService>::descriptor().to_string();
@@ -2473,6 +2748,10 @@ fn test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works() {
 /// Identity is `(handle, generation)`, matching Android `BpBinder`
 /// identity (stable across resurrection).
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_weak_partial_eq_handle_identity_across_resurrection() {
     init_test();
 
@@ -2782,6 +3061,10 @@ fn test_unlink_to_death_single_remove_via_obituary() {
 /// `binder_died` would skip. Non-destructive — does not call
 /// `killService`.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_link_to_death_rejects_already_dead_weak_remote_proxy() {
     init_test();
     let test_service = get_test_service();
@@ -2815,6 +3098,10 @@ fn test_link_to_death_rejects_already_dead_weak_remote_proxy() {
 /// `get_extension` continues to work, returning the extension that
 /// `test_service` set on its native side.
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_set_extension_on_remote_proxy_rejects() {
     init_test();
     let test_service = get_test_service();
@@ -2959,6 +3246,10 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
 /// (table entry torn down before the kernel finished its
 /// dereferences).
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
 fn test_native_publish_drop_release_cycle() {
     let service = get_test_service();
 
