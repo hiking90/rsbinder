@@ -128,6 +128,29 @@ fn test_check_interface_resolves_running_service() {
     assert_eq!(service.RepeatString("check"), Ok("check".to_string()));
 }
 
+/// Casting a *sync-only* local service to its async interface view must fail
+/// with `BadType` at cast time — not succeed and then panic (`unreachable!`)
+/// at the first method call. A local `Binder<BnOldName>` published from a sync
+/// `new_binder` has no async server behind it, so the async `FromIBinder` gates
+/// on the adapter's `try_as_async()` and rejects the cast (AOSP returns
+/// `BadType` for the same sync/async mismatch). Hermetic — no `/dev/binder`.
+#[test]
+fn sync_only_service_cannot_cast_to_async_interface() {
+    struct OldName;
+    impl rsbinder::Interface for OldName {}
+    impl IOldName::IOldName for OldName {
+        fn RealName(&self) -> std::result::Result<String, Status> {
+            Ok("OldName".into())
+        }
+    }
+
+    let sync: rsbinder::Strong<dyn IOldName::IOldName> = IOldName::BnOldName::new_binder(OldName);
+    let cast = sync
+        .as_binder()
+        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>();
+    assert_eq!(cast.err(), Some(rsbinder::StatusCode::BadType));
+}
+
 #[test]
 fn test_constants() {
     assert_eq!(ITestService::A1, 1);

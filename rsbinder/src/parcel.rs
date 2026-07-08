@@ -354,6 +354,12 @@ impl RpcFields {
     }
 }
 
+/// Maximum [`Parcel::sized_read`] nesting depth. Bounds recursion through
+/// self-referential parcelables so a hostile deeply-nested payload cannot
+/// overflow the worker-thread stack. Set far above any legitimate AIDL
+/// nesting; conforming traffic never reaches it.
+const MAX_NESTED_READ_DEPTH: usize = 1000;
+
 /// Parcel converts data into a byte stream (serialization), making it transferable.
 /// The receiving side then transforms this byte stream back into its original data form (deserialization).
 ///
@@ -373,6 +379,12 @@ pub struct Parcel {
     /// paired with the per-field `has_more_data()` guards emitted in
     /// generated `read_from_parcel`.
     read_boundary: Option<usize>,
+    /// Current [`Parcel::sized_read`] nesting depth. A self-referential
+    /// parcelable (e.g. AIDL `RecursiveList`) recurses through `sized_read`
+    /// on read, so a hostile deeply-nested payload would overflow the
+    /// worker-thread stack (a hard `SIGABRT`, not a recoverable error).
+    /// Capped at [`MAX_NESTED_READ_DEPTH`]; see [`Parcel::sized_read`].
+    nested_read_depth: usize,
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
@@ -405,6 +417,7 @@ impl Parcel {
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
+            nested_read_depth: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
@@ -436,6 +449,7 @@ impl Parcel {
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
+            nested_read_depth: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: Some(free_buffer),
@@ -451,6 +465,7 @@ impl Parcel {
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
+            nested_read_depth: 0,
             // objects: ptr::null_mut(),
             // object_count: 0,
             request_header_present: false,
@@ -924,6 +939,14 @@ impl Parcel {
     /// After the closure returns, skip to the end of the current
     /// parcelable regardless of how much the closure has read.
     ///
+    /// A self-referential parcelable (e.g. AIDL `RecursiveList`) recurses
+    /// through this method as it reads each `next` node, so a hostile
+    /// deeply-nested payload would recurse until the worker-thread stack
+    /// overflows — a hard `SIGABRT`, not a recoverable [`StatusCode`]. The
+    /// nesting is capped at [`MAX_NESTED_READ_DEPTH`]; a payload exceeding it
+    /// is rejected with [`StatusCode::BadValue`]. This is defense-in-depth
+    /// beyond AOSP (whose `Parcel` has no equivalent guard) and is set far
+    /// above any legitimate AIDL nesting, so conforming traffic is unaffected.
     pub fn sized_read<F>(&mut self, f: F) -> Result<()>
     where
         for<'b> F: FnOnce(&mut Parcel) -> Result<()>,
@@ -944,6 +967,12 @@ impl Parcel {
             return Err(StatusCode::NotEnoughData);
         }
 
+        if self.nested_read_depth >= MAX_NESTED_READ_DEPTH {
+            log::error!("Parcel: nested parcelable read depth exceeded {MAX_NESTED_READ_DEPTH}");
+            return Err(StatusCode::BadValue);
+        }
+        self.nested_read_depth += 1;
+
         // Bound `has_more_data()` to this block while the closure runs, so a
         // newer reader stops at a shorter (older-peer) parcelable's end
         // rather than reading trailing bytes. Saved/restored to support
@@ -952,6 +981,7 @@ impl Parcel {
         self.read_boundary = Some(end);
         let result = f(self);
         self.read_boundary = prev_boundary;
+        self.nested_read_depth -= 1;
         result?;
 
         // Advance the data position to the actual end,
@@ -2095,6 +2125,52 @@ mod tests {
             0x5555_5555,
             "extra field skipped to block end, sentinel intact"
         );
+    }
+
+    /// A self-referential parcelable (AIDL `RecursiveList`) recurses through
+    /// `sized_read` on read, so a hostile deeply-nested payload must be
+    /// rejected with `BadValue` at [`MAX_NESTED_READ_DEPTH`] rather than
+    /// recursing until the worker-thread stack overflows (a hard abort).
+    /// Also proves the depth counter is decremented on both the success and
+    /// error paths, so it never leaks across successive reads.
+    #[test]
+    fn sized_read_depth_is_bounded() {
+        // Mirrors a generated `RecursiveList` write: each node is a sized
+        // block holding a marker plus (optionally) the next node.
+        fn write_nested(p: &mut Parcel, depth: usize) -> Result<()> {
+            p.sized_write(|s| {
+                s.write(&(depth as i32))?;
+                if depth > 1 {
+                    write_nested(s, depth - 1)?;
+                }
+                Ok(())
+            })
+        }
+        fn read_nested(p: &mut Parcel) -> Result<()> {
+            p.sized_read(|s| {
+                let _marker: i32 = s.read()?;
+                if s.has_more_data() {
+                    read_nested(s)?;
+                }
+                Ok(())
+            })
+        }
+
+        // Nesting beyond the cap → BadValue, not a stack-overflow abort.
+        let mut over = Parcel::new();
+        write_nested(&mut over, super::MAX_NESTED_READ_DEPTH + 50).expect("write over-deep");
+        over.set_data_position(0);
+        assert_eq!(read_nested(&mut over).unwrap_err(), StatusCode::BadValue);
+
+        // A legitimate shallow nesting still reads cleanly, twice — the second
+        // read only succeeds if the counter was restored on the way out of the
+        // first (and on the error unwind above).
+        let mut ok = Parcel::new();
+        write_nested(&mut ok, 8).expect("write shallow");
+        for _ in 0..2 {
+            ok.set_data_position(0);
+            read_nested(&mut ok).expect("shallow read");
+        }
     }
 
     /// The RPC object-position table is collected AOSP-faithfully: the

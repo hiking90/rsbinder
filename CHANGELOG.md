@@ -80,6 +80,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **rsbinder-aidl:** versioned interfaces now expose
   `getInterfaceVersion()` / `getInterfaceHash()` on the async trait and the
   async proxy (cache + transact, mirroring AOSP), not just the sync side.
+- **rsbinder-aidl:** generated `Bn{{Iface}}` now offers
+  `new_async_binder_with_features(inner, rt, features)`, the async counterpart
+  to the sync `new_binder_with_features`. An async service can now opt into
+  kernel binder features (e.g. `set_requesting_sid`); previously only sync
+  services could. `new_async_binder` delegates to it with default features
+  (unchanged behavior).
 - **rsbinder-aidl:** a `//` comment on the last line of a file no longer
   requires a trailing newline; interfaces with thousands of members parse
   without stack overflow (grammar flattened).
@@ -110,6 +116,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
   rather than `BadValue`, `BR_TRANSACTION_PENDING_FROZEN` is treated as a
   successful oneway completion, and driver `errno` values are normalized to
   negative `status_t` form so callers never observe positive `errno`s. (#162)
+- Reading a self-referential parcelable (e.g. AIDL `RecursiveList`) is now
+  bounded to a nesting depth of 1000: a hostile deeply-nested payload is
+  rejected with `BadValue` instead of recursing until the worker thread's
+  stack overflows (a hard abort). Defense-in-depth beyond AOSP `Parcel`; the
+  limit is far above any legitimate AIDL nesting, so conforming traffic is
+  unaffected.
+- Casting a **sync-only** local service to its async interface view
+  (`into_interface::<dyn IFooAsync<_>>`, `Strong::into_async`,
+  `get_interface::<dyn IFooAsync<_>>`) now fails with `BadType` at cast time
+  instead of succeeding and then panicking (`unreachable!`) on the first
+  method call. Matches AOSP, which rejects the same sync/async mismatch.
+- **rsbinder-aidl:** a server dispatching an out-only, non-nullable
+  `ParcelFileDescriptor[]` now returns `UNEXPECTED_NULL` when the service
+  leaves an element unset, instead of writing a null fd marker onto the wire
+  (which corrupts the reply for a conforming peer). Mirrors AOSP's server-side
+  guard; scoped, as AOSP is, to `ParcelFileDescriptor` arrays only.
+
+### Deprecated / known gaps
+
+- **rsbinder-aidl:** an AIDL `/** @deprecated */` doc comment is not yet
+  propagated to a Rust `#[deprecated]` attribute (AOSP does). No wire or
+  correctness impact; downstream users of a deprecated AIDL member simply do
+  not get a compile-time warning. The parser discards doc comments today, so
+  this awaits grammar support.
 
 ## [0.9.0] - 2026-06-15
 

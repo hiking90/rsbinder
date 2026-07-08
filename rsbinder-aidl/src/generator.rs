@@ -270,6 +270,23 @@ pub mod {{mod}} {
             T: {{name}}AsyncService + Sync + Send + 'static,
             R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
         {
+            Self::new_async_binder_with_features(inner, rt, {{crate}}::BinderFeatures::default())
+        }
+
+        /// Like [`Self::new_async_binder`] but lets the caller opt into
+        /// kernel-level binder features (e.g. `set_requesting_sid`). The async
+        /// counterpart to the sync `new_binder_with_features`; without it an
+        /// async service could not request those features. See
+        /// `rsbinder::BinderFeatures`.
+        pub fn new_async_binder_with_features<T, R>(
+            inner: T,
+            rt: R,
+            features: {{crate}}::BinderFeatures,
+        ) -> {{crate}}::Strong<dyn {{name}}>
+        where
+            T: {{name}}AsyncService + Sync + Send + 'static,
+            R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
+        {
             struct Wrapper<T, R> {
                 _inner: T,
                 _rt: R,
@@ -289,6 +306,9 @@ pub mod {{mod}} {
                 fn as_async(&self) -> &dyn {{name}}AsyncService {
                     &self._inner
                 }
+                fn try_as_async(&self) -> Option<&dyn {{name}}AsyncService> {
+                    Some(&self._inner)
+                }
             }
             impl<T, R> {{name}} for Wrapper<T, R>
             where
@@ -303,9 +323,9 @@ pub mod {{mod}} {
             }
             let wrapped = Wrapper { _inner: inner, _rt: rt };
             {%- if is_vintf %}
-            let binder = {{crate}}::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf);
+            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
             {%- else %}
-            let binder = {{crate}}::native::Binder::new_with_stability({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default());
+            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
             {%- endif %}
             {{crate}}::Strong::new(Box::new(binder))
         }
@@ -439,7 +459,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -570,7 +590,10 @@ pub mod {{mod}} {
                         _reply.write(_aidl_return)?;
                         {%- endif %}
                         {%- for arg in member.transaction_write %}
-                        _reply.write(&{{ arg }})?;
+                        {%- if arg.needs_null_guard %}
+                        if {{ arg.identifier }}.iter().any(Option::is_none) { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                        {%- endif %}
+                        _reply.write(&{{ arg.identifier }})?;
                         {%- endfor %}
                     }
                     Err(_aidl_status) => {
@@ -637,6 +660,15 @@ fn template() -> &'static tera::Tera {
     })
 }
 
+/// One out/inout arg written back to the reply in `on_transact`.
+#[derive(Serialize, Deserialize, Debug)]
+struct TransactionWrite {
+    identifier: String,
+    /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
+    /// writing this arg back. See [`TypeGenerator::out_array_needs_null_guard`].
+    needs_null_guard: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct FnMembers {
     identifier: String,
@@ -646,7 +678,7 @@ struct FnMembers {
     write_funcs: Vec<String>,
     func_call_params: String,
     transaction_decls: Vec<String>,
-    transaction_write: Vec<String>,
+    transaction_write: Vec<TransactionWrite>,
     transaction_params: String,
     transaction_has_return: bool,
     oneway: bool,
@@ -719,7 +751,10 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
         }
 
         if matches!(arg.direction, Direction::Out | Direction::Inout) {
-            transaction_write.push(generator.identifier.to_owned());
+            transaction_write.push(TransactionWrite {
+                identifier: generator.identifier.to_owned(),
+                needs_null_guard: generator.out_array_needs_null_guard(),
+            });
             read_onto_params.push(generator.identifier.to_owned());
         }
         transaction_params += &format!("{}, ", generator.func_call_param());

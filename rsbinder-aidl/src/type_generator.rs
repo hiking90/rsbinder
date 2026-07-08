@@ -668,6 +668,25 @@ impl TypeGenerator {
         }
     }
 
+    /// True when this arg is a non-nullable, out-only *variable* array of
+    /// `ParcelFileDescriptor`. Such an array is represented as
+    /// `Vec<Option<ParcelFileDescriptor>>` and filled with `None` placeholders
+    /// by `resize_out_vec`, so before writing it back to the reply the server
+    /// must reject any element the service left unset — a `None` has no valid
+    /// fd wire encoding, so writing it would corrupt the reply for a
+    /// conforming peer. Mirrors AOSP `generate_rust.cpp`'s
+    /// `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard, which is
+    /// deliberately scoped to out-only `ParcelFileDescriptor` arrays only
+    /// (a null `IBinder` *is* a legal wire value, so binder arrays are not
+    /// guarded; inout arrays are read in fully populated).
+    pub fn out_array_needs_null_guard(&self) -> bool {
+        matches!(self.direction, Direction::Out)
+            && !self.is_nullable
+            && self.array_types.first().is_some_and(|sub| {
+                !sub.is_fixed() && matches!(sub.value_type, ValueType::FileDescriptor)
+            })
+    }
+
     fn func_list_type_decl_fixed(&self, array_info: &ArrayInfo) -> String {
         let fixed_array = self.make_fixed_array(array_info, false);
 
