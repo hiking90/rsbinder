@@ -396,17 +396,29 @@ fn real_process_abstract_unix_socket_e2e() {
         std::process::exit(0);
     }
 
+    // Kill + reap the server child even when an assert below panics —
+    // its `server.run()` loop never exits on its own.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     let name = format!("rsb_rpc_abs_proc_{}", std::process::id());
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "real_process_abstract_unix_socket_e2e",
-            "--nocapture",
-        ])
-        .env("RSB_RPC_ABSTRACT_SERVER", &name)
-        .spawn()
-        .expect("spawn abstract server child");
+    let _child = KillOnDrop(
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "real_process_abstract_unix_socket_e2e",
+                "--nocapture",
+            ])
+            .env("RSB_RPC_ABSTRACT_SERVER", &name)
+            .spawn()
+            .expect("spawn abstract server child"),
+    );
 
     let client = 'connect: {
         for _ in 0..400 {
@@ -451,9 +463,6 @@ fn real_process_abstract_unix_socket_e2e() {
         t0.elapsed() < Duration::from_millis(420),
         "abstract fan-out across process must run 3 slow calls in parallel"
     );
-
-    child.kill().expect("kill abstract server child");
-    child.wait().expect("reap abstract server child");
 }
 
 // ---- concurrency: many threads, ONE shared session ----------------

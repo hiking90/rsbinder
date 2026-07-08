@@ -66,6 +66,12 @@ pub enum AccessorSockAddr {
     Unix(PathBuf),
     /// AF_UNIX abstract name. Variant is always present for enum-shape
     /// stability; connect is supported only on Linux / Android.
+    ///
+    /// **Security**: the abstract namespace has no filesystem
+    /// permissions — any same-network-namespace process can bind a name
+    /// first and impersonate the server (path-bound sockets can rely on
+    /// directory modes to prevent this). Trust in the peer must come
+    /// from elsewhere, e.g. LSM policy or post-connect verification.
     UnixAbstract(Vec<u8>),
     /// AF_VSOCK `(cid, port)`. Only usable when the binary was built
     /// with the `rpc-vsock` feature; otherwise the connect helper

@@ -51,7 +51,23 @@ enum RpcUnixAddr<'a> {
     Abstract(&'a [u8]),
 }
 
-/// Unix-domain android-13+ RPC client configuration.
+/// Unix-domain android-13+ RPC client configuration — the builder
+/// consumed by
+/// [`RpcSession::setup_unix_client_android13plus_with_config`] and
+/// [`RpcSession::add_outgoing_connection_android13plus_with_config`].
+///
+/// One config expresses everything the per-shape convenience helpers
+/// (`setup_unix_client_android13plus{,_abstract,_with_id,_fan_out}`)
+/// take positionally: the address (filesystem path or Linux/Android
+/// abstract name), the highest wire version to offer, and the optional
+/// session-id attach / fan-out / fd-transport-mode knobs. The defaults
+/// (`session_id = empty`, `outgoing_connections = 1`, `fd_mode = None`)
+/// reproduce the plain single-connection
+/// [`RpcSession::setup_unix_client_android13plus`] byte-for-byte.
+///
+/// `session_id` and `outgoing_connections > 1` are mutually exclusive
+/// (attaching joins an existing session; fan-out mints a new one) —
+/// the consuming setup call rejects the combination with `BadValue`.
 pub struct RpcUnixClientConfig<'a> {
     addr: RpcUnixAddr<'a>,
     max_version: u32,
@@ -71,25 +87,38 @@ impl<'a> RpcUnixClientConfig<'a> {
         }
     }
 
+    /// Config for a filesystem-path Unix socket, offering at most wire
+    /// version `max_version` in the handshake.
     pub fn path(path: &'a Path, max_version: u32) -> Self {
         Self::new(RpcUnixAddr::Path(path), max_version)
     }
 
+    /// Config for a Linux/Android abstract Unix socket, offering at
+    /// most wire version `max_version` in the handshake.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn abstract_name(name: &'a [u8], max_version: u32) -> Self {
         Self::new(RpcUnixAddr::Abstract(name), max_version)
     }
 
+    /// Attach to an existing server session by echoing its 32-byte id
+    /// (AOSP `RpcSession::setupClient` follow-up connections). Empty
+    /// (the default) requests a brand-new session.
     pub fn session_id(mut self, session_id: &'a [u8]) -> Self {
         self.session_id = session_id;
         self
     }
 
+    /// Ask for an `n`-connection outgoing pool (AOSP `setupClient`
+    /// fan-out): the setup call negotiates `min(n, server max)` and
+    /// opens that many connections. Default 1 = founding connection
+    /// only, skipping negotiation entirely.
     pub fn outgoing_connections(mut self, n: u32) -> Self {
         self.outgoing_connections = n;
         self
     }
 
+    /// Request an fd transport mode in the connection header (AOSP
+    /// `setFileDescriptorTransportMode`). Default is no fd support.
     pub fn fd_mode(mut self, mode: FileDescriptorTransportMode) -> Self {
         self.fd_mode = Some(mode);
         self
