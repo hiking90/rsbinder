@@ -17,7 +17,7 @@ Every AIDL-generated method returns this type:
 pub type Result<T> = std::result::Result<T, Status>;
 ```
 
-This is a standard `Result` whose error variant is a `Status`.
+This is a standard `Result` whose error variant is a `Status`. In generated code the alias is spelled `rsbinder::BinderResult<T>` — it is identical to `rsbinder::status::Result<T>`, so that is the name you will see in your generated files.
 
 > **Note — two `Result` aliases coexist in `rsbinder`.** AIDL methods use
 > `rsbinder::status::Result<T> = Result<T, Status>` (rich error with exception

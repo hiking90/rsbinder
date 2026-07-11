@@ -14,7 +14,35 @@
 //! - **Proxy**: Client-side interface for remote services
 //! - **Native**: Server-side service implementation utilities
 //! - **ProcessState**: Process-level binder state management
-//! - **ServiceManager**: Service discovery and registration
+//! - **ServiceManager**: Service discovery and registration (the [`hub`] module)
+//! - **RPC transport**: binder-over-socket (`rpc` module, behind the `rpc`
+//!   feature) — a separate stack from the kernel binder path
+//! - **Service facade**: the [`service`] module — register/look up services
+//!   once, choosing kernel binder or RPC by construction
+//!
+//! # Feature flags
+//!
+//! - `tokio` *(default)* — full async/await support on the Tokio runtime
+//!   (implies `async`).
+//! - `async` — generic async-trait support, without committing to a
+//!   specific runtime.
+//! - `rpc` — master switch for the RPC transport (binder-over-socket), a
+//!   separate stack from the kernel binder path. Off by default; default
+//!   and `--no-default-features` builds carry zero RPC/networking cost.
+//! - `rpc-tcp-debug` — plaintext TCP backend (implies `rpc`). Debug and
+//!   interop bring-up **only**, never production — use `rpc-tls` for real
+//!   networks.
+//! - `rpc-vsock` — vsock backend for host↔VM channels (implies `rpc`;
+//!   Linux and Android targets only).
+//! - `rpc-tls` — TLS backend over rustls (implies `rpc`). rsbinder never
+//!   invents crypto; the caller supplies the `rustls` configuration.
+//! - `android_10` … `android_16`, plus the `android_*_plus` ranges (e.g.
+//!   `android_11_plus`) — select which Android service-manager protocol
+//!   versions to support. Android 10 uses the legacy C service-manager
+//!   protocol. Android 15 and 17 need no dedicated flag: their
+//!   service-manager wire format is identical to Android 14 and
+//!   Android 16 respectively, so they are served by `android_14` /
+//!   `android_16`.
 //!
 //! # Basic Usage
 //!
@@ -197,9 +225,10 @@ pub mod permission_controller;
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
-/// Cross-transport service facade (Plan 2-16 Phase D): register/look up
-/// services once, choosing kernel binder or RPC by construction. Additive
-/// layer over `ProcessState`/`hub`/`RpcServer`/`RpcSession`.
+// Cross-transport service facade — see the module's own docs. Kept as a
+// plain (non-doc) comment: an outer doc here would merge with the
+// module's inner `//!` docs and re-resolve their intra-doc links at the
+// crate root, breaking them.
 pub mod service;
 
 // Explicit re-exports: glob re-exports would silently leak every

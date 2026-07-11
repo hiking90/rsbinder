@@ -115,7 +115,7 @@ For input parameters, a nullable array becomes `Option<&[T]>`. For return values
 AIDL definition:
 
 ```aidl
-@nullable int[] RepeatNullableIntArray(@nullable in int[] input);
+@nullable int[] RepeatNullableIntArray(in @nullable int[] input);
 ```
 
 Rust service implementation:

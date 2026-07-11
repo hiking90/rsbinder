@@ -429,7 +429,7 @@ impl dyn IBinder {
 
     /// Generalized proxy dispatch: a kernel
     /// [`proxy::ProxyHandle`] **or** (with the `rpc` feature) an
-    /// [`rpc::RpcProxy`](crate::rpc::RpcProxy), as a single
+    /// `rpc::RpcProxy`, as a single
     /// [`RemoteProxy`] trait object. Lets one generated `Bp*` stub
     /// call either stack. `as_proxy()` is retained unchanged so the
     /// existing generated kernel code keeps working verbatim.

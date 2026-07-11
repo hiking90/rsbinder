@@ -25,6 +25,10 @@ binder and is not expected to break.
   `FLAG_CLEAR_BUF`.
 - **Service manager (Android binder)** — `hub::add_service`,
   `hub::get_service`, `hub::check_service`, `hub::get_interface`.
+  (`hub::get_service` / `hub::get_interface` are deprecated as of 0.10.0 in
+  favor of `wait_for_*` / `check_interface` / `try_*` — deprecated-but-kept
+  still satisfies the no-breakage promise; the replacements start in
+  Provisional. See [Service Manager](service-manager.md).)
 - **AIDL compiler entry points** — `rsbinder_aidl::Builder::{new, source,
   output, version, generate}`.
 - **rsb_device** binary CLI (binderfs setup).
@@ -35,6 +39,12 @@ Implemented and validated, but the public-API shape is still under
 review for 1.0. Expect at most a single round of renames or signature
 tweaks; wire formats are already locked.
 
+- **Service-manager lookups (new in 0.10.0)** — `hub::wait_for_service`,
+  `wait_for_interface`, `check_interface`, `try_get_service`,
+  `try_get_interface`, `register_client_callback`,
+  `try_unregister_service`, and the `impl Into<SIBinder>` form of
+  `add_service`. Wire behavior matches AOSP `waitForService` /
+  `checkService`; only the Rust signatures are still settling.
 - **RPC transport** — `RpcServer`, `RpcSession`, `setup_unix_server`,
   `setup_unix_client*`, `from_preconnected_fd`, `set_root`, `get_root`,
   `set_android13plus`, `set_max_threads(N)` (both `N == 1` and

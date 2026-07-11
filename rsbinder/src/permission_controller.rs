@@ -48,7 +48,7 @@ pub const SERVICE_NAME: &str = "permission";
 /// check ([`check_permission`]) — across kernel binder *and* RPC — and
 /// receives the transport-tagged [`Caller`] so it can apply the right rule
 /// per transport (Android permission for [`Caller::Kernel`]; a uid ACL,
-/// TLS-certificate allowlist, or token scope for [`Caller::Rpc`]).
+/// TLS-certificate allowlist, or token scope for `Caller::Rpc`).
 ///
 /// The core crate ships only this **slot**, never a policy: token/JWT
 /// formats, certificate→permission tables, and uid→permission maps are

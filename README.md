@@ -41,14 +41,14 @@ $ mdbook serve
 
 ## Current Development Status
 
-**rsbinder** is pre-1.0 — the API may still change before 1.0. Core binder, AIDL, RPC transport, and Android `libbinder` interop are exercised by CI across Android API 29–36 and a Linux native-kernel-binder host.
+**rsbinder** is pre-1.0 — the API may still change before 1.0. Core binder, AIDL, RPC transport, and Android `libbinder` interop are exercised by CI across Android API 29–36 and a Linux native-kernel-binder host; Android 17 (API 37) is validated on an emulator.
 
 ## Platform Support
 
 | Platform | Kernel binder (`/dev/binder`) | RPC transport (binder-over-socket) |
 |----------|:-----------------------------:|:----------------------------------:|
 | Linux    | ✅ (binderfs)                  | ✅                                  |
-| Android  | ✅ (API 29–36)                 | ✅ (`libbinder` RPC v1 / v2 interop) |
+| Android  | ✅ (API 29–37)                 | ✅ (`libbinder` RPC v1 / v2 interop) |
 | macOS    | —                             | ✅ (first-class)                    |
 
 The RPC transport requires no kernel module, no root, and no special device file — making rsbinder usable as a general cross-platform Rust IPC layer in addition to its Android role.
@@ -129,7 +129,7 @@ Please follow the [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) guide.
 - **Memory Management** — compatible parcel serialization and shared-memory handling.
 
 ### Android Version Support
-**rsbinder** supports Android versions 10 through 16 (API levels 29–36). Android 10 uses the legacy C service manager protocol; APIs not implemented there (`is_declared`, `register_for_notifications`, `unregister_for_notifications`, `get_service_debug_info`) return an error or `false` so callers can detect the gap. CI exercises emulator API levels 29, 30, 32, 34, and 36.
+**rsbinder** supports Android versions 10 through 17 (API levels 29–37). Android 15 (SDK 35) and Android 17 (SDK 37) share the Android 14 / Android 16 service-manager wire format respectively, so they are covered by the `android_14` / `android_16` features — no dedicated feature flag is needed. Android 10 uses the legacy C service manager protocol; APIs not implemented there (`is_declared`, `register_for_notifications`, `unregister_for_notifications`, `get_service_debug_info`) return an error or `false` so callers can detect the gap. CI exercises emulator API levels 29, 30, 32, 34, and 36.
 
 ### AIDL Compatibility
 The **rsbinder-aidl** compiler generates Rust code that maintains compatibility with Android's AIDL:

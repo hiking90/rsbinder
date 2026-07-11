@@ -29,6 +29,11 @@ let read_pfd = rsbinder::ParcelFileDescriptor::new(reader);
 let write_pfd = rsbinder::ParcelFileDescriptor::new(writer);
 ```
 
+Since 0.10.0 `ParcelFileDescriptor` also implements `From<std::fs::File>`
+and `From<OwnedFd>`, so the common concrete cases work with plain
+conversions — `let pfd: ParcelFileDescriptor = file.into();`. The generic
+`new()` covers any other `Into<OwnedFd>` source.
+
 ## Sending a File Descriptor to a Service
 
 A typical pattern is to create a pipe, wrap one end in a `ParcelFileDescriptor`,
@@ -65,28 +70,21 @@ When a service receives a `ParcelFileDescriptor`, it usually needs to **duplicat
 the descriptor before returning it or storing it. This avoids ownership conflicts
 and ensures each side can close its handle independently.
 
-The idiomatic helper function looks like this:
-
-```rust
-use rsbinder::ParcelFileDescriptor;
-
-fn dup_fd(fd: &ParcelFileDescriptor) -> ParcelFileDescriptor {
-    ParcelFileDescriptor::new(fd.as_ref().try_clone().unwrap())
-}
-```
-
-`as_ref()` returns a reference to the inner `OwnedFd`, and `try_clone()` calls
-the underlying OS `dup` system call.
-
+Since 0.10.0 the type has a built-in `ParcelFileDescriptor::try_clone()`
+that duplicates the underlying descriptor with `fcntl(F_DUPFD_CLOEXEC)`
+(the duplicate is always close-on-exec, matching AOSP
+`ParcelFileDescriptor::dup`), so no hand-rolled `dup` helper is needed.
 A service method that repeats a file descriptor back to the caller is then
 straightforward:
 
 ```rust
+use rsbinder::ParcelFileDescriptor;
+
 fn RepeatParcelFileDescriptor(
     &self,
     read: &ParcelFileDescriptor,
 ) -> rsbinder::status::Result<ParcelFileDescriptor> {
-    Ok(dup_fd(read))
+    Ok(read.try_clone()?)
 }
 ```
 
@@ -94,7 +92,7 @@ fn RepeatParcelFileDescriptor(
 
 AIDL interfaces can accept and return arrays of `ParcelFileDescriptor`. The
 pattern for reversing an array -- a common test case -- illustrates how to
-combine `dup_fd` with iterator combinators:
+combine `try_clone()` with iterator combinators:
 
 ```rust
 fn ReverseParcelFileDescriptorArray(
@@ -103,8 +101,10 @@ fn ReverseParcelFileDescriptorArray(
     repeated: &mut Vec<Option<ParcelFileDescriptor>>,
 ) -> rsbinder::status::Result<Vec<ParcelFileDescriptor>> {
     repeated.clear();
-    repeated.extend(input.iter().map(dup_fd).map(Some));
-    Ok(input.iter().rev().map(dup_fd).collect())
+    for fd in input {
+        repeated.push(Some(fd.try_clone()?));
+    }
+    input.iter().rev().map(|fd| Ok(fd.try_clone()?)).collect()
 }
 ```
 
@@ -155,6 +155,20 @@ fn file_from_pfd(fd: &ParcelFileDescriptor) -> File {
 }
 ```
 
+## File Descriptors over RPC
+
+`ParcelFileDescriptor` also crosses the socket-based
+[RPC transport](./rpc-transport.md) (the `rpc` Cargo feature). Unlike
+kernel binder, FD passing over RPC is **opt-in and negotiated per
+connection**: the server declares the modes it accepts with
+`RpcServer::set_supported_fd_modes`, and the client requests one with
+`RpcSession::negotiate_fd_transport` (or the `fd_mode` knob on the
+`RpcUnixClientConfig` builder). Descriptors then travel out-of-band via
+`SCM_RIGHTS`, which requires a Unix-domain socket and the android-14+
+wire version. Service and client code using `ParcelFileDescriptor` is
+otherwise unchanged. See
+[RPC Transport](./rpc-transport.md#capabilities) for details.
+
 ## Tips and Best Practices
 
 - **Descriptors are duplicated during IPC.** When a `ParcelFileDescriptor` is
@@ -170,14 +184,16 @@ fn file_from_pfd(fd: &ParcelFileDescriptor) -> File {
   `File` (via `try_clone().into()`) to use those traits.
 
 - **Always duplicate before storing.** If your service needs to keep a
-  reference to a received descriptor, clone it with `dup_fd`. Returning or
-  forwarding the original reference without duplication can lead to
+  reference to a received descriptor, clone it with `try_clone()`. Returning
+  or forwarding the original reference without duplication can lead to
   use-after-close errors.
 
 - **`ParcelFileDescriptor` is not `Clone`.** Because it wraps an `OwnedFd`,
   which owns the underlying file descriptor, the type cannot derive `Clone`.
-  Use `dup_fd` (or `as_ref().try_clone()`) for explicit duplication.
+  Use the built-in `try_clone()` (a `fcntl(F_DUPFD_CLOEXEC)` duplication,
+  added in 0.10.0) for explicit duplication, and the `From<OwnedFd>` /
+  `From<std::fs::File>` impls for construction.
 
 - **Error handling.** `try_clone()` can fail if the process has exhausted its
-  file descriptor limit. In production code, consider propagating the error
-  rather than calling `unwrap()`.
+  file descriptor limit. Propagate the error with `?` (a `StatusCode`
+  converts into `Status` automatically) rather than calling `unwrap()`.

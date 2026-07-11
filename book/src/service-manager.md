@@ -43,8 +43,10 @@ use rsbinder::*;
 // Create the Binder service object
 let service = BnMyService::new_binder(MyServiceImpl);
 
-// Register it under a descriptive name
-hub::add_service("com.example.myservice", service.as_binder())?;
+// Register it under a descriptive name. `add_service` accepts anything
+// convertible into `SIBinder`, so the typed `Strong<dyn IMyService>` can
+// be passed directly — no `.as_binder()` needed.
+hub::add_service("com.example.myservice", &service)?;
 ```
 
 The name passed to `add_service` is the identifier that clients will use to
@@ -64,68 +66,88 @@ the IPC call rather than a local compile-time or pre-flight check.
   (`_`), hyphens (`-`), and forward slashes (`/`). Special characters such as
   `$` are not allowed.
 - **Non-empty**: An empty string is rejected.
-- **Overwrite permitted**: Registering a service with a name that is already
-  in use replaces the previous registration.
+- **Overwrite rules**: Re-registering the *same* binder under a name, or
+  replacing a registration from the *same UID* (e.g. a restarted service
+  process), is always allowed. However, `rsb_hub` **rejects** an attempt by a
+  different UID to overwrite an existing name with a different binder — a
+  likely service-name hijack — unless it was started with the opt-in
+  `--allow-cross-uid-overwrite` flag.
 
 ```rust
 let service = BnFoo::new_binder(FooImpl {});
 
 // Empty names are rejected
-assert!(hub::add_service("", service.as_binder()).is_err());
+assert!(hub::add_service("", &service).is_err());
 
 // Valid name
-assert!(hub::add_service("foo", service.as_binder()).is_ok());
+assert!(hub::add_service("foo", &service).is_ok());
 
 // Maximum length (127 characters)
 let long_name = "a".repeat(127);
-assert!(hub::add_service(&long_name, service.as_binder()).is_ok());
+assert!(hub::add_service(&long_name, &service).is_ok());
 
 // Too long (128 characters)
 let too_long = "a".repeat(128);
-assert!(hub::add_service(&too_long, service.as_binder()).is_err());
+assert!(hub::add_service(&too_long, &service).is_err());
 
 // Special characters are rejected
-assert!(hub::add_service("happy$foo$fo", service.as_binder()).is_err());
+assert!(hub::add_service("happy$foo$fo", &service).is_err());
 ```
 
 ## Looking Up Services
 
-rsbinder provides three ways to find a registered service, each suited to a
-different use case.
+rsbinder provides a family of lookup functions. They differ only in *how they
+wait* and *how they encode "not registered"* — pick by what your client needs:
 
-### Type-Safe Lookup with `get_interface`
+| Function | Waits? | Returns | Not registered |
+|---|---|---|---|
+| `wait_for_interface::<T>` | blocks until registered | `Result<Strong<T>>` | *blocks* |
+| `wait_for_service` | blocks until registered | `Option<SIBinder>` | *blocks* |
+| `check_interface::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
+| `check_service` | no | `Option<SIBinder>` | `None` |
+| `try_get_interface::<T>` | no | `Result<Option<Strong<T>>>` | `Ok(None)` |
+| `try_get_service` | no | `Result<Option<SIBinder>>` | `Ok(None)` |
 
-The most common approach is `hub::get_interface`, which retrieves the service
-and casts it to the expected AIDL interface type in one step:
+> **Deprecated**: `hub::get_service` and `hub::get_interface` are
+> `#[deprecated]` as of 0.10.0 because their wait behavior was inconsistent
+> across Android versions. Use `wait_for_service` / `wait_for_interface` to
+> block until the service appears, or `check_service` / `check_interface`
+> for a non-blocking lookup.
+
+### Blocking, Type-Safe Lookup with `wait_for_interface`
+
+The most common client pattern is `hub::wait_for_interface`, which blocks
+until the service is registered and casts it to the expected AIDL interface
+type in one step — the equivalent of AOSP's `waitForService`:
 
 ```rust
 let service: rsbinder::Strong<dyn IMyService::IMyService> =
-    hub::get_interface("com.example.myservice")?;
+    hub::wait_for_interface("com.example.myservice")?;
 
 // Now call methods directly on the typed proxy
 let result = service.some_method()?;
 ```
 
-If the service is not registered, `get_interface` returns an error.
+The wait is unbounded: it returns when the service appears, and fails only
+if the service manager itself is unreachable. The wait is event-driven
+(registration-callback based) when the process runs a binder thread pool
+(`ProcessState::start_thread_pool()`); without one it degrades gracefully to
+~1-second polling.
 
-### Raw Binder Lookup with `get_service`
-
-If you need the untyped `SIBinder` handle (for example, to inspect the
-descriptor or pass it to another API), use `hub::get_service`:
+`hub::wait_for_service` is the untyped variant — it returns
+`Option<SIBinder>` when you need the raw handle (for example, to inspect the
+descriptor or pass it to another API):
 
 ```rust
-let binder: Option<SIBinder> = hub::get_service("com.example.myservice");
-if let Some(binder) = binder {
+if let Some(binder) = hub::wait_for_service("com.example.myservice") {
     println!("Found service with descriptor: {}", binder.descriptor());
 }
 ```
 
-Returns `None` if the service is not registered.
+### Non-Blocking Check with `check_service` / `check_interface`
 
-### Non-Blocking Check with `check_service`
-
-`hub::check_service` behaves like `get_service` but is intended as a
-non-blocking availability check:
+`hub::check_service` returns immediately, with `None` if the service is not
+(yet) registered:
 
 ```rust
 let binder: Option<SIBinder> = hub::check_service("com.example.myservice");
@@ -133,6 +155,26 @@ if binder.is_some() {
     println!("Service is available");
 } else {
     println!("Service is not yet registered");
+}
+```
+
+The typed counterpart `hub::check_interface` casts in one step and returns
+`Err(StatusCode::NameNotFound)` immediately when the service is absent.
+
+### Error-Preserving Lookup with `try_get_service` / `try_get_interface`
+
+`check_service` folds "not registered" and "service manager unreachable"
+into the same `None`. When you must tell those apart, use
+`hub::try_get_service` (or the typed `hub::try_get_interface`), which
+returns `Result<Option<_>>`: `Ok(None)` means the service is not registered,
+while `Err(..)` means the lookup itself failed (transport or service-manager
+error):
+
+```rust
+match hub::try_get_service("com.example.myservice") {
+    Ok(Some(binder)) => println!("found: {}", binder.descriptor()),
+    Ok(None) => println!("service not registered"),
+    Err(err) => println!("service manager unreachable: {err:?}"),
 }
 ```
 
@@ -203,6 +245,12 @@ hub::unregister_for_notifications("com.example.myservice", &callback)?;
 The callback will be invoked each time a service matching the given name is
 registered, including if it is re-registered after a restart.
 
+> **Thread pool required.** `onRegistration` arrives as an *inbound* binder
+> transaction, so the client process must call
+> `ProcessState::start_thread_pool()` (or park a thread in
+> `join_thread_pool()`) — otherwise the callback never fires. This applies
+> to any client that receives inbound calls, not just services.
+
 ## Checking if a Service is Declared
 
 `hub::is_declared` checks whether a service name has been declared in the
@@ -265,7 +313,7 @@ API availability matrix:
 
 | API                                | Android 10 | Android 11 | Android 12+ |
 |------------------------------------|:---------:|:---------:|:-----------:|
-| `get_service` / `check_service`    |     ✓     |     ✓     |      ✓      |
+| `check_service` / `wait_for_service` |     ✓     |     ✓     |      ✓      |
 | `add_service`                      |     ✓     |     ✓     |      ✓      |
 | `list_services`                    |     ✓     |     ✓     |      ✓      |
 | `is_declared`                      |   false   |     ✓     |      ✓      |
@@ -284,7 +332,7 @@ Linux (no VINTF manifest).
 
 ## Using the ServiceManager Object Directly
 
-The convenience functions (`hub::add_service`, `hub::get_service`, etc.) use
+The convenience functions (`hub::add_service`, `hub::check_service`, etc.) use
 a global singleton `ServiceManager` under the hood. If you need more control,
 you can obtain the `ServiceManager` instance directly:
 
@@ -297,7 +345,7 @@ use rsbinder::hub;
 let sm = hub::default()?;
 
 // Use methods on the ServiceManager instance
-let service = sm.get_service("com.example.myservice");
+let service = sm.check_service("com.example.myservice");
 let services = sm.list_services(hub::DUMP_FLAG_PRIORITY_ALL);
 ```
 
@@ -314,17 +362,25 @@ service manager as a parameter or store it in a struct.
   (e.g., `com.example.myservice`) to avoid name collisions with other
   services.
 
-- **Register for notifications instead of polling.** If your client starts
-  before the service it depends on, use `register_for_notifications` rather
-  than repeatedly calling `get_service` in a loop.
+- **Wait, don't poll.** If your client starts before the service it depends
+  on, call `wait_for_interface` / `wait_for_service` rather than repeatedly
+  calling `check_service` in a loop — the wait is event-driven when a binder
+  thread pool is running. Use `register_for_notifications` when you need to
+  observe every (re-)registration over time, and remember that the
+  notification callback only fires if the process runs a thread pool.
+
+- **Avoid the deprecated `get_service` / `get_interface`.** Their wait
+  behavior differed across Android versions; the `wait_*`, `check_*`, and
+  `try_get_*` families make the blocking and error semantics explicit.
 
 - **Handle registration failures.** `add_service` can fail if the name is
   invalid or if the caller lacks permission (on Android with SELinux). Always
   check the result.
 
-- **Use `get_interface` for type safety.** Prefer `hub::get_interface` over
-  `hub::get_service` when you know the expected interface type. It returns a
-  strongly-typed proxy that provides compile-time guarantees.
+- **Prefer the typed `*_interface` variants.** `wait_for_interface`,
+  `check_interface`, and `try_get_interface` return a strongly-typed proxy
+  that provides compile-time guarantees; the `*_service` variants return the
+  raw `SIBinder`.
 
 - **Debug with `list_services` and `get_service_debug_info`.** When
   troubleshooting, list all registered services and inspect their debug

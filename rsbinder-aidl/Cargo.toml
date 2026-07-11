@@ -3,7 +3,7 @@ name = "rsbinder-aidl"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
-description = "This is a AIDL compiler for rsbinder."
+description = "An AIDL compiler for rsbinder — generates Rust Binder IPC code from .aidl files."
 homepage = { workspace = true }
 repository = { workspace = true }
 readme = "README.md"
@@ -11,6 +11,9 @@ rust-version = { workspace = true }
 keywords.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 async = []

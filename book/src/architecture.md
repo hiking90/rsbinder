@@ -48,14 +48,14 @@ flowchart BT
     - Supports both native services and async services with runtime integration.
 
 - **Binder Client**
-    - Use hub::get_interface() to obtain a strongly-typed proxy to the service.
+    - Use hub::wait_for_interface() to obtain a strongly-typed proxy to the service (or hub::check_interface() / hub::try_get_interface() for non-blocking lookup).
     - The generated proxy code handles all IPC marshalling/unmarshalling automatically.
     - Supports death notifications for service lifecycle management.
     - Can register service callbacks for service availability notifications.
     - Full type safety with compile-time interface validation.
 
 - **HUB (Service Manager)**
-    - In **rsbinder**, the service manager is referred to as **HUB**. The `hub` module in the rsbinder API provides a unified interface (`hub::add_service()`, `hub::get_interface()`, etc.) that works on both platforms.
+    - In **rsbinder**, the service manager is referred to as **HUB**. The `hub` module in the rsbinder API provides a unified interface (`hub::add_service()`, `hub::wait_for_interface()`, etc.) that works on both platforms.
     - **On Linux**: **rsbinder** provides **rsb_hub**, a standalone service manager that you run as a separate process. You must start `rsb_hub` before registering or discovering services.
     - **On Android**: The system already provides its own service manager (`servicemanager`). **rsbinder** connects to it automatically — no need to run `rsb_hub`.
     - Handles service registration, discovery, and lifecycle management.

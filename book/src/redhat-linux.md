@@ -131,23 +131,22 @@ $ sudo dnf update kernel
 $ grep -E "(ANDROID|BINDER)" /boot/config-$(uname -r)
 ```
 
-## Module Loading (After Kernel Build)
+## After Kernel Build
 
-Once you have a kernel with binder support:
+With the kernel built as described above, binder is compiled directly
+into the kernel (`CONFIG_ANDROID_BINDER_IPC=y` is a built-in option,
+not a module), so nothing needs to be loaded with `modprobe` or
+configured in `modules-load.d`:
 
 ```bash
-# Load binder modules
-$ sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
-
-# Verify modules are loaded
-$ lsmod | grep binder
-
-# Create persistent module loading
-$ echo "binder_linux" | sudo tee /etc/modules-load.d/binder.conf
-
-# Set module parameters
-$ echo "options binder_linux devices=binder,hwbinder,vndbinder" | sudo tee /etc/modprobe.d/binder.conf
+# Verify binder is built into the running kernel
+$ grep -E "(ANDROID|BINDER)" /boot/config-$(uname -r)
 ```
+
+> **Note**: `modprobe binder_linux` / `modules-load.d` instructions
+> found elsewhere refer to `binder_linux`, the out-of-tree Anbox DKMS
+> module for kernels without built-in binder support. They do not apply
+> to a kernel built with the options above.
 
 ## SELinux Considerations
 

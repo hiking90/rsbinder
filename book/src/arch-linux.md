@@ -71,15 +71,16 @@ $ cargo run --bin hello_client
 
 ## Persistent Configuration
 
-To automatically load binder modules on boot:
+The linux-zen kernel builds binder directly into the kernel
+(`CONFIG_ANDROID_BINDER_IPC=y`), so there is no module to load on boot —
+no `modules-load.d` or `modprobe` configuration is needed. The only
+non-persistent piece is the binderfs device itself: re-run
+`sudo rsb_device binder` after each reboot (see above).
 
-```bash
-# Create module loading configuration
-$ echo "binder_linux" | sudo tee /etc/modules-load.d/binder.conf
-
-# Set module parameters
-$ echo "options binder_linux devices=binder,hwbinder,vndbinder" | sudo tee /etc/modprobe.d/binder.conf
-```
+> **Note**: `binder_linux` is the out-of-tree Anbox DKMS module, not
+> part of the zen kernel. `modules-load.d` / `modprobe binder_linux`
+> instructions found elsewhere apply only to that third-party module
+> setup on kernels without built-in binder support.
 
 ## Troubleshooting
 
@@ -92,8 +93,8 @@ $ dmesg | grep -i binder
 # Verify zen kernel is running
 $ uname -r | grep zen
 
-# Check if modules loaded successfully
-$ sudo modprobe -v binder_linux
+# Verify binder is built into the kernel config
+$ zgrep -E "(ANDROID|BINDER)" /proc/config.gz
 ```
 
 ## References

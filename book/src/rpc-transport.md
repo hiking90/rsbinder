@@ -26,7 +26,7 @@ distinguish RPC from kernel binder.
 >
 > ```toml
 > [dependencies]
-> rsbinder = { version = "0.8", features = ["rpc"] }
+> rsbinder = { version = "0.10", features = ["rpc"] }
 > ```
 
 ## When to use RPC vs. kernel binder
@@ -99,7 +99,7 @@ Key points:
   pure-RPC process needs neither `ProcessState` nor `rsb_hub`.
 - **`set_root`** publishes the single root binder. The client fetches
   it back through `RpcSession::get_root` — this is the moral
-  equivalent of `hub::get_interface(name)` for kernel binder, just
+  equivalent of `hub::wait_for_interface(name)` for kernel binder, just
   without a service manager.
 - **`server.run()`** runs the accept loop until
   [`RpcServer::shutdown`] is called. Use
@@ -222,12 +222,60 @@ Add the matching feature in `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.8", features = ["rpc", "rpc-vsock"] }
+rsbinder = { version = "0.10", features = ["rpc", "rpc-vsock"] }
 ```
 
 Each backend implements the
 [`RpcTransport`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html)
 trait — you can implement your own if you need a custom carrier.
+
+### Abstract Unix-domain sockets (Linux/Android)
+
+Since 0.10.0 the Unix backend can also bind the Linux **abstract socket
+namespace** — a kernel-namespace name with no filesystem entry, so there
+is no socket file to create, unlink, or leak:
+
+```rust
+// Server: no filesystem path, nothing to clean up on shutdown.
+let server = RpcServer::setup_unix_server_abstract(b"my.rpc.name")?;
+
+// Client, r34 wire:
+let session = RpcSession::setup_unix_client_abstract(b"my.rpc.name")?;
+
+// Client, android-13+ wire (negotiating up to v2):
+let session =
+    RpcSession::setup_unix_client_android13plus_abstract(b"my.rpc.name", 2)?;
+```
+
+These functions exist only on Linux and Android (the abstract namespace
+is a Linux kernel feature).
+
+For the android-13+ client there is also a builder,
+[`RpcUnixClientConfig`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcUnixClientConfig.html),
+consumed by `RpcSession::setup_unix_client_android13plus_with_config`.
+One config combines filesystem-path or abstract addressing with the
+optional knobs the positional helpers expose individually — attaching to
+an existing session by echoing its 32-byte id, an outgoing-connection
+fan-out, and the fd transport mode (session-id attach and fan-out are
+mutually exclusive):
+
+```rust
+use rsbinder::rpc::{FileDescriptorTransportMode, RpcSession, RpcUnixClientConfig};
+
+let session = RpcSession::setup_unix_client_android13plus_with_config(
+    RpcUnixClientConfig::abstract_name(b"my.rpc.name", 2)
+        .outgoing_connections(2)
+        .fd_mode(FileDescriptorTransportMode::Unix),
+)?;
+```
+
+> **Security.** An abstract socket has **no filesystem permissions**:
+> any process in the same network namespace can connect (subject only to
+> LSM policy such as SELinux), so the directory-mode access control a
+> path-bound socket can rely on does not apply. When exposure matters,
+> install an [`RpcServer::set_authorizer`] hook (see
+> [Security](#security)) and check the peer identity (uid/gid/pid) it
+> receives.
 
 ### TLS client
 
@@ -421,20 +469,24 @@ through the android-13+ handshake.
 
 rsbinder implements **both sides** of this pattern:
 
-- **Consume side** — `hub::get_service(name)` transparently follows
-  the `IAccessor` arm: if the service manager hands back an
+- **Consume side** — the shared `hub` lookup path (`hub::check_service`,
+  `hub::wait_for_service`, and the typed/`try_*` variants) transparently
+  follows the `IAccessor` arm: if the service manager hands back an
   `IAccessor` instead of a regular binder, rsbinder calls
   `addConnection()`, adopts the fd, runs the v2 handshake, and gives
   you back the RPC root. Your client code looks identical to a
-  regular `hub::get_service` call.
+  regular `hub::check_service` call.
 
 - **Register side** — `hub::android_16::create_accessor(instance,
   addr_provider)` builds a `LocalAccessor` `BnAccessor` you can
   publish via `hub::add_service`. The provider closure resolves an
   instance name to an
   [`AccessorSockAddr`](https://docs.rs/rsbinder/latest/rsbinder/hub/android_16/enum.AccessorSockAddr.html)
-  (`Unix(path)`, `Vsock { cid, port }`, or `Inet(addr)`), and the
-  accessor opens the connection on demand:
+  (`Unix(path)`, `UnixAbstract(name)` — added in 0.10.0 —
+  `Vsock { cid, port }`, or `Inet(addr)`), and the accessor opens the
+  connection on demand. The enum is intentionally exhaustive (not
+  `#[non_exhaustive]`), so downstream exhaustive `match`es need an arm
+  for the new `UnixAbstract` variant — see the 0.10.0 CHANGELOG:
 
   ```rust
   use rsbinder::hub::{self, android_16::{create_accessor, AccessorSockAddr}};
@@ -471,9 +523,9 @@ rsbinder implements **both sides** of this pattern:
 Use
 [`hub::android_16::add_accessor_provider`](https://docs.rs/rsbinder/latest/rsbinder/hub/android_16/fn.add_accessor_provider.html)
 when you want a **process-local** accessor — one that doesn't go
-through the system service manager. Lookups via `hub::get_service` in
-the same process fall back to the process-local registry when the
-service manager returns nothing.
+through the system service manager. Lookups via `hub::check_service` /
+`hub::wait_for_service` in the same process fall back to the
+process-local registry when the service manager returns nothing.
 
 Both sides of the Accessor pattern have been validated against real
 Android 16 `libbinder` on the emulator.

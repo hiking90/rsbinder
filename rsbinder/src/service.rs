@@ -16,7 +16,7 @@
 //! and two typed host/broker pairs, one per transport:
 //!
 //! - [`kernel::Host`] / [`kernel::Broker`] — over `ProcessState` + `hub`.
-//! - [`rpc::Host`] / [`rpc::Broker`] — over `RpcServer` + `RpcSession`
+//! - `rpc::Host` / `rpc::Broker` — over `RpcServer` + `RpcSession`
 //!   (`#[cfg(feature = "rpc")]`).
 //!
 //! # This is additive, not a replacement
@@ -41,7 +41,7 @@
 //! Phase A), and [`crate::get_calling_uid`] returns the kernel-vouched
 //! peer uid over Unix RPC / a fail-closed sentinel on uid-less transports
 //! (Phase B). Authorization on RPC is the transport's own boundary
-//! (`PeerIdentity` + [`crate::rpc::RpcServer::set_authorizer`]).
+//! (`PeerIdentity` + `crate::rpc::RpcServer::set_authorizer`).
 //!
 //! # Why typed pairs, not one `Endpoint` enum
 //!
@@ -75,7 +75,7 @@ pub trait Registry {
     ///
     /// Kernel: delegates to [`crate::hub::add_service`] (the system service
     /// manager). RPC: delegates to
-    /// [`crate::rpc::RpcServer::add_service`] (an in-process directory the
+    /// `crate::rpc::RpcServer::add_service` (an in-process directory the
     /// session root resolves) — there is no system-wide RPC service
     /// manager, by design (mirrors AOSP).
     fn add_service(&self, name: &str, binder: SIBinder) -> Result<()>;
@@ -159,7 +159,7 @@ pub mod kernel {
     ///
     /// Construction is **idempotent** (`ProcessState` is process-wide);
     /// [`Host::serve`] joins the **process-wide** binder thread pool — it
-    /// is not a per-instance lifecycle. Contrast [`super::rpc::Host`],
+    /// is not a per-instance lifecycle. Contrast `super::rpc::Host`,
     /// whose `serve()` drives a single socket.
     pub struct Host {
         _priv: (),
