@@ -564,7 +564,7 @@ impl RpcServer {
     /// `config` is the caller's `rustls::ServerConfig` (server cert
     /// chain + private key, optional mTLS client-cert verifier);
     /// rsbinder never invents crypto. Use
-    /// [`super::rustls`](super::rustls) (re-export of the linked
+    /// [`super::rustls`] (re-export of the linked
     /// `rustls` version) to construct the config.
     #[cfg(feature = "rpc-tls")]
     pub fn setup_unix_server_tls(
@@ -579,7 +579,7 @@ impl RpcServer {
     /// TCP server with TLS. The TCP backend is
     /// **TLS-only** by design (plain-text network RPC is never
     /// production-appropriate; see [`super`] module doc). Use
-    /// [`super::rustls`](super::rustls) to construct the config (server
+    /// [`super::rustls`] to construct the config (server
     /// cert chain + private key, optional mTLS).
     #[cfg(feature = "rpc-tls")]
     pub fn setup_tcp_server_tls(
@@ -701,7 +701,7 @@ impl RpcServer {
 
     /// Set (or disable) the **handshake/admission read deadline** applied
     /// to each accepted connection before it enters the blocking serve
-    /// loop. Default [`DEFAULT_HANDSHAKE_TIMEOUT`] (10s). `Some(d)` ⇒ a
+    /// loop. Default `DEFAULT_HANDSHAKE_TIMEOUT` (10s). `Some(d)` ⇒ a
     /// connected-but-silent peer that never sends its handshake is
     /// dropped after `d`, releasing both its `Arc<RpcServer>` (so the
     /// server's `Drop` cleanup can run) and its
@@ -1001,7 +1001,7 @@ impl RpcServer {
 
     /// Serve one already-connected transport on its own worker thread
     /// (used by in-memory tests and by [`super::session`] direct calls).
-    /// The accept loop uses [`serve_connection_raw`](Self::serve_connection_raw)
+    /// The accept loop uses the private `serve_connection_raw`
     /// to keep TLS handshake (if any) on the worker side.
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
         let server = Arc::clone(self);

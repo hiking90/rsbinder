@@ -34,6 +34,8 @@ pub struct Point {
 | `PartialEq` | Enables equality comparison |
 | `Copy` | Enables bitwise copy (fixed-size types only) |
 
+These are the most common choices, but the list is not exhaustive: as in AOSP, the generator passes through any `Name=true` identifier as a derive, so other derivable traits (`Eq`, `Hash`, `PartialOrd`, `Ord`, ...) work the same way.
+
 ### Why Clone Is Not Derived by Default
 
 Generated types do **not** derive `Clone` by default. This is intentional because some AIDL types contain fields that cannot be cloned:
@@ -118,7 +120,7 @@ Apply `@nullable` to method parameters, return values, or struct fields:
 ```aidl
 interface IUserService {
     @nullable String getName();
-    void setValues(@nullable in int[] values);
+    void setValues(in @nullable int[] values);
 }
 ```
 
@@ -320,8 +322,8 @@ The following table provides a quick reference for all annotations covered in th
 | `@nullable(heap=true)` | field | AOSP-faithful syntax for recursive fields; rsbinder boxes self-referential fields automatically (parameter accepted but not required) |
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
-| `@VintfStability` | parcelable, interface | Enforces VINTF stability rules |
-| `@FixedSize` | parcelable | Restricts fields to fixed-size types, enables `Copy` |
+| `@VintfStability` | parcelable, interface | Stamps `Stability::Vintf`; structural constraints not enforced |
+| `@FixedSize` | parcelable | Recognized; currently a no-op (`Copy` comes from `@RustDerive(Copy=true)`) |
 | `@EnforcePermission` | interface method | Generates a `PermissionManagerService` check (kernel-only; denied over RPC) |
 
 When writing AIDL files for rsbinder, the most commonly used annotations are `@RustDerive` (for ergonomic Rust types), `@Backing` (for enums), and `@nullable` (for optional values). The remaining annotations are important for interoperability with Android or for specific use cases like recursive types and interface migration.

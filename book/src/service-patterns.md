@@ -69,8 +69,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // to surface device-open or initialization failures.
     ProcessState::init_default()?;
 
-    // Start additional threads for handling concurrent Binder transactions.
-    // Optional but recommended for services that handle multiple clients.
+    // Start the binder thread pool and enable kernel-driven thread
+    // spawning, so concurrent transactions are handled in parallel.
     ProcessState::start_thread_pool();
 
     // Create a Binder object from your service implementation.
@@ -79,7 +79,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Register the service with the service manager (hub).
     // The first argument is the service name used by clients to find it.
-    hub::add_service("com.example.myservice", service.as_binder())?;
+    // `add_service` accepts anything convertible into `SIBinder`, so the
+    // typed `Strong<dyn IMyService>` goes in directly — no `.as_binder()`.
+    hub::add_service("com.example.myservice", &service)?;
 
     // Block the main thread and process incoming Binder transactions.
     // This call does not return under normal operation.
@@ -91,9 +93,10 @@ Each function in this lifecycle serves a specific purpose:
 
 - **`ProcessState::init_default()`** opens the Binder device (typically `/dev/binderfs/binder`)
   and sets up process-wide state for Binder communication.
-- **`ProcessState::start_thread_pool()`** spawns additional threads so the process can
-  handle multiple concurrent transactions. Without this call, only one thread handles
-  all incoming requests.
+- **`ProcessState::start_thread_pool()`** spawns a binder worker thread and enables
+  kernel-driven spawning of further workers. Without this call, transactions are
+  served only by threads that explicitly call `join_thread_pool()`, so the process
+  is effectively single-threaded.
 - **`BnMyService::new_binder()`** wraps your implementation struct in a Binder-compatible
   object. The `Bn` prefix stands for "Binder native" (the server-side stub).
 - **`hub::add_service()`** registers your service with the service manager so that clients
@@ -238,9 +241,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ProcessState::init_default()?;
 
     // Obtain a strongly-typed proxy for the service.
-    // hub::get_interface returns a Strong<dyn IMyService> on success.
+    // hub::wait_for_interface blocks until the service is registered and
+    // returns a Strong<dyn IMyService> on success. Use hub::check_interface
+    // instead for a non-blocking probe that fails immediately with
+    // NameNotFound when the service is absent.
     let service: rsbinder::Strong<dyn IMyService::IMyService> =
-        hub::get_interface("com.example.myservice")?;
+        hub::wait_for_interface("com.example.myservice")?;
 
     // Call service methods through the proxy.
     let result = service.echo("hello")?;
@@ -249,6 +255,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+A purely-outbound client like this one needs no binder thread pool. As soon
+as the client *receives* inbound calls — a callback object it passed to the
+service, a service-registration notification, or a death recipient — it must
+also call `ProcessState::start_thread_pool()` (see below).
 
 ### Listing Available Services
 
@@ -280,6 +291,10 @@ let callback = hub::BnServiceCallback::new_binder(MyServiceCallback);
 hub::register_for_notifications(SERVICE_NAME, &callback)?;
 ```
 
+Note: `onRegistration` is an *inbound* transaction into the client process,
+so the client must call `ProcessState::start_thread_pool()` (or park a thread
+in `join_thread_pool()`) — otherwise the notification never fires.
+
 ### Death Recipients
 
 Clients can monitor whether a remote service process is still alive by registering
@@ -303,12 +318,21 @@ service.as_binder().link_to_death(
 
 To stop receiving notifications, call `unlink_to_death` with the same weak reference.
 
+Note: `binder_died` is delivered as an inbound binder command, so a client
+that links a death recipient must call `ProcessState::start_thread_pool()`
+(or park a thread in `join_thread_pool()`) — otherwise `binder_died` never
+fires.
+
 ## Tips and Best Practices
 
 - **`ProcessState::init_default()` must be called before any Binder operations.**
   Failing to do so will result in a panic.
-- **`start_thread_pool()` is optional but recommended.** Without it, only a single
-  thread handles all Binder transactions, which can become a bottleneck under load.
+- **`start_thread_pool()` is required by any process that receives inbound
+  transactions.** That includes not just services, but also *clients* holding a
+  service-notification callback, a callback object passed to a service, or a death
+  recipient — without a thread pool (or a thread parked in `join_thread_pool()`),
+  those callbacks and `binder_died` never fire. Only a purely-outbound client that
+  makes synchronous calls and receives nothing back can skip it.
 - **Each process needs only one `ProcessState::init_default()` call.** Multiple calls
   are safe but unnecessary.
 - **`join_thread_pool()` blocks the calling thread.** Place it at the end of `main()`

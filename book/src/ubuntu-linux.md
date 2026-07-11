@@ -67,13 +67,14 @@ $ sudo rsb_device binder
 
 1. **Module not found**: Ensure your kernel was built with binder support enabled
 2. **Permission denied**: Make sure you're using sudo for device creation
-3. **Kernel too old**: Binder support requires Linux kernel 4.17+ natively
+3. **Kernel too old**: The binder driver was mainlined in kernel 4.17, but binderfs (used by `rsb_device`) requires kernel 5.0+
 
 ### Getting Help:
 
 - Check dmesg for kernel messages: `dmesg | grep -i binder`
-- Verify module loading: `sudo modprobe -v binder_linux`
-- Check system logs: `journalctl -f` while loading modules
+- Verify binder is enabled in the kernel config: `grep -E "(ANDROID|BINDER)" /boot/config-$(uname -r)`
+  (note: `binder_linux` is the out-of-tree Anbox DKMS module — `modprobe binder_linux` does not apply to a kernel built with the options above)
+- Check system logs: `journalctl -f`
 
 ## References
 

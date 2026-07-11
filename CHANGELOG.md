@@ -13,10 +13,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-07-08
+## [0.10.0] - 2026-07-11
 
 ### Changed
 
+- **rsbinder:** oneway transactions now propagate transport errors (e.g.
+  `DeadObject`) to the caller instead of swallowing them as `Ok(())`,
+  matching AOSP's generated Rust proxies. (#159)
+- Dropped the `downcast-rs` dependency (replaced by std `Arc` downcasting)
+  and trimmed unused `tera` builtins from rsbinder-aidl's dependency tree.
 - **rsbinder (breaking):** `AccessorSockAddr` gained the `UnixAbstract`
   variant. The enum is intentionally not `#[non_exhaustive]` (its shape is
   part of the documented contract), so downstream exhaustive `match`es
@@ -83,6 +88,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **hub:** Android 17 (SDK 37) service-manager support. SDK 37 shares
+  Android 16's service-manager wire format, so it is served by the existing
+  `android_16` / `android_16_plus` features — no new feature flag.
+  Validated against an API 37 emulator. (#158)
+- **hub:** event-driven service lookups matching AOSP `waitForService`:
+  `wait_for_service` / `wait_for_interface` (block until registered, via
+  `registerForNotifications` where available) and non-blocking
+  `check_interface`. (#159)
+- **hub:** error-preserving lookups `try_get_service` / `try_get_interface`
+  returning `Result<Option<_>>`, so "service not registered" (`Ok(None)`)
+  is distinguishable from a transport/service-manager failure (`Err`). (#159)
+- **hub:** `add_service` now accepts `impl Into<SIBinder>` (pass a
+  `Strong<dyn IFoo>` or a reference to one directly — no `.as_binder()`),
+  backed by new `From<Strong<I>>` / `TryFrom<SIBinder>` conversions; plus
+  public `register_client_callback` / `try_unregister_service` for lazy
+  services. (#159)
+- **rsbinder:** `include_aidl!` macro replacing the
+  `include!(concat!(env!("OUT_DIR"), …))` + re-export boilerplate;
+  `BinderResult<T>` alias with `From<std::io::Error>` /
+  `From<TryFromSliceError>` for `Status`;
+  `SIBinder::link_to_death_arc` / `unlink_to_death_arc` (no more manual
+  `Arc::downgrade` incantation); `ParcelFileDescriptor::try_clone` +
+  `AsFd` + `From<OwnedFd>` / `From<File>`; typed `Parcel` scalar
+  read/write helpers; `RpcSession::get_interface`. (#159)
 - **rsbinder-aidl:** string concatenation composes through the ordinary
   expression grammar: `CONST_A + "suffix"` and parenthesized chains
   (`("a" + "b")`) now parse; previously only a literal-first chain did.
@@ -161,6 +190,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Deprecated / known gaps
 
+- **hub:** `get_service` / `get_interface` are now `#[deprecated]`: their
+  implicit wait behavior is inconsistent across Android versions. Migrate to
+  `wait_for_service` / `wait_for_interface` (blocking), `check_service` /
+  `check_interface` (non-blocking), or the error-preserving `try_*`
+  variants. The functions still work; upgrading surfaces a compile-time
+  deprecation warning. (#159)
 - **rsbinder-aidl:** an AIDL `/** @deprecated */` doc comment is not yet
   propagated to a Rust `#[deprecated]` attribute (AOSP does). No wire or
   correctness impact; downstream users of a deprecated AIDL member simply do

@@ -43,7 +43,7 @@ assert_eq!(default_profile.age, 0);
 
 ## Constants in Parcelable
 
-Parcelable types can define constants, including numeric values and bit flags. These are emitted as module-level `pub const` items inside the generated parcelable module. Because the module shares its name with the struct, you still reach them with the familiar `TypeName::CONSTANT` path. This pattern is commonly used for configuration values and flag fields.
+Parcelable types can define constants, including numeric values and bit flags. These are emitted as module-level `pub const` items inside the generated parcelable module — not as associated constants on the struct. The familiar-looking `TypeName::CONSTANT` path therefore resolves through the *module* name (which shares its name with the struct), so you must import the module, not the struct: `use ...::Config;` gives you both `Config::BIT_VERBOSE` (the constant) and `Config::Config` (the struct). Importing the struct directly (`use ...::Config::Config;`) shadows the module path and makes the constants unreachable through it. This pattern is commonly used for configuration values and flag fields.
 
 ```aidl
 @RustDerive(Clone=true, PartialEq=true)
@@ -58,12 +58,12 @@ parcelable Config {
 }
 ```
 
-In Rust, the constants are accessed through the type path:
+In Rust, the constants are accessed through the module path, and the struct through the module-qualified `Config::Config` spelling:
 
 ```rust
-use Config::Config;
+use com::example::Config;
 
-let mut cfg = Config::default();
+let mut cfg = Config::Config::default();
 assert_eq!(cfg.retryCount, 5);
 
 cfg.flags = Config::BIT_VERBOSE | Config::BIT_DEBUG;
@@ -74,14 +74,14 @@ This pattern mirrors how the Android test suite defines and uses bit flags withi
 
 ## Using Parcelable in Services
 
-Parcelable types are passed to and from service methods as regular parameters. A common pattern is to pass a mutable reference to a parcelable so that the service can fill in or modify its fields. This is based on the `FillOutStructuredParcelable` pattern used in the rsbinder test suite.
+Parcelable types are passed to and from service methods as regular parameters. A common pattern is to pass a mutable reference to a parcelable so that the service can fill in or modify its fields. This is based on the `FillOutStructuredParcelable` pattern used in the rsbinder test suite. As with the constants above, `StructuredParcelable` in the snippets below names the generated *module*: the struct is written module-qualified as `StructuredParcelable::StructuredParcelable`, while the bit constants (`StructuredParcelable::BIT0`, `StructuredParcelable::BIT2`) resolve through the module.
 
 Service implementation:
 
 ```rust
 fn FillOutStructuredParcelable(
     &self,
-    parcelable: &mut StructuredParcelable,
+    parcelable: &mut StructuredParcelable::StructuredParcelable,
 ) -> rsbinder::status::Result<()> {
     parcelable.shouldBeJerry = "Jerry".into();
     parcelable.shouldContainThreeFs = vec![parcelable.f, parcelable.f, parcelable.f];
@@ -94,7 +94,7 @@ fn FillOutStructuredParcelable(
 Client side:
 
 ```rust
-let mut parcelable = StructuredParcelable {
+let mut parcelable = StructuredParcelable::StructuredParcelable {
     f: 17,
     shouldSetBit0AndBit2: 0,
     ..Default::default()
@@ -119,7 +119,7 @@ The `@nullable` annotation allows a parcelable parameter or return type to be `N
 AIDL declaration:
 
 ```aidl
-@nullable Empty RepeatNullableParcelable(@nullable in Empty input);
+@nullable Empty RepeatNullableParcelable(in @nullable Empty input);
 ```
 
 Service implementation:
@@ -167,7 +167,7 @@ for n in 0..10 {
 let result = service.ReverseList(head.as_ref().unwrap())?;
 
 // Traverse the reversed list: [0, 1, ..., 9]
-let mut current: Option<&RecursiveList> = result.as_ref();
+let mut current: Option<&RecursiveList> = Some(&result);
 for n in 0..10 {
     assert_eq!(current.map(|inner| inner.value), Some(n));
     current = current.unwrap().next.as_ref().map(|n| n.as_ref());
@@ -270,4 +270,4 @@ Here are some practical guidelines when working with parcelable types in rsbinde
 
 - **Place each parcelable in its own `.aidl` file.** Following the AIDL convention, each parcelable type should be defined in a separate file whose name matches the type name (e.g., `UserProfile.aidl` for `parcelable UserProfile`).
 
-- **Constants are scoped to the parcelable.** When you define `const int MAX_VALUE = 100;` inside a parcelable, access it in Rust as `MyParcelable::MAX_VALUE`. This keeps related constants close to the data they describe.
+- **Constants are scoped to the parcelable's module.** When you define `const int MAX_VALUE = 100;` inside a parcelable, access it in Rust as `MyParcelable::MAX_VALUE`, where `MyParcelable` is the generated *module* (import the module, not the struct — the struct itself is `MyParcelable::MyParcelable`). This keeps related constants close to the data they describe.

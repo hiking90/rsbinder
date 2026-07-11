@@ -943,7 +943,7 @@ impl Parcel {
     /// through this method as it reads each `next` node, so a hostile
     /// deeply-nested payload would recurse until the worker-thread stack
     /// overflows — a hard `SIGABRT`, not a recoverable [`StatusCode`]. The
-    /// nesting is capped at [`MAX_NESTED_READ_DEPTH`]; a payload exceeding it
+    /// nesting is capped at `MAX_NESTED_READ_DEPTH` (1000); a payload exceeding it
     /// is rejected with [`StatusCode::BadValue`]. This is defense-in-depth
     /// beyond AOSP (whose `Parcel` has no equivalent guard) and is set far
     /// above any legitimate AIDL nesting, so conforming traffic is unaffected.

@@ -170,8 +170,8 @@ fn rpc_calling() -> Option<(binder::uid_t, binder::pid_t)> {
 /// - [`Caller::Kernel`] — Android permissions (`@EnforcePermission` /
 ///   [`crate::permission_controller::check_permission`]), `uid`/`pid`
 ///   ACLs, or the SELinux `sid`.
-/// - [`Caller::Rpc`] — the transport's own trust boundary: a Unix
-///   [`PeerIdentity::Local`](crate::rpc::PeerIdentity) uid ACL, a TLS
+/// - `Caller::Rpc` (with the `rpc` feature) — the transport's own trust
+///   boundary: a Unix `PeerIdentity::Local` uid ACL, a TLS
 ///   `Certificate` subject/fingerprint allowlist, etc.
 ///   `@EnforcePermission` is **denied** over RPC (Plan 2-16 Phase A).
 #[derive(Clone, Debug)]

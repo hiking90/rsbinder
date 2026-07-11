@@ -887,7 +887,7 @@ impl IServiceManager for ServiceManager {
                     let msg = format!(
                         "registerForNotifications: too many callbacks for {name} (max {MAX_CALLBACKS_PER_NAME})"
                     );
-                    log::warn!("{}", &msg);
+                    log::warn!("{}", msg);
                     return Err((ExceptionCode::IllegalState, msg.as_str()).into());
                 }
             }
@@ -898,7 +898,7 @@ impl IServiceManager for ServiceManager {
                 let msg = format!(
                     "registerForNotifications: name registry full (max {MAX_DISTINCT_NAMES})"
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
@@ -1030,7 +1030,7 @@ impl IServiceManager for ServiceManager {
                 service
             } else {
                 let msg = format!("registerClientCallback could not find service {name}");
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             };
 
@@ -1039,13 +1039,13 @@ impl IServiceManager for ServiceManager {
                     "{:?} Only a server can register for client callbacks (for {})",
                     service.context, name
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::Security, msg.as_str()).into());
             }
 
             if service.binder != *arg_service {
                 let msg = format!("registerClientCallback called with wrong service {name}");
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             }
 
@@ -1061,7 +1061,7 @@ impl IServiceManager for ServiceManager {
                     let msg = format!(
                         "registerClientCallback: too many callbacks for {name} (max {MAX_CALLBACKS_PER_NAME})"
                     );
-                    log::warn!("{}", &msg);
+                    log::warn!("{}", msg);
                     return Err((ExceptionCode::IllegalState, msg.as_str()).into());
                 }
             }
@@ -1074,7 +1074,7 @@ impl IServiceManager for ServiceManager {
                 let msg = format!(
                     "registerClientCallback: name registry full (max {MAX_DISTINCT_NAMES})"
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
@@ -1139,7 +1139,7 @@ impl IServiceManager for ServiceManager {
                 let msg = format!(
                     "{context:?} Tried to unregister {name}, but that service wasn't registered to begin with."
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             };
 
@@ -1148,13 +1148,13 @@ impl IServiceManager for ServiceManager {
                     "{:?} Only a server can register for client callbacks (for {})",
                     service.context, name
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::Security, msg.as_str()).into());
             }
 
             if service.binder != *arg_service {
                 let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             }
 
@@ -1162,7 +1162,7 @@ impl IServiceManager for ServiceManager {
                 let msg = format!(
                     "{context:?} Tried to unregister {name}, but there is about to be a client."
                 );
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
@@ -1187,7 +1187,7 @@ impl IServiceManager for ServiceManager {
                 .unwrap_or(true);
             if has_clients {
                 let msg = format!("{context:?} Tried to unregister {name}, but there are clients.");
-                log::warn!("{}", &msg);
+                log::warn!("{}", msg);
                 if let Some(service) = inner.name_to_service.get_mut(name) {
                     service.guarantee_client = true;
                 }

@@ -18,12 +18,12 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.8"
+rsbinder = "0.10"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.8"
+rsbinder-aidl = "0.10"
 ```
 Add rsbinder and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
 
@@ -78,14 +78,21 @@ For the Client and Service, create a library that includes the Rust code generat
 
 Create src/lib.rs and add the following content.
 ```rust
-// Include the code hello.rs generated from AIDL.
-include!(concat!(env!("OUT_DIR"), "/hello.rs"));
-
-// Set up to use the APIs provided in the code generated for Client and Service.
-pub use crate::hello::IHello::*;
+// Include the code hello.rs generated from AIDL and re-export the
+// IHello interface items (the trait, BnHello, BpHello, ...) so both
+// the client and the service can use them.
+rsbinder::include_aidl!("hello", crate::hello::IHello::*);
 
 // Define the name of the service to be registered in the HUB(service manager).
 pub const SERVICE_NAME: &str = "my.hello";
+```
+
+The `rsbinder::include_aidl!` macro is the one-call form of the manual
+include/re-export pair. The above is equivalent to:
+
+```rust
+include!(concat!(env!("OUT_DIR"), "/hello.rs"));
+pub use crate::hello::IHello::*;
 ```
 
 ## Create a service
@@ -113,7 +120,7 @@ impl Interface for IHelloService {
 // Implement the IHello interface for the IHelloService.
 impl IHello for IHelloService {
     // Implement the echo method.
-    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         Ok(echo.to_owned())
     }
 }
@@ -134,9 +141,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService{});
 
-    // Add the service to binder service manager.
+    // Add the service to binder service manager. `add_service` takes anything
+    // convertible into `SIBinder`, so the typed handle goes in directly.
     println!("Adding service to hub...");
-    hub::add_service(SERVICE_NAME, service.as_binder())?;
+    hub::add_service(SERVICE_NAME, &service)?;
 
     // Join the thread pool.
     // This is a blocking call. It will return when the thread pool is terminated.
@@ -160,7 +168,7 @@ struct MyServiceCallback {}
 impl Interface for MyServiceCallback {}
 
 impl IServiceCallback for MyServiceCallback {
-    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::status::Result<()> {
+    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::BinderResult<()> {
         println!("MyServiceCallback: {name}");
         Ok(())
     }
@@ -189,14 +197,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
     hub::register_for_notifications(SERVICE_NAME, &service_callback)?;
 
-    // Create a Hello proxy from binder service manager.
-    let hello: rsbinder::Strong<dyn IHello> = hub::get_interface(SERVICE_NAME)
-        .unwrap_or_else(|_| panic!("Can't find {SERVICE_NAME}"));
+    // Block until the Hello service is registered, then cast it to the
+    // interface — the event-driven equivalent of AOSP's `waitForService`.
+    let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
 
+    // `link_to_death_arc` takes the concrete `Arc<MyDeathRecipient>` directly.
+    // Keep `recipient` alive for the link's lifetime (the link holds only a weak ref).
     let recipient = Arc::new(MyDeathRecipient {});
-    hello
-        .as_binder()
-        .link_to_death(Arc::downgrade(&(recipient as Arc<dyn DeathRecipient>)))?;
+    hello.link_to_death_arc(&recipient)?;
 
     // Call echo method of Hello proxy.
     let echo = hello.echo("Hello World!")?;
@@ -274,7 +282,7 @@ If you encounter issues:
 
 1. **"ProcessState is not initialized!"** - `ProcessState::init_default()` (or `ProcessState::init()`) must be called in `main()` before using any other rsbinder APIs
 2. **"environment variable OUT_DIR not defined"** - `build.rs` must be placed in the project root directory (next to `Cargo.toml`), not inside `src/`
-3. **"Can't find my.hello"** - Ensure the service is running and registered
+3. **Client blocks without output** - `hub::wait_for_interface` waits until the service is registered; ensure the service is running
 4. **Permission errors** - Check that binder device has correct permissions (0666)
 5. **Service manager not found** - Verify `rsb_hub` is running
 6. **Build errors** - Ensure all dependencies are correctly specified in Cargo.toml
@@ -290,7 +298,7 @@ Inside a service method, you can identify the calling process using `CallingCont
 ```rust
 use rsbinder::thread_state::CallingContext;
 
-fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
     let caller = CallingContext::default();
     let caller_uid = caller.uid;
     let caller_pid = caller.pid;
@@ -312,7 +320,7 @@ This is especially useful since **rsbinder** does not enforce any access control
 Services can return service-specific errors to clients using `Status::new_service_specific_error`:
 
 ```rust
-fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
     if echo.is_empty() {
         return Err(rsbinder::Status::new_service_specific_error(-1, None));
     }

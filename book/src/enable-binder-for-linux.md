@@ -1,7 +1,7 @@
 # Enable binder for Linux
 Most Linux distributions do not have Binder IPC enabled by default, so additional steps are required to use it.
 
-> **Note**: Binder IPC requires Linux kernel 4.17 or later for native binderfs support.
+> **Note**: The binder driver was mainlined in Linux kernel 4.17, but **binderfs** — which rsbinder's `rsb_device` tool uses to create binder devices — landed in kernel 5.0. In practice you need kernel 5.0 or later.
 
 If you are able to build the Linux kernel yourself, you can enable Binder IPC by adding the following kernel configuration options:
 ```

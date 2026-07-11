@@ -233,7 +233,7 @@ impl INestedService::ICallback::ICallback for Callback {
 To create and pass a nested callback to the service:
 
 ```rust
-let service: rsbinder::Strong<dyn INestedService::INestedService> = hub::get_interface(
+let service: rsbinder::Strong<dyn INestedService::INestedService> = hub::wait_for_interface(
     <INestedService::BpNestedService as INestedService::INestedService>::descriptor(),
 )
 .expect("did not get binder service");
@@ -258,6 +258,8 @@ assert_eq!(*received, Some(ParcelableWithNested::Status::Status::OK));
 ```
 
 The key detail is the fully-qualified path for the nested callback's Binder node: `INestedService::ICallback::BnCallback`. This follows the Rust module hierarchy generated from the AIDL nesting structure.
+
+Note that a client passing a callback object to a service must run a binder thread pool — call `ProcessState::start_thread_pool()` (or park a thread in `join_thread_pool()`) — because the service's `done(..)` invocation arrives as an *inbound* transaction into the client process.
 
 ### Service-Side Nested Callback Handling
 
@@ -336,6 +338,8 @@ service
 The cast `recipient.clone() as Arc<dyn DeathRecipient>` is necessary to convert from the concrete type to the trait object before calling `Arc::downgrade`. The weak reference ensures that the death recipient does not keep the Binder object alive -- if all strong references are dropped, the Binder object can be cleaned up normally.
 
 Note that death notifications only work for **remote** Binder objects. Calling `link_to_death` on a local Binder object (one in the same process) will return an error because there is no remote process to monitor.
+
+Also note that `binder_died` is delivered as an inbound binder command: the process that links a death recipient must call `ProcessState::start_thread_pool()` (or park a thread in `join_thread_pool()`), or the notification never fires — even a client that otherwise only makes outbound calls.
 
 ## Tips
 

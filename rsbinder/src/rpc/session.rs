@@ -2959,7 +2959,7 @@ impl RpcSession {
     /// The fd's address family (`SO_DOMAIN`) selects the rsbinder
     /// transport — `AF_UNIX` → [`super::transport::UnixTransport`],
     /// `AF_VSOCK` → `VsockTransport` (feature `rpc-vsock`, Linux only),
-    /// `AF_INET`/`AF_INET6` → [`super::transport::TcpDebugTransport`]
+    /// `AF_INET`/`AF_INET6` → `TcpDebugTransport`
     /// (feature `rpc-tcp-debug`). Any other family is rejected as
     /// [`StatusCode::BadType`], paralleling AOSP's
     /// `IAccessor::ERROR_UNSUPPORTED_SOCKET_FAMILY`. The handshake then

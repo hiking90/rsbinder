@@ -3,7 +3,7 @@ name = "rsbinder"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
-description = "rsbinder provides crates implemented in pure Rust that make Binder IPC available on both Android and Linux."
+description = "Pure-Rust Binder IPC for Linux, Android, and macOS — kernel binder plus a libbinder-compatible RPC (binder-over-socket) transport."
 homepage = { workspace = true }
 repository = { workspace = true }
 readme = "README.md"
@@ -11,6 +11,12 @@ rust-version = { workspace = true }
 keywords.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# docs.rs builds with default features only unless told otherwise — without
+# this, the entire feature-gated `rpc` surface is absent from the published
+# docs.
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

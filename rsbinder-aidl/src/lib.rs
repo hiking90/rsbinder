@@ -46,6 +46,15 @@
 //! - [`Builder::set_async_support`] — also emit `.await`-able async
 //!   client/server traits (defaults to the crate's `async` feature).
 //!
+//! # Constants
+//!
+//! As of 0.10.0, constant names are emitted **verbatim** — `const int kFoo`
+//! becomes `r#kFoo`, with no case-normalization — and constant expressions
+//! are evaluated with AOSP-strict rules: integer overflow, lossy narrowing,
+//! circular constant references, and invalid shift amounts are compile
+//! errors rather than being silently wrapped or truncated. See the project
+//! CHANGELOG for migration notes if upgrading from an earlier release.
+//!
 //! Compatibility notes, supported AIDL constructs, and diagnostics examples
 //! live in the repository README and <https://hiking90.github.io/rsbinder/>.
 

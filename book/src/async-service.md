@@ -94,10 +94,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     runtime.block_on(async {
         // Create and register the async service (see next section).
+        // `add_service` accepts anything convertible into `SIBinder`, so
+        // the typed binder is passed directly — no `.as_binder()` needed.
         let service = BnMyService::new_async_binder(
             MyAsyncService::default(), rt(),
         );
-        hub::add_service("com.example.myservice", service.as_binder())
+        hub::add_service("com.example.myservice", &service)
             .expect("Could not register service");
 
         // Yield to the runtime. This keeps the process alive and
