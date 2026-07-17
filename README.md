@@ -11,8 +11,8 @@
 
 Android's Binder IPC mechanism has been in the mainline Linux kernel since 2015, but adoption outside Android has been limited by the lack of Rust-native tooling. **rsbinder** fills that gap with two complementary transports:
 
-* **Kernel binder** — the `/dev/binder` driver on Linux and Android. Same protocol and wire format as Android `libbinder`.
-* **RPC transport (binder-over-socket)** — a separate stack that works on Linux, macOS, and Android without needing the kernel driver or root. Wire-compatible with Android `libbinder` RPC v1 and v2.
+* **Kernel binder** — the `/dev/binder` driver on Linux and Android. Same protocol and wire format as Android `libbinder`, so an AIDL-generated rsbinder client can call existing Android services written in C++ or Java directly — see [Android Development](book/src/android.md#protocol-compatibility).
+* **RPC transport (binder-over-socket)** — a separate stack that works on Linux, macOS, and Android without needing the kernel driver or root. Wire-compatible with Android `libbinder` RPC v1 and v2, verified in both directions against real `libbinder` on Android 13–16.
 
 For Android developers writing system-level Rust, **rsbinder** is the missing NDK-level binder API. For Linux and macOS, it brings binder-style IPC to environments where it was previously impractical. If you'd rather use C++ on Linux, see [binder-linux](https://github.com/hiking90/binder-linux).
 
