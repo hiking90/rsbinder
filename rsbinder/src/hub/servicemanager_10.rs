@@ -6,13 +6,12 @@ use crate::*;
 // Interface descriptor for the Android 10 C service manager.
 pub const SERVICE_MANAGER_DESCRIPTOR: &str = "android.os.IServiceManager";
 
-// Re-export the priority flags from the hub root so values can never drift
-// from the AIDL-generated constants used by API 30+.
+// Re-export the priority/proto flags from the hub root so values can never
+// drift from the AIDL-generated constants used by API 30+.
 pub use crate::hub::{
     DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
-    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL,
+    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
 };
-pub const DUMP_FLAG_PROTO: i32 = 1 << 4;
 
 // `addService` allow_isolated argument; the C service manager treats any
 // non-zero value as true.
@@ -126,7 +125,12 @@ pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
     match result {
         Ok(binder) => binder,
         Err(err) => {
-            log::error!("Failed to check service {name}: {err}");
+            // The legacy C service manager signals "not found" as a single
+            // `u32 0` (no flat object), which surfaces here as a short-read
+            // `Err`. That is the normal absent-service path, not an error —
+            // log at `debug` like `get_service`/`try_get_service` (and unlike
+            // API 11+, where it is a silent `Ok(None)`).
+            log::debug!("check_service({name}): not found or read error: {err}");
             None
         }
     }

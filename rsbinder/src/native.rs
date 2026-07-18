@@ -184,6 +184,9 @@ fn stability_from_tag(tag: u8) -> Stability {
     }
 }
 
+// Must stay crate-private and never be embedded by value in another type:
+// `try_from`'s Arc reinterpret cast relies on an `Inner<B>` at an Arc's data
+// address being the Arc's own pointee.
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
     /// `AtomicU8` storing a [`Stability`] tag (see `STABILITY_TAG_*`).
@@ -461,8 +464,11 @@ impl<T: Remotable> Transactable for Inner<T> {
                 if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code)
                     && !(thread_state::check_interface(reader, T::descriptor())?)
                 {
-                    reply.write(&StatusCode::BadType)?;
-                    return Ok(());
+                    // BAD_TYPE as the transaction *status* (the dispatcher
+                    // emits a TF_STATUS_CODE reply), matching AOSP NDK
+                    // `ABBinder::onTransact` — never as reply payload, which
+                    // clients would parse as a success.
+                    return Err(StatusCode::BadType);
                 }
 
                 match self.remotable.on_transact(code, reader, reply) {
@@ -650,17 +656,35 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             return Err(StatusCode::BadType);
         }
 
-        if ibinder.as_any().downcast_ref::<Inner<B>>().is_some() {
-            // SAFETY: `downcast_ref::<Inner<B>>` confirmed the
-            // underlying allocation is `Inner<B>`. The trait-object
-            // Arc's data pointer addresses that `Inner<B>` value
-            // directly, so casting `*const dyn IBinder` to
-            // `*const Inner<B>` is layout-correct. Cloning the
-            // trait-object Arc and consuming it via `Arc::into_raw`
-            // leaks one strong ref; `Arc::from_raw` on the cast
-            // pointer reclaims that ref as `Arc<Inner<B>>`, conserving
-            // the total strong count after `ibinder` drops at the end
-            // of this function.
+        if let Some(inner_ref) = ibinder.as_any().downcast_ref::<Inner<B>>() {
+            // Soundness guard for a caller-supplied `IBinder`: the cast below
+            // reinterprets the trait-object Arc's *data* allocation as
+            // `Inner<B>`. `downcast_ref` only proves that `as_any()`'s return
+            // is *an* `Inner<B>` — an external impl that delegates `as_any()`/
+            // `descriptor()` to a wrapped inner object would pass both checks
+            // while its Arc points at the *wrapper* allocation, making the
+            // reinterpret (and the refcount ops on it) UB. Require that
+            // `as_any()` returned this Arc's own data before casting.
+            let data_ptr = Arc::as_ptr(ibinder.as_arc()) as *const u8;
+            let any_ptr = inner_ref as *const Inner<B> as *const u8;
+            if !std::ptr::eq(data_ptr, any_ptr) {
+                log::error!(
+                    "binder cast to `{}`: as_any() is not the Arc's own data (delegating IBinder impl?)",
+                    B::descriptor()
+                );
+                return Err(StatusCode::BadValue);
+            }
+            // SAFETY: `downcast_ref::<Inner<B>>` confirmed the underlying value
+            // is `Inner<B>`, and the pointer-identity check above confirms the
+            // trait-object Arc's data pointer addresses that same `Inner<B>`,
+            // which can only be the Arc's own pointee because `Inner<T>` is
+            // crate-private and never embedded by value (a wrapper with an
+            // `Inner<B>` first field could otherwise pass both checks), so
+            // casting `*const dyn IBinder` to `*const Inner<B>` is
+            // layout-correct. Cloning the trait-object Arc and consuming it via
+            // `Arc::into_raw` leaks one strong ref; `Arc::from_raw` on the cast
+            // pointer reclaims that ref as `Arc<Inner<B>>`, conserving the total
+            // strong count after `ibinder` drops at the end of this function.
             let arc_dyn = Arc::clone(ibinder.as_arc());
             let raw_dyn = Arc::into_raw(arc_dyn);
             let inner_raw = raw_dyn as *const Inner<B>;
@@ -668,10 +692,13 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
 
             Ok(Self { inner })
         } else {
+            // Descriptor matched (checked above) but the object is not a local
+            // `Binder<B>` — a remote proxy for the same interface, or a
+            // different `Remotable` type sharing the descriptor. Logging both
+            // descriptors would just print the same string twice.
             log::error!(
-                "Downcast failed: expected {}, got {}",
-                B::descriptor(),
-                ibinder.descriptor()
+                "cast to local Binder<{}> failed: not a local binder (remote proxy or different Remotable)",
+                B::descriptor()
             );
             Err(StatusCode::BadValue)
         }
@@ -880,11 +907,11 @@ mod stability_mutation_tests {
         b.inner.mark_vintf().expect("not parceled yet");
         assert_eq!(b.inner.stability(), Stability::Vintf);
         let wire: i32 = b.inner.stability().into();
-        // Bottom 6 bits are the level; higher bits may carry the
-        // Android-12 `0x0c000000` overlay on a real Android target —
-        // mask before comparing so the host-tree hermetic test stays
-        // build-independent.
-        assert_eq!(wire & 0xFF, 0b111111);
+        // Decode independent of the wire format — raw level (off-android /
+        // SDK ≠ 31,32) puts the level in the low byte, the android-12 Category
+        // repr puts it in the high byte — so round-trip through the decoder
+        // rather than masking a fixed byte.
+        assert_eq!(Stability::try_from(wire).unwrap(), Stability::Vintf);
     }
 
     /// `force_downgrade_to_vendor_stability` flips the

@@ -463,9 +463,12 @@ impl RpcTransport for UnixTransport {
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
-    /// Received fds are `O_CLOEXEC` (`RecvFlags::CMSG_CLOEXEC`).
-    /// Connections in `Unix` fd-mode use this for *every* frame, so
-    /// `recvmsg` and `Read` are never mixed on one fd.
+    /// Received fds are made `O_CLOEXEC` explicitly via `fcntl_setfd`
+    /// (`recvmsg` runs with `RecvFlags::empty()`; `MSG_CMSG_CLOEXEC` is
+    /// Linux-only, so the portable path sets the flag after receipt — same as
+    /// [`recv_raw_with_fds`](Self::recv_raw_with_fds)). Connections in `Unix`
+    /// fd-mode use this for *every* frame, so `recvmsg` and `Read` are never
+    /// mixed on one fd.
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
         use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
         use std::io::IoSliceMut;

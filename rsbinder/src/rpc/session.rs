@@ -243,10 +243,10 @@ fn consume_rpc_interface_token(reader: &mut Parcel, expected: &str) -> Result<()
     Ok(())
 }
 
-fn write_addr(p: &mut Parcel, addr: &RpcAddress) {
+fn write_addr(p: &mut Parcel, addr: &RpcAddress) -> Result<()> {
     // 32 bytes, already 4-aligned (no padding) — matches the r34
     // Parcel RPC binder encoding (i32 present flag handled by caller).
-    p.write_aligned_data(addr.as_wire_bytes().as_slice());
+    p.write_aligned_data(addr.as_wire_bytes().as_slice())
 }
 
 fn read_addr(p: &mut Parcel) -> Result<RpcAddress> {
@@ -752,11 +752,14 @@ impl RpcSessionInner {
         }) {
             let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
-                st.slots
-                    .iter()
-                    .find(|s| s.id == slot_id)
-                    .map(|s| Arc::clone(&s.transport))
-                    .expect("DRIVING slot present")
+                match st.slots.iter().find(|s| s.id == slot_id) {
+                    Some(s) => Arc::clone(&s.transport),
+                    // The slot this thread was driving was retired
+                    // (`remove_slot` on a worker exit) between the `DRIVING`
+                    // push and this reentrant lookup. Surface a typed dead
+                    // error rather than panicking on the driver loop.
+                    None => return Err(StatusCode::DeadObject),
+                }
             };
             return Ok(ConnGuard {
                 inner: self,
@@ -801,17 +804,41 @@ impl RpcSessionInner {
 
     /// Non-blocking variant of [`find_conn`]
     /// for `RpcProxy::drop`'s fast path. Returns `None` instead of
-    /// waiting on `slot_cv` when the pool has no free slot. Does NOT
-    /// touch the reentrant `DRIVING` short-circuit (callers in Drop
-    /// context are by definition not the slot's driver).
+    /// waiting on `slot_cv` when the pool has no free slot.
+    ///
+    /// Like [`find_conn`], step (1) is the reentrant `DRIVING` pin: a
+    /// caller reaching here from `RpcProxy::drop` → `queue_dec_strong` can
+    /// be a server handler that dropped the last cached-proxy `SIBinder`
+    /// on its *own* dispatch thread — which is already driving one of this
+    /// session's slots. Reusing that slot (`reentrant: true`) is the
+    /// documented interleaved-DEC_STRONG path. The first-available scan
+    /// below claims **only** a genuinely free slot: claiming a slot this
+    /// thread already drives would, on this guard's drop, clear an
+    /// `exclusive_tid` the outer frame still owns and let another thread
+    /// race onto the same transport (wire interleaving / reply theft).
     fn try_find_conn(&self) -> Option<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
+        // (1) Reentrant pin — mirror `find_conn` step (1).
+        if let Some(slot_id) = DRIVING.with(|d| {
+            d.borrow()
+                .iter()
+                .rev()
+                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
+        }) {
+            let st = self.conn_state.lock().expect("conn_state poisoned");
+            let transport = Arc::clone(&st.slots.iter().find(|s| s.id == slot_id)?.transport);
+            drop(st);
+            return Some(ConnGuard {
+                inner: self,
+                slot_id,
+                transport,
+                reentrant: true,
+            });
+        }
+        // (3) First available — only a truly free slot.
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
-        let s = st
-            .slots
-            .iter_mut()
-            .find(|s| s.exclusive_tid == Some(tid) || s.exclusive_tid.is_none())?;
+        let s = st.slots.iter_mut().find(|s| s.exclusive_tid.is_none())?;
         s.exclusive_tid = Some(tid);
         let slot_id = s.id;
         let transport = Arc::clone(&s.transport);
@@ -889,11 +916,13 @@ impl RpcSessionInner {
         }) {
             let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
-                st.slots
-                    .iter()
-                    .find(|s| s.id == want_slot_id)
-                    .map(|s| Arc::clone(&s.transport))
-                    .expect("pinned slot present")
+                match st.slots.iter().find(|s| s.id == want_slot_id) {
+                    Some(s) => Arc::clone(&s.transport),
+                    // Pinned slot retired between the `DRIVING` push and this
+                    // reentrant lookup — surface a typed dead error instead of
+                    // panicking on the driver loop.
+                    None => return Err(StatusCode::DeadObject),
+                }
             };
             return Ok(ConnGuard {
                 inner: self,
@@ -1040,15 +1069,14 @@ impl RpcSessionInner {
         Some(id)
     }
 
-    /// Remove a slot from the pool on its worker's
-    /// `serve_blocking_on` exit. Called by the slot's *own* worker
-    /// (self-remove), so `find_conn_pinned(slot_id)`'s
-    /// `panic!("removed from pool")` remains structurally unreachable
-    /// (the slot's exclusive holder is the dropping thread itself; no
-    /// other thread can be pinned on it). `notify_all` so any
-    /// `find_conn` (any-available) waiter re-evaluates against the
-    /// shrunk pool — and any `find_conn_pinned(slot_id)` waiter
-    /// surfaces the structural error (treated as a should-never panic).
+    /// Remove a slot from the pool. Two legitimate callers: the slot's
+    /// *own* worker on its `serve_blocking_on` exit (self-remove), and
+    /// `client_transact`'s stale-reply poison path (a non-reentrant slot
+    /// whose transport desynced mid-transaction). After a poison, the
+    /// slot's worker finds its slot gone and gets `DeadObject` from
+    /// `find_conn_pinned` — an expected exit signal, not a structural
+    /// bug. `notify_all` so any `find_conn` (any-available) waiter
+    /// re-evaluates against the shrunk pool.
     fn remove_slot(&self, slot_id: u64) {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         st.slots.retain(|s| s.id != slot_id);
@@ -1209,11 +1237,11 @@ impl RpcSessionInner {
     ///   `writeUint64(address)`. r34's 32-byte form here was rejected by
     ///   a real libbinder peer (`"unrecognized address … we should own
     ///   the creation of"`) — real-peer-pinned Parcel-body conformance.
-    fn wire_write_binder_addr(&self, p: &mut Parcel, addr: &RpcAddress) {
+    fn wire_write_binder_addr(&self, p: &mut Parcel, addr: &RpcAddress) -> Result<()> {
         match &self.profile {
             WireProfile::R34(_) => write_addr(p, addr),
             WireProfile::Android13Plus(_) => {
-                p.write_aligned_data(&Android13PlusCodec::encode_addr(addr));
+                p.write_aligned_data(&Android13PlusCodec::encode_addr(addr))
             }
         }
     }
@@ -1266,7 +1294,7 @@ impl RpcSessionInner {
                 // never grow a table.
                 let obj_pos = parcel.data_position();
                 parcel.write(&1i32)?;
-                self.wire_write_binder_addr(parcel, &addr);
+                self.wire_write_binder_addr(parcel, &addr)?;
                 if self.profile.records_binder_positions() {
                     parcel.rpc_record_object_position(obj_pos);
                 }
@@ -1458,9 +1486,38 @@ impl RpcSessionInner {
         // leaks onto the next call or a later recv on this connection.
         let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
         let _deadline_guard = ReplyDeadlineGuard::arm(transport, deadline)?;
+        // The request has already been sent, so any transport/decode error
+        // below (timeout, truncation, peer close, malformed frame) leaves the
+        // reply in-flight on a now-desynced stream. `WireReply` carries no
+        // transaction id (AOSP-faithful), so the next transact on this slot
+        // would misread the stale reply as its own. Retire the slot on such an
+        // error so the desynced stream is never reused — AOSP tears the whole
+        // session down here; retiring one connection is the multi-connection
+        // analogue. A clean, fully-consumed reply frame that carries a non-zero
+        // application `status` does NOT desync the stream and must not poison.
+        // A reentrant guard does not own the slot (the outer frame does), so it
+        // never retires it.
+        let poison_slot = || {
+            if !conn.reentrant {
+                self.remove_slot(conn.slot_id);
+            }
+        };
         loop {
-            let (frame, in_fds) = self.recv_msg(transport)?;
-            match self.profile.codec().decode_message(&frame)? {
+            let (frame, in_fds) = match self.recv_msg(transport) {
+                Ok(v) => v,
+                Err(e) => {
+                    poison_slot();
+                    return Err(e.into());
+                }
+            };
+            let message = match self.profile.codec().decode_message(&frame) {
+                Ok(m) => m,
+                Err(e) => {
+                    poison_slot();
+                    return Err(e.into());
+                }
+            };
+            match message {
                 WireMessage::Reply(WireReply {
                     status,
                     data,
@@ -1503,7 +1560,10 @@ impl RpcSessionInner {
                     // leave the timeout desynchronized.
                     let _restore = NestedDeadlineGuard::lift(transport, deadline)?;
                     let peer = transport.peer_identity();
-                    self.dispatch_transact(t, in_fds, peer)?;
+                    if let Err(e) = self.dispatch_transact(t, in_fds, peer) {
+                        poison_slot();
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1874,11 +1934,10 @@ impl RpcSessionInner {
     /// via the `DRIVING` marker).
     /// `Ok(false)` ⇒ peer closed (stop).
     fn serve_once_on_slot(&self, slot_id: u64) -> Result<bool> {
-        // The worker drives its own slot — pinning to it must succeed
-        // (the slot was just added by `add_incoming_slot`/etc. and
-        // hasn't been removed yet because `remove_slot` only runs from
-        // this very call's `serve_blocking_on` exit). A `DeadObject`
-        // here would be a structural bug, propagated so the worker exits.
+        // The worker drives its own slot. Pinning normally succeeds, but a
+        // concurrent `client_transact` may have poisoned (removed) the slot
+        // after a stale-reply desync — `find_conn_pinned` then returns
+        // `DeadObject`, propagated so the worker exits cleanly.
         let conn = self.find_conn_pinned(slot_id)?;
         let transport = conn.transport();
         let (frame, in_fds) = match self.recv_msg(transport) {
@@ -1922,14 +1981,28 @@ impl RpcSessionInner {
                 let root = self.shared.root.lock().expect("root poisoned").clone();
                 let mut reply = Parcel::new();
                 reply.attach_rpc_ops(self.parcel_ops());
-                // SIBinder::serialize → RPC branch → write_binder.
-                match &root {
-                    Some(b) => reply.write(b)?,
-                    None => reply.write(&0i32)?,
+                // SIBinder::serialize → RPC branch → write_binder. A write
+                // failure after `write_binder`'s `timesSent` bump must roll
+                // back too, same as a send failure below.
+                let write_res = match &root {
+                    Some(b) => reply.write(b),
+                    None => reply.write(&0i32),
+                };
+                if let Err(e) = write_res {
+                    self.rollback_outgoing(&reply, None);
+                    return Err(e);
                 }
                 // GET_ROOT carries a binder-in-parcel: at v2 its
                 // position is in the object table.
-                self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_object_positions(), &[])
+                let sent =
+                    self.send_reply(0, reply.rpc_data_bytes(), reply.rpc_object_positions(), &[]);
+                if sent.is_err() {
+                    // The reply carrying the root binder never reached the peer;
+                    // roll back its `timesSent` bump so the root node does not
+                    // leak. Symmetric with the twoway reply path.
+                    self.rollback_outgoing(&reply, None);
+                }
+                sent
             }
             Some(SpecialTransaction::GetMaxThreads) => {
                 let n = self.shared.max_threads.load(Ordering::SeqCst) as i32;
@@ -1969,7 +2042,21 @@ impl RpcSessionInner {
                         false
                     }
                 };
-                let agreed = if want_unix && self.shared.fd_unix_supported.load(Ordering::SeqCst) {
+                // FD transport is a v1+ feature. Gate GET_FD_MODE the same way
+                // the connection handshake does (`negotiated >= PROTOCOL_V1`),
+                // so a v0-negotiated android-13+ session cannot be flipped into
+                // `Unix` fd mode here — that would open a v0 wire to fd
+                // transport, bypassing the handshake's category-forbids-fd rule.
+                // R34 (android-12, `wire_version() == None`) has no versioned
+                // handshake; GET_FD_MODE *is* its native fd negotiation.
+                let fd_version_ok = match self.profile.wire_version() {
+                    None => true,
+                    Some(v) => v >= PROTOCOL_V1,
+                };
+                let agreed = if want_unix
+                    && fd_version_ok
+                    && self.shared.fd_unix_supported.load(Ordering::SeqCst)
+                {
                     FileDescriptorTransportMode::Unix
                 } else {
                     FileDescriptorTransportMode::None
@@ -2494,9 +2581,11 @@ impl RpcSession {
             )?
             .ok_or(StatusCode::UnexpectedNull)?;
         let mut reply = reply;
-        reply
-            .read::<SIBinder>()
-            .map_err(|_| StatusCode::UnexpectedNull)
+        // Propagate the real read error (v2 strict-position `BadValue`, a
+        // stability short-read, `UnexpectedNull` for an actually-null root)
+        // rather than squashing every failure into `UnexpectedNull`, which
+        // hides the diagnostic — matching `get_session_id`'s no-squash policy.
+        reply.read::<SIBinder>()
     }
 
     /// Server: process inbound messages until the peer closes.

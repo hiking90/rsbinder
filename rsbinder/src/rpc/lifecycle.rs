@@ -165,11 +165,15 @@ impl SessionLifecycle {
     pub(crate) fn drop_connection(&self) -> bool {
         let mut v = self.inner.load(Ordering::SeqCst);
         loop {
-            debug_assert_eq!(
-                v >> STATE_SHIFT,
-                STATE_LIVE_TAG,
-                "drop_connection called from non-Live state"
-            );
+            if v >> STATE_SHIFT != STATE_LIVE_TAG {
+                // Contract violation (double `drop_connection`, or a call from
+                // Dying/Dead). In release, refuse rather than let `v - 1`
+                // underflow the tag/count and *resurrect* a torn-down session —
+                // the exact invariant this type exists to protect. No obituary
+                // edge is reported. In debug this still trips the assertion.
+                debug_assert!(false, "drop_connection called from non-Live state");
+                return false;
+            }
             let count = v & COUNT_MASK;
             debug_assert!(count >= 1, "Live state with count == 0");
             let (new_v, was_last) = if count == 1 {
@@ -190,12 +194,16 @@ impl SessionLifecycle {
     /// Transition `Dying → Dead`. The caller MUST have just fired
     /// session obituaries (the only path that reaches `Dying`).
     pub(crate) fn mark_dead(&self) {
-        let prev = self.inner.swap(encode_dead(), Ordering::SeqCst);
-        debug_assert_eq!(
-            prev >> STATE_SHIFT,
-            STATE_DYING_TAG,
-            "mark_dead called from non-Dying state"
+        // Only `Dying → Dead`. An unconditional `swap` would clobber a `Live`
+        // state (silently killing a live session in release if called out of
+        // order); the CAS makes any out-of-order call a no-op instead.
+        let res = self.inner.compare_exchange(
+            encode_dying(),
+            encode_dead(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
+        debug_assert!(res.is_ok(), "mark_dead called from non-Dying state");
     }
 }
 

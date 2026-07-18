@@ -226,7 +226,7 @@ impl<T: Clone + Default> ParcelData<T> {
     fn push(&mut self, other: T) {
         match self {
             ParcelData::Vec(v) => v.push(other),
-            _ => panic!("extend_from_slice() is only available for ParcelData::Vec."),
+            _ => panic!("push() is only available for ParcelData::Vec."),
         }
     }
 }
@@ -1180,7 +1180,10 @@ impl Parcel {
 
     pub(crate) fn write_array<S: Serialize + Sized>(&mut self, parcelable: &[S]) -> Result<()> {
         let len = parcelable.len();
-        self.write::<i32>(&(len as _))?;
+        // The wire length word is an `i32`; a slice too large to fit is a
+        // `BadValue`, not a silently truncated (possibly negative) count.
+        let len_i32: i32 = len.try_into().or(Err(StatusCode::BadValue))?;
+        self.write::<i32>(&len_i32)?;
 
         if len == 0 {
             return Ok(());
@@ -1190,17 +1193,24 @@ impl Parcel {
         let padded = pad_size(size);
         let pos = self.pos;
 
-        self.data.reserve(pos + padded);
-        // SAFETY: `reserve(pos + padded)` above guarantees the destination
-        // has at least `pos + padded` bytes of capacity, so `add(pos)` and
-        // the `size`-byte copy (size <= padded) stay in-bounds and the
-        // ranges do not overlap (distinct allocations). The 0-3 trailing pad
-        // bytes are then zeroed so that `set_len` exposes only initialized
-        // memory: `reserve` allocates but does not initialize, and the pad is
-        // transmitted (it is counted in `data_size`), so without this we would
-        // both hit UB and leak uninitialized process memory to the peer. AOSP
-        // masks the pad to zero as well. `set_len` only grows up to the
-        // just-reserved capacity over now-initialized `u8` bytes.
+        // See `write_aligned_data`: keep the end position within `i32::MAX`
+        // and reject rather than overflow the reserve/copy arithmetic.
+        let end = pos
+            .checked_add(padded)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+
+        self.data.reserve(end);
+        // SAFETY: `reserve(end)` above guarantees the destination has at least
+        // `end` bytes of capacity, so `add(pos)` and the `size`-byte copy
+        // (size <= padded) stay in-bounds and the ranges do not overlap
+        // (distinct allocations). The 0-3 trailing pad bytes are then zeroed
+        // so that `set_len` exposes only initialized memory: `reserve`
+        // allocates but does not initialize, and the pad is transmitted (it is
+        // counted in `data_size`), so without this we would both hit UB and
+        // leak uninitialized process memory to the peer. AOSP masks the pad to
+        // zero as well. `set_len` only grows up to the just-reserved capacity
+        // over now-initialized `u8` bytes.
         unsafe {
             // Zero any `[len..pos]` gap left by a forward `set_data_position`
             // before `set_len`, so an uninitialized hole is never exposed via
@@ -1218,24 +1228,33 @@ impl Parcel {
             if padded > size {
                 std::ptr::write_bytes(self.data.as_mut_ptr().add(pos + size), 0, padded - size);
             }
-            if self.data.len() < pos + padded {
-                self.data.set_len(pos + padded);
+            if self.data.len() < end {
+                self.data.set_len(end);
             }
         }
 
-        self.set_data_position(pos + padded);
+        self.set_data_position(end);
 
         Ok(())
     }
 
     pub(crate) fn write_array_char<S: CharType>(&mut self, parcelable: &[S]) -> Result<()> {
         let len = parcelable.len();
-        self.write::<i32>(&(len as _))?;
+        // Length word is an `i32`, and `4 * len` must not overflow `usize`.
+        let len_i32: i32 = len.try_into().or(Err(StatusCode::BadValue))?;
+        self.write::<i32>(&len_i32)?;
 
-        let size = 4 * len;
+        let size = len.checked_mul(4).ok_or(StatusCode::BadValue)?;
         let padded = pad_size(size);
 
-        self.data.reserve(self.pos + padded);
+        // See `write_aligned_data`: keep the end position within `i32::MAX`
+        // and reject rather than overflow the reserve arithmetic.
+        let end = self
+            .pos
+            .checked_add(padded)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+        self.data.reserve(end);
         for c in parcelable {
             self.write(&c.as_i32())?;
         }
@@ -1262,7 +1281,7 @@ impl Parcel {
         }
     }
 
-    pub(crate) fn write_aligned<T>(&mut self, val: &T) {
+    pub(crate) fn write_aligned<T>(&mut self, val: &T) -> Result<()> {
         let unaligned = std::mem::size_of::<T>();
         // SAFETY: `val` is a live `&T`, so its `size_of::<T>()` bytes are
         // valid to read as `u8` for the borrow's duration. The resulting
@@ -1270,23 +1289,34 @@ impl Parcel {
         let val_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
 
-        self.write_aligned_data(val_bytes);
+        self.write_aligned_data(val_bytes)
     }
 
-    pub(crate) fn write_aligned_data(&mut self, data: &[u8]) {
+    pub(crate) fn write_aligned_data(&mut self, data: &[u8]) -> Result<()> {
         let unaligned = data.len();
         let aligned = pad_size(unaligned);
         let pos = self.pos;
 
-        self.data.reserve(pos + aligned);
-        // SAFETY: `reserve(pos + aligned)` guarantees capacity for `add(pos)`
-        // and the `unaligned`-byte copy (unaligned <= aligned). Source `data`
-        // and the parcel buffer are distinct allocations (non-overlapping).
-        // The 0-3 trailing pad bytes are zeroed before `set_len`: `reserve`
-        // does not initialize, and the pad is transmitted (counted in
-        // `data_size`), so leaving it uninitialized is both UB and an
-        // info-leak to the peer. AOSP masks the pad to zero too. `set_len`
-        // only grows up to the reserved capacity over now-initialized `u8`.
+        // A valid parcel never exceeds `i32::MAX` bytes (wire offsets are
+        // int32), so the end position must fit in that range. A larger `pos`
+        // can only come from moving the write cursor there via a misuse of
+        // the public `set_data_position`; reject it rather than overflow
+        // `pos + aligned` into a wild `reserve`/`write_bytes`. Mirrors AOSP
+        // `Parcel::growData` returning `BAD_VALUE` for `len > INT32_MAX`.
+        let end = pos
+            .checked_add(aligned)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+
+        self.data.reserve(end);
+        // SAFETY: `reserve(end)` guarantees capacity for `add(pos)` and the
+        // `unaligned`-byte copy (unaligned <= aligned). Source `data` and the
+        // parcel buffer are distinct allocations (non-overlapping). The 0-3
+        // trailing pad bytes are zeroed before `set_len`: `reserve` does not
+        // initialize, and the pad is transmitted (counted in `data_size`), so
+        // leaving it uninitialized is both UB and an info-leak to the peer.
+        // AOSP masks the pad to zero too. `set_len` only grows up to the
+        // reserved capacity over now-initialized `u8`.
         unsafe {
             // If the write cursor sits past the current end (a forward
             // `set_data_position`), the skipped `[len..pos]` bytes were never
@@ -1310,12 +1340,13 @@ impl Parcel {
                     aligned - unaligned,
                 );
             }
-            if pos + aligned > self.data.len() {
-                self.data.set_len(pos + aligned);
+            if end > self.data.len() {
+                self.data.set_len(end);
             }
         }
 
-        self.set_data_position(pos + aligned);
+        self.set_data_position(end);
+        Ok(())
     }
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
@@ -1327,12 +1358,12 @@ impl Parcel {
         // `is_for_rpc == false`.
         #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
-            self.write_aligned(obj);
+            self.write_aligned(obj)?;
             return Ok(());
         }
 
         let data_pos = self.pos;
-        self.write_aligned(obj);
+        self.write_aligned(obj)?;
 
         if null_meta || obj.pointer() != 0 {
             obj.acquire()?;
@@ -1451,13 +1482,22 @@ impl Parcel {
 
         let num_objects = last_idx - first_idx + 1;
 
-        self.data.reserve(self.pos + size);
+        // See `write_aligned_data`: bound the end position to `i32::MAX` and
+        // reject rather than overflow the reserve/copy arithmetic when the
+        // write cursor was moved to a nonsensical position.
+        let end = self
+            .pos
+            .checked_add(size)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+
+        self.data.reserve(end);
         // SAFETY: the source range `other.data[offset..offset + size]` is
         // bounds-checked by the slice index above (panics if out of range),
-        // and `reserve(self.pos + size)` guarantees the destination has
-        // capacity for `add(self.pos)` plus `size` bytes. `other` and `self`
-        // are distinct parcels (non-overlapping). `set_len` only grows up to
-        // the reserved capacity over the `u8` bytes just copied.
+        // and `reserve(end)` guarantees the destination has capacity for
+        // `add(self.pos)` plus `size` bytes. `other` and `self` are distinct
+        // parcels (non-overlapping). `set_len` only grows up to the reserved
+        // capacity over the `u8` bytes just copied.
         unsafe {
             // Zero any `[len..pos]` gap from a forward `set_data_position`
             // before `set_len` so an uninitialized hole is never exposed /
@@ -1471,11 +1511,11 @@ impl Parcel {
                 self.data.as_mut_ptr().add(self.pos),
                 size,
             );
-            if self.pos + size > self.data.len() {
-                self.data.set_len(self.pos + size);
+            if end > self.data.len() {
+                self.data.set_len(end);
             }
         }
-        self.set_data_position(self.pos + size);
+        self.set_data_position(end);
 
         // An RPC-mode parcel carries no `flat_binder_object`s, so the
         // offset recompute / re-acquire / FD-dup below is kernel-only.
@@ -2218,7 +2258,7 @@ mod tests {
         let pos = p.data_position();
         expect.push(pos as u32);
         p.write(&1i32).unwrap(); // present/TYPE_BINDER
-        p.write_aligned_data(&[0u8; 8]); // 8B RpcWireAddress
+        p.write_aligned_data(&[0u8; 8]).unwrap(); // 8B RpcWireAddress
         p.write(&0x0Ci32).unwrap(); // stability
         p.rpc_record_object_position(pos);
 
@@ -2235,7 +2275,7 @@ mod tests {
         let pos = p.data_position();
         expect.push(pos as u32);
         p.write(&1i32).unwrap();
-        p.write_aligned_data(&[0u8; 8]);
+        p.write_aligned_data(&[0u8; 8]).unwrap();
         p.write(&0x0Ci32).unwrap();
         p.rpc_record_object_position(pos);
 

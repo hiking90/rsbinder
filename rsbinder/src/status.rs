@@ -235,7 +235,7 @@ impl Display for Status {
                 "{} / {}: {}",
                 self.exception,
                 self.code,
-                self.message.as_ref().unwrap_or(&"".to_owned())
+                self.message.as_deref().unwrap_or("")
             )
         }
     }
@@ -338,7 +338,7 @@ impl Serialize for Status {
             return Ok(());
         }
 
-        parcel.write::<String>(self.message.as_ref().unwrap_or(&"".to_owned()))?;
+        parcel.write::<str>(self.message.as_deref().unwrap_or(""))?;
         parcel.write::<i32>(&0)?; // Empty remote stack trace header
 
         if self.exception == ExceptionCode::ServiceSpecific {
@@ -408,7 +408,13 @@ impl Deserialize for Status {
         let status = if exception == ExceptionCode::None {
             exception.into()
         } else {
-            let message: String = parcel.read::<String>()?;
+            // AOSP `Status::readFromParcel` reads the message as
+            // `std::optional<String16>` and folds null to empty. A Java peer
+            // that throws an exception with no detail message writes a null
+            // string (`Parcel.writeString(null)` → length -1); reading it as a
+            // non-null `String` would fail the whole exception decode with
+            // `UnexpectedNull`, hiding the real exception code.
+            let message: Option<String> = parcel.read::<Option<String>>()?;
 
             // AOSP `Status::readFromParcel` (frameworks/native/libs/binder/
             // Status.cpp): capture the header start position and the
@@ -467,7 +473,7 @@ impl Deserialize for Status {
                 StatusCode::Ok
             };
 
-            Status::new(exception, code, Some(message))
+            Status::new(exception, code, message)
         };
 
         Ok(status)

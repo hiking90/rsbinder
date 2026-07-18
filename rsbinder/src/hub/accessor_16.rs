@@ -77,9 +77,11 @@ pub use android::os::IAccessor::{IAccessorAsync, IAccessorAsyncService};
 /// wrapper is transparent to consumers. The inner proxy is the only
 /// concrete `IBinder` anyone outside this module needs to recognise.
 pub(crate) struct AccessorRoot {
-    /// The RPC root `SIBinder` returned by `RpcSession::get_root`. Owns
-    /// an `Arc<RpcProxy>` (one of two: the other is cached inside
-    /// `RpcSessionInner.state` and dies with the session).
+    /// The RPC root `SIBinder` returned by `RpcSession::get_root`. This is,
+    /// via its `Arc<RpcProxy>`, what keeps the proxy alive: the session-side
+    /// cache in `RpcSessionInner.state` holds only a `Weak` (it dedups without
+    /// keeping proxies alive), so dropping `inner` is what fires
+    /// `RpcProxy::drop`.
     inner: SIBinder,
     /// **Load-bearing**: must drop *after* `inner` (Rust drops fields in
     /// declaration order). Dropping `session` first kills the
@@ -306,7 +308,7 @@ pub fn accessor_error_name(code: i32) -> &'static str {
     }
 }
 
-/// Fuzz hook: feed an arbitrary big-endian i32
+/// Fuzz hook: feed an arbitrary little-endian i32
 /// byte payload into [`accessor_error_name`] and assert it never
 /// panics, allocates indefinitely, or returns a non-`'static str`. The
 /// returned string is intentionally consumed via `std::hint::black_box`

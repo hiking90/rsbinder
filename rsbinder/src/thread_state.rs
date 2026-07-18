@@ -33,7 +33,7 @@
 //!     (invoked via `deref_native_kernel`), and
 //!     `DeathRecipient::binder_died`.
 //!   - Other functions in this module that take a borrow at some point:
-//!     `transact`, `wait_for_response`, `flush_commands`, `flash_if_needed`,
+//!     `transact`, `wait_for_response`, `flush_commands`, `flush_if_needed`,
 //!     `inc_strong_handle`, `dec_strong_handle`, `inc_weak_handle`,
 //!     `dec_weak_handle`, `free_buffer`, and `process_pending_derefs`.
 //!
@@ -637,8 +637,15 @@ impl ThreadState {
             }
         };
 
+        let start = self.out_parcel.data_size();
         self.out_parcel.write::<u32>(&cmd)?;
-        self.out_parcel.write_aligned(&tr);
+        if let Err(e) = self.out_parcel.write_aligned(&tr) {
+            // Roll back the orphan cmd word: flushing a bare BC_* opcode with
+            // no binder_transaction_data behind it would desync the driver
+            // protocol.
+            let _ = self.out_parcel.set_data_size(start);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -670,9 +677,17 @@ pub(crate) fn call_restriction() -> CallRestriction {
 /// only when interoperating with Android system_server's strict-mode
 /// chain (disk-I/O / network-on-main-thread / etc. policies).
 ///
+/// No-op in a process where kernel binder is not initialized (pure-RPC
+/// process).
+///
 /// Mirrors AOSP `IPCThreadState::setStrictModePolicy(int32_t)`
 /// (`IPCThreadState.cpp:575`).
 pub fn set_strict_mode_policy(policy: i32) {
+    // In a pure-RPC process the kernel `THREAD_STATE` is not initialized;
+    // touching it would panic (`ThreadState::new` pulls `ProcessState`).
+    if !ProcessState::is_initialized() {
+        return;
+    }
     THREAD_STATE.with(|thread_state| {
         thread_state.borrow_mut().set_strict_mode_policy(policy);
     })
@@ -686,9 +701,15 @@ pub fn set_strict_mode_policy(policy: i32) {
 /// On a client thread, returns whatever was last set by
 /// [`set_strict_mode_policy`] (default `0`).
 ///
+/// Returns `0` in a process where kernel binder is not initialized
+/// (pure-RPC process).
+///
 /// Mirrors AOSP `IPCThreadState::getStrictModePolicy() const`
 /// (`IPCThreadState.cpp:580`).
 pub fn get_strict_mode_policy() -> i32 {
+    if !ProcessState::is_initialized() {
+        return 0;
+    }
     THREAD_STATE.with(|thread_state| thread_state.borrow().strict_mode_policy)
 }
 
@@ -806,6 +827,9 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                         .borrow_mut()
                         .in_parcel
                         .read::<binder::binder_transaction_data>()?;
+                    // SAFETY: for a kernel-delivered BR_REPLY the driver populates
+                    // the `data.ptr` arm of the union (buffer/offsets pointers into
+                    // the mmap region), so reading that arm is valid.
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
@@ -1086,12 +1110,21 @@ fn execute_command(cmd: i32) -> Result<()> {
                             Some(arc) => {
                                 let strong = SIBinder::from_arc(arc);
                                 if strong.attempt_increase() {
-                                    let result = dispatch_transact_caught(
-                                        strong.as_transactable().expect("Transactable is None."),
-                                        tr_secctx.transaction_data.code,
-                                        &mut reader,
-                                        &mut reply,
-                                    );
+                                    // `as_transactable()` is a public-trait method that
+                                    // may return `None` for a caller-supplied `IBinder`;
+                                    // reject rather than `expect`-panic on the worker loop.
+                                    let result = match strong.as_transactable() {
+                                        Some(t) => dispatch_transact_caught(
+                                            t,
+                                            tr_secctx.transaction_data.code,
+                                            &mut reader,
+                                            &mut reply,
+                                        ),
+                                        None => {
+                                            log::error!("native id {id} is not Transactable");
+                                            Err(StatusCode::UnknownTransaction)
+                                        }
+                                    };
                                     strong.decrease()?;
                                     result
                                 } else {
@@ -1105,15 +1138,26 @@ fn execute_command(cmd: i32) -> Result<()> {
                             }
                         }
                     } else {
-                        let context = ProcessState::as_self()
-                            .context_manager()
-                            .expect("Transactable is None.");
-                        dispatch_transact_caught(
-                            context.as_transactable().expect("Transactable is None."),
-                            tr_secctx.transaction_data.code,
-                            &mut reader,
-                            &mut reply,
-                        )
+                        match ProcessState::as_self().context_manager() {
+                            Some(context) => match context.as_transactable() {
+                                Some(t) => dispatch_transact_caught(
+                                    t,
+                                    tr_secctx.transaction_data.code,
+                                    &mut reader,
+                                    &mut reply,
+                                ),
+                                None => {
+                                    log::error!("context manager is not Transactable");
+                                    Err(StatusCode::UnknownTransaction)
+                                }
+                            },
+                            None => {
+                                log::error!(
+                                    "BR_TRANSACTION to handle 0 but no context manager set"
+                                );
+                                Err(StatusCode::DeadObject)
+                            }
+                        }
                     }
                 };
                 let flags = tr_secctx.transaction_data.flags;
@@ -1462,7 +1506,7 @@ pub(crate) fn flush_commands() -> Result<()> {
         }
 
         if thread_state.borrow().out_parcel.data_size() > 0 {
-            log::warn!("self.out_parcel.len() > 0 after flash_commands()");
+            log::warn!("self.out_parcel.len() > 0 after flush_commands()");
         }
 
         Ok(())
@@ -1479,7 +1523,7 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        flash_if_needed()?;
+        flush_if_needed()?;
 
         Ok(())
     })
@@ -1495,7 +1539,7 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        flash_if_needed()?;
+        flush_if_needed()?;
 
         Ok(())
     })
@@ -1511,7 +1555,7 @@ pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        flash_if_needed()?;
+        flush_if_needed()?;
 
         Ok(())
     })
@@ -1527,13 +1571,13 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
             state.out_parcel.write::<u32>(&(handle))?;
         }
 
-        flash_if_needed()?;
+        flush_if_needed()?;
 
         Ok(())
     })
 }
 
-pub(crate) fn flash_if_needed() -> Result<bool> {
+pub(crate) fn flush_if_needed() -> Result<bool> {
     THREAD_STATE.with(|thread_state| -> Result<bool> {
         {
             let thread_state = thread_state.borrow();
@@ -1617,21 +1661,17 @@ pub(crate) fn transact(
 
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
-    let call_restriction = THREAD_STATE.with(|thread_state| -> Result<CallRestriction> {
-        let mut thread_state = thread_state.borrow_mut();
-        thread_state.write_transaction_data(
-            binder::BC_TRANSACTION,
-            flags,
-            handle,
-            code,
-            data,
-            &0,
-        )?;
-        Ok(thread_state.call_restriction)
-    })?;
-
+    // Enforce the call restriction BEFORE queuing BC_TRANSACTION into
+    // out_parcel. `write_transaction_data` records raw pointers into `data`'s
+    // buffer/offsets; if the FatalIfNotOneway `panic!` unwinds instead of
+    // aborting (it is reachable under `dispatch_transact_caught`'s
+    // `catch_unwind` for a nested sync call, and under tokio's spawn_blocking
+    // panic capture), a completed BC_TRANSACTION with now-dangling pointers
+    // would remain in out_parcel and be flushed to the kernel later —
+    // cross-process use-after-free. AOSP checks *after* queuing, but its
+    // LOG_ALWAYS_FATAL aborts, so the queued command is never flushed.
     if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-        match call_restriction {
+        match call_restriction() {
             CallRestriction::ErrorIfNotOneway => {
                 error!("Process making non-oneway call (code: {code}) but is restricted.")
             }
@@ -1640,7 +1680,14 @@ pub(crate) fn transact(
             }
             _ => (),
         }
+    }
 
+    THREAD_STATE.with(|thread_state| -> Result<()> {
+        let mut thread_state = thread_state.borrow_mut();
+        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data, &0)
+    })?;
+
+    if (flags & transaction_flags_TF_ONE_WAY) == 0 {
         reply = wait_for_response(UntilResponse::Reply)?;
     } else {
         wait_for_response(UntilResponse::TransactionComplete)?;
@@ -1669,7 +1716,7 @@ fn free_buffer(
         Ok(())
     })?;
 
-    flash_if_needed()?;
+    flush_if_needed()?;
 
     Ok(())
 }
@@ -1706,6 +1753,19 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
         ProcessState::as_self()
             .current_threads
             .fetch_add(1, Ordering::SeqCst);
+
+        // Decrement on every exit — including the `?` early-returns below.
+        // A write/ioctl failure that skipped the decrement would permanently
+        // inflate `current_threads` and stall the pool's spawn heuristic.
+        struct ThreadCountGuard;
+        impl Drop for ThreadCountGuard {
+            fn drop(&mut self) {
+                ProcessState::as_self()
+                    .current_threads
+                    .fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _thread_count_guard = ThreadCountGuard;
 
         let looper = if is_main {
             binder::BC_ENTER_LOOPER
@@ -1769,9 +1829,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
         }
 
         talk_with_driver(false)?;
-        ProcessState::as_self()
-            .current_threads
-            .fetch_sub(1, Ordering::SeqCst);
+        // `_thread_count_guard` decrements `current_threads` on drop.
         Ok(())
     })
 }
@@ -2091,6 +2149,11 @@ pub fn get_calling_uid_or_self() -> binder::uid_t {
 /// AOSP user-facing semantics (clear before downstream call, restore
 /// after) match.
 pub fn clear_calling_identity() -> i64 {
+    // Pure-RPC process: no kernel `THREAD_STATE` (touching it would panic),
+    // and no kernel-delivered identity to clear — the documented no-op.
+    if !ProcessState::is_initialized() {
+        return 0;
+    }
     THREAD_STATE.with(|thread_state| {
         let mut thread_state = thread_state.borrow_mut();
         let Some(ref mut tr) = thread_state.transaction else {
@@ -2132,6 +2195,9 @@ pub fn clear_calling_identity() -> i64 {
 /// (caller wraps `clear`/`restore` in a `Drop` impl) is recommended; see
 /// AOSP `IPCThreadState::CallingIdentityScope` for the C++ analogue.
 pub fn restore_calling_identity(token: i64) {
+    if !ProcessState::is_initialized() {
+        return;
+    }
     THREAD_STATE.with(|thread_state| {
         let mut thread_state = thread_state.borrow_mut();
         let Some(ref mut tr) = thread_state.transaction else {
@@ -2267,6 +2333,9 @@ pub fn get_extended_error() -> Result<ExtendedError> {
 ///
 /// Returns `false` when not currently dispatching a transaction.
 pub fn has_explicit_identity() -> bool {
+    if !ProcessState::is_initialized() {
+        return false;
+    }
     THREAD_STATE.with(|thread_state| {
         thread_state
             .borrow()

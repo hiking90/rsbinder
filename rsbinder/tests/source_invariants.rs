@@ -39,25 +39,34 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
     }
 }
 
-/// `RpcSessionInner::remove_slot` is `pub(crate)`; callers other than
-/// the slot's own `serve_blocking_on` exit break the "structurally
-/// unreachable" expect at `find_conn_pinned` ([session.rs:780]) and turn
-/// a documented design invariant into a reachable panic on the hot
-/// transact path.
+/// `RpcSessionInner::remove_slot` is `pub(crate)` and safe to call from more
+/// than one site now that `find_conn` / `find_conn_pinned` return
+/// `Err(StatusCode::DeadObject)` (not `expect`-panic) when their reentrant
+/// slot lookup misses. The two sanctioned callers are the slot's own
+/// `serve_blocking_on` exit and `client_transact`'s stale-reply poison (retire
+/// a slot whose reply read failed so the desynced stream is never reused).
+/// A NEW caller MUST re-audit that every slot-lookup path tolerates a missing
+/// slot before being added — this bound guards against accidentally
+/// reintroducing a lookup that assumes the slot is always present.
 #[test]
-fn remove_slot_has_exactly_one_caller() {
+fn remove_slot_has_at_most_two_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let hits = count_call_sites(&src_root, ".remove_slot(");
-    assert_eq!(
-        hits.len(),
-        1,
-        "RpcSessionInner::remove_slot must have exactly one caller. \
+    // Pin the location too: a count-only bound would still pass if a
+    // sanctioned caller were deleted and an unaudited one added elsewhere.
+    assert!(
+        hits.iter().all(|(p, _)| p.ends_with("rpc/session.rs")),
+        "remove_slot callers must live in rpc/session.rs: {hits:#?}"
+    );
+    assert!(
+        hits.len() <= 2,
+        "RpcSessionInner::remove_slot must have at most two callers. \
          Found {} call sites: {:#?}\n\
-         INVARIANT: only RpcSession::serve_blocking_on's own exit path \
-         may call remove_slot — find_conn / find_conn_pinned rely on it \
-         to keep their slot-lookup `expect` panics structurally \
-         unreachable. A new caller MUST audit both call sites before \
-         being added.",
+         INVARIANT: only serve_blocking_on's exit path and \
+         client_transact's stale-reply poison may call remove_slot — \
+         find_conn / find_conn_pinned must return DeadObject (not panic) \
+         on a missing slot. A new caller MUST audit every slot-lookup \
+         path before being added.",
         hits.len(),
         hits,
     );

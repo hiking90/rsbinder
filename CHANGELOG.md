@@ -13,6 +13,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Changed
+
+- **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
+  (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
+  now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
+
 ## [0.10.0] - 2026-07-11
 
 ### Changed

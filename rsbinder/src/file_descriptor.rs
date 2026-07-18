@@ -273,10 +273,13 @@ impl DeserializeOption for ParcelFileDescriptor {
             return Ok(None);
         }
 
+        // AOSP `ParcelFileDescriptor.writeToParcel` (frameworks/base
+        // core/java/android/os/ParcelFileDescriptor.java): `writeInt(hasComm)`,
+        // then `writeFileDescriptor(mFd)`, then `writeFileDescriptor(mCommFd)`
+        // when `hasComm != 0` (a Java `createReliablePipe()` /
+        // `createReliableSocketPair()` PFD). Read the main fd object first,
+        // regardless of `hasComm`.
         let has_comm = parcel.read::<i32>()?;
-        if has_comm != 0 {
-            return Err(StatusCode::BadValue);
-        }
 
         let obj = parcel.read_object(true)?;
 
@@ -293,6 +296,16 @@ impl DeserializeOption for ParcelFileDescriptor {
         }
 
         let fd = rustix::io::fcntl_dupfd_cloexec(obj.borrowed_fd(), 0)?;
+
+        // Reliable-PFD comm channel: consume the second fd object so the
+        // parcel cursor stays aligned; rsbinder has no comm channel, so drop
+        // it (the parcel owns it and closes it on `BC_FREE_BUFFER`).
+        if has_comm != 0 {
+            let comm = parcel.read_object(true)?;
+            if comm.header_type() != crate::sys::BINDER_TYPE_FD {
+                return Err(StatusCode::BadType);
+            }
+        }
 
         Ok(Some(ParcelFileDescriptor::new(fd)))
     }

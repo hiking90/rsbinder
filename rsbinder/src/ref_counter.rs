@@ -5,7 +5,15 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::*;
 
-pub(crate) const INITIAL_STRONG_VALUE: i32 = i32::MAX as _;
+// Matches AOSP `RefBase.cpp` (`#define INITIAL_STRONG_VALUE (1<<28)`) exactly.
+// The value must be positive so that the transient `fetch_add(1)` in `inc`
+// (before the sentinel is subtracted) stays positive: a concurrent
+// `attempt_inc` that observes the intermediate value must see a normal
+// positive count, never a negative one. `i32::MAX` here would wrap to
+// `i32::MIN` on that first increment and open a window where the count reads
+// negative (spurious `attempt_inc` failure in release, `debug_assert` panic
+// in debug). `1<<28` leaves ~2^28 headroom above and below.
+pub(crate) const INITIAL_STRONG_VALUE: i32 = 1 << 28;
 
 /// Thread-safe reference counter used for binder objects.
 ///
@@ -105,6 +113,12 @@ impl RefCounter {
                 // Use Relaxed to match Android's implementation
                 curr_count = self.count.fetch_add(1, Ordering::Relaxed);
                 if curr_count != 0 && curr_count != INITIAL_STRONG_VALUE {
+                    // Lost the revive race. Undo BOTH the strong bump we just
+                    // made and the weak ref (`dec_func`); a bare `dec_func`
+                    // would leak the `fetch_add(1)` above. Diverges from AOSP
+                    // `RefBase::attemptIncStrong`, which keeps the ref and
+                    // returns true here (OBJECT_LIFETIME_WEAK arm).
+                    self.count.fetch_sub(1, Ordering::Relaxed);
                     dec_func();
                     return false;
                 }
@@ -123,6 +137,7 @@ impl RefCounter {
         // Use Release ordering to ensure all our writes are visible before the decrement.
         // This matches Android's RefBase::decStrong implementation.
         let c = self.count.fetch_sub(1, Ordering::Release);
+        debug_assert!(c >= 1, "RefCounter::dec underflow (double decStrong)");
         if c == 1
             && self
                 .count

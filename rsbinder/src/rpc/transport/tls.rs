@@ -296,6 +296,9 @@ impl TlsTransport {
             match self.stream.write(&cipher[off..]) {
                 Ok(0) => return Err(RpcError::PeerClosed),
                 Ok(n) => off += n,
+                // EINTR: a signal interrupted the write — retry (matches the
+                // plain-socket backends).
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -332,7 +335,19 @@ impl TlsTransport {
     /// it into the crypto state. Returns `false` on a clean TCP EOF.
     fn pump_incoming(&self) -> RpcResult<bool> {
         let mut tmp = [0u8; TLS_READ_CHUNK];
-        let k = self.stream.read(&mut tmp)?;
+        let k = loop {
+            match self.stream.read(&mut tmp) {
+                Ok(k) => break k,
+                // EINTR: retry the interrupted blocking read.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A read deadline elapsed mid-stream: surface as `Timeout` so
+                // the android-13+ frame path maps it to `TimedOut`/`Truncated`
+                // like the plain-socket backends (this transport's module doc
+                // lists android-13+-over-TLS as a supported profile).
+                Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
+                Err(e) => return Err(e.into()),
+            }
+        };
         if k == 0 {
             return Ok(false); // peer closed the socket
         }
@@ -343,8 +358,14 @@ impl TlsTransport {
             if n == 0 {
                 break;
             }
-            c.process_new_packets()
-                .map_err(|_| RpcError::Protocol("TLS record processing failed"))?;
+            c.process_new_packets().map_err(|e| {
+                // Log the rustls detail (bad_record_mac, alert kind, …) — it is
+                // otherwise lost behind the static `Protocol` message. rustls
+                // has queued any fatal alert; the next `send_raw`/`flush_control`
+                // drains it best-effort.
+                log::warn!("TLS record processing failed: {e}");
+                RpcError::Protocol("TLS record processing failed")
+            })?;
         }
         Ok(true)
     }
@@ -370,14 +391,29 @@ impl RpcTransport for TlsTransport {
         // reader's `pump_incoming` can still drain — no flow-control
         // deadlock).
         let _g = self.wlock.lock().expect("tls wlock poisoned");
-        let cipher = {
-            let mut c = self.conn.lock().expect("tls conn poisoned");
-            c.writer().write_all(buf)?;
-            let mut v = Vec::new();
-            c.write_tls(&mut v)?;
-            v
-        };
-        self.write_socket_locked(&cipher)
+        // rustls bounds its plaintext sendable buffer (`DEFAULT_BUFFER_LIMIT`,
+        // ~64 KiB); feeding a larger frame in a single `write_all` fails with
+        // `WriteZero`. Chunk the plaintext and interleave encrypt
+        // (`write_tls`) + transmit so any frame size (up to `MAX_FRAME_LEN` =
+        // 64 MiB) streams. The record order still equals the sequence order
+        // because the whole loop holds `wlock`.
+        debug_assert!(!buf.is_empty(), "send_raw with an empty frame");
+        let mut cipher = Vec::new();
+        let mut off = 0;
+        while off < buf.len() {
+            {
+                let mut c = self.conn.lock().expect("tls conn poisoned");
+                let n = c.writer().write(&buf[off..])?;
+                if n == 0 {
+                    return Err(RpcError::Protocol("rustls accepted no plaintext"));
+                }
+                off += n;
+                cipher.clear();
+                c.write_tls(&mut cipher)?;
+            }
+            self.write_socket_locked(&cipher)?;
+        }
+        Ok(())
     }
 
     /// Single-reader: one thread drives `recv_*` per connection (the RPC
@@ -440,6 +476,11 @@ impl Read for RawIo<'_> {
             // (`WouldBlock`/`TimedOut`) and clean-close handling stay
             // byte-for-byte the R34 behavior over a plain socket.
             Err(RpcError::Io(e)) => Err(e),
+            // A read-deadline timeout (mapped in `pump_incoming`) must keep the
+            // `TimedOut` io kind so `read_header`'s `is_timeout` still fires —
+            // otherwise it degrades to a generic `Other` and the frame path
+            // loses the Timeout/Truncated contract.
+            Err(RpcError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
             Err(RpcError::PeerClosed) => Ok(0),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
