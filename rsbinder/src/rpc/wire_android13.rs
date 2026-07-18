@@ -429,6 +429,12 @@ impl Android13PlusCodec {
             .get(A13_CONN_HEADER_LEN..end)
             .ok_or(RpcError::Protocol("session id truncated"))?
             .to_vec();
+        // Strict length: reject trailing bytes past the declared session id,
+        // matching `decode_message` / `decode_session_preamble` — a lenient
+        // decoder would silently desync a caller that framed this header.
+        if buf.len() != end {
+            return Err(RpcError::Protocol("RpcConnectionHeader length mismatch"));
+        }
         Ok((version, options, fd_mode, session_id))
     }
 
@@ -804,12 +810,15 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_size);
     out.extend_from_slice(&header);
     if body_size > 0 {
-        // The header is already consumed, so a deadline that elapses at the
-        // start of the body is mid-message, not frame-synchronized: report
-        // `Truncated`, not `Timeout` (matches `read_aosp_message_with_fds`,
-        // which carries `total_read` across header+body).
+        // The header is already consumed, so either a deadline that elapses at
+        // the start of the body (`Timeout`) or a clean EOF before the body
+        // (`PeerClosed`, which `read_exact_raw` reports for a 0-byte read) is
+        // mid-message, not frame-synchronized: report `Truncated` in both
+        // cases (matches `read_aosp_message_with_fds`, which carries
+        // `total_read` across header+body). Without the `PeerClosed` arm a peer
+        // that sends only a header and dies would be recorded as a clean close.
         let body = read_exact_raw(r, body_size).map_err(|e| match e {
-            RpcError::Timeout => RpcError::Truncated,
+            RpcError::Timeout | RpcError::PeerClosed => RpcError::Truncated,
             other => other,
         })?;
         out.extend_from_slice(&body);
@@ -1008,6 +1017,17 @@ pub fn client_connect_with_id<S: Read + Write>(
     if requesting_new_session {
         let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;
         let negotiated = hdr_codec.decode_new_session_response(&resp)?;
+        // AOSP `RpcSession::setProtocolVersionInternal`: a server may
+        // *downgrade* but never *upgrade* past the version the client
+        // advertised (`max_version` is the client's explicit cap). Accepting a
+        // higher version would let a non-compliant server pull, e.g., a
+        // v0-pinned client onto v1+ framing — opening the SCM_RIGHTS fd path
+        // the cap was meant to exclude.
+        if negotiated > max_version {
+            return Err(RpcError::Protocol(
+                "server upgraded the protocol version past the client cap",
+            ));
+        }
         if negotiated == hdr_codec.version() {
             Ok(hdr_codec)
         } else {

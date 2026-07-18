@@ -167,7 +167,7 @@ impl ParcelableHolder {
                 }
             }
             ParcelableHolderData::Parcel(ref mut parcel) => {
-                // Safety: 0 should always be a valid position.
+                // Position 0 (rewind to start) is always valid.
                 parcel.set_data_position(0);
 
                 let name: String = parcel.read()?;
@@ -276,12 +276,12 @@ impl Parcelable for ParcelableHolder {
                 parcelable.write_to_parcel(parcel)?;
 
                 let end = parcel.data_position();
-                // Safety: we got the position from `data_position`.
+                // The position came from `data_position`, so it is in range.
                 parcel.set_data_position(length_start);
 
                 assert!(end >= data_start);
                 parcel.write(&((end - data_start) as i32))?;
-                // Safety: we got the position from `data_position`.
+                // The position came from `data_position`, so it is in range.
                 parcel.set_data_position(end);
 
                 Ok(())
@@ -334,7 +334,7 @@ impl Parcelable for ParcelableHolder {
             .get_mut()
             .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Parcel(new_parcel);
 
-        // Safety: `append_from` checks if `data_size` overflows
+        // `append_from` checks whether `data_size` overflows
         // `parcel` and returns `BAD_VALUE` if that happens. We also
         // explicitly check for negative and zero `data_size` above,
         // so `data_end` is guaranteed to be greater than `data_start`.

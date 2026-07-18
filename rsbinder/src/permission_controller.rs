@@ -133,8 +133,8 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 ///
 /// Returns `false` when:
 /// - The transaction arrived over RPC (see above).
-/// - The current thread is not handling a binder transaction
-///   (`get_calling_uid()` / `get_calling_pid()` both `0`).
+/// - The current thread is not handling a binder transaction (explicit
+///   deny before uid/pid are read or PMS is consulted).
 /// - The `permission` service is unreachable (`system_server` absent or
 ///   the binder driver is not initialized).
 /// - The remote `checkPermission` call returns an error.
@@ -171,6 +171,14 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
     // an RPC parcel), so it is independent of Plan 2-16 Phase B uid wiring.
     if reader.is_for_rpc() {
         warn_enforce_permission_over_rpc();
+        return false;
+    }
+    // Kernel default path. Outside a live binder transaction the calling
+    // uid/pid read as `0`, and PermissionManagerService unconditionally grants
+    // root (uid 0) — so a call made outside a transaction would return `true`,
+    // inverting the documented "fail closed when not handling a transaction"
+    // contract. Deny explicitly before reading uid/pid or reaching PMS.
+    if !crate::is_handling_transaction() {
         return false;
     }
     let calling_pid = crate::get_calling_pid();
@@ -227,10 +235,10 @@ mod tests {
     }
 
     /// Plan 2-16 Phase A unit-level proof: `check_permission` denies for
-    /// an RPC parcel **before** consulting PMS. A kernel parcel falls
-    /// through to the PMS path (which returns `false` here only because
-    /// `system_server` is unreachable in this hermetic build) — the RPC
-    /// arm is the new transport gate this asserts.
+    /// an RPC parcel **before** consulting PMS. A kernel parcel outside a
+    /// live transaction is denied at the `is_handling_transaction` gate
+    /// before PMS is ever consulted — the RPC arm is the transport gate
+    /// this asserts.
     //
     // `serial(authority)`: `AUTHORITY` is a process global, so this default
     // test must not run concurrently with the authority-delegation test.

@@ -67,9 +67,13 @@ pub type TransactionFlags = u32;
 pub const FLAG_ONEWAY: TransactionFlags = sys::transaction_flags_TF_ONE_WAY;
 /// Corresponds to TF_CLEAR_BUF -- clear transaction buffers after call is made.
 pub const FLAG_CLEAR_BUF: TransactionFlags = sys::transaction_flags_TF_CLEAR_BUF;
-/// Set to the vendor flag if we are building for the VNDK, 0 otherwise
+/// `FLAG_PRIVATE_LOCAL` — the vendor flag on a VNDK build, `0` otherwise
+/// (AOSP `IBinder.h`). rsbinder targets the system side, so it is `0`; this is
+/// the flag the AIDL codegen emits on outgoing transactions.
 pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
-pub const FLAG_PRIVATE_VENDOR: TransactionFlags = FLAG_PRIVATE_LOCAL;
+/// `FLAG_PRIVATE_VENDOR` (`0x10000000`, AOSP `IBinder.h`) — unconditional,
+/// unlike [`FLAG_PRIVATE_LOCAL`]. Marks a transaction as vendor-private.
+pub const FLAG_PRIVATE_VENDOR: TransactionFlags = 0x10000000;
 /// `TF_UPDATE_TXN` (0x40). Set together with
 /// [`FLAG_ONEWAY`] on a `transact()` to ask the Android 12+ driver to
 /// replace any pending async transaction with the same `(target, code)`
@@ -470,7 +474,12 @@ pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
 
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.as_any())
+        // `as_any()` formats as the useless `Any { .. }`; surface the fields a
+        // reader actually needs from a bare `&dyn IBinder` instead.
+        f.debug_struct("dyn IBinder")
+            .field("descriptor", &self.descriptor())
+            .field("remote", &self.is_remote())
+            .finish()
     }
 }
 
@@ -602,6 +611,23 @@ impl Stability {
     }
 }
 
+/// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`) — the wire
+/// version stamped into an android-12 `Category`.
+const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
+
+/// android-12 `Stability::Category::repr()` for a raw `Level`.
+///
+/// AOSP-12 `Category { uint8_t version; uint8_t reserved[2]; Level level; }`
+/// with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, so on
+/// little-endian `repr() == (level << 24) | version`
+/// (`frameworks/native/libs/binder/{include/binder/Stability.h,Stability.cpp}`,
+/// android-12.0.0_r34).
+// Only reachable in the `target_os = "android"` encode branch (and unit tests).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const fn android12_category_repr(level: i32) -> i32 {
+    (level << 24) | BINDER_WIRE_FORMAT_VERSION
+}
+
 // Android 12 version uses "Category" as the stability format for passed on the wire lines,
 // whereas other versions do not. Therefore, we can use the android_properties crate
 // to determine the Android version and perform different handling accordingly.
@@ -613,7 +639,7 @@ impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
         use Stability::*;
 
-        let stability = match stability {
+        let level = match stability {
             Local => 0,
             Vendor => 0b000011,
             System => 0b001100,
@@ -624,13 +650,13 @@ impl From<Stability> for i32 {
         {
             let android_sdk_version = crate::get_android_sdk_version();
             if android_sdk_version == 31 || android_sdk_version == 32 {
-                stability | 0x0c000000
+                android12_category_repr(level)
             } else {
-                stability
+                level
             }
         }
         #[cfg(not(target_os = "android"))]
-        stability
+        level
     }
 }
 
@@ -639,14 +665,26 @@ impl TryFrom<i32> for Stability {
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
 
-        // Try matching as raw Level value first (Android 11, 13+)
-        let level = if stability <= 0xFF {
-            stability
-        } else {
-            // Try extracting level from Category repr format (Android 12).
-            // Category struct on little-endian: { version: u8, reserved: [u8; 2], level: u8 }
-            // repr() = (level << 24) | version
+        // A stability field arrives in one of two on-wire encodings:
+        //   * Raw `Level` (android-11, android-13+, and the non-android
+        //     build): the level value itself in the low byte (0/3/12/63),
+        //     high bytes zero.
+        //   * android-12 `Category::repr()` = `(level << 24) | version`, i.e.
+        //     the level in the high byte with a nonzero wire-format version in
+        //     the low byte.
+        // If any bit above the low byte is set it is a Category (a
+        // nonzero-level Category decodes by level whatever its version byte).
+        // Otherwise the low byte is the raw level — except the bare android-12
+        // wire-format version `0x0000_0001` (Category with level 0), which
+        // decodes to `Local`. A level-0 Category with any other version byte
+        // is byte-ambiguous with a raw level and cannot be distinguished;
+        // AOSP-12 only ever writes version 1.
+        let level = if stability & !0xFF != 0 {
             (stability >> 24) & 0xFF
+        } else if stability == BINDER_WIRE_FORMAT_VERSION {
+            0
+        } else {
+            stability
         };
 
         match level {
@@ -1359,10 +1397,35 @@ mod stability_tests {
     // === Wire value tests ===
     #[test]
     fn test_stability_wire_values() {
-        assert_eq!(Into::<i32>::into(Stability::Local), 0);
-        assert_eq!(Into::<i32>::into(Stability::Vendor), 0b000011);
-        assert_eq!(Into::<i32>::into(Stability::System), 0b001100);
-        assert_eq!(Into::<i32>::into(Stability::Vintf), 0b111111);
+        // On a real android SDK 31/32 device the wire form is the Category
+        // repr `(level << 24) | 1`; on every other target it is the raw level.
+        // Assert the exact bytes for whichever encoding is active, and that
+        // the decoder round-trips it back.
+        for (s, level) in [
+            (Stability::Local, 0),
+            (Stability::Vendor, 0b000011),
+            (Stability::System, 0b001100),
+            (Stability::Vintf, 0b111111),
+        ] {
+            let wire: i32 = s.into();
+            #[cfg(target_os = "android")]
+            let expected = {
+                let sdk = crate::get_android_sdk_version();
+                if sdk == 31 || sdk == 32 {
+                    android12_category_repr(level)
+                } else {
+                    level
+                }
+            };
+            #[cfg(not(target_os = "android"))]
+            let expected = level;
+            assert_eq!(wire, expected, "wire encoding for {s:?}");
+            assert_eq!(
+                Stability::try_from(wire).unwrap(),
+                s,
+                "round-trip for {s:?}"
+            );
+        }
     }
 
     // === TryFrom round-trip tests ===
@@ -1381,40 +1444,43 @@ mod stability_tests {
 
     #[test]
     fn test_stability_category_format() {
-        // Android 12 Category repr: level in byte 3 (big end on little-endian)
-        // Category{version=1, reserved=[0,0], level} → repr = (level << 24) | version
-        let category = |level: i32, version: i32| -> i32 { (level << 24) | version };
+        // android-12 Category repr = (level << 24) | version(1), byte-exact to
+        // AOSP-12.0.0_r34 Stability::Category::currentFromLevel.
+        assert_eq!(super::android12_category_repr(0), 0x0000_0001);
+        assert_eq!(super::android12_category_repr(0b000011), 0x0300_0001);
+        assert_eq!(super::android12_category_repr(0b001100), 0x0c00_0001);
+        assert_eq!(super::android12_category_repr(0b111111), 0x3f00_0001);
 
-        assert_eq!(
-            Stability::try_from(category(0b000011, 1)).unwrap(),
-            Stability::Vendor
-        );
-        assert_eq!(
-            Stability::try_from(category(0b001100, 1)).unwrap(),
-            Stability::System
-        );
-        assert_eq!(
-            Stability::try_from(category(0b111111, 1)).unwrap(),
-            Stability::Vintf
-        );
+        // Decode every Category repr back to its level — including the
+        // Local/UNDECLARED case (0x0000_0001).
+        assert_eq!(Stability::try_from(0x0000_0001).unwrap(), Stability::Local);
+        assert_eq!(Stability::try_from(0x0300_0001).unwrap(), Stability::Vendor);
+        assert_eq!(Stability::try_from(0x0c00_0001).unwrap(), Stability::System);
+        assert_eq!(Stability::try_from(0x3f00_0001).unwrap(), Stability::Vintf);
 
-        // Different version values should also work
+        // A nonzero-level Category with a different (future) version byte
+        // still decodes by level (AOSP reads only Category.level).
         assert_eq!(
-            Stability::try_from(category(0b001100, 12)).unwrap(),
+            Stability::try_from((0b001100 << 24) | 12).unwrap(),
             Stability::System
         );
 
-        // rsbinder's own Android 12 format: level | 0x0c000000
-        assert_eq!(
-            Stability::try_from(0b001100 | 0x0c000000_i32).unwrap(),
-            Stability::System
-        );
+        // Raw-level encoding (android-11 / android-13+) still decodes.
+        assert_eq!(Stability::try_from(0).unwrap(), Stability::Local);
+        assert_eq!(Stability::try_from(0b000011).unwrap(), Stability::Vendor);
+        assert_eq!(Stability::try_from(0b001100).unwrap(), Stability::System);
+        assert_eq!(Stability::try_from(0b111111).unwrap(), Stability::Vintf);
     }
 
     #[test]
     fn test_stability_invalid_value() {
         assert_eq!(Stability::try_from(0x7F).unwrap_err(), StatusCode::BadValue);
-        assert_eq!(Stability::try_from(0x01).unwrap_err(), StatusCode::BadValue);
+        // A low-byte value that is neither a valid raw level nor the android-12
+        // wire-format version tag is rejected.
+        assert_eq!(Stability::try_from(0x05).unwrap_err(), StatusCode::BadValue);
+        // 0x01 is the android-12 Local/UNDECLARED Category repr — it decodes
+        // to Local, not BadValue.
+        assert_eq!(Stability::try_from(0x01).unwrap(), Stability::Local);
     }
 
     // === Bitmask verification tests ===

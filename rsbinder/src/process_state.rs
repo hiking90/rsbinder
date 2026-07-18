@@ -304,10 +304,17 @@ struct MemoryMap {
     size: usize,
 }
 // SAFETY: `ptr` is a PROT_READ binder mapping owned for the whole
-// ProcessState lifetime. It is never written through and never read as
-// Rust data (the binder driver manages the pages); the only use is the
-// single `munmap(ptr, size)` in ProcessState::drop. No data race is
-// possible, so the handle is safe to send and share across threads.
+// ProcessState lifetime. Accesses *through this handle* are limited to the
+// single `munmap(ptr, size)` in ProcessState::drop. The region itself is the
+// kernel-delivered transaction-buffer area and *is* read as Rust data
+// elsewhere (thread_state reads inbound `BR_TRANSACTION`/`BR_REPLY` buffers
+// and `calling_sid` out of it), but that access is synchronized by the binder
+// driver's buffer-lifetime protocol (a buffer stays valid until
+// `BC_FREE_BUFFER`), not by this handle — and it goes through the kernel
+// pointers in the transaction, not `ptr`. Because the mapping lives for the
+// singleton's whole lifetime (the init-race loser never serviced a
+// transaction), no such read is outstanding at drop. No data race is possible
+// through this handle, so it is safe to send and share across threads.
 unsafe impl Sync for MemoryMap {}
 unsafe impl Send for MemoryMap {}
 
@@ -504,7 +511,12 @@ impl ProcessState {
         Self::init(path, 0)
     }
 
-    /// Get binder service manager.
+    /// Register `binder` as this process's binder context manager
+    /// (`BINDER_SET_CONTEXT_MGR`). First-wins: a second call is a no-op — the
+    /// process can only be the context manager for one object, and the kernel
+    /// registers the *process*, not a specific binder — so a second call with
+    /// a different binder is logged and the passed binder dropped rather than
+    /// silently believed to have taken effect.
     pub fn become_context_manager(
         &self,
         binder: SIBinder,
@@ -514,22 +526,24 @@ impl ProcessState {
             .write()
             .expect("Context manager lock poisoned");
 
-        if context_manager.is_none() {
-            let obj = binder::flat_binder_object::new_binder_with_flags(
-                binder::FLAT_BINDER_FLAG_ACCEPTS_FDS,
+        if context_manager.is_some() {
+            log::warn!(
+                "become_context_manager called again; keeping the first registration (no-op)"
             );
-
-            if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
-                //     android_errorWriteLog(0x534e4554, "121035042");
-                // let unused: i32 = 0;
-                if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
-                    return Err(
-                        format!("Binder ioctl to become context manager failed: {e}").into(),
-                    );
-                }
-            }
-            *context_manager = Some(binder);
+            return Ok(());
         }
+
+        let obj =
+            binder::flat_binder_object::new_binder_with_flags(binder::FLAT_BINDER_FLAG_ACCEPTS_FDS);
+
+        if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
+            //     android_errorWriteLog(0x534e4554, "121035042");
+            // let unused: i32 = 0;
+            if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
+                return Err(format!("Binder ioctl to become context manager failed: {e}").into());
+            }
+        }
+        *context_manager = Some(binder);
 
         Ok(())
     }
@@ -713,6 +727,12 @@ impl ProcessState {
         stability: Stability,
         ready: SlowPathReady,
     ) -> Result<SIBinder> {
+        // Declared BEFORE the write lock so it drops AFTER (reverse order):
+        // any watermark callback that `new_acquired` → `proxy_count::
+        // on_proxy_create` would fire is queued and only runs once this lock
+        // is released, so a callback re-entering the proxy cache can't
+        // deadlock against the write lock this thread still holds.
+        let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
@@ -1163,7 +1183,12 @@ impl ProcessState {
         // guaranteed no further BR_* will reference this id (kernel_refs
         // was 0 to reach this branch).
         let arc_for_weak = Arc::clone(entry.binder_pin.as_arc());
-        let _ = arc_for_weak.dec_weak();
+        if let Err(e) = arc_for_weak.dec_weak() {
+            // Symmetric with `publish_native`'s `inc_weak` (which is loud on
+            // failure); a discarded error here would hide a RefCounter.weak
+            // underflow / leak.
+            log::error!("unpublish_native: dec_weak failed for id {id}: {e:?}");
+        }
         drop(entry.binder_pin);
     }
 
@@ -1246,18 +1271,28 @@ impl ProcessState {
         if self.thread_pool_started.load(Ordering::Relaxed) {
             let name = self.make_binder_thread_name();
             log::info!("Spawning new pooled thread, name={name}");
-            let _ = thread::Builder::new()
+            match thread::Builder::new()
                 .name(name)
-                .spawn(move || thread_state::join_thread_pool(is_main));
-
-            // Account into the per-origin counter so tests can verify
-            // the `start_thread_pool` spawn contract without racing
-            // kernel-driven `BR_SPAWN_LOOPER` spawns. See the field
-            // docs on `main_thread_spawned` / `kernel_started_threads`.
-            if is_main {
-                self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
+                .spawn(move || thread_state::join_thread_pool(is_main))
+            {
+                Ok(_) => {
+                    // Account into the per-origin counter so tests can verify
+                    // the `start_thread_pool` spawn contract without racing
+                    // kernel-driven `BR_SPAWN_LOOPER` spawns. See the field
+                    // docs on `main_thread_spawned` / `kernel_started_threads`.
+                    // Only on success — a failed spawn must not desync the
+                    // counter, and on a `BR_SPAWN_LOOPER` request the kernel
+                    // would otherwise wait forever for a looper that never
+                    // registered.
+                    if is_main {
+                        self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Err(e) => {
+                    log::error!("failed to spawn pooled binder thread: {e}");
+                }
             }
         }
         // AOSP's late-startThreadPool desync TODO can't arise here: BC_REGISTER_LOOPER is
@@ -1328,13 +1363,20 @@ fn open_driver(
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        let mmap = self.mmap.read().expect("Mmap lock poisoned");
+        // This `Drop` runs on the `init` race loser too; a `munmap` failure is
+        // not worth aborting the process (a `Drop` panic while unwinding
+        // aborts immediately). A poisoned lock still yields usable data —
+        // `ptr`/`size` are a POD pair a panicking reader cannot leave
+        // inconsistent — so unmap anyway rather than leak the mapping.
+        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `mmap.ptr`/`mmap.size` are exactly the address and length
         // returned by the `mmap` call in `ProcessState::new`. This runs only
         // in `Drop`, so the mapping is still live and is unmapped exactly
         // once; no references into the region outlive `ProcessState`.
         unsafe {
-            rustix::mm::munmap(mmap.ptr, mmap.size).expect("Failed to unmap memory");
+            if let Err(e) = rustix::mm::munmap(mmap.ptr, mmap.size) {
+                log::error!("ProcessState::drop: munmap failed: {e}");
+            }
         }
     }
 }

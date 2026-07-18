@@ -86,13 +86,18 @@ pub struct ProxyHandle {
     /// `new_acquired`; left `false` by test-only construction helpers
     /// (`synthetic_proxy`) and by the construction-failure path where
     /// `inc_strong_handle` errored before the counter was bumped.
-    count_acquired: AtomicBool,
+    ///
+    /// Plain `bool`, not atomic: written once at construction (before the
+    /// `Arc<ProxyHandle>` is shared) and read only in `Drop` (`&mut self`);
+    /// the `Arc` refcount's release/acquire supplies the happens-before.
+    count_acquired: bool,
     /// True iff `on_proxy_create` incremented the per-uid tracking map for
     /// this proxy (i.e. tracking was enabled at construction). `Drop` uses
     /// this — not the live `COUNT_BY_UID_ENABLED` flag — to decide whether to
     /// decrement the per-uid map, so toggling tracking off while the proxy is
-    /// live cannot desync the count (AOSP `BpBinder::mTrackedUid`).
-    counted_by_uid: AtomicBool,
+    /// live cannot desync the count (AOSP `BpBinder::mTrackedUid`). Plain
+    /// `bool` for the same reason as `count_acquired`.
+    counted_by_uid: bool,
     stability: Stability,
     /// Set once when `send_obituary` runs to publish "this proxy is
     /// dead" to all observers.
@@ -146,8 +151,8 @@ impl ProxyHandle {
             handle,
             descriptor,
             tracked_uid,
-            count_acquired: AtomicBool::new(true),
-            counted_by_uid: AtomicBool::new(counted_by_uid),
+            count_acquired: true,
+            counted_by_uid,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
@@ -386,7 +391,7 @@ impl ProxyHandle {
 
 impl Debug for ProxyHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner")
+        f.debug_struct("ProxyHandle")
             .field("handle", &self.handle)
             .field("descriptor", &self.descriptor)
             .field("stability", &self.stability)
@@ -421,11 +426,8 @@ impl Drop for ProxyHandle {
         // `on_proxy_create`. Test-only `synthetic_proxy`
         // and the `inc_strong_handle`-failure path leave the guard
         // `false`, so the proxy_count globals never see a phantom drop.
-        if self.count_acquired.load(Ordering::Relaxed) {
-            crate::proxy_count::on_proxy_drop(
-                self.tracked_uid,
-                self.counted_by_uid.load(Ordering::Relaxed),
-            );
+        if self.count_acquired {
+            crate::proxy_count::on_proxy_drop(self.tracked_uid, self.counted_by_uid);
         }
     }
 }
@@ -465,11 +467,15 @@ impl IBinder for ProxyHandle {
         // 2. Remote query (EXTENSION_TRANSACTION)
         let data = Parcel::new();
         let ext: Option<SIBinder> = match self.submit_transact(EXTENSION_TRANSACTION, &data, 0) {
-            Ok(Some(mut reply)) => match DeserializeOption::deserialize_option(&mut reply) {
-                Ok(ext) => ext,
-                Err(_) => return Ok(None),
-            },
-            _ => return Ok(None),
+            Ok(Some(mut reply)) => DeserializeOption::deserialize_option(&mut reply)?,
+            Ok(None) => None,
+            // A server predating extensions reports `UnknownTransaction`;
+            // treat that as "no extension". Every other error (notably
+            // `DeadObject`, and reply-corruption) propagates — matching AOSP
+            // `BpBinder::getExtension`, which returns the transact status
+            // rather than collapsing all failures to "none".
+            Err(StatusCode::UnknownTransaction) => None,
+            Err(e) => return Err(e),
         };
 
         // 3. Classify and cache. Strong unless the extension's handle
@@ -680,8 +686,8 @@ mod tests {
             // `count_acquired = false` means `Drop` skips
             // `proxy_count::on_proxy_drop`, matching this constructor's
             // skip of `new_acquired`'s `on_proxy_create`.
-            count_acquired: AtomicBool::new(false),
-            counted_by_uid: AtomicBool::new(false),
+            count_acquired: false,
+            counted_by_uid: false,
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),
@@ -719,7 +725,7 @@ mod tests {
         let debug_str = format!("{handle:?}");
         assert_eq!(
             debug_str,
-            "Inner { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
+            "ProxyHandle { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
         );
 
         std::mem::forget(handle);

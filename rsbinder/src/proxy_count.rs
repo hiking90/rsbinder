@@ -20,6 +20,7 @@
 //! are debounced (a uid only fires `Limit` once until it drops below `low`,
 //! and `Warning` once until it drops below `warning`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -44,11 +45,13 @@ pub enum ProxyCountEvent {
     Limit { uid: u32, count: u64 },
 }
 
-/// Callback type for [`ProxyCountEvent`] notifications. Invoked from
-/// the proxy create/drop hot path **outside** the internal mutex, so
-/// the callback may freely re-enter `proxy_count` APIs (but must not
-/// itself block indefinitely — every proxy create/drop on every thread
-/// is gated on that callback returning).
+/// Callback type for [`ProxyCountEvent`] notifications. Invoked **outside**
+/// the internal `proxy_count` mutex, and — on the proxy-create path — after
+/// the process-wide `ProcessState::handle_to_proxy` cache lock is released
+/// (via [`CallbackDeferGuard`]). The callback may therefore freely re-enter
+/// both `proxy_count` APIs and the binder proxy cache (`get_service`,
+/// resolving/creating proxies). It must not block indefinitely — every proxy
+/// create/drop on the firing thread is gated on it returning.
 pub type ProxyCountCallback = Arc<dyn Fn(ProxyCountEvent) + Send + Sync>;
 
 /// Process-global proxy count. Lock-free hot path: every
@@ -93,6 +96,54 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         per_uid: HashMap::new(),
     })
 });
+
+thread_local! {
+    /// While set, `on_proxy_create` queues watermark callbacks instead of
+    /// firing them inline. Set by [`CallbackDeferGuard`] around the
+    /// proxy-cache create path so the callback never runs with the caller's
+    /// `ProcessState::handle_to_proxy` write lock still held.
+    static CALLBACK_DEFER: Cell<bool> = const { Cell::new(false) };
+    /// Watermark callbacks queued while [`CALLBACK_DEFER`] was set, fired by
+    /// the outermost [`CallbackDeferGuard`] on drop (after the cache lock is
+    /// released).
+    static PENDING_CALLBACKS: RefCell<Vec<(ProxyCountCallback, ProxyCountEvent)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that defers watermark callbacks on the current thread until it
+/// drops. `ProcessState::slow_path_p3` creates it **before** taking the
+/// `handle_to_proxy` write lock and drops it **after** that lock is released
+/// (declaration order), so a user callback that re-enters the proxy cache
+/// (`get_service`, creating a proxy, …) cannot deadlock against the lock the
+/// creating thread still holds. Nested guards keep deferring until the
+/// outermost one drops. AOSP defers via `postTask`; this is the equivalent.
+pub(crate) struct CallbackDeferGuard {
+    was_deferring: bool,
+}
+
+impl CallbackDeferGuard {
+    pub(crate) fn new() -> Self {
+        let was_deferring = CALLBACK_DEFER.with(|d| d.replace(true));
+        Self { was_deferring }
+    }
+}
+
+impl Drop for CallbackDeferGuard {
+    fn drop(&mut self) {
+        CALLBACK_DEFER.with(|d| d.set(self.was_deferring));
+        if self.was_deferring {
+            // A nested guard is still active — keep deferring.
+            return;
+        }
+        // Outermost guard: fire everything queued while deferral was active.
+        // `CALLBACK_DEFER` is already cleared, so a callback that creates a
+        // proxy fires its own watermark inline (the cache lock is released).
+        let pending: Vec<_> = PENDING_CALLBACKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        for (cb, event) in pending {
+            cb(event);
+        }
+    }
+}
 
 /// Snapshot of the process-global proxy count.
 ///
@@ -212,7 +263,14 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
         }
     };
     if let Some((cb, event)) = event {
-        cb(event);
+        // Defer to after the proxy-cache lock is released when a
+        // `CallbackDeferGuard` is active on this thread (the create path);
+        // otherwise fire inline (already outside the internal `STATE` mutex).
+        if CALLBACK_DEFER.with(|d| d.get()) {
+            PENDING_CALLBACKS.with(|p| p.borrow_mut().push((cb, event)));
+        } else {
+            cb(event);
+        }
     }
     true
 }
@@ -257,6 +315,8 @@ pub(crate) fn on_proxy_drop(uid: u32, counted_by_uid: bool) {
 pub(crate) fn reset_for_test() {
     PROXY_COUNT.store(0, Ordering::Relaxed);
     COUNT_BY_UID_ENABLED.store(false, Ordering::Relaxed);
+    CALLBACK_DEFER.with(|d| d.set(false));
+    PENDING_CALLBACKS.with(|p| p.borrow_mut().clear());
     let mut state = STATE.lock().expect("proxy_count state poisoned");
     state.high = DEFAULT_HIGH_WATERMARK;
     state.low = DEFAULT_LOW_WATERMARK;

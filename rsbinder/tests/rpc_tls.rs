@@ -302,6 +302,35 @@ fn tls_concurrent_bidirectional_duplex() {
     cli_send.join().unwrap();
 }
 
+/// A frame larger than rustls's ~64 KiB plaintext sendable buffer must still
+/// round-trip: `send_raw` chunks the plaintext and interleaves encrypt-drain
+/// (a single unchunked `writer().write_all` of such a payload fails with
+/// `WriteZero`).
+#[test]
+fn tls_large_frame_over_64kib_roundtrips() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let h = thread::spawn(move || {
+        TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake")
+    });
+    let cli =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    let srv = Arc::new(h.join().unwrap());
+    let cli = Arc::new(cli);
+
+    // 1 MiB payload — well past the 64 KiB rustls sendable-buffer limit.
+    let payload: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 251) as u8).collect();
+    let srv_s = Arc::clone(&srv);
+    let sent = payload.clone();
+    let sender = thread::spawn(move || {
+        srv_s.send_frame(&sent).expect("srv send large frame");
+    });
+    let got = cli.recv_frame().expect("cli recv large frame");
+    sender.join().unwrap();
+    assert_eq!(got, payload, "1 MiB frame must round-trip over TLS");
+}
+
 /// TLS rejects out-of-band file descriptors *by type*
 /// — `SCM_RIGHTS` cannot ride an encrypted byte stream, so `TlsTransport`
 /// keeps the trait's rejecting default for `send_*_with_fds` (no

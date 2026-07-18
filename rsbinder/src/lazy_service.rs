@@ -133,29 +133,45 @@ impl LazyServiceRegistrar {
         }
     }
 
-    /// Attempt to unregister all services whose last `onClients` was
-    /// `false` (no current clients). AOSP
+    /// Attempt to unregister **every** service, all-or-nothing. AOSP
     /// [`LazyServiceRegistrar::tryUnregisterLocked`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/LazyServiceRegistrar.cpp;l=193).
     ///
-    /// **Returns** `true` if every clientless service successfully
-    /// flipped to `registered = false`; `false` if `force_persist` is
-    /// engaged or no candidates were eligible. The hub-integrated
-    /// version owed by the caller (see module docs) is the place where
-    /// the actual `tryUnregisterService` IPC happens — this skeleton
-    /// only mutates internal state.
+    /// AOSP's caller (`maybeTryShutdownLocked`) only reaches this when
+    /// `mNumConnectedServices == 0`, and `tryUnregisterLocked` then
+    /// unregisters *all* services (rolling back on the first failure). A
+    /// `true` return means "no service is registered any more → the process is
+    /// safe to exit". A per-entry flip (leaving client-holding services
+    /// registered while others go down) would let a caller following the
+    /// AOSP idiom `if try_unregister() { exit }` terminate with live-client
+    /// services still registered.
+    ///
+    /// **Returns** `true` iff every service was flipped to
+    /// `registered = false` (there is no service with clients, and
+    /// `force_persist` is not engaged); `false` otherwise — in which case
+    /// nothing is changed. A registrar with no services returns `false`:
+    /// there is nothing to unregister, so it never signals "safe to exit"
+    /// (AOSP cannot reach this state — its shutdown check only runs from an
+    /// `onClients` callback of a registered service). The hub-integrated
+    /// version owed by the caller (see module docs) is where the actual
+    /// `tryUnregisterService` IPC happens; this skeleton only mutates
+    /// internal state.
     pub fn try_unregister(&self) -> bool {
         if self.force_persist.load(Ordering::Acquire) {
             return false;
         }
         let mut inner = self.inner.lock().expect("lazy_service inner poisoned");
-        let mut any_eligible = false;
-        for entry in inner.services.values_mut() {
-            if !entry.has_clients && entry.registered {
-                entry.registered = false;
-                any_eligible = true;
-            }
+        if inner.services.is_empty() {
+            return false;
         }
-        any_eligible
+        // Global gate: if any service still has clients, unregister nothing and
+        // report "not safe to shut down" (AOSP all-or-nothing).
+        if inner.services.values().any(|e| e.has_clients) {
+            return false;
+        }
+        for entry in inner.services.values_mut() {
+            entry.registered = false;
+        }
+        true
     }
 
     /// Re-register every previously-unregistered service. AOSP
@@ -246,23 +262,44 @@ mod tests {
         assert_eq!(reg.registered_count(), 1);
     }
 
-    /// `try_unregister` flips `registered` to
-    /// false **only** for entries with `has_clients == false`. AOSP
-    /// `tryUnregisterLocked` eligibility predicate.
+    /// `try_unregister` is all-or-nothing: if ANY service still has clients it
+    /// unregisters nothing and returns `false`; only once every service is
+    /// clientless does it flip them all and return `true`. AOSP
+    /// `tryUnregisterLocked` (gated by the caller on `mNumConnectedServices ==
+    /// 0`).
     #[test]
-    fn try_unregister_only_flips_clientless_entries() {
+    fn try_unregister_is_all_or_nothing() {
         let reg = LazyServiceRegistrar::new();
         reg.register_service("a", fresh_binder()).unwrap();
         reg.register_service("b", fresh_binder()).unwrap();
-        // `a` still has clients; `b` lost theirs.
+        // `a` still has clients; `b` lost theirs → not safe to unregister
+        // anything, and nothing is changed.
         reg.on_clients("b", false);
-        assert!(reg.try_unregister(), "any eligible -> true");
+        assert!(!reg.try_unregister(), "a still has clients -> false, no-op");
         let snap = reg.snapshot();
-        let a = snap.iter().find(|(n, _, _)| n == "a").unwrap();
-        let b = snap.iter().find(|(n, _, _)| n == "b").unwrap();
-        assert!(a.2, "`a` still has clients, stays registered");
-        assert!(!b.2, "`b` clientless and unregistered");
-        assert_eq!(reg.registered_count(), 1);
+        assert!(
+            snap.iter().find(|(n, _, _)| n == "a").unwrap().2,
+            "`a` stays registered"
+        );
+        assert!(
+            snap.iter().find(|(n, _, _)| n == "b").unwrap().2,
+            "`b` also stays registered"
+        );
+        assert_eq!(reg.registered_count(), 2);
+
+        // Now `a` also loses its clients → all clientless → unregister all.
+        reg.on_clients("a", false);
+        assert!(reg.try_unregister(), "all clientless -> true");
+        let snap = reg.snapshot();
+        assert!(
+            !snap.iter().find(|(n, _, _)| n == "a").unwrap().2,
+            "`a` unregistered"
+        );
+        assert!(
+            !snap.iter().find(|(n, _, _)| n == "b").unwrap().2,
+            "`b` unregistered"
+        );
+        assert_eq!(reg.registered_count(), 0);
     }
 
     /// `force_persist(true)` short-circuits `try_unregister`

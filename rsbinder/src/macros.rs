@@ -119,7 +119,7 @@ macro_rules! __declare_binder_interface {
                                     // the cast now rather than panic in `as_async()` at
                                     // the first method call (AOSP returns `BadType` too).
                                     if native.0.try_as_async().is_some() {
-                                        Ok($crate::Strong::new(Box::new(native.clone())))
+                                        Ok($crate::Strong::new(Box::new(native)))
                                     } else {
                                         Err($crate::StatusCode::BadType)
                                     }
@@ -438,7 +438,7 @@ macro_rules! declare_binder_interface {
                     Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
                     None => {
                         match $crate::native::Binder::<$native>::try_from(binder) {
-                            Ok(native) => Ok($crate::Strong::new(Box::new(native.clone()))),
+                            Ok(native) => Ok($crate::Strong::new(Box::new(native))),
                             Err(err) => Err(err),
                         }
                     }
@@ -528,6 +528,9 @@ macro_rules! impl_deserialize_for_parcelable {
                     use $crate::Parcelable;
                     self.read_from_parcel(parcel)
                 } else {
+                    // Any flag other than NON_NULL is UNEXPECTED_NULL, matching
+                    // AOSP C++ `Parcel::readData` and `DeserializeOption`'s
+                    // default path.
                     Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
@@ -554,6 +557,9 @@ macro_rules! impl_deserialize_for_parcelable {
                     this.get_or_insert_with(Self::default)
                         .read_from_parcel(parcel)
                 } else {
+                    // Any flag other than NULL/NON_NULL is UNEXPECTED_NULL,
+                    // matching AOSP C++ `Parcel::readData` and
+                    // `DeserializeOption`'s default path.
                     Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }

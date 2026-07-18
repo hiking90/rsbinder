@@ -125,31 +125,25 @@ impl ServerListener {
     /// (and any TLS handshake) runs in the worker thread spawned by
     /// [`RpcServer::serve_connection_raw`].
     fn accept_raw(&self) -> std::io::Result<RawAccepted> {
+        // Only `accept(2)` here — the per-stream setup (blocking mode, TCP
+        // nodelay) is deferred to the worker via `prepare_for_worker`, so a
+        // setup failure on one connection (e.g. a peer that RST between SYN
+        // and our `setsockopt`, which can surface as ECONNRESET or even
+        // EINVAL) drops only that connection instead of propagating into the
+        // accept loop's error match and killing the whole server.
         match self {
             ServerListener::Unix(l) => {
                 let (stream, _addr) = l.accept()?;
-                // The listener is non-blocking so the accept loop can
-                // poll `shutdown`; the accepted connection must be
-                // blocking for the worker's `recv_frame` (and for the
-                // worker-side TLS handshake when applicable).
-                stream.set_nonblocking(false)?;
                 Ok(RawAccepted::Unix(stream))
             }
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             ServerListener::Vsock(l) => {
                 let (stream, _addr) = l.accept()?;
-                stream.set_nonblocking(false)?;
                 Ok(RawAccepted::Vsock(stream))
             }
             #[cfg(feature = "rpc-tls")]
             ServerListener::Tcp(l) => {
                 let (stream, _addr) = l.accept()?;
-                stream.set_nonblocking(false)?;
-                // TCP-specific: `nodelay=true` matches the client-side
-                // `TlsTransport::connect`/`accept` (back-compat
-                // convenience). Small-frame RPC traffic ⇒ disable
-                // Nagle so handshake + first request don't coalesce.
-                stream.set_nodelay(true)?;
                 Ok(RawAccepted::Tcp(stream))
             }
         }
@@ -157,6 +151,26 @@ impl ServerListener {
 }
 
 impl RawAccepted {
+    /// Configure the accepted stream for its worker: switch it to blocking
+    /// (the listener is non-blocking only so the accept loop can poll
+    /// `shutdown`; the worker does blocking `recv_frame` and, for TLS, a
+    /// blocking handshake), and for TCP disable Nagle (small-frame RPC
+    /// traffic; matches the client-side `TlsTransport::connect`). Runs on the
+    /// *worker* thread so a failure drops only this connection — see
+    /// [`ServerListener::accept_raw`].
+    fn prepare_for_worker(&self) -> std::io::Result<()> {
+        match self {
+            RawAccepted::Unix(s) => s.set_nonblocking(false),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            RawAccepted::Vsock(s) => s.set_nonblocking(false),
+            #[cfg(feature = "rpc-tls")]
+            RawAccepted::Tcp(s) => {
+                s.set_nonblocking(false)?;
+                s.set_nodelay(true)
+            }
+        }
+    }
+
     /// Arm a read deadline on the raw stream *before* it is wrapped, so
     /// the pre-wrap TLS handshake (driven inside [`into_transport`],
     /// which performs blocking reads on this socket) is itself bounded.
@@ -1005,9 +1019,17 @@ impl RpcServer {
     /// to keep TLS handshake (if any) on the worker side.
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
         let server = Arc::clone(self);
-        let handle = std::thread::spawn(move || {
-            Self::run_connection_in_worker(server, transport);
-        });
+        let handle = match std::thread::Builder::new()
+            .name("rpc-conn".into())
+            .spawn(move || {
+                Self::run_connection_in_worker(server, transport);
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("RPC: failed to spawn connection worker, dropping: {e}");
+                return;
+            }
+        };
         let mut workers = self.workers.lock().expect("workers poisoned");
         // Reap finished handles so `workers` is bounded by *concurrent*
         // (not cumulative) connections — same discipline as the accept
@@ -1027,35 +1049,54 @@ impl RpcServer {
     /// transports (UDS / vsock) skip the TLS branch and wrap natively.
     fn serve_connection_raw(self: &Arc<Self>, raw: RawAccepted) {
         let server = Arc::clone(self);
-        let handle = std::thread::spawn(move || {
-            // Bound the pre-wrap handshake phase on the raw socket before
-            // any blocking I/O. The TLS handshake runs inside
-            // `wrap_accepted` (below), *before* `run_connection_in_worker`
-            // arms its deadline, so a silent peer would otherwise pin this
-            // worker — and, with `set_max_connections`, the accept loop —
-            // forever. `run_connection_in_worker` re-arms (idempotent) and
-            // clears it before the long-lived serve.
-            if let Some(d) = *server
-                .handshake_timeout
-                .lock()
-                .expect("handshake_timeout poisoned")
-            {
-                if let Err(e) = raw.set_read_timeout(Some(d)) {
-                    log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
-                }
-                if let Err(e) = raw.set_write_timeout(Some(d)) {
-                    log::debug!("RPC: failed to arm pre-wrap handshake write timeout: {e:?}");
-                }
-            }
-            let transport = match server.wrap_accepted(raw) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!("RPC transport wrap (TLS or native) failed: {e:?}");
+        let spawned = std::thread::Builder::new()
+            .name("rpc-conn".into())
+            .spawn(move || {
+                // Switch the accepted socket to blocking (+ TCP nodelay) on
+                // the worker so a per-connection setup failure drops just this
+                // connection, not the whole accept loop.
+                if let Err(e) = raw.prepare_for_worker() {
+                    log::warn!("RPC: failed to prepare accepted stream, dropping: {e:?}");
                     return;
                 }
-            };
-            Self::run_connection_in_worker(server, transport);
-        });
+                // Bound the pre-wrap handshake phase on the raw socket before
+                // any blocking I/O. The TLS handshake runs inside
+                // `wrap_accepted` (below), *before* `run_connection_in_worker`
+                // arms its deadline, so a silent peer would otherwise pin this
+                // worker — and, with `set_max_connections`, the accept loop —
+                // forever. `run_connection_in_worker` re-arms (idempotent) and
+                // clears it before the long-lived serve.
+                if let Some(d) = *server
+                    .handshake_timeout
+                    .lock()
+                    .expect("handshake_timeout poisoned")
+                {
+                    if let Err(e) = raw.set_read_timeout(Some(d)) {
+                        log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
+                    }
+                    if let Err(e) = raw.set_write_timeout(Some(d)) {
+                        log::debug!("RPC: failed to arm pre-wrap handshake write timeout: {e:?}");
+                    }
+                }
+                let transport = match server.wrap_accepted(raw) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("RPC transport wrap (TLS or native) failed: {e:?}");
+                        return;
+                    }
+                };
+                Self::run_connection_in_worker(server, transport);
+            });
+        // Thread creation can fail on resource exhaustion (EAGAIN); dropping
+        // the connection is correct — the accept loop's EMFILE/ENOMEM back-off
+        // would be undone by a `spawn` panic here.
+        let handle = match spawned {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("RPC: failed to spawn connection worker, dropping: {e}");
+                return;
+            }
+        };
         let mut workers = self.workers.lock().expect("workers poisoned");
         workers.retain(|h| !h.is_finished());
         workers.push(handle);
@@ -1410,11 +1451,14 @@ impl RpcServer {
             // a full server still shuts down promptly. `live_worker_
             // count()` reaps finished handles, so a freed slot is
             // observed here.
-            if let Some(max) = *self
+            // Copy the cap and drop the guard before `live_worker_count()`
+            // (which locks `workers`) and the sleep, so a `set_max_connections`
+            // caller is never blocked behind the accept loop's poll interval.
+            let max_connections = *self
                 .max_connections
                 .lock()
-                .expect("max_connections poisoned")
-            {
+                .expect("max_connections poisoned");
+            if let Some(max) = max_connections {
                 if self.live_worker_count() >= max {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
@@ -1437,13 +1481,25 @@ impl RpcServer {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::Interrupted
+                    ) || matches!(
+                        e.raw_os_error(),
+                        Some(code)
+                            if code == libc::EPROTO
+                                || code == libc::ENETDOWN
+                                || code == libc::ENETUNREACH
+                                || code == libc::EHOSTUNREACH
+                                || code == libc::ETIMEDOUT
                     ) =>
                 {
                     // Transient: peer reset between SYN and accept()
-                    // (ECONNABORTED), or EINTR. A normal accept loop
-                    // continues past these — they must NOT take the
-                    // whole server down for all future clients.
+                    // (ECONNABORTED/ECONNRESET), EINTR, or a pending network
+                    // error that `accept(2)` documents as retry-like (EPROTO /
+                    // ENETDOWN / ENETUNREACH / EHOSTUNREACH / ETIMEDOUT). A
+                    // normal accept loop continues past these — they must NOT
+                    // take the whole server down for all future clients.
                     log::warn!("transient accept error, continuing: {e}");
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -1475,8 +1531,10 @@ impl RpcServer {
                 Err(e) => {
                     // Fatal (e.g. the listener was closed): surface it.
                     // Never disguise a hard failure as `Ok(())`, which
-                    // would make `run_background` silently dead.
-                    log::debug!("accept loop ending (fatal): {e}");
+                    // would make `run_background` silently dead. Logged at
+                    // `error` because this terminates the whole accept loop —
+                    // higher severity than the transient (`warn`) arms above.
+                    log::error!("accept loop ending (fatal): {e}");
                     return Err(e.into());
                 }
             }
@@ -1488,7 +1546,11 @@ impl RpcServer {
     pub fn run_background(self: &Arc<Self>) -> JoinHandle<()> {
         let me = Arc::clone(self);
         std::thread::spawn(move || {
-            let _ = me.run();
+            // Surface a fatal accept-loop error instead of silently discarding
+            // it — otherwise the background server dies with no trace.
+            if let Err(e) = me.run() {
+                log::error!("RPC accept loop terminated with error: {e:?}");
+            }
         })
     }
 

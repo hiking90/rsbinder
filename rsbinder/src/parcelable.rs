@@ -100,8 +100,7 @@ macro_rules! impl_parcelable {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                parcel.write_aligned(self);
-                Ok(())
+                parcel.write_aligned(self)
             }
         }
     };
@@ -156,8 +155,7 @@ macro_rules! impl_parcelable_ex {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
                 let val: $to_ty = *self as _;
-                parcel.write_aligned(&val);
-                Ok(())
+                parcel.write_aligned(&val)
             }
         }
     };
@@ -287,8 +285,7 @@ impl DeserializeArray for bool {}
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = *self as _;
-        parcel.write_aligned(&val);
-        Ok(())
+        parcel.write_aligned(&val)
     }
 }
 
@@ -319,7 +316,7 @@ impl SerializeOption for str {
                         utf16.as_ptr() as *const u8,
                         utf16.len() * std::mem::size_of::<u16>(),
                     )
-                });
+                })?;
 
                 Ok(())
             }
@@ -336,8 +333,7 @@ impl Deserialize for StatusCode {
 impl Serialize for StatusCode {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = i32::from(*self);
-        parcel.write_aligned(&val);
-        Ok(())
+        parcel.write_aligned(&val)
     }
 }
 
@@ -363,8 +359,7 @@ macro_rules! impl_parcelable_struct {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                parcel.write_aligned(self);
-                Ok(())
+                parcel.write_aligned(self)
             }
         }
     };
@@ -747,7 +742,11 @@ impl<T: SerializeOption> SerializeArray for Option<T> {}
 pub trait SerializeArray: Serialize + Sized {
     /// Serialize an array of this type into the given parcel.
     fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
-        parcel.write::<i32>(&(slice.len() as i32))?;
+        // The wire length word is an `i32`; a slice too large to fit is a
+        // `BadValue`, not a silently truncated (possibly negative) count.
+        // Matches AOSP's Rust `SerializeArray` (`try_into().or(BAD_VALUE)`).
+        let len: i32 = slice.len().try_into().or(Err(StatusCode::BadValue))?;
+        parcel.write::<i32>(&len)?;
 
         for s in slice {
             parcel.write(s)?;
@@ -992,6 +991,8 @@ mod tests {
 
         assert_eq!(p.read::<Tiny>(), Ok(Tiny { x: 7 }));
         assert_eq!(p.read::<Option<Tiny>>(), Ok(None));
+        // Any non-{0,1} flag is UNEXPECTED_NULL, matching AOSP C++
+        // `Parcel::readData` and the `DeserializeOption` default path.
         assert_eq!(p.read::<Option<Tiny>>(), Err(StatusCode::UnexpectedNull));
     }
 }

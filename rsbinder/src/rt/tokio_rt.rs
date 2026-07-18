@@ -69,30 +69,6 @@ pub async fn get_interface<T: FromIBinder + ?Sized + 'static>(
     }
 }
 
-// /// Retrieve an existing service for a particular interface, or start it if it
-// /// is configured as a dynamic service and isn't yet started.
-// pub async fn wait_for_interface<T: FromIBinder + ?Sized + 'static>(
-//     name: &str,
-// ) -> Result<Strong<T>, StatusCode> {
-//     if rsbinder::is_handling_transaction() {
-//         // See comment in the BinderAsyncPool impl.
-//         return rsbinder::wait_for_interface::<T>(name);
-//     }
-
-//     let name = name.to_string();
-//     let res = tokio::task::spawn_blocking(move || rsbinder::wait_for_interface::<T>(&name)).await;
-
-//     // The `is_panic` branch is not actually reachable in Android as we compile
-//     // with `panic = abort`.
-//     match res {
-//         Ok(Ok(service)) => Ok(service),
-//         Ok(Err(err)) => Err(err),
-//         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-//         Err(e) if e.is_cancelled() => Err(StatusCode::FailedTransaction),
-//         Err(_) => Err(StatusCode::Unknown),
-//     }
-// }
-
 /// Use the Tokio `spawn_blocking` pool with AIDL.
 pub enum Tokio {}
 
