@@ -88,17 +88,27 @@ pub(crate) mod lifecycle;
 pub mod proxy;
 pub mod server;
 pub mod session;
-pub mod state;
+// Internal RPC machinery: the wire-codec layer and per-session refcount/async
+// state. Not part of the public API — the codec is selected internally (no user
+// injection point) and `RpcState` is private session bookkeeping. Keeping them
+// `pub(crate)` lets the protocol evolve without semver-breaking releases.
+pub(crate) mod state;
 pub mod transport;
-pub mod wire;
-pub mod wire_android13;
+// The wire modules implement the complete AOSP codec surface (both directions
+// of every message, all negotiated versions), fully exercised by their own
+// hermetic `mod tests`. Some encode/decode entry points are validated there but
+// not reached by the current live dispatch path; `dead_code` fired on them only
+// after the demotion from `pub`. Keep the complete, tested surface.
+#[allow(dead_code)]
+pub(crate) mod wire;
+#[allow(dead_code)]
+pub(crate) mod wire_android13;
 
 pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
 pub use session::{RpcSession, RpcUnixClientConfig};
-pub use state::RpcState;
 pub use transport::{CertId, PeerIdentity, RpcTransport};
 
 /// Re-export of the exact `rustls` the `tls` backend links, so callers
@@ -106,11 +116,6 @@ pub use transport::{CertId, PeerIdentity, RpcTransport};
 /// (key/cert management stays caller-side).
 #[cfg(feature = "rpc-tls")]
 pub use rustls;
-pub use wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
-/// android-13+ versioned wire codec (additive — version-keyed:
-/// v0 = android-13, v1 = android-14/15. `R34Codec`
-/// stays the default; this never affects the kernel path).
-pub use wire_android13::Android13PlusCodec;
 
 use std::fmt;
 

@@ -4,7 +4,7 @@
 //! `RpcServer` — bind / listen / accept, one session per connection.
 //!
 //! Model: **one connection ⇒ one [`RpcSession`] ⇒ one worker thread**,
-//! each with its own [`super::state::RpcState`] (no global, so sessions
+//! each with its own `RpcState` (no global, so sessions
 //! are isolated and the suite is parallel-safe). Concurrent clients use
 //! independent connections; nested re-entrant calls run inline on a
 //! connection's worker (the `client_transact` recv loop dispatches

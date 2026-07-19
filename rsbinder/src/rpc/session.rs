@@ -3,7 +3,7 @@
 
 //! `RpcSession` — single-connection RPC session driver.
 //!
-//! Ties one [`RpcTransport`] + [`R34Codec`] + per-session [`RpcState`]
+//! Ties one [`RpcTransport`] + `R34Codec` + per-session `RpcState`
 //! together and provides:
 //! * client outbound transactions ([`RpcSession::get_root`], and
 //!   [`super::proxy::RpcProxy::transact`]),
@@ -2342,7 +2342,7 @@ impl RpcSession {
     /// (`RpcConnectionHeader → RpcNewSessionResponse → "cci"`,
     /// negotiating `min(max_version, server_max)`), then returns a
     /// session that speaks the negotiated version with AOSP-faithful
-    /// framing — reusing the existing per-session [`RpcState`] and
+    /// framing — reusing the existing per-session `RpcState` and
     /// `client_transact`/dispatch unchanged. `max_version` is the
     /// highest `RPC_WIRE_PROTOCOL_VERSION` to offer (0 = android-13,
     /// 1 = android-14/15).

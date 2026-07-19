@@ -24,6 +24,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
   `timesRecd - target`) is now honored instead of applying a single decrement,
   which under-counted and leaked local nodes.
+- **rsbinder (`rpc` feature, breaking):** the RPC wire-codec types
+  (`WireMessage`, `WireCodec`, `R34Codec`, `Android13PlusCodec`, `WireReply`,
+  `WireTransaction`) and `RpcState` are no longer part of the public API. They
+  were internal implementation detail — the codec is selected internally with no
+  user injection point, and `RpcState` is per-session bookkeeping. The public
+  RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
+  (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
+  lets the wire protocol evolve without further semver-breaking releases.
 
 ### Fixed
 
