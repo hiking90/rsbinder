@@ -38,6 +38,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
   `is_handling_transaction`, and `get_calling_uid_or_self`. The public
   `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
+- **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
+  `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
+  and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
+  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive) and
+  `Parcel::set_for_rpc` remain public.
 
 ### Fixed
 

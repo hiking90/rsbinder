@@ -124,6 +124,8 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(Vec::with_capacity(capacity))
     }
 
+    // Only the RPC stack adopts a ready-made byte buffer as a parcel.
+    #[cfg(feature = "rpc")]
     fn from_vec(data: Vec<T>) -> Self {
         ParcelData::Vec(data)
     }
@@ -458,7 +460,8 @@ impl Parcel {
         }
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Self {
+    #[cfg(feature = "rpc")]
+    pub(crate) fn from_vec(data: Vec<u8>) -> Self {
         Parcel {
             data: ParcelData::from_vec(data),
             objects: ParcelData::new(),
@@ -476,19 +479,19 @@ impl Parcel {
         }
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
 
-    pub fn as_ptr(&self) -> *const u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }
 
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.pos >= self.data.len()
     }
 
@@ -711,7 +714,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
+    pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.capacity() {
             // The backing buffer cannot hold `new_len` bytes — a broken
             // driver/buffer contract. Refuse rather than enter the
@@ -729,7 +732,7 @@ impl Parcel {
         Ok(())
     }
 
-    pub fn close_file_descriptors(&self) {
+    pub(crate) fn close_file_descriptors(&self) {
         // RPC-mode parcels never carry kernel FD objects (FD over RPC
         // is rejected by default / opt-in via Unix mode); nothing to close here.
         #[cfg(feature = "rpc")]
