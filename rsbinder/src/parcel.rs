@@ -231,7 +231,7 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 }
 
-pub type FnFreeBuffer =
+pub(crate) type FnFreeBuffer =
     fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
 /// RPC object-marshalling hooks attached to an RPC-mode `Parcel`
@@ -243,7 +243,7 @@ pub type FnFreeBuffer =
 /// kernel `flat_binder_object` path — the kernel path is byte-identical
 /// when `is_for_rpc == false`.
 #[cfg(feature = "rpc")]
-pub trait RpcParcelOps: Send + Sync {
+pub(crate) trait RpcParcelOps: Send + Sync {
     /// Marshal a possibly-null binder leaving this process: append the
     /// r34 RPC object encoding (`i32` present flag + 32B address).
     fn write_binder(
@@ -528,7 +528,7 @@ impl Parcel {
     /// Attach the RPC object-marshalling hooks and enter RPC mode
     /// (android `Parcel::markForRpc`/`mSession` equivalent).
     #[cfg(feature = "rpc")]
-    pub fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
+    pub(crate) fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
         self.rpc.get_or_insert_with(RpcFields::default).ops = Some(ops);
     }
 

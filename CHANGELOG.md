@@ -32,6 +32,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
   (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
   lets the wire protocol evolve without further semver-breaking releases.
+- **rsbinder (breaking):** additional helpers that were `pub` but never part of
+  the intended API are now `pub(crate)`: the `Parcel` RPC-ops plumbing
+  (`RpcParcelOps`, `Parcel::attach_rpc_ops`, `FnFreeBuffer`), `rpc::RpcSessionInner`,
+  `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
+  `is_handling_transaction`, and `get_calling_uid_or_self`. The public
+  `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
 
 ### Fixed
 

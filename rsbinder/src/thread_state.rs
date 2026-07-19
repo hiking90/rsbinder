@@ -1616,7 +1616,7 @@ pub(crate) fn _handle_commands() -> Result<()> {
     Ok(())
 }
 
-pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
+pub(crate) fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     let mut strict_policy: i32 = reader.read()?;
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -1938,7 +1938,7 @@ impl std::default::Default for CallingContext {
     }
 }
 
-pub fn is_handling_transaction() -> bool {
+pub(crate) fn is_handling_transaction() -> bool {
     // Plan 2-16 Phase B: an in-flight RPC transaction counts (and is
     // detected without forcing the ProcessState-coupled `THREAD_STATE`,
     // which would panic in a pure-RPC process).
@@ -2094,7 +2094,7 @@ pub fn get_calling_uid() -> binder::uid_t {
 /// applies only outside any (kernel or RPC) transaction, so
 /// [`crate::proxy_count`] attribution over a uid-less RPC transport buckets
 /// under the `u32::MAX` sentinel rather than this process's uid.
-pub fn get_calling_uid_or_self() -> binder::uid_t {
+pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
     // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
     // transaction; otherwise fall back to the process's own uid without
     // forcing `THREAD_STATE` in a pure-RPC process.

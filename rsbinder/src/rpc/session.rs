@@ -8,7 +8,7 @@
 //! * client outbound transactions ([`RpcSession::get_root`], and
 //!   [`super::proxy::RpcProxy::transact`]),
 //! * a blocking server serve loop ([`RpcSession::serve_blocking`]),
-//! * the [`RpcParcelOps`] bridge that lets the `SIBinder`
+//! * the `RpcParcelOps` bridge that lets the `SIBinder`
 //!   (de)serializers marshal binders as `RpcAddress`.
 //!
 //! All state is owned here (no global).
@@ -648,7 +648,7 @@ impl SharedSession {
 /// (their inbound connection). Default single-connection sessions own
 /// one slot, so `find_conn` is a no-wait single-slot pick and the
 /// `enter_connection` semantics are byte-identical.
-pub struct RpcSessionInner {
+pub(crate) struct RpcSessionInner {
     /// AOSP `RpcSession::mMutex` — the session's *single* connection
     /// pool lock, paired with [`slot_cv`](RpcSessionInner::slot_cv).
     /// Held briefly to pick a slot ([`find_conn`]); released for the
@@ -685,7 +685,7 @@ pub struct RpcSessionInner {
     shared: Arc<SharedSession>,
 }
 
-/// The [`RpcParcelOps`] implementation bound to one session.
+/// The `RpcParcelOps` implementation bound to one session.
 struct SessionParcelOps(Weak<RpcSessionInner>);
 
 impl RpcParcelOps for SessionParcelOps {

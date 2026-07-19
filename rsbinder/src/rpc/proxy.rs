@@ -36,7 +36,7 @@ pub struct RpcProxy {
     /// address (not a descriptor string), so a proxy resolved from
     /// `read_binder`/`get_root` starts empty and is stamped **once,
     /// in place** by the generated typed stub's `from_binder`
-    /// (via [`stamp_descriptor`](Self::stamp_descriptor)).
+    /// (via `stamp_descriptor`).
     /// In-place — never a replacement proxy — keeps the dedup-cache
     /// identity and the single `DEC_STRONG` intact.
     descriptor: OnceLock<String>,
@@ -156,7 +156,7 @@ impl RpcProxy {
     /// without an extra `descriptor()` round-trip; existing callers
     /// (generator `from_binder`) can keep ignoring the result with
     /// `let _ = …`.
-    pub fn stamp_descriptor(&self, descriptor: &str) -> bool {
+    pub(crate) fn stamp_descriptor(&self, descriptor: &str) -> bool {
         self.descriptor.set(descriptor.to_string()).is_ok()
     }
 
@@ -202,7 +202,7 @@ impl RpcProxy {
 /// `ProxyHandle`, so the one generated `Bp*` stub drives either stack
 /// (generator emits `as_remote()`). `prepare_transact` writes
 /// the interface token from the descriptor stamped in place by the
-/// generated `from_binder` ([`stamp_descriptor`](RpcProxy::stamp_descriptor)).
+/// generated `from_binder` (`stamp_descriptor`).
 impl crate::binder::RemoteProxy for RpcProxy {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
