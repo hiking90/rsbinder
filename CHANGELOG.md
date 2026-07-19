@@ -18,6 +18,32 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
   (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
   now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
+- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong` now carries
+  the decrement amount (`DecStrong(RpcAddress, u32)`), and
+  `RpcState::dec_strong_local` takes an `amount` argument. A batched
+  `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
+  `timesRecd - target`) is now honored instead of applying a single decrement,
+  which under-counted and leaked local nodes.
+
+### Fixed
+
+- **rsbinder:** a remote binder handle is serialized through the full 8-byte
+  object union, so no uninitialized stack bytes are copied onto the wire; the
+  proxy path previously wrote only the 32-bit handle and leaked 4 bytes to the
+  peer.
+- **rsbinder (`rpc`):** a discarded RPC reply's reference-count bumps are rolled
+  back on the handler-error and oneway dispatch paths, preventing local-node
+  leaks.
+- **rsbinder:** `Parcel::append_from` bounds the source range against the
+  backing buffer length instead of the logical size, avoiding a panic when the
+  source cursor sits past its data end.
+- **rsbinder (`rpc`):** the Unix transport retries `EINTR` on a raw read and
+  rejects file descriptors attached to an empty frame instead of dropping them.
+- **rsbinder:** `get_extended_error` and `query_interface` return a recoverable
+  error instead of panicking in a pure-RPC or malformed-reply path.
+- **rsbinder (`rpc`):** `StatusCode::RpcError` no longer shares AOSP
+  `FROZEN_OBJECT`'s `status_t` value, so an incoming frozen-object status is not
+  mis-decoded.
 
 ## [0.10.0] - 2026-07-11
 
