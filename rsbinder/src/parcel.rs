@@ -1451,7 +1451,12 @@ impl Parcel {
             log::error!("Parcel::append_from: the size is too large: {size}");
             return Err(StatusCode::BadValue);
         }
-        let other_len = other.data_size();
+        // Bound against the backing slice length, not `data_size()` (which is
+        // `max(data.len(), pos)`): the copy below indexes `other.data[offset..
+        // offset + size]`, so a source parcel whose cursor was seeked past its
+        // data end (`pos > data.len()`) must be rejected here rather than pass
+        // this check and then panic on the slice index.
+        let other_len = other.data.len();
         if offset > other_len || size > other_len || (offset + size) > other_len {
             log::error!("Parcel::append_from: The given offset({offset}) and size({size}) exceed the data range of the parcel.");
             return Err(StatusCode::BadValue);

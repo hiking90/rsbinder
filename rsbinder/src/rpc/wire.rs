@@ -96,8 +96,10 @@ pub enum WireMessage {
     Transact(WireTransaction),
     /// `REPLY`.
     Reply(WireReply),
-    /// `DEC_STRONG` against `RpcAddress`.
-    DecStrong(RpcAddress),
+    /// `DEC_STRONG` against `RpcAddress` by the given `amount` (AOSP
+    /// `RpcDecStrong.amount` — a peer may batch more than one decrement into a
+    /// single command; the R34 wire has no amount field and always means `1`).
+    DecStrong(RpcAddress, u32),
 }
 
 /// Pluggable RPC wire format. The session owns a codec instance (no
@@ -295,7 +297,8 @@ impl WireCodec for R34Codec {
                 if body.len() != RPC_ADDR_LEN {
                     return Err(RpcError::Protocol("DEC_STRONG body != 32 bytes"));
                 }
-                Ok(WireMessage::DecStrong(rd_addr(body, 0)?))
+                // The R34 wire carries no amount field: one decrement per command.
+                Ok(WireMessage::DecStrong(rd_addr(body, 0)?, 1))
             }
             _ => Err(RpcError::Protocol("unknown RpcWireHeader.command")),
         }
@@ -424,7 +427,10 @@ mod tests {
         let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
         let enc = c.encode_dec_strong(&addr);
         match c.decode_message(&enc).unwrap() {
-            WireMessage::DecStrong(a) => assert_eq!(a, addr),
+            WireMessage::DecStrong(a, amount) => {
+                assert_eq!(a, addr);
+                assert_eq!(amount, 1);
+            }
             other => panic!("expected DecStrong, got {other:?}"),
         }
 

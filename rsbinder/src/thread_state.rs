@@ -1729,9 +1729,10 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
 
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    let interface: String = reply
-        .expect("INTERFACE_TRANSACTION should have reply parcel")
-        .read()?;
+    // A two-way transact normally yields a reply, but a `break` path in
+    // `wait_for_response` can surface `Ok(None)`; return a recoverable error
+    // rather than panicking the calling thread.
+    let interface: String = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
 
     Ok(interface)
 }
@@ -2306,6 +2307,13 @@ pub struct ExtendedError {
 /// **Opt-in**: rsbinder does *not* call this automatically from the
 /// `BR_FAILED_REPLY` arm. A no-op for callers that never invoke it.
 pub fn get_extended_error() -> Result<ExtendedError> {
+    // Consistent with the other public accessors in this module (calling
+    // uid/pid/sid, strict-mode policy, identity): in a pure-RPC process kernel
+    // binder was never initialized, so return an error instead of panicking in
+    // `ProcessState::as_self()`.
+    if !ProcessState::is_initialized() {
+        return Err(StatusCode::InvalidOperation);
+    }
     let mut ee = binder::binder_extended_error::default();
     let driver = ProcessState::as_self().driver();
     crate::sys::binder::get_extended_error(driver.as_ref(), &mut ee).map_err(|errno| {

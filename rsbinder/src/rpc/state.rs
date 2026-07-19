@@ -247,12 +247,17 @@ impl RpcState {
         }
     }
 
-    /// Apply an inbound `DEC_STRONG` for `addr`. Drops the node (and
-    /// its strong `SIBinder`) once the count reaches 0 — no leak.
+    /// Apply an inbound `DEC_STRONG` for `addr` by `amount` (AOSP
+    /// `doDecStrong`: `timesSent -= amount`). A compliant peer may batch more
+    /// than one decrement into a single command, so the amount must be honored —
+    /// applying a fixed 1 would leak the node on a batched drop. Drops the node
+    /// (and its strong `SIBinder`) once the count reaches 0 — no leak. A hostile
+    /// over-decrement simply removes the node early (contained: the peer loses
+    /// access), and `strong: i64` cannot underflow for a `u32` amount.
     /// Returns `true` if the node was removed.
-    pub fn dec_strong_local(&mut self, addr: &RpcAddress) -> bool {
+    pub fn dec_strong_local(&mut self, addr: &RpcAddress, amount: u32) -> bool {
         if let Some(node) = self.local_nodes.get_mut(addr) {
-            node.strong -= 1;
+            node.strong -= amount as i64;
             if node.strong <= 0 {
                 self.local_nodes.remove(addr);
                 self.local_by_ptr.retain(|_, a| a != addr);
@@ -575,11 +580,29 @@ mod tests {
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
         assert_eq!(st.local_node_count(), 1);
-        assert!(st.dec_strong_local(&a), "node removed at strong 0");
+        assert!(st.dec_strong_local(&a, 1), "node removed at strong 0");
         assert_eq!(st.local_node_count(), 0, "no leak");
         assert!(st.lookup_local(&a).is_none());
         // DEC_STRONG on an unknown address is safe (idempotent).
-        assert!(!st.dec_strong_local(&a));
+        assert!(!st.dec_strong_local(&a, 1));
+    }
+
+    /// A batched DEC_STRONG (`amount > 1`, as a compliant libbinder peer sends
+    /// on a deduped drop) must free a node sent multiple times in one command —
+    /// applying a fixed 1 would leak `amount - 1` refs.
+    #[test]
+    fn dec_strong_honors_batched_amount() {
+        let mut st = RpcState::new(AddressSpace::Acceptor);
+        let b = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let a = st.on_binder_leaving(&b).unwrap(); // strong 1
+        st.on_binder_leaving(&b).unwrap(); // strong 2
+        st.on_binder_leaving(&b).unwrap(); // strong 3
+        assert_eq!(st.local_node_count(), 1);
+        assert!(
+            st.dec_strong_local(&a, 3),
+            "one batched DEC of amount 3 frees a node sent 3×"
+        );
+        assert_eq!(st.local_node_count(), 0, "no leak on batched drop");
     }
 
     /// A send failure rolls back exactly one `on_binder_leaving` bump; the
@@ -680,7 +703,7 @@ mod tests {
         assert_eq!(s2.local_node_count(), 0);
 
         // Mutating s1 never affects s2 (no shared storage).
-        s1.dec_strong_local(&a1);
+        s1.dec_strong_local(&a1, 1);
         assert_eq!(s1.local_node_count(), 0);
         assert_eq!(s2.local_node_count(), 0);
     }
@@ -817,9 +840,9 @@ mod tests {
             "1st mints; 2nd/3rd are excess receipts (owe a flush DEC)"
         );
         // 2 excess DECs + 1 proxy-drop DEC = 3 = timesSent ⇒ freed.
-        assert!(!srv.dec_strong_local(&a));
-        assert!(!srv.dec_strong_local(&a));
-        assert!(srv.dec_strong_local(&a), "3rd DEC frees the node");
+        assert!(!srv.dec_strong_local(&a, 1));
+        assert!(!srv.dec_strong_local(&a, 1));
+        assert!(srv.dec_strong_local(&a, 1), "3rd DEC frees the node");
         assert_eq!(srv.local_node_count(), 0, "no leak (AC-2.5)");
 
         // (b) Same object sent once to each of 2 *independent* peer
@@ -832,11 +855,11 @@ mod tests {
         let x = s.on_binder_leaving(&o).unwrap(); // conn #1 send
         let _ = s.on_binder_leaving(&o).unwrap(); // conn #2 send (timesSent ⇒ 2)
         assert!(
-            !s.dec_strong_local(&x),
+            !s.dec_strong_local(&x, 1),
             "conn #1 proxy drop must NOT free a node conn #2 still holds (F7)"
         );
         assert!(s.lookup_local(&x).is_some(), "sibling still reachable");
-        assert!(s.dec_strong_local(&x), "conn #2 proxy drop frees it");
+        assert!(s.dec_strong_local(&x, 1), "conn #2 proxy drop frees it");
         assert_eq!(s.local_node_count(), 0, "no leak");
     }
 

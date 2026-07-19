@@ -60,6 +60,25 @@ impl flat_binder_object {
         }
     }
 
+    /// Creates a new flat_binder_object for a remote handle
+    /// (`BINDER_TYPE_HANDLE`).
+    pub(crate) fn new_handle(handle: u32, flags: u32) -> Self {
+        flat_binder_object {
+            hdr: binder_object_header {
+                type_: BINDER_TYPE_HANDLE,
+            },
+            flags,
+            // Init via the 8-byte `binder` field (not the u32 `handle`) so the
+            // upper bytes are zeroed: mirrors AOSP `obj.binder = 0; obj.handle =
+            // handle;` and avoids leaking uninit stack to the remote (the whole
+            // 24-byte struct is copied onto the wire by `write_object`).
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: handle as u64,
+            },
+            cookie: 0,
+        }
+    }
+
     pub(crate) fn header_type(&self) -> u32 {
         self.hdr.type_
     }
@@ -204,19 +223,10 @@ impl From<&SIBinder> for flat_binder_object {
         };
 
         if let Some(proxy) = binder.as_proxy() {
-            flat_binder_object {
-                hdr: binder_object_header {
-                    type_: BINDER_TYPE_HANDLE,
-                },
-                // AOSP-correct: `flattenBinder`'s HANDLE arm sets `obj.flags = 0`,
-                // then applies `obj.flags |= schedBits` after both arms, so the
-                // final value is `0 | schedBits` == `sched_bits`. Do not "fix" to 0.
-                flags: sched_bits,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                    handle: proxy.handle(),
-                },
-                cookie: 0,
-            }
+            // AOSP-correct: `flattenBinder`'s HANDLE arm sets `obj.flags = 0`,
+            // then applies `obj.flags |= schedBits` after both arms, so the
+            // final value is `0 | schedBits` == `sched_bits`. Do not "fix" to 0.
+            flat_binder_object::new_handle(proxy.handle(), sched_bits)
         } else {
             // Native binder. Acquire (or dedup-resolve) an id via the
             // sidecar table on `ProcessState`; the table holds an
@@ -350,6 +360,38 @@ mod tests {
             obj.handle(),
             fd as u32,
             "handle variant must round-trip the fd"
+        );
+    }
+
+    /// Regression guard for the `From<&SIBinder>` proxy arm, which builds its
+    /// HANDLE object via [`flat_binder_object::new_handle`].
+    ///
+    /// The 8-byte `binder` union field must be written (not the u32 `handle`
+    /// variant) so the upper 4 bytes are zero — AOSP `flattenBinder` does
+    /// `obj.binder = 0; obj.handle = handle`. Writing only the `handle` variant
+    /// leaves the upper half uninitialized, and `write_object` copies the whole
+    /// struct onto the wire (uninitialized-read UB + a 4-byte stack info leak to
+    /// the peer). An rsbinder<->rsbinder round trip cannot catch this because
+    /// both sides ignore the upper bytes, so assert the union directly.
+    #[test]
+    fn new_handle_full_width_init() {
+        let handle: u32 = 0xDEAD_BEEF;
+        let obj = flat_binder_object::new_handle(handle, 0);
+
+        assert_eq!(
+            obj.header_type(),
+            BINDER_TYPE_HANDLE,
+            "must be a HANDLE object"
+        );
+        assert_eq!(
+            obj.pointer(),
+            handle as u64,
+            "upper 32 bits of the union must be zero (uninit-leak UB regression)"
+        );
+        assert_eq!(
+            obj.handle(),
+            handle,
+            "handle variant must round-trip the handle"
         );
     }
 

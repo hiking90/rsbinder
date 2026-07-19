@@ -257,15 +257,21 @@ impl RpcTransport for UnixTransport {
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         let mut r = &self.stream;
-        match r.read(buf) {
-            Ok(n) => Ok(n),
-            // A read deadline (`SO_RCVTIMEO` via `set_read_timeout`)
-            // elapsed. Surface it as `Timeout` rather than a generic `Io`
-            // so the android-13+ reader (`read_exact_raw`) can honor the
-            // `Timeout`/`Truncated` contract and a caller matching
-            // `Timeout`/`StatusCode::TimedOut` sees it.
-            Err(e) if super::is_timeout(&e) => Err(RpcError::Timeout),
-            Err(e) => Err(RpcError::from(e)),
+        loop {
+            return match r.read(buf) {
+                Ok(n) => Ok(n),
+                // A signal (no `SA_RESTART`) interrupted the blocking read.
+                // Retry, mirroring `recv_raw_with_fds` / the framed readers and
+                // AOSP `interruptableReadFully` — do not fail the message.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A read deadline (`SO_RCVTIMEO` via `set_read_timeout`)
+                // elapsed. Surface it as `Timeout` rather than a generic `Io`
+                // so the android-13+ reader (`read_exact_raw`) can honor the
+                // `Timeout`/`Truncated` contract and a caller matching
+                // `Timeout`/`StatusCode::TimedOut` sees it.
+                Err(e) if super::is_timeout(&e) => Err(RpcError::Timeout),
+                Err(e) => Err(RpcError::from(e)),
+            };
         }
     }
 
@@ -283,6 +289,16 @@ impl RpcTransport for UnixTransport {
 
         if fds.is_empty() {
             return self.send_raw(buf);
+        }
+        if buf.is_empty() {
+            // The fds ride the first `sendmsg`; with no payload bytes the send
+            // loop below never runs, so the fds would be silently dropped while
+            // the method still returned `Ok`. The AOSP RPC wire never attaches
+            // fds to an empty frame (every frame carries a >= 16-byte header), so
+            // treat this as protocol misuse rather than lose the fds.
+            return Err(RpcError::Protocol(
+                "cannot attach fds to an empty RPC frame",
+            ));
         }
         if fds.len() > MAX_FDS_PER_FRAME {
             return Err(RpcError::Protocol("too many fds in one RPC frame"));

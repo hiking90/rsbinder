@@ -1401,13 +1401,20 @@ impl RpcSessionInner {
     /// Client outbound transaction. Returns the reply parcel (or `None`
     /// for oneway). Applies any interleaved `DEC_STRONG` and loops to
     /// the matching `REPLY`.
-    /// Undo the reservations a failed outgoing transaction took before the
-    /// send actually happened: the per-node oneway `async_number` (when
+    /// Undo the reservations an outgoing parcel took while it was serialized but
+    /// which never reached the peer: the per-node oneway `async_number` (when
     /// `oneway_addr` is `Some((addr, consumed))`) and every local-binder
-    /// `timesSent` bump recorded in `data` while it was serialized. Invoked
-    /// only on an encode/send error, so the success path is untouched and the
-    /// wire is byte-unchanged.
+    /// `timesSent` bump recorded in `data`. Called on an encode/send failure and
+    /// whenever a reply parcel is discarded (handler `Err`, oneway). The success
+    /// path is untouched, so the wire is byte-unchanged.
     fn rollback_outgoing(&self, data: &Parcel, oneway_addr: Option<(RpcAddress, u64)>) {
+        // Nothing to cancel ⇒ skip the state lock. The oneway dispatch path
+        // calls this on every transaction, but a reply/args parcel that
+        // flattened no local binder has no bump to roll back — avoid the lock on
+        // that hot path (`rpc_leaving_addrs()` is a lock-free read).
+        if oneway_addr.is_none() && data.rpc_leaving_addrs().is_empty() {
+            return;
+        }
         let mut state = self.shared.state.lock().expect("rpc state poisoned");
         if let Some((addr, consumed)) = oneway_addr {
             state.cancel_send_async_number(addr, consumed);
@@ -1540,12 +1547,12 @@ impl RpcSessionInner {
                     reply.set_data_position(0);
                     return Ok(Some(reply));
                 }
-                WireMessage::DecStrong(a) => {
+                WireMessage::DecStrong(a, amount) => {
                     self.shared
                         .state
                         .lock()
                         .expect("rpc state poisoned")
-                        .dec_strong_local(&a);
+                        .dec_strong_local(&a, amount);
                 }
                 WireMessage::Transact(t) => {
                     // Nested / re-entrant call: the peer is calling
@@ -1905,6 +1912,11 @@ impl RpcSessionInner {
             if let Err(e) = result {
                 log::error!("oneway RPC transaction failed (dropped): {e:?}");
             }
+            // A oneway reply is always discarded (never sent). Roll back any
+            // `timesSent` bumps a handler made by writing a binder into `reply`,
+            // so those local nodes do not leak (the peer never receives them and
+            // so never `DEC_STRONG`s). Empty for AIDL-generated oneway stubs.
+            self.rollback_outgoing(&reply, None);
             return Ok(());
         }
         match result {
@@ -1924,7 +1936,14 @@ impl RpcSessionInner {
                 }
                 sent
             }
-            Err(e) => self.send_reply(e.into(), &[], &[], &[]),
+            Err(e) => {
+                // The error reply carries an empty body (the partially-written
+                // `reply` is discarded), so roll back any `timesSent` bumps from
+                // binders a handler wrote before returning `Err` — symmetric with
+                // the send-failure arm above.
+                self.rollback_outgoing(&reply, None);
+                self.send_reply(e.into(), &[], &[], &[])
+            }
         }
     }
 
@@ -1953,12 +1972,12 @@ impl RpcSessionInner {
                 self.dispatch_transact(t, in_fds, peer)?;
                 Ok(true)
             }
-            WireMessage::DecStrong(a) => {
+            WireMessage::DecStrong(a, amount) => {
                 self.shared
                     .state
                     .lock()
                     .expect("rpc state poisoned")
-                    .dec_strong_local(&a);
+                    .dec_strong_local(&a, amount);
                 Ok(true)
             }
             WireMessage::Reply(_) => {
