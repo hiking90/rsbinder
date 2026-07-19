@@ -131,8 +131,13 @@ impl From<StatusCode> for i32 {
             StatusCode::BadIndex => -(rustix::io::Errno::OVERFLOW.raw_os_error()),
             StatusCode::FdsNotAllowed => UNKNOWN_ERROR + 7,
             StatusCode::UnexpectedNull => UNKNOWN_ERROR + 8,
+            // `UNKNOWN_ERROR + 9` is AOSP `FROZEN_OBJECT` (Errors.h); keep
+            // `RpcError` off that slot so an incoming kernel `FROZEN_OBJECT`
+            // status is not mis-decoded as an RPC transport error (and so a
+            // stray `RpcError` on a `status_t` wire is not read as "frozen" by a
+            // C++ peer). `+ 10` is unused by AOSP's status_t table.
             #[cfg(feature = "rpc")]
-            StatusCode::RpcError => UNKNOWN_ERROR + 9,
+            StatusCode::RpcError => UNKNOWN_ERROR + 10,
             StatusCode::NotEnoughData => -(rustix::io::Errno::NODATA.raw_os_error()),
             StatusCode::WouldBlock => -(rustix::io::Errno::WOULDBLOCK.raw_os_error()),
             StatusCode::TimedOut => -(rustix::io::Errno::TIMEDOUT.raw_os_error()),
@@ -168,8 +173,9 @@ impl From<i32> for StatusCode {
         const BAD_INDEX: i32 = -Errno::OVERFLOW.raw_os_error();
         const FDS_NOT_ALLOWED: i32 = UNKNOWN_ERROR + 7;
         const UNEXPECTED_NULL: i32 = UNKNOWN_ERROR + 8;
+        // Off AOSP `FROZEN_OBJECT` (`UNKNOWN_ERROR + 9`); see the forward map.
         #[cfg(feature = "rpc")]
-        const RPC_ERROR: i32 = UNKNOWN_ERROR + 9;
+        const RPC_ERROR: i32 = UNKNOWN_ERROR + 10;
         const NOT_ENOUGH_DATA: i32 = -Errno::NODATA.raw_os_error();
         const WOULD_BLOCK: i32 = -Errno::WOULDBLOCK.raw_os_error();
         const TIMED_OUT: i32 = -Errno::TIMEDOUT.raw_os_error();

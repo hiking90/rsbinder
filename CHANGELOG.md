@@ -18,6 +18,51 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
   (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
   now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
+- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong` now carries
+  the decrement amount (`DecStrong(RpcAddress, u32)`), and
+  `RpcState::dec_strong_local` takes an `amount` argument. A batched
+  `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
+  `timesRecd - target`) is now honored instead of applying a single decrement,
+  which under-counted and leaked local nodes.
+- **rsbinder (`rpc` feature, breaking):** the RPC wire-codec types
+  (`WireMessage`, `WireCodec`, `R34Codec`, `Android13PlusCodec`, `WireReply`,
+  `WireTransaction`) and `RpcState` are no longer part of the public API. They
+  were internal implementation detail — the codec is selected internally with no
+  user injection point, and `RpcState` is per-session bookkeeping. The public
+  RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
+  (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
+  lets the wire protocol evolve without further semver-breaking releases.
+- **rsbinder (breaking):** additional helpers that were `pub` but never part of
+  the intended API are now `pub(crate)`: the `Parcel` RPC-ops plumbing
+  (`RpcParcelOps`, `Parcel::attach_rpc_ops`, `FnFreeBuffer`), `rpc::RpcSessionInner`,
+  `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
+  `is_handling_transaction`, and `get_calling_uid_or_self`. The public
+  `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
+- **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
+  `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
+  and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
+  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive) and
+  `Parcel::set_for_rpc` remain public.
+
+### Fixed
+
+- **rsbinder:** a remote binder handle is serialized through the full 8-byte
+  object union, so no uninitialized stack bytes are copied onto the wire; the
+  proxy path previously wrote only the 32-bit handle and leaked 4 bytes to the
+  peer.
+- **rsbinder (`rpc`):** a discarded RPC reply's reference-count bumps are rolled
+  back on the handler-error and oneway dispatch paths, preventing local-node
+  leaks.
+- **rsbinder:** `Parcel::append_from` bounds the source range against the
+  backing buffer length instead of the logical size, avoiding a panic when the
+  source cursor sits past its data end.
+- **rsbinder (`rpc`):** the Unix transport retries `EINTR` on a raw read and
+  rejects file descriptors attached to an empty frame instead of dropping them.
+- **rsbinder:** `get_extended_error` and `query_interface` return a recoverable
+  error instead of panicking in a pure-RPC or malformed-reply path.
+- **rsbinder (`rpc`):** `StatusCode::RpcError` no longer shares AOSP
+  `FROZEN_OBJECT`'s `status_t` value, so an incoming frozen-object status is not
+  mis-decoded.
 
 ## [0.10.0] - 2026-07-11
 

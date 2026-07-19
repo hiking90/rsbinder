@@ -124,6 +124,8 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(Vec::with_capacity(capacity))
     }
 
+    // Only the RPC stack adopts a ready-made byte buffer as a parcel.
+    #[cfg(feature = "rpc")]
     fn from_vec(data: Vec<T>) -> Self {
         ParcelData::Vec(data)
     }
@@ -231,7 +233,7 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 }
 
-pub type FnFreeBuffer =
+pub(crate) type FnFreeBuffer =
     fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
 /// RPC object-marshalling hooks attached to an RPC-mode `Parcel`
@@ -243,7 +245,7 @@ pub type FnFreeBuffer =
 /// kernel `flat_binder_object` path — the kernel path is byte-identical
 /// when `is_for_rpc == false`.
 #[cfg(feature = "rpc")]
-pub trait RpcParcelOps: Send + Sync {
+pub(crate) trait RpcParcelOps: Send + Sync {
     /// Marshal a possibly-null binder leaving this process: append the
     /// r34 RPC object encoding (`i32` present flag + 32B address).
     fn write_binder(
@@ -458,7 +460,8 @@ impl Parcel {
         }
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Self {
+    #[cfg(feature = "rpc")]
+    pub(crate) fn from_vec(data: Vec<u8>) -> Self {
         Parcel {
             data: ParcelData::from_vec(data),
             objects: ParcelData::new(),
@@ -476,19 +479,19 @@ impl Parcel {
         }
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
 
-    pub fn as_ptr(&self) -> *const u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }
 
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.pos >= self.data.len()
     }
 
@@ -528,7 +531,7 @@ impl Parcel {
     /// Attach the RPC object-marshalling hooks and enter RPC mode
     /// (android `Parcel::markForRpc`/`mSession` equivalent).
     #[cfg(feature = "rpc")]
-    pub fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
+    pub(crate) fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
         self.rpc.get_or_insert_with(RpcFields::default).ops = Some(ops);
     }
 
@@ -711,7 +714,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    pub fn set_data_size(&mut self, new_len: usize) -> Result<()> {
+    pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.capacity() {
             // The backing buffer cannot hold `new_len` bytes — a broken
             // driver/buffer contract. Refuse rather than enter the
@@ -729,7 +732,7 @@ impl Parcel {
         Ok(())
     }
 
-    pub fn close_file_descriptors(&self) {
+    pub(crate) fn close_file_descriptors(&self) {
         // RPC-mode parcels never carry kernel FD objects (FD over RPC
         // is rejected by default / opt-in via Unix mode); nothing to close here.
         #[cfg(feature = "rpc")]
@@ -1451,7 +1454,12 @@ impl Parcel {
             log::error!("Parcel::append_from: the size is too large: {size}");
             return Err(StatusCode::BadValue);
         }
-        let other_len = other.data_size();
+        // Bound against the backing slice length, not `data_size()` (which is
+        // `max(data.len(), pos)`): the copy below indexes `other.data[offset..
+        // offset + size]`, so a source parcel whose cursor was seeked past its
+        // data end (`pos > data.len()`) must be rejected here rather than pass
+        // this check and then panic on the slice index.
+        let other_len = other.data.len();
         if offset > other_len || size > other_len || (offset + size) > other_len {
             log::error!("Parcel::append_from: The given offset({offset}) and size({size}) exceed the data range of the parcel.");
             return Err(StatusCode::BadValue);

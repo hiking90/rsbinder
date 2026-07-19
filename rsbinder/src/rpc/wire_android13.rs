@@ -688,10 +688,12 @@ impl WireCodec for Android13PlusCodec {
                     return Err(RpcError::Protocol("RpcDecStrong body != 16 bytes"));
                 }
                 let address = Self::decode_addr(body, 0)?;
-                // amount @8 — rsbinder applies one decrement per
-                // DEC_STRONG; honoring amount>1 from a live peer is a
-                // separate refinement.
-                Ok(WireMessage::DecStrong(address))
+                // `RpcDecStrong.amount` @8: a compliant libbinder peer batches
+                // `timesRecd - target` decrements (AOSP `sendDecStrongToTarget`)
+                // into one command, so honor it rather than assuming 1 — else a
+                // batched drop under-decrements our local node and leaks it.
+                let amount = rd_u32(body, A13_ADDR_LEN)?;
+                Ok(WireMessage::DecStrong(address, amount))
             }
             _ => Err(RpcError::Protocol("unknown RpcWireHeader.command")),
         }
@@ -1457,7 +1459,23 @@ mod tests {
             let mut ctr = 9u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
             match c.decode_message(&c.encode_dec_strong(&addr)).unwrap() {
-                WireMessage::DecStrong(a) => assert_eq!(a, addr),
+                WireMessage::DecStrong(a, amount) => {
+                    assert_eq!(a, addr);
+                    assert_eq!(amount, 1, "rsbinder emits amount = 1 per DEC_STRONG");
+                }
+                other => panic!("expected DecStrong, got {other:?}"),
+            }
+            // A compliant peer may batch amount > 1 (AOSP `sendDecStrongToTarget`
+            // sends `timesRecd - target`). The decoder must read the field, not
+            // assume 1 — otherwise a batched drop under-decrements and leaks.
+            let mut framed = c.encode_dec_strong(&addr);
+            let amt_off = WIRE_HEADER_LEN + A13_ADDR_LEN;
+            framed[amt_off..amt_off + 4].copy_from_slice(&3u32.to_le_bytes());
+            match c.decode_message(&framed).unwrap() {
+                WireMessage::DecStrong(a, amount) => {
+                    assert_eq!(a, addr);
+                    assert_eq!(amount, 3, "decoder must honor RpcDecStrong.amount");
+                }
                 other => panic!("expected DecStrong, got {other:?}"),
             }
         }
@@ -1645,7 +1663,7 @@ mod tests {
                 // Read a DEC_STRONG.
                 let raw = read_aosp_message(&mut s).expect("read dec_strong");
                 match codec.decode_message(&raw).expect("decode dec_strong") {
-                    WireMessage::DecStrong(_) => {}
+                    WireMessage::DecStrong(..) => {}
                     other => panic!("expected DecStrong, got {other:?}"),
                 }
                 codec.version()

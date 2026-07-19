@@ -1616,7 +1616,7 @@ pub(crate) fn _handle_commands() -> Result<()> {
     Ok(())
 }
 
-pub fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
+pub(crate) fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<bool> {
     let mut strict_policy: i32 = reader.read()?;
 
     THREAD_STATE.with(|thread_state| -> Result<()> {
@@ -1729,9 +1729,10 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
 
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    let interface: String = reply
-        .expect("INTERFACE_TRANSACTION should have reply parcel")
-        .read()?;
+    // A two-way transact normally yields a reply, but a `break` path in
+    // `wait_for_response` can surface `Ok(None)`; return a recoverable error
+    // rather than panicking the calling thread.
+    let interface: String = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
 
     Ok(interface)
 }
@@ -1937,7 +1938,7 @@ impl std::default::Default for CallingContext {
     }
 }
 
-pub fn is_handling_transaction() -> bool {
+pub(crate) fn is_handling_transaction() -> bool {
     // Plan 2-16 Phase B: an in-flight RPC transaction counts (and is
     // detected without forcing the ProcessState-coupled `THREAD_STATE`,
     // which would panic in a pure-RPC process).
@@ -2093,7 +2094,7 @@ pub fn get_calling_uid() -> binder::uid_t {
 /// applies only outside any (kernel or RPC) transaction, so
 /// [`crate::proxy_count`] attribution over a uid-less RPC transport buckets
 /// under the `u32::MAX` sentinel rather than this process's uid.
-pub fn get_calling_uid_or_self() -> binder::uid_t {
+pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
     // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
     // transaction; otherwise fall back to the process's own uid without
     // forcing `THREAD_STATE` in a pure-RPC process.
@@ -2306,6 +2307,13 @@ pub struct ExtendedError {
 /// **Opt-in**: rsbinder does *not* call this automatically from the
 /// `BR_FAILED_REPLY` arm. A no-op for callers that never invoke it.
 pub fn get_extended_error() -> Result<ExtendedError> {
+    // Consistent with the other public accessors in this module (calling
+    // uid/pid/sid, strict-mode policy, identity): in a pure-RPC process kernel
+    // binder was never initialized, so return an error instead of panicking in
+    // `ProcessState::as_self()`.
+    if !ProcessState::is_initialized() {
+        return Err(StatusCode::InvalidOperation);
+    }
     let mut ee = binder::binder_extended_error::default();
     let driver = ProcessState::as_self().driver();
     crate::sys::binder::get_extended_error(driver.as_ref(), &mut ee).map_err(|errno| {

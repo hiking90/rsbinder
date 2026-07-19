@@ -330,13 +330,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    // proxy_count state is process-global; serialize tests so they
-    // don't trip over each other's mutations.
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    // `PROXY_COUNT` and the per-uid map are process-global. Every test here is
+    // `#[serial_test::serial(binder)]` so it shares the `binder` serial group
+    // with the proxy-creating `process_state` tests: on a real binder those
+    // create `ProxyHandle`s that bump the global count in parallel, which would
+    // otherwise pollute these exact-count assertions (a local mutex serialized
+    // only the proxy_count tests against each other, not against the creators).
 
     #[test]
+    #[serial_test::serial(binder)]
     fn global_counter_increments_and_decrements() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         assert_eq!(get_binder_proxy_count(), 0);
         on_proxy_create(1000);
@@ -351,8 +354,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn per_uid_disabled_by_default_skips_map() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         on_proxy_create(1000);
         on_proxy_create(2000);
@@ -365,8 +368,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn per_uid_enabled_tracks_each_uid() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         enable_count_by_uid(true);
         on_proxy_create(1000);
@@ -386,8 +389,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn limit_callback_fires_once_until_low_watermark_resets() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         enable_count_by_uid(true);
         set_binder_proxy_count_watermarks(/*high*/ 5, /*low*/ 2, /*warning*/ 4);
@@ -429,8 +432,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn callback_runs_outside_state_lock() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         enable_count_by_uid(true);
         set_binder_proxy_count_watermarks(2, 1, 2);
@@ -448,8 +451,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn clear_count_by_uid_resets_map_only() {
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
         enable_count_by_uid(true);
         on_proxy_create(1000);
@@ -465,13 +468,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(binder)]
     fn per_uid_count_survives_tracking_toggled_off_while_live() {
         // Regression: `on_proxy_drop` must mirror what the proxy's
         // `on_proxy_create` did (captured per-object), not re-read the live
         // `COUNT_BY_UID_ENABLED`. Toggling tracking off while a counted proxy
         // is alive previously skipped its decrement and permanently inflated
         // the uid's count.
-        let _g = TEST_LOCK.lock().unwrap();
         reset_for_test();
 
         enable_count_by_uid(true);

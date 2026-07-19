@@ -3,12 +3,12 @@
 
 //! `RpcSession` — single-connection RPC session driver.
 //!
-//! Ties one [`RpcTransport`] + [`R34Codec`] + per-session [`RpcState`]
+//! Ties one [`RpcTransport`] + `R34Codec` + per-session `RpcState`
 //! together and provides:
 //! * client outbound transactions ([`RpcSession::get_root`], and
 //!   [`super::proxy::RpcProxy::transact`]),
 //! * a blocking server serve loop ([`RpcSession::serve_blocking`]),
-//! * the [`RpcParcelOps`] bridge that lets the `SIBinder`
+//! * the `RpcParcelOps` bridge that lets the `SIBinder`
 //!   (de)serializers marshal binders as `RpcAddress`.
 //!
 //! All state is owned here (no global).
@@ -648,7 +648,7 @@ impl SharedSession {
 /// (their inbound connection). Default single-connection sessions own
 /// one slot, so `find_conn` is a no-wait single-slot pick and the
 /// `enter_connection` semantics are byte-identical.
-pub struct RpcSessionInner {
+pub(crate) struct RpcSessionInner {
     /// AOSP `RpcSession::mMutex` — the session's *single* connection
     /// pool lock, paired with [`slot_cv`](RpcSessionInner::slot_cv).
     /// Held briefly to pick a slot ([`find_conn`]); released for the
@@ -685,7 +685,7 @@ pub struct RpcSessionInner {
     shared: Arc<SharedSession>,
 }
 
-/// The [`RpcParcelOps`] implementation bound to one session.
+/// The `RpcParcelOps` implementation bound to one session.
 struct SessionParcelOps(Weak<RpcSessionInner>);
 
 impl RpcParcelOps for SessionParcelOps {
@@ -1401,13 +1401,20 @@ impl RpcSessionInner {
     /// Client outbound transaction. Returns the reply parcel (or `None`
     /// for oneway). Applies any interleaved `DEC_STRONG` and loops to
     /// the matching `REPLY`.
-    /// Undo the reservations a failed outgoing transaction took before the
-    /// send actually happened: the per-node oneway `async_number` (when
+    /// Undo the reservations an outgoing parcel took while it was serialized but
+    /// which never reached the peer: the per-node oneway `async_number` (when
     /// `oneway_addr` is `Some((addr, consumed))`) and every local-binder
-    /// `timesSent` bump recorded in `data` while it was serialized. Invoked
-    /// only on an encode/send error, so the success path is untouched and the
-    /// wire is byte-unchanged.
+    /// `timesSent` bump recorded in `data`. Called on an encode/send failure and
+    /// whenever a reply parcel is discarded (handler `Err`, oneway). The success
+    /// path is untouched, so the wire is byte-unchanged.
     fn rollback_outgoing(&self, data: &Parcel, oneway_addr: Option<(RpcAddress, u64)>) {
+        // Nothing to cancel ⇒ skip the state lock. The oneway dispatch path
+        // calls this on every transaction, but a reply/args parcel that
+        // flattened no local binder has no bump to roll back — avoid the lock on
+        // that hot path (`rpc_leaving_addrs()` is a lock-free read).
+        if oneway_addr.is_none() && data.rpc_leaving_addrs().is_empty() {
+            return;
+        }
         let mut state = self.shared.state.lock().expect("rpc state poisoned");
         if let Some((addr, consumed)) = oneway_addr {
             state.cancel_send_async_number(addr, consumed);
@@ -1540,12 +1547,12 @@ impl RpcSessionInner {
                     reply.set_data_position(0);
                     return Ok(Some(reply));
                 }
-                WireMessage::DecStrong(a) => {
+                WireMessage::DecStrong(a, amount) => {
                     self.shared
                         .state
                         .lock()
                         .expect("rpc state poisoned")
-                        .dec_strong_local(&a);
+                        .dec_strong_local(&a, amount);
                 }
                 WireMessage::Transact(t) => {
                     // Nested / re-entrant call: the peer is calling
@@ -1905,6 +1912,11 @@ impl RpcSessionInner {
             if let Err(e) = result {
                 log::error!("oneway RPC transaction failed (dropped): {e:?}");
             }
+            // A oneway reply is always discarded (never sent). Roll back any
+            // `timesSent` bumps a handler made by writing a binder into `reply`,
+            // so those local nodes do not leak (the peer never receives them and
+            // so never `DEC_STRONG`s). Empty for AIDL-generated oneway stubs.
+            self.rollback_outgoing(&reply, None);
             return Ok(());
         }
         match result {
@@ -1924,7 +1936,14 @@ impl RpcSessionInner {
                 }
                 sent
             }
-            Err(e) => self.send_reply(e.into(), &[], &[], &[]),
+            Err(e) => {
+                // The error reply carries an empty body (the partially-written
+                // `reply` is discarded), so roll back any `timesSent` bumps from
+                // binders a handler wrote before returning `Err` — symmetric with
+                // the send-failure arm above.
+                self.rollback_outgoing(&reply, None);
+                self.send_reply(e.into(), &[], &[], &[])
+            }
         }
     }
 
@@ -1953,12 +1972,12 @@ impl RpcSessionInner {
                 self.dispatch_transact(t, in_fds, peer)?;
                 Ok(true)
             }
-            WireMessage::DecStrong(a) => {
+            WireMessage::DecStrong(a, amount) => {
                 self.shared
                     .state
                     .lock()
                     .expect("rpc state poisoned")
-                    .dec_strong_local(&a);
+                    .dec_strong_local(&a, amount);
                 Ok(true)
             }
             WireMessage::Reply(_) => {
@@ -2323,7 +2342,7 @@ impl RpcSession {
     /// (`RpcConnectionHeader → RpcNewSessionResponse → "cci"`,
     /// negotiating `min(max_version, server_max)`), then returns a
     /// session that speaks the negotiated version with AOSP-faithful
-    /// framing — reusing the existing per-session [`RpcState`] and
+    /// framing — reusing the existing per-session `RpcState` and
     /// `client_transact`/dispatch unchanged. `max_version` is the
     /// highest `RPC_WIRE_PROTOCOL_VERSION` to offer (0 = android-13,
     /// 1 = android-14/15).
