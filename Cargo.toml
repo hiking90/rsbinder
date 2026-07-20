@@ -43,7 +43,7 @@ pretty_hex = { version = "0.4", package = "pretty-hex" }
 rustix = "1.1"
 libc = "0.2"
 clap = "4.6"
-rsproperties = "0.5"
+rsproperties = "0.6"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2"
 # dev-only: serializes the handful of rsbinder unit tests that share the
