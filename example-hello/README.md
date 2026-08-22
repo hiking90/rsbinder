@@ -15,3 +15,10 @@ https://github.com/hiking90/rsbinder/blob/master/example-hello/src/bin/hello_cli
 
 
 
+
+Shared memory (one `SharedMemory` region over a `ParcelFileDescriptor`, plus
+`MemoryDealer` frames as `IMemory` binders), over the kernel binder or a
+Unix-socket RPC session — see the book's *Shared Memory* chapter:
+
+* https://github.com/hiking90/rsbinder/blob/master/example-hello/src/bin/shm_service.rs
+* https://github.com/hiking90/rsbinder/blob/master/example-hello/src/bin/shm_client.rs

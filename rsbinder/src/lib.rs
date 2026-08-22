@@ -157,6 +157,10 @@
 //! * [Binder](https://source.android.com/docs/core/architecture/hidl/binder-ipc)
 //!
 
+// android-only: clippy false-positives here on thread_locals that already use,
+// or cannot use, a `const { .. }` initializer.
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
+
 // Core binder functionality
 mod binder;
 /// Async binder runtime support
@@ -194,14 +198,11 @@ pub mod proxy;
 /// `setBinderProxyCountEventCallback` / `enableCountByUid`).
 pub mod proxy_count;
 mod ref_counter;
-/// Shared-memory IPC trait skeleton
-/// (`IMemoryHeap` / `IMemory` / `MemoryHeapBase`). AOSP
-/// `frameworks/native/libs/binder/include/binder/IMemory.h`. A future
-/// `memfd_create(2)`-backed `MemoryHeapBase` impl on Linux/Android and
-/// a `MemoryDealer` chunk allocator are not yet implemented. macOS
-/// host build compiles the trait surface but `MemoryHeapBase::new`
-/// permanently returns `Err(StatusCode::InvalidOperation)` — see the
-/// module docs.
+/// Shared-memory IPC: AOSP `IMemoryHeap` / `IMemory` traits, a
+/// `memfd_create` (Linux/Android) / `shm_open` (macOS) backed
+/// `MemoryHeapBase`, and wire-faithful `android.utils.IMemory*`
+/// stubs so a heap fd can travel over the kernel binder or
+/// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
 /// Status and exception handling
 pub mod status;

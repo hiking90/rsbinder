@@ -19,7 +19,7 @@ rpc-tcp-debug = ["rsbinder/rpc-tcp-debug", "rpc"]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 tokio = { workspace = true }
 env_logger = { workspace = true }
-rustix = { workspace = true, features = ["pipe"] }
+rustix = { workspace = true, features = ["pipe", "param"] }
 async-trait = { workspace = true }
 log.workspace = true
 

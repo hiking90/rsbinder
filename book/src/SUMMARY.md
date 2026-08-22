@@ -17,6 +17,7 @@
     - [Async Service](./async-service.md)
     - [Callbacks and Interfaces](./callbacks-and-interfaces.md)
     - [ParcelFileDescriptor](./parcel-file-descriptor.md)
+    - [Shared Memory](./shared-memory.md)
     - [Error Handling](./error-handling.md)
     - [Service Manager (HUB)](./service-manager.md)
 - [RPC Transport (binder-over-socket)](./rpc-transport.md)

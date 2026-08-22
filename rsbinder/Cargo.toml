@@ -70,7 +70,7 @@ android_14_plus = ["android_14", "android_16"]
 android_16_plus = ["android_16"]
 
 [dependencies]
-rustix = { workspace = true, features = ["process", "param", "mm"] }
+rustix = { workspace = true, features = ["process", "param", "mm", "fs"] }
 log = { workspace = true }
 pretty_hex = { workspace = true }
 async-trait = { workspace = true, optional = true }
@@ -112,3 +112,8 @@ serial_test = { workspace = true }
 # files compile to empty crates.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
+
+# Plan 4-7a: POSIX `shm_open` backing for `shared_memory::MemoryHeapBase`
+# on darwin (no `memfd_create`). `shm` implies rustix's `fs`.
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { workspace = true, features = ["shm"] }

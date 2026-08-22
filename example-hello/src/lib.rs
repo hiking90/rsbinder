@@ -51,3 +51,17 @@ pub mod authz {
     /// Unix-domain socket the example service binds and client connects to.
     pub const RPC_SOCKET: &str = "/tmp/rsb_authz.sock";
 }
+
+/// Shared-memory example (`bin/shm_{service,client}`): a `SharedMemory`
+/// region handed over as a `ParcelFileDescriptor`, plus `MemoryDealer`
+/// frames handed over as `android.utils.IMemory` binders.
+pub mod shm {
+    rsbinder::include_aidl!("shm", self::shm::IShm::*);
+    pub const SERVICE_NAME: &str = "example.shm";
+    /// Unix-domain socket for the `rpc` transport variant.
+    pub const RPC_SOCKET: &str = "/tmp/rsb_shm.sock";
+    /// Bytes of the whole-region buffer.
+    pub const REGION_SIZE: usize = 64 * 1024;
+    /// Bytes of the dealer heap behind `nextFrame`.
+    pub const DEALER_SIZE: usize = 1024 * 1024;
+}

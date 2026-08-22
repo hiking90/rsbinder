@@ -72,6 +72,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rpc_raw_fd"
+path = "fuzz_targets/rpc_raw_fd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rpc_accessor_error"
 path = "fuzz_targets/rpc_accessor_error.rs"
 test = false

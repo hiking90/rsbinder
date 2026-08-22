@@ -10,5 +10,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    rsbinder::rpc::wire::__fuzz_session_handshake(data);
+    rsbinder::rpc::__fuzz_session_handshake(data);
 });
