@@ -812,6 +812,11 @@ impl DeathRecipient for MyDeathRecipient {
     fn binder_died(&self, _who: &WIBinder) {}
 }
 
+/// Plan 4-7a E4 shared-memory service name + the pattern the server
+/// writes at window offset 0 before registering.
+const SHM_SERVICE_NAME: &str = "rsbinder.test.shm";
+const SHM_PATTERN: &[u8] = b"kernel-shm-from-server";
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
@@ -883,6 +888,28 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         fixed_size_array_service.as_binder(),
     )
     .expect("Could not register service");
+
+    // Plan 4-7a E4: an `android.utils.IMemory` window over a memfd heap.
+    // The client maps it through the kernel's fd passing and reads the
+    // pattern written here from the server's own mapping.
+    let page = rustix::param::page_size();
+    let shm_heap = Arc::new(
+        rsbinder::shared_memory::MemoryHeapBase::new(page * 2, 0).expect("shared memory heap"),
+    );
+    shm_heap
+        .write_at(page, SHM_PATTERN)
+        .expect("write shared memory pattern");
+    let shm_memory = Arc::new(
+        rsbinder::shared_memory::MemoryBase::new(
+            shm_heap.clone(),
+            rsbinder::shared_memory::export_heap(shm_heap.clone()),
+            page,
+            page,
+        )
+        .expect("shared memory window"),
+    );
+    hub::add_service(SHM_SERVICE_NAME, shm_memory.export())
+        .expect("Could not register shm service");
 
     // Readiness signal for the integration harness: every service is now
     // registered, so a client `getService` will resolve. Printed to stderr

@@ -101,6 +101,10 @@ pub mod transport;
 // after the demotion from `pub`. Keep the complete, tested surface.
 #[allow(dead_code)]
 pub(crate) mod wire;
+/// Fuzz entrypoints (`fuzz/fuzz_targets/rpc_{wire,address}_decode.rs`,
+/// `rpc_session_handshake.rs`); not part of the supported API.
+#[doc(hidden)]
+pub use wire::{__fuzz_decode_address, __fuzz_decode_wire, __fuzz_session_handshake};
 #[allow(dead_code)]
 pub(crate) mod wire_android13;
 

@@ -13,6 +13,38 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- **rsbinder (shared memory):** `shared_memory` is now a working
+  implementation instead of a trait skeleton. `MemoryHeapBase` allocates an
+  anonymous shared region (`memfd_create` + `F_ADD_SEALS` on Linux/Android,
+  matching AOSP `MemoryHeapBase`'s `FORCE_MEMFD` path; `shm_open` on macOS)
+  and `MappedHeap` maps a received fd with the wire geometry
+  (`from_fd_strict` additionally verifies the sender's seals). New
+  wire-faithful stubs `BnMemoryHeap`/`BpMemoryHeap` and `BnMemory`/`BpMemory`
+  (`android.utils.IMemoryHeap` / `android.utils.IMemory`, handwritten AOSP
+  `IMemory.cpp` layout, no AIDL) let a heap travel over the kernel binder or
+  a Unix-socket RPC session with `FileDescriptorTransportMode::Unix`.
+  `SharedMemory` mirrors `android.os.SharedMemory` / NDK `ASharedMemory`:
+  one fd on the wire, size recovered from the fd (`fstat`, or
+  `ASHMEM_GET_SIZE` for legacy ashmem on Android), `Serialize`/`Deserialize`
+  byte-identical to `ParcelFileDescriptor`. Verified against the real
+  libbinder `IMemory`/`MemoryHeapBase` on an Android 16 emulator in both
+  directions (`example-hello/cpp/run_imemory_interop.sh`). `rustix` gains the
+  `fs` feature (and `shm` on macOS). Plan: `plans/4-7a-shared-memory-impl.md`.
+  On macOS the same protections memfd seals give are kernel-backed too: a
+  POSIX shm object's size is fixed after creation, and a read-only heap
+  exports an `O_RDONLY` fd the kernel refuses to map writable.
+  `MemoryHeapBase::seals()` reports these as the same `SEAL_*` bits and
+  `MappedHeap::from_fd_strict` works there; new
+  `MemoryHeapBase::seal_future_write` / `MappedHeap::seal_future_write`.
+  Plan: `plans/4-7b-macos-shared-memory.md`.
+- **rsbinder (internal):** `ParcelFileDescriptor` serialization is now layered
+  on crate-private `write_raw_fd` / `read_raw_fd` (AOSP
+  `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
+  without the AIDL not-null / comm markers), which the handwritten
+  `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
+
 ### Changed
 
 - **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
@@ -45,6 +77,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Parcel::set_for_rpc` remain public.
 
 ### Fixed
+
+- **fuzz:** the `rpc_wire_decode` / `rpc_address_decode` / `rpc_session_handshake`
+  targets compile again — their entrypoints are re-exported as
+  `rsbinder::rpc::__fuzz_*` after the wire-codec module became crate-private.
+  New `rpc_raw_fd` target covers the bare (`IMemoryHeap`-style) fd decode.
 
 - **rsbinder:** a remote binder handle is serialized through the full 8-byte
   object union, so no uninitialized stack bytes are copied onto the wire; the

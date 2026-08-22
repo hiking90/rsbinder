@@ -3270,3 +3270,99 @@ fn test_native_publish_drop_release_cycle() {
         drop(local);
     }
 }
+
+/// Plan 4-7a E4 / AC-4.7a.8: an `android.utils.IMemory` window served by
+/// `test_service` over the kernel binder. The heap fd crosses as
+/// `BINDER_TYPE_FD`; both processes map the same pages.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
+fn test_shared_memory_window_over_kernel_binder() {
+    use rsbinder::shared_memory::{BpMemory, IMemory, IMemoryHeap};
+    init_test();
+
+    let binder = hub::get_service("rsbinder.test.shm").expect("rsbinder.test.shm registered");
+    let bp = BpMemory::new(binder);
+    let heap = bp
+        .resolve()
+        .expect("GET_MEMORY + HEAP_ID + mmap over kernel binder");
+    let page = heap.size() / 2;
+    assert!(page > 0);
+    assert_eq!(bp.offset(), page);
+    assert_eq!(bp.size(), page);
+    assert_eq!(heap.flags(), 0);
+    assert_eq!(IMemory::memory(&bp).size(), page * 2);
+
+    // Written by the server process through its own mapping.
+    let pattern = b"kernel-shm-from-server";
+    let mut buf = vec![0u8; pattern.len()];
+    bp.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf, pattern);
+
+    // Our write is visible through a second, independent mapping obtained
+    // via a fresh proxy (new HEAP_ID round-trip, new fd, new mmap).
+    bp.write_at(64, b"client-wrote").unwrap();
+    let bp2 = BpMemory::new(hub::get_service("rsbinder.test.shm").unwrap());
+    let heap2 = bp2.resolve().unwrap();
+    assert!(!Arc::ptr_eq(&heap, &heap2));
+    assert_ne!(heap.heap_id(), heap2.heap_id());
+    let mut back = [0u8; 12];
+    bp2.read_at(64, &mut back).unwrap();
+    assert_eq!(&back, b"client-wrote");
+
+    // Window bounds are enforced before touching the mapping.
+    assert_eq!(
+        bp.read_at(page - 1, &mut [0u8; 2]).unwrap_err(),
+        rsbinder::StatusCode::BadValue
+    );
+}
+
+/// Plan 4-7a E5 STAGE3 (a): after `imemory_interop client` (real
+/// libbinder) has read our window and written its marker at +128, the
+/// marker is visible through rsbinder's own proxy. Driven by
+/// `example-hello/cpp/run_imemory_interop.sh`.
+#[test]
+#[ignore = "STAGE3: needs test_service + the C++ imemory_interop client run first"]
+fn stage3_cpp_imemory_client_marker_visible() {
+    use rsbinder::shared_memory::BpMemory;
+    init_test();
+    let bp = BpMemory::new(hub::get_service("rsbinder.test.shm").expect("rsbinder.test.shm"));
+    bp.resolve().unwrap();
+    let marker = b"cpp-client-wrote";
+    let mut buf = vec![0u8; marker.len()];
+    bp.read_at(128, &mut buf).unwrap();
+    assert_eq!(&buf, marker, "C++ client's write not visible");
+    println!("STAGE3_4_7A_RUST_SEES_CPP_MARKER");
+}
+
+/// Plan 4-7a E5 STAGE3 (b): rsbinder `BpMemory` → `BpMemoryHeap` against
+/// a real libbinder `MemoryBase`/`MemoryHeapBase` server
+/// (`imemory_interop server`).
+#[test]
+#[ignore = "STAGE3: needs the C++ imemory_interop server running"]
+fn stage3_cpp_memory_heap_server_readable() {
+    use rsbinder::shared_memory::{BpMemory, IMemory, IMemoryHeap};
+    init_test();
+    let bp = BpMemory::new(hub::get_service("rsbinder.test.cppshm").expect("rsbinder.test.cppshm"));
+    let heap = bp
+        .resolve()
+        .expect("GET_MEMORY + HEAP_ID against libbinder");
+    let page = heap.size() / 2;
+    assert!(page > 0);
+    assert_eq!(bp.offset(), page);
+    assert_eq!(bp.size(), page);
+    assert_eq!(IMemory::memory(&bp).size(), page * 2);
+    let pattern = b"cpp-server-pattern";
+    let mut buf = vec![0u8; pattern.len()];
+    bp.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf, pattern);
+    bp.write_at(64, b"rust-client-wrote").unwrap();
+    let bp2 = BpMemory::new(hub::get_service("rsbinder.test.cppshm").unwrap());
+    bp2.resolve().unwrap();
+    let mut back = [0u8; 17];
+    bp2.read_at(64, &mut back).unwrap();
+    assert_eq!(&back, b"rust-client-wrote");
+    println!("STAGE3_4_7A_RUST_READS_CPP_HEAP");
+}
