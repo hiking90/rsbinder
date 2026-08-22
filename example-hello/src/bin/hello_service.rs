@@ -29,17 +29,6 @@ impl IHello for IHelloService {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    println!("Initializing ProcessState...");
-    ProcessState::init_default()?;
-
-    // Start the thread pool — required for any service that handles incoming
-    // calls: it lets the kernel add workers, so a re-entrant or concurrent call
-    // won't block on the lone `join_thread_pool` thread below. See
-    // `ProcessState::start_thread_pool` for the precise rule.
-    println!("Starting thread pool...");
-    ProcessState::start_thread_pool();
-
     // Create a binder service.
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService {});
@@ -51,13 +40,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     //     features.set_requesting_sid = true;
     //     let service = BnHello::new_binder_with_features(IHelloService {}, features);
 
-    // Add the service to binder service manager. `add_service` takes anything
-    // convertible into `SIBinder`, so the typed handle goes in directly — pass
-    // `&service` to keep the local handle alive for the rest of `main`.
-    println!("Adding service to hub...");
-    hub::add_service(SERVICE_NAME, &service)?;
-
-    // Join the thread pool.
-    // This is a blocking call. It will return when the thread pool is terminated.
-    Ok(ProcessState::join_thread_pool()?)
+    // `serve("binder://")` initializes the kernel binder `ProcessState`;
+    // `add` registers with the service manager (anything `Into<SIBinder>`
+    // — pass `&service` to keep the local handle alive); `run` starts the
+    // thread pool and joins it. The same three calls with
+    // `serve("unix:///tmp/hello.sock")` would serve over RPC instead.
+    println!("Serving {SERVICE_NAME} over kernel binder...");
+    rsbinder::serve("binder://")?
+        .add(SERVICE_NAME, &service)?
+        .run()?;
+    Ok(())
 }

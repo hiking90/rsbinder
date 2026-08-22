@@ -128,29 +128,27 @@ impl IHello for IHelloService {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    println!("Initializing ProcessState...");
-    ProcessState::init_default()?;
-
-    // Start the thread pool.
-    // This is optional. If you don't call this, only one thread will be created to handle the binder transactions.
-    println!("Starting thread pool...");
-    ProcessState::start_thread_pool();
-
     // Create a binder service.
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService{});
 
-    // Add the service to binder service manager. `add_service` takes anything
-    // convertible into `SIBinder`, so the typed handle goes in directly.
-    println!("Adding service to hub...");
-    hub::add_service(SERVICE_NAME, &service)?;
-
-    // Join the thread pool.
-    // This is a blocking call. It will return when the thread pool is terminated.
-    Ok(ProcessState::join_thread_pool()?)
+    // `serve("binder://")` initializes the kernel binder process state,
+    // `add` registers the service with the service manager (it takes
+    // anything convertible into `SIBinder`), and `run` starts the binder
+    // thread pool and joins it — this blocks for the life of the service.
+    println!("Serving {SERVICE_NAME}...");
+    rsbinder::serve("binder://")?
+        .add(SERVICE_NAME, &service)?
+        .run()?;
+    Ok(())
 }
 ```
+
+> The same three calls with `serve("unix:///tmp/hello.sock")` serve the
+> service over a Unix socket instead of kernel binder — see
+> [Cross-Transport Services](./cross-transport-services.md). The low-level
+> form (`ProcessState::init_default()`, `start_thread_pool()`,
+> `hub::add_service()`, `join_thread_pool()`) remains available.
 
 ## Create a client
 Create the src/bin/hello_client.rs file and configure it as follows.
@@ -185,21 +183,19 @@ impl DeathRecipient for MyDeathRecipient {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    ProcessState::init_default()?;
+    // `connect("binder://<name>")` initializes the kernel binder process
+    // state, blocks until the service is registered (the event-driven
+    // equivalent of AOSP's `waitForService`), and casts it to the interface.
+    let hello: rsbinder::Strong<dyn IHello> = rsbinder::connect(&format!("binder://{SERVICE_NAME}"))?;
 
     println!("list services:");
-    // This is an example of how to use service manager.
+    // Service-manager extras stay on `hub`.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
         println!("{name}");
     }
 
     let service_callback = BnServiceCallback::new_binder(MyServiceCallback {});
     hub::register_for_notifications(SERVICE_NAME, &service_callback)?;
-
-    // Block until the Hello service is registered, then cast it to the
-    // interface — the event-driven equivalent of AOSP's `waitForService`.
-    let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
 
     // `link_to_death_arc` takes the concrete `Arc<MyDeathRecipient>` directly.
     // Keep `recipient` alive for the link's lifetime (the link holds only a weak ref).
@@ -255,10 +251,8 @@ $ cargo run --bin hello_client
 
 **hello_service** output:
 ```
-Initializing ProcessState...
-Starting thread pool...
 Creating service...
-Adding service to hub...
+Serving my.hello...
 ```
 
 **hello_client** output:
@@ -280,9 +274,9 @@ The client demonstrates several advanced features:
 
 If you encounter issues:
 
-1. **"ProcessState is not initialized!"** - `ProcessState::init_default()` (or `ProcessState::init()`) must be called in `main()` before using any other rsbinder APIs
+1. **"ProcessState is not initialized!"** - `rsbinder::serve("binder://")` / `rsbinder::connect("binder://…")` (or the low-level `ProcessState::init_default()`) must run before any other rsbinder API that touches the binder device
 2. **"environment variable OUT_DIR not defined"** - `build.rs` must be placed in the project root directory (next to `Cargo.toml`), not inside `src/`
-3. **Client blocks without output** - `hub::wait_for_interface` waits until the service is registered; ensure the service is running
+3. **Client blocks without output** - `rsbinder::connect("binder://…")` waits until the service is registered; ensure the service is running
 4. **Permission errors** - Check that binder device has correct permissions (0666)
 5. **Service manager not found** - Verify `rsb_hub` is running
 6. **Build errors** - Ensure all dependencies are correctly specified in Cargo.toml

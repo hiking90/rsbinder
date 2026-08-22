@@ -17,8 +17,8 @@
 //! - **ServiceManager**: Service discovery and registration (the [`hub`] module)
 //! - **RPC transport**: binder-over-socket (`rpc` module, behind the `rpc`
 //!   feature) — a separate stack from the kernel binder path
-//! - **Service facade**: the [`service`] module — register/look up services
-//!   once, choosing kernel binder or RPC by construction
+//! - **Entry API**: [`serve`] / [`connect`] — publish and look up services
+//!   with one URI-selected transport (kernel binder or RPC)
 //!
 //! # Feature flags
 //!
@@ -99,23 +99,19 @@
 //! }
 //!
 //! # fn main() -> Result<()> {
-//! // Initialize the process state
-//! ProcessState::init_default()?;
-//!
-//! // Start the thread pool
-//! ProcessState::start_thread_pool();
-//!
-//! // Register your service
-//! let service = BnHello::new_binder(HelloService);
-//! hub::add_service("hello_service", service.as_binder())?;
-//!
-//! println!("Hello service started");
-//!
-//! // Join the thread pool to handle requests
-//! ProcessState::join_thread_pool();
+//! // Kernel binder: init the process state, register with the service
+//! // manager, start the thread pool and join it. The same three calls
+//! // with `serve("unix:///tmp/hello.sock")` serve over RPC instead.
+//! rsbinder::serve("binder://")?
+//!     .add("hello_service", BnHello::new_binder(HelloService))?
+//!     .run()?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! (`ProcessState::init_default()` + `start_thread_pool()` +
+//! `hub::add_service()` + `join_thread_pool()` remain available as the
+//! low-level form.)
 //!
 //! ## Creating a Client
 //!
@@ -126,12 +122,10 @@
 //! rsbinder::include_aidl!("hello", crate::hello::IHello::*);
 //!
 //! # fn main() -> Result<()> {
-//! // Initialize the process state
-//! ProcessState::init_default()?;
-//!
-//! // Wait for the service to be registered, then cast it to the interface.
+//! // Init the process state, wait for the service to be registered, and
+//! // cast it to the interface. Over RPC: "unix:///tmp/hello.sock#hello_service".
 //! let hello_service: rsbinder::Strong<dyn IHello> =
-//!     hub::wait_for_interface("hello_service")?;
+//!     rsbinder::connect("binder://hello_service")?;
 //!
 //! // Call remote method
 //! let result = hello_service.echo("Hello, World!")?;
@@ -226,11 +220,17 @@ pub mod permission_controller;
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
-// Cross-transport service facade — see the module's own docs. Kept as a
-// plain (non-doc) comment: an outer doc here would merge with the
-// module's inner `//!` docs and re-resolve their intra-doc links at the
-// crate root, breaking them.
-pub mod service;
+// Unified entry API (Plan 2-17): `serve` / `connect` + URI over every
+// transport. Kept as a plain (non-doc) comment: an outer doc here would
+// merge with the module's inner `//!` docs and re-resolve their intra-doc
+// links at the crate root, breaking them.
+pub mod entry;
+#[cfg(feature = "tokio")]
+pub use entry::connect_async;
+pub use entry::{
+    connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
+    ServerGuard,
+};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
@@ -280,7 +280,7 @@ pub use parcelable::{
 };
 
 pub use parcelable_holder::ParcelableHolder;
-pub use process_state::ProcessState;
+pub use process_state::{CallRestriction, ProcessState};
 
 // From `proxy` — client-side handle types.
 pub use proxy::{Proxy, ProxyHandle};

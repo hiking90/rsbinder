@@ -15,7 +15,6 @@
 
 use std::process::ExitCode;
 
-use rsbinder::service::{kernel, Broker as _};
 use rsbinder::*;
 
 use example_hello::permcheck::{IPermCheck, SERVICE_NAME};
@@ -60,16 +59,21 @@ fn expect_security_denial(r: rsbinder::status::Result<bool>) -> bool {
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let broker = match kernel::Broker::new() {
-        Ok(b) => b,
+    let client = match rsbinder::Client::open("binder://") {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("kernel::Broker init failed: {e}");
+            eprintln!("kernel client init failed: {e:?}");
             return ExitCode::from(2);
         }
     };
-
-    let svc = match broker.get_interface::<dyn IPermCheck>(SERVICE_NAME) {
-        Ok(s) => s,
+    // `try_get`, not `get`: the harness has no timeout, so a missing
+    // service must fail fast rather than wait for registration.
+    let svc = match client.try_get::<dyn IPermCheck>(SERVICE_NAME) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("{SERVICE_NAME} is not registered");
+            return ExitCode::from(4);
+        }
         Err(e) => {
             eprintln!("lookup/interface_cast failed: {e:?}");
             return ExitCode::from(4);

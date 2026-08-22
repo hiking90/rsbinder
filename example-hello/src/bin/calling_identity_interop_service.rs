@@ -20,7 +20,6 @@
 // when invoked from `adb shell`).
 
 use env_logger::Env;
-use rsbinder::service::{kernel, Registry as _};
 use rsbinder::*;
 
 use example_hello::calling_identity::{BnCallingIdentity, ICallingIdentity, SERVICE_NAME};
@@ -61,19 +60,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     eprintln!("STAGE3 4-1 server: init ProcessState");
-    let host = kernel::Host::new()?;
+    let server = rsbinder::serve("binder://")?;
 
     // Opt the binder into BR_TRANSACTION_SEC_CTX so the kernel delivers
-    // the caller's SELinux context. `new_binder_with_features` is
-    // independent of the facade — only the init/register/serve
-    // scaffolding moved onto `kernel::Host`.
+    // the caller's SELinux context. `BinderFeatures` are per binder
+    // (`new_binder_with_features`), not a server option.
     let mut features = BinderFeatures::default();
     features.set_requesting_sid = true;
     let service = BnCallingIdentity::new_binder_with_features(CallingIdentitySmoke, features);
 
     eprintln!("STAGE3 4-1 server: register `{SERVICE_NAME}`");
-    host.add_service(SERVICE_NAME, service.as_binder())?;
+    let server = server.add(SERVICE_NAME, &service)?;
 
     eprintln!("STAGE3 4-1 server: join thread pool");
-    Ok(host.serve()?)
+    Ok(server.run()?)
 }

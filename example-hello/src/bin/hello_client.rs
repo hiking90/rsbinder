@@ -18,26 +18,18 @@ impl DeathRecipient for MyDeathRecipient {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // Initialize ProcessState with the default binder path and the default max threads.
-    ProcessState::init_default()?;
-
-    // Start the thread pool so this client's inbound transactions — the
-    // event-driven `onRegistration` (wait_for_interface) and the death
-    // notification below — are delivered promptly; without it the wait still
-    // works but degrades to ~1s polling. See `ProcessState::start_thread_pool`.
-    ProcessState::start_thread_pool();
+    // `Client::open` starts the binder thread pool, so the death
+    // notification registered below is delivered promptly.
+    let client = rsbinder::Client::open("binder://")?;
 
     println!("list services:");
-    // This is an example of how to use service manager.
+    // Kernel-only service-manager powers stay on `hub`.
     for name in hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT) {
         println!("{name}");
     }
 
-    // Block until the Hello service is registered, then cast it to the
-    // interface — the event-driven AOSP `waitForService` equivalent. This
-    // replaces the old hand-rolled retry loop: no polling, no fixed attempt
-    // cap, and the register-after-miss race is handled by the hub.
-    let hello: rsbinder::Strong<dyn IHello> = hub::wait_for_interface(SERVICE_NAME)?;
+    // Blocks until the service is registered (AOSP `waitForService`).
+    let hello: rsbinder::Strong<dyn IHello> = client.get(SERVICE_NAME)?;
 
     // `link_to_death_arc` takes the concrete `Arc<MyDeathRecipient>` directly —
     // no `Arc::downgrade(&(x as Arc<dyn DeathRecipient>))` incantation. Keep

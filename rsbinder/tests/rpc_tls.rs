@@ -240,6 +240,84 @@ fn setup_tcp_client_tls_convenience_e2e() {
     server.join().unwrap();
 }
 
+/// Plan 2-17: the entry layer over `tls://` — `serve` binds the TLS
+/// listener with `ServeOptions::tls`, `Client::open_with` supplies the
+/// client config plus a `tls_server_name` that differs from the URI host
+/// (cert is for `localhost`, the socket is `127.0.0.1`). The `:0` port is
+/// resolved through the guard's `server()` escape hatch.
+#[test]
+fn entry_tls_serve_and_client() {
+    let svc = Interface::as_binder(&Binder::new(BnPing(Box::new(PingSvc))));
+    let guard = rsbinder::serve("tls://127.0.0.1:0")
+        .expect("serve tls://")
+        .with(|o| o.tls = Some(server_config(SRV_CRT, SRV_KEY)))
+        .add("ping", svc)
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let addr = guard
+        .server()
+        .expect("rpc server")
+        .tcp_address()
+        .expect("bound TCP address");
+
+    let client = rsbinder::Client::open_with(&format!("tls://{addr}"), |o, _endpoint| {
+        o.tls = Some(client_config_trusting(CA));
+        // The fixture cert is issued for `localhost`; the URI host is the
+        // dialed address. `tls_server_name` decouples the two.
+        o.tls_server_name = Some("localhost".to_string());
+    })
+    .expect("Client::open_with tls://");
+
+    let root = client.binder("ping").expect("lookup ping");
+    assert_eq!(ping_via(&root, "entry").unwrap(), "pong:entry");
+    drop(root);
+    drop(client);
+}
+
+/// `tls://` without a config is refused on **both** sides before any
+/// socket work — the URI cannot carry trust anchors or a server identity,
+/// so the option is mandatory. The server half has no compile-time signal
+/// at all (`serve(..).add(..).spawn()` looks complete on its own), which
+/// makes it the likelier mistake.
+#[test]
+fn entry_tls_requires_explicit_config() {
+    let err = rsbinder::Client::open("tls://127.0.0.1:1")
+        .expect_err("tls:// without ClientOptions::tls must fail");
+    assert_eq!(err, StatusCode::BadValue);
+
+    let err = rsbinder::serve("tls://127.0.0.1:0")
+        .expect("parse")
+        .spawn()
+        .expect_err("tls:// without ServeOptions::tls must fail");
+    assert_eq!(err, StatusCode::BadValue);
+}
+
+/// `fd_modes` / `fd_mode` may only advertise Unix fd passing where the
+/// transport can actually carry `SCM_RIGHTS`; TLS cannot, so both sides
+/// reject it instead of agreeing a mode that fails later on the wire.
+#[test]
+fn entry_tls_rejects_unix_fd_mode() {
+    use rsbinder::rpc::FileDescriptorTransportMode;
+    let err = rsbinder::serve("tls://127.0.0.1:0")
+        .expect("parse")
+        .with(|o| {
+            o.tls = Some(server_config(SRV_CRT, SRV_KEY));
+            o.fd_modes = Some(vec![FileDescriptorTransportMode::Unix]);
+        })
+        .spawn()
+        .expect_err("Unix fd passing is not available over TLS");
+    assert_eq!(err, StatusCode::BadValue);
+
+    let err = rsbinder::Client::open_with("tls://127.0.0.1:1", |o, _| {
+        o.tls = Some(client_config_trusting(CA));
+        o.fd_mode = Some(FileDescriptorTransportMode::Unix);
+    })
+    .expect_err("Unix fd passing is not available over TLS");
+    assert_eq!(err, StatusCode::BadValue);
+}
+
 /// Concurrency gate: a single `TlsTransport` must
 /// support a sender thread and a receiver thread **concurrently**
 /// ([`RpcTransport`] contract). The decomposed `Mutex<Connection>` +

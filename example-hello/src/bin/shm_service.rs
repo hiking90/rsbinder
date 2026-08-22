@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex};
 
 use env_logger::Env;
 use example_hello::shm::*;
-use rsbinder::service::{kernel, Registry};
 use rsbinder::shared_memory::{Allocation, MemoryDealer, SharedMemory};
 use rsbinder::*;
 
@@ -94,38 +93,36 @@ impl IShm for ShmService {
     }
 }
 
-fn register<R: Registry>(reg: &R) -> rsbinder::Result<()> {
-    let binder = BnShm::new_binder(ShmService::new()?).as_binder();
-    reg.add_service(SERVICE_NAME, binder)
-}
-
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    match std::env::args().nth(1).as_deref() {
-        Some("kernel") => {
-            let host = kernel::Host::new()?;
-            register(&host)?;
-            println!("shm_service: serving {SERVICE_NAME} over kernel binder");
-            host.serve()?;
-        }
-        #[cfg(feature = "rpc")]
-        Some("rpc") => {
-            use rsbinder::rpc::FileDescriptorTransportMode;
-            use rsbinder::service::rpc;
-            let host = rpc::Host::unix(RPC_SOCKET)?;
-            // Shared memory is an fd: the session must be allowed to carry
-            // fds (SCM_RIGHTS). TCP / vsock / TLS sessions cannot.
-            host.server()
-                .set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
-            register(&host)?;
-            println!("shm_service: serving {SERVICE_NAME} over RPC at {RPC_SOCKET}");
-            host.serve()?;
-        }
-        _ => {
-            eprintln!("usage: shm_service <kernel|rpc>   (rpc needs --features rpc)");
+    let uri = match std::env::args().nth(1).as_deref() {
+        Some("kernel") => "binder://".to_string(),
+        Some("rpc") => format!("unix://{RPC_SOCKET}"),
+        Some(uri) => uri.to_string(),
+        None => {
+            eprintln!("usage: shm_service <kernel|rpc|URI>   (rpc needs --features rpc)");
             std::process::exit(2);
         }
-    }
+    };
+    let server = rsbinder::serve(&uri)?;
+    // Shared memory is an fd: the session must be allowed to carry fds
+    // (SCM_RIGHTS — Unix sockets only; kernel binder passes fds natively,
+    // and TCP / vsock / TLS cannot carry them at all, so both reject the
+    // option).
+    let server = if server.endpoint().supports_fd_passing() {
+        server.with(|_o| {
+            #[cfg(feature = "rpc")]
+            {
+                _o.fd_modes = Some(vec![rsbinder::rpc::FileDescriptorTransportMode::Unix]);
+            }
+        })
+    } else {
+        server
+    };
+    println!("shm_service: serving {SERVICE_NAME} at {uri}");
+    server
+        .add(SERVICE_NAME, BnShm::new_binder(ShmService::new()?))?
+        .run()?;
     Ok(())
 }

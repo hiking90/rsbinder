@@ -15,7 +15,6 @@
 
 use std::process::ExitCode;
 
-use rsbinder::service::{kernel, Broker as _};
 use rsbinder::*;
 
 use example_hello::calling_identity::{ICallingIdentity, SERVICE_NAME};
@@ -26,14 +25,18 @@ use example_hello::calling_identity::{ICallingIdentity, SERVICE_NAME};
 /// before/after-clear/after-restore triple matched `false / true /
 /// false`.
 fn describe_caller_round_trip() -> Result<()> {
-    // `kernel::Broker::new()` is idempotent — `ProcessState` is already
-    // initialized in `main`. `get_interface` does lookup + cast.
-    let broker = kernel::Broker::new()?;
-    let svc = broker
-        .get_interface::<dyn ICallingIdentity>(SERVICE_NAME)
+    // `try_get`, not `get`: the harness has no timeout, so a missing
+    // service must fail fast rather than wait for registration.
+    let client = rsbinder::Client::open("binder://")?;
+    let svc = client
+        .try_get::<dyn ICallingIdentity>(SERVICE_NAME)
         .map_err(|e| {
             eprintln!("interface_cast/lookup failed: {e:?}");
             StatusCode::BadType
+        })?
+        .ok_or_else(|| {
+            eprintln!("{SERVICE_NAME} is not registered");
+            StatusCode::NameNotFound
         })?;
 
     let line = svc.describeCaller().map_err(|status| {

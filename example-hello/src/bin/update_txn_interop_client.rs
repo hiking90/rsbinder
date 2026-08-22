@@ -16,7 +16,6 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rsbinder::service::{kernel, Broker as _};
 use rsbinder::*;
 
 use example_hello::update_txn::{IUpdateTxnDedup, ONRECORD_CODE, SERVICE_NAME};
@@ -134,20 +133,23 @@ fn extended_error_round() -> std::result::Result<(), String> {
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let broker = match kernel::Broker::new() {
-        Ok(b) => b,
+    let client = match rsbinder::Client::open("binder://") {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("kernel::Broker init failed: {e}");
+            eprintln!("kernel client init failed: {e}");
             return ExitCode::from(2);
         }
     };
-
-    // This client needs the raw `SIBinder` (to hand-build oneway parcels
-    // with `FLAG_UPDATE_TXN`, which the generated `Bp*` stub cannot
-    // express) *and* the typed proxy, so use `Broker::lookup` + an
-    // explicit cast rather than `get_interface`.
-    let binder = match broker.lookup(SERVICE_NAME) {
-        Ok(b) => b,
+    // Raw `SIBinder` (to hand-build oneway parcels with `FLAG_UPDATE_TXN`,
+    // which the generated `Bp*` stub cannot express) plus a typed proxy
+    // cast from it. `try_get` keeps the harness fail-fast: `get` would wait
+    // for registration and the script has no timeout.
+    let binder = match client.try_get::<dyn IUpdateTxnDedup>(SERVICE_NAME) {
+        Ok(Some(s)) => s.as_binder(),
+        Ok(None) => {
+            eprintln!("{SERVICE_NAME} is not registered");
+            return ExitCode::from(3);
+        }
         Err(e) => {
             eprintln!("lookup({SERVICE_NAME}) failed: {e:?}");
             return ExitCode::from(3);
