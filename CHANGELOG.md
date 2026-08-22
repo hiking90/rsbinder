@@ -15,6 +15,28 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder (entry API):** `rsbinder::serve(uri)` / `rsbinder::connect::<dyn I>(uri)`
+  / `rsbinder::Client` — one bootstrap for every transport, selected by a
+  URI (`binder://`, `unix://`, `unix-abstract://`, `vsock://`, `tls://`,
+  `#service`, `?profile=android13plus`). `serve("binder://")?.add(name,
+  BnFoo::new_binder(impl))?.run()?` is the whole kernel service setup
+  (`ProcessState` init + thread pool + `hub::add_service` + join); the same
+  three lines with `unix:///path` are an RPC server. Options that do not fit
+  a URI go through `ServeOptions` / `ClientOptions`; an option for the wrong
+  transport is `BadValue` at `run`/`open` time, logged. `connect_async` under
+  the `tokio` feature. `CallRestriction` is now re-exported at the crate root.
+  `ServerGuard::server()` and `Client::session()` are the escape hatches to
+  the underlying `RpcServer` / `RpcSession` (bound address after a `:0`
+  port, session counters, RPC-only powers the entry layer does not wrap).
+  `Client::open_with`'s closure also receives the parsed `Endpoint`, and
+  `Endpoint::supports_fd_passing()` names the one predicate behind fd-mode
+  validation, so transport-conditional options never need URI string matching.
+  `CallRestriction` is documented, `#[non_exhaustive]`, and `PartialEq`.
+- **rsbinder (rpc):** `RpcSession::shutdown()` — declare a session dead now
+  (obituaries + release of the peer's local objects, AOSP `RpcState::clear`).
+  This is the only way to break the `session → local object → stored proxy →
+  session` cycle for a session that has no serve loop and will never transact
+  again; unlike AOSP `shutdownAndWait` it does not join workers.
 - **rsbinder (shared memory):** `shared_memory` is now a working
   implementation instead of a trait skeleton. `MemoryHeapBase` allocates an
   anonymous shared region (`memfd_create` + `F_ADD_SEALS` on Linux/Android,
@@ -55,8 +77,39 @@ This changelog starts at 0.9.0. For earlier releases, see the
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
 
+### Removed
+
+- **rsbinder (`service` module):** the `rsbinder::service` facade (`Registry` /
+  `Broker`, `service::kernel::{Host, Broker}`, `service::rpc::{Host, Broker}`)
+  is gone, replaced by the entry API above (`serve` / `connect` / `Client`).
+  Migration: `kernel::Host::new()? + add_service + serve()` →
+  `serve("binder://")?.add(..)?.run()?`; `rpc::Host::unix(p)` →
+  `serve("unix://<p>")`; `kernel::Broker::new()?.get_interface(n)` →
+  `connect("binder://<n>")`; `rpc::Broker::unix(p)?.get_interface(n)` →
+  `connect("unix://<p>#<n>")`; `Host::builder()` options → `ServeOptions`
+  via `Server::with`. The examples, the book chapter *Cross-Transport
+  Services*, and the crate quick-start now use the entry API.
+
 ### Changed
 
+- **rsbinder (rpc):** an RPC proxy now holds its `RpcSession` **strongly**
+  (AOSP `BpBinder` ↔ `sp<RpcSession>`). Dropping the `RpcSession` handle no
+  longer invalidates proxies obtained from it — the proxy alone keeps the
+  connection open, and the connection closes when the last proxy (and
+  handle) is gone. Previously every call on such a proxy returned
+  `DeadObject`. Code that relied on "drop the session to disconnect" while
+  still holding a proxy must drop the proxy too. To keep the strong ref
+  acyclic, session death now also releases every local object the peer
+  held (AOSP `RpcState::clear`), on both the served path and — new — a
+  client-only session whose last connection is lost (detected on the next
+  failed transaction, which also fires `DeathRecipient`s). Because a failing
+  transaction may now declare session death before the slot's own serve
+  worker exits, `serve_blocking` no longer trips a debug assertion on that
+  ordering.
+- **rsbinder (entry API):** `ServeOptions::fd_modes` / `ClientOptions::fd_mode`
+  now reject Unix fd passing on a transport that cannot carry `SCM_RIGHTS`
+  (vsock, TLS, kernel binder) instead of agreeing a mode that fails later on
+  the wire.
 - **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
   (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
   now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).

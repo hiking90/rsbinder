@@ -450,7 +450,7 @@ pub struct RpcServer {
     /// Holds a `Weak` of the founding `RpcSessionInner` itself so
     /// id-echoing attaches add a slot onto the *single* inner via
     /// [`RpcSession::add_incoming_slot`] —
-    /// `state.remote_proxies`-cached `RpcProxy`s' `Weak<RpcSessionInner>`
+    /// `state.remote_proxies`-cached `RpcProxy`s' `Arc<RpcSessionInner>`
     /// then point to the only inner and any server worker's nested
     /// `proxy.transact` `find_conn`s stay within its own slot pool
     /// (no cross-slot aliasing). The public API
@@ -902,11 +902,14 @@ impl RpcServer {
 
     /// Register a newly-minted session's founding `RpcSessionInner`
     /// under its 32-byte id (new-session / empty-id accept path). Stored
-    /// as a `Weak` so a fully-torn-down session (last slot exit drops
-    /// the `Arc<RpcSessionInner>`) does not pin memory, and its id, if
-    /// later echoed, resolves to "unknown". Holds a
-    /// `Weak<RpcSessionInner>` so the attach path adds a slot onto the
-    /// founding inner directly.
+    /// as a `Weak` so the registry never keeps a session alive on its
+    /// own; the entry does outlive session death while any proxy still
+    /// pins the dead inner (proxies hold `Arc<RpcSessionInner>`), and an
+    /// id echoed onto such a session is rejected by the lifecycle —
+    /// `add_incoming_slot`'s `try_bump_live_conns` refuses `Dying`/`Dead`
+    /// — not by a dangling `Weak`. The `Weak<RpcSessionInner>` (rather
+    /// than of `SharedSession`) is what lets the attach path add a slot
+    /// onto the founding inner directly.
     fn register_session(&self, id: RpcSessionId, inner: &Arc<RpcSessionInner>) {
         let mut map = self.sessions.lock().expect("sessions poisoned");
         // Opportunistically prune fully-dead sessions so the map is

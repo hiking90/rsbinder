@@ -16,17 +16,17 @@ Async lives in the **AIDL-generated stubs**, not in the transport. The compiler
 emits the async trait (`IMyServiceAsyncService`), the async proxy
 (`into_async::<Tokio>()`), and the `new_async_binder` constructor *once*, and
 the very same async `impl` runs unchanged over **kernel binder or RPC** — including
-through the transport-agnostic [`service` facade](./cross-transport-services.md).
+through the transport-agnostic [`serve` / `connect` entry API](./cross-transport-services.md).
 
-The reason is that the facade and the transports only ever move a transport-agnostic
+The reason is that the entry API and the transports only ever move a transport-agnostic
 `SIBinder` around (register a binder under a name, look one up). Whether that binder is
 sync- or async-backed is decided entirely by which constructor produced it
 (`new_binder` vs `new_async_binder`) — a fact the transport never sees. So async needs
 **no transport-specific code**: pick the constructor, pick the transport, and the two
 compose.
 
-This chapter starts with the kernel-binder setup, then shows the RPC and unified-facade
-variants — which differ only in the bootstrap and the runtime flavor.
+This chapter starts with the kernel-binder setup, then shows the RPC variant — which
+differs only in the URI and the runtime flavor.
 
 > **Under the hood — it is a thread bridge, not a reactor.** rsbinder async is *not*
 > epoll-driven non-blocking I/O. On the client a transact runs on
@@ -57,9 +57,8 @@ depending on whether your service needs async capabilities.
 
 The trait, proxy, and constructor rows above are **identical across transports** — only the
 "Main loop" and "Runtime" rows are the kernel-binder values shown here. Over RPC the main
-loop is `rpc::Host::serve()` (or `serve_background()`) and the runtime must be
-**multi-threaded**; see [Async Over RPC and the Unified Facade](#async-over-rpc-and-the-unified-facade)
-below.
+loop is `serve("unix://…").run()` (or `spawn()`) and the runtime must be
+**multi-threaded**; see [Async Over RPC](#async-over-rpc) below.
 
 ## Setting Up the Tokio Runtime (kernel binder)
 
@@ -124,16 +123,14 @@ There are several things to note here:
   call (and therefore the process) alive indefinitely, which is the async equivalent of the
   synchronous `ProcessState::join_thread_pool()`.
 
-## Async Over RPC and the Unified Facade
+## Async Over RPC
 
-Because async lives in the generated stubs and the [`service`
-facade](./cross-transport-services.md) only moves an `SIBinder`, the *same* async service
-runs over RPC with no new code. You register the result of `new_async_binder` through the
-generic `Registry`, and the client converts the looked-up proxy with `into_async`:
+Because async lives in the generated stubs and `rsbinder::serve` / `connect` only move
+an `SIBinder`, the *same* async service runs over RPC with no new code. You `add` the
+result of `new_async_binder` and the client converts the looked-up proxy with `into_async`:
 
 ```rust
 use async_trait::async_trait;
-use rsbinder::service::{rpc, Registry, Broker};
 use rsbinder::*;
 
 struct IHelloService;
@@ -145,27 +142,16 @@ impl IHelloAsyncService for IHelloService {
         Ok(echo.to_owned())
     }
 }
-
-/// Registration is written once, generic over the transport — identical to the
-/// sync facade example in "Cross-Transport Services". Only the binder
-/// constructor differs (`new_async_binder` instead of `new_binder`).
-fn register<R: Registry>(
-    reg: &R,
-    rt: TokioRuntime<tokio::runtime::Handle>,
-) -> rsbinder::Result<()> {
-    let binder = BnHello::new_async_binder(IHelloService {}, rt).as_binder();
-    reg.add_service("hello", binder)
-}
 ```
 
 ### The server needs a multi-threaded runtime
 
 This is the one substantive difference from the kernel setup. An RPC async server is driven
-by a **blocking `serve` worker** that calls `rt.block_on(handler)`. That `block_on` runs on a
+by a **blocking serve worker** that calls `rt.block_on(handler)`. That `block_on` runs on a
 thread that is *not* the runtime's own, so the runtime must be a **multi-threaded** one — a
 `current_thread` runtime cannot be driven from an outside thread while it is also being kept
 alive elsewhere. (Kernel binder gets away with `current_thread` only because the binder
-thread pool, not a `serve` loop, supplies the worker threads.)
+thread pool, not a serve loop, supplies the worker threads.)
 
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -175,60 +161,56 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let handle = runtime.handle().clone();
+    let rt = TokioRuntime(runtime.handle().clone());
 
-    let host = rpc::Host::unix("/tmp/hello.sock")?;
-    register(&host, TokioRuntime(handle))?;
     println!("serving over RPC at /tmp/hello.sock");
-    host.serve()?; // blocks, driving this one socket
+    rsbinder::serve("unix:///tmp/hello.sock")?
+        .add("hello", BnHello::new_async_binder(IHelloService {}, rt))?
+        .run()?; // blocks, driving this one socket
     Ok(())
 }
 ```
 
-Use [`rpc::Host::serve_background()`](./cross-transport-services.md) instead of `serve()`
-if you want the socket driven on a background thread while `main` does other work.
+Use `spawn()` instead of `run()` if you want the socket driven on a background thread
+while `main` does other work (for instance from inside `runtime.block_on`).
 
 ### The client converts the looked-up proxy
 
-The client side is the ordinary facade lookup followed by `into_async`:
+The client side is the ordinary `connect` followed by `into_async` — or
+`connect_async::<dyn IHelloAsync<Tokio>>(uri).await`, which does the blocking connect on
+`spawn_blocking`:
 
 ```rust
 let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
-let broker = rpc::Broker::unix("/tmp/hello.sock")?;
-let hello = broker.get_interface::<dyn IHello>("hello")?; // sync Strong<dyn IHello>
-
 runtime.block_on(async {
-    let hello = hello.into_async::<Tokio>();
+    let hello = rsbinder::connect_async::<dyn IHelloAsync<Tokio>>("unix:///tmp/hello.sock#hello").await?;
     println!("{}", hello.echo("hi").await?);
     Ok::<_, Box<dyn std::error::Error>>(())
 })?;
 ```
 
-> The blocking bootstrap — `Broker::unix`, `get_interface` — is done *before* entering the
-> runtime; only the transacts themselves are `.await`ed. The async-over-RPC *bridge* shown
-> here (`new_async_binder` + `into_async::<Tokio>` over a real Unix-socket session, multi-thread
-> runtime) is verified end-to-end by `tests/tests/rpc_async.rs` — including many in-flight
-> calls on one shared session under genuine async concurrency. That test drives the bridge
-> through the lower-level `RpcSession` API directly rather than the `rpc::Host`/`Broker`
-> facade, but the facade is a thin wrapper over exactly that path.
+> The async-over-RPC *bridge* shown here (`new_async_binder` + the async proxy over a real
+> Unix-socket session, multi-thread runtime) is verified end-to-end by
+> `tests/tests/rpc_async.rs` — including many in-flight calls on one shared session under
+> genuine async concurrency. That test drives the bridge through the lower-level
+> `RpcSession` API directly; `serve` / `connect` are a thin wrapper over exactly that path.
 
 ### Switching transports
 
-To run the exact same async service over **kernel binder** instead, swap only the host
-construction and the runtime flavor — the `register` helper and the service `impl` are
-unchanged:
+To run the exact same async service over **kernel binder** instead, swap only the URI and
+the runtime flavor — the service `impl` is unchanged:
 
 ```rust
-let host = kernel::Host::new()?;      // instead of rpc::Host::unix(..)
-register(&host, rt())?;
-host.serve()?;                        // joins the process-wide binder pool
+rsbinder::serve("binder://")?                      // instead of "unix:///tmp/hello.sock"
+    .add("hello", BnHello::new_async_binder(IHelloService {}, rt()))?
+    .run()?;                                       // joins the process-wide binder pool
 ```
 
 Be aware that the two transports' trust boundaries differ: see
 [Security & Authorization](./security.md) — `@EnforcePermission` denies over RPC, and
 `get_calling_uid()` is the kernel-vouched peer uid on Unix RPC (fail-closed on uid-less
-transports). The facade makes the transport swap easy; it does not make the security models
+transports). The URI makes the transport swap easy; it does not make the security models
 identical.
 
 ## Implementing an Async Service
@@ -522,11 +504,11 @@ steps:
 4. Create binders with `BnXxx::new_async_binder(impl, rt())`.
 5. Use `into_async::<Tokio>()` when calling other Binder services from async code.
 6. Keep the process alive with `std::future::pending().await` (kernel binder) or
-   `rpc::Host::serve()` / `serve_background()` (RPC).
+   `serve("unix://…").run()` / `spawn()` (RPC).
 
 Because async lives in the generated stubs, the same async service runs over **either
-transport** — register the `new_async_binder` result through the [`service`
-facade](./cross-transport-services.md)'s `Registry` and look it up through `Broker`. The only
+transport** — `add` the `new_async_binder` result to `rsbinder::serve(uri)` and look it up
+with [`connect`](./cross-transport-services.md). The only
 RPC-specific requirement is a **multi-threaded** runtime, because the blocking `serve` worker
 calls `rt.block_on(handler)`.
 

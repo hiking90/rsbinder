@@ -1215,12 +1215,14 @@ fn a0b_multi_connection_shared_session() {
     );
     assert_eq!(server.attached_count(), 1, "attach count stable");
 
-    // --- Drop **only** the ATTACHED connection #2 (a partial
-    //     loss; `root2` is intentionally left alive — see below). The
-    //     session must survive: the founding connection #1 keeps
-    //     working and still reports the same shared id. A spurious
-    //     obituary / early teardown on a partial connection loss
-    //     (live_conns mis-gated) would make these DeadObject.
+    // --- Sever **only** the ATTACHED connection #2 (a partial loss).
+    //     A proxy holds its session strongly (AOSP `sp<RpcSession>` in
+    //     `BpBinder`), so `root2` must go first: dropping `c2` alone
+    //     would leave connection #2 open through `root2`. The session
+    //     must survive: the founding connection #1 keeps working and
+    //     still reports the same shared id. A spurious obituary / early
+    //     teardown on a partial connection loss (live_conns mis-gated)
+    //     would make these DeadObject.
     //
     //     The liveness probe is `get_session_id` (a zero-address
     //     special transact). It does not drop a sibling proxy here;
@@ -1230,6 +1232,7 @@ fn a0b_multi_connection_shared_session() {
     //     `f7_excess_receipt_no_leak_single_client`. This test stays
     //     focused on attach (shown above) + no premature teardown on
     //     partial loss (shown here) so its mutant gate stays clean.
+    drop(root2);
     drop(c2);
     // **Deterministic** wait for the server's attached worker to
     // exit (`serve_blocking_on` → `live_conns.fetch_sub`), replacing
@@ -1257,7 +1260,6 @@ fn a0b_multi_connection_shared_session() {
     assert_eq!(server.attached_count(), 1, "attach count stable post-drop");
 
     drop(root1);
-    drop(root2);
     drop(c1);
     drop(c3);
     // _cu's Drop handles shutdown/bg.join/join_workers/remove_file —

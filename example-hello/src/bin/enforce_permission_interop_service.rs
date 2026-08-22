@@ -13,7 +13,6 @@
 // + the `permission_controller::check_permission` proxy
 // have round-tripped against real `PermissionManagerService`.
 
-use rsbinder::service::{kernel, Registry as _};
 use rsbinder::*;
 
 use example_hello::permcheck::{BnPermCheck, IPermCheck, SERVICE_NAME};
@@ -48,15 +47,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     eprintln!("STAGE3 4-2 server: init ProcessState");
-    let host = kernel::Host::new()?;
+    let server = rsbinder::serve("binder://")?;
 
     let mut features = BinderFeatures::default();
     features.set_requesting_sid = true;
     let service = BnPermCheck::new_binder_with_features(PermCheckImpl, features);
 
     eprintln!("STAGE3 4-2 server: register `{SERVICE_NAME}`");
-    host.add_service(SERVICE_NAME, service.as_binder())?;
+    let server = server.add(SERVICE_NAME, &service)?;
 
     eprintln!("STAGE3 4-2 server: join thread pool");
-    Ok(host.serve()?)
+    Ok(server.run()?)
 }

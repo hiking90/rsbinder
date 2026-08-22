@@ -5,15 +5,15 @@
 //!
 //!     cargo run -p example-hello --bin shm_client kernel
 //!     cargo run -p example-hello --features rpc --bin shm_client rpc
+//!     cargo run -p example-hello --features rpc --bin shm_client unix:///tmp/x.sock
 
 use env_logger::Env;
 use example_hello::shm::*;
-use rsbinder::service::{kernel, Broker};
 use rsbinder::shared_memory::{BpMemory, HeapCache, IMemory, IMemoryHeap, SharedMemory};
 use rsbinder::*;
 
-fn talk<B: Broker>(broker: &B) -> rsbinder::Result<()> {
-    let shm: Strong<dyn IShm> = broker.get_interface(SERVICE_NAME)?;
+fn talk(client: &rsbinder::Client) -> rsbinder::Result<()> {
+    let shm: Strong<dyn IShm> = client.get(SERVICE_NAME)?;
 
     // ---- 1. Whole region: one fd, mapped on both sides -------------------
     let pfd = shm.getRegion()?;
@@ -54,27 +54,26 @@ fn talk<B: Broker>(broker: &B) -> rsbinder::Result<()> {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    match std::env::args().nth(1).as_deref() {
-        Some("kernel") => {
-            let broker = kernel::Broker::new()?;
-            talk(&broker)?;
-        }
-        #[cfg(feature = "rpc")]
-        Some("rpc") => {
-            use rsbinder::rpc::FileDescriptorTransportMode;
-            use rsbinder::service::rpc;
-            let broker = rpc::Broker::unix(RPC_SOCKET)?;
-            // Opt into fd passing before the first lookup; without it the
-            // service's `getRegion()` reply is rejected with BadType.
-            broker
-                .session()
-                .negotiate_fd_transport(FileDescriptorTransportMode::Unix)?;
-            talk(&broker)?;
-        }
-        _ => {
-            eprintln!("usage: shm_client <kernel|rpc>   (rpc needs --features rpc)");
+    let uri = match std::env::args().nth(1).as_deref() {
+        Some("kernel") => "binder://".to_string(),
+        Some("rpc") => format!("unix://{RPC_SOCKET}"),
+        Some(uri) => uri.to_string(),
+        None => {
+            eprintln!("usage: shm_client <kernel|rpc|URI>   (rpc needs --features rpc)");
             std::process::exit(2);
         }
-    }
+    };
+    // Shared memory travels as an fd. A Unix-socket RPC session must opt
+    // into fd passing (SCM_RIGHTS) before the first lookup — without it the
+    // service's `getRegion()` reply is rejected with BadType. Every other
+    // endpoint rejects the option, so ask the parsed endpoint rather than
+    // the URI string.
+    let client = rsbinder::Client::open_with(&uri, |_o, _endpoint| {
+        #[cfg(feature = "rpc")]
+        if _endpoint.supports_fd_passing() {
+            _o.fd_mode = Some(rsbinder::rpc::FileDescriptorTransportMode::Unix);
+        }
+    })?;
+    talk(&client)?;
     Ok(())
 }

@@ -286,13 +286,18 @@ pub(crate) struct PublishedNative {
     pub(crate) pending_reservations: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// How this process treats **blocking** (non-oneway) outgoing binder
+/// calls. AOSP `IPCThreadState::CallRestriction`. Set with
+/// [`ProcessState::set_call_restriction`] or
+/// [`ServeOptions::call_restriction`](crate::ServeOptions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CallRestriction {
-    // all calls okay
+    /// All calls are permitted (the default).
     None,
-    // log when calls are blocking
+    /// Log when a blocking call is made.
     ErrorIfNotOneway,
-    // abort process on blocking calls
+    /// Abort the process on a blocking call.
     FatalIfNotOneway,
 }
 
@@ -413,9 +418,9 @@ impl ProcessState {
 
     /// The effective max-threads `inner_init` will store for a requested
     /// value: `0` and any value `>= DEFAULT_MAX_BINDER_THREADS` clamp to
-    /// the default. Shared with the [`crate::service::kernel`] re-init
-    /// check so its "requested differs from stored" comparison matches
-    /// what was actually stored.
+    /// the default. Shared with the [`crate::serve`] / [`crate::Client`]
+    /// re-init check so its "requested differs from stored" comparison
+    /// matches what was actually stored.
     pub(crate) fn clamp_max_threads(max_threads: u32) -> u32 {
         if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
             max_threads
@@ -1206,7 +1211,7 @@ impl ProcessState {
     }
 
     /// The binder driver path this process was initialized with. Used by
-    /// the [`crate::service::kernel::Host`] builder to detect a
+    /// [`crate::serve`] / [`crate::Client`] to detect a
     /// conflicting re-init (Plan 2-16 §6) — `init`/`init_default` are
     /// idempotent and keep the first config.
     pub(crate) fn driver_name(&self) -> &std::path::Path {

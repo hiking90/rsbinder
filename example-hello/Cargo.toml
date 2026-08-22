@@ -27,9 +27,9 @@ required-features = ["rpc"]
 name = "rpc_hello_client"
 required-features = ["rpc"]
 
-# Plan 2-16 Phase D — the cross-transport facade example: identical
-# service/registration/call code, kernel vs RPC chosen by one line. Uses
-# `rsbinder::service::rpc`, so it is gated on the `rpc` feature.
+# The cross-transport example: identical service/registration/call code,
+# kernel vs RPC chosen by the URI argument. Gated on the `rpc` feature so
+# the RPC URIs are available.
 #   cargo run -p example-hello --features rpc --bin unified_service rpc
 #   cargo run -p example-hello --features rpc --bin unified_client rpc
 [[bin]]

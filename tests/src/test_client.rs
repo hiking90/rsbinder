@@ -70,27 +70,30 @@ fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
     )
 }
 
-/// Plan 2-16 Phase D — kernel-transport parity for the service facade.
-/// The `kernel::Broker` resolves the *same* running test service that the
-/// rest of this suite reaches via `hub::get_interface`, and the resolved
-/// binder is fully functional. This is the kernel half of the facade's
-/// transport-parity proof; the RPC half is `tests/service_facade.rs`
-/// (`rpc::{Host, Broker}`). Both drive the same `Registry`/`Broker`
-/// traits, so registration/lookup code is written once.
+/// Plan 2-17 entry API on the kernel transport: `Client::open("binder://")`
+/// resolves the running test service exactly like `hub` does. `try_get` (not
+/// `get`) keeps the failure fast and self-describing — `get` waits for
+/// registration, so an absent service would hang the suite instead of
+/// failing it. The RPC form of the same calls is `tests/entry_rpc.rs`.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
     ignore = "requires /dev/binder"
 )]
-fn test_facade_kernel_broker_parity() {
-    use rsbinder::service::{kernel, Broker as _};
+fn test_entry_kernel_client_parity() {
     init_test();
-    let broker = kernel::Broker::new().expect("kernel::Broker::new");
-    let service: rsbinder::Strong<dyn ITestService::ITestService> = broker
-        .get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-        .expect("facade kernel::Broker must resolve the running test service");
-    // The facade-resolved binder behaves exactly like a `hub`-resolved one.
-    assert_eq!(service.RepeatString("facade"), Ok("facade".to_string()));
+    let desc = <BpTestService as ITestService::ITestService>::descriptor();
+    let client = rsbinder::Client::open("binder://").expect("Client::open(binder://)");
+    let service: rsbinder::Strong<dyn ITestService::ITestService> = client
+        .try_get(desc)
+        .expect("Client::try_get")
+        .expect("test service must be running");
+    assert_eq!(service.RepeatString("entry"), Ok("entry".to_string()));
+    // `connect` is the one-call form; it waits, which is right for a client
+    // but is why the lookup above uses `try_get`.
+    let direct: rsbinder::Strong<dyn ITestService::ITestService> =
+        rsbinder::connect(&format!("binder://{desc}")).expect("connect(binder://name)");
+    assert_eq!(direct.RepeatString("connect"), Ok("connect".to_string()));
 }
 
 /// `wait_for_interface` (the event-driven AOSP `waitForService` equivalent,

@@ -267,6 +267,17 @@ impl RpcState {
         false
     }
 
+    /// Session death: release every local object the peer held (AOSP
+    /// `RpcState::clear`). Returns the strong refs so the caller drops
+    /// them **outside** the state lock (a dropped service may run
+    /// arbitrary user `Drop` code). After this the proxy→session strong
+    /// ref ([`super::proxy::RpcProxy`]) cannot form a cycle through a
+    /// service that stored a proxy of this same session.
+    pub fn clear_local(&mut self) -> Vec<SIBinder> {
+        self.local_by_ptr.clear();
+        self.local_nodes.drain().map(|(_, n)| n.binder).collect()
+    }
+
     /// Get or create the deduped remote-proxy `SIBinder` for `addr`.
     /// `make` is only called when there is no live proxy yet.
     ///

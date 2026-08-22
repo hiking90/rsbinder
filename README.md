@@ -80,7 +80,7 @@ $ cargo run -p example-hello --features rpc --bin rpc_hello_client
 
 ## Cross-transport services & authorization
 
-Write service registration and lookup **once** and pick kernel binder or RPC by construction — the `rsbinder::service` facade (`Registry` / `Broker`) keeps the AIDL interface, generated stubs, and call sites transport-agnostic. Async works the same way over either transport. Calling identity and authorization stay coherent across the trust boundary: `get_calling_uid()` returns the kernel-vouched peer uid over Unix RPC, and `@EnforcePermission` methods fail closed (deny) over RPC rather than silently granting.
+Write service registration and lookup **once** and pick kernel binder or RPC by URI — `rsbinder::serve("binder://")` / `serve("unix:///path")` and `rsbinder::connect("binder://name")` are the whole bootstrap, and the AIDL interface, generated stubs, and call sites are transport-agnostic. Async works the same way over either transport. Calling identity and authorization stay coherent across the trust boundary: `get_calling_uid()` returns the kernel-vouched peer uid over Unix RPC, and `@EnforcePermission` methods fail closed (deny) over RPC rather than silently granting.
 
 See [Cross-Transport Services](book/src/cross-transport-services.md), [Security & Authorization](book/src/security.md), and [Async Service](book/src/async-service.md) in the book.
 

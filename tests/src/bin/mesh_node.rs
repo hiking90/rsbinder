@@ -35,7 +35,6 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rsbinder::service::{Broker as _, Registry as _};
 use rsbinder::*;
 
 include!(concat!(env!("OUT_DIR"), "/mesh.rs"));
@@ -49,7 +48,7 @@ use mesh::NodeKind::NodeKind;
 const RPC_ROOT_VERSION: u32 = 0; // r34 default profile
 
 /// Service name every node registers/resolves the `IMeshNode` binder under,
-/// for *both* transports via the [`rsbinder::service`] facade's named-service
+/// for *both* transports via `rsbinder::serve` / `connect`'s named-service
 /// model. Over RPC each session is a private directory, so a fixed name is
 /// safe; over kernel the orchestrator passes a per-run unique
 /// `--kernel-service` name (the shared device service manager is global), so
@@ -258,22 +257,17 @@ fn hammer(
     true
 }
 
-fn connect_peer_rpc(path: &str) -> Result<(rsbinder::service::rpc::Broker, Strong<dyn IMeshNode>)> {
-    // The facade Broker owns the underlying `RpcSession`, so keeping it
-    // alongside the proxy keeps the connection up (no more "drop session →
-    // DeadObject"). Resolution is the named-service model: the peer's
-    // `Host::add_service(MESH_SVC, ..)` published the binder; we look it up
-    // by the same name through this session's in-process directory.
-    let broker = rsbinder::service::rpc::Broker::unix(path)?;
-    let node: Strong<dyn IMeshNode> = broker.get_interface(MESH_SVC)?;
+fn connect_peer_rpc(path: &str) -> Result<Strong<dyn IMeshNode>> {
+    // Named-service model: the peer's `serve(..).add(MESH_SVC, ..)`
+    // published the binder; `connect` looks it up through the session's
+    // in-process directory. The proxy keeps the session alive.
+    let node: Strong<dyn IMeshNode> = rsbinder::connect(&format!("unix://{path}#{MESH_SVC}"))?;
     // A connect() can succeed against a socket whose server has bound but
     // not yet entered its accept/serve loop; the first transaction then
     // races and may surface DeadObject. Probe once here so the caller's
     // retry loop treats that as "not ready yet" rather than a real error.
     node.receivedCount()?;
-    // The broker owns the session/connection; it must outlive `node` or the
-    // proxy goes DeadObject. Caller keeps both.
-    Ok((broker, node))
+    Ok(node)
 }
 
 fn print_summary(name: &str, role: &str, s: &Stats, served: i32) {
@@ -317,10 +311,10 @@ fn run_rpc_server(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listen = cfg.listen.as_ref().ok_or("rpc-server requires --listen")?;
     let _ = std::fs::remove_file(listen);
-    let host = rsbinder::service::rpc::Host::unix(listen)?;
     let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::RPC, Arc::clone(&served));
-    host.add_service(MESH_SVC, BnMeshNode::new_binder(svc).as_binder())?;
-    let _bg = host.serve_background();
+    let _bg = rsbinder::serve(&format!("unix://{listen}"))?
+        .add(MESH_SVC, BnMeshNode::new_binder(svc))?
+        .spawn()?;
 
     // Give peers a moment to bind, then hammer them as a client too.
     let mut stats = Stats::default();
@@ -333,6 +327,10 @@ fn run_rpc_server(
     serve_until(deadline);
 
     print_summary(&cfg.name, &cfg.role, &stats, served.load(Ordering::Relaxed));
+    // Detach: dropping the guard would `join_workers()`, and a peer that
+    // still holds a session would stall this node's exit (the harness
+    // `wait()`s without a timeout). The process is ending anyway.
+    std::mem::forget(_bg);
     Ok(())
 }
 
@@ -359,9 +357,6 @@ fn run_rpc_client(
 /// Connect to every `--peer` (with bounded retry while they come up) and
 /// hammer each in turn until the deadline.
 fn drive_peers(cfg: &Config, deadline: Instant, stats: &mut Stats) {
-    // Keep each broker (which owns the RPC session) alive alongside its
-    // proxy for the whole run, or the proxy goes DeadObject.
-    let mut brokers: Vec<rsbinder::service::rpc::Broker> = Vec::new();
     let mut nodes: Vec<Strong<dyn IMeshNode>> = Vec::new();
     // Reserve ~20% of the window (capped at 3s) for hammering, so even a
     // short run still exchanges after connecting.
@@ -379,8 +374,7 @@ fn drive_peers(cfg: &Config, deadline: Instant, stats: &mut Stats) {
         let mut backoff = Duration::from_millis(20);
         loop {
             match connect_peer_rpc(p) {
-                Ok((broker, n)) => {
-                    brokers.push(broker);
+                Ok(n) => {
                     nodes.push(n);
                     break;
                 }
@@ -418,14 +412,12 @@ fn run_kernel_server(
         .kernel_service
         .as_ref()
         .ok_or("kernel-server requires --kernel-service")?;
-    // `kernel::Host::new` does the (idempotent) ProcessState init but does
-    // NOT start the thread pool — `Host::serve` would block joining the
-    // process-wide pool, and this node also needs to run as a client, so we
-    // start the pool directly (the documented non-blocking kernel serve).
-    let host = rsbinder::service::kernel::Host::new()?;
+    // `spawn()` on the kernel: ProcessState init + register + start the
+    // thread pool without joining it, so this node can also run as a client.
     let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::KERNEL, Arc::clone(&served));
-    host.add_service(name, BnMeshNode::new_binder(svc).as_binder())?;
-    rsbinder::ProcessState::start_thread_pool();
+    let _kernel = rsbinder::serve("binder://")?
+        .add(name, BnMeshNode::new_binder(svc))?
+        .spawn()?;
 
     // Also act as an RPC client against peers, if any.
     let mut stats = Stats::default();
@@ -454,30 +446,52 @@ fn run_kernel_client(
     // ECONNREFUSED across the 20-process mesh.
     let _bg = if let Some(listen) = &cfg.listen {
         let _ = std::fs::remove_file(listen);
-        let host = rsbinder::service::rpc::Host::unix(listen)?;
         let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::RPC, Arc::clone(&served));
-        host.add_service(MESH_SVC, BnMeshNode::new_binder(svc).as_binder())?;
-        Some(host.serve_background())
+        Some(
+            rsbinder::serve(&format!("unix://{listen}"))?
+                .add(MESH_SVC, BnMeshNode::new_binder(svc))?
+                .spawn()?,
+        )
     } else {
         None
     };
 
-    // `kernel::Broker::new` does the (idempotent) ProcessState init so the
-    // system service manager is reachable.
-    let broker = rsbinder::service::kernel::Broker::new()?;
+    // `Client::open("binder://")` does the (idempotent) ProcessState init
+    // so the system service manager is reachable.
+    let client = rsbinder::Client::open("binder://")?;
 
-    // Connect the kernel service with bounded retry.
+    // Connect the kernel service with bounded retry (`try_get` does not
+    // wait, so the retry budget stays ours).
     let mut kernel_node: Option<Strong<dyn IMeshNode>> = None;
     let mut attempt = 0;
     while Instant::now() < deadline {
-        match broker.get_interface::<dyn IMeshNode>(name) {
-            Ok(n) => {
+        match client.try_get::<dyn IMeshNode>(name) {
+            Ok(Some(n)) => {
                 kernel_node = Some(n);
                 break;
             }
-            Err(_) if attempt < 50 => {
+            // Not registered yet is the expected startup state; a hard
+            // error is not, so surface it once instead of retrying blind.
+            Ok(None) if attempt < 50 => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) if attempt < 50 => {
+                if attempt == 0 {
+                    eprintln!(
+                        "mesh_node {}: kernel lookup {name} failed, retrying: {e:?}",
+                        cfg.name
+                    );
+                }
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "mesh_node {}: kernel service {name} never registered",
+                    cfg.name
+                );
+                break;
             }
             Err(e) => {
                 eprintln!(
@@ -499,5 +513,10 @@ fn run_kernel_client(
         serve_until(deadline);
     }
     print_summary(&cfg.name, &cfg.role, &stats, served.load(Ordering::Relaxed));
+    // Detach (see `run_rpc_server`): a peer still holding a session must
+    // not stall this node's exit.
+    if let Some(bg) = _bg {
+        std::mem::forget(bg);
+    }
     Ok(())
 }

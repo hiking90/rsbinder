@@ -19,7 +19,7 @@
 use std::any::Any;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, OnceLock, RwLock, Weak};
+use std::sync::{self, Arc, OnceLock, RwLock};
 
 use crate::binder::{DeathRecipient, IBinder, SIBinder, Stability, Transactable, WIBinder};
 use crate::binder::{TransactionCode, TransactionFlags};
@@ -40,7 +40,17 @@ pub struct RpcProxy {
     /// In-place — never a replacement proxy — keeps the dedup-cache
     /// identity and the single `DEC_STRONG` intact.
     descriptor: OnceLock<String>,
-    session: Weak<RpcSessionInner>,
+    /// **Strong** session ref (AOSP `BpBinder::RpcSessionBinder` holds
+    /// `sp<RpcSession>`): a proxy alone keeps its session — and thus
+    /// the connection — alive. The session's `remote_proxies` table is
+    /// `Weak`, so the only cycle back to the session runs through a
+    /// *local* object the peer holds; that is broken by
+    /// [`RpcSessionInner::on_session_dead`], which runs when a serve loop
+    /// ends, when a transaction fails on a lost connection, or on an
+    /// explicit [`RpcSession::shutdown`](super::RpcSession::shutdown) —
+    /// the last being the only break available to a session that neither
+    /// serves nor transacts again.
+    session: Arc<RpcSessionInner>,
     /// Death-notification state, mirroring the kernel
     /// [`ProxyHandle`](crate::proxy::ProxyHandle) exactly. RPC has no
     /// death *wire* message (AOSP `RpcState::sendObituaries`): an RPC
@@ -54,7 +64,7 @@ pub struct RpcProxy {
 }
 
 impl RpcProxy {
-    pub(crate) fn new(addr: RpcAddress, session: Weak<RpcSessionInner>) -> Self {
+    pub(crate) fn new(addr: RpcAddress, session: Arc<RpcSessionInner>) -> Self {
         RpcProxy {
             addr,
             descriptor: OnceLock::new(),
@@ -171,7 +181,7 @@ impl RpcProxy {
     /// Hand-written typed stubs call this, write their args, then
     /// [`RpcProxy::transact`].
     pub fn build_request(&self, descriptor: &str) -> Result<Parcel> {
-        let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
+        let inner = &self.session;
         let mut data = Parcel::new();
         // Enter RPC mode + stamp the negotiated FD policy (default
         // `None` ⇒ `ParcelFileDescriptor::serialize` rejects FDs).
@@ -192,8 +202,7 @@ impl RpcProxy {
         data: &Parcel,
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>> {
-        let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
-        inner.client_transact(self.addr, code, data, flags)
+        self.session.client_transact(self.addr, code, data, flags)
     }
 }
 
@@ -205,7 +214,7 @@ impl RpcProxy {
 /// generated `from_binder` (`stamp_descriptor`).
 impl crate::binder::RemoteProxy for RpcProxy {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
-        let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
+        let inner = &self.session;
         let mut data = Parcel::new();
         data.configure_rpc(
             inner.parcel_ops(),
@@ -240,14 +249,13 @@ impl Drop for RpcProxy {
         // on a single-slot session a synchronous `find_conn` would
         // `cv.wait` if another thread already drives the slot, blocking
         // the user's hot path for the full peer round-trip.
-        if let Some(inner) = self.session.upgrade() {
-            inner.queue_dec_strong(self.addr);
-            // Identity-checked: if this proxy's `Arc` already hit 0 and
-            // a concurrent `read_binder` re-cached a fresh live proxy
-            // for the same address, this stale `Drop` must NOT evict
-            // that successor (see `forget_remote_if`).
-            inner.forget_remote_if(&self.addr, self as *const RpcProxy as *const ());
-        }
+        let inner = &self.session;
+        inner.queue_dec_strong(self.addr);
+        // Identity-checked: if this proxy's `Arc` already hit 0 and
+        // a concurrent `read_binder` re-cached a fresh live proxy
+        // for the same address, this stale `Drop` must NOT evict
+        // that successor (see `forget_remote_if`).
+        inner.forget_remote_if(&self.addr, self as *const RpcProxy as *const ());
     }
 }
 
@@ -265,10 +273,11 @@ impl IBinder for RpcProxy {
     /// [`RpcSession::serve_blocking`](super::session::RpcSession) on
     /// connection loss, so a peer that wants death notification must
     /// run a serve loop (it already does for nested callbacks). A
-    /// session that is never served still registers the recipient but
-    /// will not deliver until something drives the connection — a
-    /// documented rsbinder model property, faithful to AOSP's
-    /// incoming-thread requirement.
+    /// session that is never served still registers the recipient and
+    /// delivers **lazily**: the first transaction that fails on the lost
+    /// connection runs the same death sequence (obituaries + local
+    /// object release) — a documented rsbinder model property, faithful
+    /// to AOSP's incoming-thread requirement.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
@@ -313,9 +322,9 @@ impl IBinder for RpcProxy {
 
     fn ping_binder(&self) -> Result<()> {
         // PING_TRANSACTION round-trip (no payload, no reply body).
-        let inner = self.session.upgrade().ok_or(StatusCode::DeadObject)?;
         let data = Parcel::new();
-        inner.client_transact(self.addr, crate::binder::PING_TRANSACTION, &data, 0)?;
+        self.session
+            .client_transact(self.addr, crate::binder::PING_TRANSACTION, &data, 0)?;
         Ok(())
     }
 
