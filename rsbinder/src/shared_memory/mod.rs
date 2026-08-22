@@ -15,6 +15,10 @@
 //!   receiver-side mapping of an fd that arrived through a parcel.
 //!   See [`heap`](crate::shared_memory::heap) for the backing-store table and the aliasing
 //!   contract.
+//! * [`MemoryDealer`](crate::shared_memory::MemoryDealer) — AOSP's chunk
+//!   allocator: one heap, many `IMemory` windows, with
+//!   [`HeapCache`](crate::shared_memory::HeapCache) on the receiving side
+//!   so the heap is mapped once. See [`dealer`](crate::shared_memory::dealer).
 //!
 //! A shared region travels over any transport that can carry an fd:
 //! the kernel binder (`BINDER_TYPE_FD`) and Unix-socket RPC with
@@ -29,10 +33,12 @@
 //! constructor returns `Err(StatusCode::InvalidOperation)`; check
 //! [`is_supported`](crate::shared_memory::is_supported) to branch at runtime.
 
+pub mod dealer;
 pub mod heap;
 pub mod shared;
 pub mod wire;
 
+pub use dealer::{Allocation, MemoryDealer, ALLOCATION_ALIGNMENT};
 pub use heap::{
     is_supported, MappedHeap, MemoryHeapBase, FLAG_DONT_MAP_LOCALLY, FLAG_FORCE_MEMFD,
     FLAG_MEMFD_ALLOW_SEALING, FLAG_NO_CACHING, SEAL_FUTURE_WRITE, SEAL_GROW, SEAL_SEAL,
@@ -40,8 +46,8 @@ pub use heap::{
 };
 pub use shared::{region_size, SharedMemory};
 pub use wire::{
-    export_heap, BnMemory, BnMemoryHeap, BpMemory, BpMemoryHeap, MemoryBase, GET_MEMORY, HEAP_ID,
-    IMEMORY_DESCRIPTOR, IMEMORY_HEAP_DESCRIPTOR,
+    export_heap, BnMemory, BnMemoryHeap, BpMemory, BpMemoryHeap, HeapCache, MemoryBase, GET_MEMORY,
+    HEAP_ID, IMEMORY_DESCRIPTOR, IMEMORY_HEAP_DESCRIPTOR,
 };
 
 /// AOSP `IMemoryHeap::READ_ONLY` flag

@@ -22,10 +22,13 @@ use std::thread;
 
 use rsbinder::rpc::{FileDescriptorTransportMode as FdMode, RpcServer, RpcSession};
 use rsbinder::shared_memory::{
-    export_heap, BpMemory, BpMemoryHeap, IMemory, IMemoryHeap, MemoryBase, MemoryHeapBase,
-    FLAG_READ_ONLY,
+    export_heap, BpMemory, BpMemoryHeap, HeapCache, IMemory, IMemoryHeap, MemoryBase, MemoryDealer,
+    MemoryHeapBase, FLAG_READ_ONLY,
 };
-use rsbinder::StatusCode;
+use rsbinder::{
+    Binder, Interface, Parcel, Remotable, Result as RsResult, StatusCode, TransactionCode,
+    FIRST_CALL_TRANSACTION,
+};
 
 fn page() -> usize {
     rustix::param::page_size()
@@ -270,6 +273,95 @@ fn heap_fd_rejected_without_fd_mode() {
     assert_eq!(bp.size(), 0);
 
     drop(bp);
+    drop(client);
+    bound.finish(bg);
+}
+
+/// A tiny handwritten service handing out dealer allocations: code 1 →
+/// reply = one `IMemory` binder per call (index in the request).
+struct BnAllocs(Vec<rsbinder::shared_memory::Allocation>);
+impl Remotable for BnAllocs {
+    fn descriptor() -> &'static str {
+        "rsbinder.test.IAllocs"
+    }
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> RsResult<()> {
+        match code {
+            FIRST_CALL_TRANSACTION => {
+                let i: i32 = reader.read()?;
+                let a = self.0.get(i as usize).ok_or(StatusCode::BadValue)?;
+                reply.write(&a.export())
+            }
+            _ => Err(StatusCode::UnknownTransaction),
+        }
+    }
+    fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> RsResult<()> {
+        Ok(())
+    }
+}
+
+/// Plan 4-7a Phase D: three dealer allocations cross the session as
+/// three `IMemory` binders; with a `HeapCache` the client maps the heap
+/// once and reads each block at its own offset.
+#[test]
+fn dealer_allocations_share_one_mapping_through_heap_cache() {
+    let bound = Bound::new("dealer");
+    bound.server.set_supported_fd_modes(&[FdMode::Unix]);
+    let dealer = MemoryDealer::new(page() * 4, 0).unwrap();
+    let allocs: Vec<_> = (0..3)
+        .map(|i| {
+            let a = dealer.allocate(page() / 2 + i * 64).unwrap();
+            a.write_at(0, format!("block-{i}").as_bytes()).unwrap();
+            a
+        })
+        .collect();
+    let offsets: Vec<usize> = allocs.iter().map(|a| a.offset()).collect();
+    bound
+        .server
+        .set_root(Interface::as_binder(&Binder::new(BnAllocs(allocs))));
+    let bg = bound.run();
+
+    let client = bound.connect(true);
+    let root = client.get_root().unwrap();
+    let rp = (*root)
+        .as_any()
+        .downcast_ref::<rsbinder::rpc::RpcProxy>()
+        .expect("RpcProxy");
+    let cache = HeapCache::new();
+    let mut heaps = Vec::new();
+    for i in 0..3i32 {
+        let mut data = rp.build_request("rsbinder.test.IAllocs").unwrap();
+        data.write(&i).unwrap();
+        let mut reply = rp
+            .transact(FIRST_CALL_TRANSACTION, &data, 0)
+            .unwrap()
+            .unwrap();
+        let mem_binder: rsbinder::SIBinder = reply.read().unwrap();
+        let bp = BpMemory::new_with_cache(mem_binder, cache.clone());
+        let heap = bp.resolve().unwrap();
+        assert_eq!(bp.offset(), offsets[i as usize]);
+        let mut buf = [0u8; 7];
+        bp.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, format!("block-{i}").as_bytes());
+        heaps.push((bp, heap));
+    }
+    // One heap proxy (one HEAP_ID, one mmap) behind all three windows.
+    assert!(Arc::ptr_eq(&heaps[0].1, &heaps[1].1));
+    assert!(Arc::ptr_eq(&heaps[1].1, &heaps[2].1));
+    assert_eq!(cache.len(), 1);
+    assert_eq!(heaps[0].1.size(), page() * 4);
+
+    // Client writes into block 2; the owner sees it at the block's offset.
+    heaps[2].0.write_at(8, b"from-client").unwrap();
+    let mut back = [0u8; 11];
+    dealer.heap().read_at(offsets[2] + 8, &mut back).unwrap();
+    assert_eq!(&back, b"from-client");
+    drop(heaps);
+    assert!(cache.is_empty(), "weak entries are pruned once unused");
     drop(client);
     bound.finish(bg);
 }

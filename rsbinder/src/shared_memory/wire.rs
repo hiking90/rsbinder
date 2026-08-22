@@ -28,7 +28,7 @@
 //! first use, like AOSP `BpMemoryHeap::assertReallyMapped()` /
 //! `BpMemory::getMemory()`; it never re-transacts.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::heap::MappedHeap;
 use super::{IMemory, IMemoryHeap};
@@ -216,6 +216,73 @@ impl IMemoryHeap for BpMemoryHeap {
     }
 }
 
+/// Receiver-side cache of [`BpMemoryHeap`] per heap binder (AOSP
+/// `HeapCache`). Allocations from one [`MemoryDealer`](super::MemoryDealer)
+/// all name the same heap binder; resolving them through a shared cache
+/// maps the heap **once** and turns every further allocation into a
+/// bare `(offset, size)` — no fd passing, no `mmap` per buffer.
+///
+/// Entries are weak: the mapping lives as long as some [`BpMemory`] /
+/// caller holds the `Arc<BpMemoryHeap>`; dead entries (and the heap
+/// binder reference they pin) are dropped on the next access of any
+/// kind. Keyed by binder identity (`SIBinder == SIBinder`), which is per
+/// kernel handle / per RPC address.
+#[derive(Default)]
+pub struct HeapCache {
+    entries: Mutex<Vec<(SIBinder, Weak<BpMemoryHeap>)>>,
+}
+
+impl std::fmt::Debug for HeapCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeapCache")
+            .field("live", &self.live().len())
+            .finish()
+    }
+}
+
+impl HeapCache {
+    /// An empty cache, already in the `Arc` that
+    /// [`BpMemory::new_with_cache`] takes so one instance is shared by
+    /// every `IMemory` of a session.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Lock the table with dead entries pruned — every accessor goes
+    /// through here, so a heap binder is released as soon as the cache
+    /// is next touched, not only on the next insert.
+    fn live(&self) -> std::sync::MutexGuard<'_, Vec<(SIBinder, Weak<BpMemoryHeap>)>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(_, w)| w.strong_count() > 0);
+        entries
+    }
+
+    /// The shared proxy for `heap_binder`, creating it on first sight.
+    pub fn get_or_insert(&self, heap_binder: &SIBinder) -> Arc<BpMemoryHeap> {
+        let mut entries = self.live();
+        if let Some(h) = entries
+            .iter()
+            .find(|(b, _)| b == heap_binder)
+            .and_then(|(_, w)| w.upgrade())
+        {
+            return h;
+        }
+        let h = Arc::new(BpMemoryHeap::new(heap_binder.clone()));
+        entries.push((heap_binder.clone(), Arc::downgrade(&h)));
+        h
+    }
+
+    /// Number of heaps currently mapped through this cache.
+    pub fn len(&self) -> usize {
+        self.live().len()
+    }
+
+    /// `true` if no heap is currently held through this cache.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 // ---------------------------------------------------------------------
 // IMemory
 // ---------------------------------------------------------------------
@@ -338,14 +405,28 @@ struct Resolved {
 pub struct BpMemory {
     binder: SIBinder,
     resolved: OnceLock<Resolved>,
+    cache: Option<Arc<HeapCache>>,
 }
 
 impl BpMemory {
-    /// Wrap a binder obtained from a parcel / service lookup.
+    /// Wrap a binder obtained from a parcel / service lookup. The heap it
+    /// names gets its own mapping; use [`new_with_cache`](Self::new_with_cache)
+    /// when many `IMemory`s share one heap (a `MemoryDealer` peer).
     pub fn new(binder: SIBinder) -> Self {
         Self {
             binder,
             resolved: OnceLock::new(),
+            cache: None,
+        }
+    }
+
+    /// Like [`new`](Self::new), but the heap proxy is shared through
+    /// `cache`, so allocations from the same dealer map the heap once.
+    pub fn new_with_cache(binder: SIBinder, cache: Arc<HeapCache>) -> Self {
+        Self {
+            binder,
+            resolved: OnceLock::new(),
+            cache: Some(cache),
         }
     }
 
@@ -365,7 +446,10 @@ impl BpMemory {
         let heap_binder: SIBinder = reply.read()?;
         let offset64 = reply.read_i64()?;
         let size64 = reply.read_u64()?;
-        let heap = Arc::new(BpMemoryHeap::new(heap_binder));
+        let heap = match &self.cache {
+            Some(c) => c.get_or_insert(&heap_binder),
+            None => Arc::new(BpMemoryHeap::new(heap_binder)),
+        };
         let mapped = heap.map()?;
         let (offset, size) = clamp_window(mapped.size(), offset64, size64);
         let r = self

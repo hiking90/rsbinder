@@ -26,4 +26,6 @@ fn main() {
     aidl("aidl/rt_inherit/IRtCheck.aidl", "rt_inherit.rs");
     // Plan 2-16 handler-side authorization example interface.
     aidl("aidl/authz/IAuthz.aidl", "authz.rs");
+    // Shared-memory example interface (`bin/shm_{service,client}`).
+    aidl("aidl/shm/IShm.aidl", "shm.rs");
 }

@@ -39,6 +39,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `MappedHeap::from_fd_strict` works there; new
   `MemoryHeapBase::seal_future_write` / `MappedHeap::seal_future_write`.
   Plan: `plans/4-7b-macos-shared-memory.md`.
+- **rsbinder (shared memory):** `MemoryDealer` — AOSP's chunk allocator over
+  one shared heap (`SimpleBestFitAllocator`: 32-byte granules, best-fit,
+  coalescing, page-aligned blocks). Each `Allocation` is an
+  `android.utils.IMemory` window returned to the dealer on drop. On the
+  receiving side `HeapCache` shares one `BpMemoryHeap` per heap binder, so a
+  peer maps a dealer's heap once (`BpMemory::new_with_cache`).
+- **example-hello / book:** `shm_service` / `shm_client` (kernel binder or
+  Unix-socket RPC with `--features rpc`) and a *Shared Memory* chapter
+  covering both the `SharedMemory` region and the `MemoryDealer` frame
+  patterns.
 - **rsbinder (internal):** `ParcelFileDescriptor` serialization is now layered
   on crate-private `write_raw_fd` / `read_raw_fd` (AOSP
   `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
