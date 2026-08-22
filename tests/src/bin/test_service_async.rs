@@ -65,7 +65,7 @@ use trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::{
 };
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -855,6 +855,10 @@ fn rt() -> TokioRuntime<tokio::runtime::Handle> {
     TokioRuntime(tokio::runtime::Handle::current())
 }
 
+/// Mirrors `test_service.rs` (Plan 4-7a E4).
+const SHM_SERVICE_NAME: &str = "rsbinder.test.shm";
+const SHM_PATTERN: &[u8] = b"kernel-shm-from-server";
+
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
@@ -916,6 +920,29 @@ fn main() {
         );
         hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())
         .expect("Could not register service");
+
+        // Plan 4-7a E4: the same `android.utils.IMemory` window `test_service`
+        // serves, so `test_shared_memory_window_over_kernel_binder` also
+        // passes against the async service (the window is transport-side
+        // only — nothing async about it).
+        let page = rustix::param::page_size();
+        let shm_heap = Arc::new(
+            rsbinder::shared_memory::MemoryHeapBase::new(page * 2, 0).expect("shared memory heap"),
+        );
+        shm_heap
+            .write_at(page, SHM_PATTERN)
+            .expect("write shared memory pattern");
+        let shm_memory = Arc::new(
+            rsbinder::shared_memory::MemoryBase::new(
+                shm_heap.clone(),
+                rsbinder::shared_memory::export_heap(shm_heap.clone()),
+                page,
+                page,
+            )
+            .expect("shared memory window"),
+        );
+        hub::add_service(SHM_SERVICE_NAME, shm_memory.export())
+            .expect("Could not register shm service");
 
         // Readiness signal for the integration harness (see test_service.rs):
         // all services registered; stderr is unbuffered so it reaches a
