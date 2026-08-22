@@ -1069,19 +1069,50 @@ impl RpcSessionInner {
         Some(id)
     }
 
-    /// Remove a slot from the pool. Two legitimate callers: the slot's
+    /// Remove a slot from the pool. Three legitimate callers: the slot's
     /// *own* worker on its `serve_blocking_on` exit (self-remove), and
-    /// `client_transact`'s stale-reply poison path (a non-reentrant slot
-    /// whose transport desynced mid-transaction). After a poison, the
-    /// slot's worker finds its slot gone and gets `DeadObject` from
-    /// `find_conn_pinned` — an expected exit signal, not a structural
-    /// bug. `notify_all` so any `find_conn` (any-available) waiter
-    /// re-evaluates against the shrunk pool.
+    /// `client_transact`'s two poison paths (a non-reentrant slot whose
+    /// send failed at the transport, or whose reply read desynced the
+    /// stream). After a poison, the slot's worker finds its slot gone and
+    /// gets `DeadObject` from `find_conn_pinned` — an expected exit
+    /// signal, not a structural bug. `notify_all` so any `find_conn`
+    /// (any-available) waiter re-evaluates against the shrunk pool.
+    ///
+    /// **Not a pure pool mutation:** emptying the pool runs the full
+    /// death sequence ([`on_session_dead`](Self::on_session_dead)), which
+    /// fires obituaries and drops the peer's local objects — i.e. it can
+    /// re-enter user `Drop` code. Callers must hold no session lock.
     fn remove_slot(&self, slot_id: u64) {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         st.slots.retain(|s| s.id != slot_id);
+        let empty = st.slots.is_empty();
         drop(st);
         self.slot_cv.notify_all();
+        // Pool empty ⇒ no connection left; a serve-less client reaches
+        // death only here.
+        if empty && self.shared.lifecycle.try_drop_sole_connection() {
+            self.on_session_dead();
+        }
+    }
+
+    /// Full session death (the `Dying` state has just been entered):
+    /// fire the obituaries, settle to `Dead`, then release every local
+    /// object the peer held (AOSP `RpcState::clear`) — the step that
+    /// breaks `session → local service → stored proxy → session`.
+    /// Strong refs are dropped outside every lock — user `Drop` code may
+    /// re-enter the session.
+    pub(crate) fn on_session_dead(&self) {
+        self.send_session_obituaries();
+        self.shared.lifecycle.mark_dead();
+        let root = self.shared.root.lock().expect("root poisoned").take();
+        let locals = self
+            .shared
+            .state
+            .lock()
+            .expect("rpc state poisoned")
+            .clear_local();
+        drop(locals);
+        drop(root);
     }
 
     pub(crate) fn fd_mode(&self) -> FileDescriptorTransportMode {
@@ -1362,7 +1393,9 @@ impl RpcSessionInner {
         {
             return Ok(Some(local));
         }
-        let weak = self.self_weak();
+        // `self_weak` is published in `with_shared` and `self` is reached
+        // through that `Arc`, so this upgrade cannot fail; `?` is defensive.
+        let strong = self.self_weak().upgrade().ok_or(StatusCode::DeadObject)?;
         // Explicit inner block: the `MutexGuard` is bound to `st` and
         // dropped at the closing `}`, **before** the excess
         // `DEC_STRONG` send below. This makes the no-I/O-under-the-
@@ -1376,7 +1409,8 @@ impl RpcSessionInner {
         let (sib, excess) = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
             st.remote_proxy(addr, || {
-                SIBinder::new(Arc::new(RpcProxy::new(addr, weak))).expect("SIBinder::new(RpcProxy)")
+                SIBinder::new(Arc::new(RpcProxy::new(addr, strong)))
+                    .expect("SIBinder::new(RpcProxy)")
             })
         };
         if excess {
@@ -1482,6 +1516,11 @@ impl RpcSessionInner {
         // (empty unless `Unix` fd-mode).
         if let Err(e) = self.send_msg(transport, &frame, data.rpc_out_fds()) {
             rollback();
+            // Transport-level send failure ⇒ peer gone on this connection;
+            // retire the slot like the reply path (encode errors are not).
+            if matches!(e, RpcError::PeerClosed | RpcError::Io(_)) && !conn.reentrant {
+                self.remove_slot(conn.slot_id);
+            }
             return Err(e.into());
         }
         if oneway {
@@ -2099,6 +2138,25 @@ impl RpcSessionInner {
 }
 
 /// A single-connection RPC session (client and/or server role).
+///
+/// # Lifetime
+///
+/// Proxies obtained over this session (`get_root`, binders read from
+/// replies) hold the session **strongly** — AOSP `BpBinder` ↔
+/// `sp<RpcSession>`. Dropping this handle does not invalidate them; the
+/// connection closes when the last proxy and handle are gone. The
+/// converse also holds: while the *peer* still holds one of this
+/// endpoint's local objects (a callback it was handed), the session
+/// stays alive until the peer releases it (`DEC_STRONG`) or the
+/// connection ends — so dropping every proxy is not a guaranteed
+/// disconnect. On connection loss every local object the peer held is
+/// released (AOSP `RpcState::clear`); for a session without a serve
+/// thread that loss is detected on the next failed transaction.
+///
+/// That leaves one case the runtime cannot notice: a local object handed
+/// to the peer may itself hold a proxy back into this session, and if the
+/// session neither serves nor transacts again, nothing runs the release.
+/// [`RpcSession::shutdown`] is the explicit break for it.
 #[derive(Clone)]
 pub struct RpcSession {
     inner: Arc<RpcSessionInner>,
@@ -2201,6 +2259,13 @@ impl RpcSession {
             .name("rsbinder-rpc-reaper".into())
             .spawn(move || reaper_loop(weak_for_reaper, dec_strong_rx));
         RpcSession { inner }
+    }
+
+    /// Test-only leak probe: a `Weak` on the session inner, so a test can
+    /// assert the whole session graph was reclaimed after a disconnect.
+    #[cfg(test)]
+    pub(crate) fn inner_weak(&self) -> Weak<RpcSessionInner> {
+        Arc::downgrade(&self.inner)
     }
 
     /// Id of the founding (first) slot. All non-attach
@@ -2689,8 +2754,7 @@ impl RpcSession {
         // Dying → Dead via `mark_dead` so subsequent attach attempts
         // and best-effort `dec_strong` calls see a settled state.
         if self.inner.shared.lifecycle.drop_connection() {
-            self.inner.send_session_obituaries();
-            self.inner.shared.lifecycle.mark_dead();
+            self.inner.on_session_dead();
         }
         // Drop this worker's slot from the pool **after**
         // the lifecycle transition + obituary so a concurrent
@@ -2722,6 +2786,30 @@ impl RpcSession {
             .shared
             .max_threads
             .store(n.max(1), Ordering::SeqCst);
+    }
+
+    /// Declare this session dead now: fire every cached proxy's
+    /// `binder_died` and release every local object the peer held (AOSP
+    /// `RpcState::clear`). Idempotent; subsequent transactions on proxies
+    /// of this session fail with [`StatusCode::DeadObject`].
+    ///
+    /// Normally death is detected on its own — a serve loop ending, or a
+    /// transaction failing on a lost connection. This is the explicit
+    /// form, and it is the **only** way to break the
+    /// `session → local object → stored proxy → session` reference cycle
+    /// for a session that has no serve loop and will never transact
+    /// again: a service this endpoint handed to the peer may hold a proxy
+    /// back into the same session, and proxies keep the session alive (see
+    /// the type-level `# Lifetime` note). Call it when abandoning such a
+    /// session.
+    ///
+    /// Unlike AOSP `RpcSession::shutdownAndWait` this does **not** join
+    /// worker threads or interrupt a blocked `serve_blocking`; those exit
+    /// on their own when the transport closes.
+    pub fn shutdown(&self) {
+        if self.inner.shared.lifecycle.try_drop_sole_connection() {
+            self.inner.on_session_dead();
+        }
     }
 
     /// Set the client reply/handshake wait deadline. `None`

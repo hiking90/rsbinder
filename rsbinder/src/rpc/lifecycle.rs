@@ -159,19 +159,19 @@ impl SessionLifecycle {
     ///
     /// In a `Live(n)` state with `n > 1` this CAS-decrements and
     /// returns `false`. In `Live(1)` it CAS-transitions to `Dying` and
-    /// returns `true`. Calling from `Dying`/`Dead` is a contract
-    /// violation (only one founding worker observes the `1→0` edge);
-    /// a `debug_assert` catches it.
+    /// returns `true`. From `Dying`/`Dead` it returns `false`: death has
+    /// already been declared, either by another connection's exit or by
+    /// [`try_drop_sole_connection`](Self::try_drop_sole_connection) when
+    /// a failing transaction emptied the slot pool first. At most one
+    /// caller ever observes the `1→0` edge, which is what the obituary
+    /// contract needs.
     pub(crate) fn drop_connection(&self) -> bool {
         let mut v = self.inner.load(Ordering::SeqCst);
         loop {
             if v >> STATE_SHIFT != STATE_LIVE_TAG {
-                // Contract violation (double `drop_connection`, or a call from
-                // Dying/Dead). In release, refuse rather than let `v - 1`
-                // underflow the tag/count and *resurrect* a torn-down session —
-                // the exact invariant this type exists to protect. No obituary
-                // edge is reported. In debug this still trips the assertion.
-                debug_assert!(false, "drop_connection called from non-Live state");
+                // Death already declared. Refusing (rather than letting `v - 1`
+                // underflow the tag/count) is what keeps a torn-down session
+                // from being resurrected — the invariant this type exists for.
                 return false;
             }
             let count = v & COUNT_MASK;
@@ -189,6 +189,26 @@ impl SessionLifecycle {
                 Err(actual) => v = actual,
             }
         }
+    }
+
+    /// Client-side death detection counterpart of [`drop_connection`]:
+    /// `Live(1) → Dying` **only** when this is the sole connection and
+    /// the session is still `Live`; `false` (no-op, no assert) from any
+    /// other state. Used when a session with no serve worker loses its
+    /// last pool slot (a client whose peer went away) so the same
+    /// obituary + clear sequence runs there. This races a serve worker's
+    /// own `drop_connection` and either may win: whichever call observes
+    /// the `1→0` edge runs the death sequence, and the loser gets
+    /// `false` from a settled state.
+    pub(crate) fn try_drop_sole_connection(&self) -> bool {
+        self.inner
+            .compare_exchange(
+                encode_live(1),
+                encode_dying(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// Transition `Dying → Dead`. The caller MUST have just fired
@@ -373,6 +393,29 @@ mod tests {
     /// scheme — a racing `RpcProxy::drop` reaper now sees the
     /// `Dying` state and skips immediately instead of blocking on an
     /// empty slot pool.
+    /// A failing transaction that empties the slot pool
+    /// (`try_drop_sole_connection`) may declare death before the slot's
+    /// own serve worker reaches its unconditional `drop_connection()` on
+    /// exit. That later call must be a quiet `false`, not a panic:
+    /// `serve_blocking` is public API and this ordering is reachable
+    /// whenever a client runs a serve loop and transacts concurrently.
+    #[test]
+    fn drop_connection_after_death_declared_elsewhere_is_quiet() {
+        let lc = SessionLifecycle::new();
+        assert!(lc.try_drop_sole_connection(), "Live(1) -> Dying");
+        lc.mark_dead();
+        assert!(
+            !lc.drop_connection(),
+            "the serve worker's exit must not report a second obituary edge"
+        );
+        assert!(lc.is_torn_down());
+        // The reverse order stays intact: the worker wins, the pool hook loses.
+        let lc = SessionLifecycle::new();
+        assert!(lc.drop_connection(), "Live(1) -> Dying");
+        assert!(!lc.try_drop_sole_connection());
+        lc.mark_dead();
+    }
+
     #[test]
     fn dying_window_is_observable_to_hot_path_checks() {
         let lc = SessionLifecycle::new();

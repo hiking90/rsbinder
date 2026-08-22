@@ -297,6 +297,9 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
 }
 
 #[cfg(test)]
+mod strong_session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::StatusCode;
