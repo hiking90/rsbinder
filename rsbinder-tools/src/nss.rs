@@ -152,6 +152,17 @@ type GroupListId = libc::gid_t;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 type GroupListId = libc::c_int;
 
+/// One `getgrouplist` entry as a `gid_t`.
+///
+/// A no-op on Linux, where [`GroupListId`] already *is* `u32`, and a real
+/// conversion on the BSD-derived platforms, where it is a signed `int`.
+/// Written as a function so the `allow` covers exactly the cast that is
+/// redundant on one target and required on the other.
+#[allow(clippy::unnecessary_cast)]
+fn gid_of(id: GroupListId) -> u32 {
+    id as u32
+}
+
 /// Every group `uid` belongs to: its primary gid plus every supplementary
 /// group. Returns an empty set if the uid is not in the user database —
 /// an unknown uid simply matches no group rule, which under default-deny
@@ -215,7 +226,7 @@ pub fn gids_for_uid(uid: u32) -> BTreeSet<u32> {
             groups
                 .iter()
                 .take(ngroups.max(0) as usize)
-                .map(|g| *g as u32),
+                .map(|g| gid_of(*g)),
         );
         return gids;
     }
