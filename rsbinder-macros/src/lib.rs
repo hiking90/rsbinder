@@ -684,6 +684,32 @@ interface IGolden4 {
         assert_eq!(expected, actual, "generated code differs");
     }
 
+    /// The self-referencing shape, now that the AIDL front-end renders it
+    /// correctly (it used to emit `Strong<dyn Box<IFoo>>`). This is the
+    /// callback pattern users reach for first, so it is worth pinning on both
+    /// paths.
+    #[test]
+    fn self_referencing_interface() {
+        assert_same(
+            r#"
+interface IGolden6 {
+    void register(in IGolden6 cb);
+    IGolden6 fetch();
+}
+"#,
+            "IGolden6",
+            quote! {
+                pub trait IGolden6 {
+                    fn register(
+                        &self,
+                        cb: &rsbinder::Strong<dyn IGolden6>,
+                    ) -> BinderResult<()>;
+                    fn fetch(&self) -> BinderResult<rsbinder::Strong<dyn IGolden6>>;
+                }
+            },
+        );
+    }
+
     #[test]
     fn rejects_generic_trait() {
         let item: ItemTrait = syn::parse2(quote! {

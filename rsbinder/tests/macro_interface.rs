@@ -35,6 +35,16 @@ pub trait IMacroSink {
     fn hit(&self, tag: &str) -> BinderResult<()>;
 }
 
+/// A self-referencing interface: the callback is the same type as the
+/// callee. `rsbinder-aidl` used to render this shape as `Strong<dyn Box<I>>`,
+/// which did not compile — this test exists so that stays fixed on the macro
+/// path too, since `syn` parsing alone would not have caught it.
+#[interface(descriptor = "rsbinder.test.IMacroChain")]
+pub trait IMacroChain {
+    fn relay(&self, next: &Strong<dyn IMacroChain>, msg: &str) -> BinderResult<String>;
+    fn name(&self) -> BinderResult<String>;
+}
+
 struct Echo {
     pinged: Arc<Mutex<u32>>,
 }
@@ -78,6 +88,19 @@ impl IMacroSink for Sink {
     fn hit(&self, tag: &str) -> BinderResult<()> {
         self.seen.lock().unwrap().push(tag.to_string());
         Ok(())
+    }
+}
+
+struct Chain {
+    tag: String,
+}
+impl Interface for Chain {}
+impl IMacroChain for Chain {
+    fn relay(&self, next: &Strong<dyn IMacroChain>, msg: &str) -> BinderResult<String> {
+        Ok(format!("{}>{}:{msg}", self.tag, next.name()?))
+    }
+    fn name(&self) -> BinderResult<String> {
+        Ok(self.tag.clone())
     }
 }
 
@@ -175,4 +198,28 @@ fn macro_interface_descriptor_is_the_attribute_value() {
         <Sink as IMacroSink>::descriptor(),
         "rsbinder.test.IMacroSink"
     );
+}
+
+#[test]
+fn macro_interface_can_reference_itself() {
+    let sock = SockPath::new("chain");
+    let _guard = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add(
+            "chain",
+            BnMacroChain::new_binder(Chain {
+                tag: "server".into(),
+            }),
+        )
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let chain: Strong<dyn IMacroChain> = rsbinder::connect(&sock.uri("#chain")).expect("connect");
+    let local = BnMacroChain::new_binder(Chain {
+        tag: "local".into(),
+    });
+
+    // The server calls back into the binder we handed it, of its own type.
+    assert_eq!(chain.relay(&local, "hi").unwrap(), "server>local:hi");
 }

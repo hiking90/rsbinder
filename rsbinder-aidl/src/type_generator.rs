@@ -325,19 +325,24 @@ impl TypeGenerator {
         // so the generated path / `Strong<dyn …>` / `Box<…>` compiles. The
         // `relative_mod` module path is already keyword-escaped.
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
+        let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
+        let refers_to_self = curr_ns.ns.last().unwrap() == lookup_decl.name.ns.last().unwrap();
         let name = if !ns.is_empty() {
             format!("{ns}::{simple}")
-        } else if curr_ns.ns.last().unwrap() == lookup_decl.name.ns.last().unwrap().as_str() {
-            format!("Box<{simple}>") // To avoid, recursive type issue.
+        } else if refers_to_self && !is_interface {
+            // A parcelable that names itself would be infinitely sized, so the
+            // field has to be behind a pointer. An interface must NOT be boxed
+            // here: it is already rendered as `Strong<dyn …>`, which is a
+            // handle, and `dyn Box<IFoo>` is not a trait — it does not compile.
+            format!("Box<{simple}>")
         } else {
             simple.into_owned()
         };
 
-        match lookup_decl.decl {
-            Declaration::Interface(_) => {
-                format!("{}::Strong<dyn {}>", crate_name(), name)
-            }
-            _ => name,
+        if is_interface {
+            format!("{}::Strong<dyn {}>", crate_name(), name)
+        } else {
+            name
         }
     }
 

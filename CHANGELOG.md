@@ -94,6 +94,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
 
+### Fixed
+
+- **rsbinder-aidl:** an interface that names *itself* in a signature
+  (`interface IFoo { void register(in IFoo cb); }`) rendered as
+  `Strong<dyn Box<IFoo>>` and did not compile — the guard that boxes a
+  self-referencing *parcelable* field, which genuinely needs the indirection,
+  was being applied to interfaces, where `Strong<dyn …>` is already a handle.
+  Self-referencing callbacks now generate correctly; recursive parcelables are
+  unchanged, and so is every other generated file.
+
 ### Removed
 
 - **rsbinder (`service` module):** the `rsbinder::service` facade (`Registry` /

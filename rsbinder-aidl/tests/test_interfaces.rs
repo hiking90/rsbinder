@@ -321,3 +321,68 @@ interface IDuplicate {
         "transaction code 10 conflict between",
     );
 }
+
+/// An interface that names *itself* in a signature.
+///
+/// This used to render as `Strong<dyn Box<IFoo>>` — the self-reference guard
+/// that boxes a recursive *parcelable* field was applied to interfaces too.
+/// `dyn Box<IFoo>` is not a trait, so the emitted module did not compile. No
+/// in-tree `.aidl` has a self-referencing interface, which is why it survived.
+#[test]
+fn self_referencing_interface_is_not_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+interface ISelfRef {
+    void register(in ISelfRef cb);
+    ISelfRef fetch();
+    @nullable ISelfRef maybe();
+    void many(in ISelfRef[] cbs);
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(
+        !out.contains("Box<"),
+        "a binder handle needs no box:\n{out}"
+    );
+    assert!(out.contains("rsbinder::Strong<dyn ISelfRef>"), "{out}");
+    assert!(
+        out.contains("Option<rsbinder::Strong<dyn ISelfRef>>"),
+        "@nullable must still be an Option:\n{out}"
+    );
+    assert!(
+        out.contains("Vec<rsbinder::Strong<dyn ISelfRef>>"),
+        "arrays must still be Vec:\n{out}"
+    );
+    // The point of the fix: the module compiles.
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// The counterpart the box guard exists for: a parcelable naming itself is
+/// infinitely sized without one, so this must keep boxing.
+#[test]
+fn self_referencing_parcelable_is_still_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+parcelable Node {
+    int value;
+    @nullable Node next;
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(out.contains("Option<Box<Node>>"), "{out}");
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
