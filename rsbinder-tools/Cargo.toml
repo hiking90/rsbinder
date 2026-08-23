@@ -18,3 +18,5 @@ log.workspace = true
 env_logger.workspace = true
 anstyle.workspace = true
 clap.workspace = true
+libc.workspace = true
+thiserror.workspace = true

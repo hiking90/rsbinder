@@ -112,6 +112,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
+- **rsbinder-tools (`rsb_device`):** `--group` and `--mode` for the binder
+  device node. Binder has no in-kernel access control of its own, so the node
+  is the only gate on who may speak binder at all.
+
 ### Changed
 
 - **rsbinder — breaking (internal representation):** a proxy's weak identity
@@ -123,6 +127,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   they come from different `Arc<ProxyHandle>` allocations — which was already
   the documented intent for case-(b) resurrection, and is now also true after
   the obituary.
+- **rsbinder-tools (`rsb_device`) — breaking:** the binder device node is now
+  created `0600` (root only) instead of `0666` (world read/write). Grant access
+  deliberately: `sudo rsb_device binder --group binder --mode 0660`, with your
+  user in that group — the same model as `/dev/kvm` being `0660 root:kvm`.
 - **rsbinder-tools (`rsb_hub`):** `listServices` and `getServiceDebugInfo`
   return names in sorted order. The registry is a `BTreeMap` now, matching
   AOSP's `std::map`; previously the order shuffled between calls.

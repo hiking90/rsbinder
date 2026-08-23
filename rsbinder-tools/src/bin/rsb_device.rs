@@ -8,6 +8,7 @@ use std::process::Command;
 
 use anstyle::*;
 use rsbinder::*;
+use rsbinder_tools::nss::gid_for_group;
 
 /// Returns `true` if `binderfs_path` is a current mount point in `/proc/mounts`.
 ///
@@ -26,6 +27,37 @@ fn mounts_text_contains_target(mounts: &str, target: &Path) -> bool {
             .nth(1)
             .is_some_and(|t| Path::new(t) == target)
     })
+}
+
+/// Default permission bits for a newly created binder device node.
+///
+/// Root-only. Binder has no in-kernel access control of its own, so the
+/// device node's mode is the only gate on *who can speak binder at all* —
+/// the same model as `/dev/kvm` (`0660 root:kvm`). An operator grants
+/// access deliberately with `--group` / `--mode`; nothing is world-writable
+/// by default.
+const DEFAULT_DEVICE_MODE: u32 = 0o600;
+
+/// Parse an octal permission spec (`"660"`, `"0660"`, `"0o660"`).
+///
+/// Rejects set-uid / set-gid / sticky bits: they are meaningless on a
+/// character device and would only widen the blast radius of a typo.
+fn parse_mode(spec: &str) -> std::result::Result<u32, String> {
+    let digits = spec
+        .strip_prefix("0o")
+        .or_else(|| spec.strip_prefix("0O"))
+        .unwrap_or(spec);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit() && b < b'8') {
+        return Err(format!("mode must be octal digits, got {spec:?}"));
+    }
+    let mode = u32::from_str_radix(digits, 8).map_err(|e| format!("invalid mode {spec:?}: {e}"))?;
+    if mode > 0o777 {
+        return Err(format!(
+            "mode {spec:?} out of range: set-uid/set-gid/sticky bits are not \
+             accepted on a device node (max 777)"
+        ));
+    }
+    Ok(mode)
 }
 
 fn log_ok(msg: &str) {
@@ -47,16 +79,47 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
              .help("Name of the binder device to create on binderfs, accessible via /dev/binderfs/<device_name>")
              .required(true)
              .index(1))
+        .arg(clap::Arg::new("mode")
+             .short('m')
+             .long("mode")
+             .value_name("MODE")
+             .help("Octal permission bits for the device node (default: 0600, root only)"))
+        .arg(clap::Arg::new("group")
+             .short('g')
+             .long("group")
+             .value_name("GROUP")
+             .help("Group name or numeric gid to own the device node (default: unchanged)"))
         .after_help("Examples:\n    \
-            Create a new binder device named 'mybinder':\n    \
-            $ ./rsb_device mybinder\n    \
-            This command will create a device accessible at /dev/binderfs/mybinder.\n\n\
-            Create a new binder device named 'test_device':\n    \
-            $ ./rsb_device test_device\n    \
-            This command will create a device accessible at /dev/binderfs/test_device.")
+            Create a root-only binder device (default 0600):\n    \
+            $ sudo ./rsb_device mybinder\n\n    \
+            Grant a group access, the /dev/kvm model:\n    \
+            $ sudo groupadd -f binder\n    \
+            $ sudo ./rsb_device binder --group binder --mode 0660\n    \
+            $ sudo usermod -aG binder \"$USER\"\n\n    \
+            The device node's mode is the only gate on who can speak binder at\n    \
+            all -- binder itself has no in-kernel access control. rsb_hub layers\n    \
+            per-service policy on top; see its --policy option.")
         .get_matches();
 
     env_logger::init();
+
+    // Resolve --mode and --group up front. Everything below this point
+    // mutates the system (mounting binderfs, allocating a device node), and a
+    // rejected argument must not leave half of that behind.
+    let mode = match app.get_one::<String>("mode") {
+        Some(spec) => match parse_mode(spec) {
+            Ok(mode) => mode,
+            Err(err) => log_err(&err),
+        },
+        None => DEFAULT_DEVICE_MODE,
+    };
+    let gid = match app.get_one::<String>("group") {
+        Some(spec) => match gid_for_group(spec) {
+            Ok(gid) => Some((spec.clone(), gid)),
+            Err(err) => log_err(&err.to_string()),
+        },
+        None => None,
+    };
 
     let binderfs_path = Path::new(DEFAULT_BINDERFS_PATH);
     let control_path = Path::new(DEFAULT_BINDER_CONTROL_PATH);
@@ -151,14 +214,33 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             err
         )),
     };
-    perms.set_mode(0o666);
+    // Chown before chmod: widening the mode first would leave a window in
+    // which the node is group-accessible while still owned by the *old*
+    // group. Ordering it this way means the node is never more permissive
+    // than the operator asked for.
+    if let Some((spec, gid)) = &gid {
+        let gid = *gid;
+        match std::os::unix::fs::chown(&device_path, None, Some(gid)) {
+            Ok(()) => log_ok(&format!(
+                "Group set to {spec} (gid {gid}) for {}",
+                device_path.display()
+            )),
+            Err(err) => log_err(&format!(
+                "Failed to set group of {} to {spec}\n{}",
+                device_path.display(),
+                err
+            )),
+        }
+    }
+
+    perms.set_mode(mode);
     match std::fs::set_permissions(&device_path, perms) {
         Ok(()) => log_ok(&format!(
-            "Permission set to 0666 for {}",
+            "Permission set to {mode:04o} for {}",
             device_path.display()
         )),
         Err(err) => log_err(&format!(
-            "Failed to change the permission of device path({}) to 0666\n{}",
+            "Failed to change the permission of device path({}) to {mode:04o}\n{}",
             device_path.display(),
             err
         )),
@@ -188,10 +270,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     println!("\nSummary:");
     println!(
-        "The binder device '{device_name}' has been successfully created \
-        and is accessible at /dev/binderfs/{device_name} with full permissions (read/write by all users). \
-        This setup facilitates IPC mechanisms within the Linux kernel.\n"
+        "The binder device '{device_name}' has been created at \
+        /dev/binderfs/{device_name} with mode {mode:04o}."
     );
+    if mode & 0o077 == 0 && gid.is_none() {
+        println!(
+            "Only root can open it. Grant access deliberately, e.g.\n    \
+            $ sudo {} {device_name} --group binder --mode 0660",
+            std::env::args()
+                .next()
+                .unwrap_or_else(|| "rsb_device".to_owned())
+        );
+    }
+    println!();
 
     Ok(())
 }
@@ -245,5 +336,38 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
             mounts,
             Path::new("/dev/binderfs")
         ));
+    }
+
+    #[test]
+    fn parse_mode_accepts_octal_spellings() {
+        assert_eq!(parse_mode("660").unwrap(), 0o660);
+        assert_eq!(parse_mode("0660").unwrap(), 0o660);
+        assert_eq!(parse_mode("0o660").unwrap(), 0o660);
+        assert_eq!(parse_mode("600").unwrap(), DEFAULT_DEVICE_MODE);
+        assert_eq!(parse_mode("0").unwrap(), 0);
+        assert_eq!(parse_mode("777").unwrap(), 0o777);
+    }
+
+    /// `8`/`9` are decimal digits that are *not* octal — a spec like "666"
+    /// read as decimal would silently mean 0o1232, so the digit class must
+    /// be checked, not just `from_str_radix`'s error.
+    #[test]
+    fn parse_mode_rejects_non_octal() {
+        assert!(parse_mode("").is_err());
+        assert!(parse_mode("0o").is_err());
+        assert!(parse_mode("668").is_err());
+        assert!(parse_mode("6a6").is_err());
+        assert!(parse_mode("-660").is_err());
+        assert!(parse_mode(" 660").is_err());
+    }
+
+    /// set-uid / set-gid / sticky on a character device is never wanted and
+    /// is the shape a typo takes (`4660` for `0660`).
+    #[test]
+    fn parse_mode_rejects_special_bits() {
+        assert!(parse_mode("4660").is_err());
+        assert!(parse_mode("2660").is_err());
+        assert!(parse_mode("1660").is_err());
+        assert!(parse_mode("7777").is_err());
     }
 }
