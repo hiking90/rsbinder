@@ -3,10 +3,12 @@
 
 //! Library half of `rsbinder-tools`.
 //!
-//! The CLI binaries (`rsb_hub`, `rsb_device`) stay thin; anything worth
-//! unit-testing on its own lives here. Currently that is the service
-//! manager's configuration — access-control policy today, service
-//! declarations next — see [`config`] and `plans/6-1-hub-access-control.md`.
+//! The CLI binaries (`rsb_hub`, `rsb_service`, `rsb_device`) stay thin;
+//! anything worth unit-testing on its own lives here. Today that is the
+//! service manager's configuration ([`config`] — access control, service
+//! declarations, on-demand activation) and its readiness notification
+//! ([`notify`]). See `plans/6-rsb-hub-linux.md`.
 
 pub mod config;
+pub mod notify;
 pub mod nss;

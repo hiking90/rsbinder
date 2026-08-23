@@ -9,6 +9,7 @@ use hub::android_16::{
 };
 use rsbinder::*;
 use rsbinder_tools::config::{self, Activator, Enforcer, Permission, SystemResolver, SystemRunner};
+use rsbinder_tools::notify::Notifier;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -1844,29 +1845,43 @@ fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
     std::process::exit(1);
 }
 
-/// A `sigset_t` containing only SIGHUP.
-fn sighup_set() -> std::io::Result<libc::sigset_t> {
+/// The signals `rsb_hub` consumes itself rather than dying from.
+///
+/// SIGHUP reloads the configuration; SIGTERM and SIGINT are a deliberate
+/// stop. Handling the latter two is what lets the hub tell its supervisor
+/// it is going down on purpose — a hub killed by the default disposition
+/// exits "by signal", which systemd records as a failure and a reader of
+/// the journal cannot tell from a crash.
+const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGHUP, libc::SIGTERM, libc::SIGINT];
+
+/// A `sigset_t` containing exactly [`HANDLED_SIGNALS`].
+fn handled_signal_set() -> std::io::Result<libc::sigset_t> {
     // SAFETY: `sigemptyset` fully initializes the zeroed set before
     // `sigaddset` or any reader touches it, and both take a valid pointer
     // to a live local.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
-        if libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, libc::SIGHUP) != 0 {
+        if libc::sigemptyset(&mut set) != 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        for signo in HANDLED_SIGNALS {
+            if libc::sigaddset(&mut set, signo) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         Ok(set)
     }
 }
 
-/// Block SIGHUP in this thread, and therefore in every thread spawned
-/// later.
+/// Block [`HANDLED_SIGNALS`] in this thread, and therefore in every thread
+/// spawned later.
 ///
 /// `pthread_sigmask` is per-thread and a new thread inherits its creator's
-/// mask, so doing this before anything else spawns is what makes the
-/// reloader thread's `sigwait` the single consumer. Without the block,
-/// SIGHUP's default disposition would simply kill rsb_hub.
-fn block_sighup() -> std::io::Result<()> {
-    let set = sighup_set()?;
+/// mask, so doing this before anything else spawns is what makes the signal
+/// thread's `sigwait` the single consumer. Without the block, each signal's
+/// default disposition would simply kill rsb_hub.
+fn block_handled_signals() -> std::io::Result<()> {
+    let set = handled_signal_set()?;
     // SAFETY: `set` is initialized above and only read by the call; the
     // null `oldset` means "do not report the previous mask".
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
@@ -1876,21 +1891,38 @@ fn block_sighup() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Reload the policy from `path` on every SIGHUP.
+/// What a SIGHUP reloads, when there is a configuration to reload.
 ///
-/// A failed reload **keeps the policy already in force**. Dropping to
-/// deny-all would take the machine's IPC down over a typo, and falling back
-/// to permissive would do the opposite and worse; continuing with the last
-/// known-good policy is the only option that neither breaks nor silently
-/// opens the system. The failure is logged at error level.
-fn spawn_policy_reloader(enforcer: Arc<Enforcer>, path: PathBuf) {
+/// `None` under `--insecure-allow-all`: there is no configuration, so a
+/// SIGHUP has nothing to do — but the thread still runs, because SIGTERM
+/// must be handled in that mode too.
+struct Reloadable {
+    enforcer: Arc<Enforcer>,
+    path: PathBuf,
+}
+
+/// Consume [`HANDLED_SIGNALS`] for the life of the process.
+///
+/// A failed reload **keeps the configuration already in force**. Dropping
+/// to deny-all would take the machine's IPC down over a typo, and falling
+/// back to permissive would do the opposite and worse; continuing with the
+/// last known-good configuration is the only option that neither breaks nor
+/// silently opens the system. The failure is logged at error level.
+///
+/// SIGTERM/SIGINT exit the process from this thread. There is nothing to
+/// flush — the registry is in memory and dies with it, exactly as AOSP's
+/// `servicemanager` does when init kills it — so "graceful" here means
+/// telling the supervisor this was intentional and saying so in the log.
+fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) {
     let spawn_result = std::thread::Builder::new()
-        .name("rsb_hub:reload".to_owned())
+        .name("rsb_hub:signals".to_owned())
         .spawn(move || {
-            let set = match sighup_set() {
+            let set = match handled_signal_set() {
                 Ok(set) => set,
                 Err(e) => {
-                    log::error!("rsb_hub: cannot build the SIGHUP set, reload disabled: {e}");
+                    log::error!(
+                        "rsb_hub: cannot build the signal set; reload and clean shutdown                          are disabled: {e}"
+                    );
                     return;
                 }
             };
@@ -1901,41 +1933,69 @@ fn spawn_policy_reloader(enforcer: Arc<Enforcer>, path: PathBuf) {
                 let rc = unsafe { libc::sigwait(&set, &mut signo) };
                 if rc != 0 {
                     log::error!(
-                        "rsb_hub: sigwait failed, reload disabled: {}",
+                        "rsb_hub: sigwait failed; reload and clean shutdown are disabled: {}",
                         std::io::Error::from_raw_os_error(rc)
                     );
                     return;
                 }
-                match config::load(&path, &SystemResolver) {
-                    Ok(loaded) => {
-                        let rules = loaded.policy.rules.len();
-                        let services = loaded.declarations.len();
-                        enforcer.replace(loaded);
-                        log::info!(
-                            "rsb_hub: SIGHUP reloaded {rules} rule(s) and {services} \
-                             service declaration(s) from {}",
-                            path.display()
-                        );
+                match signo {
+                    libc::SIGHUP => reload(reloadable.as_ref(), &notifier),
+                    // SIGTERM is `systemctl stop`; SIGINT is Ctrl-C from the
+                    // terminal that started it. Same intent, same answer.
+                    _ => {
+                        let name = if signo == libc::SIGINT { "SIGINT" } else { "SIGTERM" };
+                        log::info!("rsb_hub: {name} received, shutting down");
+                        notifier.stopping("shutting down");
+                        // Exit successfully: this was asked for. Nothing is
+                        // pending that a longer unwind would finish, and the
+                        // binder device is released by the kernel on exit.
+                        std::process::exit(0);
                     }
-                    Err(err) => log::error!(
-                        "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
-                         force: {err}",
-                        path.display()
-                    ),
                 }
             }
         });
     if let Err(e) = spawn_result {
-        log::error!("rsb_hub: failed to spawn the policy reloader thread: {e}");
+        log::error!("rsb_hub: failed to spawn the signal thread: {e}");
+    }
+}
+
+/// One SIGHUP's worth of work.
+fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
+    let Some(Reloadable { enforcer, path }) = reloadable else {
+        log::warn!("rsb_hub: SIGHUP ignored; running with --insecure-allow-all, no configuration");
+        return;
+    };
+    match config::load(path, &SystemResolver) {
+        Ok(loaded) => {
+            let rules = loaded.policy.rules.len();
+            let services = loaded.declarations.len();
+            enforcer.replace(loaded);
+            log::info!(
+                "rsb_hub: SIGHUP reloaded {rules} rule(s) and {services} \
+                 service declaration(s) from {}",
+                path.display()
+            );
+            notifier.status(&format!(
+                "serving; {rules} rule(s), {services} declaration(s)"
+            ));
+        }
+        Err(err) => log::error!(
+            "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
+             force: {err}",
+            path.display()
+        ),
     }
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Before anything spawns a thread, so the mask is inherited everywhere.
-    if let Err(e) = block_sighup() {
-        eprintln!("rsb_hub: cannot block SIGHUP: {e}");
+    // Both before anything spawns a thread: the signal mask is inherited by
+    // every later thread, and `Notifier::from_environment` mutates the
+    // environment, which is only sound while single-threaded.
+    if let Err(e) = block_handled_signals() {
+        eprintln!("rsb_hub: cannot block signals: {e}");
         std::process::exit(1);
     }
+    let notifier = Arc::new(Notifier::from_environment());
 
     let matches = clap::Command::new("rsb_hub")
         .version(env!("CARGO_PKG_VERSION"))
@@ -1990,7 +2050,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Run with configuration from somewhere other than /etc/rsbinder/hub.d:\n    \
             $ rsb_hub --config /usr/local/etc/rsbinder/hub.d\n\n    \
             Run with no access control (development only):\n    \
-            $ rsb_hub --insecure-allow-all\n\n    \
+            $ rsb_hub --insecure-allow-all\n\n\
+            Signals:\n    \
+            SIGHUP           reload the configuration (a failed reload keeps the\n                     \
+            one already in force)\n    \
+            SIGTERM, SIGINT  stop, reporting a clean exit to the supervisor\n\n\
+            Under systemd, use Type=notify: rsb_hub reports READY=1 only once it\n\
+            holds handle 0, so units ordered After= it never race the registry.\n\n    \
             Note: The binder device must be created first using rsb_device.\n    \
             rsb_hub denies every request that its policy does not allow, and \n    \
             refuses to start when no policy can be loaded.",
@@ -2018,7 +2084,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let enforcer = if insecure_allow_all {
+    let (enforcer, reloadable, ready_status) = if insecure_allow_all {
         // Loud on stderr as well as the log: this is a running service
         // manager with no access control, and the operator has to be able
         // to see that from the terminal that started it.
@@ -2028,24 +2094,31 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
         log::warn!("rsb_hub: running with --insecure-allow-all; no access control is applied");
         log::warn!("rsb_hub: SIGHUP will be ignored (there is no policy to reload)");
-        Arc::new(Enforcer::allow_all())
+        (
+            Arc::new(Enforcer::allow_all()),
+            None,
+            "serving; NO ACCESS CONTROL (--insecure-allow-all)".to_owned(),
+        )
     } else {
         let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
-        let enforcer = match config::load(&path, &SystemResolver) {
+        let (enforcer, rules, services) = match config::load(&path, &SystemResolver) {
             Ok(loaded) => {
+                let (rules, services) = (loaded.policy.rules.len(), loaded.declarations.len());
                 log::info!(
-                    "rsb_hub: loaded {} rule(s) and {} service declaration(s) from {}",
-                    loaded.policy.rules.len(),
-                    loaded.declarations.len(),
+                    "rsb_hub: loaded {rules} rule(s) and {services} service declaration(s) from {}",
                     path.display()
                 );
-                Arc::new(Enforcer::enforcing(loaded))
+                (Arc::new(Enforcer::enforcing(loaded)), rules, services)
             }
             Err(err) => exit_without_config(&path, &err),
         };
-        spawn_policy_reloader(Arc::clone(&enforcer), path);
-        enforcer
+        (
+            Arc::clone(&enforcer),
+            Some(Reloadable { enforcer, path }),
+            format!("serving; {rules} rule(s), {services} declaration(s)"),
+        )
     };
+    spawn_signal_thread(reloadable, Arc::clone(&notifier));
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
@@ -2076,7 +2149,27 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         log::error!("rsb_hub: could not self-register as '{SELF_SERVICE_NAME}': {e:?}");
     }
 
-    ProcessState::as_self().become_context_manager(service.as_binder())?;
+    // A binder device has exactly one context manager, and the kernel is
+    // what enforces it — a lock file here would be a second, weaker truth.
+    // What is worth adding is a legible failure: the raw ioctl error says
+    // nothing about the one thing that is almost always the cause.
+    if let Err(e) = ProcessState::as_self().become_context_manager(service.as_binder()) {
+        eprintln!("rsb_hub: cannot become the service manager for {binder_path}: {e}");
+        eprintln!();
+        eprintln!("A binder device has exactly one service manager, so this usually means");
+        eprintln!("one is already running on {binder_path}. Check with:");
+        eprintln!("    rsb_service --device {device_name} check manager");
+        eprintln!();
+        eprintln!("To run a second, independent service manager, give it its own device:");
+        eprintln!("    sudo rsb_device other && rsb_hub --device other");
+        std::process::exit(1);
+    }
+
+    // Only now: handle 0 is ours, so this is the first instant at which a
+    // client can reach the hub. Announcing readiness any earlier would let
+    // systemd release units ordered `After=` into a race.
+    log::info!("rsb_hub: serving on {binder_path}");
+    notifier.ready(&ready_status);
 
     Ok(ProcessState::join_thread_pool()?)
 }
@@ -2555,6 +2648,27 @@ mod tests {
         assert!(dump_filter_matches(&filter, "com.example.IFoo/default"));
         assert!(dump_filter_matches(&filter, "manager"));
         assert!(!dump_filter_matches(&filter, "com.example.IBar/default"));
+    }
+
+    /// The mask has to cover *shutdown* as well as reload: a signal that
+    /// reaches the thread but is not in the set blocked at startup would
+    /// have already killed the process by its default disposition.
+    #[test]
+    fn the_blocked_signal_set_covers_reload_and_shutdown() {
+        let set = handled_signal_set().expect("building a sigset cannot fail here");
+        for signo in [libc::SIGHUP, libc::SIGTERM, libc::SIGINT] {
+            assert!(
+                HANDLED_SIGNALS.contains(&signo),
+                "signal {signo} must be handled"
+            );
+            // SAFETY: `set` is a live, fully initialized sigset and
+            // `sigismember` only reads it.
+            assert_eq!(unsafe { libc::sigismember(&set, signo) }, 1);
+        }
+        // And nothing else: blocking a signal nobody consumes would make it
+        // silently ineffective instead of doing what the operator expects.
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::sigismember(&set, libc::SIGUSR1) }, 0);
     }
 
     #[test]
