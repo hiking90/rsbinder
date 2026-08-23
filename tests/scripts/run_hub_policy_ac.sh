@@ -59,7 +59,7 @@ run_probe() { $PROBE "$@" >"$OUT" 2>>/tmp/rsb61-probe.err; }
 note "AC-6.1.1  no policy -> refuse to start"
 out=$($HUB --config /tmp/rsb61-nonexistent 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "exits non-zero" || bad "exit $rc"
-echo "$out" | grep -q "cannot load access-control policy" && ok "names the failure" || bad "message: $out"
+echo "$out" | grep -q "cannot load its configuration" && ok "names the failure" || bad "message: $out"
 echo "$out" | grep -q '\[\[rule\]\]'                      && ok "shows a minimal example" || bad "no example"
 
 note "AC-6.1.1b  malformed policy -> refuse to start, point at the file"
@@ -183,6 +183,65 @@ kill -0 "$HUB_PID" 2>/dev/null && ok "hub survived the cycles" || bad "hub died 
 run_probe add:ac61.allowed.after find:ac61.allowed.after
 want_result add  ac61.allowed.after OK "hub still accepting registrations afterwards"
 want_result find ac61.allowed.after OK "hub still serving lookups afterwards"
+
+######################################################################
+# Plan 6-2 / 6-3: declarations answer isDeclared and friends, and a lookup
+# that misses a declared service starts it. The activation is a real
+# process, so this is the only place it can be exercised.
+note "6-3  declarations answer isDeclared / getDeclaredInstances / getConnectionInfo"
+MARKER=/tmp/rsb61-started
+rm -f "$MARKER"
+cat > "$POLDIR/30-declared.toml" <<EOF
+[[rule]]
+name = "ac61.declared.*"
+add  = { uid = [$MY_UID] }
+find = { uid = [$MY_UID] }
+
+[[service]]
+name = "ac61.declared.IFoo/default"
+start = { exec = ["/usr/bin/touch", "$MARKER"] }
+connection = { ip = "10.0.0.1", port = 4242 }
+
+[[service]]
+name = "ac61.declared.IFoo/secondary"
+
+[[service]]
+name = "ac61.declared.IBar/default"
+EOF
+kill -HUP "$HUB_PID"; sleep 1
+grep -q "service declaration(s)" "$LOG" && ok "reload reports the declarations" || bad "no declaration count: $(tail -2 "$LOG")"
+
+run_probe declared:ac61.declared.IFoo/default declared:ac61.declared.INope/default \
+          instances:ac61.declared.IFoo conninfo:ac61.declared.IFoo/default
+want_result declared  ac61.declared.IFoo/default  YES "declared instance reports true"
+want_result declared  ac61.declared.INope/default NO  "undeclared instance reports false"
+want_line   "INSTANCE default"                        "getDeclaredInstances returns default"
+want_line   "INSTANCE secondary"                      "getDeclaredInstances returns secondary"
+want_result conninfo  ac61.declared.IFoo/default  "10.0.0.1:4242" "getConnectionInfo reports the declared pair"
+
+note "6-2  a lookup that misses a declared service starts it"
+[ ! -e "$MARKER" ] || bad "precondition: marker already exists"
+# checkService must NOT start anything.
+run_probe find:ac61.declared.IFoo/default
+sleep 1
+[ -e "$MARKER" ] && bad "checkService must not start a service" || ok "checkService started nothing"
+# getService must.
+run_probe get:ac61.declared.IFoo/default
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -e "$MARKER" ] && break; sleep 0.5; done
+[ -e "$MARKER" ] && ok "6-2  getService started the declared service" || bad "activation did not run"
+kill -0 "$HUB_PID" 2>/dev/null && ok "hub survived the activation" || bad "hub died activating"
+# A declaration without `start` must be inert rather than an error.
+run_probe get:ac61.declared.IFoo/secondary
+want_result get ac61.declared.IFoo/secondary NOTFOUND "a declaration without start is inert"
+rm -f "$MARKER" "$POLDIR/30-declared.toml"
+kill -HUP "$HUB_PID"; sleep 1
+
+note "config trust: a writable configuration is refused"
+chmod 777 "$POLDIR"
+out=$($HUB --config "$POLDIR" 2>&1); rc=$?
+chmod 755 "$POLDIR"
+[ "$rc" -eq 1 ] && ok "world-writable config refuses to start" || bad "exit $rc"
+echo "$out" | grep -q "world-writable" && ok "and says why" || bad "$out"
 
 ######################################################################
 note "AC-6.1.7  SIGHUP reload"

@@ -10,7 +10,8 @@
 //! binder driver, so nothing in-process can stand in for it.
 //!
 //! ```text
-//! ac61_probe add:NAME addsame:NAME find:NAME notify:NAME unnotify:NAME list debuginfo
+//! ac61_probe add:NAME addsame:NAME find:NAME get:NAME notify:NAME unnotify:NAME
+//!            declared:NAME instances:IFACE conninfo:NAME list debuginfo
 //! ```
 //!
 //! `addsame` registers *one* binder under every name it is given, which is
@@ -130,6 +131,33 @@ fn main() {
                 Some(_) => "OK",
                 None => "NOTFOUND",
             },
+            // `get` is the half that may start a declared service;
+            // `find` (checkService) must never have that side effect.
+            #[allow(deprecated)]
+            "get" => match hub::get_service(arg) {
+                Some(_) => "OK",
+                None => "NOTFOUND",
+            },
+            "declared" => {
+                if hub::is_declared(arg) {
+                    "YES"
+                } else {
+                    "NO"
+                }
+            }
+            "instances" => {
+                for instance in hub::get_declared_instances(arg) {
+                    println!("INSTANCE {instance}");
+                }
+                "OK"
+            }
+            "conninfo" => {
+                let reported = hub::get_connection_info(arg)
+                    .map(|c| format!("{}:{}", c.ipAddress, c.port))
+                    .unwrap_or_else(|| "none".to_owned());
+                println!("RESULT conninfo {arg} {reported}");
+                continue;
+            }
             "notify" => match hub::register_for_notifications(arg, &callback) {
                 Ok(()) => "OK",
                 Err(err) => outcome_of_code(err),

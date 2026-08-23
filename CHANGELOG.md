@@ -15,6 +15,26 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder-tools (`rsb_hub`):** on-demand service start. A `[[service]]`
+  entry with `start = { systemd = "unit" }` or `start = { exec = [...] }` is
+  brought up when a `getService` misses it — AOSP's `tryStartService`, with
+  the declaration standing in for the `ctl.interface_start` property. Until
+  now the lazy-service machinery was all present (the client-callback poller,
+  `onClients`, `tryUnregisterService`) except the trigger, so
+  `wait_for_service` on a service that had not started yet waited forever.
+  `checkService` still never starts anything. At most one attempt per name is
+  outstanding at a time, so polling cannot spawn a copy per attempt.
+- **rsbinder-tools (`rsb_hub`):** the configuration is now checked before it
+  is read, and `rsb_hub` refuses to start if it or any file in it is writable
+  by anyone but its owner, or owned by someone other than root or `rsb_hub`.
+  A `start` entry runs with `rsb_hub`'s privileges and is triggered by any
+  client allowed to look the name up, so a file anyone can edit is a file
+  anyone can use to run code. Same discipline sudo, ssh and cron apply.
+- **rsbinder (hub):** `hub::get_declared_instances` and
+  `hub::get_connection_info` — the client half of the two calls above.
+  `isDeclared` had a wrapper; these two were reachable only through the raw
+  AIDL proxy. Available from the Android 12 and 13 protocols respectively,
+  and on Linux.
 - **rsbinder-tools (`rsb_hub`):** service declarations. A `[[service]]` entry
   in the configuration names a concrete instance
   (`pack.age.IFoo/instance`, split as AOSP's `NameUtil.h` splits it) and

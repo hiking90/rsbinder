@@ -8,7 +8,7 @@ use hub::android_16::{
     FLAG_IS_LAZY_SERVICE,
 };
 use rsbinder::*;
-use rsbinder_tools::config::{self, Enforcer, Permission, SystemResolver};
+use rsbinder_tools::config::{self, Activator, Enforcer, Permission, SystemResolver, SystemRunner};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -482,10 +482,14 @@ impl Inner {
     ///
     /// The metadata rides along because `getService2`/`checkService2` put it
     /// on the wire; see [`Lookup`].
+    /// No `start_if_not_found`: AOSP takes it here, but starting a service
+    /// means spawning a process, and this runs under the registry lock.
+    /// `getService` triggers the start itself, after the lock is dropped
+    /// and the reply is decided — see
+    /// [`ServiceManager::try_start_service`].
     fn try_get_binder(
         &mut self,
         name: &str,
-        _start_if_not_found: bool,
         pending: &mut Vec<PendingCallback>,
     ) -> rsbinder::status::Result<Option<Lookup>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
@@ -591,16 +595,31 @@ struct ServiceManager {
     /// consults this before touching the registry; see
     /// [`ServiceManager::require`] and `plans/6-1-hub-access-control.md`.
     enforcer: Arc<Enforcer>,
+    /// Brings a declared service up when a lookup misses it.
+    activator: Activator,
 }
 
 impl ServiceManager {
     fn new(allow_cross_uid_overwrite: bool, enforcer: Arc<Enforcer>) -> Self {
+        Self::with_activator(
+            allow_cross_uid_overwrite,
+            enforcer,
+            Activator::new(Arc::new(SystemRunner)),
+        )
+    }
+
+    fn with_activator(
+        allow_cross_uid_overwrite: bool,
+        enforcer: Arc<Enforcer>,
+        activator: Activator,
+    ) -> Self {
         let (death_sender, death_receiver) = mpsc::channel();
 
         let this = Self {
             inner: Arc::new(Mutex::new(Inner::new(death_sender))),
             allow_cross_uid_overwrite,
             enforcer,
+            activator,
         };
 
         this.run_death_receiver(death_receiver);
@@ -751,6 +770,27 @@ impl ServiceManager {
         }
     }
 
+    /// Ask for `name` to be started, if it is declared with a way to start
+    /// it. AOSP's `tryStartService`, with a declaration standing in for the
+    /// init property.
+    ///
+    /// Only `getService`/`getService2` reach this — `checkService` is
+    /// documented as non-blocking and must not have side effects. It
+    /// returns immediately either way: the start runs on its own thread,
+    /// and the caller has already answered "not registered". What tells the
+    /// client the service came up is the registration notification it is
+    /// waiting on, exactly as on Android.
+    fn try_start_service(&self, name: &str) {
+        let config = self.enforcer.config();
+        match config.declarations.activation(name) {
+            Some(activation) => self.activator.try_start(name, activation),
+            None if config.declarations.is_declared(name) => {
+                log::debug!("{name} is declared but has no `start`; not starting it")
+            }
+            None => log::debug!("{name} is not declared; not starting it"),
+        }
+    }
+
     /// [`Self::allows`], as a `Result` for the entry points whose denial is
     /// reported to the caller as `EX_SECURITY`.
     ///
@@ -855,16 +895,10 @@ fn classify_for_service_union(
 }
 
 impl IServiceManager for ServiceManager {
-    /// Linux note: this is semantically equivalent to
-    /// [`checkService`](Self::checkService). AOSP's servicemanager
-    /// distinguishes the two — `getService` calls `tryGetBinder(name,
-    /// /*startIfNotFound=*/true)` and triggers a lazy-service start via
-    /// `ctl.interface_start_<name>` init property — but lazy service
-    /// activation depends on Android's init system and has no
-    /// equivalent on a plain Linux host. The `start_if_not_found`
-    /// argument is therefore hardcoded to `false`. Accessor routing for
-    /// callers that want it lives in
-    /// [`getService2`](Self::getService2)/[`checkService2`](Self::checkService2).
+    /// Like AOSP's, this starts a declared service that is not running:
+    /// `getService` is the "start it if you have to" half of the pair, and
+    /// [`checkService`](Self::checkService) is the non-blocking half that
+    /// must not. See [`try_start_service`](Self::try_start_service).
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
@@ -873,10 +907,13 @@ impl IServiceManager for ServiceManager {
         let result = {
             let mut inner = lock_recover(&self.inner);
             inner
-                .try_get_binder(name, false, &mut pending)?
+                .try_get_binder(name, &mut pending)?
                 .map(|found| found.binder)
         };
         fire_pending(pending);
+        if result.is_none() {
+            self.try_start_service(name);
+        }
         Ok(result)
     }
 
@@ -1074,10 +1111,8 @@ impl IServiceManager for ServiceManager {
         fire_pending_propagate(reg_pending)
     }
 
-    /// Linux note: identical to [`getService`](Self::getService) —
-    /// `start_if_not_found` is always `false` on this implementation
-    /// (no lazy-service infrastructure). See `getService`'s rustdoc for
-    /// the rationale.
+    /// Non-blocking, and free of side effects: unlike
+    /// [`getService`](Self::getService) this never starts anything.
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
@@ -1086,7 +1121,7 @@ impl IServiceManager for ServiceManager {
         let result = {
             let mut inner = lock_recover(&self.inner);
             inner
-                .try_get_binder(name, false, &mut pending)?
+                .try_get_binder(name, &mut pending)?
                 .map(|found| found.binder)
         };
         fire_pending(pending);
@@ -1509,9 +1544,12 @@ impl IServiceManager for ServiceManager {
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
-            inner.try_get_binder(name, false, &mut pending)?
+            inner.try_get_binder(name, &mut pending)?
         };
         fire_pending(pending);
+        if lookup.is_none() {
+            self.try_start_service(name);
+        }
         Ok(classify_for_service_union(lookup))
     }
 
@@ -1527,7 +1565,7 @@ impl IServiceManager for ServiceManager {
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
-            inner.try_get_binder(name, false, &mut pending)?
+            inner.try_get_binder(name, &mut pending)?
         };
         fire_pending(pending);
         Ok(classify_for_service_union(lookup))
@@ -1546,18 +1584,18 @@ impl IServiceManager for ServiceManager {
 /// given. Every `*.toml` in it is loaded, sorted by file name.
 const DEFAULT_CONFIG_DIR: &str = "/etc/rsbinder/hub.d";
 
-/// Report an unloadable policy and exit.
+/// Report an unloadable configuration and exit.
 ///
-/// `rsb_hub` does not start without a policy. Falling back to a permissive
-/// mode here would mean a typo in a config file silently drops all access
+/// `rsb_hub` does not start without one. Falling back to a permissive mode
+/// here would mean a typo in a config file silently drops all access
 /// control on a running system — the one failure mode that must never be
 /// quiet. `--insecure-allow-all` exists for the cases that genuinely want
 /// no policy, and it has to be asked for by that name.
-fn exit_without_policy(path: &Path, err: &config::ConfigError) -> ! {
-    eprintln!("rsb_hub: cannot load access-control policy");
+fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
+    eprintln!("rsb_hub: cannot load its configuration");
     eprintln!("  {err}");
     eprintln!();
-    eprintln!("rsb_hub denies every request unless a policy grants it. Create a policy");
+    eprintln!("rsb_hub denies every request its configuration does not allow. Create a");
     eprintln!("file, for example {}/10-local.toml:", path.display());
     eprintln!();
     eprintln!("    [global]");
@@ -1567,6 +1605,13 @@ fn exit_without_policy(path: &Path, err: &config::ConfigError) -> ! {
     eprintln!("    name = \"com.example.*\"");
     eprintln!("    add  = {{ user = [\"exampled\"] }}");
     eprintln!("    find = {{ group = [\"binder-clients\"] }}");
+    eprintln!();
+    eprintln!("    [[service]]");
+    eprintln!("    name = \"com.example.IFoo/default\"");
+    eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
+    eprintln!();
+    eprintln!("It must not be writable by anyone but its owner: a start entry runs with");
+    eprintln!("rsb_hub's privileges when a lookup misses.");
     eprintln!();
     eprintln!("Point rsb_hub at a different path with --config <PATH>, or pass");
     eprintln!("--insecure-allow-all to run with no access control (development only).");
@@ -1770,7 +1815,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 );
                 Arc::new(Enforcer::enforcing(loaded))
             }
-            Err(err) => exit_without_policy(&path, &err),
+            Err(err) => exit_without_config(&path, &err),
         };
         spawn_policy_reloader(Arc::clone(&enforcer), path);
         enforcer

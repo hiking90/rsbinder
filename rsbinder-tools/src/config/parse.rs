@@ -74,19 +74,19 @@ impl NameResolver for SystemResolver {
 /// Why a policy could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The policy path could not be read.
-    #[error("cannot read policy path {path}: {source}")]
+    /// The configuration path could not be read.
+    #[error("cannot read configuration path {path}: {source}")]
     Io {
         /// The path that could not be read.
         path: PathBuf,
         /// The underlying I/O error.
         source: std::io::Error,
     },
-    /// The policy directory contained no `*.toml` files. Not silently
-    /// treated as deny-all: an operator who meant deny-all writes it, and
-    /// an empty directory is far more often a deployment mistake.
-    #[error("no policy files (*.toml) found in {0}")]
-    NoPolicyFiles(PathBuf),
+    /// The directory contained no `*.toml` files. Not silently treated as
+    /// deny-all: an operator who meant deny-all writes it, and an empty
+    /// directory is far more often a deployment mistake.
+    #[error("no configuration files (*.toml) found in {0}")]
+    NoConfigFiles(PathBuf),
     /// A file was not valid TOML, or had unknown/mistyped keys.
     #[error("{path}: {source}")]
     Toml {
@@ -148,6 +148,15 @@ pub enum ConfigError {
         path: PathBuf,
         /// The instance whose `exec` is empty.
         name: String,
+    },
+    /// A configuration path anyone but root or this process can rewrite.
+    /// See [`super::trust`].
+    #[error("{path} is {problem}; refusing to load configuration from it")]
+    Untrusted {
+        /// The offending path.
+        path: PathBuf,
+        /// What is wrong with it.
+        problem: super::trust::TrustProblem,
     },
     /// A keyword subject other than `"any"` / `"none"`.
     #[error("{path}: unknown subject keyword {keyword:?} (expected \"any\" or \"none\")")]
@@ -368,6 +377,22 @@ pub fn parse_file(
     })
 }
 
+/// Refuse a path anyone else can rewrite. See [`super::trust`] for why
+/// this is fatal rather than a warning.
+fn check_trusted(path: &Path, our_uid: u32) -> Result<(), ConfigError> {
+    match super::trust::check_path(path, our_uid) {
+        Ok(None) => Ok(()),
+        Ok(Some(bad)) => Err(ConfigError::Untrusted {
+            path: bad.path,
+            problem: bad.problem,
+        }),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
 /// Every `*.toml` under `dir`, sorted by file name.
 fn policy_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let entries = std::fs::read_dir(dir).map_err(|source| ConfigError::Io {
@@ -406,10 +431,13 @@ pub struct Config {
 /// a policy that silently dropped the rule it could not parse would be a
 /// policy that fails open.
 pub fn load(path: &Path, resolver: &dyn NameResolver) -> Result<Config, ConfigError> {
+    let our_uid = rustix::process::getuid().as_raw();
+    check_trusted(path, our_uid)?;
+
     let files = if path.is_dir() {
         let files = policy_files(path)?;
         if files.is_empty() {
-            return Err(ConfigError::NoPolicyFiles(path.to_owned()));
+            return Err(ConfigError::NoConfigFiles(path.to_owned()));
         }
         files
     } else {
@@ -421,6 +449,7 @@ pub fn load(path: &Path, resolver: &dyn NameResolver) -> Result<Config, ConfigEr
     let mut service_origin: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for file in files {
+        check_trusted(&file, our_uid)?;
         let text = std::fs::read_to_string(&file).map_err(|source| ConfigError::Io {
             path: file.clone(),
             source,
@@ -763,8 +792,41 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(matches!(
             load(&dir, &FakeResolver),
-            Err(ConfigError::NoPolicyFiles(_))
+            Err(ConfigError::NoConfigFiles(_))
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The configuration decides what runs; a file anyone can rewrite is a
+    /// file anyone can use to run it.
+    #[test]
+    fn a_world_writable_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rsb-cfg-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("10.toml"),
+            "[[rule]]\nname = \"*\"\nfind = \"any\"\n",
+        )
+        .unwrap();
+
+        // Sane to begin with.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(load(&dir, &FakeResolver).is_ok());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = load(&dir, &FakeResolver).unwrap_err();
+        assert!(matches!(err, ConfigError::Untrusted { .. }), "{err:?}");
+
+        // And a sane directory holding a writable file is refused too.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.join("10.toml"), std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        let err = load(&dir, &FakeResolver).unwrap_err();
+        assert!(matches!(err, ConfigError::Untrusted { .. }), "{err:?}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

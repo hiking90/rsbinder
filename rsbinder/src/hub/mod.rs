@@ -320,9 +320,10 @@ use crate::*;
 
 // Export Android 16 types as the default public API
 pub use android_16::{
-    BnClientCallback, BnServiceCallback, IClientCallback, IServiceCallback, ServiceDebugInfo,
-    DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
-    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
+    BnClientCallback, BnServiceCallback, ConnectionInfo, IClientCallback, IServiceCallback,
+    ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL,
+    DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL,
+    DUMP_FLAG_PROTO,
 };
 
 /// Android SDK version constants
@@ -758,6 +759,61 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
             ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
+        }
+    }
+
+    /// Every declared instance of `iface`.
+    ///
+    /// Requires the Android 12 protocol or later; earlier ones have no
+    /// `getDeclaredInstances`, and report none declared.
+    pub fn get_declared_instances(&self, iface: &str) -> Vec<String> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("get_declared_instances: not supported on Android 10");
+                Vec::new()
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => {
+                log::error!("get_declared_instances: not supported on Android 11");
+                Vec::new()
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::get_declared_instances(sm, iface),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::get_declared_instances(sm, iface),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::get_declared_instances(sm, iface),
+            ServiceManager::Android16(sm) => android_16::get_declared_instances(sm, iface),
+        }
+    }
+
+    /// Connection info declared for `name`, if any.
+    ///
+    /// Requires the Android 13 protocol or later; earlier ones have no
+    /// `getConnectionInfo`, and report none.
+    pub fn get_connection_info(&self, name: &str) -> Option<ConnectionInfo> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("get_connection_info: not supported on Android 10");
+                None
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => {
+                log::error!("get_connection_info: not supported on Android 11");
+                None
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(_) => {
+                log::error!("get_connection_info: not supported on Android 12");
+                None
+            }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::get_connection_info(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::get_connection_info(sm, name),
+            ServiceManager::Android16(sm) => android_16::get_connection_info(sm, name),
         }
     }
 
@@ -1422,6 +1478,20 @@ pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<S
 #[inline]
 pub fn is_declared(name: &str) -> bool {
     default().map(|sm| sm.is_declared(name)).unwrap_or(false)
+}
+
+/// Convenience function for [`ServiceManager::get_declared_instances`].
+#[inline]
+pub fn get_declared_instances(iface: &str) -> Vec<String> {
+    default()
+        .map(|sm| sm.get_declared_instances(iface))
+        .unwrap_or_default()
+}
+
+/// Convenience function for [`ServiceManager::get_connection_info`].
+#[inline]
+pub fn get_connection_info(name: &str) -> Option<ConnectionInfo> {
+    default().ok().and_then(|sm| sm.get_connection_info(name))
 }
 
 /// Convenience function to get debug information about all services from the default ServiceManager.

@@ -85,6 +85,8 @@ for the file format.
 - **Service Discovery**: Enables clients to find and connect to registered services
 - **Lifecycle Management**: Monitors service health and handles cleanup
 - **Access Control**: Per-name `add` / `find` / `list` policy keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
+- **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests
+- **On-Demand Start**: a lookup that misses a declared service starts it, via systemd or a configured command
 - **Priority Support**: Implements priority-based service access control
 - **Notification System**: Provides callbacks for service availability changes
 - **Debug Information**: Offers service introspection and debugging capabilities

@@ -413,6 +413,62 @@ $ sudo rsb_device binder --group binder --mode 0660
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.
 
+## Declaring services
+
+An access rule says who may use a name. A **declaration** says the name is
+expected to exist at all — the question `is_declared` answers, and the one a
+client uses to tell "not installed" from "not started yet". On Android that
+comes from VINTF manifests; on Linux it comes from a `[[service]]` entry in
+the same configuration files.
+
+```toml
+[[service]]
+name = "com.example.IFoo/default"          # pack.age.IFace/instance
+start = { systemd = "example-foo.service" }
+connection = { ip = "127.0.0.1", port = 8080 }
+```
+
+A declaration answers three calls:
+
+| Call | Answered from |
+|---|---|
+| `is_declared("com.example.IFoo/default")` | the entry existing |
+| `get_declared_instances("com.example.IFoo")` | the instance halves of every entry for that interface |
+| `get_connection_info("com.example.IFoo/default")` | the `connection` table |
+
+Declared instances are filtered by `find`, so a caller only learns about
+instances it could look up.
+
+### Starting a service on demand
+
+With a `start` entry, a `get_service` (or `wait_for_interface`) that misses
+the service asks for it to be started — AOSP's `tryStartService`, with the
+declaration standing in for the init property:
+
+```toml
+start = { systemd = "example-foo.service" }
+# or
+start = { exec = ["/usr/bin/exampled", "--instance", "default"] }
+```
+
+`check_service` never does this: it is documented as non-blocking and free
+of side effects. Only the `get`/`wait` family starts anything.
+
+The start runs on its own thread and `rsb_hub` does not wait for it — what
+tells the client the service is up is the registration notification it is
+already waiting on, which is why `wait_for_interface` is the natural call
+here. At most one start attempt per name is outstanding at a time, so a
+client polling a service that cannot come up does not spawn a copy per
+attempt. `exec` takes an argv list, never a shell string.
+
+> **The configuration is a trust boundary.** A `start` entry runs with
+> `rsb_hub`'s privileges, and any client allowed to look the name up can
+> trigger it. `rsb_hub` therefore refuses to start if its configuration
+> directory or any file in it is writable by anyone but its owner, or is
+> owned by someone other than root or `rsb_hub` itself — the same check
+> sudo, ssh and cron apply to their own configuration. Keep it `0644`
+> root-owned in a `0755` root-owned directory.
+
 ## Linux vs. Android Differences
 
 While rsbinder aims for API compatibility across both platforms, there are
@@ -423,7 +479,7 @@ Android's native `servicemanager`:
 |-------------------------|-----------------------------------------|-----------------------------------------|
 | **Process**             | User-space `rsb_hub` binary             | System `servicemanager` daemon          |
 | **Access control**      | uid/group policy files ([above](#access-control)) | SELinux MAC policy                      |
-| **VINTF manifests**     | Not supported (`is_declared` is false)  | Supported and enforced                  |
+| **Service declarations** | `[[service]]` entries ([above](#declaring-services)) | VINTF manifests                        |
 | **Service debug info**  | Supported                               | Supported (Android 12+; not on 10/11)   |
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
 | **Version selection**   | Always uses Android 16 protocol         | Auto-detected from SDK version          |
@@ -449,8 +505,9 @@ predates the API. Android 10 falls back to the legacy C `IServiceManager`,
 which only learned the AIDL-based interface in Android 11; `get_service_debug_info`
 was added in Android 12. On Linux, rsbinder always uses the Android 16
 protocol — what `rsb_hub` implements — so every row in the Android 12+
-column applies, with the caveat that `is_declared` is *always* `false` on
-Linux (no VINTF manifest).
+column applies. `is_declared` answers from the declarations above rather
+than from a VINTF manifest, so it is `false` only when nothing declares the
+name.
 
 ## Using the ServiceManager Object Directly
 

@@ -46,12 +46,16 @@
 //! deny. `rsb_hub` refuses to start without a policy rather than falling
 //! back to a permissive mode.
 
+mod activation;
 mod declaration;
 mod enforcer;
 mod parse;
 mod policy;
+mod trust;
 
+pub use activation::{ActivationRunner, Activator, SystemRunner};
 pub use declaration::{Activation, ConnectionInfo, Declaration, Declarations, InstanceName};
 pub use enforcer::Enforcer;
 pub use parse::{load, parse_file, ConfigError, NameResolver, SystemResolver};
 pub use policy::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};
+pub use trust::{check_path, trust_problem, TrustProblem, Untrusted};
