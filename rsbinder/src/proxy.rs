@@ -72,6 +72,21 @@ enum CachedExtension {
 /// type — see `process_state::strong_proxy_for_handle_stability`.
 pub struct ProxyHandle {
     handle: u32,
+    /// Which kernel binder_node this handle id currently names.
+    ///
+    /// A handle id is only unique while the `binder_ref` slot lives; the
+    /// kernel may recycle it for a different node afterwards. The
+    /// process-wide generation counter, snapshotted when this proxy's
+    /// cache entry was created, distinguishes the two — so
+    /// `(handle, generation)` is a stable identity for the *node*, which
+    /// is what `WIBinder` equality compares on.
+    ///
+    /// Stored here rather than looked up from the proxy cache on demand.
+    /// The cache entry is retired when the obituary is delivered, so a
+    /// cache lookup answers `None` for exactly the binders whose identity
+    /// a death recipient most needs to match — see
+    /// [`crate::SIBinder::downgrade`].
+    generation: u64,
     descriptor: String,
     /// Uid attributed to this proxy at construction
     /// time, used by [`crate::proxy_count`]'s per-uid map. Captured
@@ -132,6 +147,7 @@ impl ProxyHandle {
     /// against a concurrent `BC_RELEASE` to a freed slot.
     pub(crate) fn new_acquired(
         handle: u32,
+        generation: u64,
         descriptor: String,
         stability: Stability,
     ) -> Result<Arc<Self>> {
@@ -149,6 +165,7 @@ impl ProxyHandle {
         let counted_by_uid = crate::proxy_count::on_proxy_create(tracked_uid);
         Ok(Arc::new(Self {
             handle,
+            generation,
             descriptor,
             tracked_uid,
             count_acquired: true,
@@ -163,6 +180,14 @@ impl ProxyHandle {
     /// Get the underlying binder handle number.
     pub fn handle(&self) -> u32 {
         self.handle
+    }
+
+    /// The proxy-cache generation this handle was resolved under. See the
+    /// field docs: `(handle, generation)` identifies the kernel node, and
+    /// stays valid for this `ProxyHandle`'s whole life — including after
+    /// the obituary retires the cache entry.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Get the interface descriptor for this proxy.
@@ -681,6 +706,7 @@ mod tests {
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
         Arc::new(ProxyHandle {
             handle: 1,
+            generation: 1,
             descriptor: "test".to_string(),
             tracked_uid: 0,
             // `count_acquired = false` means `Drop` skips
@@ -711,6 +737,86 @@ mod tests {
         let arc: Arc<dyn DeathRecipient> = Arc::new(NoopRecipient);
         let weak = Arc::downgrade(&arc);
         (arc, weak)
+    }
+
+    /// A proxy's weak identity must come from the proxy, not the cache.
+    ///
+    /// The obituary retires a handle's cache entry *before* dispatching
+    /// `binder_died`, so a `downgrade` taken inside a death recipient used
+    /// to fall back to the `Native` variant — which compares unequal to the
+    /// `Proxy` weak the obituary carries, and unequal to every weak taken
+    /// while the binder was alive. A recipient matching `who` against its
+    /// stored `SIBinder`s therefore matched nothing, every time.
+    ///
+    /// `synthetic_proxy` is never in the cache, so it stands in for exactly
+    /// that state: a live `Arc<ProxyHandle>` with no cache entry behind it.
+    #[test]
+    fn proxy_downgrade_keeps_its_identity_without_a_cache_entry() {
+        let proxy = synthetic_proxy(false);
+        let strong = SIBinder::from_arc(proxy.clone() as Arc<dyn IBinder>);
+
+        let weak = SIBinder::downgrade(&strong);
+        assert_eq!(weak, SIBinder::downgrade(&strong));
+
+        // The discriminator between the two identity models. `synthetic_proxy`
+        // hands back a *distinct allocation* naming the same
+        // `(handle, generation)` — which is also what a case-(b) resurrection
+        // produces. Proxy identity says these are the same binder; the
+        // `Native` fallback, comparing `Weak::ptr_eq` on the allocation, says
+        // they are not. Equality here is what proves the fallback is gone.
+        let resurrected = synthetic_proxy(false);
+        assert!(
+            !Arc::ptr_eq(&proxy, &resurrected),
+            "precondition: distinct allocations"
+        );
+        let resurrected_strong = SIBinder::from_arc(resurrected.clone() as Arc<dyn IBinder>);
+        assert_eq!(
+            weak,
+            SIBinder::downgrade(&resurrected_strong),
+            "same (handle, generation) is the same binder, whatever the allocation"
+        );
+
+        std::mem::forget(strong);
+        std::mem::forget(resurrected_strong);
+        std::mem::forget(proxy);
+        std::mem::forget(resurrected);
+    }
+
+    /// The comparison a `DeathRecipient` actually writes.
+    #[test]
+    fn weak_compares_against_the_strong_it_came_from() {
+        let proxy = synthetic_proxy(false);
+        let strong = SIBinder::from_arc(proxy.clone() as Arc<dyn IBinder>);
+        let who = SIBinder::downgrade(&strong);
+
+        assert!(who == strong, "who == stored binder");
+        assert!(strong == who, "and the operands commute");
+
+        // A different binder must not match. A native one is enough: the
+        // variants differ, which is the cheapest possible mismatch.
+        struct Other;
+        impl crate::Interface for Other {}
+        impl crate::Remotable for Other {
+            fn descriptor() -> &'static str {
+                "rsbinder.test.proxy.IOther"
+            }
+            fn on_transact(
+                &self,
+                _code: crate::TransactionCode,
+                _reader: &mut crate::Parcel,
+                _reply: &mut crate::Parcel,
+            ) -> Result<()> {
+                Err(StatusCode::UnknownTransaction)
+            }
+            fn on_dump(&self, _w: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+        let native = crate::Interface::as_binder(&crate::Binder::new(Other));
+        assert!(who != native);
+
+        std::mem::forget(strong);
+        std::mem::forget(proxy);
     }
 
     #[test]

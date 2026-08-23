@@ -146,7 +146,7 @@ fn commit_new_acquired(
     stability: Stability,
     owns_case_a_pin: bool,
 ) -> Result<SIBinder> {
-    let arc = match ProxyHandle::new_acquired(handle, descriptor.clone(), stability) {
+    let arc = match ProxyHandle::new_acquired(handle, generation, descriptor.clone(), stability) {
         Ok(arc) => arc,
         Err(err) => {
             if owns_case_a_pin {
@@ -835,10 +835,12 @@ impl ProcessState {
     /// Called from `SIBinder::downgrade` when constructing a proxy
     /// `WIBinder` so the resulting weak reference carries the
     /// generation it observed at construction time. A subsequent
-    /// `WIBinder::upgrade` rejects (returns `DeadObject`) if the live
-    /// entry's generation differs — i.e. the original binder_node was
-    /// obituary'd and the same handle id was later recycled to a
-    /// different node.
+    /// Test-only. Production code reads the generation off the
+    /// `ProxyHandle` instead ([`crate::SIBinder::downgrade`]), because this
+    /// answers `None` once the obituary has retired the entry — precisely
+    /// when a death recipient needs the identity. What remains here is the
+    /// cache-side invariant the resurrection tests assert on.
+    #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
         self.handle_to_proxy
             .read()
@@ -873,11 +875,11 @@ impl ProcessState {
     /// `DeathRecipient::binder_died` callbacks, which can issue nested
     /// binder calls. See [`thread_state`](super::thread_state) module doc.
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        // Downgrade to `who` BEFORE removing the cache entry: afterwards
-        // `cache_generation_for` returns `None` and `downgrade` yields a
-        // `Native` `WIBinder` that compares unequal to the registered `Proxy`,
-        // breaking `binder_died` identity matching. The read guard is dropped
-        // first — `downgrade` re-acquires the same (non-reentrant) RwLock read.
+        // The read guard is dropped before `downgrade` runs. `downgrade` no
+        // longer consults the cache — it reads `(handle, generation)` off the
+        // `ProxyHandle` — so the ordering against the removal below is no
+        // longer load-bearing for identity; it is kept because building `who`
+        // needs a live `Arc`, which the entry's weak is what we have.
         let arc = {
             let handle_to_proxy = self
                 .handle_to_proxy

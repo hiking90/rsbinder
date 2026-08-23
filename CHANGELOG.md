@@ -15,6 +15,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder:** `WIBinder` now implements `PartialEq<SIBinder>` (and the
+  reverse), so a `DeathRecipient` can ask the question it actually has —
+  "is this the binder that died?" — as `*who == stored`. Writing it by hand
+  meant downgrading the stored strong reference and comparing two weaks, which
+  was the shape of the bug fixed below.
 - **rsbinder (`macros` feature):** `#[rsbinder::interface]`,
   `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` — declare a binder
   interface as a Rust trait and its data types as ordinary structs and enums,
@@ -107,9 +112,17 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
-
 ### Changed
 
+- **rsbinder — breaking (internal representation):** a proxy's weak identity
+  is now stamped into the `ProxyHandle` at construction instead of being looked
+  up in the proxy cache on every `SIBinder::downgrade`. `WIBinder` no longer
+  has a `Native` fallback for proxies, `downgrade` no longer takes the cache
+  lock, and it no longer requires an initialized `ProcessState`. Two weak
+  references naming the same `(handle, generation)` compare equal even when
+  they come from different `Arc<ProxyHandle>` allocations — which was already
+  the documented intent for case-(b) resurrection, and is now also true after
+  the obituary.
 - **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls now
   carry `#[rsbinder::__async_trait]` instead of `#[::async_trait::async_trait]`,
   and `rsbinder` re-exports the attribute. A crate that only consumes generated
@@ -121,6 +134,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
+- **rsbinder:** a `DeathRecipient` could not identify the binder that died.
+  `SIBinder::downgrade` read a proxy's generation from the proxy cache and fell
+  back to the `Native` variant when the entry was missing — and the obituary
+  retires that entry *before* dispatching `binder_died`. Every weak taken
+  inside a death recipient therefore compared unequal to the `who` it was
+  handed and to every weak taken while the binder was alive, so a recipient
+  watching more than one binder matched none of them. This is what made
+  `rsb_hub` keep dead services in its registry (see below); any user code
+  matching `who` against stored binders hit the same wall.
 - **rsbinder (`macros` feature):** signature shapes the macros accepted but
   should not have, all found by review and each now refused with a compile-fail
   case in `rsbinder-macros/tests/ui`: a `#[oneway]` method with an out/inout
