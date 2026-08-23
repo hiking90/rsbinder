@@ -910,7 +910,7 @@ dependencies = [
  "pest_derive",
  "serde",
  "similar",
- "syn 2.0.119",
+ "syn 3.0.3",
  "tempfile",
  "tera",
  "thiserror",
@@ -924,7 +924,7 @@ dependencies = [
  "quote",
  "rsbinder",
  "rsbinder-aidl",
- "syn 2.0.119",
+ "syn 3.0.3",
  "trybuild",
 ]
 
@@ -941,9 +941,9 @@ dependencies = [
 
 [[package]]
 name = "rsproperties"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "878032a02f0dd5ec0fdd772e0141c50ef05d406c5a9f2ea79826285270fea168"
+checksum = "e92cdbbe82223006ba7f16e6178dd9b24fbb967d000a096e8dc4129560d7ab41"
 dependencies = [
  "log",
  "pretty-hex",
