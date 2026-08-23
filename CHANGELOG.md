@@ -15,6 +15,23 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder (`macros` feature):** `#[rsbinder::interface]` — declare a binder
+  interface as a Rust trait, with no `.aidl` file and no `build.rs`. `&mut T`
+  is an out parameter, `#[inout]` makes it round-trip, `Option<T>` is nullable,
+  `#[oneway]` drops the reply, and transaction codes follow declaration order.
+  The macro fills the same render structs `rsbinder-aidl` fills and runs the
+  same templates, so a trait and the equivalent `.aidl` produce **identical**
+  generated code — golden-tested in `rsbinder-macros`. `.aidl` stays canonical:
+  unions, constants, `@VintfStability`, `@EnforcePermission`,
+  `ParcelableHolder`, generics and nested types still need it. Off by default;
+  the macro pulls the AIDL compiler in as a proc-macro dependency.
+- **rsbinder-aidl:** new public `render` module — `FnMembers`,
+  `InterfaceRender` / `ParcelableRender` / `EnumRender`, and
+  `render_interface` / `render_parcelable` / `render_enum`. This is the seam
+  `rsbinder-macros` plugs into: the templates and their inputs are now a
+  documented surface rather than private detail, so a second front-end cannot
+  drift from the AIDL one. Generated output is byte-for-byte unchanged.
+
 - **rsbinder (entry API):** `rsbinder::serve(uri)` / `rsbinder::connect::<dyn I>(uri)`
   / `rsbinder::Client` — one bootstrap for every transport, selected by a
   URI (`binder://`, `unix://`, `unix-abstract://`, `vsock://`, `tls://`,

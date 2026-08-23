@@ -24,7 +24,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [features]
 default = ["tokio"]
 tokio = ["async", "tokio/full"]
-async = ["rsbinder-aidl/async", "async-trait"]
+async = ["rsbinder-aidl/async", "async-trait", "rsbinder-macros?/async"]
+# `#[rsbinder::interface]` — declare an interface as a Rust trait instead of
+# an `.aidl` file (plan 2-19). Off by default: it pulls the AIDL compiler
+# (pest + tera) in as a proc-macro dependency, which a build that only
+# consumes generated code has no reason to carry. `.aidl` stays canonical;
+# see the `rsbinder-macros` crate docs for what the macro cannot express.
+macros = ["dep:rsbinder-macros"]
 # RPC transport (binder-over-socket) — a separate stack from the kernel
 # binder path. Off by default; enabling it pulls in rustix's `net` APIs
 # (socketpair / SO_PEERCRED / SCM_RIGHTS) and `getrandom` (CSPRNG for
@@ -91,6 +97,9 @@ getrandom = { version = "0.4", optional = true }
 
 # subplan 2-9 Phase A: macOS/BSD peer-credential resolution
 # (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
+# `#[rsbinder::interface]`, behind the `macros` feature.
+rsbinder-macros = { workspace = true, optional = true }
+
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = { workspace = true }
 
