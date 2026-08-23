@@ -123,6 +123,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   they come from different `Arc<ProxyHandle>` allocations — which was already
   the documented intent for case-(b) resurrection, and is now also true after
   the obituary.
+- **rsbinder-tools (`rsb_hub`):** `listServices` and `getServiceDebugInfo`
+  return names in sorted order. The registry is a `BTreeMap` now, matching
+  AOSP's `std::map`; previously the order shuffled between calls.
 - **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls now
   carry `#[rsbinder::__async_trait]` instead of `#[::async_trait::async_trait]`,
   and `rsbinder` re-exports the attribute. A crate that only consumes generated
@@ -143,6 +146,37 @@ This changelog starts at 0.9.0. For earlier releases, see the
   watching more than one binder matched none of them. This is what made
   `rsb_hub` keep dead services in its registry (see below); any user code
   matching `who` against stored binders hit the same wall.
+- **rsbinder-tools (`rsb_hub`):** a dead service was never removed from the
+  registry. The death handler matched the obituary against a *freshly*
+  downgraded `WIBinder`, but a proxy `WIBinder` compares on
+  `(handle, proxy-cache generation)` and the obituary retires that cache entry
+  before invoking callbacks — so every death matched nothing and retired zero
+  entries. A crashed service kept its name reserved, kept being handed to
+  clients as a dead binder, and leaked its callbacks and death subscription
+  until `rsb_hub` restarted. The underlying `SIBinder::downgrade` defect is
+  fixed above; `rsb_hub` now matches `who` against its stored binders directly.
+- **rsbinder-tools (`rsb_hub`):** death subscriptions are reference-counted per
+  binder, so link and unlink can no longer drift apart. They drifted both ways:
+  `unregisterForNotifications` removed a callback without unlinking, so every
+  register/unregister cycle left another subscription behind — unbounded, and
+  reachable by any local caller — and one binder registered under K names took
+  K subscriptions, so its death ran K full cleanup sweeps instead of one.
+- **rsbinder-tools (`rsb_hub`):** `getService2`/`checkService2` now report
+  `isLazyService` from the registered `FLAG_IS_LAZY_SERVICE` instead of always
+  `false`. AOSP's client uses it to skip caching a lazy service, which can
+  withdraw via `tryUnregisterService` *without dying* — so no death
+  notification would have invalidated the client's cached binder.
+- **rsbinder-tools (`rsb_hub`):** exception-code parity with AOSP on three
+  replies that are visible to a C++ `LazyServiceRegistrar`: "only a server can
+  register client callbacks" and "only a server can unregister itself" are now
+  `EX_UNSUPPORTED_OPERATION` (were `EX_SECURITY`), and `tryUnregisterService`
+  on an unregistered or mismatched name is `EX_ILLEGAL_STATE` (was
+  `EX_ILLEGAL_ARGUMENT`).
+- **rsbinder-tools (`rsb_hub`):** a failed self-registration no longer stops
+  the process — it is logged, as AOSP does. Clients reach the hub through
+  handle 0 regardless. `addService` also warns when `dumpPriority` sets no
+  `DUMP_FLAG_PRIORITY_*` bit, which silently hides the service from every
+  `listServices` filter.
 - **rsbinder (`macros` feature):** signature shapes the macros accepted but
   should not have, all found by review and each now refused with a compile-fail
   case in `rsbinder-macros/tests/ui`: a `#[oneway]` method with an out/inout

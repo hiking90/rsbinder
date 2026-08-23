@@ -3,10 +3,13 @@
 #![allow(non_snake_case)]
 
 use env_logger::Env;
-use hub::android_16::{BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_DEFAULT};
+use hub::android_16::{
+    BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_DEFAULT,
+    FLAG_IS_LAZY_SERVICE,
+};
 use rsbinder::*;
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
@@ -111,6 +114,11 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The name `rsb_hub` publishes itself under, so clients can reach the
+/// service manager through the registry as well as through handle 0.
+/// Matches AOSP `main.cpp`'s `addService("manager", ...)`.
+const SELF_SERVICE_NAME: &str = "manager";
+
 /// Upper bound on registration / client callbacks held per service name.
 /// `registerForNotifications` has no uid gating on Linux, so without a cap
 /// (and identity de-duplication) a client could loop-register to grow the
@@ -134,18 +142,50 @@ const MAX_DISTINCT_NAMES: usize = 10_000;
 /// True when inserting `name` would add a *new* distinct key to a registry
 /// `map` that already holds `MAX_DISTINCT_NAMES` names. Overwriting an existing
 /// key never grows the map, so it is always allowed. Factored out for testing.
-fn distinct_name_cap_exceeded<V>(map: &HashMap<String, V>, name: &str) -> bool {
+fn distinct_name_cap_exceeded<V>(map: &BTreeMap<String, V>, name: &str) -> bool {
     !map.contains_key(name) && map.len() >= MAX_DISTINCT_NAMES
+}
+
+/// One kernel death subscription, and how many registry entries currently
+/// depend on it.
+///
+/// The binder is held *weakly*: the maps that need it alive already hold it
+/// strongly, and a strong reference here would keep a proxy — and its
+/// kernel ref — alive past the registry entry that justified it. The weak
+/// reference is what an obituary carries, so it is also what
+/// [`Inner::forget_death_link`] matches on.
+struct DeathLink {
+    weak: rsbinder::WIBinder,
+    count: usize,
 }
 
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
-    name_to_service: HashMap<String, Service>,
-    name_to_registration_callbacks: HashMap<
+    /// Death subscriptions, one per proxy handle, reference-counted by the
+    /// number of registry entries depending on each.
+    ///
+    /// `ProxyHandle::link_to_death` appends to a per-proxy `Vec` without
+    /// deduplicating and `unlink_to_death` removes a single entry, so a
+    /// registry that links and unlinks ad hoc drifts in both directions.
+    /// It drifted both ways: one binder registered under K names took K
+    /// subscriptions and so fired `binder_died` K times, each a full
+    /// O(registry) cleanup sweep; and `unregisterForNotifications` removed
+    /// the callback without unlinking, so every register/unregister cycle
+    /// left another subscription behind — unbounded, and reached by any
+    /// local caller, which is exactly what `MAX_CALLBACKS_PER_NAME` exists
+    /// to prevent.
+    ///
+    /// Counting here makes the pairing structural: link on 0→1, unlink on
+    /// 1→0, and neither drift is expressible. Keyed by handle because that
+    /// is what the kernel subscription is keyed by; native (`Bn*`) binders
+    /// have no death notification and are skipped.
+    death_links: BTreeMap<u32, DeathLink>,
+    name_to_service: BTreeMap<String, Service>,
+    name_to_registration_callbacks: BTreeMap<
         String,
         Vec<rsbinder::Strong<dyn hub::android_16::android::os::IServiceCallback::IServiceCallback>>,
     >,
-    name_to_client_callbacks: HashMap<
+    name_to_client_callbacks: BTreeMap<
         String,
         Vec<rsbinder::Strong<dyn hub::android_16::android::os::IClientCallback::IClientCallback>>,
     >,
@@ -173,15 +213,110 @@ impl Inner {
     fn new(death_sender: mpsc::Sender<rsbinder::WIBinder>) -> Self {
         Self {
             death_recipient: Arc::new(DeathRecipientWrapper(death_sender)),
-            name_to_service: HashMap::new(),
-            name_to_registration_callbacks: HashMap::new(),
-            name_to_client_callbacks: HashMap::new(),
+            death_links: BTreeMap::new(),
+            name_to_service: BTreeMap::new(),
+            name_to_registration_callbacks: BTreeMap::new(),
+            name_to_client_callbacks: BTreeMap::new(),
         }
     }
 
     fn add_service(&mut self, name: &str, service: Service) -> rsbinder::status::Result<()> {
         self.name_to_service.insert(name.to_owned(), service);
         Ok(())
+    }
+
+    /// Start depending on `binder`'s death notification, taking the kernel
+    /// subscription if this is the first dependant.
+    ///
+    /// A native binder cannot be linked and is silently skipped, so callers
+    /// do not need to test for it. Every successful call must be paired
+    /// with exactly one [`Inner::release_death_link`] or, once the binder
+    /// has died, one [`Inner::forget_death_link`].
+    fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::status::Result<()> {
+        let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
+            return Ok(());
+        };
+        let recipient: Arc<dyn rsbinder::DeathRecipient> = self.death_recipient.clone();
+        self.retain_counted(handle, &SIBinder::downgrade(binder), || {
+            binder
+                .link_to_death(Arc::downgrade(&recipient))
+                .map_err(Into::into)
+        })
+    }
+
+    /// Bookkeeping half of [`Inner::retain_death_link`], with the kernel
+    /// call passed in.
+    ///
+    /// Split because the two halves fail differently: taking a subscription
+    /// needs a live proxy and so a live binder device, while the accounting
+    /// is pure — and the accounting is what drifted. The seam lets a test
+    /// assert *how many times* the kernel call happens for a given sequence
+    /// of retains and releases, which is the property that was wrong.
+    ///
+    /// `link` runs only when this is the first dependant, and the entry is
+    /// recorded only if it succeeds — a failed link leaves no accounting
+    /// behind to release.
+    fn retain_counted(
+        &mut self,
+        handle: u32,
+        weak: &rsbinder::WIBinder,
+        link: impl FnOnce() -> rsbinder::status::Result<()>,
+    ) -> rsbinder::status::Result<()> {
+        if let Some(existing) = self.death_links.get_mut(&handle) {
+            existing.count += 1;
+            return Ok(());
+        }
+        link()?;
+        self.death_links.insert(
+            handle,
+            DeathLink {
+                weak: weak.clone(),
+                count: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Stop depending on `binder`'s death notification, dropping the kernel
+    /// subscription once nothing depends on it.
+    ///
+    /// Dropping it matters: `ProxyHandle::Drop` does not clear the kernel
+    /// subscription (rsbinder has no `~Service` hook the way AOSP does), so
+    /// a registration that is replaced or unregistered would otherwise leak
+    /// a `BC_REQUEST_DEATH_NOTIFICATION` for the rest of the process's life.
+    fn release_death_link(&mut self, binder: &SIBinder) {
+        let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
+            return;
+        };
+        let recipient: Arc<dyn rsbinder::DeathRecipient> = self.death_recipient.clone();
+        self.release_counted(handle, || {
+            if let Err(e) = binder.unlink_to_death(Arc::downgrade(&recipient)) {
+                // A binder that died between its obituary and this call is
+                // the ordinary racing case — not worth a warning on every
+                // service restart.
+                if e == rsbinder::StatusCode::DeadObject {
+                    log::debug!("death notification for handle {handle} was already gone");
+                } else {
+                    log::warn!("failed to unlink death notification for handle {handle}: {e:?}");
+                }
+            }
+        });
+    }
+
+    /// Bookkeeping half of [`Inner::release_death_link`]; see
+    /// [`Inner::retain_counted`] for why it is split. `unlink` runs, and the
+    /// entry is dropped, only when the last dependant goes away. A release
+    /// with no matching entry is ignored rather than underflowing.
+    fn release_counted(&mut self, handle: u32, unlink: impl FnOnce()) {
+        let Some(link) = self.death_links.get_mut(&handle) else {
+            return;
+        };
+        link.count -= 1;
+        if link.count > 0 {
+            return;
+        }
+        unlink();
+        self.death_links.remove(&handle);
     }
 
     /// Mutate `service.has_clients` under the lock and *collect* (do not
@@ -341,18 +476,16 @@ impl Inner {
         Ok(has_clients)
     }
 
-    /// Look up a registered service by name. Returns `Some((binder,
-    /// is_accessor))` if registered — the `is_accessor` flag is the
-    /// one stamped at `addService` time, used by
-    /// `getService2`/`checkService2` to choose between
-    /// `Service::Accessor(Some(_))` and `Service::ServiceWithMetadata`.
-    /// Callers that only need the binder can `.map(|(b, _)| b)`.
+    /// Look up a registered service by name.
+    ///
+    /// The metadata rides along because `getService2`/`checkService2` put it
+    /// on the wire; see [`Lookup`].
     fn try_get_binder(
         &mut self,
         name: &str,
         _start_if_not_found: bool,
         pending: &mut Vec<PendingCallback>,
-    ) -> rsbinder::status::Result<Option<(SIBinder, bool)>> {
+    ) -> rsbinder::status::Result<Option<Lookup>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
             service
         } else {
@@ -361,6 +494,7 @@ impl Inner {
 
         let out = service.binder.clone();
         let is_accessor = service.is_accessor;
+        let is_lazy = service.dump_priority & FLAG_IS_LAZY_SERVICE != 0;
         service.guarantee_client = true;
         self.handle_service_client_callback(Self::KNOWN_CLIENTS_ON_DEMAND, name, false, pending)?;
 
@@ -368,51 +502,79 @@ impl Inner {
             service.guarantee_client = true;
         }
 
-        Ok(Some((out, is_accessor)))
+        Ok(Some(Lookup {
+            binder: out,
+            is_accessor,
+            is_lazy,
+        }))
     }
 
-    fn remove_registration_callback(
-        &mut self,
-        name: Option<&str>,
-        who: &rsbinder::WIBinder,
-    ) -> bool {
-        let mut found = false;
-        if let Some(name) = name {
-            if let Some(callbacks) = self.name_to_registration_callbacks.get_mut(name) {
-                callbacks.retain(|callback| {
-                    let is_not_equal = SIBinder::downgrade(&callback.as_binder()) != *who;
-                    found |= !is_not_equal;
-                    is_not_equal
-                });
-                if callbacks.is_empty() {
-                    self.name_to_registration_callbacks.remove(name);
-                }
-            }
-        } else {
-            self.name_to_registration_callbacks.retain(|_, callbacks| {
-                callbacks.retain(|callback| {
-                    let is_not_equal = SIBinder::downgrade(&callback.as_binder()) != *who;
-                    found |= !is_not_equal;
-                    is_not_equal
-                });
-                !callbacks.is_empty()
+    /// Drop every registration callback for `binder` under `name`, and
+    /// return how many entries went.
+    ///
+    /// The count, not a bool: each entry holds one reference on the
+    /// callback's death subscription, so `unregisterForNotifications` has
+    /// to release exactly as many as it removed.
+    ///
+    /// Matches on binder identity (`Arc` pointer equality), which is what
+    /// the proxy cache guarantees for two references to the same live
+    /// handle. The dead-binder path cannot use this and goes through
+    /// [`Inner::retire_dead_binder`] instead.
+    fn remove_registration_callback(&mut self, name: &str, binder: &SIBinder) -> usize {
+        let mut removed = 0;
+        if let Some(callbacks) = self.name_to_registration_callbacks.get_mut(name) {
+            callbacks.retain(|callback| {
+                let keep = callback.as_binder() != *binder;
+                removed += usize::from(!keep);
+                keep
             });
+            if callbacks.is_empty() {
+                self.name_to_registration_callbacks.remove(name);
+            }
         }
-
-        found
+        removed
     }
 
-    fn remove_client_callback(&mut self, who: &rsbinder::WIBinder) {
-        // Mirror AOSP `ServiceManager::binderDied`'s third loop
-        // (`removeClientCallback` over `mNameToClientCallback`): drop every
-        // client callback whose binder matches the dead `who`, and remove
-        // any now-empty entries. Without this the dead `IClientCallback`
-        // `Strong` is leaked for the lifetime of rsb_hub and
-        // `onClients` keeps firing on a dead proxy on every state change.
-        self.name_to_client_callbacks.retain(|_, callbacks| {
-            callbacks.retain(|callback| SIBinder::downgrade(&callback.as_binder()) != *who);
-            !callbacks.is_empty()
+    /// Drop every registration owned by a binder that has died: its service
+    /// names, its registration callbacks, its client callbacks, and its
+    /// death-subscription record. Returns `(services, callbacks)` retired.
+    ///
+    /// Matching `who` against a stored `SIBinder` is only sound because
+    /// [`SIBinder::downgrade`] takes a proxy's identity from the proxy
+    /// itself. It used to read it from the proxy cache, which the obituary
+    /// retires *before* dispatching — so this comparison answered `false`
+    /// for every binder and each death retired nothing, leaving the
+    /// registry to hand out dead binders and hold their names forever.
+    fn retire_dead_binder(&mut self, who: &rsbinder::WIBinder) -> (usize, usize) {
+        let before = self.name_to_service.len();
+        self.name_to_service
+            .retain(|_, service| *who != service.binder);
+        let services = before - self.name_to_service.len();
+
+        let mut callbacks = 0;
+        self.name_to_registration_callbacks.retain(|_, entries| {
+            entries.retain(|callback| {
+                let keep = *who != callback.as_binder();
+                callbacks += usize::from(!keep);
+                keep
+            });
+            !entries.is_empty()
         });
+
+        // AOSP `ServiceManager::binderDied`'s third loop: without this the
+        // dead `IClientCallback` is held for the lifetime of rsb_hub and
+        // `onClients` keeps firing at a dead proxy on every state change.
+        self.name_to_client_callbacks.retain(|_, entries| {
+            entries.retain(|callback| *who != callback.as_binder());
+            !entries.is_empty()
+        });
+
+        // Last: the entries above each held a reference on this
+        // subscription, and the kernel released it when it sent the
+        // obituary, so there is nothing to unlink.
+        self.death_links.retain(|_, link| link.weak != *who);
+
+        (services, callbacks)
     }
 }
 
@@ -446,14 +608,18 @@ impl ServiceManager {
             .name("rsb_hub:death".to_owned())
             .spawn(move || {
                 for who in death_receiver {
-                    let mut inner = lock_recover(&inner_clone);
-
-                    inner
-                        .name_to_service
-                        .retain(|_, service| !(SIBinder::downgrade(&service.binder) == who));
-
-                    inner.remove_registration_callback(None, &who);
-                    inner.remove_client_callback(&who);
+                    let (services, callbacks) = {
+                        let mut inner = lock_recover(&inner_clone);
+                        inner.retire_dead_binder(&who)
+                    };
+                    // Worth a line even at zero: a death that retires nothing
+                    // means the obituary matched no registration, which is
+                    // the shape this cleanup failing takes — and when it
+                    // fails the registry keeps handing out a dead binder.
+                    log::info!(
+                        "binder died: retired {services} service name(s) and \
+                         {callbacks} registration callback(s)"
+                    );
                 }
             });
         if let Err(e) = spawn_result {
@@ -579,6 +745,23 @@ impl ServiceManager {
 
 impl Interface for ServiceManager {}
 
+/// A registered service, as `getService2`/`checkService2` need to see it.
+struct Lookup {
+    binder: SIBinder,
+    /// Stamped at `addService` time from the binder's own descriptor;
+    /// selects the `Service::Accessor` arm below.
+    is_accessor: bool,
+    /// `dumpPriority & FLAG_IS_LAZY_SERVICE`, which the client uses to
+    /// decide whether the binder may be cached. AOSP's
+    /// `BackendUnifiedServiceManager::updateCache`
+    /// (`BackendUnifiedServiceManager.cpp:150-153`) returns early for a lazy
+    /// service, because a lazy service can be unregistered via
+    /// `tryUnregisterService` *without dying* — so no death notification
+    /// invalidates the cache, and the client would keep handing out a binder
+    /// to a service that has withdrawn.
+    is_lazy: bool,
+}
+
 /// Convert a `Inner::try_get_binder` lookup result
 /// into the `Service` union arm shape returned by
 /// `getService2`/`checkService2`. Routes `is_accessor=true`
@@ -589,17 +772,23 @@ impl Interface for ServiceManager {}
 /// still pick up locally-registered providers when servicemanager has
 /// no binder under this name.
 fn classify_for_service_union(
-    lookup: Option<(SIBinder, bool)>,
+    lookup: Option<Lookup>,
 ) -> hub::android_16::android::os::Service::Service {
     use hub::android_16::android::os::{Service, ServiceWithMetadata};
     match lookup {
-        Some((binder, true)) => Service::Service::Accessor(Some(binder)),
-        Some((binder, false)) => {
-            Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
-                service: Some(binder),
-                isLazyService: false,
-            })
-        }
+        Some(Lookup {
+            binder,
+            is_accessor: true,
+            ..
+        }) => Service::Service::Accessor(Some(binder)),
+        Some(Lookup {
+            binder,
+            is_accessor: false,
+            is_lazy,
+        }) => Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
+            service: Some(binder),
+            isLazyService: is_lazy,
+        }),
         // Not found. AOSP returns `serviceWithMetadata(nullptr)` for a
         // missing non-accessor name, which an AOSP client routes into its
         // local `getInjectedAccessor(name)` fallback; an `accessor(nullptr)`
@@ -631,7 +820,7 @@ impl IServiceManager for ServiceManager {
             let mut inner = lock_recover(&self.inner);
             inner
                 .try_get_binder(name, false, &mut pending)?
-                .map(|(b, _)| b)
+                .map(|found| found.binder)
         };
         fire_pending(pending);
         Ok(result)
@@ -662,6 +851,17 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
+        // Not fatal, and AOSP does not reject it either
+        // (`ServiceManager.cpp:539`) — but a service registered with no
+        // priority bit is invisible to every `listServices` filter, which is
+        // almost always a caller bug rather than an intent.
+        if dumpPriority & DUMP_FLAG_PRIORITY_ALL == 0 {
+            log::warn!(
+                "addService: '{name}' registered with dumpPriority {dumpPriority:#x}, which sets \
+                 no DUMP_FLAG_PRIORITY_* bit; it will not appear in listServices"
+            );
+        }
+
         // Detect `IAccessor` binders by interface descriptor at registration.
         // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
         // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
@@ -684,7 +884,6 @@ impl IServiceManager for ServiceManager {
         let mut reg_pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
             let mut inner = lock_recover(&self.inner);
-            let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
 
             // distinct-name DoS cap: refuse a *new* service name once the
             // registry is full (overwriting an existing name never grows the
@@ -751,34 +950,23 @@ impl IServiceManager for ServiceManager {
                         existing.context.pid
                     );
                 }
-                if !same_binder && existing.binder.as_proxy().is_some() {
+                if !same_binder {
                     old_to_unlink = Some(existing.binder.clone());
                 }
             }
 
-            // Link the new binder FIRST (proxies only — native binders have
-            // no death notification), before unlinking the old one: a link
-            // failure then leaves the existing registration and its death
-            // link intact (clean no-op), instead of stranding an unmonitored
-            // entry. Skip when the same binder is re-registered (already
-            // linked; relinking would stack a duplicate recipient that fires
-            // `binder_died` once per copy).
-            if !same_binder && service.as_proxy().is_some() {
-                service.link_to_death(Arc::downgrade(&recipient))?;
+            // Take a reference on the new binder's subscription BEFORE
+            // releasing the old one's: a failure here then leaves the
+            // existing registration and its subscription intact (a clean
+            // no-op) instead of stranding an unmonitored entry. Skipped when
+            // the same binder is re-registered, since this entry's existing
+            // reference carries over.
+            if !same_binder {
+                inner.retain_death_link(service)?;
             }
 
-            // New link is in place: unlink the old binder we are about to
-            // drop. `ProxyHandle::Drop` does *not* clear death notifications,
-            // so without this its kernel subscription would leak until that
-            // binder dies. (AOSP drops the link in `~Service`; rsbinder has
-            // no such dtor hook.)
             if let Some(old) = old_to_unlink {
-                if let Err(e) = old.unlink_to_death(Arc::downgrade(&recipient)) {
-                    log::warn!(
-                        "addService: failed to unlink death notification for \
-                         replaced '{name}': {e:?}"
-                    );
-                }
+                inner.release_death_link(&old);
             }
 
             inner.add_service(
@@ -840,7 +1028,7 @@ impl IServiceManager for ServiceManager {
             let mut inner = lock_recover(&self.inner);
             inner
                 .try_get_binder(name, false, &mut pending)?
-                .map(|(b, _)| b)
+                .map(|found| found.binder)
         };
         fire_pending(pending);
         Ok(result)
@@ -849,15 +1037,12 @@ impl IServiceManager for ServiceManager {
     fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
         let inner = lock_recover(&self.inner);
 
-        let mut services = Vec::new();
-
-        for (name, service) in inner.name_to_service.iter() {
-            if (service.dump_priority & dump_priority) != 0 {
-                services.push(name.clone());
-            }
-        }
-
-        Ok(services)
+        Ok(inner
+            .name_to_service
+            .iter()
+            .filter(|(_, service)| (service.dump_priority & dump_priority) != 0)
+            .map(|(name, _)| name.clone())
+            .collect())
     }
 
     fn registerForNotifications(
@@ -902,30 +1087,9 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // Death-link dedup. rsb_hub links every accepted registration to a
-            // single shared `death_recipient`, and `ProxyHandle::link_to_death`
-            // does not dedup recipients, so linking the same callback binder
-            // under K distinct names would stack K identical death
-            // subscriptions and fire `binder_died` K times on death — K full
-            // O(maps) cleanup sweeps in the single death thread (a self-DoS
-            // bounded only by `MAX_DISTINCT_NAMES`). Link at most once per
-            // distinct callback binder; the per-name list still records it
-            // under every name, so cleanup still finds and removes all entries.
-            // The scan short-circuits on the first match, so the amplification
-            // case (one binder, many names) stays O(1) per registration after
-            // the initial link. Mirrors the `same_binder` relink guard in
-            // `addService`.
-            let cb_binder = arg_callback.as_binder();
-            let already_linked = inner
-                .name_to_registration_callbacks
-                .values()
-                .flatten()
-                .any(|c| c.as_binder() == cb_binder);
-            if !already_linked {
-                cb_binder.link_to_death(Arc::downgrade(
-                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-                ))?;
-            }
+            // One reference per (name, callback) entry; the idempotency
+            // guard above means this cannot double-count a single name.
+            inner.retain_death_link(&arg_callback.as_binder())?;
 
             inner
                 .name_to_registration_callbacks
@@ -955,13 +1119,19 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<()> {
         let mut inner = lock_recover(&self.inner);
 
-        if inner
-            .remove_registration_callback(Some(name), &SIBinder::downgrade(&callback.as_binder()))
-        {
-            Ok(())
-        } else {
-            Err(ExceptionCode::IllegalState.into())
+        let binder = callback.as_binder();
+        let removed = inner.remove_registration_callback(name, &binder);
+        if removed == 0 {
+            return Err(ExceptionCode::IllegalState.into());
         }
+        // Release one reference per entry removed. Without this the
+        // subscription outlives every registration that justified it, and
+        // the next `registerForNotifications` for the same binder takes a
+        // second one — unbounded growth across register/unregister cycles.
+        for _ in 0..removed {
+            inner.release_death_link(&binder);
+        }
+        Ok(())
     }
 
     /// rsb_hub has no static service declaration system on Linux —
@@ -1034,13 +1204,16 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             };
 
+            // AOSP `ServiceManager.cpp:911` answers this with
+            // `EX_UNSUPPORTED_OPERATION`, not `EX_SECURITY`; the code is on
+            // the wire, so a C++ `LazyServiceRegistrar` sees the difference.
             if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
                 let msg = format!(
                     "{:?} Only a server can register for client callbacks (for {})",
                     service.context, name
                 );
                 log::warn!("{}", msg);
-                return Err((ExceptionCode::Security, msg.as_str()).into());
+                return Err((ExceptionCode::UnsupportedOperation, msg.as_str()).into());
             }
 
             if service.binder != *arg_service {
@@ -1048,6 +1221,11 @@ impl IServiceManager for ServiceManager {
                 log::warn!("{}", msg);
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             }
+
+            // Copy what the rest of this function needs so the borrow on the
+            // registry ends here; everything below mutates it.
+            let service_binder = service.binder.clone();
+            let service_has_clients = service.has_clients;
 
             // Drop idempotent re-registrations and cap the list before
             // taking a death link or storing the callback. See
@@ -1078,26 +1256,18 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // Death-link dedup, same rationale as `registerForNotifications`:
-            // link the shared `death_recipient` at most once per distinct
-            // callback binder so registering one binder across K service names
-            // cannot stack K death subscriptions (K cleanup sweeps on death).
-            let cb_binder = arg_callback.as_binder();
-            let already_linked = inner
-                .name_to_client_callbacks
-                .values()
-                .flatten()
-                .any(|c| c.as_binder() == cb_binder);
-            if !already_linked {
-                cb_binder.link_to_death(Arc::downgrade(
-                    &(inner.death_recipient.clone() as Arc<dyn rsbinder::DeathRecipient>),
-                ))?;
-            }
+            // One reference per (name, callback) entry, as in
+            // `registerForNotifications`. There is no unregister call for a
+            // client callback, so these are released only when the binder
+            // dies — matching AOSP, which likewise keeps them across a
+            // `tryUnregisterService` so a reactivating lazy service does not
+            // have to re-register.
+            inner.retain_death_link(&arg_callback.as_binder())?;
 
-            if service.has_clients {
+            if service_has_clients {
                 pending.push(PendingCallback::Clients {
                     callback: arg_callback.clone(),
-                    binder: service.binder.clone(),
+                    binder: service_binder,
                     has_clients: true,
                 });
             }
@@ -1140,22 +1310,25 @@ impl IServiceManager for ServiceManager {
                     "{context:?} Tried to unregister {name}, but that service wasn't registered to begin with."
                 );
                 log::warn!("{}", msg);
-                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+                // AOSP `ServiceManager.cpp:1084`: EX_ILLEGAL_STATE.
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             };
 
+            // AOSP `ServiceManager.cpp:1090`: EX_UNSUPPORTED_OPERATION.
             if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
                 let msg = format!(
-                    "{:?} Only a server can register for client callbacks (for {})",
+                    "{:?} Only a server can unregister itself (for {})",
                     service.context, name
                 );
                 log::warn!("{}", msg);
-                return Err((ExceptionCode::Security, msg.as_str()).into());
+                return Err((ExceptionCode::UnsupportedOperation, msg.as_str()).into());
             }
 
             if service.binder != *arg_service {
                 let msg = format!("{context:?} Tried to unregister {name}, but a different service is registered under this name.");
                 log::warn!("{}", msg);
-                return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
+                // AOSP `ServiceManager.cpp:1098`: EX_ILLEGAL_STATE.
+                return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
             if service.guarantee_client {
@@ -1194,22 +1367,10 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // Drop the death subscription before removing the entry.
-            // `ProxyHandle::Drop` does not clear the kernel death
-            // notification (rsbinder has no `~Service` hook), so — exactly
-            // as addService's replace path does — an explicit unlink is
-            // required. Otherwise every register→tryUnregister cycle (e.g.
-            // a lazy service idling and reactivating) leaks a kernel
-            // `BC_REQUEST_DEATH_NOTIFICATION` plus a `DeathRecipient` entry.
-            if arg_service.as_proxy().is_some() {
-                let recipient: Arc<dyn rsbinder::DeathRecipient> = inner.death_recipient.clone();
-                if let Err(e) = arg_service.unlink_to_death(Arc::downgrade(&recipient)) {
-                    log::warn!(
-                        "tryUnregisterService: failed to unlink death notification for '{name}': {e:?}"
-                    );
-                }
-            }
-
+            // Release this registration's reference on the subscription
+            // before dropping the entry, so a register→tryUnregister cycle
+            // (a lazy service idling and reactivating) is net-zero.
+            inner.release_death_link(arg_service);
             inner.name_to_service.remove(name);
 
             Ok(())
@@ -1226,18 +1387,16 @@ impl IServiceManager for ServiceManager {
     > {
         let inner = lock_recover(&self.inner);
 
-        let mut out = Vec::with_capacity(inner.name_to_service.len());
-
-        for (name, service) in inner.name_to_service.iter() {
-            out.push(
+        Ok(inner
+            .name_to_service
+            .iter()
+            .map(|(name, service)| {
                 hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo {
                     name: name.clone(),
                     debugPid: service.context.pid,
-                },
-            );
-        }
-
-        Ok(out)
+                }
+            })
+            .collect())
     }
 
     fn getService2(
@@ -1331,16 +1490,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
+    // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: rsb_hub is deliberately
+    // single-threaded, exactly like `servicemanager`. Note that rsbinder
+    // currently clamps 0 up to its default, so the kernel is told a larger
+    // ceiling than rsb_hub will ever honor — harmless (nothing here calls
+    // `start_thread_pool`, so `BR_SPAWN_LOOPER` is ignored and the kernel
+    // simply stops asking), and 0 becomes accurate for free if rsbinder
+    // learns to pass it through. See plans/6-rsb-hub-linux.md L-2.
     ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.
     let service = BnServiceManager::new_binder(ServiceManager::new(allow_cross_uid_overwrite));
-    service.addService(
-        "manager",
+    // Log and carry on, as AOSP does (`main.cpp`: "Could not self register
+    // servicemanager"). Clients reach the hub through handle 0 regardless;
+    // the registry entry is a convenience, and refusing to come up without
+    // it would take the machine's IPC down for a cosmetic failure.
+    if let Err(e) = service.addService(
+        SELF_SERVICE_NAME,
         &service.as_binder(),
         false,
         DUMP_FLAG_PRIORITY_DEFAULT,
-    )?;
+    ) {
+        log::error!("rsb_hub: could not self-register as '{SELF_SERVICE_NAME}': {e:?}");
+    }
 
     ProcessState::as_self().become_context_manager(service.as_binder())?;
 
@@ -1350,6 +1522,238 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local binder, purely as a source of distinct `WIBinder` identities
+    /// for the death-link tests — every `fake_binder()` is its own
+    /// allocation and so its own identity. Never transacted on.
+    struct FakeBinder;
+
+    impl Interface for FakeBinder {}
+
+    impl Remotable for FakeBinder {
+        fn descriptor() -> &'static str {
+            "rsbinder.test.hub.IFake"
+        }
+        fn on_transact(
+            &self,
+            _code: TransactionCode,
+            _reader: &mut Parcel,
+            _reply: &mut Parcel,
+        ) -> rsbinder::Result<()> {
+            Err(rsbinder::StatusCode::UnknownTransaction)
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake_binder() -> SIBinder {
+        Interface::as_binder(&rsbinder::Binder::new(FakeBinder))
+    }
+
+    fn test_inner() -> Inner {
+        let (tx, _rx) = mpsc::channel();
+        Inner::new(tx)
+    }
+
+    /// Counts how many times the kernel half of a retain/release would run.
+    #[derive(Default)]
+    struct LinkLedger {
+        links: std::cell::Cell<usize>,
+        unlinks: std::cell::Cell<usize>,
+    }
+
+    impl LinkLedger {
+        fn link(&self) -> rsbinder::status::Result<()> {
+            self.links.set(self.links.get() + 1);
+            Ok(())
+        }
+        fn unlink(&self) {
+            self.unlinks.set(self.unlinks.get() + 1);
+        }
+    }
+
+    /// H-1b: one binder registered under many names must take **one**
+    /// kernel subscription, so its death fires `binder_died` once and
+    /// triggers one cleanup sweep — not one per name. Releasing all but the
+    /// last name must not drop the subscription the remaining name needs.
+    #[test]
+    fn one_subscription_per_binder_regardless_of_name_count() {
+        let mut inner = test_inner();
+        let ledger = LinkLedger::default();
+        let weak = SIBinder::downgrade(&fake_binder());
+
+        for _ in 0..5 {
+            inner
+                .retain_counted(7, &weak, || ledger.link())
+                .expect("retain must succeed");
+        }
+        assert_eq!(ledger.links.get(), 1, "five names, one subscription");
+        assert_eq!(inner.death_links[&7].count, 5);
+
+        for _ in 0..4 {
+            inner.release_counted(7, || ledger.unlink());
+        }
+        assert_eq!(ledger.unlinks.get(), 0, "one name still depends on it");
+        assert!(inner.death_links.contains_key(&7));
+
+        inner.release_counted(7, || ledger.unlink());
+        assert_eq!(ledger.unlinks.get(), 1, "last release drops it");
+        assert!(!inner.death_links.contains_key(&7));
+    }
+
+    /// H-1: the register/unregister cycle that used to leak. Each iteration
+    /// re-links because the previous unregister removed the callback from
+    /// the map without releasing the subscription, so a client could grow
+    /// the recipient list — and the per-death sweep count — without bound.
+    /// Paired accounting must keep it flat.
+    #[test]
+    fn register_unregister_cycles_do_not_accumulate_subscriptions() {
+        let mut inner = test_inner();
+        let ledger = LinkLedger::default();
+        let weak = SIBinder::downgrade(&fake_binder());
+
+        for _ in 0..100 {
+            inner
+                .retain_counted(9, &weak, || ledger.link())
+                .expect("retain must succeed");
+            inner.release_counted(9, || ledger.unlink());
+        }
+
+        assert_eq!(ledger.links.get(), 100, "one link per cycle");
+        assert_eq!(ledger.unlinks.get(), 100, "and one unlink per cycle");
+        assert!(
+            inner.death_links.is_empty(),
+            "no residue after the last release"
+        );
+    }
+
+    /// A failed link must leave no accounting behind: a later release would
+    /// otherwise unlink a subscription that was never taken.
+    #[test]
+    fn failed_link_records_nothing() {
+        let mut inner = test_inner();
+        let weak = SIBinder::downgrade(&fake_binder());
+
+        let err = inner
+            .retain_counted(3, &weak, || Err(ExceptionCode::IllegalState.into()))
+            .expect_err("link failure must propagate");
+        assert_eq!(err.exception_code(), ExceptionCode::IllegalState);
+        assert!(inner.death_links.is_empty());
+
+        // And the release that follows a failed retain is inert.
+        let ledger = LinkLedger::default();
+        inner.release_counted(3, || ledger.unlink());
+        assert_eq!(ledger.unlinks.get(), 0);
+    }
+
+    /// H-2: an obituary retires the dead binder's record — whatever its
+    /// count, since the kernel released the subscription itself — and
+    /// attempts no unlink. Only that binder's record goes.
+    ///
+    /// The identity comparison this rests on is pinned in `rsbinder`
+    /// (`proxy_downgrade_keeps_its_identity_without_a_cache_entry`); the
+    /// registry-sweeping half needs proxies with real handles and lives in
+    /// `tests/scripts/run_hub_policy_ac.sh`.
+    #[test]
+    fn obituary_finds_its_record_by_the_stored_weak() {
+        let mut inner = test_inner();
+        let ledger = LinkLedger::default();
+        let dead = fake_binder();
+        let live = fake_binder();
+        let dead_weak = SIBinder::downgrade(&dead);
+        let live_weak = SIBinder::downgrade(&live);
+
+        inner
+            .retain_counted(1, &dead_weak, || ledger.link())
+            .unwrap();
+        inner
+            .retain_counted(1, &dead_weak, || ledger.link())
+            .unwrap();
+        inner
+            .retain_counted(2, &live_weak, || ledger.link())
+            .unwrap();
+
+        let retired = inner.retire_dead_binder(&dead_weak);
+        assert_eq!(retired, (0, 0), "no registrations exist in this test");
+
+        assert!(!inner.death_links.contains_key(&1), "dead record removed");
+        assert!(inner.death_links.contains_key(&2), "live record kept");
+        assert_eq!(ledger.unlinks.get(), 0, "the obituary path must not unlink");
+    }
+
+    /// An obituary for a binder nothing tracks must be inert, not a panic
+    /// and not a sweep keyed on a handle it guessed.
+    #[test]
+    fn obituary_for_an_untracked_binder_is_inert() {
+        let mut inner = test_inner();
+        let stranger = SIBinder::downgrade(&fake_binder());
+        assert_eq!(inner.retire_dead_binder(&stranger), (0, 0));
+        assert!(inner.death_links.is_empty());
+    }
+
+    /// A native (`Bn*`) binder has no death notification, so both halves are
+    /// no-ops. Callers rely on this to avoid testing for it themselves.
+    #[test]
+    fn native_binders_are_skipped() {
+        let mut inner = test_inner();
+        let native = fake_binder();
+        assert!(native.as_proxy().is_none(), "precondition");
+
+        inner
+            .retain_death_link(&native)
+            .expect("retain on a native binder must be a no-op");
+        assert!(inner.death_links.is_empty());
+        inner.release_death_link(&native);
+        assert!(inner.death_links.is_empty());
+    }
+
+    /// M-1: `isLazyService` must reflect `FLAG_IS_LAZY_SERVICE` in the
+    /// registered dumpPriority. AOSP's client uses it to decide whether the
+    /// binder may be cached, and a lazy service withdraws via
+    /// `tryUnregisterService` *without dying* — so a stuck `false` hands out
+    /// a cached binder to a service that is gone.
+    #[test]
+    fn lazy_flag_reaches_the_service_union() {
+        use hub::android_16::android::os::Service::Service;
+
+        let lazy = classify_for_service_union(Some(Lookup {
+            binder: fake_binder(),
+            is_accessor: false,
+            is_lazy: true,
+        }));
+        match lazy {
+            Service::ServiceWithMetadata(swm) => assert!(swm.isLazyService),
+            other => panic!("expected ServiceWithMetadata, got {other:?}"),
+        }
+
+        let eager = classify_for_service_union(Some(Lookup {
+            binder: fake_binder(),
+            is_accessor: false,
+            is_lazy: false,
+        }));
+        match eager {
+            Service::ServiceWithMetadata(swm) => assert!(!swm.isLazyService),
+            other => panic!("expected ServiceWithMetadata, got {other:?}"),
+        }
+
+        // An accessor has no metadata arm to carry the flag.
+        let accessor = classify_for_service_union(Some(Lookup {
+            binder: fake_binder(),
+            is_accessor: true,
+            is_lazy: true,
+        }));
+        assert!(matches!(accessor, Service::Accessor(Some(_))));
+    }
+
+    /// The lazy bit is the one AOSP defines, and it is outside
+    /// `DUMP_FLAG_PRIORITY_ALL` — so a lazy registration still needs a
+    /// priority bit of its own to appear in `listServices`.
+    #[test]
+    fn lazy_flag_is_disjoint_from_the_priority_mask() {
+        assert_eq!(FLAG_IS_LAZY_SERVICE, 1 << 30);
+        assert_eq!(FLAG_IS_LAZY_SERVICE & DUMP_FLAG_PRIORITY_ALL, 0);
+    }
 
     /// Add-time access control: a cross-UID overwrite of a different live
     /// binder is rejected by default; same-UID restarts, identical-binder
@@ -1445,13 +1849,13 @@ mod tests {
     #[test]
     fn distinct_name_cap_rejects_new_but_allows_existing() {
         // Below capacity: any name is allowed.
-        let mut small: HashMap<String, ()> = HashMap::new();
+        let mut small: BTreeMap<String, ()> = BTreeMap::new();
         small.insert("a".to_owned(), ());
         assert!(!distinct_name_cap_exceeded(&small, "a"));
         assert!(!distinct_name_cap_exceeded(&small, "brand-new"));
 
         // Fill exactly to capacity with distinct names.
-        let mut full: HashMap<String, ()> = HashMap::new();
+        let mut full: BTreeMap<String, ()> = BTreeMap::new();
         for i in 0..MAX_DISTINCT_NAMES {
             full.insert(format!("svc.{i}"), ());
         }
