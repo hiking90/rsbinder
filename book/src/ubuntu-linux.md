@@ -58,7 +58,14 @@ $ grep binderfs /proc/filesystems
 
 # Test creating a binder device (requires rsbinder-tools)
 $ cargo install rsbinder-tools
-$ sudo rsb_device binder
+# Create the `binder` group and put yourself in it (log out and back in,
+# or use `newgrp binder`, for the membership to take effect)
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+
+# Create the device, owned by that group. The node's mode is the only gate
+# on who may speak binder at all, so it defaults to 0600 (root only).
+$ sudo rsb_device binder --group binder --mode 0660
 ```
 
 ## Troubleshooting

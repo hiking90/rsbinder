@@ -106,8 +106,8 @@ CONFIG_ANDROID_BINDERFS=y
 Build, bring up the service manager, then run the example:
 ```
 $ cargo build
-$ sudo target/debug/rsb_device binder    # create /dev/binder
-$ cargo run --bin rsb_hub                # service manager
+$ sudo target/debug/rsb_device binder --group "$(id -gn)" --mode 0660
+$ cargo run --bin rsb_hub -- --insecure-allow-all   # service manager
 $ cargo run --bin hello_service
 $ cargo run --bin hello_client
 ```

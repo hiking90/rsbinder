@@ -20,7 +20,14 @@ Install **rsbinder-tools** and run to create a binder device:
 
 ```bash
 $ cargo install rsbinder-tools
-$ sudo rsb_device binder
+# Create the `binder` group and put yourself in it (log out and back in,
+# or use `newgrp binder`, for the membership to take effect)
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+
+# Create the device, owned by that group. The node's mode is the only gate
+# on who may speak binder at all, so it defaults to 0600 (root only).
+$ sudo rsb_device binder --group binder --mode 0660
 ```
 
 ### Method 2: Build from source
@@ -30,26 +37,51 @@ If you prefer to build from source:
 $ git clone https://github.com/hiking90/rsbinder.git
 $ cd rsbinder
 $ cargo build --release
-$ sudo target/release/rsb_device binder
+# Create the `binder` group and put yourself in it (log out and back in,
+# or use `newgrp binder`, for the membership to take effect)
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+
+# Create the device, owned by that group. The node's mode is the only gate
+# on who may speak binder at all, so it defaults to 0600 (root only).
+$ sudo target/release/rsb_device binder --group binder --mode 0660
 ```
 
 The `rsb_device` tool will:
 - Create `/dev/binderfs` directory if it doesn't exist
 - Mount binderfs filesystem
 - Create the specified binder device
-- Set appropriate permissions (0666) for user access
+- Set the device node's owning group (`--group`) and mode (`--mode`, default
+  `0600`)
+
+The mode is not a formality: binder has no in-kernel access control of its
+own, so the device node is the only thing deciding who can speak binder at
+all — the same model as `/dev/kvm` being `0660 root:kvm`. It defaults to
+root-only; grant access deliberately with `--group`.
 
 ## Run a service manager for Linux
-If **rsbinder-tools** is already installed, the **rsb_hub** executable is also installed. Run it as follows:
+If **rsbinder-tools** is already installed, the **rsb_hub** executable is also installed.
+
+`rsb_hub` denies every request that its policy does not allow, and refuses to
+start when it cannot load one, so a first run needs one of two things. For a
+quick local try-out, run with no access control at all:
 
 ```bash
-$ rsb_hub
+$ rsb_hub --insecure-allow-all
+```
+
+For anything else, write a policy — see
+[Access control](./service-manager.md#access-control) — and point `rsb_hub` at
+it (`/etc/rsbinder/hub.d` is the default):
+
+```bash
+$ rsb_hub --policy /etc/rsbinder/hub.d
 ```
 
 Alternatively, if building from source:
 
 ```bash
-$ cargo run --bin rsb_hub
+$ cargo run --bin rsb_hub -- --insecure-allow-all
 ```
 
 The service manager (rsb_hub) provides:

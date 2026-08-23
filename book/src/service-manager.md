@@ -24,13 +24,18 @@ Before any service can register or any client can perform lookups, the HUB
 process must be running:
 
 ```bash
-# Build and run the service manager
-$ cargo run --bin rsb_hub
+# Build and run the service manager, with no access control (development)
+$ cargo run --bin rsb_hub -- --insecure-allow-all
 ```
 
 `rsb_hub` opens the Binder device, becomes the context manager (handle 0),
 and enters a loop that processes registration and lookup requests. It must
 remain running for the lifetime of the system's Binder services.
+
+**It also refuses to start without an access-control policy.** Every request
+is denied unless a policy allows it, and `--insecure-allow-all` above is the
+explicit opt-out for development. See [Access control](#access-control) for
+how to write one.
 
 ## Registering a Service
 
@@ -291,6 +296,123 @@ The returned `ServiceDebugInfo` struct has two fields:
 This feature is available on Android 12 and above. On Android 10 and Android 11,
 calling `get_service_debug_info` returns an error.
 
+## Access control
+
+`rsb_hub` gates every entry point on a policy. There is no permissive
+default: a name with no matching rule is denied, a rule that does not mention
+a permission denies it, and a policy that fails to load stops the process
+from starting.
+
+### Why it does not use SELinux
+
+Android's `servicemanager` gates the same three permissions through SELinux.
+SELinux is not present on every Linux distribution and does not exist on
+macOS, so it cannot be the basis of the model here — and it does not need to
+be. Android's policy *model* is SELinux-independent:
+
+```text
+(caller identity, service name) -> {add, find, list}
+```
+
+SELinux is only one way of expressing "caller identity". `rsb_hub` keeps the
+model and swaps that identity for **uid**, which every platform reports and
+the binder driver fills in itself (`sender_euid`) at transaction time —
+unforgeable and not racy. This is the same conclusion D-Bus reached for the
+same problem: uid/group policy files as the portable base, with an LSM as an
+optional overlay rather than a prerequisite.
+
+Note what is *not* used: **pid**. Pid reuse races make every pid-derived
+attribute (`/proc/<pid>/exe`, cgroup, systemd unit) unsound as an
+authorization key — which is why AOSP calls its own field `debugPid`. Groups
+are usable because resolving uid → groups through NSS is race-free.
+
+### Permissions
+
+| Permission | Gates |
+|---|---|
+| `add` | `add_service`, `register_client_callback`, `try_unregister_service` |
+| `find` | `check_service`, `wait_for_service`, `get_service`, `register_for_notifications`, `is_declared`, `get_connection_info`, and the per-name filtering of the two `list` calls |
+| `list` | `list_services`, `get_service_debug_info` — a single global gate, since there is no name to scope it to |
+
+A denied **lookup** is reported as "not registered" rather than as an error.
+That matches AOSP (`getService` returns ok regardless of result) and keeps a
+denied caller from using the error to probe which names exist. Every other
+denial returns `ExceptionCode::Security`.
+
+The two `list` calls apply *both* gates: the caller must be allowed to
+enumerate at all, and each name it would learn about must be one it may
+`find`. A name you cannot look up is a name you do not get told about.
+
+### Policy files
+
+`rsb_hub --policy <PATH>` takes a `.toml` file or a directory of them
+(default: `/etc/rsbinder/hub.d`). A directory is read as every `*.toml` in
+it, sorted by file name — so `10-`/`20-` prefixes control precedence the way
+they do in any other `.d` directory.
+
+```toml
+# /etc/rsbinder/hub.d/10-example.toml
+
+[global]
+# Who may enumerate service names at all. Omitted means nobody.
+list = { group = ["binder-admin"] }
+
+[[rule]]
+name = "com.example.*"                       # trailing `*` only
+add  = { user = ["exampled"] }
+find = { group = ["example-clients"], uid = [0] }
+
+[[rule]]
+name = "*"
+add  = "none"
+find = "none"
+```
+
+A subject is the union of `uid` (numeric), `user` (resolved through NSS at
+load time), and `group` (matched against the caller's primary *and*
+supplementary groups). The shorthands `"any"` and `"none"` are also accepted;
+`"any"` must be written out, since an omitted key always means deny.
+
+**The first rule whose `name` matches decides**, and evaluation stops there —
+a later rule never widens what an earlier one refused. That makes the rule
+governing any given name unique and greppable, which is worth more in a
+security file than the extra expressiveness of last-match-wins. Put
+catch-alls last.
+
+Patterns support a trailing `*` and nothing else. A leading or interior `*`
+is rejected at load time rather than silently matching nothing.
+
+### Reloading
+
+`SIGHUP` reloads the policy in place:
+
+```bash
+$ sudo kill -HUP "$(pidof rsb_hub)"
+```
+
+A reload that fails to parse or resolve **keeps the policy already in
+force** and logs the error. Dropping to deny-all would take the machine's IPC
+down over a typo; falling back to permissive would be worse. The reload also
+drops the memoized uid → groups sets, so group-membership changes take effect
+with it.
+
+### Layers underneath
+
+The policy is the second of two gates. The first is the binder device node
+itself: binder has no in-kernel access control of its own, so
+`/dev/binderfs/<name>` decides who can speak binder *at all*. `rsb_device`
+creates it `0600` (root only) and takes `--group` / `--mode` to widen that
+deliberately — the same model as `/dev/kvm` being `0660 root:kvm`:
+
+```bash
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+$ sudo rsb_device binder --group binder --mode 0660
+```
+
+An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
+platform provides one, but it is never what makes the first two unnecessary.
+
 ## Linux vs. Android Differences
 
 While rsbinder aims for API compatibility across both platforms, there are
@@ -300,7 +422,7 @@ Android's native `servicemanager`:
 | Aspect                  | Linux (`rsb_hub`)                       | Android (`servicemanager`)              |
 |-------------------------|-----------------------------------------|-----------------------------------------|
 | **Process**             | User-space `rsb_hub` binary             | System `servicemanager` daemon          |
-| **Access control**      | No SELinux enforcement                  | Full SELinux MAC policy enforcement     |
+| **Access control**      | uid/group policy files ([above](#access-control)) | SELinux MAC policy                      |
 | **VINTF manifests**     | Not supported (`is_declared` is false)  | Supported and enforced                  |
 | **Service debug info**  | Supported                               | Supported (Android 12+; not on 10/11)   |
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
