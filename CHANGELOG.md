@@ -15,16 +15,23 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
-- **rsbinder (`macros` feature):** `#[rsbinder::interface]` — declare a binder
-  interface as a Rust trait, with no `.aidl` file and no `build.rs`. `&mut T`
-  is an out parameter, `#[inout]` makes it round-trip, `Option<T>` is nullable,
-  `#[oneway]` drops the reply, and transaction codes follow declaration order.
-  The macro fills the same render structs `rsbinder-aidl` fills and runs the
-  same templates, so a trait and the equivalent `.aidl` produce **identical**
-  generated code — golden-tested in `rsbinder-macros`. `.aidl` stays canonical:
+- **rsbinder (`macros` feature):** `#[rsbinder::interface]`,
+  `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` — declare a binder
+  interface as a Rust trait and its data types as ordinary structs and enums,
+  with no `.aidl` file and no `build.rs`. `&mut T` is an out parameter,
+  `#[inout]` makes it round-trip, `Option<T>` is nullable, `#[oneway]` drops
+  the reply, and transaction codes follow declaration order. The macros fill
+  the same render structs `rsbinder-aidl` fills and run the same templates, so
+  a declaration here and the equivalent `.aidl` produce **identical** generated
+  code — golden-tested in `rsbinder-macros`, interface and parcelable alike.
+  `#[derive(Parcelable)]` emits only the codec, leaving `Default`/`Debug`/… to
+  the usual derives. `#[derive(BinderEnum)]` needs `#[repr(i8|i32|i64)]` (the
+  wire format) and explicit variant values, and is **closed**: an undeclared
+  value is `BadValue`, where an `.aidl` enum carries it through — use `.aidl`
+  or `declare_binder_enum!` across version skew. `.aidl` stays canonical for
   unions, constants, `@VintfStability`, `@EnforcePermission`,
-  `ParcelableHolder`, generics and nested types still need it. Off by default;
-  the macro pulls the AIDL compiler in as a proc-macro dependency.
+  `ParcelableHolder`, generics and nested types. Off by default; the macros
+  pull the AIDL compiler in as a proc-macro dependency.
 - **rsbinder-aidl:** new public `render` module — `FnMembers`,
   `InterfaceRender` / `ParcelableRender` / `EnumRender`, and
   `render_interface` / `render_parcelable` / `render_enum`. This is the seam

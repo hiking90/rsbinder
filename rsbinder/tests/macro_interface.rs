@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rsbinder::{interface, BinderResult, Interface, Strong};
+use rsbinder::{interface, BinderEnum, BinderResult, Interface, Parcelable, Strong};
 
 #[interface(descriptor = "rsbinder.test.IMacroEcho")]
 pub trait IMacroEcho {
@@ -33,6 +33,30 @@ pub trait IMacroEcho {
 #[interface(descriptor = "rsbinder.test.IMacroSink")]
 pub trait IMacroSink {
     fn hit(&self, tag: &str) -> BinderResult<()>;
+}
+
+/// A parcelable and an enum, derived rather than written in `.aidl`. Only the
+/// codec is generated, so `Default`/`Debug`/`Clone` are derived alongside.
+#[derive(Parcelable, Default, Debug, Clone, PartialEq)]
+pub struct Config {
+    pub name: String,
+    pub retries: i32,
+    pub extra: Option<Vec<u8>>,
+}
+
+#[derive(BinderEnum, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Mode {
+    #[default]
+    Fast = 0,
+    Safe = 1,
+}
+
+#[interface(descriptor = "rsbinder.test.IMacroData")]
+pub trait IMacroData {
+    fn apply(&self, cfg: &Config, mode: Mode) -> BinderResult<Config>;
+    fn modes(&self, all: &[Mode]) -> BinderResult<Vec<Mode>>;
+    fn maybe_cfg(&self, cfg: Option<&Config>) -> BinderResult<Option<Config>>;
 }
 
 /// A self-referencing interface: the callback is the same type as the
@@ -101,6 +125,23 @@ impl IMacroChain for Chain {
     }
     fn name(&self) -> BinderResult<String> {
         Ok(self.tag.clone())
+    }
+}
+
+struct Data;
+impl Interface for Data {}
+impl IMacroData for Data {
+    fn apply(&self, cfg: &Config, mode: Mode) -> BinderResult<Config> {
+        let mut out = cfg.clone();
+        out.retries += 1;
+        out.name = format!("{}:{mode:?}", cfg.name);
+        Ok(out)
+    }
+    fn modes(&self, all: &[Mode]) -> BinderResult<Vec<Mode>> {
+        Ok(all.iter().rev().copied().collect())
+    }
+    fn maybe_cfg(&self, cfg: Option<&Config>) -> BinderResult<Option<Config>> {
+        Ok(cfg.cloned())
     }
 }
 
@@ -222,4 +263,50 @@ fn macro_interface_can_reference_itself() {
 
     // The server calls back into the binder we handed it, of its own type.
     assert_eq!(chain.relay(&local, "hi").unwrap(), "server>local:hi");
+}
+
+#[test]
+fn derived_parcelable_and_enum_cross_the_wire() {
+    let sock = SockPath::new("data");
+    let _guard = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add("data", BnMacroData::new_binder(Data))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let data: Strong<dyn IMacroData> = rsbinder::connect(&sock.uri("#data")).expect("connect");
+
+    let cfg = Config {
+        name: "cfg".into(),
+        retries: 2,
+        extra: Some(vec![1, 2, 3]),
+    };
+    let back = data.apply(&cfg, Mode::Safe).unwrap();
+    assert_eq!(back.name, "cfg:Safe");
+    assert_eq!(back.retries, 3);
+    assert_eq!(back.extra, Some(vec![1, 2, 3]));
+
+    // An enum travels as its `#[repr]` scalar, arrays included.
+    assert_eq!(
+        data.modes(&[Mode::Fast, Mode::Safe]).unwrap(),
+        vec![Mode::Safe, Mode::Fast]
+    );
+
+    // `Option` is AIDL's `@nullable`, both ways.
+    assert_eq!(data.maybe_cfg(Some(&cfg)).unwrap(), Some(cfg));
+    assert_eq!(data.maybe_cfg(None).unwrap(), None);
+}
+
+/// A derived enum is closed: a value no variant declares is rejected rather
+/// than carried along, which is the one place it parts company with `.aidl`.
+#[test]
+fn derived_enum_rejects_an_undeclared_value() {
+    assert_eq!(Mode::try_from_binder_value(0), Ok(Mode::Fast));
+    assert_eq!(Mode::try_from_binder_value(1), Ok(Mode::Safe));
+    assert_eq!(
+        Mode::try_from_binder_value(7),
+        Err(rsbinder::StatusCode::BadValue)
+    );
+    assert_eq!(Mode::Safe.binder_value(), 1);
 }

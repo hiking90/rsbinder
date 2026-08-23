@@ -122,23 +122,3 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
         other => as_written(other)?,
     })
 }
-
-/// `true` for the scalar types `rsbinder-aidl` passes by value in
-/// `func_call_param` (`TypeGenerator::is_primitive`).
-pub fn is_primitive(owned_decl: &str) -> bool {
-    matches!(
-        owned_decl,
-        "bool"
-            | "i8"
-            | "u8"
-            | "i16"
-            | "u16"
-            | "i32"
-            | "u32"
-            | "i64"
-            | "u64"
-            | "f32"
-            | "f64"
-            | "u16string"
-    )
-}

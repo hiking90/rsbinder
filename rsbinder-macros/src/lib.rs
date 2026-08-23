@@ -70,6 +70,8 @@ use syn::{
     FnArg, ItemTrait, Pat, PathArguments, ReturnType, Token, TraitItem, TraitItemFn, Type,
 };
 
+mod binder_enum;
+mod parcelable;
 mod type_str;
 
 /// Argument direction, read off the Rust signature.
@@ -113,6 +115,74 @@ impl Parse for Args {
             }
         }
         Ok(Self { descriptor })
+    }
+}
+
+/// `#[<name>(descriptor = "…")]` on a derive input.
+fn attr_descriptor(attrs: &[syn::Attribute], name: &str) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if !attr.path().is_ident(name) {
+            continue;
+        }
+        let args: Args = attr.parse_args()?;
+        if args.descriptor.is_some() {
+            return Ok(args.descriptor);
+        }
+    }
+    Ok(None)
+}
+
+/// Parcel codec for a plain Rust struct — the `.aidl`-free `parcelable`.
+///
+/// Fields are the wire, in declaration order, so **reordering or inserting a
+/// field is a wire break**. The emitted `write_to_parcel` / `read_from_parcel`
+/// are the same ones `rsbinder-aidl` emits for the equivalent `parcelable`,
+/// including the size-prefixed header and the truncated-read handling that
+/// lets an older reader accept a newer writer's extra fields.
+///
+/// Only the codec is generated. `Default`, `Debug`, `Clone` and friends stay
+/// yours to derive; a `#[derive(Parcelable, Default, Debug)]` line is the
+/// normal shape. The descriptor defaults to the type name and is overridden
+/// with `#[parcelable(descriptor = "…")]`.
+///
+/// Fields must be named and owned. `ParcelableHolder` and non-nullable binder
+/// fields are `.aidl`-only shapes: spell a binder field `Option<Strong<dyn
+/// IFoo>>`, which is AIDL's `@nullable`.
+#[proc_macro_derive(Parcelable, attributes(parcelable))]
+pub fn derive_parcelable(item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::DeriveInput);
+    match parcelable::expand(&input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Parcel codec for a plain Rust enum, carried as its `#[repr(..)]` scalar.
+///
+/// `#[repr(i8)]`, `#[repr(i32)]` or `#[repr(i64)]` is required — it is the
+/// wire format (AIDL `byte`, `int`, `long`) — and every variant needs an
+/// explicit value, so what goes on the wire is visible at the declaration
+/// instead of implied by declaration order.
+///
+/// ```ignore
+/// #[derive(BinderEnum, Clone, Copy, PartialEq, Eq, Debug)]
+/// #[repr(i32)]
+/// pub enum Mode { Fast = 0, Safe = 1 }
+/// ```
+///
+/// **This enum is closed.** A value no variant declares deserializes to
+/// [`rsbinder::StatusCode::BadValue`]. An `.aidl` enum is open: its generated
+/// newtype keeps whatever a newer peer sent, so a reader can pass an unknown
+/// value along untouched. Use `.aidl` — or `rsbinder::declare_binder_enum!`,
+/// which emits exactly that newtype — when the two ends may be different
+/// versions. Within one build of both ends, a real Rust enum is the better
+/// type: it matches exhaustively and cannot hold a value you never defined.
+#[proc_macro_derive(BinderEnum)]
+pub fn derive_binder_enum(item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::DeriveInput);
+    match binder_enum::expand(&input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
     }
 }
 
@@ -312,7 +382,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
             });
             read_onto_params.push(ident.clone());
         }
-        transaction_params += &format!("{}, ", func_call_param(&ident, &owned, dir));
+        transaction_params += &format!("{}, ", func_call_param(&ident, &as_written, &owned, dir));
     }
 
     let return_type = return_type(f)?;
@@ -342,26 +412,33 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
     })
 }
 
-/// `rsbinder-aidl`'s `func_call_param`: how the server hands a decoded
-/// argument to the user's `impl`.
-fn func_call_param(ident: &str, owned: &str, dir: Dir) -> String {
-    if type_str::is_primitive(owned) {
+/// How the server hands a decoded argument to the user's `impl`.
+///
+/// The server owns what it read (`owned`), and the trait asks for the type the
+/// signature spells (`as_written`); this bridges the two. Driving it off the
+/// signature rather than off a list of known types is what makes a
+/// `#[derive(BinderEnum)]` enum — passed by value, like any `Copy` type — work
+/// without the macro having to recognise it.
+fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> String {
+    if dir != Dir::In {
+        return format!("&mut {ident}");
+    }
+    if as_written == owned {
         return ident.to_string();
     }
-    if owned == "String" && dir == Dir::In {
+    if as_written == "&str" {
         return format!("{ident}.as_str()");
     }
-    match dir {
-        Dir::Out | Dir::Inout => format!("&mut {ident}"),
-        Dir::In => {
-            if owned.starts_with("Option<Vec<") || owned.starts_with("Option<String>") {
-                format!("{ident}.as_deref()")
-            } else if owned.starts_with("Option<") {
-                format!("{ident}.as_ref()")
-            } else {
-                format!("&{ident}")
-            }
-        }
+    if as_written.starts_with('&') {
+        return format!("&{ident}");
+    }
+    // `Option<&str>` / `Option<&[T]>` borrow through, anything else by ref.
+    if owned.starts_with("Option<Vec<") || owned.starts_with("Option<String>") {
+        format!("{ident}.as_deref()")
+    } else if owned.starts_with("Option<") {
+        format!("{ident}.as_ref()")
+    } else {
+        format!("&{ident}")
     }
 }
 
@@ -708,6 +785,92 @@ interface IGolden6 {
                 }
             },
         );
+    }
+
+    /// The same contract for data types: `#[derive(Parcelable)]` must produce
+    /// the codec `.aidl` produces for the equivalent `parcelable`. The derive
+    /// then drops the struct and `Default` from this module (a derive adds to
+    /// a type, it cannot redeclare it) — what is compared here is the whole
+    /// module, so the parts that do survive are pinned too.
+    #[test]
+    fn parcelable_codec_matches_aidl() {
+        let expected = from_aidl(
+            r#"
+parcelable GoldenConfig {
+    String name;
+    int retries;
+    boolean verbose;
+    long timeoutNanos;
+    double ratio;
+    @nullable byte[] extra;
+    String[] tags;
+}
+"#,
+            "GoldenConfig",
+        );
+        let input: syn::DeriveInput = syn::parse2(quote! {
+            pub struct GoldenConfig {
+                pub name: String,
+                pub retries: i32,
+                pub verbose: bool,
+                pub timeoutNanos: i64,
+                pub ratio: f64,
+                pub extra: Option<Vec<u8>>,
+                pub tags: Vec<String>,
+            }
+        })
+        .unwrap();
+        let actual = parcelable::render_source(&input).expect("render");
+        assert_eq!(expected, actual, "generated parcelable differs");
+    }
+
+    /// A method taking a parcelable and an enum. The enum is the case that
+    /// forced argument passing to follow the signature: `.aidl` treats an enum
+    /// as a scalar and hands it to the service by value, which a list of known
+    /// primitive type names would never have covered.
+    #[test]
+    fn parcelable_and_enum_arguments() {
+        let expected = from_aidl_files(
+            &[
+                (
+                    "com/example/IGolden7.aidl",
+                    "package com.example;\nimport com.example.GoldenCfg;\n\
+                     import com.example.GoldenMode;\n\
+                     interface IGolden7 {\n\
+                     \x20   GoldenCfg apply(in GoldenCfg cfg, in GoldenMode mode);\n}\n",
+                ),
+                (
+                    "com/example/GoldenCfg.aidl",
+                    "package com.example;\nparcelable GoldenCfg {\n    String name;\n\
+                     \x20   int retries;\n}\n",
+                ),
+                (
+                    "com/example/GoldenMode.aidl",
+                    "package com.example;\n@Backing(type=\"int\")\n\
+                     enum GoldenMode {\n    FAST = 0,\n    SAFE = 1,\n}\n",
+                ),
+            ],
+            "com/example/IGolden7.aidl",
+            "IGolden7",
+        );
+        let item: ItemTrait = syn::parse2(quote! {
+            pub trait IGolden7 {
+                fn apply(
+                    &self,
+                    cfg: &super::GoldenCfg::GoldenCfg,
+                    mode: super::GoldenMode::GoldenMode,
+                ) -> BinderResult<super::GoldenCfg::GoldenCfg>;
+            }
+        })
+        .unwrap();
+        let actual = render_source(
+            &Args {
+                descriptor: Some("com.example.IGolden7".to_string()),
+            },
+            &item,
+        )
+        .expect("render");
+        assert_eq!(expected, actual, "generated code differs");
     }
 
     #[test]

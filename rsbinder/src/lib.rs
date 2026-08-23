@@ -232,11 +232,13 @@ pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
     ServerGuard,
 };
-/// Declare a binder interface as a Rust trait — the `.aidl`-free path (plan
-/// 2-19). Behind the `macros` feature; see [`rsbinder_macros`] for the
-/// signature rules and for what still needs `.aidl`.
+// The `.aidl`-free path (plan 2-19), behind the `macros` feature: declare an
+// interface as a Rust trait and its data types as ordinary structs and enums.
+// See the `rsbinder_macros` crate docs for the signature rules and for what
+// still needs `.aidl`. `Parcelable` is re-exported as both a trait and a
+// derive; they live in different namespaces, so the one name serves both.
 #[cfg(feature = "macros")]
-pub use rsbinder_macros::interface;
+pub use rsbinder_macros::{interface, BinderEnum, Parcelable};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
