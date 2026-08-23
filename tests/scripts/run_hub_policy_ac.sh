@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# rsb_hub access-control acceptance gates (Plan 6-1, AC-6.1.1 .. AC-6.1.9).
+# rsb_hub acceptance gates: Plan 6-1 access control (AC-6.1.1 .. AC-6.1.9),
+# plus the 6-2/6-3 declaration gates, the 6-5 diagnostic CLI, and the 6-4
+# service-supervisor integration.
 #
 # Needs a Linux host with a working binder device: the point of these gates is
 # that a denial crosses a real kernel transaction, because the caller uid the
 # policy matches on is filled in by the binder driver. Nothing in-process can
 # stand in for it, which is why none of this can run on macOS.
 #
-#   cargo build --bin rsb_hub -p rsbinder-tools
+#   cargo build -p rsbinder-tools --bin rsb_hub --bin rsb_service
 #   cargo build -p tests --bin ac61_probe
 #   ./tests/scripts/run_hub_policy_ac.sh
 #
@@ -22,6 +24,7 @@ set -u
 cd "$(dirname "$0")/../.." || exit 1
 
 HUB=./target/debug/rsb_hub
+SVC=./target/debug/rsb_service
 PROBE=./target/debug/ac61_probe
 POLDIR=/tmp/rsb61-policy
 LOG=/tmp/rsb61-hub.log
@@ -54,6 +57,14 @@ start_hub() {
 }
 stop_hub() { pkill -f 'target/debug/rsb_hub' 2>/dev/null; sleep 1; HUB_PID=""; }
 run_probe() { $PROBE "$@" >"$OUT" 2>>/tmp/rsb61-probe.err; }
+# Plan 6-5: the CLI is an ordinary binder client, so it answers under the
+# same policy as everything else. Capture stdout+stderr together — a denial
+# is reported on stderr and the gates below assert on both.
+SVC_RC=0
+run_svc() { $SVC "$@" >"$OUT" 2>&1; SVC_RC=$?; }
+want_rc() { if [ "$SVC_RC" = "$1" ]; then ok "$2"; else bad "$2 (exit $SVC_RC, want $1)"; fi; }
+want_out() { if grep -q "$1" "$OUT"; then ok "$2"; else bad "$2 (missing '$1' in: $(head -3 "$OUT"))"; fi; }
+reject_out() { if grep -q "$1" "$OUT"; then bad "$2 (leaked '$1')"; else ok "$2"; fi; }
 
 ######################################################################
 note "AC-6.1.1  no policy -> refuse to start"
@@ -114,6 +125,13 @@ find = { group = ["$OUT_GROUP"] }
 [[rule]]
 name = "ac61.shared.*"
 add  = { uid = [$MY_UID] }
+find = { uid = [$MY_UID] }
+
+# rsb_service dump manager looks the hub up by name like any other client,
+# so it needs find on it. The dump itself is gated on list separately, which
+# is what the denial gate at the end of this script revokes.
+[[rule]]
+name = "manager"
 find = { uid = [$MY_UID] }
 EOF
 cat > "$POLDIR/99-catchall.toml" <<'EOF'
@@ -233,6 +251,83 @@ kill -0 "$HUB_PID" 2>/dev/null && ok "hub survived the activation" || bad "hub d
 # A declaration without `start` must be inert rather than an error.
 run_probe get:ac61.declared.IFoo/secondary
 want_result get ac61.declared.IFoo/secondary NOTFOUND "a declaration without start is inert"
+######################################################################
+# Plan 6-5: the diagnostic CLI. It is a plain binder client, so these gates
+# also re-prove the policy from a second, independent implementation of the
+# client side.
+note "6-5  rsb_service answers the operator's questions"
+# A registrant that outlives one shell command, so a *second* process can
+# see the registry. Everywhere else in this script the probe registers and
+# exits, which is what the death-cleanup gates depend on -- and what makes a
+# populated registry impossible to inspect from outside without this.
+$PROBE add:ac61.allowed.live add:ac61.hidden.live hold:60 >/tmp/rsb61-hold.out 2>&1 &
+HOLD_PID=$!
+sleep 2
+grep -q "RESULT hold 60 OK" /tmp/rsb61-hold.out \
+    && ok "a live registrant is holding two names" \
+    || bad "the holding probe did not register: $(cat /tmp/rsb61-hold.out)"
+
+run_svc list
+want_rc 0 "list exits 0"
+want_out "^ac61.allowed.live$"  "list shows a findable name"
+reject_out "^ac61.hidden.live$" "list filtered the non-findable name"
+
+run_svc check ac61.allowed.live
+want_rc 0 "check of a registered service exits 0"
+want_out "registered" "check says so"
+
+run_svc check ac61.allowed.nonexistent
+want_rc 1 "check of an unregistered service exits 1"
+want_out "not registered" "check says so"
+
+run_svc info
+want_rc 0 "info exits 0"
+want_out "pid=" "info reports the registering pid"
+want_out "ac61.allowed.live"    "info names a findable service"
+reject_out "ac61.hidden.live"   "info filtered the non-findable name"
+
+run_svc declared ac61.declared.IFoo/default
+want_rc 0 "declared exits 0 for a declared instance"
+run_svc declared ac61.declared.INope/default
+want_rc 1 "declared exits 1 for an undeclared instance"
+
+run_svc instances ac61.declared.IFoo
+want_rc 0 "instances exits 0"
+want_out "ac61.declared.IFoo/default"   "instances lists default"
+want_out "ac61.declared.IFoo/secondary" "instances lists secondary"
+
+run_svc connection ac61.declared.IFoo/default
+want_rc 0 "connection exits 0"
+want_out "10.0.0.1:4242" "connection reports the declared pair"
+run_svc connection ac61.declared.IFoo/secondary
+want_rc 1 "connection exits 1 when none is declared"
+
+note "6-5  rsb_service check must not start a declared service"
+rm -f "$MARKER"
+run_svc check ac61.declared.IFoo/default
+sleep 1
+[ -e "$MARKER" ] && bad "rsb_service check started a service" || ok "check is side-effect free"
+
+note "6-5  dump: the hub reports its own registry"
+run_svc dump manager
+want_rc 0 "dump manager exits 0"
+want_out "^rsb_hub "                  "dump identifies the hub and its version"
+want_out "access control: enforcing"  "dump reports the access-control mode"
+want_out "^services ("                "dump has a services section"
+want_out "ac61.allowed.live"          "dump lists a findable registration"
+want_out "pid=$HOLD_PID"              "dump attributes it to the registering pid"
+reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
+want_out "hidden by policy"           "dump says the view is partial"
+want_out "declarations: 3"            "dump counts the loaded declarations"
+
+run_svc dump manager ac61.allowed
+want_rc 0 "dump with a filter exits 0"
+want_out "filter: ac61.allowed"       "dump echoes the filter"
+want_out "ac61.allowed.live"          "dump keeps the matching name"
+reject_out "^  manager$"              "dump dropped the non-matching name"
+
+kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null
+
 rm -f "$MARKER" "$POLDIR/30-declared.toml"
 kill -HUP "$HUB_PID"; sleep 1
 
@@ -271,6 +366,18 @@ kill -HUP "$HUB_PID"; sleep 1
 run_probe debuginfo
 want_result debuginfo "" FAILEDTXN "AC-6.1.5d global list gate denies getServiceDebugInfo"
 
+# Plan 6-5: the CLI must say *denied*, not report an empty registry. This is
+# the whole reason `hub::try_*` exists — the swallowing wrappers would print
+# nothing here and exit 0.
+run_svc list
+want_rc 2 "6-5  a denied list exits 2, not 0-with-no-output"
+want_out "policy denies this to uid" "6-5  and explains that the policy is the reason"
+run_svc info
+want_rc 2 "6-5  a denied info exits 2"
+run_svc dump manager
+want_rc 2 "6-5  a denied dump exits 2"
+want_out "policy denies .list." "6-5  and the hub says so on the dump fd itself"
+
 # A broken reload must keep the policy already in force.
 echo 'name = [[[' > "$POLDIR/30-broken.toml"
 kill -HUP "$HUB_PID"; sleep 1
@@ -281,5 +388,89 @@ want_result add       ac61.reloaded.svc2 OK        "AC-6.1.7b previous policy st
 want_result debuginfo ""                 FAILEDTXN "AC-6.1.7c previous policy's list denial still in force"
 
 stop_hub
-printf '\n==== Plan 6-1 AC gates: %d passed, %d failed ====\n' "$PASS" "$FAIL"
+
+######################################################################
+# Plan 6-4: running under a service supervisor. Readiness has to be
+# reported at the instant handle 0 becomes reachable -- earlier and every
+# unit ordered After= the hub races the registry -- and a deliberate stop
+# has to look deliberate, not like a crash.
+note "6-4  readiness, clean shutdown, single instance"
+# Start from a configuration that loads and grants this user `list` again:
+# the reload gates above deliberately left a broken file and a revoked
+# global gate behind, and neither is what 6-4 is about.
+rm -f "$POLDIR/30-broken.toml" "$POLDIR/05-noglobal.toml"
+printf '[global]\nlist = { uid = [%s] }\n' "$MY_UID" > "$POLDIR/00-global.toml"
+NOTIFY_SOCK=/tmp/rsb61-notify.sock
+NOTIFY_OUT=/tmp/rsb61-notify.out
+rm -f "$NOTIFY_SOCK" "$NOTIFY_OUT"
+python3 - "$NOTIFY_SOCK" "$NOTIFY_OUT" <<'NOTIFY_LISTENER_PY' &
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+sock.bind(sys.argv[1])
+sock.settimeout(30)
+with open(sys.argv[2], "w") as out:
+    for _ in range(2):          # READY=1, then STOPPING=1
+        try:
+            out.write(sock.recv(4096).decode())
+        except OSError as e:
+            out.write(f"TIMEOUT {e}\n")
+        out.flush()
+NOTIFY_LISTENER_PY
+NOTIFY_LISTENER=$!
+sleep 1
+
+NOTIFY_SOCKET="$NOTIFY_SOCK" RUST_LOG=info nohup $HUB --config "$POLDIR" > "$LOG" 2>&1 &
+HUB_PID=$!
+for _ in $(seq 1 20); do grep -q '^READY=1' "$NOTIFY_OUT" 2>/dev/null && break; sleep 0.5; done
+if grep -q '^READY=1' "$NOTIFY_OUT" 2>/dev/null; then
+    ok "6-4  the hub reports READY=1 to \$NOTIFY_SOCKET"
+    if grep -q 'STATUS=serving' "$NOTIFY_OUT"; then
+        ok "6-4  and a STATUS line for systemctl status"
+    else
+        bad "no STATUS line: $(cat "$NOTIFY_OUT")"
+    fi
+    # The contract, not just the datagram: no sleep here on purpose. If
+    # readiness were announced before become_context_manager, this is the
+    # call that would race it.
+    run_svc list
+    want_rc 0 "6-4  the registry is reachable the moment READY=1 lands"
+else
+    bad "6-4  no READY=1 (got: $(cat "$NOTIFY_OUT" 2>/dev/null))"
+fi
+
+kill -TERM "$HUB_PID" 2>/dev/null
+wait "$HUB_PID"; term_rc=$?
+[ "$term_rc" -eq 0 ] && ok "6-4  SIGTERM exits 0, not killed-by-signal" || bad "SIGTERM exit $term_rc"
+if grep -q "SIGTERM received, shutting down" "$LOG"; then
+    ok "6-4  and says so in the log"
+else
+    bad "no shutdown line: $(tail -2 "$LOG")"
+fi
+for _ in $(seq 1 10); do grep -q '^STOPPING=1' "$NOTIFY_OUT" 2>/dev/null && break; sleep 0.5; done
+if grep -q '^STOPPING=1' "$NOTIFY_OUT"; then
+    ok "6-4  and told the supervisor it was deliberate"
+else
+    bad "no STOPPING=1: $(cat "$NOTIFY_OUT")"
+fi
+kill "$NOTIFY_LISTENER" 2>/dev/null; wait "$NOTIFY_LISTENER" 2>/dev/null
+rm -f "$NOTIFY_SOCK" "$NOTIFY_OUT"
+HUB_PID=""
+
+note "6-4  a second hub on the same device refuses to run"
+if start_hub --config "$POLDIR"; then
+    out=$($HUB --config "$POLDIR" 2>&1); rc=$?
+    [ "$rc" -eq 1 ] && ok "6-4  the second instance exits 1" || bad "second instance exit $rc"
+    if echo "$out" | grep -q "exactly one service manager"; then
+        ok "6-4  and names the cause instead of an ioctl errno"
+    else
+        bad "message: $out"
+    fi
+    run_svc check manager
+    want_rc 0 "6-4  the first instance is still serving"
+else
+    bad "6-4  hub did not restart for the single-instance gate"; cat "$LOG"
+fi
+stop_hub
+
+printf '\n==== Plan 6 AC gates: %d passed, %d failed ====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

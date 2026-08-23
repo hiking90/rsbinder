@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! ac61_probe add:NAME addsame:NAME find:NAME get:NAME notify:NAME unnotify:NAME
-//!            declared:NAME instances:IFACE conninfo:NAME list debuginfo
+//!            declared:NAME instances:IFACE conninfo:NAME list debuginfo hold:SECS
 //! ```
 //!
 //! `addsame` registers *one* binder under every name it is given, which is
@@ -185,6 +185,24 @@ fn main() {
                 }
                 Err(err) => outcome_of_code(err),
             },
+            // Stay alive with everything registered so far, so a *second*
+            // process can observe the registry. Every other step registers
+            // and exits, which is what the death-cleanup gates depend on and
+            // what makes a live registry impossible to inspect from outside
+            // without this.
+            "hold" => {
+                let secs: u64 = arg.parse().unwrap_or_else(|_| {
+                    eprintln!("hold takes a number of seconds, got {arg:?}");
+                    std::process::exit(2);
+                });
+                println!("RESULT hold {arg} OK");
+                // Flushed before sleeping: whoever is waiting on this line
+                // is the process that will inspect the registry.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                continue;
+            }
             other => {
                 eprintln!("unknown op: {other}");
                 std::process::exit(2);
