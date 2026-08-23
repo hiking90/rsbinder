@@ -1,0 +1,5 @@
+error: a parcelable needs named fields — field names are its wire order and its API
+ --> tests/ui/parcelable_tuple_struct.rs:4:12
+  |
+4 | pub struct Bad(i32);
+  |            ^^^

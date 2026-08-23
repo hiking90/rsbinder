@@ -1,0 +1,5 @@
+error: a binder enum needs `#[repr(i8)]`, `#[repr(i32)]` or `#[repr(i64)]` — that choice is the wire format (AIDL `byte`, `int`, `long`), not an implementation detail
+ --> tests/ui/enum_without_repr.rs:4:10
+  |
+4 | pub enum Mode {
+  |          ^^^^

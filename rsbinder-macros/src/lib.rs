@@ -171,7 +171,7 @@ pub fn derive_parcelable(item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// **This enum is closed.** A value no variant declares deserializes to
-/// [`rsbinder::StatusCode::BadValue`]. An `.aidl` enum is open: its generated
+/// `rsbinder::StatusCode::BadValue`. An `.aidl` enum is open: its generated
 /// newtype keeps whatever a newer peer sent, so a reader can pass an unknown
 /// value along untouched. Use `.aidl` — or `rsbinder::declare_binder_enum!`,
 /// which emits exactly that newtype — when the two ends may be different

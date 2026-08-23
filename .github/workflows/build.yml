@@ -158,6 +158,16 @@ jobs:
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
+      - name: Interface macro (plan 2-19 — golden equivalence, UI, e2e, interop)
+        # `rsbinder-macros` holds the contract this feature rests on: a trait
+        # through the macro and the equivalent `.aidl` must generate the same
+        # code. The other two prove it at runtime — a macro-declared interface
+        # over RPC, and macro/`.aidl` calling each other in both directions.
+        run: |
+          cargo test -p rsbinder-macros
+          cargo test -p rsbinder --features macros,rpc --test macro_interface
+          cargo test -p tests --features rpc,macros --test macro_cross
+
       - name: V5 parallel-safety soak (default test-threads, 5x)
         run: |
           for i in 1 2 3 4 5; do

@@ -13,6 +13,8 @@ license = { workspace = true }
 # under `--features rpc` (or `rpc-tcp-debug`).
 [features]
 rpc = ["rsbinder/rpc"]
+# Plan 2-19: the `#[rsbinder::interface]` half of `tests/macro_cross.rs`.
+macros = ["rsbinder/macros"]
 rpc-tcp-debug = ["rsbinder/rpc-tcp-debug", "rpc"]
 
 [dependencies]

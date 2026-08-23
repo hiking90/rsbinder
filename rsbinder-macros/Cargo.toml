@@ -28,3 +28,11 @@ rsbinder-aidl = { workspace = true }
 syn = { version = "2", features = ["full", "parsing", "printing"] }
 proc-macro2 = "1"
 quote = "1"
+
+[dev-dependencies]
+# The UI tests compile real macro invocations, so they need the runtime the
+# generated code names. This is a dev-dependency cycle (rsbinder depends on
+# this crate for the `macros` feature); cargo allows it, and it keeps the
+# rejection messages tested where they are written.
+rsbinder = { workspace = true, features = ["macros"] }
+trybuild = "1"

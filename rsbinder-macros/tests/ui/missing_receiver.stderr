@@ -1,0 +1,5 @@
+error: the first parameter must be `&self` — a binder object is shared, never owned or uniquely borrowed by a call
+ --> tests/ui/missing_receiver.rs:5:5
+  |
+5 |     fn go() -> rsbinder::BinderResult<()>;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

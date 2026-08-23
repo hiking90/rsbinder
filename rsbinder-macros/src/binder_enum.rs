@@ -100,7 +100,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             /// A wire value back to a variant.
             ///
             /// This enum is **closed**: a value no variant declares is
-            /// [`rsbinder::StatusCode::BadValue`], not a silently retained
+            /// `rsbinder::StatusCode::BadValue`, not a silently retained
             /// unknown. An `.aidl` enum is open — its generated newtype keeps
             /// whatever a newer peer sent — so reach for `.aidl` (or
             /// `rsbinder::declare_binder_enum!`) when the two ends can be

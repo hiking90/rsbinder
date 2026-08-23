@@ -847,7 +847,7 @@ pub fn render_enum(r: &EnumRender) -> Result<String, AidlError> {
 pub struct TransactionWrite {
     pub identifier: String,
     /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
-    /// writing this arg back. See [`TypeGenerator::out_array_needs_null_guard`].
+    /// writing this arg back (`TypeGenerator::out_array_needs_null_guard`).
     pub needs_null_guard: bool,
 }
 

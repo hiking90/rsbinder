@@ -1,0 +1,5 @@
+error: a binder interface cannot be generic — the wire has no way to carry the parameter
+ --> tests/ui/generic_interface.rs:4:15
+  |
+4 | pub trait IBad<T> {
+  |               ^^^
