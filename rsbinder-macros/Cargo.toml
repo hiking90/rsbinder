@@ -25,7 +25,7 @@ async = []
 
 [dependencies]
 rsbinder-aidl = { workspace = true }
-syn = { version = "2", features = ["full", "parsing", "printing"] }
+syn = { version = "3", features = ["full", "parsing", "printing"] }
 proc-macro2 = "1"
 quote = "1"
 

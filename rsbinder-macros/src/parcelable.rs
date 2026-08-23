@@ -45,7 +45,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
 fn is_codec_item(item: &syn::Item) -> bool {
     match item {
         syn::Item::Impl(i) => !matches!(
-            i.trait_.as_ref().and_then(|(_, p, _)| p.segments.last()),
+            i.trait_.as_ref().and_then(|(p, _)| p.segments.last()),
             Some(seg) if seg.ident == "Default"
         ),
         syn::Item::Macro(_) => true,

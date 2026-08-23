@@ -332,7 +332,7 @@ fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn
              so the obligation would be silently dropped",
         ));
     }
-    if let Some(auto_token) = &item.auto_token {
+    if let Some(auto_token) = &item.modifiers.auto_token {
         return Err(syn::Error::new_spanned(
             auto_token,
             "an `auto` trait carries no methods and cannot be a binder interface",
@@ -410,9 +410,11 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
              alongside it",
         ));
     }
-    if let Some(tok) = &f.sig.unsafety {
+    // `Safety::Safe` parses only inside an `extern` block, so a trait method
+    // reaches here as either `Default` or `Unsafe`.
+    if !matches!(f.sig.safety, syn::Safety::Default) {
         return Err(syn::Error::new_spanned(
-            tok,
+            &f.sig.safety,
             "an `unsafe` binder method is not supported",
         ));
     }
@@ -442,7 +444,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
 
     let mut inputs = f.sig.inputs.iter();
     match inputs.next() {
-        Some(FnArg::Receiver(r)) if r.reference.is_some() && r.mutability.is_none() => {}
+        Some(FnArg::Receiver(r)) if matches!(r.kind, syn::ReceiverKind::Reference(_, _, None)) => {}
         _ => {
             return Err(syn::Error::new_spanned(
                 &f.sig,
@@ -1275,6 +1277,25 @@ parcelable GoldenConfig {
             }
         });
         assert!(err.contains("unsafe"), "{err}");
+    }
+
+    /// `syn` keeps the `mut` of `&mut self` inside the receiver kind, not
+    /// beside it, so a shape-only check has to name the kind.
+    #[test]
+    fn rejects_non_shared_receivers() {
+        for recv in [
+            quote!(self),
+            quote!(mut self),
+            quote!(&mut self),
+            quote!(self: Box<Self>),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(#recv) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("`&self`"), "{recv}: {err}");
+        }
     }
 
     /// `check_supported` lets `Option<&str>` through for nullable *arguments*;
