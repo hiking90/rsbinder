@@ -834,7 +834,233 @@ impl ServiceManager {
     }
 }
 
-impl Interface for ServiceManager {}
+/// One registry row, copied out from under the mutex.
+///
+/// The rendering pass runs outside the lock because the per-name `find`
+/// filter it depends on resolves group membership, which can hit the name
+/// service — the same reason [`IServiceManager::listServices`] snapshots.
+struct DumpRow {
+    name: String,
+    pid: i32,
+    uid: u32,
+    dump_priority: i32,
+    has_clients: bool,
+    guarantee_client: bool,
+    is_accessor: bool,
+    registration_callbacks: usize,
+    client_callbacks: usize,
+}
+
+/// Everything [`render_dump`] needs, so the renderer is pure and testable
+/// without a registry, a policy, or a live binder.
+struct DumpSnapshot {
+    services: Vec<DumpRow>,
+    /// Names something is *waiting* on: a registration or client callback
+    /// is held for them, but nothing has registered. AOSP has no equivalent
+    /// (its `servicemanager` does not implement `dump` at all) — but "who is
+    /// blocked on a service that never came up" is the question an operator
+    /// actually arrives with.
+    awaited: Vec<(String, usize, usize)>,
+    death_subscriptions: usize,
+    /// `None` when running under `--insecure-allow-all`.
+    rules: Option<usize>,
+    declarations: usize,
+    /// The `args` the caller passed, if they narrowed the listing.
+    filter: Vec<String>,
+    /// Names the snapshot dropped because the caller may not `find` them.
+    hidden: usize,
+}
+
+/// True when `name` passes the caller-supplied `args` filter. An empty
+/// filter passes everything; otherwise a substring match against any arg
+/// is enough, which is what makes `rsb_service dump manager IFoo` useful
+/// without teaching the hub a pattern syntax.
+fn dump_filter_matches(filter: &[String], name: &str) -> bool {
+    filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str()))
+}
+
+/// Render a registry snapshot as the `dumpsys`-style text a
+/// `DUMP_TRANSACTION` returns.
+fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Result<()> {
+    writeln!(w, "rsb_hub {}", env!("CARGO_PKG_VERSION"))?;
+    match snap.rules {
+        Some(rules) => writeln!(w, "access control: enforcing, {rules} rule(s)")?,
+        None => writeln!(
+            w,
+            "access control: DISABLED (--insecure-allow-all); every caller may \
+             register, look up and enumerate everything"
+        )?,
+    }
+    writeln!(w, "declarations: {}", snap.declarations)?;
+    writeln!(w, "death subscriptions: {}", snap.death_subscriptions)?;
+    if !snap.filter.is_empty() {
+        writeln!(w, "filter: {}", snap.filter.join(" "))?;
+    }
+    if snap.hidden > 0 {
+        writeln!(w, "hidden by policy: {} name(s)", snap.hidden)?;
+    }
+
+    writeln!(w)?;
+    writeln!(w, "services ({}):", snap.services.len())?;
+    for row in &snap.services {
+        writeln!(w, "  {}", row.name)?;
+        writeln!(
+            w,
+            "    pid={} uid={} dump_priority=0x{:x}{} lazy={} accessor={}",
+            row.pid,
+            row.uid,
+            row.dump_priority,
+            if row.dump_priority & DUMP_FLAG_PRIORITY_ALL == 0 {
+                " (no priority bit: `listServices` will never report it)"
+            } else {
+                ""
+            },
+            yes_no(row.dump_priority & FLAG_IS_LAZY_SERVICE != 0),
+            yes_no(row.is_accessor),
+        )?;
+        writeln!(
+            w,
+            "    clients={} guarantee_client={} callbacks: registration={} client={}",
+            yes_no(row.has_clients),
+            yes_no(row.guarantee_client),
+            row.registration_callbacks,
+            row.client_callbacks,
+        )?;
+    }
+
+    if !snap.awaited.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "awaiting registration ({}):", snap.awaited.len())?;
+        for (name, registration, client) in &snap.awaited {
+            writeln!(
+                w,
+                "  {name}  callbacks: registration={registration} client={client}"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+impl ServiceManager {
+    /// Copy the registry out from under the mutex for [`render_dump`],
+    /// keeping only what this caller is allowed to see.
+    ///
+    /// The `find` filter runs *outside* the lock, as in
+    /// [`IServiceManager::listServices`]: it resolves group membership,
+    /// which can hit the name service, and no binder-visible state may be
+    /// held across that (R1).
+    fn dump_snapshot(&self, filter: Vec<String>) -> DumpSnapshot {
+        /// How many callbacks a name holds in one of the callback maps.
+        /// Generic because the two maps hold different callback traits.
+        fn count<V>(map: &BTreeMap<String, Vec<V>>, name: &str) -> usize {
+            map.get(name).map_or(0, |v| v.len())
+        }
+
+        let (mut rows, mut awaited, death_subscriptions) = {
+            let inner = lock_recover(&self.inner);
+            let rows: Vec<DumpRow> = inner
+                .name_to_service
+                .iter()
+                .map(|(name, service)| DumpRow {
+                    name: name.clone(),
+                    pid: service.context.pid,
+                    uid: service.context.uid,
+                    dump_priority: service.dump_priority,
+                    has_clients: service.has_clients,
+                    guarantee_client: service.guarantee_client,
+                    is_accessor: service.is_accessor,
+                    registration_callbacks: count(&inner.name_to_registration_callbacks, name),
+                    client_callbacks: count(&inner.name_to_client_callbacks, name),
+                })
+                .collect();
+            let awaited: Vec<(String, usize, usize)> = inner
+                .name_to_registration_callbacks
+                .keys()
+                .chain(inner.name_to_client_callbacks.keys())
+                .filter(|name| !inner.name_to_service.contains_key(*name))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        count(&inner.name_to_registration_callbacks, name),
+                        count(&inner.name_to_client_callbacks, name),
+                    )
+                })
+                .collect();
+            (rows, awaited, inner.death_links.len())
+        };
+
+        // Narrow by the caller's own filter first, so `hidden` counts only
+        // what the *policy* withheld from what was asked for.
+        rows.retain(|row| dump_filter_matches(&filter, &row.name));
+        awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
+
+        let before = rows.len() + awaited.len();
+        rows.retain(|row| self.allows(Permission::Find, &row.name));
+        awaited.retain(|(name, _, _)| self.allows(Permission::Find, name));
+        let hidden = before - rows.len() - awaited.len();
+
+        let config = self.enforcer.config();
+        DumpSnapshot {
+            services: rows,
+            awaited,
+            death_subscriptions,
+            rules: (!self.enforcer.is_allow_all()).then(|| config.policy.rules.len()),
+            declarations: config.declarations.len(),
+            filter,
+            hidden,
+        }
+    }
+}
+
+impl Interface for ServiceManager {
+    /// The registry as `rsb_hub` sees it — what `rsb_service dump manager`
+    /// prints, and what a `DUMP_TRANSACTION` to handle 0 returns.
+    ///
+    /// Not AOSP parity: `servicemanager` does not override `dump` at all,
+    /// because on Android the same questions are answered by `dumpsys -l`,
+    /// `service list` and the init/VINTF files. None of those exist on
+    /// Linux, so the hub answers them itself.
+    ///
+    /// Gated by `list`, like [`listServices`](IServiceManager::listServices)
+    /// and `getServiceDebugInfo`, with each name filtered by `find` on top:
+    /// a dump that named services the caller may not look up would be a way
+    /// around the per-name policy. `args` narrow the listing by substring.
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+        if !self.allows(Permission::List, "") {
+            let ctx = rsbinder::thread_state::CallingContext::default();
+            log::warn!(
+                "policy denied dump (list) for uid={} (pid={})",
+                ctx.uid,
+                ctx.pid
+            );
+            // Written to the caller's fd as well as logged: the fd is the
+            // only channel `dump` has, and a caller that sees nothing at
+            // all cannot tell a denial from an empty registry.
+            let _ = writeln!(
+                writer,
+                "rsb_hub: policy denies `list` to uid={} (pid={})",
+                ctx.uid, ctx.pid
+            );
+            return Err(StatusCode::PermissionDenied);
+        }
+        let snapshot = self.dump_snapshot(args.to_vec());
+        render_dump(writer, &snapshot).map_err(|e| {
+            log::error!("dump: writing to the caller's fd failed: {e}");
+            e.raw_os_error()
+                .map_or(StatusCode::Unknown, StatusCode::Errno)
+        })
+    }
+}
 
 /// A registered service, as `getService2`/`checkService2` need to see it.
 struct Lookup {
@@ -2196,6 +2422,141 @@ mod tests {
     /// grow the map). Bounds the unbounded heap growth a client could cause by
     /// looping over distinct service names — the per-name cap does not cover
     /// the distinct-name axis.
+    fn dump_row(name: &str, dump_priority: i32) -> DumpRow {
+        DumpRow {
+            name: name.to_owned(),
+            pid: 4242,
+            uid: 1000,
+            dump_priority,
+            has_clients: false,
+            guarantee_client: false,
+            is_accessor: false,
+            registration_callbacks: 0,
+            client_callbacks: 0,
+        }
+    }
+
+    fn dump_to_string(snap: &DumpSnapshot) -> String {
+        let mut out = Vec::new();
+        render_dump(&mut out, snap).expect("a Vec never fails to write");
+        String::from_utf8(out).expect("the renderer only writes UTF-8")
+    }
+
+    fn empty_snapshot() -> DumpSnapshot {
+        DumpSnapshot {
+            services: Vec::new(),
+            awaited: Vec::new(),
+            death_subscriptions: 0,
+            rules: Some(0),
+            declarations: 0,
+            filter: Vec::new(),
+            hidden: 0,
+        }
+    }
+
+    /// A registration's flags have to be readable *as flags*, not just as
+    /// the hex the client sent: `lazy=yes` is the difference between "this
+    /// binder may be cached" and "it may not".
+    #[test]
+    fn a_dump_reports_each_registration_and_its_flags() {
+        let mut snap = empty_snapshot();
+        snap.services = vec![
+            dump_row("com.example.IFoo/default", DUMP_FLAG_PRIORITY_DEFAULT),
+            dump_row(
+                "com.example.ILazy/default",
+                DUMP_FLAG_PRIORITY_DEFAULT | FLAG_IS_LAZY_SERVICE,
+            ),
+        ];
+        snap.declarations = 2;
+        snap.death_subscriptions = 2;
+        let out = dump_to_string(&snap);
+
+        assert!(out.contains("services (2):"), "{out}");
+        assert!(out.contains("com.example.IFoo/default"), "{out}");
+        assert!(out.contains("pid=4242 uid=1000"), "{out}");
+        assert!(out.contains("declarations: 2"), "{out}");
+        assert!(out.contains("death subscriptions: 2"), "{out}");
+        // Exactly one of the two is lazy.
+        assert_eq!(out.matches("lazy=yes").count(), 1, "{out}");
+        assert_eq!(out.matches("lazy=no").count(), 1, "{out}");
+    }
+
+    /// L-3's warning, on the read side: a registration with no priority bit
+    /// never appears in `listServices`, which looks like a lost
+    /// registration until you see the mask.
+    #[test]
+    fn a_registration_with_no_priority_bit_is_called_out() {
+        let mut snap = empty_snapshot();
+        snap.services = vec![dump_row("com.example.IFoo/default", 0)];
+        let out = dump_to_string(&snap);
+        assert!(out.contains("no priority bit"), "{out}");
+
+        snap.services = vec![dump_row("com.example.IFoo/default", DUMP_FLAG_PRIORITY_ALL)];
+        assert!(!dump_to_string(&snap).contains("no priority bit"));
+    }
+
+    /// "Nothing is registered and something is waiting for it" is the state
+    /// an operator debugs most often, so it gets its own section rather
+    /// than being invisible.
+    #[test]
+    fn names_that_are_only_waited_on_get_their_own_section() {
+        let mut snap = empty_snapshot();
+        snap.awaited = vec![("com.example.IBar/default".to_owned(), 2, 1)];
+        let out = dump_to_string(&snap);
+        assert!(out.contains("awaiting registration (1):"), "{out}");
+        assert!(
+            out.contains("com.example.IBar/default  callbacks: registration=2 client=1"),
+            "{out}"
+        );
+
+        // ... and it is absent, not empty, when nothing is waiting.
+        assert!(!dump_to_string(&empty_snapshot()).contains("awaiting registration"));
+    }
+
+    /// `--insecure-allow-all` is the one fact about a running hub that a
+    /// dump must never bury: everything else in the output is the same
+    /// whether or not access control is on.
+    #[test]
+    fn allow_all_is_reported_as_disabled_access_control() {
+        let mut snap = empty_snapshot();
+        snap.rules = None;
+        let out = dump_to_string(&snap);
+        assert!(out.contains("access control: DISABLED"), "{out}");
+
+        snap.rules = Some(7);
+        let out = dump_to_string(&snap);
+        assert!(
+            out.contains("access control: enforcing, 7 rule(s)"),
+            "{out}"
+        );
+    }
+
+    /// Names withheld by the policy are counted, never listed: the count
+    /// tells the operator the view is partial without telling a denied
+    /// caller which names exist.
+    #[test]
+    fn withheld_names_are_counted_not_named() {
+        let mut snap = empty_snapshot();
+        snap.hidden = 3;
+        snap.filter = vec!["com.example".to_owned()];
+        let out = dump_to_string(&snap);
+        assert!(out.contains("hidden by policy: 3 name(s)"), "{out}");
+        assert!(out.contains("filter: com.example"), "{out}");
+        // Neither line appears when there is nothing to say.
+        let out = dump_to_string(&empty_snapshot());
+        assert!(!out.contains("hidden by policy"), "{out}");
+        assert!(!out.contains("filter:"), "{out}");
+    }
+
+    #[test]
+    fn the_dump_filter_is_an_or_of_substrings() {
+        assert!(dump_filter_matches(&[], "anything"));
+        let filter = vec!["IFoo".to_owned(), "manager".to_owned()];
+        assert!(dump_filter_matches(&filter, "com.example.IFoo/default"));
+        assert!(dump_filter_matches(&filter, "manager"));
+        assert!(!dump_filter_matches(&filter, "com.example.IBar/default"));
+    }
+
     #[test]
     fn distinct_name_cap_rejects_new_but_allows_existing() {
         // Below capacity: any name is allowed.
