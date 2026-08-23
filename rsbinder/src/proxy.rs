@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, RwLock};
 
@@ -388,6 +388,21 @@ impl ProxyHandle {
         }
     }
 
+    /// Send `DUMP_TRANSACTION` to the remote binder, which writes its
+    /// state into `fd` — the transport under Android's `dumpsys <service>`,
+    /// and under `rsb_service dump <name>` on Linux.
+    ///
+    /// `fd` is **consumed**: the parcel takes ownership of the descriptor
+    /// (AOSP `writeFileDescriptor(fd, takeOwnership = true)`) and closes it
+    /// once the transaction is done, so pass a duplicate when the caller
+    /// needs to keep writing to the same file. The remote's handler is
+    /// [`crate::Remotable::on_dump`], which the AIDL backend routes to
+    /// [`crate::Interface::dump`]; the default implementation writes
+    /// nothing and succeeds.
+    ///
+    /// `args` reach the handler verbatim; their meaning is the service's
+    /// own. The call is synchronous, so it returns only after the remote
+    /// has finished writing.
     pub fn dump<F: IntoRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
         // Fast-fail BEFORE consuming the fd. `submit_transact` would
         // also short-circuit on `obituary_sent`, but by the time we
@@ -395,15 +410,26 @@ impl ProxyHandle {
         // from `F`'s RAII; an early `Err` from `submit_transact` would
         // then leak the fd. Mirroring the `submit_transact` Acquire-load
         // here lets `F` drop naturally (closing the fd) when the proxy
-        // is already dead. The non-fast-fail error paths (parcel-write
-        // failures, in-`transact` errors after the kernel sees the fd)
-        // still exhibit a leak.
+        // is already dead.
         if self.obituary_sent.load(Ordering::Acquire) {
             return Err(StatusCode::DeadObject);
         }
         let mut send = Parcel::new();
-        let obj = flat_binder_object::new_with_fd(fd.into_raw_fd(), true);
-        send.write_object(&obj, true)?;
+        let raw = fd.into_raw_fd();
+        let obj = flat_binder_object::new_with_fd(raw, true);
+        // Once the object is committed to the parcel the descriptor is the
+        // parcel's (`cookie = 1`), and `Parcel::drop` -> `release_objects`
+        // closes it on every path out of here — including a failed
+        // `submit_transact`. Before that commit nothing owns it but this
+        // local, so the one window that would leak is a `write_object`
+        // that fails part-way and never records the offset.
+        if let Err(e) = send.write_object(&obj, true) {
+            // SAFETY: `raw` came from `F::into_raw_fd`, which transferred
+            // sole ownership here, and the failed `write_object` left no
+            // other owner — this is the only close.
+            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+            return Err(e);
+        }
 
         send.write::<i32>(&(args.len() as i32))?;
         for arg in args {
