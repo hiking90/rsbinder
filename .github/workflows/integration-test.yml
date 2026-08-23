@@ -119,7 +119,7 @@ jobs:
           # tests/policy/permissive.toml grants everything: the suite invents
           # service names at run time. Using a policy file rather than
           # --insecure-allow-all keeps the real parse/resolve/enforce path in CI.
-          RUST_LOG=info nohup target/debug/rsb_hub --policy tests/policy/permissive.toml \
+          RUST_LOG=info nohup target/debug/rsb_hub --config tests/policy/permissive.toml \
             > rsb_hub.log 2>&1 &
           echo $! > rsb_hub.pid
           sleep 1

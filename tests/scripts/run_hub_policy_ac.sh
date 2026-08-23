@@ -57,14 +57,14 @@ run_probe() { $PROBE "$@" >"$OUT" 2>>/tmp/rsb61-probe.err; }
 
 ######################################################################
 note "AC-6.1.1  no policy -> refuse to start"
-out=$($HUB --policy /tmp/rsb61-nonexistent 2>&1); rc=$?
+out=$($HUB --config /tmp/rsb61-nonexistent 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "exits non-zero" || bad "exit $rc"
 echo "$out" | grep -q "cannot load access-control policy" && ok "names the failure" || bad "message: $out"
 echo "$out" | grep -q '\[\[rule\]\]'                      && ok "shows a minimal example" || bad "no example"
 
 note "AC-6.1.1b  malformed policy -> refuse to start, point at the file"
 mkdir -p "$POLDIR"; echo 'rule = "oops"' > "$POLDIR/10.toml"
-out=$($HUB --policy "$POLDIR" 2>&1); rc=$?
+out=$($HUB --config "$POLDIR" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "exits non-zero" || bad "exit $rc"
 echo "$out" | grep -q "TOML parse error" && ok "reports the parse error with a location" || bad "$out"
 rm -rf "$POLDIR"
@@ -123,7 +123,7 @@ add  = "none"
 find = "none"
 EOF
 
-if ! start_hub --policy "$POLDIR"; then bad "hub did not start under an enforcing policy"; cat "$LOG"; exit 1; fi
+if ! start_hub --config "$POLDIR"; then bad "hub did not start under an enforcing policy"; cat "$LOG"; exit 1; fi
 ok "AC-6.1.8  hub self-registered under a policy that grants it nothing"
 
 run_probe add:ac61.allowed.svc add:ac61.denied.svc add:ac61.ingroup.svc \

@@ -66,7 +66,7 @@ A comprehensive service manager for Linux that replaces Android's service_manage
 ```bash
 # With an access-control policy (a file, or a directory of *.toml files;
 # defaults to /etc/rsbinder/hub.d)
-$ rsb_hub --policy /etc/rsbinder/hub.d
+$ rsb_hub --config /etc/rsbinder/hub.d
 
 # With no access control at all -- development and test only
 $ rsb_hub --insecure-allow-all

@@ -8,7 +8,7 @@ use hub::android_16::{
     FLAG_IS_LAZY_SERVICE,
 };
 use rsbinder::*;
-use rsbinder_tools::policy::{self, Enforcer, Permission, SystemResolver};
+use rsbinder_tools::config::{self, Enforcer, Permission, SystemResolver};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -1538,9 +1538,9 @@ impl IServiceManager for ServiceManager {
     }
 }
 
-/// Where `rsb_hub` looks for policy when `--policy` is not given. Every
-/// `*.toml` in it is loaded, sorted by file name.
-const DEFAULT_POLICY_DIR: &str = "/etc/rsbinder/hub.d";
+/// Where `rsb_hub` looks for its configuration when `--config` is not
+/// given. Every `*.toml` in it is loaded, sorted by file name.
+const DEFAULT_CONFIG_DIR: &str = "/etc/rsbinder/hub.d";
 
 /// Report an unloadable policy and exit.
 ///
@@ -1549,7 +1549,7 @@ const DEFAULT_POLICY_DIR: &str = "/etc/rsbinder/hub.d";
 /// control on a running system — the one failure mode that must never be
 /// quiet. `--insecure-allow-all` exists for the cases that genuinely want
 /// no policy, and it has to be asked for by that name.
-fn exit_without_policy(path: &Path, err: &policy::ConfigError) -> ! {
+fn exit_without_policy(path: &Path, err: &config::ConfigError) -> ! {
     eprintln!("rsb_hub: cannot load access-control policy");
     eprintln!("  {err}");
     eprintln!();
@@ -1564,7 +1564,7 @@ fn exit_without_policy(path: &Path, err: &policy::ConfigError) -> ! {
     eprintln!("    add  = {{ user = [\"exampled\"] }}");
     eprintln!("    find = {{ group = [\"binder-clients\"] }}");
     eprintln!();
-    eprintln!("Point rsb_hub at a different path with --policy <PATH>, or pass");
+    eprintln!("Point rsb_hub at a different path with --config <PATH>, or pass");
     eprintln!("--insecure-allow-all to run with no access control (development only).");
     std::process::exit(1);
 }
@@ -1631,7 +1631,7 @@ fn spawn_policy_reloader(enforcer: Arc<Enforcer>, path: PathBuf) {
                     );
                     return;
                 }
-                match policy::load(&path, &SystemResolver) {
+                match config::load(&path, &SystemResolver) {
                     Ok(loaded) => {
                         let rules = loaded.rules.len();
                         enforcer.replace_policy(loaded);
@@ -1673,13 +1673,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .default_value("binder"),
         )
         .arg(
-            clap::Arg::new("policy")
-                .short('p')
-                .long("policy")
+            clap::Arg::new("config")
+                .short('c')
+                .long("config")
                 .value_name("PATH")
                 .help(
-                    "Access-control policy: a .toml file, or a directory of *.toml \
-                     files loaded in file-name order (default: /etc/rsbinder/hub.d)",
+                    "Service manager configuration: a .toml file, or a directory of \
+                     *.toml files loaded in file-name order \
+                     (default: /etc/rsbinder/hub.d)",
                 ),
         )
         .arg(
@@ -1709,8 +1710,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Run with a custom binder device:\n    \
             $ rsb_hub --device mybinder\n    \
             $ rsb_hub -d mybinder\n\n    \
-            Run with a policy from somewhere other than /etc/rsbinder/hub.d:\n    \
-            $ rsb_hub --policy /usr/local/etc/rsbinder/hub.d\n\n    \
+            Run with configuration from somewhere other than /etc/rsbinder/hub.d:\n    \
+            $ rsb_hub --config /usr/local/etc/rsbinder/hub.d\n\n    \
             Run with no access control (development only):\n    \
             $ rsb_hub --insecure-allow-all\n\n    \
             Note: The binder device must be created first using rsb_device.\n    \
@@ -1734,9 +1735,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let insecure_allow_all = matches.get_flag("insecure-allow-all");
-    let policy_path = matches.get_one::<String>("policy").map(PathBuf::from);
-    if insecure_allow_all && policy_path.is_some() {
-        eprintln!("rsb_hub: --policy and --insecure-allow-all are mutually exclusive");
+    let config_path = matches.get_one::<String>("config").map(PathBuf::from);
+    if insecure_allow_all && config_path.is_some() {
+        eprintln!("rsb_hub: --config and --insecure-allow-all are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -1752,8 +1753,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         log::warn!("rsb_hub: SIGHUP will be ignored (there is no policy to reload)");
         Arc::new(Enforcer::allow_all())
     } else {
-        let path = policy_path.unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_DIR));
-        let enforcer = match policy::load(&path, &SystemResolver) {
+        let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
+        let enforcer = match config::load(&path, &SystemResolver) {
             Ok(loaded) => {
                 log::info!(
                     "rsb_hub: loaded {} policy rule(s) from {}",

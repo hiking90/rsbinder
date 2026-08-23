@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::model::{NamePattern, Policy, PolicyError, Rule, Subjects};
+use super::policy::{NamePattern, Policy, PolicyError, Rule, Subjects};
 use crate::nss::{self, NssError};
 
 /// Resolves user and group names to numeric ids.
@@ -308,7 +308,7 @@ pub fn load(path: &Path, resolver: &dyn NameResolver) -> Result<Policy, ConfigEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Permission, Subject};
+    use crate::config::{Permission, Subject};
 
     /// Deterministic stand-in for the name service: `"svcuser"` is uid
     /// 1000 and `"svcgroup"` is gid 50, on every machine.

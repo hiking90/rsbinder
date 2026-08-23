@@ -98,7 +98,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             $ sudo usermod -aG binder \"$USER\"\n\n    \
             The device node's mode is the only gate on who can speak binder at\n    \
             all -- binder itself has no in-kernel access control. rsb_hub layers\n    \
-            per-service policy on top; see its --policy option.")
+            per-service policy on top; see its --config option.")
         .get_matches();
 
     env_logger::init();

@@ -345,7 +345,7 @@ enumerate at all, and each name it would learn about must be one it may
 
 ### Policy files
 
-`rsb_hub --policy <PATH>` takes a `.toml` file or a directory of them
+`rsb_hub --config <PATH>` takes a `.toml` file or a directory of them
 (default: `/etc/rsbinder/hub.d`). A directory is read as every `*.toml` in
 it, sorted by file name — so `10-`/`20-` prefixes control precedence the way
 they do in any other `.d` directory.

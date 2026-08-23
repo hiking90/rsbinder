@@ -1,7 +1,12 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Access-control policy for the service manager (`rsb_hub`).
+//! Configuration for the service manager (`rsb_hub`).
+//!
+//! One directory of TOML files describes what `rsb_hub` will allow. Today
+//! that is the access-control policy below; service declarations share the
+//! same files, so a single entry can say who may use a service, that it
+//! exists, and how to start it.
 //!
 //! # Why not SELinux
 //!
@@ -41,10 +46,10 @@
 //! deny. `rsb_hub` refuses to start without a policy rather than falling
 //! back to a permissive mode.
 
-mod config;
 mod enforcer;
-mod model;
+mod parse;
+mod policy;
 
-pub use config::{load, parse_file, ConfigError, NameResolver, SystemResolver};
 pub use enforcer::Enforcer;
-pub use model::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};
+pub use parse::{load, parse_file, ConfigError, NameResolver, SystemResolver};
+pub use policy::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};

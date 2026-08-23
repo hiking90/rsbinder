@@ -5,8 +5,8 @@
 //!
 //! The CLI binaries (`rsb_hub`, `rsb_device`) stay thin; anything worth
 //! unit-testing on its own lives here. Currently that is the service
-//! manager's access-control policy — see [`policy`] and
-//! `plans/6-1-hub-access-control.md`.
+//! manager's configuration — access-control policy today, service
+//! declarations next — see [`config`] and `plans/6-1-hub-access-control.md`.
 
+pub mod config;
 pub mod nss;
-pub mod policy;

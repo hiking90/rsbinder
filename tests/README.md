@@ -28,7 +28,7 @@ $ ./tests/scripts/run_hub_policy_ac.sh
 * Run **rsb_hub** in a terminal. The suite invents service names at run time,
   so point it at the permissive test policy:
 ```
-$ cargo run --bin rsb_hub -- --policy tests/policy/permissive.toml
+$ cargo run --bin rsb_hub -- --config tests/policy/permissive.toml
 ```
 
 * Run **test_service** in another terminal

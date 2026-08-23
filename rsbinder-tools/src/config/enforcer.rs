@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use rsbinder::Caller;
 
-use super::model::{Permission, Policy, Subject};
+use super::policy::{Permission, Policy, Subject};
 use crate::nss::GroupCache;
 
 /// Applies a [`Policy`] to live callers.
@@ -111,7 +111,7 @@ fn uid_of(caller: &Caller) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{NamePattern, Rule, Subjects};
+    use crate::config::{NamePattern, Rule, Subjects};
 
     fn policy_allowing_uid(uid: u32) -> Policy {
         Policy {

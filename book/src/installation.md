@@ -75,7 +75,7 @@ For anything else, write a policy — see
 it (`/etc/rsbinder/hub.d` is the default):
 
 ```bash
-$ rsb_hub --policy /etc/rsbinder/hub.d
+$ rsb_hub --config /etc/rsbinder/hub.d
 ```
 
 Alternatively, if building from source:
