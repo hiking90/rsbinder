@@ -8,8 +8,10 @@ use hub::android_16::{
     FLAG_IS_LAZY_SERVICE,
 };
 use rsbinder::*;
+use rsbinder_tools::policy::{self, Enforcer, Permission, SystemResolver};
 use std::{
     collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
@@ -585,15 +587,20 @@ struct ServiceManager {
     /// service-name hijack. `--allow-cross-uid-overwrite` sets it `true`
     /// for deployments that intentionally re-register across UIDs.
     allow_cross_uid_overwrite: bool,
+    /// Per-name `add`/`find`/`list` access control. Every AIDL entry point
+    /// consults this before touching the registry; see
+    /// [`ServiceManager::require`] and `plans/6-1-hub-access-control.md`.
+    enforcer: Arc<Enforcer>,
 }
 
 impl ServiceManager {
-    fn new(allow_cross_uid_overwrite: bool) -> Self {
+    fn new(allow_cross_uid_overwrite: bool, enforcer: Arc<Enforcer>) -> Self {
         let (death_sender, death_receiver) = mpsc::channel();
 
         let this = Self {
             inner: Arc::new(Mutex::new(Inner::new(death_sender))),
             allow_cross_uid_overwrite,
+            enforcer,
         };
 
         this.run_death_receiver(death_receiver);
@@ -722,6 +729,50 @@ impl ServiceManager {
         true
     }
 
+    /// May the current caller exercise `permission` on `name`?
+    ///
+    /// `rsbinder::calling_caller()` is `None` exactly when this thread is
+    /// not dispatching a binder transaction. For `rsb_hub` that is one call
+    /// and one only: publishing itself as [`SELF_SERVICE_NAME`] at startup,
+    /// which the generated code routes as a direct Rust call rather than a
+    /// transaction. There is no remote peer to authorize, and a policy
+    /// cannot be expected to grant the hub access to itself.
+    ///
+    /// The bypass is scoped to exactly that permission and that name rather
+    /// than to "no transaction" in general: a request that arrived over
+    /// binder is always inside a transaction, but `rsb_hub`'s own
+    /// death-notification and client-callback-poller threads are not, and
+    /// if either ever grows a path through here it must be denied, not
+    /// waved through. See `plans/6-1-hub-access-control.md` D10.
+    fn allows(&self, permission: Permission, name: &str) -> bool {
+        match rsbinder::calling_caller() {
+            Some(caller) => self.enforcer.check_caller(permission, name, &caller),
+            None => permission == Permission::Add && name == SELF_SERVICE_NAME,
+        }
+    }
+
+    /// [`Self::allows`], as a `Result` for the entry points whose denial is
+    /// reported to the caller as `EX_SECURITY`.
+    ///
+    /// The *lookup* entry points do not use this: AOSP's `tryGetBinder`
+    /// returns an empty result rather than an error when `canFind` fails
+    /// (`ServiceManager.cpp:468-470`), and `getService` is documented to
+    /// return ok regardless. Reporting a denied lookup as "not registered"
+    /// also keeps a denied caller from using the error to probe which names
+    /// exist.
+    fn require(&self, permission: Permission, name: &str) -> rsbinder::status::Result<()> {
+        if self.allows(permission, name) {
+            return Ok(());
+        }
+        let ctx = rsbinder::thread_state::CallingContext::default();
+        let msg = format!(
+            "policy denied {permission} on {name:?} for uid={} (pid={})",
+            ctx.uid, ctx.pid
+        );
+        log::warn!("{msg}");
+        Err((ExceptionCode::Security, msg.as_str()).into())
+    }
+
     /// Add-time access-control decision for an `addService` that would
     /// overwrite an existing registration: returns `true` when the
     /// overwrite must be rejected as a likely service-name hijack.
@@ -815,6 +866,9 @@ impl IServiceManager for ServiceManager {
     /// callers that want it lives in
     /// [`getService2`](Self::getService2)/[`checkService2`](Self::checkService2).
     fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
+        if !self.allows(Permission::Find, name) {
+            return Ok(None);
+        }
         let mut pending = Vec::new();
         let result = {
             let mut inner = lock_recover(&self.inner);
@@ -847,6 +901,8 @@ impl IServiceManager for ServiceManager {
         allowIsolated: bool,
         dumpPriority: i32,
     ) -> rsbinder::status::Result<()> {
+        self.require(Permission::Add, name)?;
+
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
@@ -1023,6 +1079,9 @@ impl IServiceManager for ServiceManager {
     /// (no lazy-service infrastructure). See `getService`'s rustdoc for
     /// the rationale.
     fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
+        if !self.allows(Permission::Find, name) {
+            return Ok(None);
+        }
         let mut pending = Vec::new();
         let result = {
             let mut inner = lock_recover(&self.inner);
@@ -1034,14 +1093,30 @@ impl IServiceManager for ServiceManager {
         Ok(result)
     }
 
+    /// Two gates, unlike AOSP's single all-or-nothing `canList`: the
+    /// caller must be allowed to enumerate at all, *and* each name it
+    /// would learn about must be one it may `find`. The per-name filter
+    /// mirrors what AOSP already does in `getUpdatableNames`
+    /// (`ServiceManager.cpp:789-793`) — a name the caller could not look
+    /// up is a name it has no business learning the existence of.
     fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
-        let inner = lock_recover(&self.inner);
+        self.require(Permission::List, "")?;
 
-        Ok(inner
-            .name_to_service
-            .iter()
-            .filter(|(_, service)| (service.dump_priority & dump_priority) != 0)
-            .map(|(name, _)| name.clone())
+        // Collect under the lock, filter outside it: `allows` resolves
+        // group membership, which can hit the name service.
+        let candidates: Vec<String> = {
+            let inner = lock_recover(&self.inner);
+            inner
+                .name_to_service
+                .iter()
+                .filter(|(_, service)| (service.dump_priority & dump_priority) != 0)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        Ok(candidates
+            .into_iter()
+            .filter(|name| self.allows(Permission::Find, name))
             .collect())
     }
 
@@ -1052,6 +1127,8 @@ impl IServiceManager for ServiceManager {
             dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
     ) -> rsbinder::status::Result<()> {
+        self.require(Permission::Find, name)?;
+
         if !Self::is_valid_service_name(name) {
             return Err(ExceptionCode::IllegalArgument.into());
         }
@@ -1117,6 +1194,8 @@ impl IServiceManager for ServiceManager {
             dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
     ) -> rsbinder::status::Result<()> {
+        self.require(Permission::Find, name)?;
+
         let mut inner = lock_recover(&self.inner);
 
         let binder = callback.as_binder();
@@ -1145,7 +1224,8 @@ impl IServiceManager for ServiceManager {
     /// on top in their own service-manager (or run rsb_hub on a host
     /// that ships VINTF files plus a parser, which is out of scope
     /// here).
-    fn isDeclared(&self, _arg_name: &str) -> rsbinder::status::Result<bool> {
+    fn isDeclared(&self, arg_name: &str) -> rsbinder::status::Result<bool> {
+        self.require(Permission::Find, arg_name)?;
         Ok(false)
     }
 
@@ -1161,7 +1241,8 @@ impl IServiceManager for ServiceManager {
     /// `None` truthfully reports "no APEX governs this service". Demoted
     /// to `debug` because under steady-state load every `getService`
     /// caller that asks may hit this — `warn` would flood the log.
-    fn updatableViaApex(&self, _arg_name: &str) -> rsbinder::status::Result<Option<String>> {
+    fn updatableViaApex(&self, arg_name: &str) -> rsbinder::status::Result<Option<String>> {
+        self.require(Permission::Find, arg_name)?;
         log::debug!("updatableViaApex is not implemented on Linux (APEX is Android-only)");
         Ok(None)
     }
@@ -1177,10 +1258,11 @@ impl IServiceManager for ServiceManager {
     /// vendor-supplied lookup. Same design choice as [`isDeclared`](Self::isDeclared).
     fn getConnectionInfo(
         &self,
-        _arg_name: &str,
+        arg_name: &str,
     ) -> rsbinder::status::Result<
         Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
     > {
+        self.require(Permission::Find, arg_name)?;
         Ok(None)
     }
 
@@ -1192,6 +1274,8 @@ impl IServiceManager for ServiceManager {
             dyn hub::android_16::android::os::IClientCallback::IClientCallback,
         >,
     ) -> rsbinder::status::Result<()> {
+        self.require(Permission::Add, name)?;
+
         let mut pending = Vec::new();
         let result: rsbinder::status::Result<()> = (|| {
             let mut inner = lock_recover(&self.inner);
@@ -1298,6 +1382,8 @@ impl IServiceManager for ServiceManager {
         name: &str,
         arg_service: &rsbinder::SIBinder,
     ) -> rsbinder::status::Result<()> {
+        self.require(Permission::Add, name)?;
+
         let context = rsbinder::thread_state::CallingContext::default();
 
         let mut pending = Vec::new();
@@ -1385,16 +1471,23 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<
         Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>,
     > {
-        let inner = lock_recover(&self.inner);
+        self.require(Permission::List, "")?;
 
-        Ok(inner
-            .name_to_service
-            .iter()
-            .map(|(name, service)| {
-                hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo {
-                    name: name.clone(),
-                    debugPid: service.context.pid,
-                }
+        // See `listServices`: snapshot under the lock, filter outside it.
+        let snapshot: Vec<(String, i32)> = {
+            let inner = lock_recover(&self.inner);
+            inner
+                .name_to_service
+                .iter()
+                .map(|(name, service)| (name.clone(), service.context.pid))
+                .collect()
+        };
+
+        Ok(snapshot
+            .into_iter()
+            .filter(|(name, _)| self.allows(Permission::Find, name))
+            .map(|(name, debugPid)| {
+                hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo { name, debugPid }
             })
             .collect())
     }
@@ -1406,6 +1499,9 @@ impl IServiceManager for ServiceManager {
         // Routing logic lives in `classify_for_service_union` so
         // `checkService2` stays byte-identical without re-stating the
         // match arms.
+        if !self.allows(Permission::Find, name) {
+            return Ok(classify_for_service_union(None));
+        }
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
@@ -1421,6 +1517,9 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
         // See `getService2` — both route through
         // `classify_for_service_union`.
+        if !self.allows(Permission::Find, name) {
+            return Ok(classify_for_service_union(None));
+        }
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
@@ -1439,7 +1538,128 @@ impl IServiceManager for ServiceManager {
     }
 }
 
+/// Where `rsb_hub` looks for policy when `--policy` is not given. Every
+/// `*.toml` in it is loaded, sorted by file name.
+const DEFAULT_POLICY_DIR: &str = "/etc/rsbinder/hub.d";
+
+/// Report an unloadable policy and exit.
+///
+/// `rsb_hub` does not start without a policy. Falling back to a permissive
+/// mode here would mean a typo in a config file silently drops all access
+/// control on a running system — the one failure mode that must never be
+/// quiet. `--insecure-allow-all` exists for the cases that genuinely want
+/// no policy, and it has to be asked for by that name.
+fn exit_without_policy(path: &Path, err: &policy::ConfigError) -> ! {
+    eprintln!("rsb_hub: cannot load access-control policy");
+    eprintln!("  {err}");
+    eprintln!();
+    eprintln!("rsb_hub denies every request unless a policy grants it. Create a policy");
+    eprintln!("file, for example {}/10-local.toml:", path.display());
+    eprintln!();
+    eprintln!("    [global]");
+    eprintln!("    list = {{ group = [\"binder-admin\"] }}");
+    eprintln!();
+    eprintln!("    [[rule]]");
+    eprintln!("    name = \"com.example.*\"");
+    eprintln!("    add  = {{ user = [\"exampled\"] }}");
+    eprintln!("    find = {{ group = [\"binder-clients\"] }}");
+    eprintln!();
+    eprintln!("Point rsb_hub at a different path with --policy <PATH>, or pass");
+    eprintln!("--insecure-allow-all to run with no access control (development only).");
+    std::process::exit(1);
+}
+
+/// A `sigset_t` containing only SIGHUP.
+fn sighup_set() -> std::io::Result<libc::sigset_t> {
+    // SAFETY: `sigemptyset` fully initializes the zeroed set before
+    // `sigaddset` or any reader touches it, and both take a valid pointer
+    // to a live local.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, libc::SIGHUP) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(set)
+    }
+}
+
+/// Block SIGHUP in this thread, and therefore in every thread spawned
+/// later.
+///
+/// `pthread_sigmask` is per-thread and a new thread inherits its creator's
+/// mask, so doing this before anything else spawns is what makes the
+/// reloader thread's `sigwait` the single consumer. Without the block,
+/// SIGHUP's default disposition would simply kill rsb_hub.
+fn block_sighup() -> std::io::Result<()> {
+    let set = sighup_set()?;
+    // SAFETY: `set` is initialized above and only read by the call; the
+    // null `oldset` means "do not report the previous mask".
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+/// Reload the policy from `path` on every SIGHUP.
+///
+/// A failed reload **keeps the policy already in force**. Dropping to
+/// deny-all would take the machine's IPC down over a typo, and falling back
+/// to permissive would do the opposite and worse; continuing with the last
+/// known-good policy is the only option that neither breaks nor silently
+/// opens the system. The failure is logged at error level.
+fn spawn_policy_reloader(enforcer: Arc<Enforcer>, path: PathBuf) {
+    let spawn_result = std::thread::Builder::new()
+        .name("rsb_hub:reload".to_owned())
+        .spawn(move || {
+            let set = match sighup_set() {
+                Ok(set) => set,
+                Err(e) => {
+                    log::error!("rsb_hub: cannot build the SIGHUP set, reload disabled: {e}");
+                    return;
+                }
+            };
+            loop {
+                let mut signo: libc::c_int = 0;
+                // SAFETY: `set` is an initialized sigset that outlives the
+                // call, and `signo` is a live local the call writes once.
+                let rc = unsafe { libc::sigwait(&set, &mut signo) };
+                if rc != 0 {
+                    log::error!(
+                        "rsb_hub: sigwait failed, reload disabled: {}",
+                        std::io::Error::from_raw_os_error(rc)
+                    );
+                    return;
+                }
+                match policy::load(&path, &SystemResolver) {
+                    Ok(loaded) => {
+                        let rules = loaded.rules.len();
+                        enforcer.replace_policy(loaded);
+                        log::info!(
+                            "rsb_hub: SIGHUP reloaded {rules} policy rule(s) from {}",
+                            path.display()
+                        );
+                    }
+                    Err(err) => log::error!(
+                        "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
+                         force: {err}",
+                        path.display()
+                    ),
+                }
+            }
+        });
+    if let Err(e) = spawn_result {
+        log::error!("rsb_hub: failed to spawn the policy reloader thread: {e}");
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Before anything spawns a thread, so the mask is inherited everywhere.
+    if let Err(e) = block_sighup() {
+        eprintln!("rsb_hub: cannot block SIGHUP: {e}");
+        std::process::exit(1);
+    }
+
     let matches = clap::Command::new("rsb_hub")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
@@ -1451,6 +1671,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .value_name("NAME")
                 .help("Name of the binder device to use (e.g., 'binder', 'mybinder')")
                 .default_value("binder"),
+        )
+        .arg(
+            clap::Arg::new("policy")
+                .short('p')
+                .long("policy")
+                .value_name("PATH")
+                .help(
+                    "Access-control policy: a .toml file, or a directory of *.toml \
+                     files loaded in file-name order (default: /etc/rsbinder/hub.d)",
+                ),
+        )
+        .arg(
+            clap::Arg::new("insecure-allow-all")
+                .long("insecure-allow-all")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Run with NO access control: every caller may register, look up, \
+                     and enumerate every service. Development and test use only",
+                ),
         )
         .arg(
             clap::Arg::new("allow-cross-uid-overwrite")
@@ -1470,7 +1709,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Run with a custom binder device:\n    \
             $ rsb_hub --device mybinder\n    \
             $ rsb_hub -d mybinder\n\n    \
-            Note: The binder device must be created first using rsb_device.",
+            Run with a policy from somewhere other than /etc/rsbinder/hub.d:\n    \
+            $ rsb_hub --policy /usr/local/etc/rsbinder/hub.d\n\n    \
+            Run with no access control (development only):\n    \
+            $ rsb_hub --insecure-allow-all\n\n    \
+            Note: The binder device must be created first using rsb_device.\n    \
+            rsb_hub denies every request that its policy does not allow, and \n    \
+            refuses to start when no policy can be loaded.",
         )
         .get_matches();
 
@@ -1488,6 +1733,41 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let insecure_allow_all = matches.get_flag("insecure-allow-all");
+    let policy_path = matches.get_one::<String>("policy").map(PathBuf::from);
+    if insecure_allow_all && policy_path.is_some() {
+        eprintln!("rsb_hub: --policy and --insecure-allow-all are mutually exclusive");
+        std::process::exit(1);
+    }
+
+    let enforcer = if insecure_allow_all {
+        // Loud on stderr as well as the log: this is a running service
+        // manager with no access control, and the operator has to be able
+        // to see that from the terminal that started it.
+        eprintln!(
+            "rsb_hub: WARNING --insecure-allow-all: no access control. Any local \
+             process may register, look up, and enumerate any service."
+        );
+        log::warn!("rsb_hub: running with --insecure-allow-all; no access control is applied");
+        log::warn!("rsb_hub: SIGHUP will be ignored (there is no policy to reload)");
+        Arc::new(Enforcer::allow_all())
+    } else {
+        let path = policy_path.unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_DIR));
+        let enforcer = match policy::load(&path, &SystemResolver) {
+            Ok(loaded) => {
+                log::info!(
+                    "rsb_hub: loaded {} policy rule(s) from {}",
+                    loaded.rules.len(),
+                    path.display()
+                );
+                Arc::new(Enforcer::enforcing(loaded))
+            }
+            Err(err) => exit_without_policy(&path, &err),
+        };
+        spawn_policy_reloader(Arc::clone(&enforcer), path);
+        enforcer
+    };
+
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
     // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: rsb_hub is deliberately
@@ -1500,7 +1780,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.
-    let service = BnServiceManager::new_binder(ServiceManager::new(allow_cross_uid_overwrite));
+    let service = BnServiceManager::new_binder(ServiceManager::new(
+        allow_cross_uid_overwrite,
+        Arc::clone(&enforcer),
+    ));
     // Log and carry on, as AOSP does (`main.cpp`: "Could not self register
     // servicemanager"). Clients reach the hub through handle 0 regardless;
     // the registry entry is a convenience, and refusing to come up without
@@ -1753,6 +2036,20 @@ mod tests {
     fn lazy_flag_is_disjoint_from_the_priority_mask() {
         assert_eq!(FLAG_IS_LAZY_SERVICE, 1 << 30);
         assert_eq!(FLAG_IS_LAZY_SERVICE & DUMP_FLAG_PRIORITY_ALL, 0);
+    }
+
+    /// The self-registration bypass in [`ServiceManager::allows`] rests
+    /// entirely on `calling_caller()` being `None` outside a transaction.
+    /// If that ever changed, `rsb_hub` would authorize its own startup
+    /// `addService("manager")` against the caller's own uid and refuse to
+    /// start under any policy that does not happen to grant it — a
+    /// startup failure with a very confusing message. Pin the premise.
+    #[test]
+    fn calling_caller_is_none_outside_a_transaction() {
+        assert!(
+            rsbinder::calling_caller().is_none(),
+            "no transaction is in flight on a test thread"
+        );
     }
 
     /// Add-time access control: a cross-UID overwrite of a different live

@@ -112,6 +112,23 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
+- **rsbinder-tools (`rsb_hub`):** per-name access control. `rsb_hub` now gates
+  every AIDL entry point on an `add` / `find` / `list` policy keyed on the
+  caller's uid and its NSS-resolved groups — the same policy model AOSP's
+  `servicemanager` applies through SELinux, but keyed on credentials every
+  platform reports rather than on an LSM that most Linux distributions do not
+  enable and macOS does not have. Policy is TOML, `--policy <PATH>` takes a
+  file or a directory of `*.toml` loaded in file-name order, and the first rule
+  whose `name` pattern matches decides. `SIGHUP` reloads in place; a reload
+  that fails to parse or resolve keeps the policy already in force. A denied
+  *lookup* reports "not registered" rather than an error, matching AOSP's
+  `tryGetBinder`; every other denial is `EX_SECURITY`. `listServices` and
+  `getServiceDebugInfo` apply the global `list` gate *and* filter their results
+  per-name by `find`, which is stricter than AOSP's all-or-nothing `canList`.
+  Deliberately **not** keyed on pid: pid reuse makes pid-derived attributes
+  unsound for authorization, which is why AOSP names its own field `debugPid`.
+  See `plans/6-1-hub-access-control.md` and the
+  [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control).
 - **rsbinder-tools (`rsb_device`):** `--group` and `--mode` for the binder
   device node. Binder has no in-kernel access control of its own, so the node
   is the only gate on who may speak binder at all.
@@ -127,6 +144,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
   they come from different `Arc<ProxyHandle>` allocations — which was already
   the documented intent for case-(b) resurrection, and is now also true after
   the obituary.
+- **rsbinder-tools (`rsb_hub`) — breaking:** `rsb_hub` refuses to start unless
+  it can load an access-control policy, and denies every request the policy
+  does not allow. Previously any local process could register, overwrite, look
+  up, and enumerate any service. Existing deployments must supply a policy
+  (`--policy <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
+  `--insecure-allow-all`, which is named that way on purpose and cannot be
+  reached by accident. There is no permissive fallback for a policy that fails
+  to load: a typo in a config file must never silently remove access control
+  from a running system.
 - **rsbinder-tools (`rsb_device`) — breaking:** the binder device node is now
   created `0600` (root only) instead of `0666` (world read/write). Grant access
   deliberately: `sudo rsb_device binder --group binder --mode 0660`, with your
