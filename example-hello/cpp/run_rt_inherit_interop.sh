@@ -47,7 +47,7 @@ ssh "$REMOTE" "cd $REPO_REMOTE && cargo build -p example-hello \
 
 echo "==> ensuring rsb_hub is running"
 ssh "$REMOTE" "cd $REPO_REMOTE && pgrep -af rsb_hub >/dev/null || \
-    (nohup ./target/debug/rsb_hub > /tmp/rsb_hub.log 2>&1 < /dev/null &) ; sleep 1"
+    (nohup ./target/debug/rsb_hub --policy tests/policy/permissive.toml > /tmp/rsb_hub.log 2>&1 < /dev/null &) ; sleep 1"
 
 echo "==> restarting service"
 ssh "$REMOTE" "cd $REPO_REMOTE && \

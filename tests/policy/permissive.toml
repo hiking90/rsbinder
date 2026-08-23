@@ -1,0 +1,20 @@
+# Test-suite policy for rsb_hub. NOT a template for a real deployment.
+#
+# The integration suite registers throwaway services under names it makes up
+# at run time, so no realistic rule set could cover them. This grants
+# everything to everyone — which is exactly what a production policy must
+# not do. It exists so CI exercises the real policy path (parse -> resolve ->
+# Enforcer::enforcing -> per-call check) instead of the `--insecure-allow-all`
+# short circuit, which would skip all of it.
+#
+# For a real policy, scope each rule to a name prefix and name the users and
+# groups that own it; see plans/6-1-hub-access-control.md and
+# book/src/service-manager.md.
+
+[global]
+list = "any"
+
+[[rule]]
+name = "*"
+add = "any"
+find = "any"

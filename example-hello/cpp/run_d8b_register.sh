@@ -66,7 +66,8 @@ cargo build -p example-hello --features rpc,android_16 \
 cargo test --no-run -p tests --features rpc --lib 2>&1 | tail -3
 
 echo "==> [3/4] starting rsb_hub + accessor server"
-RUST_LOG=warn nohup ./target/debug/rsb_hub > "$HUB_LOG" 2>&1 &
+RUST_LOG=warn nohup ./target/debug/rsb_hub --policy tests/policy/permissive.toml \
+    > "$HUB_LOG" 2>&1 &
 HUB_PID=$!
 disown $HUB_PID || true
 sleep 2

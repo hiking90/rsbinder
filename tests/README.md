@@ -11,11 +11,24 @@ The 3 failed ones require the development of new features.
 The previously failing `test_renamed_interface_*` siblings were stabilized
 by closing the proxy-cache races in PR #100.
 
-## How to run test cases
+## Access-control gates (Linux only)
 
-* Run **rsb_hub** in a terminal
+`rsb_hub`'s policy engine is exercised by `tests/scripts/run_hub_policy_ac.sh`,
+which drives `ac61_probe` against a live hub over real kernel binder — a denial
+only means anything when the caller uid comes from the binder driver. It starts
+and stops its own hub, so run it with nothing else holding handle 0:
+
 ```
-$ cargo run --bin rsb_hub
+$ cargo build --bin rsb_hub -p rsbinder-tools && cargo build -p tests --bin ac61_probe
+$ ./tests/scripts/run_hub_policy_ac.sh
+```
+
+## How to run the main suite
+
+* Run **rsb_hub** in a terminal. The suite invents service names at run time,
+  so point it at the permissive test policy:
+```
+$ cargo run --bin rsb_hub -- --policy tests/policy/permissive.toml
 ```
 
 * Run **test_service** in another terminal

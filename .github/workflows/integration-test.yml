@@ -102,8 +102,13 @@ jobs:
       - name: Setup binderfs and create binder device
         run: |
           # rsb_device mounts /dev/binderfs and creates the "binder" device
-          # with 0666 perms — matches DEFAULT_BINDER_PATH used by init_default()
-          sudo target/debug/rsb_device binder
+          # at DEFAULT_BINDER_PATH, which init_default() opens.
+          #
+          # The device node defaults to 0600 (root only) — it is the only gate
+          # on who may speak binder at all. Grant it to the runner's own group
+          # so the unprivileged rsb_hub and test processes can open it; a real
+          # deployment uses a dedicated group instead.
+          sudo target/debug/rsb_device binder --group "$(id -gn)" --mode 0660
           ls -la /dev/binderfs/
 
       - name: Clear kernel ring buffer
@@ -111,7 +116,11 @@ jobs:
 
       - name: Start rsb_hub
         run: |
-          RUST_LOG=info nohup target/debug/rsb_hub > rsb_hub.log 2>&1 &
+          # tests/policy/permissive.toml grants everything: the suite invents
+          # service names at run time. Using a policy file rather than
+          # --insecure-allow-all keeps the real parse/resolve/enforce path in CI.
+          RUST_LOG=info nohup target/debug/rsb_hub --policy tests/policy/permissive.toml \
+            > rsb_hub.log 2>&1 &
           echo $! > rsb_hub.pid
           sleep 1
           kill -0 "$(cat rsb_hub.pid)" || { echo "::error::rsb_hub failed to start"; cat rsb_hub.log; exit 1; }
