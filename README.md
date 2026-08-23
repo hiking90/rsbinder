@@ -20,7 +20,7 @@ For Android developers writing system-level Rust, **rsbinder** is the missing ND
 
 * **crate rsbinder** — library for implementing binder service / client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]** — AIDL → Rust code generator.
-* **[crate rsbinder-tools][rsbinder-tools-readme]** — CLI tools, including the Binder Service Manager for Linux (`rsb_hub`).
+* **[crate rsbinder-tools][rsbinder-tools-readme]** — CLI tools: the Binder Service Manager for Linux (`rsb_hub`), the device setup helper (`rsb_device`), and the registry inspector (`rsb_service`).
 * **[crate tests][tests-readme]** — Android binder test cases ported to rsbinder.
 * **[crate example-hello][example-hello-readme]** — example service / client written using rsbinder.
 
@@ -108,10 +108,11 @@ Build, bring up the service manager, then run the example:
 $ cargo build
 $ sudo target/debug/rsb_device binder --group "$(id -gn)" --mode 0660
 $ cargo run --bin rsb_hub -- --insecure-allow-all   # service manager
+$ cargo run --bin rsb_service -- list               # what is registered
 $ cargo run --bin hello_service
 $ cargo run --bin hello_client
 ```
-`rsb_device` and `rsb_hub` are documented under [`rsbinder-tools`][rsbinder-tools-readme].
+`rsb_device`, `rsb_hub` and `rsb_service` are documented under [`rsbinder-tools`][rsbinder-tools-readme].
 
 ### Cross compile to Android device
 Please follow the [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) guide.
@@ -165,7 +166,7 @@ Complete API parity is not a goal — rsbinder's architecture differs from `libb
 - [x] Real Android `libbinder` interop (RPC v1 / v2).
 
 **Tooling**
-- [ ] (In Progress) Service Manager (**rsb_hub**) for Linux — lazy-service poller and accessor descriptor auto-detect done.
+- [ ] (In Progress) Service Manager (**rsb_hub**) for Linux — access control, service declarations, on-demand start, `systemd` readiness and the `rsb_service` inspector are done.
 
 ## Contributing
 

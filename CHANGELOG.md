@@ -15,6 +15,39 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
+  manager what it knows — the Linux counterpart of Android's `service` and
+  `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,
+  `connection`, and `dump <name> [args...]` (which sends `DUMP_TRANSACTION`
+  to any service, not just the hub). Exit status is the answer: `0` yes, `1`
+  no, `2` the question could not be answered. It is an ordinary binder client,
+  so `rsb_hub`'s policy applies to it like anything else, and a denial is
+  reported as a denial rather than as an empty result.
+- **rsbinder-tools (`rsb_hub`):** `dump` support. `rsb_service dump manager`
+  (or a `DUMP_TRANSACTION` to handle 0) prints the registry as the hub sees
+  it: every registration with its pid, uid, dump-priority flags and callback
+  counts, the death-subscription count, the access-control mode, and the
+  names something is *waiting* on that nothing has registered. Gated on
+  `list`, with each name filtered by `find`; withheld names are counted, not
+  listed. AOSP's `servicemanager` does not implement `dump` at all — on
+  Android these questions are answered by `dumpsys`, `service list` and the
+  init/VINTF files, none of which exist on Linux.
+- **rsbinder-tools (`rsb_hub`):** service-supervisor integration. `SIGTERM`
+  and `SIGINT` now stop the hub cleanly (exit 0 with a log line, instead of
+  dying by signal), and under systemd `Type=notify` it reports `READY=1` only
+  once it holds handle 0 — so units ordered `After=` it cannot race the
+  registry — plus `STOPPING=1` on a deliberate stop and a `STATUS=` line for
+  `systemctl status`. No `libsystemd` dependency: `$NOTIFY_SOCKET` takes one
+  datagram. Starting a second hub on a device that already has one now names
+  the cause instead of surfacing a raw ioctl errno.
+- **rsbinder (hub):** error-preserving `try_*` counterparts for the client
+  calls that used to swallow the service manager's `Status` —
+  `try_list_services`, `try_is_declared`, `try_get_declared_instances`,
+  `try_get_connection_info`, `try_get_service_debug_info` (each on
+  `ServiceManager` and as a free function). The swallowing wrappers report a
+  policy denial as an empty list / `false` / `None`, indistinguishable from
+  the negative answer; anything that must explain *why* needs the status.
+
 - **rsbinder-tools (`rsb_hub`):** on-demand service start. A `[[service]]`
   entry with `start = { systemd = "unit" }` or `start = { exec = [...] }` is
   brought up when a `getService` misses it — AOSP's `tryStartService`, with
@@ -162,6 +195,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **rsbinder-tools (`rsb_device`):** `--group` and `--mode` for the binder
   device node. Binder has no in-kernel access control of its own, so the node
   is the only gate on who may speak binder at all.
+
+### Fixed
+
+- **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
+  on Android 13/14 — each version generates its own `ConnectionInfo` and the
+  dispatch arms returned the version's type where the unified one was
+  expected. Latent because no build enabled those features together.
+- **rsbinder (`ProxyHandle::dump`):** a `write_object` that failed after the
+  descriptor had been detached from its RAII wrapper leaked the descriptor.
+  Every other path is covered by the parcel's own ownership of it.
 
 ### Changed
 

@@ -78,6 +78,29 @@ fails keeps the policy already in force. See the
 [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control)
 for the file format.
 
+`SIGTERM` (and `SIGINT`) stop it cleanly, exiting 0 rather than dying by
+signal. Under systemd use `Type=notify`: `rsb_hub` reports `READY=1` only once
+it holds handle 0, so units ordered `After=` it never race the registry.
+
+```ini
+[Unit]
+Description=rsbinder service manager
+After=dev-binderfs.mount
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A binder device has exactly one service manager. Starting a second `rsb_hub`
+on the same device exits 1 and says so; give it its own device
+(`rsb_device other && rsb_hub --device other`) to run an independent one.
+
 ### Features
 **rsb_hub** provides a full-featured service management system with:
 
@@ -110,3 +133,35 @@ Built on top of **rsbinder**'s service management APIs, **rsb_hub** provides:
   RPC transport, without requiring SELinux
 
 The hub acts as a central registry that bridges the gap between service providers and consumers, making Binder IPC on Linux as seamless as on Android.
+
+## rsb_service
+
+Ask the running service manager what it knows -- the Linux counterpart of
+Android's `service` and `dumpsys -l`.
+
+### Usage
+```bash
+$ rsb_service list                                  # what is registered
+$ rsb_service info                                  # ... and which pid owns each
+$ rsb_service check com.example.IFoo/default        # is it up yet?
+$ rsb_service declared com.example.IFoo/default     # is it even configured?
+$ rsb_service instances com.example.IFoo            # every declared instance
+$ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
+$ rsb_service dump manager                          # rsb_hub's own registry
+$ rsb_service dump manager com.example              # ... narrowed by substring
+```
+
+Exit status is the answer: `0` yes, `1` no (not registered, not declared), `2`
+the question could not be answered -- no service manager, or its policy denied
+it. So `rsb_service check foo || start-foo` reads the way it looks.
+
+`rsb_service` is an ordinary binder client, so `rsb_hub`'s policy applies to it
+like anything else: `list`, `info` and `dump` need `list`, and every name they
+report is filtered by `find`. A denial is reported as a denial rather than as
+an empty result -- except for `check`, where the hub answers a denied lookup
+exactly as it answers an unregistered name, by design, so that a denied caller
+cannot use it to enumerate which names exist.
+
+`dump <name>` works on any service, not just the hub: it sends
+`DUMP_TRANSACTION` and prints whatever the service writes, which for an
+rsbinder service is its `Interface::dump` implementation.

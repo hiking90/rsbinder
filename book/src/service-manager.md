@@ -37,6 +37,88 @@ is denied unless a policy allows it, and `--insecure-allow-all` above is the
 explicit opt-out for development. See [Access control](#access-control) for
 how to write one.
 
+### Running it under systemd
+
+`rsb_hub` handles three signals: `SIGHUP` reloads the configuration in place,
+and `SIGTERM` / `SIGINT` stop it cleanly — exiting 0 rather than dying by
+signal, so a deliberate stop is distinguishable from a crash in the journal.
+
+Use `Type=notify`. The HUB reports `READY=1` only once it holds handle 0,
+which is the first instant a client can reach it; with `Type=simple` systemd
+would consider the unit started as soon as `exec` returned, and every unit
+ordered `After=` it would race the registry.
+
+```ini
+[Unit]
+Description=rsbinder service manager
+After=dev-binderfs.mount
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A binder device has exactly one service manager — the kernel enforces that,
+not `rsb_hub` — so a second instance on the same device exits 1 and says so.
+To run an independent one, give it its own device: `sudo rsb_device other`
+then `rsb_hub --device other`.
+
+### Inspecting a running HUB
+
+The `rsb_service` CLI, also from `rsbinder-tools`, is the Linux counterpart of
+Android's `service` and `dumpsys -l`:
+
+```bash
+$ rsb_service list                                  # what is registered
+$ rsb_service info                                  # ... and which pid owns each
+$ rsb_service check com.example.IFoo/default        # is it up yet?
+$ rsb_service declared com.example.IFoo/default     # is it even configured?
+$ rsb_service instances com.example.IFoo            # every declared instance
+$ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
+$ rsb_service dump manager                          # rsb_hub's own registry
+```
+
+`dump manager` is the one with no Android equivalent — AOSP's
+`servicemanager` does not implement `dump` at all, because on Android the
+same questions are answered by `dumpsys`, `service list` and the init/VINTF
+files:
+
+```text
+rsb_hub 0.11.0
+access control: enforcing, 4 rule(s)
+declarations: 2
+death subscriptions: 3
+
+services (2):
+  com.example.IFoo/default
+    pid=92338 uid=973 dump_priority=0x8 lazy=no accessor=no
+    clients=no guarantee_client=no callbacks: registration=0 client=0
+  manager
+    pid=92334 uid=973 dump_priority=0x8 lazy=no accessor=no
+    clients=no guarantee_client=yes callbacks: registration=0 client=0
+
+awaiting registration (1):
+  com.example.INope/default  callbacks: registration=1 client=0
+```
+
+That last section is usually the one you came for: a name something is
+waiting on that nothing has registered. Arguments narrow the listing by
+substring (`rsb_service dump manager com.example`), and `dump` works on any
+service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
+rsbinder service lands in its `Interface::dump` implementation.
+
+Exit status is the answer: `0` yes, `1` no, `2` the question could not be
+answered (no service manager, or its policy denied it), so
+`rsb_service check foo || start-foo` reads the way it looks. `rsb_service` is
+an ordinary binder client, so the HUB's policy applies to it like anything
+else — `list`, `info` and `dump` need `list`, and every name they report is
+filtered by `find`.
+
 ## Registering a Service
 
 To make a service available to other processes, create a Binder object and
@@ -206,6 +288,17 @@ used flags are:
 | `DUMP_FLAG_PRIORITY_NORMAL`   | Normal-priority services                 |
 | `DUMP_FLAG_PRIORITY_ALL`      | All services regardless of priority      |
 
+`list_services` reports an unreachable or unwilling service manager as an
+empty list. When you need to tell "nothing is registered" from "the policy
+denied this caller", use `hub::try_list_services`, which returns
+`Result<Vec<String>, Status>` and preserves the `EX_SECURITY` status — and
+its message — that `rsb_hub` sends on a denial. The same pairing exists for
+`is_declared` / `try_is_declared`, `get_declared_instances` /
+`try_get_declared_instances`, `get_connection_info` /
+`try_get_connection_info`, and `get_service_debug_info` /
+`try_get_service_debug_info`. This is exactly what `rsb_service` uses to
+report a denial as a denial.
+
 ## Service Notifications
 
 You can register a callback that fires whenever a service with a particular
@@ -295,6 +388,11 @@ The returned `ServiceDebugInfo` struct has two fields:
 
 This feature is available on Android 12 and above. On Android 10 and Android 11,
 calling `get_service_debug_info` returns an error.
+
+`get_service_debug_info` flattens the service manager's `Status` into a
+`StatusCode`, which turns a policy denial into an anonymous
+`FailedTransaction`. `hub::try_get_service_debug_info` keeps the `Status`,
+message included.
 
 ## Access control
 
@@ -484,6 +582,8 @@ Android's native `servicemanager`:
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
 | **Version selection**   | Always uses Android 16 protocol         | Auto-detected from SDK version          |
 | **Death notifications** | Supported                               | Supported                               |
+| **Diagnostics**         | `rsb_service`, and `dump` on the HUB itself | `dumpsys` / `service`; `servicemanager` has no `dump` |
+| **Readiness**           | `sd_notify(READY=1)` under `Type=notify` | `servicemanager.ready` property         |
 
 On Android, rsbinder automatically detects the SDK version and uses the
 appropriate service manager protocol (Android 10 through 16). The per-version
@@ -564,4 +664,6 @@ service manager as a parameter or store it in a struct.
 - **Debug with `list_services` and `get_service_debug_info`.** When
   troubleshooting, list all registered services and inspect their debug
   information to verify that services are registered from the expected
-  processes.
+  processes. From a shell, `rsb_service list` / `info` / `dump manager` ask
+  the same questions without writing a program — see
+  [Inspecting a running HUB](#inspecting-a-running-hub).
