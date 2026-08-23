@@ -15,6 +15,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder-tools (`rsb_hub`):** service declarations. A `[[service]]` entry
+  in the configuration names a concrete instance
+  (`pack.age.IFoo/instance`, split as AOSP's `NameUtil.h` splits it) and
+  answers `isDeclared`, `getDeclaredInstances` and `getConnectionInfo` — the
+  three calls that were stubs because they read VINTF manifests on Android
+  and there is no VINTF on a plain Linux host. A declaration is the
+  equivalent statement: these instances are expected to exist, so a client
+  can tell "not installed" from "not started yet". Declared instances are
+  filtered by `find`, as AOSP filters `getUpdatableNames`. A host that
+  declares nothing behaves exactly as before.
 - **rsbinder:** `WIBinder` now implements `PartialEq<SIBinder>` (and the
   reverse), so a `DeathRecipient` can ask the question it actually has —
   "is this the binder that died?" — as `*who == stored`. Writing it by hand
@@ -117,7 +127,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   caller's uid and its NSS-resolved groups — the same policy model AOSP's
   `servicemanager` applies through SELinux, but keyed on credentials every
   platform reports rather than on an LSM that most Linux distributions do not
-  enable and macOS does not have. Policy is TOML, `--config <PATH>` takes a
+  enable and macOS does not have. Policy is TOML, `--policy <PATH>` takes a
   file or a directory of `*.toml` loaded in file-name order, and the first rule
   whose `name` pattern matches decides. `SIGHUP` reloads in place; a reload
   that fails to parse or resolve keeps the policy already in force. A denied
@@ -148,7 +158,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   it can load an access-control policy, and denies every request the policy
   does not allow. Previously any local process could register, overwrite, look
   up, and enumerate any service. Existing deployments must supply a policy
-  (`--config <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
+  (`--policy <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
   `--insecure-allow-all`, which is named that way on purpose and cannot be
   reached by accident. There is no permissive fallback for a policy that fails
   to load: a typo in a config file must never silently remove access control

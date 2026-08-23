@@ -1213,27 +1213,26 @@ impl IServiceManager for ServiceManager {
         Ok(())
     }
 
-    /// rsb_hub has no static service declaration system on Linux —
-    /// AOSP's servicemanager answers this from VINTF manifests
-    /// (`/system/etc/vintf/...`, `/system_ext/etc/vintf/...`), which
-    /// are an Android-specific build artifact with no equivalent on a
-    /// plain Linux host. Returning `false` is the truthful answer:
-    /// "no, this name has no pre-declared availability — fall back to
-    /// dynamic lookup via `getService`/`checkService`". Vendors that
-    /// need VINTF-equivalent declaration semantics should layer that
-    /// on top in their own service-manager (or run rsb_hub on a host
-    /// that ships VINTF files plus a parser, which is out of scope
-    /// here).
+    /// Answered from the `[[service]]` entries in rsb_hub's configuration,
+    /// which stand in for AOSP's VINTF manifests: both say which instances
+    /// are expected to exist before anyone registers them, which is what
+    /// lets a client tell "not installed" from "not started yet". A host
+    /// that declares nothing gets `false` for everything, as before.
     fn isDeclared(&self, arg_name: &str) -> rsbinder::status::Result<bool> {
         self.require(Permission::Find, arg_name)?;
-        Ok(false)
+        Ok(self.enforcer.config().declarations.is_declared(arg_name))
     }
 
-    /// See [`isDeclared`](Self::isDeclared) — same VINTF-on-Linux
-    /// rationale. An empty `Vec` reports "no declared instances for
-    /// this interface" which on a VINTF-free system is always true.
-    fn getDeclaredInstances(&self, _arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
-        Ok(vec![])
+    /// See [`isDeclared`](Self::isDeclared). Instances are filtered by
+    /// `find`, as AOSP filters `getUpdatableNames`: an instance the caller
+    /// could not look up is one it has no business learning about.
+    fn getDeclaredInstances(&self, arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
+        let declarations = &self.enforcer.config().declarations;
+        Ok(declarations
+            .instances_of(arg_iface)
+            .into_iter()
+            .filter(|instance| self.allows(Permission::Find, &format!("{arg_iface}/{instance}")))
+            .collect())
     }
 
     /// APEX (Android Pony EXpress) is an Android-only packaging
@@ -1247,15 +1246,10 @@ impl IServiceManager for ServiceManager {
         Ok(None)
     }
 
-    /// AOSP's servicemanager surfaces the VINTF `<ip>`+`<port>` of an
-    /// AIDL service for inet-style RPC accessor connection info (see
-    /// `getVintfConnectionInfo` in `frameworks/native/cmds/servicemanager/
-    /// ServiceManager.cpp`). rsb_hub has no VINTF infrastructure on
-    /// Linux, so the only honest reply is `None` — callers should
-    /// either go through an `IAccessor` they obtained out-of-band
-    /// (e.g., via the consume-side accessor arm of `getService2` +
-    /// process-local `add_accessor_provider`) or fall back to a
-    /// vendor-supplied lookup. Same design choice as [`isDeclared`](Self::isDeclared).
+    /// AOSP surfaces the VINTF `<ip>`+`<port>` of an AIDL service here
+    /// (`getVintfConnectionInfo`); rsb_hub reads the same pair from a
+    /// declaration's `connection` table. `None` when the instance is not
+    /// declared or declared without one.
     fn getConnectionInfo(
         &self,
         arg_name: &str,
@@ -1263,7 +1257,17 @@ impl IServiceManager for ServiceManager {
         Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
     > {
         self.require(Permission::Find, arg_name)?;
-        Ok(None)
+        Ok(self
+            .enforcer
+            .config()
+            .declarations
+            .connection_info(arg_name)
+            .map(
+                |info| hub::android_16::android::os::ConnectionInfo::ConnectionInfo {
+                    ipAddress: info.ip.clone(),
+                    port: info.port,
+                },
+            ))
     }
 
     fn registerClientCallback(
@@ -1633,10 +1637,12 @@ fn spawn_policy_reloader(enforcer: Arc<Enforcer>, path: PathBuf) {
                 }
                 match config::load(&path, &SystemResolver) {
                     Ok(loaded) => {
-                        let rules = loaded.rules.len();
-                        enforcer.replace_policy(loaded);
+                        let rules = loaded.policy.rules.len();
+                        let services = loaded.declarations.len();
+                        enforcer.replace(loaded);
                         log::info!(
-                            "rsb_hub: SIGHUP reloaded {rules} policy rule(s) from {}",
+                            "rsb_hub: SIGHUP reloaded {rules} rule(s) and {services} \
+                             service declaration(s) from {}",
                             path.display()
                         );
                     }
@@ -1757,8 +1763,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let enforcer = match config::load(&path, &SystemResolver) {
             Ok(loaded) => {
                 log::info!(
-                    "rsb_hub: loaded {} policy rule(s) from {}",
-                    loaded.rules.len(),
+                    "rsb_hub: loaded {} rule(s) and {} service declaration(s) from {}",
+                    loaded.policy.rules.len(),
+                    loaded.declarations.len(),
                     path.display()
                 );
                 Arc::new(Enforcer::enforcing(loaded))

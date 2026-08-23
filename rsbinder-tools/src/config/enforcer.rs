@@ -1,14 +1,20 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runtime side of the policy: holds the loaded [`Policy`], memoizes group
-//! lookups, and answers one question — may this caller do this?
+//! Runtime side of the configuration: holds the loaded [`Config`], memoizes
+//! group lookups, and answers the two questions the hub asks of it — may
+//! this caller do this, and what is declared?
+//!
+//! One holder for both halves so a reload swaps them together. Split across
+//! two fields they could drift: a SIGHUP that updated the rules but not the
+//! declarations would enforce one file against another.
 
 use std::sync::{Arc, RwLock};
 
 use rsbinder::Caller;
 
-use super::policy::{Permission, Policy, Subject};
+use super::parse::Config;
+use super::policy::{Permission, Subject};
 use crate::nss::GroupCache;
 
 /// Applies a [`Policy`] to live callers.
@@ -17,20 +23,30 @@ use crate::nss::GroupCache;
 /// policy inside can be swapped by [`replace_policy`](Self::replace_policy)
 /// on SIGHUP without disturbing in-flight transactions.
 pub struct Enforcer {
-    policy: RwLock<Arc<Policy>>,
+    config: RwLock<Arc<Config>>,
     /// Set by `--insecure-allow-all`. Short-circuits every check.
     allow_all: bool,
     groups: GroupCache,
 }
 
 impl Enforcer {
-    /// An enforcer that applies `policy`.
-    pub fn enforcing(policy: Policy) -> Self {
+    /// An enforcer that applies `config`.
+    pub fn enforcing(config: Config) -> Self {
         Enforcer {
-            policy: RwLock::new(Arc::new(policy)),
+            config: RwLock::new(Arc::new(config)),
             allow_all: false,
             groups: GroupCache::new(),
         }
+    }
+
+    /// An enforcer over a bare policy, for tests that do not care about
+    /// declarations.
+    #[cfg(test)]
+    fn from_policy(policy: super::policy::Policy) -> Self {
+        Enforcer::enforcing(Config {
+            policy,
+            ..Config::default()
+        })
     }
 
     /// An enforcer that permits everything — `--insecure-allow-all`.
@@ -40,9 +56,11 @@ impl Enforcer {
     /// It is a separate constructor rather than an empty policy so that
     /// "allow everything" can never be the result of a policy that merely
     /// failed to load.
+    /// Nothing is declared in this mode: `--insecure-allow-all` means there
+    /// is no configuration file, so there is nothing to have declared it.
     pub fn allow_all() -> Self {
         Enforcer {
-            policy: RwLock::new(Arc::new(Policy::deny_all())),
+            config: RwLock::new(Arc::new(Config::default())),
             allow_all: true,
             groups: GroupCache::new(),
         }
@@ -53,11 +71,17 @@ impl Enforcer {
         self.allow_all
     }
 
-    /// Swap in a freshly loaded policy and drop the memoized group sets,
-    /// so a reload also picks up group-membership changes.
-    pub fn replace_policy(&self, policy: Policy) {
-        *self.policy.write().expect("policy lock poisoned") = Arc::new(policy);
+    /// Swap in a freshly loaded configuration and drop the memoized group
+    /// sets, so a reload also picks up group-membership changes.
+    pub fn replace(&self, config: Config) {
+        *self.config.write().expect("config lock poisoned") = Arc::new(config);
         self.groups.clear();
+    }
+
+    /// The configuration currently in force. Cloned out of the lock so the
+    /// caller never holds it across a binder call.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config.read().expect("config lock poisoned"))
     }
 
     /// Resolve `uid` into the subject the evaluator matches against.
@@ -73,8 +97,10 @@ impl Enforcer {
         if self.allow_all {
             return true;
         }
-        let policy = Arc::clone(&*self.policy.read().expect("policy lock poisoned"));
-        policy.check(permission, name, &self.subject_for(uid))
+        let config = self.config();
+        config
+            .policy
+            .check(permission, name, &self.subject_for(uid))
     }
 
     /// May `caller` exercise `permission` on `name`?
@@ -111,7 +137,7 @@ fn uid_of(caller: &Caller) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NamePattern, Rule, Subjects};
+    use crate::config::{NamePattern, Policy, Rule, Subjects};
 
     fn policy_allowing_uid(uid: u32) -> Policy {
         Policy {
@@ -126,7 +152,7 @@ mod tests {
 
     #[test]
     fn enforcing_follows_the_policy() {
-        let enforcer = Enforcer::enforcing(policy_allowing_uid(1000));
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
         assert!(enforcer.check_uid(Permission::Add, "svc", 1000));
         assert!(!enforcer.check_uid(Permission::Add, "svc", 1001));
         assert!(!enforcer.is_allow_all());
@@ -143,9 +169,12 @@ mod tests {
 
     #[test]
     fn replace_policy_takes_effect() {
-        let enforcer = Enforcer::enforcing(policy_allowing_uid(1000));
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
         assert!(enforcer.check_uid(Permission::Find, "svc", 1000));
-        enforcer.replace_policy(policy_allowing_uid(2000));
+        enforcer.replace(Config {
+            policy: policy_allowing_uid(2000),
+            ..Config::default()
+        });
         assert!(!enforcer.check_uid(Permission::Find, "svc", 1000));
         assert!(enforcer.check_uid(Permission::Find, "svc", 2000));
     }
@@ -154,14 +183,14 @@ mod tests {
     /// deny-all policy denies immediately.
     #[test]
     fn replace_with_deny_all_denies() {
-        let enforcer = Enforcer::enforcing(policy_allowing_uid(1000));
-        enforcer.replace_policy(Policy::deny_all());
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
+        enforcer.replace(Config::default());
         assert!(!enforcer.check_uid(Permission::Add, "svc", 1000));
     }
 
     #[test]
     fn kernel_caller_is_keyed_on_uid() {
-        let enforcer = Enforcer::enforcing(policy_allowing_uid(1000));
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
         let caller = Caller::Kernel {
             uid: 1000,
             pid: 4321,
@@ -175,7 +204,7 @@ mod tests {
     #[cfg(feature = "rpc")]
     #[test]
     fn identities_without_a_uid_are_denied() {
-        let enforcer = Enforcer::enforcing(policy_allowing_uid(1000));
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
         for peer in [
             rsbinder::rpc::PeerIdentity::Anonymous,
             rsbinder::rpc::PeerIdentity::Vsock { cid: 3 },
