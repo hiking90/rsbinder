@@ -1,0 +1,5 @@
+error: unsupported attribute; #[rsbinder::interface] understands only #[oneway] here
+ --> tests/ui/unsupported_attribute.rs:5:5
+  |
+5 |     #[cfg(feature = "nope")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,41 @@
+[package]
+name = "rsbinder-macros"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Procedural macros for rsbinder — define Binder interfaces as Rust traits, without .aidl."
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = "README.md"
+rust-version = { workspace = true }
+keywords.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+proc-macro = true
+
+[features]
+default = []
+# Emit the `IFooAsync` / `IFooAsyncService` halves, matching
+# `rsbinder-aidl`'s `set_async_support(true)`. Wired from `rsbinder`'s own
+# `async` feature through its `macros` feature.
+async = []
+
+[dependencies]
+rsbinder-aidl = { workspace = true }
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+proc-macro2 = "1"
+quote = "1"
+
+[dev-dependencies]
+# The UI tests compile real macro invocations, so they need the runtime the
+# generated code names — a dev-dependency cycle, which cargo allows. Declared
+# path-only on purpose: a version here survives into the published manifest and
+# deadlocks the first release of the pair, since neither crate can be uploaded
+# before the other.
+rsbinder = { path = "../rsbinder", features = ["macros"] }
+# Held at 1.0.119: 1.0.120 declares `rust-version = 1.88`, above this
+# workspace's 1.85, and the `rust_min` CI jobs build dev-dependencies.
+trybuild = "=1.0.119"

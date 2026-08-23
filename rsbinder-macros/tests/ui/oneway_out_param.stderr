@@ -1,0 +1,5 @@
+error: a #[oneway] method cannot have an out/inout parameter — there is no reply to write it back into
+ --> tests/ui/oneway_out_param.rs:6:28
+  |
+6 |     fn fill(&self, values: &mut Vec<i32>) -> rsbinder::BinderResult<()>;
+  |                            ^^^^^^^^^^^^^

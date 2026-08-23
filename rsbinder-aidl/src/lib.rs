@@ -71,6 +71,27 @@ mod parser;
 mod type_generator;
 pub use error::AidlError;
 pub use generator::Generator;
+
+/// The code-render layer: the data the templates consume, plus the functions
+/// that run them.
+///
+/// `rsbinder-aidl` fills these structs from parsed AIDL. They are public so a
+/// second front-end can fill them from something else and get **identical**
+/// generated code — that is how `#[rsbinder::interface]` (crate
+/// `rsbinder-macros`, plan 2-19) turns a Rust trait into the same
+/// `Bn*`/`Bp*`/trait set an `.aidl` would produce, without a second copy of
+/// the templates.
+///
+/// The fragments in [`FnMembers`](render::FnMembers) are pre-rendered Rust
+/// source, not AIDL types: serialization in the templates is trait-generic, so
+/// nothing here needs to know what a value *is*, only how to write it.
+pub mod render {
+    pub use crate::generator::{
+        interface_stem, render_enum, render_interface, render_parcelable, ConstMember, EnumMember,
+        EnumRender, FnMembers, InterfaceRender, ParcelableMember, ParcelableRender,
+        TransactionWrite,
+    };
+}
 pub use parser::parse_document;
 pub use parser::SourceContext;
 
@@ -258,6 +279,18 @@ impl Builder {
 
     pub fn source(mut self, source: impl AsRef<Path>) -> Self {
         self.sources.push(source.as_ref().into());
+        self
+    }
+
+    /// Directory [`Builder::output`] is resolved against, overriding the
+    /// `OUT_DIR` environment variable this builder otherwise reads.
+    ///
+    /// `OUT_DIR` is process-wide, so a caller outside a `build.rs` — a test
+    /// generating into a temporary directory, a tool driving several builders
+    /// — would have to mutate the environment to steer the output, which is
+    /// not thread-safe. Set the directory here instead.
+    pub fn dest_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.dest_dir = dir.as_ref().into();
         self
     }
 

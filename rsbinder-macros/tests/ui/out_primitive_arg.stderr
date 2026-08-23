@@ -1,0 +1,5 @@
+error: a primitive cannot be an `out` parameter — `.aidl` passes it only `in`; return it instead, or use a `Vec<T>` or a parcelable
+ --> tests/ui/out_primitive_arg.rs:5:25
+  |
+5 |     fn fill(&self, out: &mut i32) -> rsbinder::BinderResult<()>;
+  |                         ^^^^^^^^

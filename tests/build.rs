@@ -175,5 +175,16 @@ fn main() {
             .output(PathBuf::from("rpc_caller.rs"))
             .generate()
             .unwrap();
+
+        // Plan 2-19 P3: the `.aidl` half of the macro interop test
+        // (`tests/macro_cross.rs`), which declares the same interface as a
+        // Rust trait and calls in both directions.
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/macrocross/IMacroCross.aidl"))
+            .source(PathBuf::from("aidl/macrocross/CrossCfg.aidl"))
+            .source(PathBuf::from("aidl/macrocross/CrossMode.aidl"))
+            .output(PathBuf::from("macro_cross.rs"))
+            .generate()
+            .unwrap();
     }
 }

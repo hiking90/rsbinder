@@ -117,14 +117,14 @@ pub mod {{mod}} {
     {%- endif %}
     pub struct {{name}} {
     {%- for member in members %}
-        pub r#{{ member.0 }}: {{ member.1 }},
+        pub r#{{ member.identifier }}: {{ member.type_decl }},
     {%- endfor %}
     }
     impl Default for {{ name }} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
-                r#{{ member.0 }}: {{ member.2 }},
+                r#{{ member.identifier }}: {{ member.init }},
             {%- endfor %}
             }
         }
@@ -133,10 +133,10 @@ pub mod {{mod}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
-                {%- if member.4 %}
-                _sub_parcel.write(self.r#{{ member.0 }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)?;
+                {%- if member.needs_unexpected_null %}
+                _sub_parcel.write(self.r#{{ member.identifier }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)?;
                 {%- else %}
-                _sub_parcel.write(&self.r#{{ member.0 }})?;
+                _sub_parcel.write(&self.r#{{ member.identifier }})?;
                 {%- endif %}
                 {%- endfor %}
                 Ok(())
@@ -146,12 +146,12 @@ pub mod {{mod}} {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
                 if !_sub_parcel.has_more_data() { return Ok(()); }
-                {%- if member.3 %}
-                _sub_parcel.read_onto(&mut self.r#{{ member.0 }})?;
+                {%- if member.is_holder %}
+                _sub_parcel.read_onto(&mut self.r#{{ member.identifier }})?;
                 {%- else %}
-                self.r#{{ member.0 }} = _sub_parcel.read()?;
-                {%- if member.4 %}
-                if self.r#{{ member.0 }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                self.r#{{ member.identifier }} = _sub_parcel.read()?;
+                {%- if member.needs_unexpected_null %}
+                if self.r#{{ member.identifier }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
                 {%- endif %}
                 {%- endif %}
                 {%- endfor %}
@@ -247,7 +247,7 @@ pub mod {{mod}} {
     /// Asynchronous **server** view of `{{name}}`: implement this (with
     /// `#[async_trait]`) on your service, then wrap it with
     /// [`{{bn_name}}::new_async_binder`] to publish it as a binder.
-    #[::async_trait::async_trait]
+    #[{{crate}}::__async_trait]
     pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
@@ -660,36 +660,391 @@ fn template() -> &'static tera::Tera {
     })
 }
 
-/// One out/inout arg written back to the reply in `on_transact`.
-#[derive(Serialize, Deserialize, Debug)]
-struct TransactionWrite {
-    identifier: String,
-    /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
-    /// writing this arg back. See [`TypeGenerator::out_array_needs_null_guard`].
-    needs_null_guard: bool,
+// Union has no render entry point — `decl_union` renders directly.
+
+/// One generated constant: `(identifier, type declaration, initializer)`.
+///
+/// A positional tuple, not a struct: the templates index it by position, so
+/// unlike [`InterfaceRender`] and friends its shape is fixed — growing it is a
+/// breaking change for any front-end that fills it.
+pub type ConstMember = (String, String, String);
+
+/// One parcelable field.
+///
+/// `#[non_exhaustive]`: build one with [`ParcelableMember::new`] and assign the
+/// rest, so a new template field stays a minor release.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ParcelableMember {
+    pub identifier: String,
+    /// Rust type declaration of the field.
+    pub type_decl: String,
+    /// Initializer used by the generated `impl Default`.
+    pub init: String,
+    /// Read through `read_onto` so a `ParcelableHolder`'s pre-set stability
+    /// survives the decode.
+    pub is_holder: bool,
+    /// A non-nullable binder/PFD field stored as `Option<T>` only for lack of
+    /// `Default`, which must unwrap to `UNEXPECTED_NULL` on write rather than
+    /// emit a null marker.
+    pub needs_unexpected_null: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct FnMembers {
-    identifier: String,
-    args: String,
-    args_async: String,
-    return_type: String,
-    write_funcs: Vec<String>,
-    func_call_params: String,
-    transaction_decls: Vec<String>,
-    transaction_write: Vec<TransactionWrite>,
-    transaction_params: String,
-    transaction_has_return: bool,
-    oneway: bool,
-    read_onto_params: Vec<String>,
-    transaction_code: u32,
-    has_explicit_code: bool,
+impl ParcelableMember {
+    /// A plain field: no holder read-through, no null guard.
+    pub fn new(
+        identifier: impl Into<String>,
+        type_decl: impl Into<String>,
+        init: impl Into<String>,
+    ) -> Self {
+        Self {
+            identifier: identifier.into(),
+            type_decl: type_decl.into(),
+            init: init.into(),
+            is_holder: false,
+            needs_unexpected_null: false,
+        }
+    }
+}
+
+/// One enum variant: `(identifier, discriminant)`.
+///
+/// Positional and therefore fixed in shape, as [`ConstMember`] is.
+pub type EnumMember = (String, i64);
+
+/// AOSP `ClassName` (`aidl_to_cpp_common.cpp`): the `Bn`/`Bp` stem strips a
+/// leading `I` only when an uppercase letter follows, so `interface Foo3`
+/// becomes `BnFoo3`, not `Bnoo3`.
+pub fn interface_stem(name: &str) -> &str {
+    if name.len() >= 2 && name.starts_with('I') && name.as_bytes()[1].is_ascii_uppercase() {
+        &name[1..]
+    } else {
+        name
+    }
+}
+
+/// Inputs for [`render_interface`] — the interface template's full context.
+///
+/// `#[non_exhaustive]`: the template grows fields as AIDL features land, and
+/// adding one must stay a minor release. Build one with [`InterfaceRender::new`]
+/// and assign the rest.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InterfaceRender {
+    /// Path prefix the generated code uses for rsbinder items: `"rsbinder"`
+    /// for downstream crates, `"crate"` when generating inside rsbinder.
+    pub crate_name: String,
+    /// Name of the wrapping `pub mod`, `r#`-escaped if it is a Rust keyword.
+    pub module: String,
+    /// Trait name, `r#`-escaped if it is a Rust keyword. [`InterfaceRender::new`]
+    /// escapes it; a struct literal must do so itself.
+    pub name: String,
+    /// Interface descriptor written on the wire.
+    pub namespace: String,
+    pub bn_name: String,
+    pub bp_name: String,
+    pub const_members: Vec<ConstMember>,
+    pub fn_members: Vec<FnMembers>,
+    /// Interface-level `oneway`.
+    pub oneway: bool,
+    /// Already-rendered nested declarations, spliced into the module.
+    pub nested: String,
+    pub enabled_async: bool,
+    pub is_vintf: bool,
+    /// Stable-AIDL `--version N`. `None` suppresses the whole version
+    /// plumbing, keeping output byte-identical to the pre-versioning
+    /// generator.
+    pub version: Option<i32>,
+    /// Stable-AIDL `--hash <s>`, echoed verbatim. Independent of `version`.
+    pub hash: Option<String>,
+}
+
+/// `crate_name` defaults to `"rsbinder"`, not the empty string a derived
+/// `Default` would give: an empty path renders `impl ::Parcelable for Foo`,
+/// which the render functions would still return as `Ok`.
+impl Default for InterfaceRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            namespace: String::new(),
+            bn_name: String::new(),
+            bp_name: String::new(),
+            const_members: Vec::new(),
+            fn_members: Vec::new(),
+            oneway: false,
+            nested: String::new(),
+            enabled_async: false,
+            is_vintf: false,
+            version: None,
+            hash: None,
+        }
+    }
+}
+
+impl Default for ParcelableRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            namespace: String::new(),
+            derive: String::new(),
+            members: Vec::new(),
+            const_members: Vec::new(),
+            nested: String::new(),
+            is_vintf: false,
+        }
+    }
+}
+
+impl Default for EnumRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            backing_type: String::new(),
+            members: Vec::new(),
+        }
+    }
+}
+
+impl InterfaceRender {
+    /// Start from a trait name and descriptor, deriving `module`, `bn_name`
+    /// and `bp_name` the way the AIDL front-end does. `crate_name` defaults to
+    /// `"rsbinder"`.
+    ///
+    /// `name` is the **unescaped** interface name. A Rust keyword is
+    /// `r#`-escaped here for `module`/`name`, while `bn_name`/`bp_name` derive
+    /// from the bare stem — escaping before the call would yield `Bnr#type`,
+    /// which does not lex.
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+        let raw = name.into();
+        let stem = interface_stem(&raw);
+        let bn_name = format!("Bn{stem}");
+        let bp_name = format!("Bp{stem}");
+        let escaped = crate::escape_rust_keyword(&raw).into_owned();
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: escaped.clone(),
+            bn_name,
+            bp_name,
+            namespace: namespace.into(),
+            name: escaped,
+            ..Default::default()
+        }
+    }
+}
+
+impl ParcelableRender {
+    /// Start from a parcelable name and descriptor. `name` is the
+    /// **unescaped** name; a Rust keyword is `r#`-escaped here.
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+        let escaped = crate::escape_rust_keyword(&name.into()).into_owned();
+        Self {
+            module: escaped.clone(),
+            name: escaped,
+            namespace: namespace.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl EnumRender {
+    /// Start from an enum name and its backing Rust type (`i8`/`i32`/`i64`).
+    /// `name` is the **unescaped** name: the enum template writes it through
+    /// `declare_binder_enum!`, which prefixes `r#` itself, while `module` is
+    /// escaped here.
+    pub fn new(name: impl Into<String>, backing_type: impl Into<String>) -> Self {
+        let raw = name.into();
+        Self {
+            module: crate::escape_rust_keyword(&raw).into_owned(),
+            name: raw,
+            backing_type: backing_type.into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Render one interface module. Output is `pub mod {module} { … }`; a
+/// front-end that wants the items unwrapped strips the module itself.
+///
+/// Union has no counterpart here — it is `.aidl`-only.
+pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
+    let mut context = tera::Context::new();
+    context.insert("crate", &r.crate_name);
+    context.insert("mod", &r.module);
+    context.insert("name", &r.name);
+    context.insert("namespace", &r.namespace);
+    context.insert("const_members", &r.const_members);
+    context.insert("fn_members", &r.fn_members);
+    context.insert("bn_name", &r.bn_name);
+    context.insert("bp_name", &r.bp_name);
+    context.insert("oneway", &r.oneway);
+    context.insert("nested", &r.nested);
+    context.insert("enabled_async", &r.enabled_async);
+    context.insert("is_vintf", &r.is_vintf);
+    // `version` and `hash` are independent — the template emits each only if
+    // its key is set, matching AOSP's per-flag conditional.
+    context.insert("version", &r.version);
+    context.insert("hash", &r.hash);
+
+    template()
+        .render("interface", &context)
+        .map_err(|e| AidlError::Template {
+            message: format!("Failed to render interface template: {e}"),
+        })
+}
+
+/// Inputs for [`render_parcelable`].
+///
+/// `#[non_exhaustive]`: build one with [`ParcelableRender::new`] and assign the
+/// rest, so a new template field stays a minor release.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ParcelableRender {
+    pub crate_name: String,
+    pub module: String,
+    pub name: String,
+    pub namespace: String,
+    /// Extra `#[derive(..)]` names from `@RustDerive`, already comma-joined.
+    pub derive: String,
+    pub members: Vec<ParcelableMember>,
+    pub const_members: Vec<ConstMember>,
+    pub nested: String,
+    pub is_vintf: bool,
+}
+
+/// Render one parcelable module (`pub mod {module} { pub struct {name} … }`).
+pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
+    let mut context = tera::Context::new();
+    context.insert("crate", &r.crate_name);
+    context.insert("mod", &r.module);
+    context.insert("name", &r.name);
+    context.insert("derive", &r.derive);
+    context.insert("namespace", &r.namespace);
+    context.insert("members", &r.members);
+    context.insert("const_members", &r.const_members);
+    context.insert("nested", &r.nested);
+    context.insert("is_vintf", &r.is_vintf);
+
+    template()
+        .render("parcelable", &context)
+        .map_err(|e| AidlError::Template {
+            message: format!("Failed to render parcelable template: {e}"),
+        })
+}
+
+/// Inputs for [`render_enum`].
+///
+/// `#[non_exhaustive]`: build one with [`EnumRender::new`] and assign the rest,
+/// so a new template field stays a minor release.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EnumRender {
+    pub crate_name: String,
+    pub module: String,
+    pub name: String,
+    /// Backing Rust type (`i8` / `i32` / `i64`).
+    pub backing_type: String,
+    pub members: Vec<EnumMember>,
+}
+
+/// Render one backed-enum module.
+pub fn render_enum(r: &EnumRender) -> Result<String, AidlError> {
+    let mut context = tera::Context::new();
+    context.insert("crate", &r.crate_name);
+    context.insert("mod", &r.module);
+    context.insert("enum_name", &r.name);
+    context.insert("enum_type", &r.backing_type);
+    context.insert("enum_len", &r.members.len());
+    context.insert("members", &r.members);
+
+    template()
+        .render("enum", &context)
+        .map_err(|e| AidlError::Template {
+            message: format!("Failed to render enum template: {e}"),
+        })
+}
+
+/// One out/inout arg written back to the reply in `on_transact`.
+///
+/// `#[non_exhaustive]`: build one with [`TransactionWrite::new`] and assign the
+/// rest, so a new template field stays a minor release.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct TransactionWrite {
+    pub identifier: String,
+    /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
+    /// writing this arg back (`TypeGenerator::out_array_needs_null_guard`).
+    pub needs_null_guard: bool,
+}
+
+impl TransactionWrite {
+    /// An arg written back unguarded; set `needs_null_guard` for the
+    /// out-fd-array case.
+    pub fn new(identifier: impl Into<String>) -> Self {
+        Self {
+            identifier: identifier.into(),
+            needs_null_guard: false,
+        }
+    }
+}
+
+/// Everything the interface template needs about one method, as
+/// **pre-rendered Rust fragments** rather than AIDL types.
+///
+/// This is the seam a second front-end plugs into: `rsbinder-aidl` fills it
+/// from the AIDL AST, and the `#[rsbinder::interface]` macro fills it from a
+/// Rust trait (plan 2-19 D2), so both produce byte-identical output from the
+/// same template. Serialization in the template is trait-generic
+/// (`parcel.write(&x)` / `read()`), which is why no type classification
+/// survives into this struct.
+/// `#[non_exhaustive]`: build one with [`FnMembers::new`] and assign the rest,
+/// so a new template field stays a minor release.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct FnMembers {
+    pub identifier: String,
+    /// Sync signature args, `&self`-first (`"&self, _arg_x: &str"`).
+    pub args: String,
+    /// Async signature args with `'a` grafted onto every reference.
+    pub args_async: String,
+    pub return_type: String,
+    /// Proxy-side `data.write(..)` statements, in wire order.
+    pub write_funcs: Vec<String>,
+    /// Server-side call arguments forwarded to the user's `impl`.
+    pub func_call_params: String,
+    /// Server-side `let mut _arg_x = ..;` declarations for out/inout args.
+    pub transaction_decls: Vec<String>,
+    /// Out/inout args written back into the reply.
+    pub transaction_write: Vec<TransactionWrite>,
+    pub transaction_params: String,
+    pub transaction_has_return: bool,
+    pub oneway: bool,
+    /// Proxy-side `reply.read_onto(..)` statements for out/inout args.
+    pub read_onto_params: Vec<String>,
+    pub transaction_code: u32,
+    pub has_explicit_code: bool,
     /// Pre-rendered Rust block that runs at the top of this method's
     /// `on_transact` arm and replies with `ExceptionCode::Security`
     /// (AOSP `EX_SECURITY`) on permission denial. `None` when the
     /// method carries no `@EnforcePermission`.
-    enforce_permission_check: Option<String>,
+    pub enforce_permission_check: Option<String>,
+}
+
+impl FnMembers {
+    /// Start from the two fields with no sensible default — the method name
+    /// and its transaction code — and assign the rest.
+    pub fn new(identifier: impl Into<String>, transaction_code: u32) -> Self {
+        Self {
+            identifier: identifier.into(),
+            transaction_code,
+            ..Default::default()
+        }
+    }
 }
 
 fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMembers, AidlError> {
@@ -1168,54 +1523,36 @@ impl Generator {
             }
         }
 
-        let enabled_async = self.enabled_async;
-
         let nested = &self.declarations(&decl.members, indent + 1)?;
 
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
-        let mut context = self.new_context();
-
         // Escape a Rust-keyword interface name (AIDL permits it) so the
         // generated `pub mod` / `pub trait` compiles. `bn_name`/`bp_name` are
         // `Bn`/`Bp`-prefixed and thus never keywords.
-        let escaped_name = crate::escape_rust_keyword(&decl.name);
-        context.insert("mod", &escaped_name);
-        context.insert("name", &escaped_name);
-        context.insert("namespace", &namespace);
-        context.insert("const_members", &const_members);
-        context.insert("fn_members", &fn_members);
-        // AOSP `ClassName` (aidl_to_cpp_common.cpp): strip the leading `I`
-        // only when it is followed by an uppercase letter. `interface Foo3`
-        // must become `BnFoo3`/`BpFoo3`, not `Bnoo3`/`Bpoo3`.
-        let stem = if decl.name.len() >= 2
-            && decl.name.starts_with('I')
-            && decl.name.as_bytes()[1].is_ascii_uppercase()
-        {
-            &decl.name[1..]
-        } else {
-            decl.name.as_str()
-        };
-        context.insert("bn_name", &format!("Bn{stem}"));
-        context.insert("bp_name", &format!("Bp{stem}"));
-        context.insert("oneway", &decl.oneway);
-        context.insert("nested", &nested.trim());
-        context.insert("enabled_async", &enabled_async);
-        context.insert("is_vintf", &is_vintf);
-        // Stable-AIDL `getInterfaceVersion`/`getInterfaceHash` plumbing.
-        // `version` and `hash` are independent — INTERFACE_TEMPLATE emits
-        // each only if its key is set, matching AOSP's per-flag conditional.
-        // Both missing ⇒ wire byte-identical to the pre-versioning generator.
-        context.insert("version", &self.version);
-        context.insert("hash", &self.hash);
+        let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
+        let stem = interface_stem(&decl.name);
 
-        let rendered =
-            template()
-                .render("interface", &context)
-                .map_err(|e| AidlError::Template {
-                    message: format!("Failed to render interface template: {e}"),
-                })?;
+        let rendered = render_interface(&InterfaceRender {
+            crate_name: self.get_crate_name().to_string(),
+            module: escaped_name.clone(),
+            name: escaped_name,
+            namespace,
+            bn_name: format!("Bn{stem}"),
+            bp_name: format!("Bp{stem}"),
+            const_members,
+            fn_members,
+            oneway: decl.oneway,
+            nested: nested.trim().to_string(),
+            enabled_async: self.enabled_async,
+            is_vintf,
+            // Stable-AIDL `getInterfaceVersion`/`getInterfaceHash` plumbing.
+            // Both missing ⇒ wire byte-identical to the pre-versioning
+            // generator.
+            version: self.version,
+            hash: self.hash.clone(),
+        })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -1278,6 +1615,7 @@ pub mod {mod} {{
                 if let Some(var) = decl.is_variable() {
                     let generator = var.r#type.to_generator()?;
                     generator.ensure_resolvable()?;
+                    generator.ensure_sized()?;
 
                     if var.constant {
                         constant_members.push((
@@ -1294,27 +1632,19 @@ pub mod {mod} {{
                             _ => var.const_expr.clone(),
                         };
 
-                        members.push((
-                            var.identifier(),
-                            generator.type_declaration(true),
-                            generator.init_value(
+                        members.push(ParcelableMember {
+                            identifier: var.identifier(),
+                            type_decl: generator.type_declaration(true),
+                            init: generator.init_value(
                                 init_value.as_ref(),
                                 InitParam::builder()
                                     .with_const(false)
                                     .with_vintf(is_vintf)
                                     .with_crate_name(self.get_crate_name()),
                             )?,
-                            // is_holder: read via `read_onto` so the field's
-                            // pre-set stability survives (see ParcelableHolder
-                            // ::deserialize_from).
-                            matches!(generator.value_type, ValueType::Holder),
-                            // needs_unexpected_null: a non-nullable
-                            // IBinder/interface/PFD field is stored as
-                            // `Option<T>` only for lack of `Default`; on
-                            // write, unwrap with `UNEXPECTED_NULL` instead of
-                            // emitting a null marker (AOSP-faithful).
-                            generator.is_option_but_not_nullable(),
-                        ))
+                            is_holder: matches!(generator.value_type, ValueType::Holder),
+                            needs_unexpected_null: generator.is_option_but_not_nullable(),
+                        })
                     }
                 } else {
                     declarations.push(decl.clone());
@@ -1326,26 +1656,21 @@ pub mod {mod} {{
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
-        let mut context = self.new_context();
-
         // Escape a Rust-keyword parcelable name so `pub mod` / `pub struct`
         // compiles.
-        let escaped_name = crate::escape_rust_keyword(&decl.name);
-        context.insert("mod", &escaped_name);
-        context.insert("name", &escaped_name);
-        context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
-        context.insert("namespace", &namespace);
-        context.insert("members", &members);
-        context.insert("const_members", &constant_members);
-        context.insert("nested", &nested.trim());
-        context.insert("is_vintf", &is_vintf);
+        let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
 
-        let rendered =
-            template()
-                .render("parcelable", &context)
-                .map_err(|e| AidlError::Template {
-                    message: format!("Failed to render parcelable template: {e}"),
-                })?;
+        let rendered = render_parcelable(&ParcelableRender {
+            crate_name: self.get_crate_name().to_string(),
+            module: escaped_name.clone(),
+            name: escaped_name,
+            derive: parser::rust_derive_list(&decl.annotation_list),
+            namespace,
+            members,
+            const_members: constant_members,
+            nested: nested.trim().to_string(),
+            is_vintf,
+        })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -1431,27 +1756,18 @@ pub mod {mod} {{
             }
         }
 
-        let mut context = self.new_context();
-
         // The enum *name* is `r#`-escaped in the template; escape the module
         // name (which is not) for a Rust-keyword enum name.
-        context.insert("mod", &crate::escape_rust_keyword(&decl.name));
-        context.insert("enum_name", &decl.name);
-        context.insert(
-            "enum_type",
-            &generator
+        let rendered = render_enum(&EnumRender {
+            crate_name: self.get_crate_name().to_string(),
+            module: crate::escape_rust_keyword(&decl.name).into_owned(),
+            name: decl.name.clone(),
+            backing_type: generator
                 .clone()
                 .direction(&Direction::None)?
                 .type_declaration(true),
-        );
-        context.insert("enum_len", &decl.enumerator_list.len());
-        context.insert("members", &members);
-
-        let rendered = template()
-            .render("enum", &context)
-            .map_err(|e| AidlError::Template {
-                message: format!("Failed to render enum template: {e}"),
-            })?;
+            members,
+        })?;
 
         Ok(add_indent(indent, rendered.trim()))
     }
@@ -1474,6 +1790,7 @@ pub mod {mod} {{
             if let parser::Declaration::Variable(var) = member {
                 let generator = var.r#type.to_generator()?;
                 generator.ensure_resolvable()?;
+                generator.ensure_sized()?;
                 if var.constant {
                     constant_members.push((
                         var.const_identifier(),

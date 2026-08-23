@@ -1,0 +1,5 @@
+error: a descriptor cannot contain '"' — it is written verbatim into the generated source and onto the wire
+ --> tests/ui/descriptor_with_quote.rs:3:26
+  |
+3 | #[interface(descriptor = "bad \" descriptor")]
+  |                          ^^^^^^^^^^^^^^^^^^^

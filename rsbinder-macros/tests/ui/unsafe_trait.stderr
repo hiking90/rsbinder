@@ -1,0 +1,5 @@
+error: an `unsafe` binder interface is not supported — the generated trait is safe, so the obligation would be silently dropped
+ --> tests/ui/unsafe_trait.rs:4:5
+  |
+4 | pub unsafe trait IBad {
+  |     ^^^^^^

@@ -15,6 +15,11 @@ plans/
 CLAUDE.md
 .claude/
 
+# trybuild scratch: a UI case whose .stderr is missing or stale gets its
+# actual output written here for review, never committed. The .stderr files
+# under tests/ui/ ARE tracked — they are the assertions.
+rsbinder-macros/wip/
+
 # example-hello STAGE3 harness build outputs (compiled NDK launchers —
 # the .cpp source IS tracked; the cross-compiled aarch64 ELF beside it
 # is a build artifact of cpp/run_rpc_*_interop.sh, regenerated on demand).

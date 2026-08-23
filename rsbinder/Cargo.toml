@@ -24,7 +24,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [features]
 default = ["tokio"]
 tokio = ["async", "tokio/full"]
-async = ["rsbinder-aidl/async", "async-trait"]
+async = ["rsbinder-aidl/async", "async-trait", "rsbinder-macros?/async"]
+# `#[rsbinder::interface]` — declare an interface as a Rust trait instead of
+# an `.aidl` file (plan 2-19). Off by default: it pulls the AIDL compiler
+# (pest + tera) in as a proc-macro dependency, which a build that only
+# consumes generated code has no reason to carry. `.aidl` stays canonical;
+# see the `rsbinder-macros` crate docs for what the macro cannot express.
+macros = ["dep:rsbinder-macros"]
 # RPC transport (binder-over-socket) — a separate stack from the kernel
 # binder path. Off by default; enabling it pulls in rustix's `net` APIs
 # (socketpair / SO_PEERCRED / SCM_RIGHTS) and `getrandom` (CSPRNG for
@@ -89,6 +95,9 @@ sha2 = { version = "0.11", optional = true }
 # leaf dep on default builds either.
 getrandom = { version = "0.4", optional = true }
 
+# `#[rsbinder::interface]`, behind the `macros` feature.
+rsbinder-macros = { workspace = true, optional = true }
+
 # subplan 2-9 Phase A: macOS/BSD peer-credential resolution
 # (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
@@ -105,6 +114,13 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 [dev-dependencies]
 env_logger = { workspace = true }
 serial_test = { workspace = true }
+
+# Declared so a missing feature is an error rather than a file that `#![cfg]`
+# compiles away to zero tests and a green run.
+[[test]]
+name = "macro_interface"
+path = "tests/macro_interface.rs"
+required-features = ["macros", "rpc"]
 
 # loom is only used by tests gated on `--cfg loom`. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release

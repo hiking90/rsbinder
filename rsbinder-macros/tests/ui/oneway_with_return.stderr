@@ -1,0 +1,5 @@
+error: a #[oneway] method cannot return a value — there is no reply to read it from
+ --> tests/ui/oneway_with_return.rs:6:18
+  |
+6 |     fn go(&self) -> rsbinder::BinderResult<i32>;
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

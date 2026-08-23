@@ -1,0 +1,5 @@
+error: every variant needs an explicit value: it is what goes on the wire, so it must be visible here rather than implied by declaration order
+ --> tests/ui/enum_implicit_value.rs:6:5
+  |
+6 |     Fast,
+  |     ^^^^
