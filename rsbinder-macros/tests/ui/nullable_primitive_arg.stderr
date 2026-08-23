@@ -1,0 +1,5 @@
+error: a primitive has no null form on the wire, so it cannot be nullable — `.aidl` rejects `@nullable` on one too; use the bare type
+ --> tests/ui/nullable_primitive_arg.rs:5:27
+  |
+5 |     fn take(&self, value: Option<i32>) -> rsbinder::BinderResult<()>;
+  |                           ^^^^^^^^^^^

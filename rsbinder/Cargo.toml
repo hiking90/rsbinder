@@ -115,6 +115,13 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 env_logger = { workspace = true }
 serial_test = { workspace = true }
 
+# Declared so a missing feature is an error rather than a file that `#![cfg]`
+# compiles away to zero tests and a green run.
+[[test]]
+name = "macro_interface"
+path = "tests/macro_interface.rs"
+required-features = ["macros", "rpc"]
+
 # loom is only used by tests gated on `--cfg loom`. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
 # It is NOT a normal test dependency — without the cfg, the gated test

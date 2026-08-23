@@ -383,3 +383,212 @@ parcelable Node {
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }
+
+/// Two parcelables that reference each other form a cycle just as a
+/// self-reference does, so the field that closes it needs the same box.
+#[test]
+fn mutually_recursive_parcelables_are_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+parcelable Branch {
+    int value;
+    @nullable Leaf leaf;
+}
+parcelable Leaf {
+    int value;
+    @nullable Branch parent;
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(out.contains("Option<Box<super::Leaf::Leaf>>"), "{out}");
+    assert!(out.contains("Option<Box<super::Branch::Branch>>"), "{out}");
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// A parcelable that merely *uses* another one is not a cycle, so nothing is
+/// boxed — the guard must not fire on every cross-reference.
+#[test]
+fn acyclic_parcelable_reference_is_not_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+parcelable Outer {
+    Inner inner;
+}
+parcelable Inner {
+    int value;
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(!out.contains("Box<"), "{out}");
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// `InterfaceRender::new` takes the unescaped name: escaping before the call
+/// would put `r#` inside `Bn`/`Bp`, which does not lex.
+#[test]
+fn render_constructors_escape_rust_keywords() -> Result<(), Box<dyn Error>> {
+    use rsbinder_aidl::render::{EnumRender, InterfaceRender, ParcelableRender};
+
+    let i = InterfaceRender::new("type", "test.type");
+    assert_eq!(i.name, "r#type");
+    assert_eq!(i.module, "r#type");
+    assert_eq!(i.bn_name, "Bntype");
+    assert_eq!(i.bp_name, "Bptype");
+
+    let p = ParcelableRender::new("type", "test.type");
+    assert_eq!(p.name, "r#type");
+    assert_eq!(p.module, "r#type");
+
+    // The enum template writes the name through `declare_binder_enum!`, which
+    // prefixes `r#` itself.
+    let e = EnumRender::new("type", "i32");
+    assert_eq!(e.name, "type");
+    assert_eq!(e.module, "r#type");
+    Ok(())
+}
+
+/// A cycle that runs through an *interface* is finite — `Strong<dyn …>` is a
+/// handle — so nothing may be boxed. This is the AOSP `CircularParcelable` /
+/// `ITestService` shape.
+#[test]
+fn cycle_through_an_interface_is_not_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+parcelable Circular {
+    @nullable IRing ring;
+}
+interface IRing {
+    IRing get(out Circular c);
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(
+        !out.contains("Box<"),
+        "an interface handle breaks the cycle:\n{out}"
+    );
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// A `Vec` element is a fixed-size handle whatever it holds, so an array
+/// member neither closes a sizing cycle nor takes a box — and it must not,
+/// because `Box<T>` implements no array codec, so `Vec<Box<T>>` would emit
+/// code that does not compile.
+#[test]
+fn a_cycle_through_an_array_is_not_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+parcelable Tree {
+    Node[] nodes;
+}
+parcelable Node {
+    @nullable Tree owner;
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(
+        !out.contains("Box<"),
+        "a Vec already breaks the cycle:\n{out}"
+    );
+    assert!(out.contains("Vec<super::Node::Node>"), "{out}");
+    assert!(out.contains("Option<super::Tree::Tree>"), "{out}");
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// A `<Union>.Tag` is the scalar `declare_binder_enum!` newtype, not the union
+/// it names — it cannot hold the enclosing declaration, so it is never boxed.
+/// Its lookup reports the parent union's namespace, which is exactly the trap.
+#[test]
+fn a_union_tag_field_is_not_boxed() -> Result<(), Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r##"
+union U {
+    int a = 0;
+    @nullable Node n;
+}
+parcelable Node {
+    U.Tag tag;
+}
+        "##,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+
+    assert!(!out.contains("Box<"), "a Tag holds no union:\n{out}");
+    assert!(out.contains("super::U::Tag"), "{out}");
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(())
+}
+
+/// A non-nullable cycle has no terminating form: boxing it alone would give
+/// the generated `Default` — the deserialization entry point — infinite
+/// recursion, so it must be a diagnostic rather than a runtime abort.
+#[test]
+fn a_non_nullable_cycle_is_rejected() {
+    aidl_generator_should_fail(
+        r##"
+parcelable Branch {
+    Leaf leaf;
+}
+parcelable Leaf {
+    Branch parent;
+}
+        "##,
+        "closes a reference cycle",
+    );
+    aidl_generator_should_fail(
+        r##"
+parcelable Node {
+    Node next;
+}
+        "##,
+        "closes a reference cycle",
+    );
+}
+
+/// A fixed-size array keeps its elements inline, so it closes a cycle that a
+/// variable-length one would not — and no box can rescue it.
+#[test]
+fn a_fixed_size_array_cycle_is_rejected() {
+    aidl_generator_should_fail(
+        r##"
+parcelable Tree {
+    Node[3] nodes;
+}
+parcelable Node {
+    @nullable Tree owner;
+}
+        "##,
+        "closes a reference cycle",
+    );
+}

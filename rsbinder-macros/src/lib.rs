@@ -42,6 +42,32 @@
 //! | `Option<T>` | nullable |
 //! | `#[oneway]` on a method | no reply; must return `BinderResult<()>` |
 //!
+//! `Option<T>` is AIDL's `@nullable`, which AIDL allows only on the types that
+//! have a null representation on the wire. A `#[derive(BinderEnum)]` enum is
+//! carried as its `repr` scalar and is not one of them: `Option<Mode>` fails to
+//! compile inside the generated code, because the enum has no `SerializeOption`
+//! — the same shape `.aidl` rejects at the AIDL level.
+//!
+//! **Paths resolve inside the generated module.** The body lands in a
+//! `{Trait}_binder` module one level below where the macro was written, and it
+//! reaches the surrounding scope through a `use super::*;`. A bare name is
+//! therefore the user's own — but `super::X` names the module the macro was
+//! written in, not its parent, so a signature that means the parent has to say
+//! `crate::X`. `self::` is rejected outright for the same reason; `super::` is
+//! left legal because it is the only way to name a type the generated module
+//! shadows (`BnFoo`, `BpFoo`, `transactions`, the trait's own name).
+//!
+//! **Spell out-parameter types directly.** A proc macro cannot see through a
+//! type alias, so `&mut Ids` for `type Ids = Vec<i32>` reads as an opaque
+//! named type: it loses the length word `.aidl` writes for an out vector, and
+//! an aliased `ParcelFileDescriptor` element loses the null guard that keeps a
+//! null fd off the wire. Path qualification is fine — `std::vec::Vec<i32>` is
+//! matched structurally — but an alias is not.
+//!
+//! A doc comment on a method documents the declaration, not the generated
+//! trait: the render layer carries no doc field, so rustdoc for the emitted
+//! `IFoo` comes from the crate-level docs, not from here.
+//!
 //! # What it emits
 //!
 //! The generated items — the trait, `BnFoo`, `BpFoo`, `IFooDefault`, and with
@@ -64,9 +90,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use rsbinder_aidl::render::{
-    interface_stem, render_interface, FnMembers, InterfaceRender, TransactionWrite,
-};
+use rsbinder_aidl::render::{render_interface, FnMembers, InterfaceRender, TransactionWrite};
 use syn::{
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
@@ -109,7 +133,23 @@ impl Parse for Args {
                         "descriptor must be a string literal",
                     ));
                 };
-                descriptor = Some(s.value());
+                // The value is spliced into a Rust string literal in the
+                // generated source with no re-escaping, so a backslash or a
+                // quote would either change the wire descriptor or break the
+                // literal — surfacing as a parse failure over the whole
+                // generated module instead of a span on this attribute. The
+                // `.aidl` path is spared this by its grammar.
+                let value = s.value();
+                if let Some(bad) = value.chars().find(|c| "\\\"\n\r".contains(*c)) {
+                    return Err(syn::Error::new_spanned(
+                        s,
+                        format!(
+                            "a descriptor cannot contain {bad:?} — it is written verbatim \
+                             into the generated source and onto the wire"
+                        ),
+                    ));
+                }
+                descriptor = Some(value);
             } else {
                 return Err(syn::Error::new_spanned(
                     &meta.path,
@@ -177,6 +217,9 @@ pub fn derive_parcelable(item: TokenStream) -> TokenStream {
 /// Nothing beyond the `repr` is required of the type — the codec matches on
 /// the variant rather than casting through a shared reference.
 ///
+/// The enum is not nullable: `Option<Mode>` has no wire form here, matching
+/// `.aidl`, where `@nullable` on an enum is rejected outright.
+///
 /// **This enum is closed.** A value no variant declares deserializes to
 /// `rsbinder::StatusCode::BadValue`. An `.aidl` enum is open: its generated
 /// newtype keeps whatever a newer peer sent, so a reader can pass an unknown
@@ -198,12 +241,12 @@ pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = syn::parse_macro_input!(attr as Args);
     let item_trait = syn::parse_macro_input!(item as ItemTrait);
     match expand(&args, &item_trait) {
-        Ok(ts) => ts,
+        Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
+fn expand(args: &Args, item: &ItemTrait) -> syn::Result<proc_macro2::TokenStream> {
     let rendered = render_source(args, item)?;
 
     let file = syn::parse_file(&rendered).map_err(|e| {
@@ -212,7 +255,8 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
             format!("generated code did not parse ({e}); generated source follows:\n{rendered}"),
         )
     })?;
-    let Some(syn::Item::Mod(mut module)) = file.items.into_iter().next() else {
+    let mut items = file.items.into_iter();
+    let (Some(syn::Item::Mod(mut module)), None) = (items.next(), items.next()) else {
         return Err(syn::Error::new_spanned(
             &item.ident,
             "generated code was not a single module (generator contract changed)",
@@ -222,8 +266,21 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
     // Renamed because an explicit module would beat the glob re-export to the
     // trait's name; `use super::*;` because the signature's paths are the
     // user's, one level up.
-    let mod_ident = syn::Ident::new(&format!("{}_binder", item.ident), item.ident.span());
+    let raw_name = item.ident.to_string();
+    let mod_ident = syn::Ident::new(
+        &format!("{}_binder", strip_raw(&raw_name)),
+        item.ident.span(),
+    );
     module.ident = mod_ident.clone();
+    // The module is an implementation detail, but a `pub` one would still make
+    // a private trait nameable from outside; follow the trait's own visibility.
+    module.vis = item.vis.clone();
+
+    // The proxy passes each argument to `build_parcel_*` and then again to
+    // `read_response_*`, so a by-value argument has to be `Copy`. Asserted
+    // against the user's own type — and from *inside* the module, so a
+    // signature path resolves in the same scope the generated body uses it.
+    let copied = by_value_types(item)?;
     if let Some((_, items)) = module.content.as_mut() {
         items.insert(
             0,
@@ -231,34 +288,63 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
                 use super::*;
             ),
         );
+        for ty in &copied {
+            items.push(syn::parse_quote!(
+                const _: fn() = || {
+                    fn __rsbinder_assert_copy<T: ::core::marker::Copy>() {}
+                    __rsbinder_assert_copy::<#ty>();
+                };
+            ));
+        }
     }
 
-    // The proxy passes each argument to `build_parcel_*` and then again to
-    // `read_response_*`, so a by-value argument has to be `Copy`. Assert it
-    // against the user's own type, or the move error lands on generated
-    // tokens with no span into their file.
-    let copied = by_value_types(item)?;
     let vis = &item.vis;
     Ok(quote! {
-        #(
-            const _: fn() = || {
-                fn __rsbinder_assert_copy<T: ::core::marker::Copy>() {}
-                __rsbinder_assert_copy::<#copied>();
-            };
-        )*
         #[doc(hidden)]
         #module
         #vis use #mod_ident::*;
-    }
-    .into())
+    })
 }
 
-/// The generated module source, before the module wrapper is stripped.
-///
-/// Split out so the golden test can compare it against what `rsbinder-aidl`
-/// writes for the equivalent `.aidl` — that equality is the contract this
-/// macro exists to keep (plan 2-19 D1).
+/// `Ident`'s `Display` keeps the `r#`, and the templates add their own.
+pub(crate) fn strip_raw(ident: &str) -> &str {
+    ident.strip_prefix("r#").unwrap_or(ident)
+}
+
+/// The generated module source, before the module wrapper is stripped — split
+/// out so the golden test can hold it against the `.aidl` output (plan 2-19 D1).
 fn render_source(args: &Args, item: &ItemTrait) -> syn::Result<String> {
+    render_source_with(args, item, cfg!(feature = "async"))
+}
+
+fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn::Result<String> {
+    // The trait is re-rendered from scratch, so anything not read here is
+    // silently dropped: a `#[cfg]` would be emitted regardless of its
+    // condition, and a trait-level `#[oneway]` would become twoway.
+    check_attrs(&item.attrs, &[])?;
+    // The generated trait is re-rendered from the render layer, which carries
+    // no modifier — an accepted one would silently vanish, leaving a safe
+    // trait a `impl` could satisfy without ever writing `unsafe`.
+    if let Some(unsafety) = &item.unsafety {
+        return Err(syn::Error::new_spanned(
+            unsafety,
+            "an `unsafe` binder interface is not supported — the generated trait is safe, \
+             so the obligation would be silently dropped",
+        ));
+    }
+    if let Some(auto_token) = &item.auto_token {
+        return Err(syn::Error::new_spanned(
+            auto_token,
+            "an `auto` trait carries no methods and cannot be a binder interface",
+        ));
+    }
+    if let Some(where_clause) = &item.generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "a where clause has no meaning on a binder interface — the generated trait \
+             requires only `rsbinder::Interface + Send`",
+        ));
+    }
     if !item.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
             &item.generics,
@@ -273,7 +359,8 @@ fn render_source(args: &Args, item: &ItemTrait) -> syn::Result<String> {
         ));
     }
 
-    let name = item.ident.to_string();
+    let raw = item.ident.to_string();
+    let name = strip_raw(&raw).to_string();
     let mut fn_members = Vec::new();
     for (i, trait_item) in item.items.iter().enumerate() {
         let TraitItem::Fn(f) = trait_item else {
@@ -286,18 +373,9 @@ fn render_source(args: &Args, item: &ItemTrait) -> syn::Result<String> {
     }
 
     let descriptor = args.descriptor.clone().unwrap_or_else(|| name.clone());
-    let stem = interface_stem(&name);
-    let render = InterfaceRender {
-        crate_name: "rsbinder".to_string(),
-        module: name.clone(),
-        bn_name: format!("Bn{stem}"),
-        bp_name: format!("Bp{stem}"),
-        namespace: descriptor,
-        name,
-        fn_members,
-        enabled_async: cfg!(feature = "async"),
-        ..Default::default()
-    };
+    let mut render = InterfaceRender::new(name, descriptor);
+    render.fn_members = fn_members;
+    render.enabled_async = enabled_async;
 
     render_interface(&render)
         .map(|s| s.trim().to_string())
@@ -315,6 +393,48 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         return Err(syn::Error::new_spanned(
             &f.sig.generics,
             "generic methods are not supported",
+        ));
+    }
+    if let Some(where_clause) = &f.sig.generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "a where clause on a binder method is not supported",
+        ));
+    }
+    // Modifiers are dropped by the re-render, so the user's `impl` would fail
+    // against a signature they never wrote.
+    if let Some(tok) = &f.sig.asyncness {
+        return Err(syn::Error::new_spanned(
+            tok,
+            "declare the method as sync; the `async` feature emits the `IFooAsync` halves \
+             alongside it",
+        ));
+    }
+    if let Some(tok) = &f.sig.unsafety {
+        return Err(syn::Error::new_spanned(
+            tok,
+            "an `unsafe` binder method is not supported",
+        ));
+    }
+    if let Some(tok) = &f.sig.constness {
+        return Err(syn::Error::new_spanned(
+            tok,
+            "a `const` binder method is not supported",
+        ));
+    }
+    if let Some(abi) = &f.sig.abi {
+        return Err(syn::Error::new_spanned(
+            abi,
+            "an explicit ABI has no meaning on a binder method",
+        ));
+    }
+    // `syn` parses `...` here even outside an `extern` block, and the render
+    // layer has no place for it — the argument would vanish from the trait.
+    if let Some(variadic) = &f.sig.variadic {
+        return Err(syn::Error::new_spanned(
+            variadic,
+            "a variadic binder method is not supported — the wire carries a fixed \
+             argument list",
         ));
     }
     let oneway = has_attr(&f.attrs, "oneway");
@@ -355,7 +475,8 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         // two paths emit the same signature. Trait parameter names do not bind
         // the `impl`, so this is invisible to users writing a service.
         check_attrs(&pat_ty.attrs, &["inout"])?;
-        let ident = format!("_arg_{}", pat_ident.ident);
+        let raw_arg = pat_ident.ident.to_string();
+        let ident = format!("_arg_{}", strip_raw(&raw_arg));
         let dir = direction(&pat_ty.attrs, &pat_ty.ty)?;
         if oneway && dir != Dir::In {
             return Err(syn::Error::new_spanned(
@@ -365,6 +486,11 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
             ));
         }
         type_str::check_supported(&pat_ty.ty)?;
+        type_str::reject_nullable_primitive(&pat_ty.ty)?;
+        if dir != Dir::In {
+            let word = if dir == Dir::Out { "out" } else { "inout" };
+            type_str::check_out_capable(&pat_ty.ty, word)?;
+        }
         let as_written = type_str::as_written(&pat_ty.ty)?;
         let owned = type_str::owned(&pat_ty.ty)?;
 
@@ -373,6 +499,11 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         args_async += &arg_str.replace('&', "&'a ");
         func_call_params += &format!("{ident}, ");
 
+        // Shape decisions read the `syn::Type`, not the rendered string: a
+        // qualified `std::vec::Vec<T>` is the same type as `Vec<T>` and must
+        // carry the same length word.
+        let is_option_vec = type_str::option_vec_elem(&pat_ty.ty).is_some();
+        let is_var_array = type_str::is_variable_array(&pat_ty.ty);
         if dir != Dir::Out {
             let param = if as_written.starts_with('&') {
                 ident.clone()
@@ -380,9 +511,9 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
                 format!("&{ident}")
             };
             write_funcs.push(format!("data.write({param})?;"));
-        } else if owned.starts_with("Option<Vec<") {
+        } else if is_option_vec {
             write_funcs.push(format!("data.write_slice_size({ident}.as_deref())?;"));
-        } else if is_variable_array(&owned) {
+        } else if is_var_array {
             // An out `Vec` carries only its length on the request; the server
             // sizes its own buffer from it (AOSP `resizeOutVector`).
             write_funcs.push(format!("data.write_slice_size(Some({ident}))?;"));
@@ -391,30 +522,27 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         let (mutable, init) = match dir {
             Dir::Out => (
                 "mut ",
-                type_str::out_default(&pat_ty.ty).unwrap_or_else(|| "Default::default()".into()),
+                type_str::out_default(&pat_ty.ty)?.unwrap_or_else(|| "Default::default()".into()),
             ),
             Dir::Inout => ("mut ", "_reader.read()?".to_string()),
             Dir::In => ("", "_reader.read()?".to_string()),
         };
         transaction_decls.push(format!("let {mutable}{ident}: {owned} = {init};"));
         if dir == Dir::Out {
-            if owned.starts_with("Option<Vec<") {
+            if is_option_vec {
                 transaction_decls.push(format!("_reader.resize_nullable_out_vec(&mut {ident})?;"));
-            } else if is_variable_array(&owned) {
+            } else if is_var_array {
                 transaction_decls.push(format!("_reader.resize_out_vec(&mut {ident})?;"));
             }
         }
 
         if dir != Dir::In {
-            transaction_write.push(TransactionWrite {
-                identifier: ident.clone(),
-                // AOSP writes a non-nullable out fd array back only if every
-                // element is present; a `None` would otherwise go out as a
-                // null fd where `.aidl` raises `UNEXPECTED_NULL`.
-                needs_null_guard: dir == Dir::Out
-                    && owned.starts_with("Vec<Option<")
-                    && owned.contains("ParcelFileDescriptor"),
-            });
+            let mut write = TransactionWrite::new(ident.clone());
+            // AOSP writes a non-nullable out fd array back only if every
+            // element is present; a `None` would otherwise go out as a null fd
+            // where `.aidl` raises `UNEXPECTED_NULL`.
+            write.needs_null_guard = dir == Dir::Out && type_str::is_option_pfd_vec(&pat_ty.ty);
+            transaction_write.push(write);
             read_onto_params.push(ident.clone());
         }
         transaction_params += &format!("{}, ", func_call_param(&ident, &as_written, &owned, dir));
@@ -428,32 +556,24 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         ));
     }
 
-    Ok(FnMembers {
-        identifier: f.sig.ident.to_string(),
-        args,
-        args_async,
-        transaction_has_return: return_type != "()",
-        return_type,
-        write_funcs,
-        func_call_params: trim_comma(func_call_params),
-        transaction_decls,
-        transaction_write,
-        transaction_params: trim_comma(transaction_params),
-        oneway,
-        read_onto_params,
-        transaction_code: index,
-        has_explicit_code: false,
-        enforce_permission_check: None,
-    })
+    let raw_ident = f.sig.ident.to_string();
+    let mut member = FnMembers::new(strip_raw(&raw_ident), index);
+    member.args = args;
+    member.args_async = args_async;
+    member.transaction_has_return = return_type != "()";
+    member.return_type = return_type;
+    member.write_funcs = write_funcs;
+    member.func_call_params = trim_comma(func_call_params);
+    member.transaction_decls = transaction_decls;
+    member.transaction_write = transaction_write;
+    member.transaction_params = trim_comma(transaction_params);
+    member.oneway = oneway;
+    member.read_onto_params = read_onto_params;
+    Ok(member)
 }
 
-/// How the server hands a decoded argument to the user's `impl`.
-///
-/// The server owns what it read (`owned`), and the trait asks for the type the
-/// signature spells (`as_written`); this bridges the two. Driving it off the
-/// signature rather than off a list of known types is what makes a
-/// `#[derive(BinderEnum)]` enum — passed by value, like any `Copy` type — work
-/// without the macro having to recognise it.
+/// Bridge what the server owns (`owned`) to what the trait asks for
+/// (`as_written`), driven off the signature so no type list is needed.
 fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> String {
     if dir != Dir::In {
         return format!("&mut {ident}");
@@ -517,14 +637,12 @@ fn return_type(f: &TraitItemFn) -> syn::Result<String> {
     let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
         return Err(syn::Error::new_spanned(ty, "expected `BinderResult<T>`"));
     };
-    if matches!(inner, Type::Reference(_)) {
-        return Err(syn::Error::new_spanned(
-            inner,
-            "a return value is decoded into a fresh owned value, so it cannot be a reference — \
-             return `String`, `Vec<T>` or the owned type",
-        ));
-    }
-    type_str::check_supported(inner)?;
+    // Not `check_supported`: that lets `Option<&str>` through for nullable
+    // *arguments*, and a return value would then be silently rewritten to
+    // `Option<String>`, leaving the user's `impl` to fail with no diagnostic
+    // on the declaration.
+    type_str::reject_any_reference(inner)?;
+    type_str::reject_nullable_primitive(inner)?;
     type_str::owned(inner)
 }
 
@@ -551,9 +669,8 @@ fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-/// Anything unrecognised would be silently dropped — the trait is re-rendered
-/// from scratch, so a mistyped `#[oneway]` would quietly become a twoway call
-/// and a `#[cfg]` would be emitted regardless of its condition.
+/// The trait is re-rendered from scratch, so an unrecognised attribute would be
+/// dropped: a mistyped `#[oneway]` becoming a twoway call, a `#[cfg]` ignored.
 fn check_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<()> {
     for attr in attrs {
         if attr.path().is_ident("doc") || allowed.iter().any(|a| attr.path().is_ident(a)) {
@@ -574,11 +691,6 @@ fn check_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<()> {
     Ok(())
 }
 
-/// A `Vec` is the only length-carrying out parameter shape in v1 scope.
-fn is_variable_array(owned: &str) -> bool {
-    owned.starts_with("Vec<") || owned.starts_with("Option<Vec<")
-}
-
 fn trim_comma(mut s: String) -> String {
     if s.ends_with(", ") {
         s.truncate(s.len() - 2);
@@ -595,42 +707,59 @@ mod golden {
     //! render layer instead of emitting its own code (plan 2-19 D1).
 
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// `Builder` reads `OUT_DIR` from the environment, which is process-wide:
-    /// two golden tests generating at once would race on it.
-    static GENERATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// A temp directory that removes itself, so a `cargo test` run leaves
+    /// nothing behind in `/tmp`.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rsbinder_macros_golden_{tag}_{}_{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Generate `aidl` with `rsbinder-aidl` and return just the interface
     /// module, without the file header.
-    fn from_aidl(aidl: &str, module: &str) -> String {
-        let _guard = GENERATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "rsbinder_macros_golden_{module}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let src = dir.join(format!("{module}.aidl"));
+    fn from_aidl(aidl: &str, module: &str, enabled_async: bool) -> String {
+        let dir = TempDir::new(module);
+        let src = dir.path().join(format!("{module}.aidl"));
         std::fs::write(&src, aidl).expect("write aidl");
-        std::env::set_var("OUT_DIR", &dir);
 
         rsbinder_aidl::Builder::new()
             .source(src)
-            .include_dir(&dir)
+            .include_dir(dir.path())
+            .dest_dir(dir.path())
             .output(PathBuf::from("golden.rs"))
-            .set_async_support(cfg!(feature = "async"))
+            .set_async_support(enabled_async)
             .generate()
             .expect("aidl generate");
 
-        let text = std::fs::read_to_string(dir.join("golden.rs")).expect("read generated");
+        let text = std::fs::read_to_string(dir.path().join("golden.rs")).expect("read generated");
         extract_module(&text, module)
     }
 
-    /// Pull `pub mod {module} { … }` out of a generated file and dedent it.
-    ///
-    /// A packaged `.aidl` nests the interface under its package modules, so
-    /// the block arrives indented; the macro emits it at column 0.
+    /// Pull `pub mod {module} { … }` out of a generated file and dedent it —
+    /// a packaged `.aidl` nests it, the macro emits it at column 0.
     fn extract_module(text: &str, module: &str) -> String {
         let needle = format!("pub mod {module} {{");
         let start_line = text
@@ -666,15 +795,29 @@ mod golden {
             .to_string()
     }
 
-    fn from_macro(tokens: proc_macro2::TokenStream) -> String {
+    fn from_macro(tokens: proc_macro2::TokenStream, enabled_async: bool) -> String {
         let item: ItemTrait = syn::parse2(tokens).expect("parse trait");
-        render_source(&Args { descriptor: None }, &item).expect("render")
+        render_source_with(&Args { descriptor: None }, &item, enabled_async).expect("render")
+    }
+
+    /// Both `enabled_async` settings, because the golden gate is what pins the
+    /// two front-ends together and a `cfg!` would leave one half unchecked.
+    #[track_caller]
+    fn assert_same(aidl: &str, module: &str, tokens: proc_macro2::TokenStream) {
+        for enabled_async in [false, true] {
+            assert_same_for(aidl, module, tokens.clone(), enabled_async);
+        }
     }
 
     #[track_caller]
-    fn assert_same(aidl: &str, module: &str, tokens: proc_macro2::TokenStream) {
-        let expected = from_aidl(aidl, module);
-        let actual = from_macro(tokens);
+    fn assert_same_for(
+        aidl: &str,
+        module: &str,
+        tokens: proc_macro2::TokenStream,
+        enabled_async: bool,
+    ) {
+        let expected = from_aidl(aidl, module, enabled_async);
+        let actual = from_macro(tokens, enabled_async);
         if expected != actual {
             let mut report = String::new();
             for diff in expected
@@ -693,34 +836,61 @@ mod golden {
                     actual.lines().count()
                 ));
             }
-            panic!("generated code differs\n{report}\n--- aidl ---\n{expected}\n--- macro ---\n{actual}");
+            panic!("generated code differs (enabled_async = {enabled_async})\n{report}\n--- aidl ---\n{expected}\n--- macro ---\n{actual}");
+        }
+    }
+
+    /// [`assert_same`] for a multi-file fixture carrying an explicit descriptor.
+    #[track_caller]
+    fn assert_same_files(
+        files: &[(&str, &str)],
+        main: &str,
+        module: &str,
+        descriptor: &str,
+        tokens: proc_macro2::TokenStream,
+    ) {
+        for enabled_async in [false, true] {
+            let expected = from_aidl_files(files, main, module, enabled_async);
+            let item: ItemTrait = syn::parse2(tokens.clone()).expect("parse trait");
+            let actual = render_source_with(
+                &Args {
+                    descriptor: Some(descriptor.to_string()),
+                },
+                &item,
+                enabled_async,
+            )
+            .expect("render");
+            assert_eq!(
+                expected, actual,
+                "generated code differs (enabled_async = {enabled_async})"
+            );
         }
     }
 
     /// Same as [`from_aidl`] but with sibling files in the include dir, so a
     /// fixture can reference another interface.
-    fn from_aidl_files(files: &[(&str, &str)], main: &str, module: &str) -> String {
-        let _guard = GENERATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "rsbinder_macros_golden_multi_{module}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    fn from_aidl_files(
+        files: &[(&str, &str)],
+        main: &str,
+        module: &str,
+        enabled_async: bool,
+    ) -> String {
+        let dir = TempDir::new(&format!("multi_{module}"));
         for (rel, body) in files {
-            let path = dir.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("relative path")).expect("mkdir");
             std::fs::write(&path, body).expect("write aidl");
         }
-        std::env::set_var("OUT_DIR", &dir);
         rsbinder_aidl::Builder::new()
-            .source(dir.join(main))
-            .include_dir(&dir)
+            .source(dir.path().join(main))
+            .include_dir(dir.path())
+            .dest_dir(dir.path())
             .output(PathBuf::from("golden_multi.rs"))
-            .set_async_support(cfg!(feature = "async"))
+            .set_async_support(enabled_async)
             .generate()
             .expect("aidl generate");
-        let text = std::fs::read_to_string(dir.join("golden_multi.rs")).expect("read generated");
+        let text =
+            std::fs::read_to_string(dir.path().join("golden_multi.rs")).expect("read generated");
         extract_module(&text, module)
     }
 
@@ -811,7 +981,7 @@ interface IGolden4 {
     fn binder_objects() {
         // Cross-file: pins the `super::Mod::Type` path a packaged import
         // produces, which a single-file fixture never exercises.
-        let expected = from_aidl_files(
+        assert_same_files(
             &[
                 (
                     "com/example/IGolden5.aidl",
@@ -826,27 +996,19 @@ interface IGolden4 {
             ],
             "com/example/IGolden5.aidl",
             "IGolden5",
-        );
-        let item: ItemTrait = syn::parse2(quote! {
-            pub trait IGolden5 {
-                fn register(
-                    &self,
-                    cb: &rsbinder::Strong<dyn super::IGolden5Cb::IGolden5Cb>,
-                ) -> BinderResult<()>;
-                fn fetch(
-                    &self,
-                ) -> BinderResult<rsbinder::Strong<dyn super::IGolden5Cb::IGolden5Cb>>;
-            }
-        })
-        .unwrap();
-        let actual = render_source(
-            &Args {
-                descriptor: Some("com.example.IGolden5".to_string()),
+            "com.example.IGolden5",
+            quote! {
+                pub trait IGolden5 {
+                    fn register(
+                        &self,
+                        cb: &rsbinder::Strong<dyn super::IGolden5Cb::IGolden5Cb>,
+                    ) -> BinderResult<()>;
+                    fn fetch(
+                        &self,
+                    ) -> BinderResult<rsbinder::Strong<dyn super::IGolden5Cb::IGolden5Cb>>;
+                }
             },
-            &item,
-        )
-        .expect("render");
-        assert_eq!(expected, actual, "generated code differs");
+        );
     }
 
     /// A self-referencing interface — the callback pattern users reach for
@@ -881,20 +1043,6 @@ interface IGolden6 {
     /// module, so the parts that do survive are pinned too.
     #[test]
     fn parcelable_codec_matches_aidl() {
-        let expected = from_aidl(
-            r#"
-parcelable GoldenConfig {
-    String name;
-    int retries;
-    boolean verbose;
-    long timeoutNanos;
-    double ratio;
-    @nullable byte[] extra;
-    String[] tags;
-}
-"#,
-            "GoldenConfig",
-        );
         let input: syn::DeriveInput = syn::parse2(quote! {
             pub struct GoldenConfig {
                 pub name: String,
@@ -908,7 +1056,24 @@ parcelable GoldenConfig {
         })
         .unwrap();
         let actual = parcelable::render_source(&input).expect("render");
-        assert_eq!(expected, actual, "generated parcelable differs");
+        for enabled_async in [false, true] {
+            let expected = from_aidl(
+                r#"
+parcelable GoldenConfig {
+    String name;
+    int retries;
+    boolean verbose;
+    long timeoutNanos;
+    double ratio;
+    @nullable byte[] extra;
+    String[] tags;
+}
+"#,
+                "GoldenConfig",
+                enabled_async,
+            );
+            assert_eq!(expected, actual, "generated parcelable differs");
+        }
     }
 
     /// A method taking a parcelable and an enum. The enum is the case that
@@ -917,47 +1082,40 @@ parcelable GoldenConfig {
     /// primitive type names would never have covered.
     #[test]
     fn parcelable_and_enum_arguments() {
-        let expected = from_aidl_files(
-            &[
-                (
-                    "com/example/IGolden7.aidl",
-                    "package com.example;\nimport com.example.GoldenCfg;\n\
-                     import com.example.GoldenMode;\n\
-                     interface IGolden7 {\n\
-                     \x20   GoldenCfg apply(in GoldenCfg cfg, in GoldenMode mode);\n}\n",
-                ),
-                (
-                    "com/example/GoldenCfg.aidl",
-                    "package com.example;\nparcelable GoldenCfg {\n    String name;\n\
-                     \x20   int retries;\n}\n",
-                ),
-                (
-                    "com/example/GoldenMode.aidl",
-                    "package com.example;\n@Backing(type=\"int\")\n\
-                     enum GoldenMode {\n    FAST = 0,\n    SAFE = 1,\n}\n",
-                ),
-            ],
+        let files = [
+            (
+                "com/example/IGolden7.aidl",
+                "package com.example;\nimport com.example.GoldenCfg;\n\
+                 import com.example.GoldenMode;\n\
+                 interface IGolden7 {\n\
+                 \x20   GoldenCfg apply(in GoldenCfg cfg, in GoldenMode mode);\n}\n",
+            ),
+            (
+                "com/example/GoldenCfg.aidl",
+                "package com.example;\nparcelable GoldenCfg {\n    String name;\n\
+                 \x20   int retries;\n}\n",
+            ),
+            (
+                "com/example/GoldenMode.aidl",
+                "package com.example;\n@Backing(type=\"int\")\n\
+                 enum GoldenMode {\n    FAST = 0,\n    SAFE = 1,\n}\n",
+            ),
+        ];
+        assert_same_files(
+            &files,
             "com/example/IGolden7.aidl",
             "IGolden7",
-        );
-        let item: ItemTrait = syn::parse2(quote! {
-            pub trait IGolden7 {
-                fn apply(
-                    &self,
-                    cfg: &super::GoldenCfg::GoldenCfg,
-                    mode: super::GoldenMode::GoldenMode,
-                ) -> BinderResult<super::GoldenCfg::GoldenCfg>;
-            }
-        })
-        .unwrap();
-        let actual = render_source(
-            &Args {
-                descriptor: Some("com.example.IGolden7".to_string()),
+            "com.example.IGolden7",
+            quote! {
+                pub trait IGolden7 {
+                    fn apply(
+                        &self,
+                        cfg: &super::GoldenCfg::GoldenCfg,
+                        mode: super::GoldenMode::GoldenMode,
+                    ) -> BinderResult<super::GoldenCfg::GoldenCfg>;
+                }
             },
-            &item,
-        )
-        .expect("render");
-        assert_eq!(expected, actual, "generated code differs");
+        );
     }
 
     #[test]
@@ -1015,5 +1173,254 @@ parcelable GoldenConfig {
         )
         .unwrap();
         assert!(named.contains(r#""com.example.IHello""#), "{named}");
+    }
+
+    fn render(tokens: proc_macro2::TokenStream) -> String {
+        let item: ItemTrait = syn::parse2(tokens).expect("parse trait");
+        render_source(&Args { descriptor: None }, &item).expect("render")
+    }
+
+    fn reject(tokens: proc_macro2::TokenStream) -> String {
+        let item: ItemTrait = syn::parse2(tokens).expect("parse trait");
+        render_source(&Args { descriptor: None }, &item)
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// The `_arg_` prefix and the templates' own `r#` would otherwise stack up
+    /// into `_arg_r#type` / `fn r#r#type`, neither of which lexes.
+    #[test]
+    fn raw_identifiers_are_not_double_escaped() {
+        let s = render(quote! {
+            pub trait IRaw {
+                fn r#type(&self, r#match: i32) -> BinderResult<()>;
+            }
+        });
+        assert!(!s.contains("r#r#"), "{s}");
+        assert!(!s.contains("_arg_r#"), "{s}");
+        assert!(s.contains("fn r#type("), "{s}");
+        assert!(s.contains("_arg_match"), "{s}");
+        syn::parse_file(&s).unwrap_or_else(|e| panic!("does not parse: {e}\n{s}"));
+    }
+
+    /// A raw trait name has to survive into `Bn`/`Bp` and the module name.
+    #[test]
+    fn raw_trait_name_renders() {
+        let item: ItemTrait = syn::parse2(quote! {
+            pub trait r#type {
+                fn go(&self) -> BinderResult<()>;
+            }
+        })
+        .unwrap();
+        let s = render_source(&Args { descriptor: None }, &item).expect("render");
+        assert!(s.contains("pub trait r#type"), "{s}");
+        assert!(s.contains("Bntype"), "{s}");
+        assert!(!s.contains("r#r#"), "{s}");
+        syn::parse_file(&s).unwrap_or_else(|e| panic!("does not parse: {e}\n{s}"));
+    }
+
+    /// The trait is re-rendered, so an attribute left on it would vanish —
+    /// a `#[cfg]` emitted regardless of its condition, a trait-level
+    /// `#[oneway]` silently becoming twoway.
+    #[test]
+    fn rejects_trait_level_attributes() {
+        let err = reject(quote! {
+            #[cfg(feature = "x")]
+            pub trait IBad {
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("unsupported attribute"), "{err}");
+
+        let err = reject(quote! {
+            #[oneway]
+            pub trait IBad {
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("unsupported attribute"), "{err}");
+    }
+
+    #[test]
+    fn rejects_where_clauses() {
+        let err = reject(quote! {
+            pub trait IBad where Self: Sized {
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("where clause"), "{err}");
+
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self) -> BinderResult<()> where Self: Sized;
+            }
+        });
+        assert!(err.contains("where clause"), "{err}");
+    }
+
+    /// A modifier the re-render drops would leave the user's `impl` failing
+    /// against a signature they never wrote.
+    #[test]
+    fn rejects_signature_modifiers() {
+        let err = reject(quote! {
+            pub trait IBad {
+                async fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("sync"), "{err}");
+
+        let err = reject(quote! {
+            pub trait IBad {
+                unsafe fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("unsafe"), "{err}");
+    }
+
+    /// `check_supported` lets `Option<&str>` through for nullable *arguments*;
+    /// as a return type it would be rewritten to `Option<String>` with no
+    /// diagnostic on the declaration.
+    #[test]
+    fn rejects_borrowed_return_inside_option() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self) -> BinderResult<Option<&str>>;
+            }
+        });
+        assert!(err.contains("borrow"), "{err}");
+    }
+
+    /// `self::` would resolve inside the generated module, not the user's.
+    #[test]
+    fn rejects_self_paths() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self, cfg: &self::Config) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("`self::`"), "{err}");
+    }
+
+    /// The out-vector wire decisions read the `syn::Type`, so a qualified path
+    /// spells the same type and must carry the same length word.
+    #[test]
+    fn qualified_vec_is_still_a_length_carrying_out_vector() {
+        let bare = render(quote! {
+            pub trait IOut {
+                fn fill(&self, values: &mut Vec<i32>) -> BinderResult<()>;
+            }
+        });
+        let qualified = render(quote! {
+            pub trait IOut {
+                fn fill(&self, values: &mut std::vec::Vec<i32>) -> BinderResult<()>;
+            }
+        });
+        assert!(bare.contains("write_slice_size"), "{bare}");
+        assert!(
+            qualified.contains("write_slice_size"),
+            "a qualified `Vec` must still write the length word:\n{qualified}"
+        );
+        assert!(qualified.contains("resize_out_vec"), "{qualified}");
+    }
+
+    /// Same for `Option<Vec<T>>` and for the out-fd-array null guard, whose
+    /// absence would put a null fd where `.aidl` raises `UNEXPECTED_NULL`.
+    #[test]
+    fn qualified_paths_keep_the_nullable_and_fd_guards() {
+        let s = render(quote! {
+            pub trait IOut {
+                fn fill(&self, v: &mut core::option::Option<std::vec::Vec<i32>>)
+                    -> BinderResult<()>;
+            }
+        });
+        assert!(s.contains("resize_nullable_out_vec"), "{s}");
+
+        let s = render(quote! {
+            pub trait IOut {
+                fn fds(
+                    &self,
+                    v: &mut std::vec::Vec<Option<rsbinder::ParcelFileDescriptor>>,
+                ) -> BinderResult<()>;
+            }
+        });
+        assert!(s.contains("iter().any(Option::is_none)"), "{s}");
+    }
+
+    /// The proxy passes a by-value argument twice, so the macro asserts `Copy`
+    /// against the user's own type. Pinned here rather than in `tests/ui`: the
+    /// resulting rustc diagnostic is compiler wording that moves between
+    /// releases.
+    #[test]
+    fn by_value_argument_is_asserted_copy() {
+        let item: ItemTrait = syn::parse2(quote! {
+            pub trait IBad {
+                fn go(&self, s: String) -> BinderResult<()>;
+            }
+        })
+        .unwrap();
+        let expanded = expand(&Args { descriptor: None }, &item)
+            .expect("expand")
+            .to_string();
+        // Both halves are pinned: that the bound is `Copy` — swapping it for a
+        // bound every type meets would otherwise go unnoticed — and that the
+        // user's own type is what gets asserted.
+        assert!(
+            expanded.contains("T : :: core :: marker :: Copy"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("__rsbinder_assert_copy :: < String > ()"),
+            "{expanded}"
+        );
+    }
+
+    /// The assertion has to sit inside the generated module: it names types
+    /// straight from the signature, which the rendered body resolves there.
+    #[test]
+    fn copy_assertion_shares_the_generated_module_scope() {
+        let item: ItemTrait = syn::parse2(quote! {
+            pub trait IScoped {
+                fn go(&self, mode: super::Mode::Mode) -> BinderResult<()>;
+            }
+        })
+        .unwrap();
+        let expanded = expand(&Args { descriptor: None }, &item).expect("expand");
+        let file: syn::File = syn::parse2(expanded).expect("expansion parses");
+        let module = file
+            .items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Mod(m) => Some(m),
+                _ => None,
+            })
+            .expect("generated module");
+        let body = quote!(#module).to_string();
+        assert!(body.contains("__rsbinder_assert_copy"), "{body}");
+    }
+
+    /// `#[doc(hidden)]` hides the module from docs, not from paths: a private
+    /// trait must not become nameable through it.
+    #[test]
+    fn generated_module_follows_the_trait_visibility() {
+        let item: ItemTrait = syn::parse2(quote! {
+            trait IPrivate {
+                fn go(&self) -> BinderResult<()>;
+            }
+        })
+        .unwrap();
+        let expanded = expand(&Args { descriptor: None }, &item).expect("expand");
+        let file: syn::File = syn::parse2(expanded).expect("expansion parses");
+        let module = file
+            .items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Mod(m) => Some(m),
+                _ => None,
+            })
+            .expect("generated module");
+        assert!(
+            matches!(module.vis, syn::Visibility::Inherited),
+            "a private trait must not get a `pub` module"
+        );
     }
 }

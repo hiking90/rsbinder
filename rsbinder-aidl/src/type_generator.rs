@@ -300,6 +300,57 @@ impl TypeGenerator {
         Ok(())
     }
 
+    /// Reject a field that closes a reference cycle without a form that can
+    /// terminate.
+    ///
+    /// `@nullable` renders such a field as `Option<Box<T>>`, which both breaks
+    /// the cycle and gives the generated `Default` impl somewhere to stop. A
+    /// non-nullable one has neither: boxing it alone would produce a `Default`
+    /// that recurses until the stack runs out, and that `Default` is the
+    /// deserialization entry point, so a peer's parcel would abort the
+    /// process. AOSP likewise makes the cycle-closing field nullable. Must be
+    /// invoked while the owning declaration's `NamespaceGuard` is active.
+    pub fn ensure_sized(&self) -> Result<(), AidlError> {
+        // A `Vec` element is finite whatever it holds, so only a bare field or
+        // a fixed-size array — which keeps its elements inline — can close a
+        // cycle. Nullability rescues the former; nothing rescues the latter,
+        // since `Box<T>` implements no array codec.
+        let (type_name, nullable_rescues) = match &self.value_type {
+            ValueType::UserDefined(name) => (name, true),
+            ValueType::Array(_) => match self.array_types.first() {
+                Some(info) if info.is_fixed() => match &info.value_type {
+                    ValueType::UserDefined(name) => (name, false),
+                    _ => return Ok(()),
+                },
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        if nullable_rescues && self.is_nullable {
+            return Ok(());
+        }
+        let Some(lookup_decl) = lookup_decl_from_name(type_name, crate::Namespace::AIDL) else {
+            return Ok(());
+        };
+        if !Self::closes_reference_cycle(&lookup_decl) {
+            return Ok(());
+        }
+        let (src, span) = diagnostic_source(self.type_span);
+        let help = if nullable_rescues {
+            "mark the field `@nullable` so it becomes `Option<Box<…>>`, which \
+             breaks the cycle and can still be default-constructed"
+        } else {
+            "a fixed-size array keeps its elements inline; use a \
+             variable-length array (`T[]`) so the elements live behind a `Vec`"
+        };
+        Err(AidlError::from(SemanticError::RecursiveParcelable {
+            type_name: type_name.clone(),
+            help: Some(help.to_owned()),
+            src,
+            span,
+        }))
+    }
+
     fn is_aidl_nullable(value_type: &ValueType) -> bool {
         match value_type {
             ValueType::String(_)
@@ -316,7 +367,38 @@ impl TypeGenerator {
         }
     }
 
-    fn make_user_defined_type_name(&self, type_name: &str) -> String {
+    /// Would a by-value field of `lookup_decl`, inside the declaration being
+    /// generated, close a reference cycle and make the Rust struct infinitely
+    /// sized? A direct self-reference is only the shortest such cycle.
+    ///
+    /// Only a parcelable or a union can hold the enclosing declaration inline.
+    /// An interface renders as a `Strong<dyn …>` handle, and an enum — a
+    /// synthetic union `Tag` included, which reports its parent union's
+    /// namespace — is a scalar; neither closes a cycle.
+    fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
+        if !matches!(
+            lookup_decl.decl,
+            Declaration::Parcelable(_) | Declaration::Union(_)
+        ) {
+            return false;
+        }
+        let curr_ns = current_namespace();
+        let refers_to_self = curr_ns.relative_mod(&lookup_decl.ns).is_empty()
+            && lookup_decl
+                .name
+                .ns
+                .last()
+                .is_some_and(|name| curr_ns.ns.last() == Some(name));
+        refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns)
+    }
+
+    /// `allow_box` is false in an array element position: `Vec<T>` and
+    /// `[T; N]` never take the box a cycle-closing field does. For `Vec<T>`
+    /// the allocation already makes the field finite, and `Box<T>` implements
+    /// neither `SerializeArray` nor `DeserializeArray`, so boxing an element
+    /// would emit code that does not compile. A fixed-size array cannot be
+    /// rescued at all and is rejected by [`Self::ensure_sized`].
+    fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL)
             .expect("type must be resolved during code generation");
         let curr_ns = current_namespace();
@@ -326,18 +408,24 @@ impl TypeGenerator {
         // `relative_mod` module path is already keyword-escaped.
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
-        let refers_to_self =
-            || curr_ns.ns.last() == Some(lookup_decl.name.ns.last().expect("named decl"));
-        let name = if !ns.is_empty() {
+        // Only `@nullable` earns the box. The `Option` is what gives the field
+        // a terminating `Default`; a bare `Box<T>` would make the generated
+        // `Default` impl recurse until the stack runs out — and that `Default`
+        // is the deserialization entry point, not decoration.
+        // `ensure_sized` rejects the non-nullable case with a diagnostic.
+        let needs_box = allow_box
+            && self.is_nullable
+            && !is_interface
+            && Self::closes_reference_cycle(&lookup_decl);
+        let path = if !ns.is_empty() {
             format!("{ns}::{simple}")
-        } else if !is_interface && refers_to_self() {
-            // A parcelable that names itself would be infinitely sized, so the
-            // field has to be behind a pointer. An interface must NOT be boxed
-            // here: it is already rendered as `Strong<dyn …>`, which is a
-            // handle, and `dyn Box<IFoo>` is not a trait — it does not compile.
-            format!("Box<{simple}>")
         } else {
             simple.into_owned()
+        };
+        let name = if needs_box {
+            format!("Box<{path}>")
+        } else {
+            path
         };
 
         if is_interface {
@@ -511,7 +599,7 @@ impl TypeGenerator {
     }
 
     fn array_type_name(&self, value_type: &ValueType) -> String {
-        let name = self.type_decl(value_type);
+        let name = self.type_decl(value_type, false);
         if name == "i8" {
             "u8".to_owned()
         } else {
@@ -612,7 +700,7 @@ impl TypeGenerator {
         }
     }
 
-    fn type_decl(&self, value_type: &ValueType) -> String {
+    fn type_decl(&self, value_type: &ValueType, allow_box: bool) -> String {
         match value_type {
             ValueType::Void => "()".into(),
             ValueType::String(_) => "String".into(),
@@ -631,7 +719,7 @@ impl TypeGenerator {
             ValueType::IBinder => format!("{}::SIBinder", crate_name()),
             ValueType::FileDescriptor => format!("{}::ParcelFileDescriptor", crate_name()),
             ValueType::Holder => format!("{}::ParcelableHolder", crate_name()),
-            ValueType::UserDefined(name) => self.make_user_defined_type_name(name),
+            ValueType::UserDefined(name) => self.make_user_defined_type_name(name, allow_box),
             _ => unreachable!(),
         }
     }
@@ -644,7 +732,7 @@ impl TypeGenerator {
                 if !Self::can_be_defaulted(&self.value_type, is_struct) && is_struct {
                     is_nullable = true;
                 }
-                self.type_decl(&self.value_type)
+                self.type_decl(&self.value_type, true)
             }
         };
 
@@ -785,7 +873,7 @@ impl TypeGenerator {
                             self.type_span,
                         ));
                     }
-                    let name = self.type_decl(&self.value_type);
+                    let name = self.type_decl(&self.value_type, true);
                     if self.is_nullable {
                         format!("&mut Option<{name}>")
                     } else {
@@ -794,9 +882,9 @@ impl TypeGenerator {
                 }
                 _ => {
                     if Self::is_primitive(&self.value_type) {
-                        self.type_decl(&self.value_type)
+                        self.type_decl(&self.value_type, true)
                     } else {
-                        let name = self.type_decl(&self.value_type);
+                        let name = self.type_decl(&self.value_type, true);
                         if self.is_nullable {
                             format!("Option<&{name}>")
                         } else {
@@ -910,7 +998,7 @@ impl TypeGenerator {
                             let first = enum_decl.enumerator_list.first().unwrap();
                             format!(
                                 "{}::{}",
-                                self.make_user_defined_type_name(name),
+                                self.make_user_defined_type_name(name, false),
                                 first.identifier
                             )
                         }
@@ -1164,7 +1252,7 @@ impl TypeGenerator {
             return Err(make_type_error(
                 format!(
                     "an array literal cannot initialize the non-array type {}",
-                    self.type_decl(&self.value_type)
+                    self.type_decl(&self.value_type, true)
                 ),
                 self.type_span,
             ));

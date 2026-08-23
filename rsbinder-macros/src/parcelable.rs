@@ -5,7 +5,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use rsbinder_aidl::render::{render_parcelable, ParcelableRender};
+use rsbinder_aidl::render::{render_parcelable, ParcelableMember, ParcelableRender};
 use syn::{Data, DeriveInput, Fields};
 
 use crate::type_str;
@@ -53,8 +53,8 @@ fn is_codec_item(item: &syn::Item) -> bool {
     }
 }
 
-/// The parcelable module source, before the non-codec items are dropped.
-/// Split out so the golden test can hold it against the `.aidl` output.
+/// The parcelable module source, before the non-codec items are dropped —
+/// split out so the golden test can hold it against the `.aidl` output.
 pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -80,39 +80,63 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
     for field in &fields.named {
         // `Ident`'s `Display` keeps the `r#`, and the template adds its own.
         let raw = field.ident.as_ref().expect("named field").to_string();
-        let ident = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
-        if matches!(field.ty, syn::Type::Reference(_)) {
+        let ident = crate::strip_raw(&raw).to_string();
+        if matches!(type_str::unwrap_group(&field.ty), syn::Type::Reference(_)) {
             return Err(syn::Error::new_spanned(
                 &field.ty,
                 "a parcelable field cannot be a reference — it owns what it carries",
             ));
         }
-        let decl = type_str::as_written(&field.ty)?;
-        if decl.split(['<', ':']).next_back().unwrap_or(&decl).trim() == "ParcelableHolder" {
-            return Err(syn::Error::new_spanned(
-                &field.ty,
-                "a `ParcelableHolder` field needs the `.aidl` path: its stability is set before \
-                 the read and the derived codec would replace the whole field, so a peer's \
-                 `@VintfStability` holder can never be decoded",
-            ));
-        }
+        reject_parcelable_holder(&field.ty)?;
+        let decl = type_str::as_written_in(&field.ty, type_str::Ctx::Parcelable)?;
         // Read only by the `impl Default` that is dropped below.
-        members.push((ident, decl, "Default::default()".to_string(), false, false));
+        members.push(ParcelableMember::new(ident, decl, "Default::default()"));
     }
 
+    // The descriptor goes on the wire — `ParcelableHolder` records it as the
+    // holder's name and compares it on read — so a raw identifier must shed
+    // its `r#` exactly as the `.aidl` path does, which spells `parcelable
+    // type` as `"type"`.
     let descriptor = crate::attr_descriptor(&input.attrs, "parcelable")?
-        .unwrap_or_else(|| input.ident.to_string());
+        .unwrap_or_else(|| crate::strip_raw(&input.ident.to_string()).to_string());
 
-    render_parcelable(&ParcelableRender {
-        crate_name: "rsbinder".to_string(),
-        module: input.ident.to_string(),
-        name: input.ident.to_string(),
-        namespace: descriptor,
-        members,
-        ..Default::default()
-    })
-    .map(|s| s.trim().to_string())
-    .map_err(|e| syn::Error::new_spanned(&input.ident, format!("codegen failed: {e}")))
+    let mut render = ParcelableRender::new(input.ident.to_string(), descriptor);
+    render.members = members;
+
+    render_parcelable(&render)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| syn::Error::new_spanned(&input.ident, format!("codegen failed: {e}")))
+}
+
+/// A holder's stability is set before the read, and the derived codec replaces
+/// the whole field — a peer's `@VintfStability` holder could never be decoded.
+/// Matched structurally so `Option<rsbinder::ParcelableHolder>` is caught too.
+fn reject_parcelable_holder(ty: &syn::Type) -> syn::Result<()> {
+    if !mentions_parcelable_holder(ty) {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        ty,
+        "a `ParcelableHolder` field needs the `.aidl` path: its stability is set before \
+         the read and the derived codec would replace the whole field, so a peer's \
+         `@VintfStability` holder can never be decoded",
+    ))
+}
+
+fn mentions_parcelable_holder(ty: &syn::Type) -> bool {
+    match type_str::unwrap_group(ty) {
+        syn::Type::Path(p) => p.path.segments.iter().any(|seg| {
+            seg.ident == "ParcelableHolder" || match &seg.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.iter().any(
+                    |a| matches!(a, syn::GenericArgument::Type(t) if mentions_parcelable_holder(t)),
+                ),
+                _ => false,
+            }
+        }),
+        syn::Type::Slice(s) => mentions_parcelable_holder(&s.elem),
+        syn::Type::Array(a) => mentions_parcelable_holder(&a.elem),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +186,20 @@ mod tests {
         .unwrap();
         let err = render_source(&input).unwrap_err();
         assert!(err.to_string().contains("`.aidl` path"), "{err}");
+    }
+
+    /// The guard is structural, so a holder wrapped in `Option`/`Vec` — where
+    /// a string comparison saw `"ParcelableHolder>"` — is caught too.
+    #[test]
+    fn rejects_a_wrapped_parcelable_holder_field() {
+        for tokens in [
+            quote! { struct Bad { ext: Option<rsbinder::ParcelableHolder> } },
+            quote! { struct Bad { ext: Vec<ParcelableHolder> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains("`.aidl` path"), "{err}");
+        }
     }
 
     #[test]

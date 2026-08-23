@@ -42,7 +42,10 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                  must be visible here rather than implied by declaration order",
             ));
         };
-        variants.push((variant.ident.clone(), discriminant.clone()));
+        // The discriminant is required so the wire value is visible at the
+        // declaration, but it is never re-emitted: see `read_arms` below.
+        let _ = discriminant;
+        variants.push(variant.ident.clone());
     }
     if variants.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -51,13 +54,19 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    let read_arms = variants.iter().map(|(ident, value)| {
-        quote! { v if v == (#value) as #backing => Ok(#name::#ident), }
+    // Cast the declared variant rather than re-emitting its discriminant
+    // expression: re-emitted, the expression is typed on its own and an
+    // integer literal falls back to `i32`, so `#[repr(i64)] A = 1 << 31`
+    // would go on the wire as `-2147483648` while `A as i64` is
+    // `2147483648`. A unit-only variant is guaranteed above, so the cast is
+    // always valid.
+    let read_arms = variants.iter().map(|ident| {
+        quote! { v if v == #name::#ident as #backing => Ok(#name::#ident), }
     });
     // `self as #backing` would move out of `&self` unless the enum is `Copy`;
     // matching asks nothing of the user's type.
-    let write_arms = variants.iter().map(|(ident, value)| {
-        quote! { #name::#ident => (#value) as #backing, }
+    let write_arms = variants.iter().map(|ident| {
+        quote! { #name::#ident => #name::#ident as #backing, }
     });
 
     Ok(quote! {
@@ -235,10 +244,23 @@ mod tests {
         })
         .unwrap();
         let out = expand(&input).unwrap().to_string();
-        assert!(
-            !out.contains("as i32) ;") || !out.contains("* self"),
-            "{out}"
-        );
+        assert!(!out.contains("* self"), "{out}");
         assert!(out.contains("match self"), "{out}");
+    }
+
+    /// The wire value must come from the declared variant, not from a
+    /// re-emitted discriminant expression: re-emitted, an integer literal is
+    /// typed on its own and falls back to `i32`, so `#[repr(i64)] A = 1 << 31`
+    /// would go out as `-2147483648`.
+    #[test]
+    fn casts_the_variant_not_the_discriminant_expression() {
+        let input: DeriveInput = syn::parse2(quote! {
+            #[repr(i64)]
+            enum Wide { A = 1 << 31 }
+        })
+        .unwrap();
+        let out = expand(&input).unwrap().to_string();
+        assert!(out.contains("Wide :: A as i64"), "{out}");
+        assert!(!out.contains("1 << 31"), "{out}");
     }
 }

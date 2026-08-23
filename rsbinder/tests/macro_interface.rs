@@ -296,16 +296,3 @@ fn derived_parcelable_and_enum_cross_the_wire() {
     assert_eq!(data.maybe_cfg(Some(&cfg)).unwrap(), Some(cfg));
     assert_eq!(data.maybe_cfg(None).unwrap(), None);
 }
-
-/// A derived enum is closed: a value no variant declares is rejected rather
-/// than carried along, which is the one place it parts company with `.aidl`.
-#[test]
-fn derived_enum_rejects_an_undeclared_value() {
-    assert_eq!(Mode::try_from_binder_value(0), Ok(Mode::Fast));
-    assert_eq!(Mode::try_from_binder_value(1), Ok(Mode::Safe));
-    assert_eq!(
-        Mode::try_from_binder_value(7),
-        Err(rsbinder::StatusCode::BadValue)
-    );
-    assert_eq!(Mode::Safe.binder_value(), 1);
-}

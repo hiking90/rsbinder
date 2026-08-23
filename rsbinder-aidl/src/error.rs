@@ -227,6 +227,18 @@ pub enum SemanticError {
         span: SourceSpan,
     },
 
+    #[error("recursive parcelable: field type '{type_name}' closes a reference cycle")]
+    #[diagnostic(code(aidl::recursive_parcelable))]
+    RecursiveParcelable {
+        type_name: String,
+        #[help]
+        help: Option<String>,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this field makes '{type_name}' infinitely sized")]
+        span: SourceSpan,
+    },
+
     #[error("invalid operation: Primitive types and String cannot be an out or inout parameter")]
     #[diagnostic(code(aidl::invalid_direction))]
     DirectionPrimitive {

@@ -117,14 +117,14 @@ pub mod {{mod}} {
     {%- endif %}
     pub struct {{name}} {
     {%- for member in members %}
-        pub r#{{ member.0 }}: {{ member.1 }},
+        pub r#{{ member.identifier }}: {{ member.type_decl }},
     {%- endfor %}
     }
     impl Default for {{ name }} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
-                r#{{ member.0 }}: {{ member.2 }},
+                r#{{ member.identifier }}: {{ member.init }},
             {%- endfor %}
             }
         }
@@ -133,10 +133,10 @@ pub mod {{mod}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
-                {%- if member.4 %}
-                _sub_parcel.write(self.r#{{ member.0 }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)?;
+                {%- if member.needs_unexpected_null %}
+                _sub_parcel.write(self.r#{{ member.identifier }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?)?;
                 {%- else %}
-                _sub_parcel.write(&self.r#{{ member.0 }})?;
+                _sub_parcel.write(&self.r#{{ member.identifier }})?;
                 {%- endif %}
                 {%- endfor %}
                 Ok(())
@@ -146,12 +146,12 @@ pub mod {{mod}} {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
                 if !_sub_parcel.has_more_data() { return Ok(()); }
-                {%- if member.3 %}
-                _sub_parcel.read_onto(&mut self.r#{{ member.0 }})?;
+                {%- if member.is_holder %}
+                _sub_parcel.read_onto(&mut self.r#{{ member.identifier }})?;
                 {%- else %}
-                self.r#{{ member.0 }} = _sub_parcel.read()?;
-                {%- if member.4 %}
-                if self.r#{{ member.0 }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                self.r#{{ member.identifier }} = _sub_parcel.read()?;
+                {%- if member.needs_unexpected_null %}
+                if self.r#{{ member.identifier }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
                 {%- endif %}
                 {%- endif %}
                 {%- endfor %}
@@ -660,34 +660,56 @@ fn template() -> &'static tera::Tera {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Render layer (plan 2-19 P0)
-//
-// The tera templates below are the single source of generated code, and
-// everything the AIDL front-end computes for them is plain data. Exposing that
-// data plus the render entry points lets a second front-end — the
-// `#[rsbinder::interface]` macro in `rsbinder-macros` — fill the same structs
-// from a Rust trait and get byte-identical output, without a second copy of
-// the templates. `Generator` goes through these same functions for interface,
-// parcelable and enum; union stays AIDL-only (`decl_union` renders directly).
-//
-// Member lists stay tuples because the templates index them positionally
-// (`member.0`, `member.1`, …); the aliases below name the positions.
-// ---------------------------------------------------------------------------
+// Union has no render entry point — `decl_union` renders directly.
 
 /// One generated constant: `(identifier, type declaration, initializer)`.
+///
+/// A positional tuple, not a struct: the templates index it by position, so
+/// unlike [`InterfaceRender`] and friends its shape is fixed — growing it is a
+/// breaking change for any front-end that fills it.
 pub type ConstMember = (String, String, String);
 
-/// One parcelable field: `(identifier, type declaration, initializer,
-/// is_holder, needs_unexpected_null)`.
+/// One parcelable field.
 ///
-/// `is_holder` reads through `read_onto` so a `ParcelableHolder`'s pre-set
-/// stability survives; `needs_unexpected_null` marks a non-nullable
-/// binder/PFD field stored as `Option<T>` only for lack of `Default`, which
-/// must unwrap to `UNEXPECTED_NULL` on write rather than emit a null marker.
-pub type ParcelableMember = (String, String, String, bool, bool);
+/// `#[non_exhaustive]`: build one with [`ParcelableMember::new`] and assign the
+/// rest, so a new template field stays a minor release.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ParcelableMember {
+    pub identifier: String,
+    /// Rust type declaration of the field.
+    pub type_decl: String,
+    /// Initializer used by the generated `impl Default`.
+    pub init: String,
+    /// Read through `read_onto` so a `ParcelableHolder`'s pre-set stability
+    /// survives the decode.
+    pub is_holder: bool,
+    /// A non-nullable binder/PFD field stored as `Option<T>` only for lack of
+    /// `Default`, which must unwrap to `UNEXPECTED_NULL` on write rather than
+    /// emit a null marker.
+    pub needs_unexpected_null: bool,
+}
+
+impl ParcelableMember {
+    /// A plain field: no holder read-through, no null guard.
+    pub fn new(
+        identifier: impl Into<String>,
+        type_decl: impl Into<String>,
+        init: impl Into<String>,
+    ) -> Self {
+        Self {
+            identifier: identifier.into(),
+            type_decl: type_decl.into(),
+            init: init.into(),
+            is_holder: false,
+            needs_unexpected_null: false,
+        }
+    }
+}
 
 /// One enum variant: `(identifier, discriminant)`.
+///
+/// Positional and therefore fixed in shape, as [`ConstMember`] is.
 pub type EnumMember = (String, i64);
 
 /// AOSP `ClassName` (`aidl_to_cpp_common.cpp`): the `Bn`/`Bp` stem strips a
@@ -702,15 +724,20 @@ pub fn interface_stem(name: &str) -> &str {
 }
 
 /// Inputs for [`render_interface`] — the interface template's full context.
+///
+/// `#[non_exhaustive]`: the template grows fields as AIDL features land, and
+/// adding one must stay a minor release. Build one with [`InterfaceRender::new`]
+/// and assign the rest.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct InterfaceRender {
     /// Path prefix the generated code uses for rsbinder items: `"rsbinder"`
     /// for downstream crates, `"crate"` when generating inside rsbinder.
     pub crate_name: String,
-    /// Name of the wrapping `pub mod`.
+    /// Name of the wrapping `pub mod`, `r#`-escaped if it is a Rust keyword.
     pub module: String,
-    /// Trait name, already `r#`-escapable (a Rust keyword must be escaped by
-    /// the caller, as [`Generator`] does).
+    /// Trait name, `r#`-escaped if it is a Rust keyword. [`InterfaceRender::new`]
+    /// escapes it; a struct literal must do so itself.
     pub name: String,
     /// Interface descriptor written on the wire.
     pub namespace: String,
@@ -788,16 +815,54 @@ impl InterfaceRender {
     /// Start from a trait name and descriptor, deriving `module`, `bn_name`
     /// and `bp_name` the way the AIDL front-end does. `crate_name` defaults to
     /// `"rsbinder"`.
+    ///
+    /// `name` is the **unescaped** interface name. A Rust keyword is
+    /// `r#`-escaped here for `module`/`name`, while `bn_name`/`bp_name` derive
+    /// from the bare stem — escaping before the call would yield `Bnr#type`,
+    /// which does not lex.
     pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
-        let name = name.into();
-        let stem = interface_stem(&name);
+        let raw = name.into();
+        let stem = interface_stem(&raw);
+        let bn_name = format!("Bn{stem}");
+        let bp_name = format!("Bp{stem}");
+        let escaped = crate::escape_rust_keyword(&raw).into_owned();
         Self {
             crate_name: "rsbinder".to_string(),
-            module: name.clone(),
-            bn_name: format!("Bn{stem}"),
-            bp_name: format!("Bp{stem}"),
+            module: escaped.clone(),
+            bn_name,
+            bp_name,
             namespace: namespace.into(),
-            name,
+            name: escaped,
+            ..Default::default()
+        }
+    }
+}
+
+impl ParcelableRender {
+    /// Start from a parcelable name and descriptor. `name` is the
+    /// **unescaped** name; a Rust keyword is `r#`-escaped here.
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+        let escaped = crate::escape_rust_keyword(&name.into()).into_owned();
+        Self {
+            module: escaped.clone(),
+            name: escaped,
+            namespace: namespace.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl EnumRender {
+    /// Start from an enum name and its backing Rust type (`i8`/`i32`/`i64`).
+    /// `name` is the **unescaped** name: the enum template writes it through
+    /// `declare_binder_enum!`, which prefixes `r#` itself, while `module` is
+    /// escaped here.
+    pub fn new(name: impl Into<String>, backing_type: impl Into<String>) -> Self {
+        let raw = name.into();
+        Self {
+            module: crate::escape_rust_keyword(&raw).into_owned(),
+            name: raw,
+            backing_type: backing_type.into(),
             ..Default::default()
         }
     }
@@ -834,7 +899,11 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
 }
 
 /// Inputs for [`render_parcelable`].
+///
+/// `#[non_exhaustive]`: build one with [`ParcelableRender::new`] and assign the
+/// rest, so a new template field stays a minor release.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParcelableRender {
     pub crate_name: String,
     pub module: String,
@@ -869,7 +938,11 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
 }
 
 /// Inputs for [`render_enum`].
+///
+/// `#[non_exhaustive]`: build one with [`EnumRender::new`] and assign the rest,
+/// so a new template field stays a minor release.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EnumRender {
     pub crate_name: String,
     pub module: String,
@@ -897,12 +970,27 @@ pub fn render_enum(r: &EnumRender) -> Result<String, AidlError> {
 }
 
 /// One out/inout arg written back to the reply in `on_transact`.
+///
+/// `#[non_exhaustive]`: build one with [`TransactionWrite::new`] and assign the
+/// rest, so a new template field stays a minor release.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct TransactionWrite {
     pub identifier: String,
     /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
     /// writing this arg back (`TypeGenerator::out_array_needs_null_guard`).
     pub needs_null_guard: bool,
+}
+
+impl TransactionWrite {
+    /// An arg written back unguarded; set `needs_null_guard` for the
+    /// out-fd-array case.
+    pub fn new(identifier: impl Into<String>) -> Self {
+        Self {
+            identifier: identifier.into(),
+            needs_null_guard: false,
+        }
+    }
 }
 
 /// Everything the interface template needs about one method, as
@@ -914,7 +1002,10 @@ pub struct TransactionWrite {
 /// same template. Serialization in the template is trait-generic
 /// (`parcel.write(&x)` / `read()`), which is why no type classification
 /// survives into this struct.
+/// `#[non_exhaustive]`: build one with [`FnMembers::new`] and assign the rest,
+/// so a new template field stays a minor release.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct FnMembers {
     pub identifier: String,
     /// Sync signature args, `&self`-first (`"&self, _arg_x: &str"`).
@@ -942,6 +1033,18 @@ pub struct FnMembers {
     /// (AOSP `EX_SECURITY`) on permission denial. `None` when the
     /// method carries no `@EnforcePermission`.
     pub enforce_permission_check: Option<String>,
+}
+
+impl FnMembers {
+    /// Start from the two fields with no sensible default — the method name
+    /// and its transaction code — and assign the rest.
+    pub fn new(identifier: impl Into<String>, transaction_code: u32) -> Self {
+        Self {
+            identifier: identifier.into(),
+            transaction_code,
+            ..Default::default()
+        }
+    }
 }
 
 fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMembers, AidlError> {
@@ -1512,6 +1615,7 @@ pub mod {mod} {{
                 if let Some(var) = decl.is_variable() {
                     let generator = var.r#type.to_generator()?;
                     generator.ensure_resolvable()?;
+                    generator.ensure_sized()?;
 
                     if var.constant {
                         constant_members.push((
@@ -1528,27 +1632,19 @@ pub mod {mod} {{
                             _ => var.const_expr.clone(),
                         };
 
-                        members.push((
-                            var.identifier(),
-                            generator.type_declaration(true),
-                            generator.init_value(
+                        members.push(ParcelableMember {
+                            identifier: var.identifier(),
+                            type_decl: generator.type_declaration(true),
+                            init: generator.init_value(
                                 init_value.as_ref(),
                                 InitParam::builder()
                                     .with_const(false)
                                     .with_vintf(is_vintf)
                                     .with_crate_name(self.get_crate_name()),
                             )?,
-                            // is_holder: read via `read_onto` so the field's
-                            // pre-set stability survives (see ParcelableHolder
-                            // ::deserialize_from).
-                            matches!(generator.value_type, ValueType::Holder),
-                            // needs_unexpected_null: a non-nullable
-                            // IBinder/interface/PFD field is stored as
-                            // `Option<T>` only for lack of `Default`; on
-                            // write, unwrap with `UNEXPECTED_NULL` instead of
-                            // emitting a null marker (AOSP-faithful).
-                            generator.is_option_but_not_nullable(),
-                        ))
+                            is_holder: matches!(generator.value_type, ValueType::Holder),
+                            needs_unexpected_null: generator.is_option_but_not_nullable(),
+                        })
                     }
                 } else {
                     declarations.push(decl.clone());
@@ -1694,6 +1790,7 @@ pub mod {mod} {{
             if let parser::Declaration::Variable(var) = member {
                 let generator = var.r#type.to_generator()?;
                 generator.ensure_resolvable()?;
+                generator.ensure_sized()?;
                 if var.constant {
                     constant_members.push((
                         var.const_identifier(),

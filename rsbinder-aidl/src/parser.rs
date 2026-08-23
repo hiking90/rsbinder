@@ -316,6 +316,103 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
     })
 }
 
+/// The one type name a member holds **by value** — the edges of the sizing
+/// graph in [`declaration_reaches`].
+///
+/// A variable-length array, a `List<T>` or a `Map<K, V>` is rendered as a
+/// `Vec`/`HashMap`, so it is a fixed-size handle whatever it holds and can
+/// never close a sizing cycle. Only a bare name, or one under fixed-size
+/// array dimensions, keeps its declaration inline.
+fn by_value_type_name(ty: &Type) -> Option<&str> {
+    if ty.array_types.iter().any(|a| a.const_expr.is_none()) {
+        return None;
+    }
+    if ty.non_array_type.generic.is_some() {
+        return None;
+    }
+    Some(&ty.non_array_type.name)
+}
+
+fn value_members(ns: &Namespace) -> Option<Vec<Declaration>> {
+    DECLARATION_MAP.with(|map| match map.borrow().get(ns) {
+        Some(Declaration::Parcelable(p)) => Some(p.members.clone()),
+        Some(Declaration::Union(u)) => Some(u.members.clone()),
+        _ => None,
+    })
+}
+
+/// Whether a declaration stores its members by value, without cloning the
+/// subtree [`value_members`] would hand back just to test it.
+fn is_value_decl(ns: &Namespace) -> bool {
+    DECLARATION_MAP.with(|map| {
+        matches!(
+            map.borrow().get(ns),
+            Some(Declaration::Parcelable(_) | Declaration::Union(_))
+        )
+    })
+}
+
+/// Can `start` reach `target` by following the fields of parcelables and
+/// unions? A reference cycle of any length is an infinitely sized Rust type, so
+/// the field that closes it has to be boxed — a direct self-reference is only
+/// the shortest case.
+///
+/// Only members held by value are edges, as [`by_value_type_name`] decides.
+/// Anything reached through a handle keeps the enclosing type finite and must
+/// not be boxed: an interface is a `Strong<dyn …>` — the
+/// `CircularParcelable` / `ITestService` pair in the AOSP fixtures is exactly
+/// that shape — and a `Vec`/`HashMap` element is behind an allocation.
+pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
+    if !is_value_decl(start) || !is_value_decl(target) {
+        return false;
+    }
+
+    let mut seen = HashSet::new();
+    let mut pending = vec![start.clone()];
+
+    while let Some(ns) = pending.pop() {
+        if !seen.insert(ns.clone()) {
+            continue;
+        }
+        let Some(members) = value_members(&ns) else {
+            continue;
+        };
+
+        // Member type names are written relative to their own declaration, so
+        // resolve them under that declaration's namespace and imports.
+        let _doc = declaration_document_context(&ns).map(|ctx| DocumentGuard::new(&ctx));
+        let _guard = NamespaceGuard::new(&ns);
+        for member in &members {
+            let Some(var) = member.is_variable() else {
+                continue;
+            };
+            if var.constant {
+                continue;
+            }
+            let Some(name) = by_value_type_name(&var.r#type) else {
+                continue;
+            };
+            let Some(found) = lookup_decl_from_name(name, Namespace::AIDL) else {
+                continue;
+            };
+            // A synthetic union `Tag` reports its parent union's namespace, so
+            // the declaration kind — not the namespace — decides whether this
+            // member is an edge. A `Tag` is a scalar and holds no union.
+            if !matches!(
+                found.decl,
+                Declaration::Parcelable(_) | Declaration::Union(_)
+            ) {
+                continue;
+            }
+            if found.ns == *target {
+                return true;
+            }
+            pending.push(found.ns);
+        }
+    }
+    false
+}
+
 fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> ConstExpr {
     if let Some(expr) = const_expr {
         expr.clone()

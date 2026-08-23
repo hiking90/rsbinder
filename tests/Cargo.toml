@@ -33,5 +33,12 @@ name = "mesh_node"
 path = "src/bin/mesh_node.rs"
 required-features = ["rpc"]
 
+# Declared so a missing feature is an error rather than a file that `#![cfg]`
+# compiles away to zero tests and a green run.
+[[test]]
+name = "macro_cross"
+path = "tests/macro_cross.rs"
+required-features = ["rpc", "macros"]
+
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

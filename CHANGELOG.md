@@ -37,7 +37,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `render_interface` / `render_parcelable` / `render_enum`. This is the seam
   `rsbinder-macros` plugs into: the templates and their inputs are now a
   documented surface rather than private detail, so a second front-end cannot
-  drift from the AIDL one. Generated output is byte-for-byte unchanged.
+  drift from the AIDL one. Generated output is byte-for-byte unchanged. The
+  input structs are `#[non_exhaustive]` with `new()` constructors, so a
+  template gaining a field stays a minor release, and `ParcelableMember` is a
+  named struct rather than a five-element tuple whose two adjacent `bool`s
+  could be swapped without a compile error.
+- **rsbinder-aidl:** `Builder::dest_dir` — set the output directory directly
+  instead of through the process-wide `OUT_DIR` environment variable, which a
+  caller outside a `build.rs` cannot set without a data race.
 
 - **rsbinder (entry API):** `rsbinder::serve(uri)` / `rsbinder::connect::<dyn I>(uri)`
   / `rsbinder::Client` — one bootstrap for every transport, selected by a
@@ -114,22 +121,53 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
-- **rsbinder (`macros` feature):** a batch of signature shapes the macros
-  accepted but should not have, all found by review and each now covered by a
-  compile-fail case: a `#[oneway]` method with an out/inout parameter (which
-  `.aidl` rejects, and whose value could never come back); a nullable out
-  vector, which generated code that did not type-check; an out
-  `ParcelFileDescriptor` array, which silently omitted the null guard `.aidl`
-  emits and would have put a null fd on the wire; a `ParcelableHolder` field,
-  whose derived codec could never decode a peer's `@VintfStability` holder; a
-  raw-identifier field such as `r#type`, which rendered as `r#r#type`; a
-  fixed-size out array longer than 32; and borrowed types nested inside another
-  type. A by-value argument must be `Copy` (the proxy passes it twice) and a
-  derived parcelable must implement `Default` — both are now stated in the
-  rustdoc and asserted against the user's own type instead of failing inside
-  generated code. `#[derive(BinderEnum)]` no longer requires `Copy` and accepts
+- **rsbinder (`macros` feature):** signature shapes the macros accepted but
+  should not have, all found by review and each now refused with a compile-fail
+  case in `rsbinder-macros/tests/ui`: a `#[oneway]` method with an out/inout
+  parameter (which `.aidl` rejects, and whose value could never come back); a
+  `ParcelableHolder` field, whose derived codec could never decode a peer's
+  `@VintfStability` holder; borrowed types nested inside another type; an
+  `unsafe` or `auto` trait and a variadic method, whose modifiers the
+  re-render dropped without a word; and a fixed-array length written as a named
+  constant, which the macro cannot evaluate and so silently mis-initialised.
+- **rsbinder (`macros` feature):** shapes that no `.aidl` can express are now
+  refused instead of building an interface with no migration path — `out`/
+  `inout` on a primitive, on `String` or on `ParcelFileDescriptor`, and
+  `Option<T>` over a primitive. AOSP's `GetArgumentAspect` gives every
+  non-array builtin `in` as its only direction and rejects `@nullable` on a
+  scalar; `rsbinder-aidl` matched it, the macros did not.
+- **rsbinder (`macros` feature):** shapes the macros accepted and now render
+  correctly, unit-tested in `rsbinder-macros`: a nullable out vector, which
+  generated code that did not type-check; an out `ParcelFileDescriptor` array,
+  which silently omitted the null guard `.aidl` emits and would have put a null
+  fd on the wire; a raw-identifier field such as `r#type`, which rendered as
+  `r#r#type`; and a fixed-size out array longer than 32. A by-value argument
+  must be `Copy` (the proxy passes it twice) and a derived parcelable must
+  implement `Default` — both are now stated in the rustdoc and asserted against
+  the user's own type instead of failing inside generated code.
+  `#[derive(BinderEnum)]` no longer requires `Copy` and accepts
   `#[repr(i32, align(8))]`; an unrecognised method attribute is refused rather
   than dropped; and the generated items follow the trait's own visibility.
+- **rsbinder (`macros` feature):** `#[derive(BinderEnum)]` re-emitted each
+  variant's discriminant *expression* and cast that, so the literal inside was
+  typed on its own and fell back to `i32`: `#[repr(i64)] A = 1 << 31` went on
+  the wire as `-2147483648` instead of `2147483648`, and `1 << 40` failed to
+  compile with a message about `i32`. Both ends of the macro used the same
+  wrong value, so only a `.aidl` or AOSP peer saw the mismatch. The codec now
+  casts the declared variant.
+- **rsbinder (`macros` feature):** a `descriptor = "…"` containing a backslash
+  or a quote was spliced verbatim into the generated source, either changing
+  the wire descriptor or breaking the string literal — the latter surfacing as
+  a parse failure printing the whole generated module. It is now refused on the
+  attribute itself. The `.aidl` path is spared this by its grammar.
+- **rsbinder (`macros` feature):** a type reaching the macros through a
+  `macro_rules!` `$t:ty` capture, or wrapped in parentheses, was refused as
+  "unsupported" even when it was something as ordinary as `i32` — `syn` hands
+  such a capture over inside invisible delimiters, which the type walkers now
+  see through. `#[derive(Parcelable)]` on a raw-identifier type also sent
+  `"r#type"` as its descriptor, where the `.aidl` path sends `"type"`; the
+  descriptor is wire-visible through `ParcelableHolder`, which records and
+  compares it.
 
 - **rsbinder-aidl:** an interface that names *itself* in a signature
   (`interface IFoo { void register(in IFoo cb); }`) rendered as
@@ -138,6 +176,40 @@ This changelog starts at 0.9.0. For earlier releases, see the
   was being applied to interfaces, where `Strong<dyn …>` is already a handle.
   Self-referencing callbacks now generate correctly; recursive parcelables are
   unchanged, and so is every other generated file.
+- **rsbinder-aidl:** two parcelables that reference *each other* produced an
+  infinitely sized Rust type (`E0072`). The box guard compared names, so it saw
+  only cycles of length one; it now walks the declaration graph. A cycle that
+  runs through an interface stays unboxed — `Strong<dyn …>` is a handle, which
+  is what makes the AOSP `CircularParcelable` / `ITestService` pair finite. So
+  is a cycle that runs through an array or a `List`: a `Vec` element is a
+  fixed-size handle whatever it holds, and `Box<T>` implements neither
+  `SerializeArray` nor `DeserializeArray`, so boxing one emitted a
+  `Vec<Box<T>>` that did not compile. `<Union>.Tag` is likewise never boxed —
+  it resolves to its parent union's namespace, which made it look like the
+  union itself, but the generated `Tag` is a scalar newtype holding no union.
+- **rsbinder-aidl:** a cycle closed by a **non-nullable** field is now a
+  diagnostic (`aidl::recursive_parcelable`) rather than a box. `Box<T>` alone
+  breaks the size, not the recursion: the generated `impl Default` — which is
+  the deserialization entry point, not decoration — called itself until the
+  stack ran out, so a peer's parcel aborted the process. `@nullable` renders
+  the field as `Option<Box<T>>`, which terminates; AOSP likewise requires the
+  cycle-closing field to be nullable.
+- **rsbinder (`macros` feature):** a second batch of signature shapes, each now
+  covered by a test. A raw identifier — `fn r#type`, or an argument named
+  `r#match` — rendered as `fn r#r#type` / `_arg_r#type` and did not lex, the
+  same double-escape already fixed for parcelable fields. An out parameter
+  spelled through a qualified path (`&mut std::vec::Vec<i32>`) silently lost
+  the length word `.aidl` writes, and a qualified `ParcelFileDescriptor`
+  element lost the null guard that keeps a null fd off the wire — those
+  decisions now read the type, not its rendered text. `BinderResult<Option<&T>>`
+  was rewritten to `Option<String>` with no diagnostic on the declaration. An
+  attribute on the *trait* (a `#[cfg]`, a trait-level `#[oneway]`), a where
+  clause, and `async`/`unsafe`/`const`/`extern` on a method were all dropped by
+  the re-render rather than refused. `self::` in a signature resolved inside the
+  generated module instead of the caller's. The generated module followed
+  neither the trait's visibility — a private trait was reachable through it —
+  nor the scope its own `Copy` assertion used, so a path in a by-value argument
+  was resolved at two different depths.
 
 ### Removed
 

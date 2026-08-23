@@ -282,6 +282,18 @@ impl Builder {
         self
     }
 
+    /// Directory [`Builder::output`] is resolved against, overriding the
+    /// `OUT_DIR` environment variable this builder otherwise reads.
+    ///
+    /// `OUT_DIR` is process-wide, so a caller outside a `build.rs` — a test
+    /// generating into a temporary directory, a tool driving several builders
+    /// — would have to mutate the environment to steer the output, which is
+    /// not thread-safe. Set the directory here instead.
+    pub fn dest_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.dest_dir = dir.as_ref().into();
+        self
+    }
+
     /// Stamp the **most recently added** source with an interface version,
     /// equivalent to AOSP `aidl --version N`. Causes the generator to emit
     /// `pub const VERSION: i32 = N;` plus a synthetic `getInterfaceVersion()`
