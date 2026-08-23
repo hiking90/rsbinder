@@ -1,0 +1,5 @@
+error: a borrowed type nested inside another type is not supported — the decoded value is owned, so there is nothing for it to borrow from; use the owned form
+ --> tests/ui/nested_reference_arg.rs:5:26
+  |
+5 |     fn go(&self, tags: &[&str]) -> rsbinder::BinderResult<()>;
+  |                          ^^^^

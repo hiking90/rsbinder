@@ -51,14 +51,19 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    let arms = variants.iter().map(|(ident, value)| {
+    let read_arms = variants.iter().map(|(ident, value)| {
         quote! { v if v == (#value) as #backing => Ok(#name::#ident), }
+    });
+    // `self as #backing` would move out of `&self` unless the enum is `Copy`;
+    // matching asks nothing of the user's type.
+    let write_arms = variants.iter().map(|(ident, value)| {
+        quote! { #name::#ident => (#value) as #backing, }
     });
 
     Ok(quote! {
         impl rsbinder::Serialize for #name {
             fn serialize(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
-                parcel.write(&(*self as #backing))
+                parcel.write(&self.binder_value())
             }
         }
 
@@ -67,7 +72,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                 slice: &[Self],
                 parcel: &mut rsbinder::Parcel,
             ) -> rsbinder::Result<()> {
-                let values: Vec<#backing> = slice.iter().map(|v| *v as #backing).collect();
+                let values: Vec<#backing> = slice.iter().map(#name::binder_value).collect();
                 <#backing as rsbinder::SerializeArray>::serialize_array(&values, parcel)
             }
         }
@@ -93,8 +98,8 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
 
         impl #name {
             /// The wire value of this variant.
-            pub const fn binder_value(self) -> #backing {
-                self as #backing
+            pub fn binder_value(&self) -> #backing {
+                match self { #(#write_arms)* }
             }
 
             /// A wire value back to a variant.
@@ -107,7 +112,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             /// different versions.
             pub fn try_from_binder_value(value: #backing) -> rsbinder::Result<Self> {
                 match value {
-                    #(#arms)*
+                    #(#read_arms)*
                     _ => Err(rsbinder::StatusCode::BadValue),
                 }
             }
@@ -122,14 +127,19 @@ fn backing_type(input: &DeriveInput) -> syn::Result<Ident> {
         if !attr.path().is_ident("repr") {
             continue;
         }
-        attr.parse_nested_meta(|meta| {
-            if let Some(ident) = meta.path.get_ident() {
+        // Token scan, not `parse_nested_meta`: the callback would have to
+        // consume `align(8)`'s argument list, and failing to leaves syn
+        // reporting `expected ,` instead of anything about the backing type.
+        let Ok(list) = attr.meta.require_list() else {
+            continue;
+        };
+        for token in list.tokens.clone() {
+            if let proc_macro2::TokenTree::Ident(ident) = token {
                 if BACKINGS.contains(&ident.to_string().as_str()) {
-                    found = Some(ident.clone());
+                    found = Some(ident);
                 }
             }
-            Ok(())
-        })?;
+        }
     }
     found.ok_or_else(|| {
         syn::Error::new_spanned(
@@ -203,5 +213,32 @@ mod tests {
         ] {
             assert!(out.contains(expected), "missing {expected} in:\n{out}");
         }
+    }
+
+    #[test]
+    fn accepts_a_repr_with_extra_modifiers() {
+        let input: DeriveInput = syn::parse2(quote! {
+            #[repr(i32, align(8))]
+            enum Mode { Fast = 0 }
+        })
+        .unwrap();
+        assert!(expand(&input).is_ok());
+    }
+
+    #[test]
+    fn does_not_require_copy() {
+        // `self as #backing` would move out of `&self`; the emitted code must
+        // match on the variant instead.
+        let input: DeriveInput = syn::parse2(quote! {
+            #[repr(i32)]
+            enum Mode { Fast = 0, Safe = 1 }
+        })
+        .unwrap();
+        let out = expand(&input).unwrap().to_string();
+        assert!(
+            !out.contains("as i32) ;") || !out.contains("* self"),
+            "{out}"
+        );
+        assert!(out.contains("match self"), "{out}");
     }
 }

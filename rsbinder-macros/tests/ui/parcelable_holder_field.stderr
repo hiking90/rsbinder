@@ -1,0 +1,5 @@
+error: a `ParcelableHolder` field needs the `.aidl` path: its stability is set before the read and the derived codec would replace the whole field, so a peer's `@VintfStability` holder can never be decoded
+ --> tests/ui/parcelable_holder_field.rs:5:14
+  |
+5 |     pub ext: rsbinder::ParcelableHolder,
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^

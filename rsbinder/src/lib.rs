@@ -232,6 +232,12 @@ pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
     ServerGuard,
 };
+// Generated `IFooAsyncService` impls carry this attribute. Re-exported so a
+// consumer of generated code needs no `async-trait` line of its own.
+#[cfg(feature = "async")]
+#[doc(hidden)]
+pub use async_trait::async_trait as __async_trait;
+
 // The `.aidl`-free path (plan 2-19), behind the `macros` feature: declare an
 // interface as a Rust trait and its data types as ordinary structs and enums.
 // See the `rsbinder_macros` crate docs for the signature rules and for what

@@ -326,10 +326,11 @@ impl TypeGenerator {
         // `relative_mod` module path is already keyword-escaped.
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
-        let refers_to_self = curr_ns.ns.last().unwrap() == lookup_decl.name.ns.last().unwrap();
+        let refers_to_self =
+            || curr_ns.ns.last() == Some(lookup_decl.name.ns.last().expect("named decl"));
         let name = if !ns.is_empty() {
             format!("{ns}::{simple}")
-        } else if refers_to_self && !is_interface {
+        } else if !is_interface && refers_to_self() {
             // A parcelable that names itself would be infinitely sized, so the
             // field has to be behind a pointer. An interface must NOT be boxed
             // here: it is already rendered as `Strong<dyn …>`, which is a

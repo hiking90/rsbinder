@@ -247,7 +247,7 @@ pub mod {{mod}} {
     /// Asynchronous **server** view of `{{name}}`: implement this (with
     /// `#[async_trait]`) on your service, then wrap it with
     /// [`{{bn_name}}::new_async_binder`] to publish it as a binder.
-    #[::async_trait::async_trait]
+    #[{{crate}}::__async_trait]
     pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
@@ -668,8 +668,8 @@ fn template() -> &'static tera::Tera {
 // data plus the render entry points lets a second front-end — the
 // `#[rsbinder::interface]` macro in `rsbinder-macros` — fill the same structs
 // from a Rust trait and get byte-identical output, without a second copy of
-// the templates. `Generator` goes through these same functions, so there is
-// exactly one render path.
+// the templates. `Generator` goes through these same functions for interface,
+// parcelable and enum; union stays AIDL-only (`decl_union` renders directly).
 //
 // Member lists stay tuples because the templates index them positionally
 // (`member.0`, `member.1`, …); the aliases below name the positions.
@@ -702,7 +702,7 @@ pub fn interface_stem(name: &str) -> &str {
 }
 
 /// Inputs for [`render_interface`] — the interface template's full context.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct InterfaceRender {
     /// Path prefix the generated code uses for rsbinder items: `"rsbinder"`
     /// for downstream crates, `"crate"` when generating inside rsbinder.
@@ -732,6 +732,58 @@ pub struct InterfaceRender {
     pub hash: Option<String>,
 }
 
+/// `crate_name` defaults to `"rsbinder"`, not the empty string a derived
+/// `Default` would give: an empty path renders `impl ::Parcelable for Foo`,
+/// which the render functions would still return as `Ok`.
+impl Default for InterfaceRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            namespace: String::new(),
+            bn_name: String::new(),
+            bp_name: String::new(),
+            const_members: Vec::new(),
+            fn_members: Vec::new(),
+            oneway: false,
+            nested: String::new(),
+            enabled_async: false,
+            is_vintf: false,
+            version: None,
+            hash: None,
+        }
+    }
+}
+
+impl Default for ParcelableRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            namespace: String::new(),
+            derive: String::new(),
+            members: Vec::new(),
+            const_members: Vec::new(),
+            nested: String::new(),
+            is_vintf: false,
+        }
+    }
+}
+
+impl Default for EnumRender {
+    fn default() -> Self {
+        Self {
+            crate_name: "rsbinder".to_string(),
+            module: String::new(),
+            name: String::new(),
+            backing_type: String::new(),
+            members: Vec::new(),
+        }
+    }
+}
+
 impl InterfaceRender {
     /// Start from a trait name and descriptor, deriving `module`, `bn_name`
     /// and `bp_name` the way the AIDL front-end does. `crate_name` defaults to
@@ -753,6 +805,8 @@ impl InterfaceRender {
 
 /// Render one interface module. Output is `pub mod {module} { … }`; a
 /// front-end that wants the items unwrapped strips the module itself.
+///
+/// Union has no counterpart here — it is `.aidl`-only.
 pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     let mut context = tera::Context::new();
     context.insert("crate", &r.crate_name);
@@ -780,7 +834,7 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
 }
 
 /// Inputs for [`render_parcelable`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ParcelableRender {
     pub crate_name: String,
     pub module: String,
@@ -815,7 +869,7 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
 }
 
 /// Inputs for [`render_enum`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct EnumRender {
     pub crate_name: String,
     pub module: String,

@@ -14,6 +14,7 @@
 #![allow(non_snake_case)]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use rsbinder::{interface, BinderEnum, BinderResult, Interface, Parcelable, Strong};
 
@@ -23,11 +24,7 @@ use macrocross::CrossCfg::CrossCfg as AidlCfg;
 use macrocross::CrossMode::CrossMode as AidlMode;
 use macrocross::IMacroCross::{BnMacroCross as AidlBn, IMacroCross as AidlIface};
 
-// ---------------------------------------------------------------------------
-// The same contract, declared as Rust. Method order is the transaction
-// numbering, so it has to match the `.aidl` exactly; the descriptor is what
-// the cast checks.
-// ---------------------------------------------------------------------------
+// Method order is the transaction numbering: it must match the `.aidl`.
 
 #[derive(Parcelable, Default, Debug, Clone, PartialEq)]
 #[parcelable(descriptor = "macrocross.CrossCfg")]
@@ -57,7 +54,9 @@ pub trait IMacroSide {
 }
 
 /// Service written against the macro-declared trait.
-struct MacroSvc;
+struct MacroSvc {
+    pinged: Arc<Mutex<u32>>,
+}
 impl Interface for MacroSvc {}
 impl IMacroSide for MacroSvc {
     fn echo(&self, s: &str) -> BinderResult<String> {
@@ -83,12 +82,15 @@ impl IMacroSide for MacroSvc {
         Ok(s.map(str::to_uppercase))
     }
     fn ping(&self) -> BinderResult<()> {
+        *self.pinged.lock().unwrap() += 1;
         Ok(())
     }
 }
 
 /// The same service written against the `.aidl`-generated trait.
-struct AidlSvc;
+struct AidlSvc {
+    pinged: Arc<Mutex<u32>>,
+}
 impl Interface for AidlSvc {}
 impl AidlIface for AidlSvc {
     fn r#echo(&self, s: &str) -> BinderResult<String> {
@@ -114,6 +116,7 @@ impl AidlIface for AidlSvc {
         Ok(s.map(str::to_uppercase))
     }
     fn r#ping(&self) -> BinderResult<()> {
+        *self.pinged.lock().unwrap() += 1;
         Ok(())
     }
 }
@@ -140,14 +143,21 @@ impl Drop for SockPath {
 #[test]
 fn aidl_client_calls_a_macro_service() {
     let sock = SockPath::new("m2a");
+    let pinged = Arc::new(Mutex::new(0));
     let _guard = rsbinder::serve(&sock.uri(""))
         .expect("serve")
-        .add("svc", BnMacroSide::new_binder(MacroSvc))
+        .add(
+            "svc",
+            BnMacroSide::new_binder(MacroSvc {
+                pinged: pinged.clone(),
+            }),
+        )
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    // The cast succeeds only because both sides agree on the descriptor.
+    // Over RPC the descriptors are checked by the interface token on the
+    // first transact, not by this cast.
     let svc: Strong<dyn AidlIface> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
 
     assert_eq!(svc.r#echo("x").unwrap(), "macro:x");
@@ -174,17 +184,26 @@ fn aidl_client_calls_a_macro_service() {
     assert_eq!(back.r#retries, 2);
     assert_eq!(back.r#extra, Some(vec![9, 9]));
 
+    // `ping` is the last method, so a transaction-code drift between the two
+    // declarations shows up here first — but only if the arrival is observed.
     svc.r#ping().unwrap();
     svc.r#echo("barrier").unwrap();
+    assert_eq!(*pinged.lock().unwrap(), 1);
 }
 
 /// `.aidl`-generated service, macro-declared proxy.
 #[test]
 fn macro_client_calls_an_aidl_service() {
     let sock = SockPath::new("a2m");
+    let pinged = Arc::new(Mutex::new(0));
     let _guard = rsbinder::serve(&sock.uri(""))
         .expect("serve")
-        .add("svc", AidlBn::new_binder(AidlSvc))
+        .add(
+            "svc",
+            AidlBn::new_binder(AidlSvc {
+                pinged: pinged.clone(),
+            }),
+        )
         .expect("add")
         .spawn()
         .expect("spawn");
@@ -218,4 +237,5 @@ fn macro_client_calls_an_aidl_service() {
 
     svc.ping().unwrap();
     svc.echo("barrier").unwrap();
+    assert_eq!(*pinged.lock().unwrap(), 1);
 }

@@ -31,8 +31,11 @@ quote = "1"
 
 [dev-dependencies]
 # The UI tests compile real macro invocations, so they need the runtime the
-# generated code names. This is a dev-dependency cycle (rsbinder depends on
-# this crate for the `macros` feature); cargo allows it, and it keeps the
-# rejection messages tested where they are written.
-rsbinder = { workspace = true, features = ["macros"] }
-trybuild = "1"
+# generated code names — a dev-dependency cycle, which cargo allows. Declared
+# path-only on purpose: a version here survives into the published manifest and
+# deadlocks the first release of the pair, since neither crate can be uploaded
+# before the other.
+rsbinder = { path = "../rsbinder", features = ["macros"] }
+# Held at 1.0.119: 1.0.120 declares `rust-version = 1.88`, above this
+# workspace's 1.85, and the `rust_min` CI jobs build dev-dependencies.
+trybuild = "=1.0.119"

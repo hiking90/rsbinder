@@ -95,11 +95,11 @@ sha2 = { version = "0.11", optional = true }
 # leaf dep on default builds either.
 getrandom = { version = "0.4", optional = true }
 
-# subplan 2-9 Phase A: macOS/BSD peer-credential resolution
-# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
 # `#[rsbinder::interface]`, behind the `macros` feature.
 rsbinder-macros = { workspace = true, optional = true }
 
+# subplan 2-9 Phase A: macOS/BSD peer-credential resolution
+# (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.
 [target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = { workspace = true }
 

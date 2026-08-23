@@ -1,0 +1,63 @@
+error[E0277]: the trait bound `String: Copy` is not satisfied
+ --> tests/ui/by_value_non_copy_arg.rs:5:21
+  |
+5 |     fn go(&self, s: String) -> rsbinder::BinderResult<()>;
+  |                     ^^^^^^ the trait `Copy` is not implemented for `String`
+  |
+note: required by a bound in `__rsbinder_assert_copy`
+ --> tests/ui/by_value_non_copy_arg.rs:3:1
+  |
+3 | #[interface]
+  | ^^^^^^^^^^^^ required by this bound in `__rsbinder_assert_copy`
+  = note: this error originates in the attribute macro `interface` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0382]: use of moved value
+ --> tests/ui/by_value_non_copy_arg.rs:3:1
+  |
+3 | #[interface]
+  | ^^^^^^^^^^^^
+  | |
+  | value used here after move
+  | move occurs because value has type `String`, which does not implement the `Copy` trait
+  |
+note: consider changing this parameter type in method `read_response_go` to borrow instead if owning the value isn't necessary
+ --> tests/ui/by_value_non_copy_arg.rs:3:1
+  |
+3 | #[interface]
+  | ^^^^^^^^^^^^
+  | |
+  | this parameter takes ownership of the value
+  | in this method
+  = note: this error originates in the attribute macro `interface` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider cloning the value if the performance cost is acceptable
+  |
+3 | #[interface].clone()
+  |             ++++++++
+help: borrow this binding in the pattern to avoid moving the value
+  |
+3 | ref #[interface]
+  | +++
+
+error[E0382]: use of moved value
+ --> tests/ui/by_value_non_copy_arg.rs:3:1
+  |
+3 | #[interface]
+  | ^^^^^^^^^^^^
+  | |
+  | use occurs due to use in closure
+  | value used here after move
+  | move occurs because value has type `String`, which does not implement the `Copy` trait
+  |
+note: consider changing this parameter type in method `read_response_go` to borrow instead if owning the value isn't necessary
+ --> tests/ui/by_value_non_copy_arg.rs:3:1
+  |
+3 | #[interface]
+  | ^^^^^^^^^^^^
+  | |
+  | this parameter takes ownership of the value
+  | in this method
+  = note: this error originates in the attribute macro `interface` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: borrow this binding in the pattern to avoid moving the value
+  |
+3 | ref #[interface]
+  | +++

@@ -36,7 +36,7 @@
 //!
 //! | Signature | Meaning |
 //! |---|---|
-//! | `x: T`, `x: &T`, `x: &str`, `x: &[T]` | in argument |
+//! | `x: T` (must be `Copy`), `x: &T`, `x: &str`, `x: &[T]` | in argument |
 //! | `x: &mut T` | **out** argument |
 //! | `#[inout] x: &mut T` | written **and** read back |
 //! | `Option<T>` | nullable |
@@ -58,6 +58,9 @@
 //! codes — so **reordering methods is a wire break**. The descriptor defaults
 //! to the bare trait name; pass `descriptor = "…"` for anything shared across
 //! crates.
+//!
+//! The generated code names `rsbinder::` directly, so the dependency has to
+//! keep that name — a `package = "rsbinder"` rename will not resolve.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -140,10 +143,11 @@ fn attr_descriptor(attrs: &[syn::Attribute], name: &str) -> syn::Result<Option<S
 /// including the size-prefixed header and the truncated-read handling that
 /// lets an older reader accept a newer writer's extra fields.
 ///
-/// Only the codec is generated. `Default`, `Debug`, `Clone` and friends stay
-/// yours to derive; a `#[derive(Parcelable, Default, Debug)]` line is the
-/// normal shape. The descriptor defaults to the type name and is overridden
-/// with `#[parcelable(descriptor = "…")]`.
+/// Only the codec is generated, so `Debug`, `Clone` and friends stay yours to
+/// derive — but **`Default` is required**: reading a parcelable that arrives
+/// as `null` builds one from it. `#[derive(Parcelable, Default, Debug)]` is
+/// the normal shape. The descriptor defaults to the type name and is
+/// overridden with `#[parcelable(descriptor = "…")]`.
 ///
 /// Fields must be named and owned. `ParcelableHolder` and non-nullable binder
 /// fields are `.aidl`-only shapes: spell a binder field `Option<Strong<dyn
@@ -169,6 +173,9 @@ pub fn derive_parcelable(item: TokenStream) -> TokenStream {
 /// #[repr(i32)]
 /// pub enum Mode { Fast = 0, Safe = 1 }
 /// ```
+///
+/// Nothing beyond the `repr` is required of the type — the codec matches on
+/// the variant rather than casting through a shared reference.
 ///
 /// **This enum is closed.** A value no variant declares deserializes to
 /// `rsbinder::StatusCode::BadValue`. An `.aidl` enum is open: its generated
@@ -212,17 +219,9 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
         ));
     };
 
-    // The generated module keeps `.aidl`'s shape — `transactions`,
-    // `DEFAULT_IMPL` and `on_transact` are fixed names, so two interfaces
-    // cannot be emitted side by side without one. Two adjustments make it
-    // usable from a macro, neither of which touches the body:
-    //
-    // 1. The module is named `<Trait>_binder`, not `<Trait>`. The glob
-    //    re-export below has to put the *trait* under the trait's name, and a
-    //    module of that name would win (an explicit item beats a glob).
-    // 2. `use super::*;` leads the body, because the types in the signature
-    //    are Rust paths the user wrote in the surrounding module — including
-    //    a sibling `#[interface]` trait — and the body is one level deeper.
+    // Renamed because an explicit module would beat the glob re-export to the
+    // trait's name; `use super::*;` because the signature's paths are the
+    // user's, one level up.
     let mod_ident = syn::Ident::new(&format!("{}_binder", item.ident), item.ident.span());
     module.ident = mod_ident.clone();
     if let Some((_, items)) = module.content.as_mut() {
@@ -234,10 +233,22 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<TokenStream> {
         );
     }
 
+    // The proxy passes each argument to `build_parcel_*` and then again to
+    // `read_response_*`, so a by-value argument has to be `Copy`. Assert it
+    // against the user's own type, or the move error lands on generated
+    // tokens with no span into their file.
+    let copied = by_value_types(item)?;
+    let vis = &item.vis;
     Ok(quote! {
+        #(
+            const _: fn() = || {
+                fn __rsbinder_assert_copy<T: ::core::marker::Copy>() {}
+                __rsbinder_assert_copy::<#copied>();
+            };
+        )*
         #[doc(hidden)]
         #module
-        pub use #mod_ident::*;
+        #vis use #mod_ident::*;
     }
     .into())
 }
@@ -307,6 +318,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         ));
     }
     let oneway = has_attr(&f.attrs, "oneway");
+    check_attrs(&f.attrs, &["oneway"])?;
 
     let mut inputs = f.sig.inputs.iter();
     match inputs.next() {
@@ -342,8 +354,17 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         // `rsbinder-aidl` prefixes every parameter with `_arg_`; match it so the
         // two paths emit the same signature. Trait parameter names do not bind
         // the `impl`, so this is invisible to users writing a service.
+        check_attrs(&pat_ty.attrs, &["inout"])?;
         let ident = format!("_arg_{}", pat_ident.ident);
         let dir = direction(&pat_ty.attrs, &pat_ty.ty)?;
+        if oneway && dir != Dir::In {
+            return Err(syn::Error::new_spanned(
+                &pat_ty.ty,
+                "a #[oneway] method cannot have an out/inout parameter — there is no reply to \
+                 write it back into",
+            ));
+        }
+        type_str::check_supported(&pat_ty.ty)?;
         let as_written = type_str::as_written(&pat_ty.ty)?;
         let owned = type_str::owned(&pat_ty.ty)?;
 
@@ -359,6 +380,8 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
                 format!("&{ident}")
             };
             write_funcs.push(format!("data.write({param})?;"));
+        } else if owned.starts_with("Option<Vec<") {
+            write_funcs.push(format!("data.write_slice_size({ident}.as_deref())?;"));
         } else if is_variable_array(&owned) {
             // An out `Vec` carries only its length on the request; the server
             // sizes its own buffer from it (AOSP `resizeOutVector`).
@@ -366,19 +389,31 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         }
 
         let (mutable, init) = match dir {
-            Dir::Out => ("mut ", "Default::default()".to_string()),
+            Dir::Out => (
+                "mut ",
+                type_str::out_default(&pat_ty.ty).unwrap_or_else(|| "Default::default()".into()),
+            ),
             Dir::Inout => ("mut ", "_reader.read()?".to_string()),
             Dir::In => ("", "_reader.read()?".to_string()),
         };
         transaction_decls.push(format!("let {mutable}{ident}: {owned} = {init};"));
-        if dir == Dir::Out && is_variable_array(&owned) {
-            transaction_decls.push(format!("_reader.resize_out_vec(&mut {ident})?;"));
+        if dir == Dir::Out {
+            if owned.starts_with("Option<Vec<") {
+                transaction_decls.push(format!("_reader.resize_nullable_out_vec(&mut {ident})?;"));
+            } else if is_variable_array(&owned) {
+                transaction_decls.push(format!("_reader.resize_out_vec(&mut {ident})?;"));
+            }
         }
 
         if dir != Dir::In {
             transaction_write.push(TransactionWrite {
                 identifier: ident.clone(),
-                needs_null_guard: false,
+                // AOSP writes a non-nullable out fd array back only if every
+                // element is present; a `None` would otherwise go out as a
+                // null fd where `.aidl` raises `UNEXPECTED_NULL`.
+                needs_null_guard: dir == Dir::Out
+                    && owned.starts_with("Vec<Option<")
+                    && owned.contains("ParcelFileDescriptor"),
             });
             read_onto_params.push(ident.clone());
         }
@@ -482,11 +517,61 @@ fn return_type(f: &TraitItemFn) -> syn::Result<String> {
     let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
         return Err(syn::Error::new_spanned(ty, "expected `BinderResult<T>`"));
     };
+    if matches!(inner, Type::Reference(_)) {
+        return Err(syn::Error::new_spanned(
+            inner,
+            "a return value is decoded into a fresh owned value, so it cannot be a reference — \
+             return `String`, `Vec<T>` or the owned type",
+        ));
+    }
+    type_str::check_supported(inner)?;
     type_str::owned(inner)
+}
+
+/// Argument types the signature takes by value.
+fn by_value_types(item: &ItemTrait) -> syn::Result<Vec<Type>> {
+    let mut out = Vec::new();
+    for trait_item in &item.items {
+        let TraitItem::Fn(f) = trait_item else {
+            continue;
+        };
+        for input in &f.sig.inputs {
+            let FnArg::Typed(pat_ty) = input else {
+                continue;
+            };
+            if !type_str::as_written(&pat_ty.ty)?.starts_with('&') {
+                out.push((*pat_ty.ty).clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
+}
+
+/// Anything unrecognised would be silently dropped — the trait is re-rendered
+/// from scratch, so a mistyped `#[oneway]` would quietly become a twoway call
+/// and a `#[cfg]` would be emitted regardless of its condition.
+fn check_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<()> {
+    for attr in attrs {
+        if attr.path().is_ident("doc") || allowed.iter().any(|a| attr.path().is_ident(a)) {
+            continue;
+        }
+        return Err(syn::Error::new_spanned(
+            attr,
+            format!(
+                "unsupported attribute; #[rsbinder::interface] understands only {} here",
+                allowed
+                    .iter()
+                    .map(|a| format!("#[{a}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A `Vec` is the only length-carrying out parameter shape in v1 scope.
@@ -520,7 +605,10 @@ mod golden {
     /// module, without the file header.
     fn from_aidl(aidl: &str, module: &str) -> String {
         let _guard = GENERATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("rsbinder_macros_golden_{module}"));
+        let dir = std::env::temp_dir().join(format!(
+            "rsbinder_macros_golden_{module}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let src = dir.join(format!("{module}.aidl"));
@@ -613,7 +701,10 @@ mod golden {
     /// fixture can reference another interface.
     fn from_aidl_files(files: &[(&str, &str)], main: &str, module: &str) -> String {
         let _guard = GENERATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("rsbinder_macros_golden_multi_{module}"));
+        let dir = std::env::temp_dir().join(format!(
+            "rsbinder_macros_golden_multi_{module}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         for (rel, body) in files {
@@ -718,11 +809,8 @@ interface IGolden4 {
 
     #[test]
     fn binder_objects() {
-        // The callback lives in its own file: a *self*-referencing interface
-        // argument is currently mis-resolved by the AIDL front-end (it emits
-        // `Strong<dyn Box<IFoo>>`, which does not compile), so a self-reference
-        // fixture would compare the macro against broken codegen. The macro
-        // path itself is unaffected — it renders the signature as written.
+        // Cross-file: pins the `super::Mod::Type` path a packaged import
+        // produces, which a single-file fixture never exercises.
         let expected = from_aidl_files(
             &[
                 (
@@ -761,10 +849,9 @@ interface IGolden4 {
         assert_eq!(expected, actual, "generated code differs");
     }
 
-    /// The self-referencing shape, now that the AIDL front-end renders it
-    /// correctly (it used to emit `Strong<dyn Box<IFoo>>`). This is the
-    /// callback pattern users reach for first, so it is worth pinning on both
-    /// paths.
+    /// A self-referencing interface — the callback pattern users reach for
+    /// first, and the one shape where the two paths could disagree on how the
+    /// declaring interface names itself.
     #[test]
     fn self_referencing_interface() {
         assert_same(

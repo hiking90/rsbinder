@@ -101,7 +101,35 @@ This changelog starts at 0.9.0. For earlier releases, see the
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
 
+### Changed
+
+- **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls now
+  carry `#[rsbinder::__async_trait]` instead of `#[::async_trait::async_trait]`,
+  and `rsbinder` re-exports the attribute. A crate that only consumes generated
+  code no longer needs an `async-trait` line of its own — which the
+  `#[rsbinder::interface]` path had no way to tell users about, since it has no
+  `build.rs` step to document. Existing manifests keep working; the dependency
+  is simply redundant now. This changes the generated source text (not the
+  wire) for async builds.
+
 ### Fixed
+
+- **rsbinder (`macros` feature):** a batch of signature shapes the macros
+  accepted but should not have, all found by review and each now covered by a
+  compile-fail case: a `#[oneway]` method with an out/inout parameter (which
+  `.aidl` rejects, and whose value could never come back); a nullable out
+  vector, which generated code that did not type-check; an out
+  `ParcelFileDescriptor` array, which silently omitted the null guard `.aidl`
+  emits and would have put a null fd on the wire; a `ParcelableHolder` field,
+  whose derived codec could never decode a peer's `@VintfStability` holder; a
+  raw-identifier field such as `r#type`, which rendered as `r#r#type`; a
+  fixed-size out array longer than 32; and borrowed types nested inside another
+  type. A by-value argument must be `Copy` (the proxy passes it twice) and a
+  derived parcelable must implement `Default` — both are now stated in the
+  rustdoc and asserted against the user's own type instead of failing inside
+  generated code. `#[derive(BinderEnum)]` no longer requires `Copy` and accepts
+  `#[repr(i32, align(8))]`; an unrecognised method attribute is refused rather
+  than dropped; and the generated items follow the trait's own visibility.
 
 - **rsbinder-aidl:** an interface that names *itself* in a signature
   (`interface IFoo { void register(in IFoo cb); }`) rendered as

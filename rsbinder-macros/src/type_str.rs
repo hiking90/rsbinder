@@ -122,3 +122,110 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
         other => as_written(other)?,
     })
 }
+
+/// Reject the shapes whose owned form cannot be handed back to the signature.
+///
+/// [`owned`] folds references away, including inside `Option`/`Vec`, so a type
+/// like `&[&str]` would have the server declare `Vec<String>` and then pass
+/// `&Vec<String>` to a trait asking for `&[&str]`. The compiler would report
+/// that against generated tokens with no span into the user's file, so refuse
+/// it here instead, where the error can point at the type.
+///
+/// `Option<&str>` and `Option<&[T]>` stay legal: those are AIDL's nullable in
+/// arguments, and `func_call_param` bridges them with `as_deref`.
+pub fn check_supported(ty: &Type) -> syn::Result<()> {
+    match ty {
+        Type::Reference(r) => {
+            if r.lifetime.is_some() {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "an explicit lifetime is not supported — the generated trait has none to \
+                     bind it to; use a plain `&T`",
+                ));
+            }
+            reject_inner_references(&r.elem)
+        }
+        Type::Path(p) => {
+            let last = p.path.segments.last();
+            if let Some(seg) = last {
+                if seg.ident == "Option" {
+                    if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                        if let Some(GenericArgument::Type(Type::Reference(inner))) =
+                            args.args.first()
+                        {
+                            if inner.lifetime.is_some() || inner.mutability.is_some() {
+                                return Err(syn::Error::new_spanned(
+                                    ty,
+                                    "a nullable argument borrows immutably and without a named \
+                                     lifetime — use `Option<&str>` or `Option<&[T]>`",
+                                ));
+                            }
+                            return reject_inner_references(&inner.elem);
+                        }
+                    }
+                }
+            }
+            reject_inner_references(ty)
+        }
+        other => reject_inner_references(other),
+    }
+}
+
+fn reject_inner_references(ty: &Type) -> syn::Result<()> {
+    match ty {
+        Type::Reference(_) => Err(syn::Error::new_spanned(
+            ty,
+            "a borrowed type nested inside another type is not supported — the decoded value is \
+             owned, so there is nothing for it to borrow from; use the owned form",
+        )),
+        Type::Slice(s) => reject_inner_references(&s.elem),
+        Type::Array(a) => reject_inner_references(&a.elem),
+        Type::Path(p) => {
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(t) = arg {
+                            reject_inner_references(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Initializer for an out parameter whose `Default::default()` would not
+/// compile: `Default` stops at length 32, so a longer fixed array needs one
+/// `std::array::from_fn` per dimension (mirrors `rsbinder-aidl`'s
+/// `TypeGenerator::fixed_array_default`).
+pub fn out_default(ty: &Type) -> Option<String> {
+    let mut inner = ty;
+    if let Type::Reference(r) = inner {
+        inner = &r.elem;
+    }
+    let mut dims = 0usize;
+    let mut oversized = false;
+    while let Type::Array(a) = inner {
+        dims += 1;
+        if let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(n),
+            ..
+        }) = &a.len
+        {
+            if n.base10_parse::<usize>().is_ok_and(|n| n > 32) {
+                oversized = true;
+            }
+        }
+        inner = &a.elem;
+    }
+    if !oversized {
+        return None;
+    }
+    let mut init = "Default::default()".to_string();
+    for _ in 0..dims {
+        init = format!("std::array::from_fn(|_| {init})");
+    }
+    Some(init)
+}

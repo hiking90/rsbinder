@@ -59,10 +59,9 @@ pub trait IMacroData {
     fn maybe_cfg(&self, cfg: Option<&Config>) -> BinderResult<Option<Config>>;
 }
 
-/// A self-referencing interface: the callback is the same type as the
-/// callee. `rsbinder-aidl` used to render this shape as `Strong<dyn Box<I>>`,
-/// which did not compile — this test exists so that stays fixed on the macro
-/// path too, since `syn` parsing alone would not have caught it.
+/// A self-referencing interface: the callback is the same type as the callee.
+/// Compiled and called for real, because the textual golden tests cannot tell
+/// a type that parses from one that type-checks.
 #[interface(descriptor = "rsbinder.test.IMacroChain")]
 pub trait IMacroChain {
     fn relay(&self, next: &Strong<dyn IMacroChain>, msg: &str) -> BinderResult<String>;
@@ -227,8 +226,8 @@ fn macro_interface_carries_a_callback_binder() {
     assert_eq!(seen.lock().unwrap().as_slice(), ["from-server"]);
 }
 
-/// The descriptor is what goes on the wire, so a mismatch must be caught at
-/// the cast rather than producing a proxy that fails later.
+/// The descriptor is what goes on the wire — over RPC it is checked by the
+/// interface token on the first transact, not by the cast.
 #[test]
 fn macro_interface_descriptor_is_the_attribute_value() {
     assert_eq!(

@@ -322,12 +322,8 @@ interface IDuplicate {
     );
 }
 
-/// An interface that names *itself* in a signature.
-///
-/// This used to render as `Strong<dyn Box<IFoo>>` — the self-reference guard
-/// that boxes a recursive *parcelable* field was applied to interfaces too.
-/// `dyn Box<IFoo>` is not a trait, so the emitted module did not compile. No
-/// in-tree `.aidl` has a self-referencing interface, which is why it survived.
+/// An interface that names *itself* stays `Strong<dyn IFoo>`: the box guard is
+/// for infinitely-sized parcelable fields, and `dyn Box<IFoo>` is not a trait.
 #[test]
 fn self_referencing_interface_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -359,7 +355,8 @@ interface ISelfRef {
         out.contains("Vec<rsbinder::Strong<dyn ISelfRef>>"),
         "arrays must still be Vec:\n{out}"
     );
-    // The point of the fix: the module compiles.
+    // `Box<…>` is syntactically valid, so parsing alone would not catch it —
+    // the assertion above is the guard; this only rules out other breakage.
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }
