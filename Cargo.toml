@@ -45,11 +45,11 @@ pretty_hex = { version = "0.4", package = "pretty-hex" }
 rustix = "1.1"
 libc = "0.2"
 clap = "4.6"
-rsproperties = "0.5"
+rsproperties = "0.6"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2"
 # dev-only: serializes the handful of rsbinder unit tests that share the
 # process-wide `ProcessState` singleton + single binder fd (group key
 # `binder`). default-features = false drops the `logging`/`async` features
 # (and the `futures` dep) — every gated test is a sync `#[test]`.
-serial_test = { version = "3", default-features = false }
+serial_test = { version = "4", default-features = false }
