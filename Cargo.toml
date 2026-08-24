@@ -55,4 +55,4 @@ thiserror = "2"
 #
 # Held at 3.x: 4.0 declares `rust-version = 1.93.1`, above this workspace's
 # 1.85, and the `rust_min` CI job builds dev-dependencies.
-serial_test = { version = "3", default-features = false }
+serial_test = { version = "4", default-features = false }
