@@ -38,4 +38,4 @@ quote = "1"
 rsbinder = { path = "../rsbinder", features = ["macros"] }
 # Held at 1.0.119: 1.0.120 declares `rust-version = 1.88`, above this
 # workspace's 1.85, and the `rust_min` CI jobs build dev-dependencies.
-trybuild = "=1.0.119"
+trybuild = "=1.0.120"
