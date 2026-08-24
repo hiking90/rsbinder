@@ -208,6 +208,29 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
+  to `BINDER_SET_MAX_THREADS` **as written**, matching AOSP's
+  `setThreadPoolMaxThreadCount`. Previously `0` was a sentinel meaning "use
+  the default" and any value `>= 15` was silently clamped down to 15, so
+  neither "literally zero" nor a larger pool was expressible. Zero is what a
+  single-threaded service manager asks for (AOSP's `servicemanager` does),
+  and 15 is a *default*, not a maximum — a service that asked for 32 got 15
+  and stalled at it under load, with nothing in the log to say so.
+
+  The default now lives where the default is chosen: `init_default()` passes
+  the newly public `DEFAULT_MAX_BINDER_THREADS` explicitly, and a `binder://`
+  URI without `?threads=` does the same, so both are byte-for-byte unchanged.
+  `?threads=0` asks for zero and gets it. Callers that wrote
+  `ProcessState::init(path, 0)` meaning "the default" must now write
+  `DEFAULT_MAX_BINDER_THREADS`; the difference is only observable in a
+  process that also calls `start_thread_pool()`, which is exactly the case
+  that has always logged a warning about it — and that warning was
+  unreachable until now, because the clamp guaranteed the stored value could
+  never be 0.
+
+  The resolved ceiling is logged at `info` on init, calling out the two ends
+  of the range.
+
 - **rsbinder — breaking (internal representation):** a proxy's weak identity
   is now stamped into the `ProxyHandle` at construction instead of being looked
   up in the proxy cache on every `SIBinder::downgrade`. `WIBinder` no longer

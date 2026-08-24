@@ -103,7 +103,10 @@ In your Rust code, use `ProcessState::init()` instead of `ProcessState::init_def
 
 ```rust
 // Use a custom binder device path
-ProcessState::init("/dev/binderfs/custom_binder", 0)?;
+ProcessState::init(
+    "/dev/binderfs/custom_binder",
+    rsbinder::DEFAULT_MAX_BINDER_THREADS,
+)?;
 ```
 
 > **Important**: The service manager, service, and client must all use the **same binder device path**.

@@ -2123,12 +2123,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
     // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: rsb_hub is deliberately
-    // single-threaded, exactly like `servicemanager`. Note that rsbinder
-    // currently clamps 0 up to its default, so the kernel is told a larger
-    // ceiling than rsb_hub will ever honor — harmless (nothing here calls
-    // `start_thread_pool`, so `BR_SPAWN_LOOPER` is ignored and the kernel
-    // simply stops asking), and 0 becomes accurate for free if rsbinder
-    // learns to pass it through. See plans/6-rsb-hub-linux.md L-2.
+    // single-threaded, exactly like `servicemanager`, and the kernel is now
+    // told exactly that.
     ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.

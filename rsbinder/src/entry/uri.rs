@@ -28,7 +28,9 @@ pub enum Endpoint {
     Kernel {
         /// `?driver=` — binder device path; `None` = the default.
         driver: Option<PathBuf>,
-        /// `?threads=` — max thread-pool size; `None` = the default.
+        /// `?threads=` — max thread-pool size. `None` (the key absent) is
+        /// the only thing that means "the default"; `?threads=0` asks for a
+        /// literal zero and gets it. See [`crate::ProcessState::init`].
         threads: Option<u32>,
     },
     /// Unix-domain socket at a filesystem path.
@@ -230,6 +232,17 @@ mod tests {
             }
         );
         assert_eq!(u.service, None);
+        // `?threads=0` must survive as `Some(0)`. Collapsing it to `None`
+        // would turn "single-threaded, like a service manager" back into
+        // "give me the default" — the overload `ProcessState::init` exists
+        // to have removed.
+        assert_eq!(
+            p("binder://?threads=0").endpoint,
+            Endpoint::Kernel {
+                driver: None,
+                threads: Some(0)
+            }
+        );
         assert_eq!(p("binder://hello").service.as_deref(), Some("hello"));
         assert_eq!(p("binder://#hello").service.as_deref(), Some("hello"));
         let u = p("binder://svc?driver=/dev/binderfs/x&threads=4");

@@ -117,7 +117,7 @@ impl Drop for ServerGuard {
 
 pub(super) fn new_server(uri: Uri) -> Result<Server> {
     if let Endpoint::Kernel { driver, threads } = &uri.endpoint {
-        kernel_init(driver.as_deref(), threads.unwrap_or(0))?;
+        kernel_init(driver.as_deref(), *threads)?;
     }
     #[cfg(not(feature = "rpc"))]
     if !uri.endpoint.is_kernel() {
@@ -137,11 +137,24 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
 /// Initialize the process-global kernel `ProcessState` (idempotent).
 /// Loud on a lost config: a *different* driver / `max_threads` than the
 /// one already in force is warned about, never silently dropped.
-pub(super) fn kernel_init(driver: Option<&std::path::Path>, max_threads: u32) -> Result<()> {
+///
+/// `max_threads` is `None` when the URI carried no `?threads=`, which is
+/// the only thing that means "the default" — `?threads=0` asks for a
+/// literal zero and gets it, as [`ProcessState::init`] documents.
+pub(super) fn kernel_init(
+    driver: Option<&std::path::Path>,
+    max_threads: Option<u32>,
+) -> Result<()> {
     let pre = ProcessState::is_initialized();
     let ps = match driver {
-        Some(p) => ProcessState::init(&p.to_string_lossy(), max_threads),
-        None => ProcessState::init_default(),
+        Some(p) => ProcessState::init(
+            &p.to_string_lossy(),
+            max_threads.unwrap_or(crate::DEFAULT_MAX_BINDER_THREADS),
+        ),
+        None => match max_threads {
+            Some(n) => ProcessState::init(ProcessState::default_driver_path(), n),
+            None => ProcessState::init_default(),
+        },
     }
     .map_err(|e| {
         log::error!("rsbinder: ProcessState init failed: {e}");
@@ -149,12 +162,11 @@ pub(super) fn kernel_init(driver: Option<&std::path::Path>, max_threads: u32) ->
     })?;
     if pre {
         let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
-        let threads_mismatch =
-            max_threads != 0 && ProcessState::clamp_max_threads(max_threads) != ps.max_threads();
+        let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
         if driver_mismatch || threads_mismatch {
             log::warn!(
                 "rsbinder: ProcessState already initialized; requested driver={driver:?} \
-                 max_threads={max_threads} ignored, using existing driver={:?} max_threads={}",
+                 max_threads={max_threads:?} ignored, using existing driver={:?} max_threads={}",
                 ps.driver_name(),
                 ps.max_threads()
             );
@@ -255,10 +267,10 @@ impl Server {
         if o.tls.is_some() {
             return Err(self.reject("tls"));
         }
-        if let Some(n) = o.threads {
+        if o.threads.is_some() {
             // `threads` after init cannot change the pool; treat like the
             // URI form (warn on mismatch) by re-running the idempotent init.
-            kernel_init(None, n)?;
+            kernel_init(None, o.threads)?;
         }
         if let Some(cr) = o.call_restriction {
             ProcessState::as_self().set_call_restriction(cr);

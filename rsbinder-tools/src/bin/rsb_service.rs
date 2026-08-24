@@ -329,9 +329,9 @@ fn main() -> ExitCode {
     let device = matches
         .get_one::<String>("device")
         .expect("device has a default value");
-    // `checkService` and friends are synchronous round trips answered on
-    // this thread, so no thread pool is started: `rsb_service` never
-    // receives an inbound transaction.
+    // 0 threads: `checkService` and friends are synchronous round trips
+    // answered on this thread, and `rsb_service` never receives an inbound
+    // transaction, so the kernel has no reason to ask for a worker.
     if let Err(e) = ProcessState::init(&format!("{DEFAULT_BINDERFS_PATH}/{device}"), 0) {
         eprintln!(
             "rsb_service: cannot open the binder device {DEFAULT_BINDERFS_PATH}/{device}: {e:?}"
