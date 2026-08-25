@@ -7,11 +7,13 @@
 //! policy file into the numeric ids the kernel actually reports, and to
 //! answer "which groups does this uid belong to" for a caller.
 //!
-//! Everything here is the reentrant `_r` form: `rsb_hub` resolves groups
-//! from more than one thread (the transaction thread, the death-notification
-//! thread, and the client-callback poller), and the non-`_r` calls return a
-//! pointer into a shared static buffer that a concurrent caller would
-//! overwrite mid-use.
+//! These run on more than one thread — `rsb_hub` resolves groups from the
+//! transaction thread, the death-notification thread and the
+//! client-callback poller — so every lookup here must be reentrant. On
+//! glibc and the BSDs that means the `_r` forms, because the plain ones
+//! return a pointer into a shared static buffer a concurrent caller would
+//! overwrite mid-use. Android is the exception, and [`gid_for_group`]
+//! explains why.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
@@ -109,6 +111,12 @@ pub fn gid_for_group(spec: &str) -> Result<u32, NssError> {
         return Ok(gid);
     }
     let cname = cstring("group", spec)?;
+    lookup_gid(&cname, spec)
+}
+
+/// `getgrnam_r`, growing the buffer until libc stops asking for more.
+#[cfg(not(target_os = "android"))]
+fn lookup_gid(cname: &std::ffi::CStr, spec: &str) -> Result<u32, NssError> {
     let mut buf = vec![0u8; 1024];
     loop {
         let mut grp: libc::group = unsafe { std::mem::zeroed() };
@@ -142,6 +150,43 @@ pub fn gid_for_group(spec: &str) -> Result<u32, NssError> {
             });
         }
         return Ok(grp.gr_gid);
+    }
+}
+
+/// Android has no `getgrnam_r` below API 24 (bionic's `grp.h` marks it
+/// `__INTRODUCED_IN(24)`), so referencing it fails to *link* against a
+/// lower platform — `cargo check` cannot see this, only a real build can.
+///
+/// The plain `getgrnam` is available at every API level **and** is
+/// reentrant on bionic, which the other platforms' is not: it writes into a
+/// per-thread buffer (`get_group_tls_buffer()` in bionic's
+/// `libc/bionic/grp_pwd.cpp`), which is the property the `_r` form exists
+/// to provide elsewhere. So this is the reentrant call on Android, not a
+/// concession.
+#[cfg(target_os = "android")]
+fn lookup_gid(cname: &std::ffi::CStr, spec: &str) -> Result<u32, NssError> {
+    // `getgrnam` reports both "no such group" and a lookup failure as null,
+    // told apart only by errno — so clear it first rather than read a stale
+    // value from an unrelated call.
+    // SAFETY: `__errno()` returns this thread's errno slot, valid to write.
+    unsafe { *libc::__errno() = 0 };
+    // SAFETY: `cname` is a live NUL-terminated string, and the returned
+    // pointer is into this thread's own buffer — read before returning and
+    // never stored.
+    let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if !grp.is_null() {
+        return Ok(unsafe { (*grp).gr_gid });
+    }
+    match std::io::Error::last_os_error() {
+        e if e.raw_os_error() == Some(0) => Err(NssError::NotFound {
+            kind: "group",
+            name: spec.to_owned(),
+        }),
+        e => Err(NssError::Failed {
+            call: "getgrnam",
+            name: spec.to_owned(),
+            message: e.to_string(),
+        }),
     }
 }
 
