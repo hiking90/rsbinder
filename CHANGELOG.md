@@ -13,6 +13,37 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Migrating from 0.10.0
+
+The breaking changes are listed in *Changed* and *Removed* below. This is the
+short form — and the first entry is the only one no compiler will catch.
+
+- **`ProcessState::init(path, 0)` no longer means "the default".** The count
+  now reaches the kernel as written, so `0` asks for zero binder threads. The
+  signature did not change, so nothing warns: `cargo-semver-checks` cannot see
+  it and neither can your build. If you meant the default, pass the newly
+  public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
+  without `?threads=` are unchanged.
+- **`rsbinder::service` is gone** — `Registry`, `Broker`,
+  `service::{kernel,rpc}::{Host,Broker}`. Use `serve` / `connect`; the
+  call-by-call mapping is under *Removed*.
+- **`rsb_hub` refuses to start without an access-control policy.** Give it
+  `--policy <PATH>` (default `/etc/rsbinder/hub.d`) or, deliberately,
+  `--insecure-allow-all`.
+- **`rsb_device` creates the binder node `0600`.** Grant access with
+  `--group <group> --mode 0660` and put the users in that group.
+- **Low-level `Parcel` accessors are `pub(crate)`** (`as_ptr`, `as_mut_ptr`,
+  `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
+  `from_vec`), along with the RPC-ops plumbing and three `thread_state`
+  helpers. `Parcel::from_ipc_parts` and `Parcel::set_for_rpc` remain the
+  supported raw-buffer entry points.
+- **The RPC wire codec is private** (`WireMessage`, `WireCodec`, `R34Codec`,
+  `Android13PlusCodec`, `WireReply`, `WireTransaction`, `RpcState`). The
+  supported RPC surface is `RpcServer` / `RpcSession` / `RpcProxy`, the
+  transport traits, and the address and identity types.
+- **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
+  is stamped at construction; only an exhaustive `match` on the enum notices.
+
 ### Added
 
 - **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
@@ -196,16 +227,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
   device node. Binder has no in-kernel access control of its own, so the node
   is the only gate on who may speak binder at all.
 
-### Fixed
-
-- **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
-  on Android 13/14 — each version generates its own `ConnectionInfo` and the
-  dispatch arms returned the version's type where the unified one was
-  expected. Latent because no build enabled those features together.
-- **rsbinder (`ProxyHandle::dump`):** a `write_object` that failed after the
-  descriptor had been detached from its RAII wrapper leaked the descriptor.
-  Every other path is covered by the parcel's own ownership of it.
-
 ### Changed
 
 - **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
@@ -264,9 +285,75 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `build.rs` step to document. Existing manifests keep working; the dependency
   is simply redundant now. This changes the generated source text (not the
   wire) for async builds.
+- **rsbinder (rpc):** an RPC proxy now holds its `RpcSession` **strongly**
+  (AOSP `BpBinder` ↔ `sp<RpcSession>`). Dropping the `RpcSession` handle no
+  longer invalidates proxies obtained from it — the proxy alone keeps the
+  connection open, and the connection closes when the last proxy (and
+  handle) is gone. Previously every call on such a proxy returned
+  `DeadObject`. Code that relied on "drop the session to disconnect" while
+  still holding a proxy must drop the proxy too. To keep the strong ref
+  acyclic, session death now also releases every local object the peer
+  held (AOSP `RpcState::clear`), on both the served path and — new — a
+  client-only session whose last connection is lost (detected on the next
+  failed transaction, which also fires `DeathRecipient`s). Because a failing
+  transaction may now declare session death before the slot's own serve
+  worker exits, `serve_blocking` no longer trips a debug assertion on that
+  ordering.
+- **rsbinder (entry API):** `ServeOptions::fd_modes` / `ClientOptions::fd_mode`
+  now reject Unix fd passing on a transport that cannot carry `SCM_RIGHTS`
+  (vsock, TLS, kernel binder) instead of agreeing a mode that fails later on
+  the wire.
+- **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
+  (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
+  now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
+- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong` now carries
+  the decrement amount (`DecStrong(RpcAddress, u32)`), and
+  `RpcState::dec_strong_local` takes an `amount` argument. A batched
+  `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
+  `timesRecd - target`) is now honored instead of applying a single decrement,
+  which under-counted and leaked local nodes.
+- **rsbinder (`rpc` feature, breaking):** the RPC wire-codec types
+  (`WireMessage`, `WireCodec`, `R34Codec`, `Android13PlusCodec`, `WireReply`,
+  `WireTransaction`) and `RpcState` are no longer part of the public API. They
+  were internal implementation detail — the codec is selected internally with no
+  user injection point, and `RpcState` is per-session bookkeeping. The public
+  RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
+  (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
+  lets the wire protocol evolve without further semver-breaking releases.
+- **rsbinder (breaking):** additional helpers that were `pub` but never part of
+  the intended API are now `pub(crate)`: the `Parcel` RPC-ops plumbing
+  (`RpcParcelOps`, `Parcel::attach_rpc_ops`, `FnFreeBuffer`), `rpc::RpcSessionInner`,
+  `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
+  `is_handling_transaction`, and `get_calling_uid_or_self`. The public
+  `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
+- **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
+  `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
+  and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
+  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive) and
+  `Parcel::set_for_rpc` remain public.
+
+### Removed
+
+- **rsbinder (`service` module):** the `rsbinder::service` facade (`Registry` /
+  `Broker`, `service::kernel::{Host, Broker}`, `service::rpc::{Host, Broker}`)
+  is gone, replaced by the entry API above (`serve` / `connect` / `Client`).
+  Migration: `kernel::Host::new()? + add_service + serve()` →
+  `serve("binder://")?.add(..)?.run()?`; `rpc::Host::unix(p)` →
+  `serve("unix://<p>")`; `kernel::Broker::new()?.get_interface(n)` →
+  `connect("binder://<n>")`; `rpc::Broker::unix(p)?.get_interface(n)` →
+  `connect("unix://<p>#<n>")`; `Host::builder()` options → `ServeOptions`
+  via `Server::with`. The examples, the book chapter *Cross-Transport
+  Services*, and the crate quick-start now use the entry API.
 
 ### Fixed
 
+- **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
+  on Android 13/14 — each version generates its own `ConnectionInfo` and the
+  dispatch arms returned the version's type where the unified one was
+  expected. Latent because no build enabled those features together.
+- **rsbinder (`ProxyHandle::dump`):** a `write_object` that failed after the
+  descriptor had been detached from its RAII wrapper leaked the descriptor.
+  Every other path is covered by the parcel's own ownership of it.
 - **rsbinder:** a `DeathRecipient` could not identify the binder that died.
   `SIBinder::downgrade` read a proxy's generation from the proxy cache and fell
   back to the `Native` variant when the entry was missing — and the obituary
@@ -396,71 +483,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
   neither the trait's visibility — a private trait was reachable through it —
   nor the scope its own `Copy` assertion used, so a path in a by-value argument
   was resolved at two different depths.
-
-### Removed
-
-- **rsbinder (`service` module):** the `rsbinder::service` facade (`Registry` /
-  `Broker`, `service::kernel::{Host, Broker}`, `service::rpc::{Host, Broker}`)
-  is gone, replaced by the entry API above (`serve` / `connect` / `Client`).
-  Migration: `kernel::Host::new()? + add_service + serve()` →
-  `serve("binder://")?.add(..)?.run()?`; `rpc::Host::unix(p)` →
-  `serve("unix://<p>")`; `kernel::Broker::new()?.get_interface(n)` →
-  `connect("binder://<n>")`; `rpc::Broker::unix(p)?.get_interface(n)` →
-  `connect("unix://<p>#<n>")`; `Host::builder()` options → `ServeOptions`
-  via `Server::with`. The examples, the book chapter *Cross-Transport
-  Services*, and the crate quick-start now use the entry API.
-
-### Changed
-
-- **rsbinder (rpc):** an RPC proxy now holds its `RpcSession` **strongly**
-  (AOSP `BpBinder` ↔ `sp<RpcSession>`). Dropping the `RpcSession` handle no
-  longer invalidates proxies obtained from it — the proxy alone keeps the
-  connection open, and the connection closes when the last proxy (and
-  handle) is gone. Previously every call on such a proxy returned
-  `DeadObject`. Code that relied on "drop the session to disconnect" while
-  still holding a proxy must drop the proxy too. To keep the strong ref
-  acyclic, session death now also releases every local object the peer
-  held (AOSP `RpcState::clear`), on both the served path and — new — a
-  client-only session whose last connection is lost (detected on the next
-  failed transaction, which also fires `DeathRecipient`s). Because a failing
-  transaction may now declare session death before the slot's own serve
-  worker exits, `serve_blocking` no longer trips a debug assertion on that
-  ordering.
-- **rsbinder (entry API):** `ServeOptions::fd_modes` / `ClientOptions::fd_mode`
-  now reject Unix fd passing on a transport that cannot carry `SCM_RIGHTS`
-  (vsock, TLS, kernel binder) instead of agreeing a mode that fails later on
-  the wire.
-- **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
-  (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
-  now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
-- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong` now carries
-  the decrement amount (`DecStrong(RpcAddress, u32)`), and
-  `RpcState::dec_strong_local` takes an `amount` argument. A batched
-  `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
-  `timesRecd - target`) is now honored instead of applying a single decrement,
-  which under-counted and leaked local nodes.
-- **rsbinder (`rpc` feature, breaking):** the RPC wire-codec types
-  (`WireMessage`, `WireCodec`, `R34Codec`, `Android13PlusCodec`, `WireReply`,
-  `WireTransaction`) and `RpcState` are no longer part of the public API. They
-  were internal implementation detail — the codec is selected internally with no
-  user injection point, and `RpcState` is per-session bookkeeping. The public
-  RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
-  (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
-  lets the wire protocol evolve without further semver-breaking releases.
-- **rsbinder (breaking):** additional helpers that were `pub` but never part of
-  the intended API are now `pub(crate)`: the `Parcel` RPC-ops plumbing
-  (`RpcParcelOps`, `Parcel::attach_rpc_ops`, `FnFreeBuffer`), `rpc::RpcSessionInner`,
-  `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
-  `is_handling_transaction`, and `get_calling_uid_or_self`. The public
-  `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
-- **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
-  `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
-  and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
-  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive) and
-  `Parcel::set_for_rpc` remain public.
-
-### Fixed
-
 - **fuzz:** the `rpc_wire_decode` / `rpc_address_decode` / `rpc_session_handshake`
   targets compile again — their entrypoints are re-exported as
   `rsbinder::rpc::__fuzz_*` after the wire-codec module became crate-private.
