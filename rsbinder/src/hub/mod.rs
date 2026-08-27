@@ -320,9 +320,10 @@ use crate::*;
 
 // Export Android 16 types as the default public API
 pub use android_16::{
-    BnClientCallback, BnServiceCallback, IClientCallback, IServiceCallback, ServiceDebugInfo,
-    DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
-    DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
+    BnClientCallback, BnServiceCallback, ConnectionInfo, IClientCallback, IServiceCallback,
+    ServiceDebugInfo, DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL,
+    DUMP_FLAG_PRIORITY_DEFAULT, DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL,
+    DUMP_FLAG_PROTO,
 };
 
 /// Android SDK version constants
@@ -536,6 +537,24 @@ macro_rules! collect_debug_info {
     }};
 }
 
+/// The `Status` an error-preserving `try_*` call returns when the running
+/// service manager's protocol predates the method it was asked for.
+///
+/// `EX_UNSUPPORTED_OPERATION` is AOSP's code for "this interface has no
+/// such method"; the message names the first Android version that does,
+/// which is the actionable half for whoever reads it.
+#[cfg(all(
+    target_os = "android",
+    any(feature = "android_10", feature = "android_11", feature = "android_12")
+))]
+fn unsupported(method: &str, since: u32) -> Status {
+    (
+        ExceptionCode::UnsupportedOperation,
+        format!("{method} requires the Android {since} service-manager protocol or later").as_str(),
+    )
+        .into()
+}
+
 /// Emits the per-version `IServiceCallback` impl for [`ForwardServiceCallback`]
 /// (one per supported pre-16 version; collapses what was 4× duplicated).
 macro_rules! forward_service_callback_impl {
@@ -739,6 +758,145 @@ impl ServiceManager {
         }
     }
 
+    /// Like [`is_declared`](Self::is_declared), but reports the service
+    /// manager's error instead of collapsing it to `false`.
+    ///
+    /// `rsb_hub` answers a `find`-denied `isDeclared` with `EX_SECURITY`
+    /// (AOSP's `servicemanager` does the same through SELinux), and the
+    /// swallowing wrapper renders that indistinguishable from "not
+    /// declared". Anything that reports *why* — a diagnostic tool, a
+    /// health check — needs the status, not the bool.
+    pub fn try_is_declared(&self, name: &str) -> std::result::Result<bool, Status> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("isDeclared", 11)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::IServiceManager::isDeclared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::IServiceManager::isDeclared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::IServiceManager::isDeclared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::IServiceManager::isDeclared(sm, name),
+            ServiceManager::Android16(sm) => android_16::IServiceManager::isDeclared(sm, name),
+        }
+    }
+
+    /// Like [`get_declared_instances`](Self::get_declared_instances), but
+    /// reports the service manager's error instead of collapsing it to an
+    /// empty list. See [`try_is_declared`](Self::try_is_declared).
+    pub fn try_get_declared_instances(
+        &self,
+        iface: &str,
+    ) -> std::result::Result<Vec<String>, Status> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("getDeclaredInstances", 12)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => Err(unsupported("getDeclaredInstances", 12)),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => {
+                android_12::IServiceManager::getDeclaredInstances(sm, iface)
+            }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                android_13::IServiceManager::getDeclaredInstances(sm, iface)
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                android_14::IServiceManager::getDeclaredInstances(sm, iface)
+            }
+            ServiceManager::Android16(sm) => {
+                android_16::IServiceManager::getDeclaredInstances(sm, iface)
+            }
+        }
+    }
+
+    /// Like [`get_connection_info`](Self::get_connection_info), but
+    /// reports the service manager's error instead of collapsing it to
+    /// `None`. See [`try_is_declared`](Self::try_is_declared).
+    ///
+    /// Each version generates its own `ConnectionInfo`, so the pre-16 arms
+    /// rebuild the unified one field by field — the same shape the
+    /// `getServiceDebugInfo` dispatch uses.
+    pub fn try_get_connection_info(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<ConnectionInfo>, Status> {
+        /// Rebuild the unified `ConnectionInfo` from a version's own.
+        #[cfg(all(
+            target_os = "android",
+            any(feature = "android_13", feature = "android_14")
+        ))]
+        macro_rules! unify {
+            ($call:expr) => {
+                $call.map(|info| {
+                    info.map(|info| ConnectionInfo {
+                        ipAddress: info.ipAddress,
+                        port: info.port,
+                    })
+                })
+            };
+        }
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("getConnectionInfo", 13)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => Err(unsupported("getConnectionInfo", 13)),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(_) => Err(unsupported("getConnectionInfo", 13)),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                unify!(android_13::IServiceManager::getConnectionInfo(sm, name))
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                unify!(android_14::IServiceManager::getConnectionInfo(sm, name))
+            }
+            ServiceManager::Android16(sm) => {
+                android_16::IServiceManager::getConnectionInfo(sm, name)
+            }
+        }
+    }
+
+    /// Like [`list_services`](Self::list_services), but reports the
+    /// service manager's error instead of collapsing it to an empty list.
+    /// See [`try_is_declared`](Self::try_is_declared).
+    pub fn try_list_services(
+        &self,
+        dump_priority: i32,
+    ) -> std::result::Result<Vec<String>, Status> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => {
+                // The legacy protocol enumerates by index and stops at the
+                // first index that does not answer, so a failure part-way
+                // through is indistinguishable from the end of the list.
+                // There is no status to preserve.
+                Ok(android_10::list_services(sm, dump_priority))
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => {
+                android_11::IServiceManager::listServices(sm, dump_priority)
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => {
+                android_12::IServiceManager::listServices(sm, dump_priority)
+            }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                android_13::IServiceManager::listServices(sm, dump_priority)
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                android_14::IServiceManager::listServices(sm, dump_priority)
+            }
+            ServiceManager::Android16(sm) => {
+                android_16::IServiceManager::listServices(sm, dump_priority)
+            }
+        }
+    }
+
     /// Checks if a service with the given name is declared.
     ///
     /// Note: not supported on Android 10 - always returns false.
@@ -758,6 +916,74 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
             ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
+        }
+    }
+
+    /// Every declared instance of `iface`.
+    ///
+    /// Requires the Android 12 protocol or later; earlier ones have no
+    /// `getDeclaredInstances`, and report none declared.
+    pub fn get_declared_instances(&self, iface: &str) -> Vec<String> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("get_declared_instances: not supported on Android 10");
+                Vec::new()
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => {
+                log::error!("get_declared_instances: not supported on Android 11");
+                Vec::new()
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::get_declared_instances(sm, iface),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::get_declared_instances(sm, iface),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::get_declared_instances(sm, iface),
+            ServiceManager::Android16(sm) => android_16::get_declared_instances(sm, iface),
+        }
+    }
+
+    /// Connection info declared for `name`, if any.
+    ///
+    /// Requires the Android 13 protocol or later; earlier ones have no
+    /// `getConnectionInfo`, and report none.
+    pub fn get_connection_info(&self, name: &str) -> Option<ConnectionInfo> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => {
+                log::error!("get_connection_info: not supported on Android 10");
+                None
+            }
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => {
+                log::error!("get_connection_info: not supported on Android 11");
+                None
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(_) => {
+                log::error!("get_connection_info: not supported on Android 12");
+                None
+            }
+            // Each version generates its own `ConnectionInfo`; rebuild the
+            // unified one field by field, as the `getServiceDebugInfo`
+            // dispatch does for `ServiceDebugInfo`.
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                android_13::get_connection_info(sm, name).map(|info| ConnectionInfo {
+                    ipAddress: info.ipAddress,
+                    port: info.port,
+                })
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                android_14::get_connection_info(sm, name).map(|info| ConnectionInfo {
+                    ipAddress: info.ipAddress,
+                    port: info.port,
+                })
+            }
+            ServiceManager::Android16(sm) => android_16::get_connection_info(sm, name),
         }
     }
 
@@ -835,6 +1061,52 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => collect_debug_info!(android_14, sm),
             ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
+        }
+    }
+
+    /// Like [`get_service_debug_info`](Self::get_service_debug_info), but
+    /// preserves the service manager's `Status` — message included —
+    /// instead of flattening it to a [`StatusCode`].
+    ///
+    /// A `list`-denied call arrives as `EX_SECURITY` carrying the policy's
+    /// own wording; the flattening conversion turns that into an anonymous
+    /// `FailedTransaction`, which is not something a diagnostic can report.
+    pub fn try_get_service_debug_info(&self) -> std::result::Result<Vec<ServiceDebugInfo>, Status> {
+        /// Rebuild the unified `ServiceDebugInfo` from a version's own.
+        #[cfg(all(
+            target_os = "android",
+            any(feature = "android_12", feature = "android_13", feature = "android_14")
+        ))]
+        macro_rules! unify {
+            ($call:expr) => {
+                $call.map(|v| {
+                    v.into_iter()
+                        .map(|info| ServiceDebugInfo {
+                            name: info.name,
+                            debugPid: info.debugPid,
+                        })
+                        .collect()
+                })
+            };
+        }
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("getServiceDebugInfo", 12)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => Err(unsupported("getServiceDebugInfo", 12)),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => {
+                unify!(android_12::IServiceManager::getServiceDebugInfo(sm))
+            }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                unify!(android_13::IServiceManager::getServiceDebugInfo(sm))
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                unify!(android_14::IServiceManager::getServiceDebugInfo(sm))
+            }
+            ServiceManager::Android16(sm) => android_16::IServiceManager::getServiceDebugInfo(sm),
         }
     }
 
@@ -1422,6 +1694,57 @@ pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<S
 #[inline]
 pub fn is_declared(name: &str) -> bool {
     default().map(|sm| sm.is_declared(name)).unwrap_or(false)
+}
+
+/// Convenience function for [`ServiceManager::try_is_declared`] — the
+/// error-preserving counterpart to [`is_declared`].
+#[inline]
+pub fn try_is_declared(name: &str) -> std::result::Result<bool, Status> {
+    default()?.try_is_declared(name)
+}
+
+/// Convenience function for [`ServiceManager::get_declared_instances`].
+#[inline]
+pub fn get_declared_instances(iface: &str) -> Vec<String> {
+    default()
+        .map(|sm| sm.get_declared_instances(iface))
+        .unwrap_or_default()
+}
+
+/// Convenience function for [`ServiceManager::try_get_declared_instances`] —
+/// the error-preserving counterpart to [`get_declared_instances`].
+#[inline]
+pub fn try_get_declared_instances(iface: &str) -> std::result::Result<Vec<String>, Status> {
+    default()?.try_get_declared_instances(iface)
+}
+
+/// Convenience function for [`ServiceManager::get_connection_info`].
+#[inline]
+pub fn get_connection_info(name: &str) -> Option<ConnectionInfo> {
+    default().ok().and_then(|sm| sm.get_connection_info(name))
+}
+
+/// Convenience function for [`ServiceManager::try_get_connection_info`] —
+/// the error-preserving counterpart to [`get_connection_info`].
+#[inline]
+pub fn try_get_connection_info(name: &str) -> std::result::Result<Option<ConnectionInfo>, Status> {
+    default()?.try_get_connection_info(name)
+}
+
+/// Convenience function for [`ServiceManager::try_list_services`] — the
+/// error-preserving counterpart to [`list_services`]. A denied `list` and
+/// an empty registry are the same answer through [`list_services`]; they
+/// are `Err` and `Ok(vec![])` here.
+#[inline]
+pub fn try_list_services(dump_priority: i32) -> std::result::Result<Vec<String>, Status> {
+    default()?.try_list_services(dump_priority)
+}
+
+/// Convenience function for [`ServiceManager::try_get_service_debug_info`] —
+/// the `Status`-preserving counterpart to [`get_service_debug_info`].
+#[inline]
+pub fn try_get_service_debug_info() -> std::result::Result<Vec<ServiceDebugInfo>, Status> {
+    default()?.try_get_service_debug_info()
 }
 
 /// Convenience function to get debug information about all services from the default ServiceManager.

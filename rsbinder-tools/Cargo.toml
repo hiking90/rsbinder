@@ -18,3 +18,14 @@ log.workspace = true
 env_logger.workspace = true
 anstyle.workspace = true
 clap.workspace = true
+libc.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[features]
+# Teach the policy enforcer about RPC callers (`Caller::Rpc`). Off by
+# default: `rsb_hub` serves kernel binder only, so nothing in this crate
+# needs the RPC stack unless a downstream hub reuses `policy`.
+rpc = ["rsbinder/rpc"]

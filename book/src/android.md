@@ -89,8 +89,14 @@ On Android, the binder device files are already created and managed by the syste
 
 ```rust
 // Connect to the default system binder (/dev/binder)
-ProcessState::init("/dev/binder", 0)?;
+ProcessState::init("/dev/binder", rsbinder::DEFAULT_MAX_BINDER_THREADS)?;
 ```
+
+The second argument is the binder thread-pool ceiling, passed to the kernel
+as written. `DEFAULT_MAX_BINDER_THREADS` (15) is what `init_default()` uses;
+pass `0` only when the process must never have the kernel spawn a binder
+thread for it — a single-threaded service manager, or a client that only
+makes synchronous outbound calls.
 
 Android provides several binder devices for different purposes:
 

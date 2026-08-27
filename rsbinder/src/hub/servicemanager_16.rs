@@ -10,6 +10,7 @@ pub use android::os::IServiceManager::{
     DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO, FLAG_IS_LAZY_SERVICE,
 };
 
+pub use android::os::ConnectionInfo::ConnectionInfo;
 pub use android::os::IClientCallback::{BnClientCallback, IClientCallback};
 pub use android::os::IServiceCallback::{BnServiceCallback, IServiceCallback};
 pub use android::os::ServiceDebugInfo::ServiceDebugInfo;
@@ -238,6 +239,34 @@ pub fn try_unregister_service(sm: &BpServiceManager, name: &str, service: &SIBin
 /// Returns whether a given interface is declared on the device, even if it
 /// is not started yet. For instance, this could be a service declared in the VINTF
 /// manifest.
+/// Every declared instance of `iface`. An interface declared as
+/// `pack.age.IFoo/foo` contributes `"foo"` when asked for
+/// `pack.age.IFoo`. An error is reported as "none declared", matching
+/// the other lookup helpers here.
+pub fn get_declared_instances(sm: &BpServiceManager, iface: &str) -> Vec<String> {
+    match sm.getDeclaredInstances(iface) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to get_declared_instances({iface}): {err}");
+            Vec::new()
+        }
+    }
+}
+
+/// Connection info declared for `name`, if any.
+pub fn get_connection_info(
+    sm: &BpServiceManager,
+    name: &str,
+) -> Option<android::os::ConnectionInfo::ConnectionInfo> {
+    match sm.getConnectionInfo(name) {
+        Ok(result) => result,
+        Err(err) => {
+            log::error!("Failed to get_connection_info({name}): {err}");
+            None
+        }
+    }
+}
+
 pub fn is_declared(sm: &BpServiceManager, name: &str) -> bool {
     match sm.isDeclared(name) {
         Ok(result) => result,

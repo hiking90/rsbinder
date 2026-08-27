@@ -112,7 +112,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
                 return Err(reject("tls"));
             }
             let driver = o.driver.as_deref().or(driver.as_deref());
-            super::server::kernel_init(driver, threads.unwrap_or(0))?;
+            super::server::kernel_init(driver, *threads)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
                 endpoint: uri.endpoint.clone(),

@@ -146,7 +146,7 @@ fn commit_new_acquired(
     stability: Stability,
     owns_case_a_pin: bool,
 ) -> Result<SIBinder> {
-    let arc = match ProxyHandle::new_acquired(handle, descriptor.clone(), stability) {
+    let arc = match ProxyHandle::new_acquired(handle, generation, descriptor.clone(), stability) {
         Ok(arc) => arc,
         Err(err) => {
             if owns_case_a_pin {
@@ -301,7 +301,13 @@ pub enum CallRestriction {
     FatalIfNotOneway,
 }
 
-const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
+/// The binder thread-pool ceiling [`ProcessState::init_default`] asks for,
+/// matching AOSP's `DEFAULT_MAX_BINDER_THREADS`
+/// (`frameworks/native/libs/binder/ProcessState.cpp:49`).
+///
+/// Public because it is the *only* spelling of "the default": `0` means a
+/// literal zero to [`ProcessState::init`], not "pick something for me".
+pub const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
 struct MemoryMap {
@@ -416,16 +422,29 @@ impl ProcessState {
             .expect("Call restriction lock poisoned")
     }
 
-    /// The effective max-threads `inner_init` will store for a requested
-    /// value: `0` and any value `>= DEFAULT_MAX_BINDER_THREADS` clamp to
-    /// the default. Shared with the [`crate::serve`] / [`crate::Client`]
-    /// re-init check so its "requested differs from stored" comparison
-    /// matches what was actually stored.
-    pub(crate) fn clamp_max_threads(max_threads: u32) -> u32 {
-        if max_threads != 0 && max_threads < DEFAULT_MAX_BINDER_THREADS {
-            max_threads
-        } else {
-            DEFAULT_MAX_BINDER_THREADS
+    /// Say what `max_threads` will mean, at `info`, before the kernel is
+    /// told.
+    ///
+    /// Every value is honored as written — AOSP's
+    /// `setThreadPoolMaxThreadCount` passes it straight to
+    /// `BINDER_SET_MAX_THREADS` and so does this — so the log is the only
+    /// place a caller finds out what it actually asked for. The two ends of
+    /// the range are the ones worth spelling out: `0` disables
+    /// kernel-driven spawning entirely, and a value above the default is a
+    /// deliberate choice that should be visible next to the memory it costs.
+    fn log_max_threads(max_threads: u32) {
+        match max_threads {
+            0 => log::info!(
+                "binder max threads = 0: the kernel will never ask this process to spawn a \
+                 binder thread, so only threads that call `join_thread_pool` serve incoming \
+                 transactions (AOSP `setThreadPoolMaxThreadCount(0)`, what a service manager \
+                 wants). Pass `DEFAULT_MAX_BINDER_THREADS` for the usual pool."
+            ),
+            n if n > DEFAULT_MAX_BINDER_THREADS => log::info!(
+                "binder max threads = {n}, above the default {DEFAULT_MAX_BINDER_THREADS}; \
+                 the pool may grow to {n} kernel-started threads"
+            ),
+            n => log::info!("binder max threads = {n}"),
         }
     }
 
@@ -433,7 +452,7 @@ impl ProcessState {
         driver_name: &str,
         max_threads: u32,
     ) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
-        let max_threads = Self::clamp_max_threads(max_threads);
+        Self::log_max_threads(max_threads);
 
         let driver_name = PathBuf::from(driver_name);
 
@@ -484,9 +503,26 @@ impl ProcessState {
         })
     }
 
-    /// Initialize ProcessState with binder path and max threads.
-    /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
-    /// If you want to use the default binder path, use init_default().
+    /// Initialize `ProcessState` on `driver_name`, asking the kernel for a
+    /// binder thread pool of at most `max_threads`.
+    ///
+    /// `max_threads` is passed to `BINDER_SET_MAX_THREADS` **as written**,
+    /// matching AOSP's `setThreadPoolMaxThreadCount`. In particular `0`
+    /// means zero: the kernel never asks this process to spawn a binder
+    /// thread, so only threads that call
+    /// [`join_thread_pool`](Self::join_thread_pool) serve incoming
+    /// transactions. That is what a single-threaded service manager wants
+    /// (AOSP's `servicemanager` asks for exactly that); it is *not* a way to
+    /// spell "the default", which is
+    /// [`DEFAULT_MAX_BINDER_THREADS`] — or [`init_default`](Self::init_default),
+    /// which also picks the default binder path.
+    ///
+    /// The pool only ever grows if [`start_thread_pool`](Self::start_thread_pool)
+    /// was called, whatever `max_threads` says: the flag it sets gates
+    /// kernel-driven spawning too.
+    ///
+    /// First call wins — a later call with different arguments returns the
+    /// existing state unchanged.
     pub fn init(
         driver_name: &str,
         max_threads: u32,
@@ -503,17 +539,25 @@ impl ProcessState {
         Ok(cell.get_or_init(|| instance))
     }
 
-    /// Initialize ProcessState with default binder path and max threads.
-    /// The meaning of zero max threads is to use the default value. It is dependent on the kernel.
-    /// DEFAULT_BINDER_PATH is "/dev/binderfs/binder".
+    /// Initialize `ProcessState` on the default binder path with
+    /// [`DEFAULT_MAX_BINDER_THREADS`].
+    ///
+    /// The path is `DEFAULT_BINDER_PATH` (`/dev/binderfs/binder`), falling
+    /// back to `LEGACY_BINDER_PATH` when that does not exist.
     pub fn init_default() -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>>
     {
-        let path = if Path::new(crate::DEFAULT_BINDER_PATH).exists() {
+        Self::init(Self::default_driver_path(), DEFAULT_MAX_BINDER_THREADS)
+    }
+
+    /// The driver path [`init_default`](Self::init_default) would use, so a
+    /// caller that only wants to override `max_threads` does not have to
+    /// re-derive it.
+    pub(crate) fn default_driver_path() -> &'static str {
+        if Path::new(crate::DEFAULT_BINDER_PATH).exists() {
             crate::DEFAULT_BINDER_PATH
         } else {
             crate::LEGACY_BINDER_PATH
-        };
-        Self::init(path, 0)
+        }
     }
 
     /// Register `binder` as this process's binder context manager
@@ -835,10 +879,12 @@ impl ProcessState {
     /// Called from `SIBinder::downgrade` when constructing a proxy
     /// `WIBinder` so the resulting weak reference carries the
     /// generation it observed at construction time. A subsequent
-    /// `WIBinder::upgrade` rejects (returns `DeadObject`) if the live
-    /// entry's generation differs — i.e. the original binder_node was
-    /// obituary'd and the same handle id was later recycled to a
-    /// different node.
+    /// Test-only. Production code reads the generation off the
+    /// `ProxyHandle` instead ([`crate::SIBinder::downgrade`]), because this
+    /// answers `None` once the obituary has retired the entry — precisely
+    /// when a death recipient needs the identity. What remains here is the
+    /// cache-side invariant the resurrection tests assert on.
+    #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
         self.handle_to_proxy
             .read()
@@ -873,11 +919,11 @@ impl ProcessState {
     /// `DeathRecipient::binder_died` callbacks, which can issue nested
     /// binder calls. See [`thread_state`](super::thread_state) module doc.
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        // Downgrade to `who` BEFORE removing the cache entry: afterwards
-        // `cache_generation_for` returns `None` and `downgrade` yields a
-        // `Native` `WIBinder` that compares unequal to the registered `Proxy`,
-        // breaking `binder_died` identity matching. The read guard is dropped
-        // first — `downgrade` re-acquires the same (non-reentrant) RwLock read.
+        // The read guard is dropped before `downgrade` runs. `downgrade` no
+        // longer consults the cache — it reads `(handle, generation)` off the
+        // `ProxyHandle` — so the ordering against the removal below is no
+        // longer load-bearing for identity; it is kept because building `who`
+        // needs a live `Arc`, which the entry's weak is what we have.
         let arc = {
             let handle_to_proxy = self
                 .handle_to_proxy
@@ -1246,6 +1292,10 @@ impl ProcessState {
     /// Panics if the process state has not been initialized — call
     /// [`ProcessState::init`](Self::init) or
     /// [`init_default`](Self::init_default) first.
+    ///
+    /// Calling it after `init(.., 0)` warns: the pool is enabled but pinned
+    /// at the single worker spawned here, because a `max_threads` of zero
+    /// tells the kernel never to ask for more.
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
@@ -1253,8 +1303,18 @@ impl ProcessState {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            // Reachable now that `0` is stored as written: one worker is
+            // spawned here, but with `max_threads = 0` the kernel never
+            // sends `BR_SPAWN_LOOPER`, so the pool can never grow past it.
+            // AOSP warns about the mirror-image mistake in
+            // `checkExpectingThreadPoolStart` (pool sized but never started).
             if this.max_threads == 0 {
-                log::warn!("Extra binder thread started, but 0 threads requested.\nDo not use *start_thread_pool when zero threads are requested.");
+                log::warn!(
+                    "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
+                     kernel will never ask for another, so the pool cannot grow under load. \
+                     Pass DEFAULT_MAX_BINDER_THREADS (or any non-zero ceiling) to \
+                     ProcessState::init if this process serves incoming transactions."
+                );
             }
             this.spawn_pooled_thread(true);
         }
@@ -1395,8 +1455,19 @@ mod tests {
     /// both callers already run inside the `binder` serial section, so
     /// keeping this a plain fn avoids depending on serial_test's lock
     /// being reentrant for a same-thread nested `#[serial]` call.
+    /// AOSP parity pin: `DEFAULT_MAX_BINDER_THREADS`
+    /// (`frameworks/native/libs/binder/ProcessState.cpp:49`). It is a
+    /// *default*, not a ceiling — `init` honors larger values as written,
+    /// as AOSP's `setThreadPoolMaxThreadCount` does.
+    #[test]
+    fn the_default_thread_ceiling_matches_aosp() {
+        assert_eq!(DEFAULT_MAX_BINDER_THREADS, 15);
+    }
+
     fn assert_process_state_initialized() {
         let process = ProcessState::init_default().expect("init_default");
+        // `init_default` asks for the default *explicitly* — nothing
+        // downstream rewrites a sentinel into it any more.
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,

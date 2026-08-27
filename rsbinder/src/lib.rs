@@ -294,7 +294,7 @@ pub use parcelable::{
 };
 
 pub use parcelable_holder::ParcelableHolder;
-pub use process_state::{CallRestriction, ProcessState};
+pub use process_state::{CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS};
 
 // From `proxy` — client-side handle types.
 pub use proxy::{Proxy, ProxyHandle};
@@ -347,6 +347,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
     fn process_state() {
-        ProcessState::init("/dev/binderfs/binder", 0).expect("init");
+        ProcessState::init("/dev/binderfs/binder", DEFAULT_MAX_BINDER_THREADS).expect("init");
     }
 }

@@ -24,13 +24,100 @@ Before any service can register or any client can perform lookups, the HUB
 process must be running:
 
 ```bash
-# Build and run the service manager
-$ cargo run --bin rsb_hub
+# Build and run the service manager, with no access control (development)
+$ cargo run --bin rsb_hub -- --insecure-allow-all
 ```
 
 `rsb_hub` opens the Binder device, becomes the context manager (handle 0),
 and enters a loop that processes registration and lookup requests. It must
 remain running for the lifetime of the system's Binder services.
+
+**It also refuses to start without an access-control policy.** Every request
+is denied unless a policy allows it, and `--insecure-allow-all` above is the
+explicit opt-out for development. See [Access control](#access-control) for
+how to write one.
+
+### Running it under systemd
+
+`rsb_hub` handles three signals: `SIGHUP` reloads the configuration in place,
+and `SIGTERM` / `SIGINT` stop it cleanly — exiting 0 rather than dying by
+signal, so a deliberate stop is distinguishable from a crash in the journal.
+
+Use `Type=notify`. The HUB reports `READY=1` only once it holds handle 0,
+which is the first instant a client can reach it; with `Type=simple` systemd
+would consider the unit started as soon as `exec` returned, and every unit
+ordered `After=` it would race the registry.
+
+```ini
+[Unit]
+Description=rsbinder service manager
+After=dev-binderfs.mount
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A binder device has exactly one service manager — the kernel enforces that,
+not `rsb_hub` — so a second instance on the same device exits 1 and says so.
+To run an independent one, give it its own device: `sudo rsb_device other`
+then `rsb_hub --device other`.
+
+### Inspecting a running HUB
+
+The `rsb_service` CLI, also from `rsbinder-tools`, is the Linux counterpart of
+Android's `service` and `dumpsys -l`:
+
+```bash
+$ rsb_service list                                  # what is registered
+$ rsb_service info                                  # ... and which pid owns each
+$ rsb_service check com.example.IFoo/default        # is it up yet?
+$ rsb_service declared com.example.IFoo/default     # is it even configured?
+$ rsb_service instances com.example.IFoo            # every declared instance
+$ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
+$ rsb_service dump manager                          # rsb_hub's own registry
+```
+
+`dump manager` is the one with no Android equivalent — AOSP's
+`servicemanager` does not implement `dump` at all, because on Android the
+same questions are answered by `dumpsys`, `service list` and the init/VINTF
+files:
+
+```text
+rsb_hub 0.11.0
+access control: enforcing, 4 rule(s)
+declarations: 2
+death subscriptions: 3
+
+services (2):
+  com.example.IFoo/default
+    pid=92338 uid=973 dump_priority=0x8 lazy=no accessor=no
+    clients=no guarantee_client=no callbacks: registration=0 client=0
+  manager
+    pid=92334 uid=973 dump_priority=0x8 lazy=no accessor=no
+    clients=no guarantee_client=yes callbacks: registration=0 client=0
+
+awaiting registration (1):
+  com.example.INope/default  callbacks: registration=1 client=0
+```
+
+That last section is usually the one you came for: a name something is
+waiting on that nothing has registered. Arguments narrow the listing by
+substring (`rsb_service dump manager com.example`), and `dump` works on any
+service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
+rsbinder service lands in its `Interface::dump` implementation.
+
+Exit status is the answer: `0` yes, `1` no, `2` the question could not be
+answered (no service manager, or its policy denied it), so
+`rsb_service check foo || start-foo` reads the way it looks. `rsb_service` is
+an ordinary binder client, so the HUB's policy applies to it like anything
+else — `list`, `info` and `dump` need `list`, and every name they report is
+filtered by `find`.
 
 ## Registering a Service
 
@@ -201,6 +288,17 @@ used flags are:
 | `DUMP_FLAG_PRIORITY_NORMAL`   | Normal-priority services                 |
 | `DUMP_FLAG_PRIORITY_ALL`      | All services regardless of priority      |
 
+`list_services` reports an unreachable or unwilling service manager as an
+empty list. When you need to tell "nothing is registered" from "the policy
+denied this caller", use `hub::try_list_services`, which returns
+`Result<Vec<String>, Status>` and preserves the `EX_SECURITY` status — and
+its message — that `rsb_hub` sends on a denial. The same pairing exists for
+`is_declared` / `try_is_declared`, `get_declared_instances` /
+`try_get_declared_instances`, `get_connection_info` /
+`try_get_connection_info`, and `get_service_debug_info` /
+`try_get_service_debug_info`. This is exactly what `rsb_service` uses to
+report a denial as a denial.
+
 ## Service Notifications
 
 You can register a callback that fires whenever a service with a particular
@@ -291,6 +389,184 @@ The returned `ServiceDebugInfo` struct has two fields:
 This feature is available on Android 12 and above. On Android 10 and Android 11,
 calling `get_service_debug_info` returns an error.
 
+`get_service_debug_info` flattens the service manager's `Status` into a
+`StatusCode`, which turns a policy denial into an anonymous
+`FailedTransaction`. `hub::try_get_service_debug_info` keeps the `Status`,
+message included.
+
+## Access control
+
+`rsb_hub` gates every entry point on a policy. There is no permissive
+default: a name with no matching rule is denied, a rule that does not mention
+a permission denies it, and a policy that fails to load stops the process
+from starting.
+
+### Why it does not use SELinux
+
+Android's `servicemanager` gates the same three permissions through SELinux.
+SELinux is not present on every Linux distribution and does not exist on
+macOS, so it cannot be the basis of the model here — and it does not need to
+be. Android's policy *model* is SELinux-independent:
+
+```text
+(caller identity, service name) -> {add, find, list}
+```
+
+SELinux is only one way of expressing "caller identity". `rsb_hub` keeps the
+model and swaps that identity for **uid**, which every platform reports and
+the binder driver fills in itself (`sender_euid`) at transaction time —
+unforgeable and not racy. This is the same conclusion D-Bus reached for the
+same problem: uid/group policy files as the portable base, with an LSM as an
+optional overlay rather than a prerequisite.
+
+Note what is *not* used: **pid**. Pid reuse races make every pid-derived
+attribute (`/proc/<pid>/exe`, cgroup, systemd unit) unsound as an
+authorization key — which is why AOSP calls its own field `debugPid`. Groups
+are usable because resolving uid → groups through NSS is race-free.
+
+### Permissions
+
+| Permission | Gates |
+|---|---|
+| `add` | `add_service`, `register_client_callback`, `try_unregister_service` |
+| `find` | `check_service`, `wait_for_service`, `get_service`, `register_for_notifications`, `is_declared`, `get_connection_info`, and the per-name filtering of the two `list` calls |
+| `list` | `list_services`, `get_service_debug_info` — a single global gate, since there is no name to scope it to |
+
+A denied **lookup** is reported as "not registered" rather than as an error.
+That matches AOSP (`getService` returns ok regardless of result) and keeps a
+denied caller from using the error to probe which names exist. Every other
+denial returns `ExceptionCode::Security`.
+
+The two `list` calls apply *both* gates: the caller must be allowed to
+enumerate at all, and each name it would learn about must be one it may
+`find`. A name you cannot look up is a name you do not get told about.
+
+### Policy files
+
+`rsb_hub --config <PATH>` takes a `.toml` file or a directory of them
+(default: `/etc/rsbinder/hub.d`). A directory is read as every `*.toml` in
+it, sorted by file name — so `10-`/`20-` prefixes control precedence the way
+they do in any other `.d` directory.
+
+```toml
+# /etc/rsbinder/hub.d/10-example.toml
+
+[global]
+# Who may enumerate service names at all. Omitted means nobody.
+list = { group = ["binder-admin"] }
+
+[[rule]]
+name = "com.example.*"                       # trailing `*` only
+add  = { user = ["exampled"] }
+find = { group = ["example-clients"], uid = [0] }
+
+[[rule]]
+name = "*"
+add  = "none"
+find = "none"
+```
+
+A subject is the union of `uid` (numeric), `user` (resolved through NSS at
+load time), and `group` (matched against the caller's primary *and*
+supplementary groups). The shorthands `"any"` and `"none"` are also accepted;
+`"any"` must be written out, since an omitted key always means deny.
+
+**The first rule whose `name` matches decides**, and evaluation stops there —
+a later rule never widens what an earlier one refused. That makes the rule
+governing any given name unique and greppable, which is worth more in a
+security file than the extra expressiveness of last-match-wins. Put
+catch-alls last.
+
+Patterns support a trailing `*` and nothing else. A leading or interior `*`
+is rejected at load time rather than silently matching nothing.
+
+### Reloading
+
+`SIGHUP` reloads the policy in place:
+
+```bash
+$ sudo kill -HUP "$(pidof rsb_hub)"
+```
+
+A reload that fails to parse or resolve **keeps the policy already in
+force** and logs the error. Dropping to deny-all would take the machine's IPC
+down over a typo; falling back to permissive would be worse. The reload also
+drops the memoized uid → groups sets, so group-membership changes take effect
+with it.
+
+### Layers underneath
+
+The policy is the second of two gates. The first is the binder device node
+itself: binder has no in-kernel access control of its own, so
+`/dev/binderfs/<name>` decides who can speak binder *at all*. `rsb_device`
+creates it `0600` (root only) and takes `--group` / `--mode` to widen that
+deliberately — the same model as `/dev/kvm` being `0660 root:kvm`:
+
+```bash
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+$ sudo rsb_device binder --group binder --mode 0660
+```
+
+An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
+platform provides one, but it is never what makes the first two unnecessary.
+
+## Declaring services
+
+An access rule says who may use a name. A **declaration** says the name is
+expected to exist at all — the question `is_declared` answers, and the one a
+client uses to tell "not installed" from "not started yet". On Android that
+comes from VINTF manifests; on Linux it comes from a `[[service]]` entry in
+the same configuration files.
+
+```toml
+[[service]]
+name = "com.example.IFoo/default"          # pack.age.IFace/instance
+start = { systemd = "example-foo.service" }
+connection = { ip = "127.0.0.1", port = 8080 }
+```
+
+A declaration answers three calls:
+
+| Call | Answered from |
+|---|---|
+| `is_declared("com.example.IFoo/default")` | the entry existing |
+| `get_declared_instances("com.example.IFoo")` | the instance halves of every entry for that interface |
+| `get_connection_info("com.example.IFoo/default")` | the `connection` table |
+
+Declared instances are filtered by `find`, so a caller only learns about
+instances it could look up.
+
+### Starting a service on demand
+
+With a `start` entry, a `get_service` (or `wait_for_interface`) that misses
+the service asks for it to be started — AOSP's `tryStartService`, with the
+declaration standing in for the init property:
+
+```toml
+start = { systemd = "example-foo.service" }
+# or
+start = { exec = ["/usr/bin/exampled", "--instance", "default"] }
+```
+
+`check_service` never does this: it is documented as non-blocking and free
+of side effects. Only the `get`/`wait` family starts anything.
+
+The start runs on its own thread and `rsb_hub` does not wait for it — what
+tells the client the service is up is the registration notification it is
+already waiting on, which is why `wait_for_interface` is the natural call
+here. At most one start attempt per name is outstanding at a time, so a
+client polling a service that cannot come up does not spawn a copy per
+attempt. `exec` takes an argv list, never a shell string.
+
+> **The configuration is a trust boundary.** A `start` entry runs with
+> `rsb_hub`'s privileges, and any client allowed to look the name up can
+> trigger it. `rsb_hub` therefore refuses to start if its configuration
+> directory or any file in it is writable by anyone but its owner, or is
+> owned by someone other than root or `rsb_hub` itself — the same check
+> sudo, ssh and cron apply to their own configuration. Keep it `0644`
+> root-owned in a `0755` root-owned directory.
+
 ## Linux vs. Android Differences
 
 While rsbinder aims for API compatibility across both platforms, there are
@@ -300,12 +576,14 @@ Android's native `servicemanager`:
 | Aspect                  | Linux (`rsb_hub`)                       | Android (`servicemanager`)              |
 |-------------------------|-----------------------------------------|-----------------------------------------|
 | **Process**             | User-space `rsb_hub` binary             | System `servicemanager` daemon          |
-| **Access control**      | No SELinux enforcement                  | Full SELinux MAC policy enforcement     |
-| **VINTF manifests**     | Not supported (`is_declared` is false)  | Supported and enforced                  |
+| **Access control**      | uid/group policy files ([above](#access-control)) | SELinux MAC policy                      |
+| **Service declarations** | `[[service]]` entries ([above](#declaring-services)) | VINTF manifests                        |
 | **Service debug info**  | Supported                               | Supported (Android 12+; not on 10/11)   |
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
 | **Version selection**   | Always uses Android 16 protocol         | Auto-detected from SDK version          |
 | **Death notifications** | Supported                               | Supported                               |
+| **Diagnostics**         | `rsb_service`, and `dump` on the HUB itself | `dumpsys` / `service`; `servicemanager` has no `dump` |
+| **Readiness**           | `sd_notify(READY=1)` under `Type=notify` | `servicemanager.ready` property         |
 
 On Android, rsbinder automatically detects the SDK version and uses the
 appropriate service manager protocol (Android 10 through 16). The per-version
@@ -327,8 +605,9 @@ predates the API. Android 10 falls back to the legacy C `IServiceManager`,
 which only learned the AIDL-based interface in Android 11; `get_service_debug_info`
 was added in Android 12. On Linux, rsbinder always uses the Android 16
 protocol — what `rsb_hub` implements — so every row in the Android 12+
-column applies, with the caveat that `is_declared` is *always* `false` on
-Linux (no VINTF manifest).
+column applies. `is_declared` answers from the declarations above rather
+than from a VINTF manifest, so it is `false` only when nothing declares the
+name.
 
 ## Using the ServiceManager Object Directly
 
@@ -385,4 +664,6 @@ service manager as a parameter or store it in a struct.
 - **Debug with `list_services` and `get_service_debug_info`.** When
   troubleshooting, list all registered services and inspect their debug
   information to verify that services are registered from the expected
-  processes.
+  processes. From a shell, `rsb_service list` / `info` / `dump manager` ask
+  the same questions without writing a program — see
+  [Inspecting a running HUB](#inspecting-a-running-hub).

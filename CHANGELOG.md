@@ -15,6 +15,74 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
+  manager what it knows — the Linux counterpart of Android's `service` and
+  `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,
+  `connection`, and `dump <name> [args...]` (which sends `DUMP_TRANSACTION`
+  to any service, not just the hub). Exit status is the answer: `0` yes, `1`
+  no, `2` the question could not be answered. It is an ordinary binder client,
+  so `rsb_hub`'s policy applies to it like anything else, and a denial is
+  reported as a denial rather than as an empty result.
+- **rsbinder-tools (`rsb_hub`):** `dump` support. `rsb_service dump manager`
+  (or a `DUMP_TRANSACTION` to handle 0) prints the registry as the hub sees
+  it: every registration with its pid, uid, dump-priority flags and callback
+  counts, the death-subscription count, the access-control mode, and the
+  names something is *waiting* on that nothing has registered. Gated on
+  `list`, with each name filtered by `find`; withheld names are counted, not
+  listed. AOSP's `servicemanager` does not implement `dump` at all — on
+  Android these questions are answered by `dumpsys`, `service list` and the
+  init/VINTF files, none of which exist on Linux.
+- **rsbinder-tools (`rsb_hub`):** service-supervisor integration. `SIGTERM`
+  and `SIGINT` now stop the hub cleanly (exit 0 with a log line, instead of
+  dying by signal), and under systemd `Type=notify` it reports `READY=1` only
+  once it holds handle 0 — so units ordered `After=` it cannot race the
+  registry — plus `STOPPING=1` on a deliberate stop and a `STATUS=` line for
+  `systemctl status`. No `libsystemd` dependency: `$NOTIFY_SOCKET` takes one
+  datagram. Starting a second hub on a device that already has one now names
+  the cause instead of surfacing a raw ioctl errno.
+- **rsbinder (hub):** error-preserving `try_*` counterparts for the client
+  calls that used to swallow the service manager's `Status` —
+  `try_list_services`, `try_is_declared`, `try_get_declared_instances`,
+  `try_get_connection_info`, `try_get_service_debug_info` (each on
+  `ServiceManager` and as a free function). The swallowing wrappers report a
+  policy denial as an empty list / `false` / `None`, indistinguishable from
+  the negative answer; anything that must explain *why* needs the status.
+
+- **rsbinder-tools (`rsb_hub`):** on-demand service start. A `[[service]]`
+  entry with `start = { systemd = "unit" }` or `start = { exec = [...] }` is
+  brought up when a `getService` misses it — AOSP's `tryStartService`, with
+  the declaration standing in for the `ctl.interface_start` property. Until
+  now the lazy-service machinery was all present (the client-callback poller,
+  `onClients`, `tryUnregisterService`) except the trigger, so
+  `wait_for_service` on a service that had not started yet waited forever.
+  `checkService` still never starts anything. At most one attempt per name is
+  outstanding at a time, so polling cannot spawn a copy per attempt.
+- **rsbinder-tools (`rsb_hub`):** the configuration is now checked before it
+  is read, and `rsb_hub` refuses to start if it or any file in it is writable
+  by anyone but its owner, or owned by someone other than root or `rsb_hub`.
+  A `start` entry runs with `rsb_hub`'s privileges and is triggered by any
+  client allowed to look the name up, so a file anyone can edit is a file
+  anyone can use to run code. Same discipline sudo, ssh and cron apply.
+- **rsbinder (hub):** `hub::get_declared_instances` and
+  `hub::get_connection_info` — the client half of the two calls above.
+  `isDeclared` had a wrapper; these two were reachable only through the raw
+  AIDL proxy. Available from the Android 12 and 13 protocols respectively,
+  and on Linux.
+- **rsbinder-tools (`rsb_hub`):** service declarations. A `[[service]]` entry
+  in the configuration names a concrete instance
+  (`pack.age.IFoo/instance`, split as AOSP's `NameUtil.h` splits it) and
+  answers `isDeclared`, `getDeclaredInstances` and `getConnectionInfo` — the
+  three calls that were stubs because they read VINTF manifests on Android
+  and there is no VINTF on a plain Linux host. A declaration is the
+  equivalent statement: these instances are expected to exist, so a client
+  can tell "not installed" from "not started yet". Declared instances are
+  filtered by `find`, as AOSP filters `getUpdatableNames`. A host that
+  declares nothing behaves exactly as before.
+- **rsbinder:** `WIBinder` now implements `PartialEq<SIBinder>` (and the
+  reverse), so a `DeathRecipient` can ask the question it actually has —
+  "is this the binder that died?" — as `*who == stored`. Writing it by hand
+  meant downgrading the stored strong reference and comparing two weaks, which
+  was the shape of the bug fixed below.
 - **rsbinder (`macros` feature):** `#[rsbinder::interface]`,
   `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` — declare a binder
   interface as a Rust trait and its data types as ordinary structs and enums,
@@ -107,9 +175,87 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
   without the AIDL not-null / comm markers), which the handwritten
   `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
+- **rsbinder-tools (`rsb_hub`):** per-name access control. `rsb_hub` now gates
+  every AIDL entry point on an `add` / `find` / `list` policy keyed on the
+  caller's uid and its NSS-resolved groups — the same policy model AOSP's
+  `servicemanager` applies through SELinux, but keyed on credentials every
+  platform reports rather than on an LSM that most Linux distributions do not
+  enable and macOS does not have. Policy is TOML, `--policy <PATH>` takes a
+  file or a directory of `*.toml` loaded in file-name order, and the first rule
+  whose `name` pattern matches decides. `SIGHUP` reloads in place; a reload
+  that fails to parse or resolve keeps the policy already in force. A denied
+  *lookup* reports "not registered" rather than an error, matching AOSP's
+  `tryGetBinder`; every other denial is `EX_SECURITY`. `listServices` and
+  `getServiceDebugInfo` apply the global `list` gate *and* filter their results
+  per-name by `find`, which is stricter than AOSP's all-or-nothing `canList`.
+  Deliberately **not** keyed on pid: pid reuse makes pid-derived attributes
+  unsound for authorization, which is why AOSP names its own field `debugPid`.
+  See `plans/6-1-hub-access-control.md` and the
+  [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control).
+- **rsbinder-tools (`rsb_device`):** `--group` and `--mode` for the binder
+  device node. Binder has no in-kernel access control of its own, so the node
+  is the only gate on who may speak binder at all.
+
+### Fixed
+
+- **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
+  on Android 13/14 — each version generates its own `ConnectionInfo` and the
+  dispatch arms returned the version's type where the unified one was
+  expected. Latent because no build enabled those features together.
+- **rsbinder (`ProxyHandle::dump`):** a `write_object` that failed after the
+  descriptor had been detached from its RAII wrapper leaked the descriptor.
+  Every other path is covered by the parcel's own ownership of it.
 
 ### Changed
 
+- **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
+  to `BINDER_SET_MAX_THREADS` **as written**, matching AOSP's
+  `setThreadPoolMaxThreadCount`. Previously `0` was a sentinel meaning "use
+  the default" and any value `>= 15` was silently clamped down to 15, so
+  neither "literally zero" nor a larger pool was expressible. Zero is what a
+  single-threaded service manager asks for (AOSP's `servicemanager` does),
+  and 15 is a *default*, not a maximum — a service that asked for 32 got 15
+  and stalled at it under load, with nothing in the log to say so.
+
+  The default now lives where the default is chosen: `init_default()` passes
+  the newly public `DEFAULT_MAX_BINDER_THREADS` explicitly, and a `binder://`
+  URI without `?threads=` does the same, so both are byte-for-byte unchanged.
+  `?threads=0` asks for zero and gets it. Callers that wrote
+  `ProcessState::init(path, 0)` meaning "the default" must now write
+  `DEFAULT_MAX_BINDER_THREADS`; the difference is only observable in a
+  process that also calls `start_thread_pool()`, which is exactly the case
+  that has always logged a warning about it — and that warning was
+  unreachable until now, because the clamp guaranteed the stored value could
+  never be 0.
+
+  The resolved ceiling is logged at `info` on init, calling out the two ends
+  of the range.
+
+- **rsbinder — breaking (internal representation):** a proxy's weak identity
+  is now stamped into the `ProxyHandle` at construction instead of being looked
+  up in the proxy cache on every `SIBinder::downgrade`. `WIBinder` no longer
+  has a `Native` fallback for proxies, `downgrade` no longer takes the cache
+  lock, and it no longer requires an initialized `ProcessState`. Two weak
+  references naming the same `(handle, generation)` compare equal even when
+  they come from different `Arc<ProxyHandle>` allocations — which was already
+  the documented intent for case-(b) resurrection, and is now also true after
+  the obituary.
+- **rsbinder-tools (`rsb_hub`) — breaking:** `rsb_hub` refuses to start unless
+  it can load an access-control policy, and denies every request the policy
+  does not allow. Previously any local process could register, overwrite, look
+  up, and enumerate any service. Existing deployments must supply a policy
+  (`--policy <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
+  `--insecure-allow-all`, which is named that way on purpose and cannot be
+  reached by accident. There is no permissive fallback for a policy that fails
+  to load: a typo in a config file must never silently remove access control
+  from a running system.
+- **rsbinder-tools (`rsb_device`) — breaking:** the binder device node is now
+  created `0600` (root only) instead of `0666` (world read/write). Grant access
+  deliberately: `sudo rsb_device binder --group binder --mode 0660`, with your
+  user in that group — the same model as `/dev/kvm` being `0660 root:kvm`.
+- **rsbinder-tools (`rsb_hub`):** `listServices` and `getServiceDebugInfo`
+  return names in sorted order. The registry is a `BTreeMap` now, matching
+  AOSP's `std::map`; previously the order shuffled between calls.
 - **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls now
   carry `#[rsbinder::__async_trait]` instead of `#[::async_trait::async_trait]`,
   and `rsbinder` re-exports the attribute. A crate that only consumes generated
@@ -121,6 +267,46 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
+- **rsbinder:** a `DeathRecipient` could not identify the binder that died.
+  `SIBinder::downgrade` read a proxy's generation from the proxy cache and fell
+  back to the `Native` variant when the entry was missing — and the obituary
+  retires that entry *before* dispatching `binder_died`. Every weak taken
+  inside a death recipient therefore compared unequal to the `who` it was
+  handed and to every weak taken while the binder was alive, so a recipient
+  watching more than one binder matched none of them. This is what made
+  `rsb_hub` keep dead services in its registry (see below); any user code
+  matching `who` against stored binders hit the same wall.
+- **rsbinder-tools (`rsb_hub`):** a dead service was never removed from the
+  registry. The death handler matched the obituary against a *freshly*
+  downgraded `WIBinder`, but a proxy `WIBinder` compares on
+  `(handle, proxy-cache generation)` and the obituary retires that cache entry
+  before invoking callbacks — so every death matched nothing and retired zero
+  entries. A crashed service kept its name reserved, kept being handed to
+  clients as a dead binder, and leaked its callbacks and death subscription
+  until `rsb_hub` restarted. The underlying `SIBinder::downgrade` defect is
+  fixed above; `rsb_hub` now matches `who` against its stored binders directly.
+- **rsbinder-tools (`rsb_hub`):** death subscriptions are reference-counted per
+  binder, so link and unlink can no longer drift apart. They drifted both ways:
+  `unregisterForNotifications` removed a callback without unlinking, so every
+  register/unregister cycle left another subscription behind — unbounded, and
+  reachable by any local caller — and one binder registered under K names took
+  K subscriptions, so its death ran K full cleanup sweeps instead of one.
+- **rsbinder-tools (`rsb_hub`):** `getService2`/`checkService2` now report
+  `isLazyService` from the registered `FLAG_IS_LAZY_SERVICE` instead of always
+  `false`. AOSP's client uses it to skip caching a lazy service, which can
+  withdraw via `tryUnregisterService` *without dying* — so no death
+  notification would have invalidated the client's cached binder.
+- **rsbinder-tools (`rsb_hub`):** exception-code parity with AOSP on three
+  replies that are visible to a C++ `LazyServiceRegistrar`: "only a server can
+  register client callbacks" and "only a server can unregister itself" are now
+  `EX_UNSUPPORTED_OPERATION` (were `EX_SECURITY`), and `tryUnregisterService`
+  on an unregistered or mismatched name is `EX_ILLEGAL_STATE` (was
+  `EX_ILLEGAL_ARGUMENT`).
+- **rsbinder-tools (`rsb_hub`):** a failed self-registration no longer stops
+  the process — it is logged, as AOSP does. Clients reach the hub through
+  handle 0 regardless. `addService` also warns when `dumpPriority` sets no
+  `DUMP_FLAG_PRIORITY_*` bit, which silently hides the service from every
+  `listServices` filter.
 - **rsbinder (`macros` feature):** signature shapes the macros accepted but
   should not have, all found by review and each now refused with a compile-fail
   case in `rsbinder-macros/tests/ui`: a `#[oneway]` method with an out/inout

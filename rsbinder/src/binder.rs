@@ -216,6 +216,25 @@ pub trait FromIBinder: Interface {
 /// abort behavior.
 pub trait DeathRecipient: Send + Sync {
     /// Called when the monitored binder object has died.
+    ///
+    /// `who` names the binder that died. A recipient watching more than
+    /// one binder identifies it by comparing against the strong references
+    /// it holds — [`WIBinder`] implements `PartialEq<SIBinder>` for exactly
+    /// this:
+    ///
+    /// ```ignore
+    /// fn binder_died(&self, who: &WIBinder) {
+    ///     self.services.lock().unwrap().retain(|svc| *who != svc.binder);
+    /// }
+    /// ```
+    ///
+    /// # Reentrancy
+    ///
+    /// This runs on the binder worker thread that received the obituary,
+    /// with no rsbinder lock held. Outbound binder calls are allowed, but
+    /// a recipient that holds its own lock across one risks deadlocking
+    /// against a transaction arriving on another thread — collect the work
+    /// under the lock and perform it after dropping the guard.
     fn binder_died(&self, who: &WIBinder);
 }
 
@@ -767,28 +786,20 @@ impl SIBinder {
     pub fn downgrade(this: &Self) -> WIBinder {
         let weak = Arc::downgrade(&this.inner);
         if let Some(proxy_handle) = this.inner.as_any().downcast_ref::<proxy::ProxyHandle>() {
-            // For proxies, capture handle/stability/generation. The cache
-            // entry MUST exist at this point — `Arc<ProxyHandle>` is alive,
-            // and `strong_proxy_for_handle_stability` always inserts the
-            // entry alongside allocating the Arc under the same write lock.
-            // If we somehow miss it (race window during obituary), fall
-            // back to Native — `upgrade` will then see a dangling weak and
-            // return DeadObject, which is the correct contract.
-            let handle = proxy_handle.handle();
-            let stability = proxy_handle.stability();
-            let generation =
-                crate::process_state::ProcessState::as_self().cache_generation_for(handle);
-            match generation {
-                Some(generation) => WIBinder {
-                    inner: WIBinderInner::Proxy {
-                        handle,
-                        stability,
-                        generation,
-                        weak,
-                    },
-                },
-                None => WIBinder {
-                    inner: WIBinderInner::Native(weak),
+            // `(handle, generation)` comes off the `ProxyHandle` itself, not
+            // off the proxy cache. The distinction is the whole contract of
+            // this function: the obituary retires the cache entry *before*
+            // dispatching `binder_died`, so a cache lookup answers `None`
+            // for exactly the binders a death recipient needs to identify.
+            // Reading it from the proxy makes a downgrade taken after the
+            // obituary compare equal to one taken before, which is what
+            // lets `binder_died` match `who` against a stored `SIBinder`.
+            WIBinder {
+                inner: WIBinderInner::Proxy {
+                    handle: proxy_handle.handle(),
+                    stability: proxy_handle.stability(),
+                    generation: proxy_handle.generation(),
+                    weak,
                 },
             }
         } else {
@@ -1078,6 +1089,28 @@ impl PartialEq for WIBinder {
             ) => ha == hb && ga == gb,
             _ => false,
         }
+    }
+}
+
+/// Does this weak reference name the same binder as `other`?
+///
+/// This is the comparison a [`DeathRecipient`] needs: `binder_died` hands
+/// out a `WIBinder`, and the recipient holds `SIBinder`s. Writing it as
+/// `*who == service.binder` avoids the trap of downgrading the stored
+/// strong reference and comparing two `WIBinder`s — correct here, but only
+/// because [`SIBinder::downgrade`] takes the proxy's identity from the
+/// proxy rather than from the (already-retired) cache.
+impl PartialEq<SIBinder> for WIBinder {
+    fn eq(&self, other: &SIBinder) -> bool {
+        *self == SIBinder::downgrade(other)
+    }
+}
+
+/// Mirror of [`PartialEq<SIBinder> for WIBinder`] so the operands can be
+/// written in either order.
+impl PartialEq<WIBinder> for SIBinder {
+    fn eq(&self, other: &WIBinder) -> bool {
+        SIBinder::downgrade(self) == *other
     }
 }
 

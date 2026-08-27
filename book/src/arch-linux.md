@@ -52,7 +52,14 @@ Create a binder device and test the setup:
 ```bash
 # Create binder device (binderfs devices are not persistent —
 # re-run this after each reboot)
-$ sudo rsb_device binder
+# Create the `binder` group and put yourself in it (log out and back in,
+# or use `newgrp binder`, for the membership to take effect)
+$ sudo groupadd -f binder
+$ sudo usermod -aG binder "$USER"
+
+# Create the device, owned by that group. The node's mode is the only gate
+# on who may speak binder at all, so it defaults to 0600 (root only).
+$ sudo rsb_device binder --group binder --mode 0660
 
 # Verify device creation
 $ ls -la /dev/binderfs/binder
@@ -61,8 +68,9 @@ $ ls -la /dev/binderfs/binder
 $ git clone https://github.com/hiking90/rsbinder.git
 $ cd rsbinder
 
-# Start service manager in one terminal
-$ rsb_hub
+# Start service manager in one terminal. --insecure-allow-all runs with no
+# access control; see the Service Manager chapter for writing a policy.
+$ rsb_hub --insecure-allow-all
 
 # In another terminal, run the example
 $ cargo run --bin hello_service &
@@ -75,7 +83,8 @@ The linux-zen kernel builds binder directly into the kernel
 (`CONFIG_ANDROID_BINDER_IPC=y`), so there is no module to load on boot —
 no `modules-load.d` or `modprobe` configuration is needed. The only
 non-persistent piece is the binderfs device itself: re-run
-`sudo rsb_device binder` after each reboot (see above).
+`sudo rsb_device binder --group binder --mode 0660` after each reboot (see
+above). The group itself persists; only the device node does not.
 
 > **Note**: `binder_linux` is the out-of-tree Anbox DKMS module, not
 > part of the zen kernel. `modules-load.d` / `modprobe binder_linux`
