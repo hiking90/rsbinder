@@ -167,12 +167,12 @@ pub mod binderfs;
 pub mod error;
 /// File descriptor wrapper for IPC
 pub mod file_descriptor;
-/// `LazyServiceRegistrar` skeleton (state machine +
-/// `IClientCallback::onClients` dispatch). AOSP
-/// `frameworks/native/libs/binder/LazyServiceRegistrar.cpp`. Hub
-/// integration (actual `registerClientCallback` / `tryUnregisterService`
-/// IPC) is owed by the caller until the hub plumbing lands — see the
-/// module docs.
+// `LazyServiceRegistrar` — AOSP
+// `frameworks/native/libs/binder/LazyServiceRegistrar.cpp`. Kept as a plain
+// (non-doc) comment for the reason spelled out at `entry` below: an outer
+// doc here merges with the module's inner `//!` docs and re-resolves their
+// intra-doc links at the crate root, where the module's own types are not
+// in scope.
 pub mod lazy_service;
 mod macros;
 /// Native service implementation helpers

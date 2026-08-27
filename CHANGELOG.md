@@ -41,11 +41,28 @@ short form — and the first entry is the only one no compiler will catch.
   `Android13PlusCodec`, `WireReply`, `WireTransaction`, `RpcState`). The
   supported RPC surface is `RpcServer` / `RpcSession` / `RpcProxy`, the
   transport traits, and the address and identity types.
+- **`LazyServiceRegistrar::register_service` now registers, and the process
+  exits when its last client goes away.** It used to touch nothing outside
+  the struct. Code that called it *and* did its own `addService` /
+  `registerClientCallback` must drop those calls; code that relied on it
+  being inert needs `set_active_services_callback` or `force_persist`.
 - **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
   is stamped at construction; only an exhaustive `match` on the enum notices.
 
 ### Added
 
+- **rsbinder (`lazy_service`):** `LazyServiceRegistrar::set_active_services_callback`
+  — AOSP `setActiveServicesCallback`. Reports whether any service in the
+  process has clients, and by returning `true` takes the shutdown decision
+  over from the registrar. Fires only when the answer changes.
+- **example-hello (`hello_callback_demo`):** a real lazy service now — it
+  registers through `LazyServiceRegistrar` and exits by itself once the last
+  client goes away, rather than printing `onClients` transitions for a human
+  to read. `tests/scripts/run_lazy_service_ac.sh` runs it against `rsb_hub`
+  and gates on the exit status, so the half of the lazy path that only exists
+  on a wire — the flag reaching the registry, the client callback landing,
+  the hub's 5-second poller driving the shutdown, `tryUnregisterService`
+  actually removing the name — is covered automatically for the first time.
 - **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
   manager what it knows — the Linux counterpart of Android's `service` and
   `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,
@@ -229,6 +246,33 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder (`lazy_service`) — breaking:** `LazyServiceRegistrar` now does
+  what its name says. `register_service` makes the service-manager calls
+  itself — `addService` with AOSP's `FLAG_IS_LAZY_SERVICE`, then
+  `registerClientCallback` with an `IClientCallback` the module owns — routes
+  the incoming `onClients` into its own state machine, and once nothing is
+  using any of its services unregisters them and exits the process with
+  status 0. That is AOSP `tryShutdownLocked`, and the reason the pattern
+  exists: the service manager starts the process again on the next lookup.
+  It used to be an in-process state machine that made no calls at all, so
+  `register_service` registered nothing and a caller owed every one of those
+  steps by hand — none of which the type could tell them about.
+
+  `force_persist` suspends the shutdown as before (and releasing it re-checks
+  immediately, as AOSP does); the new `set_active_services_callback` takes the
+  decision over entirely. `re_register` no longer resets `has_clients` to
+  `true`: AOSP `reRegisterLocked` leaves it alone, and inventing clients hides
+  the state the service manager just reported. `LazyServiceRegistrar` is
+  `Clone`, sharing one set of registrations the way AOSP's handle shares its
+  `ClientCounterCallback`.
+
+  One deliberate departure from AOSP: the service-manager calls are made
+  without the registrar's lock held. A service manager may answer
+  `tryUnregisterService` by dispatching `onClients` back into this process,
+  and the binder driver delivers such a nested transaction on the very thread
+  that is waiting for the reply — which would deadlock on a non-reentrant
+  `Mutex`. The service manager is the authority on whether an unregister may
+  proceed, so nothing is lost by not holding it.
 - **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
   to `BINDER_SET_MAX_THREADS` **as written**, matching AOSP's
   `setThreadPoolMaxThreadCount`. Previously `0` was a sentinel meaning "use

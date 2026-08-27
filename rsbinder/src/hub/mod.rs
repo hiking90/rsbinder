@@ -1033,6 +1033,36 @@ impl ServiceManager {
         }
     }
 
+    /// [`add_service`](Self::add_service) with AOSP's `FLAG_IS_LAZY_SERVICE`
+    /// set in `dumpPriority`, so the service manager can report the service
+    /// as lazy (`getServiceDebugInfo().isLazyService`, `rsb_service info`).
+    ///
+    /// The flag is an Android 16 `IServiceManager` constant — AOSP added it
+    /// in `android-15.0.0_r20` — so the older protocols register without it,
+    /// exactly as their own libbinder did. Crate-private because AOSP's
+    /// `LazyServiceRegistrar` is the only thing that may set it (it warns if
+    /// a caller pre-set the bit).
+    pub(crate) fn add_lazy_service(
+        &self,
+        identifier: &str,
+        binder: impl Into<SIBinder>,
+    ) -> std::result::Result<(), Status> {
+        let binder = binder.into();
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(sm) => android_10::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::add_service(sm, identifier, binder),
+            ServiceManager::Android16(sm) => android_16::add_lazy_service(sm, identifier, binder),
+        }
+    }
+
     /// Retrieves debug information about all currently registered services.
     ///
     /// Note: not supported on Android 10 or Android 11 - returns an error on those versions.
@@ -1602,6 +1632,14 @@ pub fn add_service(
 ) -> std::result::Result<(), Status> {
     // `?` converts a StatusCode init failure into Status via From<StatusCode>.
     default()?.add_service(identifier, binder)
+}
+
+/// [`ServiceManager::add_lazy_service`] on the default service manager.
+pub(crate) fn add_lazy_service(
+    identifier: &str,
+    binder: impl Into<SIBinder>,
+) -> std::result::Result<(), Status> {
+    default()?.add_lazy_service(identifier, binder)
 }
 
 /// Convenience function to get a service from the default ServiceManager.
