@@ -156,7 +156,7 @@ fn distinct_name_cap_exceeded<V>(map: &BTreeMap<String, V>, name: &str) -> bool 
 /// strongly, and a strong reference here would keep a proxy — and its
 /// kernel ref — alive past the registry entry that justified it. The weak
 /// reference is what an obituary carries, so it is also what
-/// [`Inner::forget_death_link`] matches on.
+/// [`Inner::retire_dead_binder`] matches on.
 struct DeathLink {
     weak: rsbinder::WIBinder,
     count: usize,
@@ -234,7 +234,7 @@ impl Inner {
     /// A native binder cannot be linked and is silently skipped, so callers
     /// do not need to test for it. Every successful call must be paired
     /// with exactly one [`Inner::release_death_link`] or, once the binder
-    /// has died, one [`Inner::forget_death_link`].
+    /// has died, one [`Inner::retire_dead_binder`].
     fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::status::Result<()> {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return Ok(());
