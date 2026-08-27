@@ -24,8 +24,8 @@
 //! // `ProcessState` has to exist first.
 //! ProcessState::init_default()?;
 //!
-//! let registrar = LazyServiceRegistrar::new();
-//! registrar.register_service("my.Service/default", binder)?;
+//! // The process-wide registrar: it has to outlive what it registers.
+//! LazyServiceRegistrar::instance().register_service("my.Service/default", binder)?;
 //!
 //! // Returns only if the thread pool is torn down; the usual exit is the
 //! // registrar's own, from the callback thread.
@@ -57,6 +57,12 @@
 //! * **Nothing aborts.** AOSP `LOG_ALWAYS_FATAL`s on an `onClients` for an
 //!   unknown service, on an `onClients` that repeats the state it already
 //!   believed, and on a failed re-register. Each is logged and survived here.
+//! * **Android 11 and up.** `registerClientCallback` does not exist in the
+//!   Android 10 service manager, so `register_service` reports
+//!   `UnknownTransaction` there — after its `addService` has already
+//!   succeeded, leaving the service registered but untracked. Call
+//!   [`hub::try_unregister_service`](crate::hub::try_unregister_service) to
+//!   undo that, or register it as an ordinary service instead.
 //! * **Re-registering a name with a *different* binder replaces the entry**
 //!   and registers a fresh client callback for it. AOSP keeps the first
 //!   binder in `mRegisteredServices` while handing the new one to
@@ -394,15 +400,39 @@ impl Shared {
 /// is using them.
 ///
 /// A cheap handle: cloning one shares the same registrations, as AOSP's
-/// `LazyServiceRegistrar` shares its `ClientCounterCallback`. AOSP exposes a
-/// process singleton (`getInstance`); construct one here and share it.
+/// `LazyServiceRegistrar` shares its `ClientCounterCallback`.
+///
+/// **A registrar must outlive the services it registers.** Reach for
+/// [`instance`](Self::instance) unless you have a reason not to — see
+/// [`new`](Self::new) for what dropping the last handle costs.
 #[derive(Clone)]
 pub struct LazyServiceRegistrar {
     shared: Arc<Shared>,
 }
 
 impl LazyServiceRegistrar {
-    /// A registrar backed by the process's default service manager.
+    /// The process-wide registrar. AOSP
+    /// [`LazyServiceRegistrar::getInstance`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/LazyServiceRegistrar.cpp;l=329),
+    /// which is likewise a singleton that is never freed.
+    ///
+    /// Use this for an ordinary lazy service. Registering through a
+    /// registrar that lives as long as the process is what makes the
+    /// shutdown reachable at all.
+    pub fn instance() -> &'static LazyServiceRegistrar {
+        static INSTANCE: std::sync::OnceLock<LazyServiceRegistrar> = std::sync::OnceLock::new();
+        INSTANCE.get_or_init(LazyServiceRegistrar::new)
+    }
+
+    /// A fresh registrar backed by the process's default service manager.
+    /// AOSP `createExtraTestInstance`.
+    ///
+    /// **Keep it alive for as long as its services are registered.** The
+    /// `IClientCallback` binder outlives the registrar — the service manager
+    /// holds a reference, so the kernel keeps the local object pinned — but
+    /// its link back to the bookkeeping is weak. Drop the last handle and
+    /// the service manager goes on calling a callback that does nothing:
+    /// the services stay registered, the process never shuts down, and
+    /// nothing says so. [`instance`](Self::instance) has no such edge.
     pub fn new() -> Self {
         Self::with_registry(Arc::new(HubRegistry))
     }
@@ -445,9 +475,11 @@ impl LazyServiceRegistrar {
     /// `registerClientCallback`. AOSP
     /// [`registerServiceLocked`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/LazyServiceRegistrar.cpp;l=129).
     ///
-    /// The service starts out assumed to have clients, so an idle process
-    /// cannot shut down before the service manager has said anything about
-    /// it.
+    /// A new registration starts out assumed to have clients, so an idle
+    /// process cannot shut down before the service manager has said anything
+    /// about it. Re-registering a name already tracked under the same binder
+    /// leaves that state alone — the service manager reports it only when it
+    /// changes, so throwing it away here would strand the process.
     pub fn register_service(&self, name: &str, binder: SIBinder) -> Result<()> {
         let tracked_same_binder = {
             let inner = self.shared.lock();
@@ -483,15 +515,27 @@ impl LazyServiceRegistrar {
         }
 
         let mut inner = self.shared.lock();
-        inner.services.insert(
-            name.to_string(),
-            RegisteredService {
-                name: name.to_string(),
-                binder,
-                has_clients: true,
-                registered: true,
-            },
-        );
+        if tracked_same_binder {
+            // A re-register must not overwrite the entry. `has_clients` is
+            // the service manager's last word on this service, and it only
+            // ever says it again when it changes — resetting it here leaves
+            // an idle process believing it is in use, with nothing due to
+            // correct it. AOSP `registerServiceLocked` inserts under
+            // `if (!reRegister)` for the same reason.
+            if let Some(entry) = inner.services.get_mut(name) {
+                entry.registered = true;
+            }
+        } else {
+            inner.services.insert(
+                name.to_string(),
+                RegisteredService {
+                    name: name.to_string(),
+                    binder,
+                    has_clients: true,
+                    registered: true,
+                },
+            );
+        }
         inner.update_cache_client_count();
         Ok(())
     }
@@ -697,6 +741,36 @@ mod tests {
         reg.register_service("foo", binder.clone()).unwrap();
         reg.register_service("foo", binder).unwrap();
         assert_eq!(registry.calls(), vec!["add:foo", "cb:foo", "add:foo"]);
+    }
+
+    /// A re-register keeps the client state the service manager reported.
+    /// Overwriting it strands the process: the service manager says
+    /// `onClients` only on a change, so nothing would ever correct a
+    /// `has_clients` invented here.
+    #[test]
+    fn re_registering_same_binder_keeps_the_reported_client_state() {
+        let (reg, _registry) = fixture();
+        let binder = fresh_binder();
+        reg.register_service("keep", binder.clone()).unwrap();
+
+        // Hold the process up so the `onClients(false)` below does not shut
+        // it down before the re-register can be observed.
+        reg.force_persist(true);
+        reg.on_clients("keep", false);
+        assert!(!reg.snapshot()[0].1, "the service manager said no clients");
+
+        reg.register_service("keep", binder).unwrap();
+        assert!(
+            !reg.snapshot()[0].1,
+            "a re-register must not invent clients"
+        );
+
+        // The proof it matters: releasing the hold must now shut down.
+        reg.force_persist(false);
+        assert!(
+            reg.shared.exited.load(Ordering::Acquire),
+            "still believed to be in use after the re-register"
+        );
     }
 
     /// A different binder under the same name is a fresh registration: the

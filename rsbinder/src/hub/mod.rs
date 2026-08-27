@@ -1035,7 +1035,10 @@ impl ServiceManager {
 
     /// [`add_service`](Self::add_service) with AOSP's `FLAG_IS_LAZY_SERVICE`
     /// set in `dumpPriority`, so the service manager can report the service
-    /// as lazy (`getServiceDebugInfo().isLazyService`, `rsb_service info`).
+    /// as lazy — `ServiceWithMetadata::isLazyService` on the
+    /// `getService2`/`checkService2` reply, and the `lazy=` column of
+    /// `rsb_service dump manager`. (`getServiceDebugInfo` does not carry it:
+    /// `ServiceDebugInfo` is name and pid only.)
     ///
     /// The flag is an Android 16 `IServiceManager` constant — AOSP added it
     /// in `android-15.0.0_r20` — so the older protocols register without it,

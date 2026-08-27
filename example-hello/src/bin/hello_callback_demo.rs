@@ -53,7 +53,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ProcessState::init_default()?;
 
     let service = BnHello::new_binder(IHelloService {});
-    let registrar = LazyServiceRegistrar::new();
+    // The process-wide registrar — it has to outlive what it registers.
+    let registrar = LazyServiceRegistrar::instance();
 
     // Observe the transitions without taking the decision away: returning
     // `false` means "not handled", so the registrar still shuts the process

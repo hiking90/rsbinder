@@ -203,7 +203,7 @@ pub fn add_service(
 /// AOSP `LazyServiceRegistrar::registerServiceLocked` ORs the flag into
 /// `dumpFlags` itself and warns if the caller pre-set it, so this is not
 /// exposed as a general `dumpFlags` parameter.
-pub fn add_lazy_service(
+pub(crate) fn add_lazy_service(
     sm: &BpServiceManager,
     identifier: &str,
     binder: SIBinder,

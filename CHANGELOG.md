@@ -51,6 +51,14 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Added
 
+- **rsbinder (`lazy_service`):** `LazyServiceRegistrar::instance` — the
+  process-wide registrar, AOSP `getInstance`. A registrar has to outlive the
+  services it registers: the `IClientCallback` binder survives it (the
+  service manager holds a reference), but its link back to the bookkeeping is
+  weak, so dropping the last handle leaves the service manager calling a
+  callback that does nothing — services registered, process never shutting
+  down, nothing logged. `new` is still there for a second, independent
+  registrar (AOSP `createExtraTestInstance`) and now says so.
 - **rsbinder (`lazy_service`):** `LazyServiceRegistrar::set_active_services_callback`
   — AOSP `setActiveServicesCallback`. Reports whether any service in the
   process has clients, and by returning `true` takes the shutdown decision
