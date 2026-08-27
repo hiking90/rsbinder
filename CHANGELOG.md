@@ -63,6 +63,9 @@ short form — and the first entry is the only one no compiler will catch.
   on a wire — the flag reaching the registry, the client callback landing,
   the hub's 5-second poller driving the shutdown, `tryUnregisterService`
   actually removing the name — is covered automatically for the first time.
+  `example-hello/cpp/run_lazy_service_stage3.sh` runs the same thing against
+  Android's own `servicemanager` instead of `rsb_hub`, which removes the
+  circularity of testing our port against our port.
 - **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
   manager what it knows — the Linux counterpart of Android's `service` and
   `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,

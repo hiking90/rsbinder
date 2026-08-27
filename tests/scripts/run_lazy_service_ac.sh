@@ -104,7 +104,7 @@ if grep -A2 "^  $SERVICE\$" "$OUT" | grep -q 'lazy=yes'; then
 else
     bad "lazy=no — FLAG_IS_LAZY_SERVICE did not reach the hub: $(grep -A2 "^  $SERVICE\$" "$OUT")"
 fi
-if grep -A3 "^  $SERVICE\$" "$OUT" | grep -q 'client=1'; then
+if grep -A3 "^  $SERVICE\$" "$OUT" | grep -q 'client=1$'; then
     ok "registerClientCallback landed (client=1)"
 else
     bad "client callback count: $(grep -A3 "^  $SERVICE\$" "$OUT" | grep client)"
