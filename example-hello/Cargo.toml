@@ -102,6 +102,15 @@ name = "shm_service"
 [[bin]]
 name = "shm_client"
 
+# STAGE3 gate for the Android 15 service-manager split: drives the whole
+# `hub` surface against a real AOSP `servicemanager` and checks that every
+# method `android-15.0.0_r6` renumbered still lands where it should. Needs
+# no feature — `android_10_plus` below already carries both Android 15
+# protocols. Run it through `cpp/run_a15_qpr_stage3.sh`, which exercises
+# both numberings.
+[[bin]]
+name = "a15_qpr_interop"
+
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
 env_logger = { workspace = true }
