@@ -1,40 +1,39 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 //
-// Lazy-service-style demo: registers `SERVICE_NAME` and then registers
-// *itself* as the `IClientCallback` for that name. Every `onClients`
-// transition prints to stdout with a wall-clock offset, so the rsb_hub
-// 5-second client-callback poller can be observed end-to-end.
+// Lazy service: registers `SERVICE_NAME` through `LazyServiceRegistrar` and
+// **exits by itself** once nothing is using it. That is the whole point of
+// the pattern — the service manager starts the process again on the next
+// lookup, so an idle service costs nothing.
 //
-// Expected trace when paired with rsb_hub + a short-lived
-// `hello_client`:
-//   1. T+0   addService + registerClientCallback → first internal
-//            `handle_service_client_callback(..., is_called_on_interval=false)`
-//            may already emit `onClients(true)` if the kernel ref-count
-//            seen by rsb_hub exceeds `KNOWN_CLIENTS=2`.
-//   2. T+x   external `hello_client` calls `get_service(SERVICE_NAME)`
-//            → rsb_hub sets `guarantee_client=true`. Either fires a
-//            fresh `onClients(true)` or is a no-op if state already
-//            matches (the latter exercises the A2 "log+return" guard
-//            replacing the prior `process::abort()`).
-//   3. T+x+1 `hello_client` exits → kernel binder ref-count drops.
-//   4. T+x+(≤5)  rsb_hub's 5-second poller wakes and calls
-//            `handle_service_client_callback(..., is_called_on_interval=true)`
-//            → `has_kernel_reported_clients=false` + `has_clients=true`
-//            arm fires `onClients(false)`.
+// The registrar does the service-manager work: `addService` with
+// `FLAG_IS_LAZY_SERVICE`, `registerClientCallback`, and the `onClients`
+// bookkeeping. Nothing here registers a callback by hand.
+//
+// Expected trace, paired with rsb_hub and a short-lived `hello_client`:
+//   1. T+0        register_service → addService + registerClientCallback.
+//                 Nothing has looked the service up yet, so it starts with
+//                 no clients — and the hub reports only changes, so the
+//                 shutdown check waits for one to happen.
+//   2. T+x        `hello_client` looks the service up → the hub reports
+//                 clients → `has_clients=true`.
+//   3. T+x+1      `hello_client` exits → the kernel ref count drops.
+//   4. T+x+(≤5)   the hub's 5-second poller reports `onClients(false)` →
+//                 tryUnregisterService → the process exits 0.
 //
 // Use with:
 //   RUST_LOG=info ./hello_callback_demo &
 //   sleep 2
 //   timeout 3 ./hello_client          # touches my.hello + exits
-//   sleep 8                            # let the 5s poller fire
-//   pkill hello_callback_demo
-#![allow(non_snake_case)]
-
+//   wait                              # the demo exits on its own
+//
+// `tests/scripts/run_lazy_service_ac.sh` runs exactly that and gates on the
+// exit status.
+use std::sync::Arc;
 use std::time::Instant;
 
 use example_hello::*;
-use rsbinder::hub::{BnClientCallback, IClientCallback};
+use rsbinder::lazy_service::LazyServiceRegistrar;
 use rsbinder::*;
 
 struct IHelloService;
@@ -45,46 +44,41 @@ impl IHello for IHelloService {
     }
 }
 
-struct MyClientCallback {
-    start: Instant,
-}
-impl Interface for MyClientCallback {}
-impl IClientCallback for MyClientCallback {
-    fn onClients(&self, _registered: &SIBinder, has_clients: bool) -> rsbinder::status::Result<()> {
-        let elapsed = self.start.elapsed().as_secs_f32();
-        println!("[+{elapsed:5.1}s] onClients(has_clients={has_clients})");
-        Ok(())
-    }
-}
-
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // `serve` + `add` registers with the service manager right away; the
-    // kernel-only `registerClientCallback` extra (reached via `hub`) runs
-    // before `run()` starts the thread pool and joins it.
+    // `register_service` talks to the service manager, so the kernel binder
+    // `ProcessState` has to exist first.
+    ProcessState::init_default()?;
+
+    // `echo` and the registrar's own `onClients` are both inbound
+    // transactions, so the pool has to be running to serve them.
+    ProcessState::start_thread_pool();
+
     let service = BnHello::new_binder(IHelloService {});
-    let service_binder = service.as_binder();
-    let server = rsbinder::serve("binder://")?.add(SERVICE_NAME, service_binder.clone())?;
-    println!("Registered service: {SERVICE_NAME}");
+    // The process-wide registrar — it has to outlive what it registers.
+    let registrar = LazyServiceRegistrar::instance();
 
+    // Observe the transitions without taking the decision away: returning
+    // `false` means "not handled", so the registrar still shuts the process
+    // down when the count reaches zero.
     let start = Instant::now();
-    let callback = BnClientCallback::new_binder(MyClientCallback { start });
+    registrar.set_active_services_callback(Arc::new(move |has_clients| {
+        println!(
+            "[+{:5.1}s] has_clients={has_clients}",
+            start.elapsed().as_secs_f32()
+        );
+        false
+    }));
 
-    // `hub::register_client_callback` hides the per-version ServiceManager
-    // dispatch, so the demo no longer reaches into a `BpServiceManager`
-    // variant by hand.
-    hub::register_client_callback(SERVICE_NAME, &service_binder, &callback)
-        .map_err(|e| format!("registerClientCallback failed: {e:?}"))?;
-    println!(
-        "[+{:5.1}s] Registered client callback; awaiting transitions...",
-        start.elapsed().as_secs_f32()
-    );
+    // The registrar holds the binder for as long as it tracks the service,
+    // so nothing here has to keep `service` alive.
+    registrar.register_service(SERVICE_NAME, service)?;
+    println!("Registered lazy service: {SERVICE_NAME}");
 
-    // Keep the service binder alive for the lifetime of the process —
-    // the `service` local goes out of scope only when `join_thread_pool`
-    // returns (which it normally doesn't).
-    let _keep_alive = service;
-
-    Ok(server.run()?)
+    // Returns only if the thread pool is torn down; the usual exit is
+    // `LazyServiceRegistrar`'s own, from the binder thread that took the
+    // `onClients`.
+    ProcessState::join_thread_pool()?;
+    Ok(())
 }

@@ -48,10 +48,11 @@ pub enum ProxyCountEvent {
 /// Callback type for [`ProxyCountEvent`] notifications. Invoked **outside**
 /// the internal `proxy_count` mutex, and — on the proxy-create path — after
 /// the process-wide `ProcessState::handle_to_proxy` cache lock is released
-/// (via [`CallbackDeferGuard`]). The callback may therefore freely re-enter
-/// both `proxy_count` APIs and the binder proxy cache (`get_service`,
-/// resolving/creating proxies). It must not block indefinitely — every proxy
-/// create/drop on the firing thread is gated on it returning.
+/// (via the internal `CallbackDeferGuard`). The callback may therefore
+/// freely re-enter both `proxy_count` APIs and the binder proxy cache
+/// (`get_service`, resolving/creating proxies). It must not block
+/// indefinitely — every proxy create/drop on the firing thread is gated on
+/// it returning.
 pub type ProxyCountCallback = Arc<dyn Fn(ProxyCountEvent) + Send + Sync>;
 
 /// Process-global proxy count. Lock-free hot path: every

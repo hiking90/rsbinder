@@ -87,6 +87,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check rustdoc
+        # docs.rs builds `rsbinder` with `all-features`, so a link that only
+        # resolves with `rpc` on still ships — but anyone running `cargo doc`
+        # on a default-feature dependency sees it break. Gate both.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc --workspace --no-deps --all-features
+          cargo doc --workspace --no-deps
 
   linux-build:
     name: Linux Build

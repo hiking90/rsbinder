@@ -376,6 +376,68 @@ pub enum ServiceManager {
     Android16(android_16::BpServiceManager),
 }
 
+/// Which of Android 15's two service-manager numberings this device speaks.
+///
+/// `android-15.0.0_r6` inserted `getService2` at index 1 of
+/// `IServiceManager.aidl`, shifting every later transaction code by one —
+/// `addService` 2 → 3, `registerClientCallback` 11 → 12,
+/// `tryUnregisterService` 12 → 13. The SDK version stayed 35 and the
+/// interface is not a frozen `aidl_interface`, so nothing preserved the old
+/// codes. AOSP is unaffected: `servicemanager` and `libbinder` ship in one
+/// image and are always in step. Only an out-of-tree client pins the
+/// numbers, so only a probe can tell the two builds apart.
+///
+/// Code 14 is the one code that answers the question without side effects —
+/// one past the last method of the pre-r6 interface, so it is rejected
+/// outright there, and `getServiceDebugInfo()` (no arguments, read-only) in
+/// the r6+ one. The code below it would not do: 13 is `tryUnregisterService`
+/// on an r6+ device.
+///
+/// `Ok(())` means this module's transaction codes are right for this device.
+#[cfg(all(target_os = "android", feature = "android_14"))]
+fn check_android_15_numbering(context: &SIBinder) -> Result<()> {
+    // One past `getServiceDebugInfo`, the last method of the pre-r6
+    // interface.
+    const PROBE_CODE: TransactionCode = 14;
+
+    let proxy = context.as_proxy().ok_or(StatusCode::BadType)?;
+    let mut data = Parcel::new();
+    data.write_interface_token(
+        <android_14::BpServiceManager as android_14::IServiceManager>::descriptor(),
+    )?;
+
+    match proxy.submit_transact(FIRST_CALL_TRANSACTION + PROBE_CODE, &data, 0) {
+        // Rejected: 14 methods, so this is a pre-r6 build and the codes this
+        // module sends are the ones it answers.
+        Err(StatusCode::UnknownTransaction) => Ok(()),
+        // Answered: 15 methods. Every code from `checkService` on is one
+        // higher than this module sends. Measured against the real
+        // servicemanager from `BP11.241210.004`: `addService` lands on
+        // `checkService`, which reads the name and leaves the rest, and
+        // AOSP's generated `onTransact` rejects the leftovers as
+        // `BAD_PARCELABLE`. So the calls fail rather than corrupt — but they
+        // fail saying nothing about why, on every method that moved.
+        Ok(_) => {
+            log::error!(
+                "Android 15 service manager with shifted transaction codes \
+                 (android-15.0.0_r6 or later - a QPR build). rsbinder has no \
+                 module for that protocol; the android_14 one addresses the \
+                 wrong method for everything past `getService`, so the \
+                 service manager is refused here rather than left to fail one \
+                 call at a time. Only kernel-binder use through `hub` is \
+                 affected; the RPC transport is not."
+            );
+            Err(StatusCode::InvalidOperation)
+        }
+        // Neither answer: which protocol this device speaks is unknown, and
+        // guessing risks the silent loss above.
+        Err(e) => {
+            log::error!("could not probe the Android 15 service-manager protocol: {e:?}");
+            Err(e)
+        }
+    }
+}
+
 /// Returns the global ServiceManager instance appropriate for the current Android version.
 ///
 /// The singleton is created on first call and reused afterwards. The correct
@@ -412,17 +474,27 @@ pub fn default() -> Result<Arc<ServiceManager>> {
             // format — the `android/os/*` AIDL is byte-identical between
             // android-16.0.0_r4 and android-17.0.0_r1 (and the kernel binder
             // UAPI is unchanged), so it is served by the `android_16` module,
-            // mirroring how Android 15 is served by `android_14`.
+            // mirroring how Android 15 is served by `android_14` (with the
+            // caveat recorded on that arm).
             sdk_versions::ANDROID_16 | sdk_versions::ANDROID_17 => {
                 create_service_manager!(Android16, android_16)
             }
-            // Android 15 (SDK 35) shares Android 14's service-manager wire
-            // format, so it is served by the `android_14` feature — there
-            // is no separate `android_15` feature. A build that enables
-            // only `android_16` therefore returns `InvalidOperation` on an
-            // Android 15 device; enable `android_14` to cover 14 *and* 15.
+            // Android 15 (SDK 35) is served by the `android_14` feature —
+            // there is no separate `android_15` feature. A build that
+            // enables only `android_16` therefore returns
+            // `InvalidOperation` on an Android 15 device.
+            //
+            // Only up to `android-15.0.0_r5`: a QPR build renumbered the
+            // interface without changing SDK 35, so which one this is has
+            // to be measured — see `check_android_15_numbering`. A QPR
+            // build is refused rather than served with the wrong codes;
+            // supporting it needs an `android_15` module, tracked
+            // separately.
             #[cfg(feature = "android_14")]
             sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => {
+                if sdk_version == sdk_versions::ANDROID_15 {
+                    check_android_15_numbering(&context)?;
+                }
                 create_service_manager!(Android14, android_14)
             }
             #[cfg(feature = "android_13")]
@@ -1033,6 +1105,48 @@ impl ServiceManager {
         }
     }
 
+    /// [`add_service`](Self::add_service) with AOSP's `FLAG_IS_LAZY_SERVICE`
+    /// set in `dumpPriority`, so the service manager can report the service
+    /// as lazy — `ServiceWithMetadata::isLazyService` on the
+    /// `getService2`/`checkService2` reply, and the `lazy=` column of
+    /// `rsb_service dump manager`. (`getServiceDebugInfo` does not carry it:
+    /// `ServiceDebugInfo` is name and pid only.)
+    ///
+    /// Only the `android_16` protocol sends the flag, and only it can act on
+    /// it: nothing reads the bit before `getService2` exists to carry
+    /// `isLazyService` back. AOSP added the constant in `android-15.0.0_r20`
+    /// and its `LazyServiceRegistrar` sets it from that release on — but the
+    /// same release train had already shifted every transaction code (see
+    /// the `android_14` note under [`ServiceManager::default`]), so the
+    /// `android_14` arm cannot reach those builds at all and gains nothing
+    /// by setting it. Android 11–14 register without the flag, exactly as
+    /// their own libbinder did; Android 10 is refused outright — see below.
+    /// Crate-private because AOSP's `LazyServiceRegistrar` is the only thing
+    /// that may set it (it warns if a caller pre-set the bit).
+    pub(crate) fn add_lazy_service(
+        &self,
+        identifier: &str,
+        binder: impl Into<SIBinder>,
+    ) -> std::result::Result<(), Status> {
+        let binder = binder.into();
+        match self {
+            // The legacy C protocol has neither `registerClientCallback` nor
+            // `tryUnregisterService`, so a service published here could
+            // never be tracked *or* taken back down. Refuse before it is.
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("lazy service registration", 11)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::add_service(sm, identifier, binder),
+            ServiceManager::Android16(sm) => android_16::add_lazy_service(sm, identifier, binder),
+        }
+    }
+
     /// Retrieves debug information about all currently registered services.
     ///
     /// Note: not supported on Android 10 or Android 11 - returns an error on those versions.
@@ -1602,6 +1716,14 @@ pub fn add_service(
 ) -> std::result::Result<(), Status> {
     // `?` converts a StatusCode init failure into Status via From<StatusCode>.
     default()?.add_service(identifier, binder)
+}
+
+/// [`ServiceManager::add_lazy_service`] on the default service manager.
+pub(crate) fn add_lazy_service(
+    identifier: &str,
+    binder: impl Into<SIBinder>,
+) -> std::result::Result<(), Status> {
+    default()?.add_lazy_service(identifier, binder)
 }
 
 /// Convenience function to get a service from the default ServiceManager.

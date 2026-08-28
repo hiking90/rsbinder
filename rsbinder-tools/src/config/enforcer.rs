@@ -17,10 +17,10 @@ use super::parse::Config;
 use super::policy::{Permission, Subject};
 use crate::nss::GroupCache;
 
-/// Applies a [`Policy`] to live callers.
+/// Applies a [`Policy`](super::policy::Policy) to live callers.
 ///
 /// Held behind a shared reference for the lifetime of `rsb_hub`; the
-/// policy inside can be swapped by [`replace_policy`](Self::replace_policy)
+/// policy inside can be swapped by [`replace`](Self::replace)
 /// on SIGHUP without disturbing in-flight transactions.
 pub struct Enforcer {
     config: RwLock<Arc<Config>>,
@@ -110,7 +110,7 @@ impl Enforcer {
     /// principal, a TLS certificate needs a certificate→principal mapping
     /// that does not exist here, and an anonymous peer has no identity at
     /// all. Denying is the only honest answer for those — see
-    /// [`rsbinder::rpc::PeerIdentity`].
+    /// `rsbinder::rpc::PeerIdentity`.
     pub fn check_caller(&self, permission: Permission, name: &str, caller: &Caller) -> bool {
         match uid_of(caller) {
             Some(uid) => self.check_uid(permission, name, uid),

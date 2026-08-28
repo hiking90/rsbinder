@@ -22,7 +22,7 @@
 //!
 //! A shared region travels over any transport that can carry an fd:
 //! the kernel binder (`BINDER_TYPE_FD`) and Unix-socket RPC with
-//! [`FileDescriptorTransportMode::Unix`](crate::rpc::FileDescriptorTransportMode)
+//! `rpc::FileDescriptorTransportMode::Unix` (the `rpc` feature)
 //! negotiated on both ends. TCP / vsock / TLS sessions cannot carry
 //! fds at all; writing a heap fd into such a parcel fails with
 //! `StatusCode::BadType` exactly as a plain

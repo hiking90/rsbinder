@@ -198,6 +198,24 @@ pub fn add_service(
     sm.addService(identifier, &binder, false, DUMP_FLAG_PRIORITY_DEFAULT)
 }
 
+/// `add_service` with `FLAG_IS_LAZY_SERVICE` set, for
+/// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
+/// AOSP `LazyServiceRegistrar::registerServiceLocked` ORs the flag into
+/// `dumpFlags` itself and warns if the caller pre-set it, so this is not
+/// exposed as a general `dumpFlags` parameter.
+pub(crate) fn add_lazy_service(
+    sm: &BpServiceManager,
+    identifier: &str,
+    binder: SIBinder,
+) -> std::result::Result<(), Status> {
+    sm.addService(
+        identifier,
+        &binder,
+        false,
+        DUMP_FLAG_PRIORITY_DEFAULT | FLAG_IS_LAZY_SERVICE,
+    )
+}
+
 /// Request a callback when a service is registered.
 pub fn register_for_notifications(
     sm: &BpServiceManager,

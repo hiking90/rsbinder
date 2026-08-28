@@ -150,7 +150,7 @@ pub enum ConfigError {
         name: String,
     },
     /// A configuration path anyone but root or this process can rewrite.
-    /// See [`super::trust`].
+    /// See [`TrustProblem`](super::TrustProblem).
     #[error("{path} is {problem}; refusing to load configuration from it")]
     Untrusted {
         /// The offending path.

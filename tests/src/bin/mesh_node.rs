@@ -12,6 +12,8 @@
 //! exchange round-tripped intact with zero errors.
 //!
 //! Roles:
+//!
+//! ```text
 //!   rpc-server    : serve IMeshNode over an RPC unix socket; also act
 //!                   as an RPC client against `--peer` sockets.
 //!   rpc-client    : RPC client only, against `--peer` sockets.
@@ -19,8 +21,11 @@
 //!                   service manager node); also an RPC client.
 //!   kernel-client : kernel binder client of `--kernel-service`; also
 //!                   serve IMeshNode over an RPC unix socket.
+//! ```
 //!
 //! Args:
+//!
+//! ```text
 //!   --role <r>             one of the roles above
 //!   --name <s>             this node's identity (origin string)
 //!   --listen <path>        unix socket to bind an RPC server on (server roles)
@@ -28,6 +33,7 @@
 //!   --kernel-service <s>   service-manager name (kernel roles)
 //!   --duration-ms <n>      how long to keep exchanging
 //!   --blob <n>             payload byte-array length
+//! ```
 
 #![allow(non_snake_case)]
 
