@@ -66,13 +66,14 @@
 //!   lands here**: its service manager has no `registerClientCallback`, so
 //!   `register_service` reports `UnknownTransaction` on every call and lazy
 //!   services need Android 11 or newer.
-//! * **Re-registering a name with a *different* binder replaces the entry.**
-//!   AOSP keeps the first binder in `mRegisteredServices` while handing the
-//!   new one to `addService`, so its own `onClients` — which carries the
-//!   binder the service manager currently holds — then matches nothing and
-//!   trips `LOG_ALWAYS_FATAL`. Replacing keeps the lookup working. The
-//!   client callback is *not* re-registered either way: the service manager
-//!   stores callbacks by name and does not de-duplicate them.
+//! * **Re-registering a name with a *different* binder replaces the entry**
+//!   (carrying its client state forward, as the service manager does). AOSP
+//!   keeps the first binder in `mRegisteredServices` while handing the new
+//!   one to `addService`, so its own `onClients` — which carries the binder
+//!   the service manager currently holds — then matches nothing and trips
+//!   `LOG_ALWAYS_FATAL`. Replacing keeps the lookup working. The client
+//!   callback is *not* re-registered either way: the service manager stores
+//!   callbacks by name and does not de-duplicate them.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -248,10 +249,13 @@ impl Shared {
                 return false;
             };
             if entry.has_clients == has_clients {
-                // AOSP `LOG_ALWAYS_FATAL`s on a repeated state.
-                log::warn!(
-                    "{name}: onClients repeated has_clients={has_clients}; already believed that"
-                );
+                // Expected right after registration: the service manager
+                // sends a catch-up `onClients(true)` from inside
+                // `registerClientCallback` when the service already has
+                // clients, and a new entry starts out assuming it does.
+                // AOSP `LOG_ALWAYS_FATAL`s here instead, which it can
+                // afford because its `Service::clients` starts `false`.
+                log::debug!("{name}: onClients({has_clients}) matched what we already believed");
             }
             entry.has_clients = has_clients;
             inner.update_cache_client_count();
@@ -365,6 +369,17 @@ impl Shared {
             }
         }
         true
+    }
+
+    /// Put the entry back the way it was, for a `register_service` that
+    /// published it and then could not complete.
+    fn restore(&self, name: &str, previous: Option<RegisteredService>) {
+        let mut inner = self.lock();
+        match previous {
+            Some(entry) => inner.services.insert(name.to_string(), entry),
+            None => inner.services.remove(name),
+        };
+        inner.update_cache_client_count();
     }
 
     /// AOSP `reRegisterLocked`. Note what it does *not* do: `has_clients` is
@@ -481,22 +496,42 @@ impl LazyServiceRegistrar {
     ///
     /// A new registration starts out assumed to have clients, so an idle
     /// process cannot shut down before the service manager has said anything
-    /// about it. Re-registering a name already tracked under the same binder
-    /// leaves that state alone — the service manager reports it only when it
-    /// changes, so throwing it away here would strand the process.
+    /// about it. Re-registering a name already tracked carries that state
+    /// forward whatever binder comes with it — the service manager does the
+    /// same, and reports it only when it changes, so throwing it away here
+    /// would strand the process.
     pub fn register_service(&self, name: &str, binder: SIBinder) -> Result<()> {
-        // Two different questions. The service manager stores client
-        // callbacks by *name*, so whether one is owed depends on the name
-        // alone (AOSP `registerServiceLocked`: `reRegister =
-        // mRegisteredServices.count(name) > 0`). Whether the tracking entry
-        // may be reused depends on the binder as well.
-        let (tracked, tracked_same_binder) = {
-            let inner = self.shared.lock();
-            match inner.services.get(name) {
-                Some(entry) => (true, entry.binder == binder),
-                None => (false, false),
-            }
+        // Everything here turns on whether the *name* is already tracked.
+        // The service manager keys the client-callback list on the name
+        // (`mNameToClientCallback[name]`) and carries `hasClients` across a
+        // re-`addService` whatever binder comes with it (AOSP
+        // `ServiceManager.cpp`: `.hasClients = prevClients`).
+        //
+        // The entry is published before the round trips, not after. The
+        // service manager dispatches `onClients` for this name from inside
+        // `addService` and `registerClientCallback`, both before their
+        // reply, so the driver lands that nested transaction on this very
+        // thread — and an entry that is not there yet would drop it, with
+        // no repeat coming.
+        let previous = {
+            let mut inner = self.shared.lock();
+            let previous = inner.services.get(name).cloned();
+            inner.services.insert(
+                name.to_string(),
+                RegisteredService {
+                    name: name.to_string(),
+                    binder: binder.clone(),
+                    // A new registration is assumed to be in use, so an idle
+                    // process cannot shut down before the service manager
+                    // has said anything about it.
+                    has_clients: previous.as_ref().is_none_or(|e| e.has_clients),
+                    registered: true,
+                },
+            );
+            inner.update_cache_client_count();
+            previous
         };
+        let tracked = previous.is_some();
 
         log::info!(
             "{} service {name}",
@@ -507,48 +542,29 @@ impl LazyServiceRegistrar {
             }
         );
 
-        self.shared
-            .registry
-            .add_lazy_service(name, &binder)
-            .map_err(|e| {
-                log::error!("Failed to register service {name} ({e:?})");
-                StatusCode::from(e)
-            })?;
+        if let Err(e) = self.shared.registry.add_lazy_service(name, &binder) {
+            log::error!("Failed to register service {name} ({e:?})");
+            self.shared.restore(name, previous);
+            return Err(StatusCode::from(e));
+        }
 
+        // Only for a name not already tracked: the service manager holds
+        // client callbacks by name and de-duplicates nothing, so a second
+        // registration would have it deliver every later `onClients` twice.
+        // AOSP `registerServiceLocked` guards on `!reRegister` for this.
         if !tracked {
             let callback = self.callback();
-            self.shared
+            if let Err(e) = self
+                .shared
                 .registry
                 .register_client_callback(name, &binder, &callback)
-                .map_err(|e| {
-                    log::error!("Failed to add client callback for service {name} ({e:?})");
-                    StatusCode::from(e)
-                })?;
+            {
+                log::error!("Failed to add client callback for service {name} ({e:?})");
+                self.shared.restore(name, previous);
+                return Err(StatusCode::from(e));
+            }
         }
 
-        let mut inner = self.shared.lock();
-        if tracked_same_binder {
-            // A re-register must not overwrite the entry. `has_clients` is
-            // the service manager's last word on this service, and it only
-            // ever says it again when it changes — resetting it here leaves
-            // an idle process believing it is in use, with nothing due to
-            // correct it. AOSP `registerServiceLocked` inserts under
-            // `if (!reRegister)` for the same reason.
-            if let Some(entry) = inner.services.get_mut(name) {
-                entry.registered = true;
-            }
-        } else {
-            inner.services.insert(
-                name.to_string(),
-                RegisteredService {
-                    name: name.to_string(),
-                    binder,
-                    has_clients: true,
-                    registered: true,
-                },
-            );
-        }
-        inner.update_cache_client_count();
         Ok(())
     }
 
@@ -987,6 +1003,101 @@ mod tests {
         // A binder this registrar never registered is logged, not fatal.
         reg.shared.on_clients_binder(&fresh_binder(), false);
         assert!(!reg.shared.exited.load(Ordering::Acquire));
+    }
+
+    /// A service manager that answers `registerClientCallback` by dispatching
+    /// `onClients` before it replies — which is what both `rsb_hub` and AOSP
+    /// do, and the binder driver lands that nested transaction on the thread
+    /// still waiting for the reply.
+    struct ReentrantRegistry {
+        shared: Mutex<Option<Weak<Shared>>>,
+        report: bool,
+    }
+
+    impl Registry for ReentrantRegistry {
+        fn add_lazy_service(
+            &self,
+            _name: &str,
+            _binder: &SIBinder,
+        ) -> std::result::Result<(), Status> {
+            Ok(())
+        }
+        fn register_client_callback(
+            &self,
+            _name: &str,
+            binder: &SIBinder,
+            _callback: &Strong<dyn IClientCallback>,
+        ) -> std::result::Result<(), Status> {
+            let shared = self.shared.lock().unwrap().clone();
+            if let Some(shared) = shared.as_ref().and_then(Weak::upgrade) {
+                shared.on_clients_binder(binder, self.report);
+            }
+            Ok(())
+        }
+        fn try_unregister_service(
+            &self,
+            _name: &str,
+            _binder: &SIBinder,
+        ) -> std::result::Result<(), Status> {
+            Ok(())
+        }
+    }
+
+    /// An `onClients` that arrives *during* `register_service`'s own round
+    /// trips must still land. The service manager sends one per change and
+    /// never repeats it, so dropping this one strands the process: it would
+    /// go on believing it has clients with nothing left to correct it.
+    #[test]
+    fn a_notification_arriving_during_registration_is_not_dropped() {
+        let registry = Arc::new(ReentrantRegistry {
+            shared: Mutex::new(None),
+            report: false,
+        });
+        let reg = LazyServiceRegistrar::with_registry(registry.clone());
+        *registry.shared.lock().unwrap() = Some(Arc::downgrade(&reg.shared));
+
+        // Held so the re-entrant `onClients(false)` cannot take the process
+        // down before the assertion; the point here is that it is *seen*.
+        reg.force_persist(true);
+        reg.register_service("nested", fresh_binder()).unwrap();
+
+        assert!(
+            !reg.snapshot()[0].1,
+            "the notification sent from inside registerClientCallback was dropped"
+        );
+    }
+
+    /// A `register_service` that cannot finish leaves nothing behind.
+    #[test]
+    fn a_failed_registration_does_not_leave_an_entry() {
+        struct Failing;
+        impl Registry for Failing {
+            fn add_lazy_service(&self, _: &str, _: &SIBinder) -> std::result::Result<(), Status> {
+                Err(Status::new_service_specific_error(-1, None))
+            }
+            fn register_client_callback(
+                &self,
+                _: &str,
+                _: &SIBinder,
+                _: &Strong<dyn IClientCallback>,
+            ) -> std::result::Result<(), Status> {
+                unreachable!("add_lazy_service fails first")
+            }
+            fn try_unregister_service(
+                &self,
+                _: &str,
+                _: &SIBinder,
+            ) -> std::result::Result<(), Status> {
+                Ok(())
+            }
+        }
+        let reg = LazyServiceRegistrar::with_registry(Arc::new(Failing));
+        assert!(reg.register_service("gone", fresh_binder()).is_err());
+        assert!(
+            reg.snapshot().is_empty(),
+            "the published entry was rolled back"
+        );
+        assert_eq!(reg.registered_count(), 0);
     }
 
     /// Clones share one set of registrations, as AOSP's handle shares its

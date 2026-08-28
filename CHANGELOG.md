@@ -278,7 +278,10 @@ short form — and the first entry is the only one no compiler will catch.
   `ClientCounterCallback`. Re-registering a name replaces the tracking entry
   when the binder differs — AOSP keeps the first, which then fails to match
   its own `onClients` — but never registers a second client callback: the
-  service manager stores those by name and de-duplicates nothing.
+  service manager stores those by name and de-duplicates nothing. The entry
+  is published before the `addService` / `registerClientCallback` round
+  trips rather than after, because the service manager dispatches `onClients`
+  from inside those calls and the driver lands it on the registering thread.
 
   One deliberate departure from AOSP: the service-manager calls are made
   without the registrar's lock held. A service manager may answer
