@@ -439,9 +439,12 @@ short form — and the first entry is the only one no compiler will catch.
   `tryUnregisterService` 12 → 13) while leaving the SDK at 35 — the interface
   is not a frozen `aidl_interface`, and AOSP is unaffected because
   `servicemanager` and `libbinder` ship in one image. rsbinder picks its
-  protocol from the SDK version, so on such a build it sent `addService` to
-  `checkService`; that reply carries a successful status, so a service
-  reported itself registered and was not there, with no error anywhere.
+  protocol from the SDK version, so on such a build it addressed the wrong
+  method for everything past `getService`: measured against the
+  `BP11.241210.004` servicemanager, `addService` lands on `checkService`,
+  which reads the name and leaves the rest of the parcel, and AOSP's
+  generated `onTransact` rejects the leftovers with `BAD_PARCELABLE`. Nothing
+  is registered, and the error says nothing about why.
   `hub::default` now measures which numbering the device speaks — one
   argument-free transaction to a code that exists in exactly one of the two —
   and returns an error naming the situation when it is the shifted one.

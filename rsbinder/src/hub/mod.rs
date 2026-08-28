@@ -411,17 +411,20 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<()> {
         // module sends are the ones it answers.
         Err(StatusCode::UnknownTransaction) => Ok(()),
         // Answered: 15 methods. Every code from `checkService` on is one
-        // higher than this module sends, and the damage is silent —
-        // `addService` would land on `checkService`, whose reply carries a
-        // successful status, so a service would report itself registered and
-        // not be there.
+        // higher than this module sends. Measured against the real
+        // servicemanager from `BP11.241210.004`: `addService` lands on
+        // `checkService`, which reads the name and leaves the rest, and
+        // AOSP's generated `onTransact` rejects the leftovers as
+        // `BAD_PARCELABLE`. So the calls fail rather than corrupt — but they
+        // fail saying nothing about why, on every method that moved.
         Ok(_) => {
             log::error!(
                 "Android 15 service manager with shifted transaction codes \
                  (android-15.0.0_r6 or later - a QPR build). rsbinder has no \
-                 module for that protocol, and the android_14 one would \
-                 register services that silently do not exist, so the service \
-                 manager is refused. Only kernel-binder use through `hub` is \
+                 module for that protocol; the android_14 one addresses the \
+                 wrong method for everything past `getService`, so the \
+                 service manager is refused here rather than left to fail one \
+                 call at a time. Only kernel-binder use through `hub` is \
                  affected; the RPC transport is not."
             );
             Err(StatusCode::InvalidOperation)
