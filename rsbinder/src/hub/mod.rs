@@ -299,6 +299,8 @@ pub mod android_14 {
     pub use super::servicemanager_14::*;
 }
 
+#[cfg(test)]
+mod numbering_pins;
 #[cfg(all(target_os = "android", feature = "android_15"))]
 mod servicemanager_15;
 /// The Android 15 service-manager protocol **from `android-15.0.0_r6` on**.
@@ -326,6 +328,14 @@ mod servicemanager_15;
 ///
 /// The numbering has not moved again through `android-15.0.0_r36`; only the
 /// `Service` union's payload has (see below).
+///
+/// With only one of the two features compiled in, [`default`] refuses the
+/// other numbering rather than addressing it: the wrong module's codes land
+/// on real methods (`addService` on `checkService`, and so on — measured
+/// against a real QPR2 `servicemanager`), so its calls fail one at a time as
+/// `BAD_PARCELABLE` errors that say nothing about the cause. The refusal
+/// names the missing feature instead. Only kernel-binder use through `hub`
+/// is affected — the RPC transport does not go through the service manager.
 ///
 /// # Why nothing here parses the `Service` union
 ///
@@ -462,41 +472,24 @@ pub enum ServiceManager {
     Android16(android_16::BpServiceManager),
 }
 
-/// Which of Android 15's two service-manager numberings this device speaks.
-///
-/// `android-15.0.0_r6` inserted `getService2` at index 1 of
-/// `IServiceManager.aidl`, shifting every later transaction code by one —
-/// `addService` 2 → 3, `registerClientCallback` 11 → 12,
-/// `tryUnregisterService` 12 → 13. The SDK version stayed 35 and the
-/// interface is not a frozen `aidl_interface`, so nothing preserved the old
-/// codes. AOSP is unaffected: `servicemanager` and `libbinder` ship in one
-/// image and are always in step. Only an out-of-tree client pins the
-/// numbers, so only a probe can tell the two builds apart.
+/// Which of Android 15's two service-manager numberings this device speaks;
+/// see [`android_15`] for the split.
 #[cfg(all(
     target_os = "android",
     any(feature = "android_14", feature = "android_15")
 ))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Android15Numbering {
-    /// `android-15.0.0_r1` through `r5`: the Android 14 interface unchanged,
-    /// served by `android_14`.
+    /// `android-15.0.0_r1`–`r5`: the Android 14 interface unchanged.
     Original,
-    /// `android-15.0.0_r6` and later, QPR builds included: `getService2` at
-    /// index 1 and everything after it moved up one, served by
-    /// `android_15`.
+    /// `android-15.0.0_r6`+: every code from `checkService` on moved up one.
     Shifted,
 }
 
-/// Measure which numbering the running service manager answers to.
-///
-/// Code 14 is the one code that answers the question without side effects —
-/// one past the last method of the pre-r6 interface, so it is rejected
-/// outright there, and `getServiceDebugInfo()` (no arguments, read-only) in
-/// the r6+ one. The code below it would not do: 13 is `tryUnregisterService`
-/// on an r6+ device.
-///
-/// Both interfaces carry the same descriptor, so the token written here is
-/// accepted either way and the reply distinguishes them on its own.
+/// Probe with code 14 — `getServiceDebugInfo()` (argument-free, read-only)
+/// on r6+ and past the end of the pre-r6 interface, so it answers without
+/// side effects on either peer (13 would not: that is `tryUnregisterService`
+/// on r6+). See [`android_15`].
 #[cfg(all(
     target_os = "android",
     any(feature = "android_14", feature = "android_15")
@@ -518,17 +511,9 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     match proxy.submit_transact(FIRST_CALL_TRANSACTION + PROBE_CODE, &data, 0) {
         // Rejected: 14 methods, so this is a pre-r6 build.
         Err(StatusCode::UnknownTransaction) => Ok(Android15Numbering::Original),
-        // Answered: 15 methods, so every code from `checkService` on is one
-        // higher than the Android 14 module sends. Measured against the real
-        // servicemanager from `BP11.241210.004`: `addService` lands on
-        // `checkService`, which reads the name and leaves the rest, and
-        // AOSP's generated `onTransact` rejects the leftovers as
-        // `BAD_PARCELABLE`. So the wrong module's calls fail rather than
-        // corrupt — but they fail saying nothing about why, on every method
-        // that moved.
+        // Answered (an in-band exception counts): 15 methods, the r6+ build.
         Ok(_) => Ok(Android15Numbering::Shifted),
-        // Neither answer: which protocol this device speaks is unknown, and
-        // guessing risks the failure above.
+        // Neither answer: refuse rather than guess (see `android_15`'s docs).
         Err(e) => {
             log::error!("could not probe the Android 15 service-manager protocol: {e:?}");
             Err(e)
@@ -536,13 +521,9 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     }
 }
 
-/// The error for an Android 15 device whose numbering this build has no
-/// module for, naming the feature that would cover it.
-///
-/// Refusing here is deliberate: the other module's codes reach real methods,
-/// so the calls fail one at a time with errors that say nothing about the
-/// cause. Only kernel-binder use through `hub` is affected — the RPC
-/// transport does not go through the service manager.
+/// Refuse an Android 15 numbering this build has no module for, naming the
+/// feature that would cover it; see [`android_15`] for why refusing beats
+/// addressing it with the wrong codes.
 #[cfg(all(
     target_os = "android",
     any(
@@ -712,7 +693,7 @@ impl crate::Interface for ForwardServiceCallback {
 /// Build a per-version `Strong<dyn IServiceCallback>` that wraps the
 /// unified callback into [`ForwardServiceCallback`]. Used by the
 /// `register_for_notifications` / `unregister_for_notifications`
-/// dispatch arms on Android 11–14.
+/// dispatch arms on every pre-16 protocol that has them.
 #[cfg(all(
     target_os = "android",
     any(
@@ -733,7 +714,8 @@ macro_rules! wrap_callback {
 
 /// Collect a per-version `Vec<android_N::ServiceDebugInfo>` into the
 /// unified `Vec<ServiceDebugInfo>`. Used by the `get_service_debug_info`
-/// dispatch arms on Android 12–14 (16 returns the unified type directly).
+/// dispatch arms on every pre-16 protocol that has it (16 returns the
+/// unified type directly).
 #[cfg(all(
     target_os = "android",
     any(
@@ -775,7 +757,7 @@ fn unsupported(method: &str, since: u32) -> Status {
 }
 
 /// Emits the per-version `IServiceCallback` impl for [`ForwardServiceCallback`]
-/// (one per supported pre-16 version; collapses what was 4× duplicated).
+/// (one per supported pre-16 version).
 macro_rules! forward_service_callback_impl {
     ($modu:ident, $feat:literal) => {
         #[cfg(all(target_os = "android", feature = $feat))]
@@ -801,7 +783,8 @@ forward_service_callback_impl!(android_14, "android_14");
 forward_service_callback_impl!(android_15, "android_15");
 
 /// `IClientCallback` analogue of [`ForwardServiceCallback`], used by
-/// `register_client_callback` on Android 11–14. Same rationale: the
+/// `register_client_callback` on every pre-16 protocol that has it. Same
+/// rationale: the
 /// per-version `android_N::IClientCallback` trait types have distinct
 /// vtables, but `registerClientCallback` only serializes the callback as
 /// its underlying `SIBinder`, so forwarding that binder is wire- and
@@ -837,7 +820,8 @@ impl crate::Interface for ForwardClientCallback {
 
 /// Build a per-version `Strong<dyn IClientCallback>` wrapping the unified
 /// callback into [`ForwardClientCallback`]. Used by the
-/// `register_client_callback` dispatch arms on Android 11–14.
+/// `register_client_callback` dispatch arms on every pre-16 protocol that
+/// has it.
 #[cfg(all(
     target_os = "android",
     any(

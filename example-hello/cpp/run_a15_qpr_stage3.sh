@@ -26,6 +26,12 @@
 # BAD_PARCELABLE; `getServiceDebugInfo` past the end of the interface). See
 # the header of `example-hello/src/bin/a15_qpr_interop.rs`.
 #
+# Each half also names the numbering it expects (`pre-r6` / `r6+`) and the
+# binary fails if the probe picked the other one, so the two halves cannot
+# silently test the same peer twice — e.g. a pre-r6 servicemanager
+# mis-extracted into `gsi-dir` fails A15-2 up front instead of green-running
+# the `android_14` module a second time.
+#
 #   ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
 #     cargo ndk -t aarch64-linux-android build -p example-hello \
 #       --bin a15_qpr_interop
@@ -84,10 +90,13 @@ if [ "$SDK" != 35 ]; then
 fi
 echo "device: SDK $SDK, build $BUILD_ID"
 
-# `pkill -x` matches the 15-char-truncated comm; `pkill -f servicemanager`
-# would match the adb shell's own command line and kill the shell. The
-# platform's servicemanager has the same comm, so kill by pid instead.
-gsi_pids() { sh_ "pgrep -f '$DEV/gsi/servicemanager'" | tr -d '\r'; }
+# `pkill -x` matches the 15-char-truncated comm, and the platform's
+# servicemanager has the same comm — so find ours by its cmdline, which is
+# `./servicemanager /dev/binderfs/<node>` (argv[0] is relative: the launch
+# below `cd`s first, so a path-prefixed pattern matches nothing). The
+# bracket keeps the pattern from matching any adb wrapper shell whose own
+# command line carries it. Kill by pid, not pkill -f, for the same reason.
+gsi_pids() { sh_ "pgrep -f '[s]ervicemanager /dev/binderfs/$NODE'" | tr -d '\r'; }
 
 PREV_ENFORCE=$(sh_ 'getenforce' | tr -d '\r')
 cleanup() {
@@ -111,7 +120,7 @@ case "$BUILD_ID" in
     *) bad "build $BUILD_ID may not be the pre-r6 platform; A15-1 would not test what it claims" ;;
 esac
 
-OUT=$(sh_ "cd $DEV && TMPDIR=$DEV ./a15_qpr_interop 2>/dev/null; echo rc=\$?")
+OUT=$(sh_ "cd $DEV && TMPDIR=$DEV ./a15_qpr_interop '' pre-r6 2>/dev/null; echo rc=\$?")
 printf '%s\n' "$OUT" | sed 's/^/    /'
 if grep -q '^rc=0' <<<"$OUT"; then
     ok "the whole hub surface round-trips on the pre-r6 numbering"
@@ -160,22 +169,16 @@ else
     bad "it did not start: $(sh_ "cat $DEV/gsi_sm.log" | tail -5)"
 fi
 
-OUT=$(sh_ "cd $DEV && TMPDIR=$DEV ./a15_qpr_interop /dev/binderfs/$NODE 2>/dev/null; echo rc=\$?")
+# The `r6+` argument is what keeps the halves apart: the binary fails here
+# unless the probe picked the r6+ module, so a mis-extracted pre-r6
+# servicemanager cannot pass this half on the other numbering (and the
+# `pre-r6` argument above covers the mirror case, a QPR platform image).
+OUT=$(sh_ "cd $DEV && TMPDIR=$DEV ./a15_qpr_interop /dev/binderfs/$NODE r6+ 2>/dev/null; echo rc=\$?")
 printf '%s\n' "$OUT" | sed 's/^/    /'
 if grep -q '^rc=0' <<<"$OUT"; then
     ok "the whole hub surface round-trips on the r6+ numbering"
 else
     bad "exit $(grep '^rc=' <<<"$OUT" | tr -d 'rc=\r')"
-fi
-
-# The two halves have to have talked to different interfaces, or one of them
-# is testing the other's peer. Only the pre-r6 run rejects the probe, and it
-# says so on the log at `error` level.
-PROBE=$(sh_ "cd $DEV && RUST_LOG=rsbinder::thread_state=warn ./a15_qpr_interop 2>&1 >/dev/null" | tr -d '\r')
-if grep -q 'UnknownTransaction' <<<"$PROBE"; then
-    ok "the platform peer rejected the probe code (so it is the pre-r6 one)"
-else
-    bad "the platform peer answered the probe code — both halves ran against r6+ numbering"
 fi
 
 ######################################################################

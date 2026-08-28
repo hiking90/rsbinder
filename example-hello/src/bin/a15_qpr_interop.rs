@@ -24,7 +24,13 @@
 // `example-hello/cpp/run_a15_qpr_stage3.sh`, which does both.
 //
 //   cargo ndk -t arm64-v8a build -p example-hello --bin a15_qpr_interop
-//   ./a15_qpr_interop [/dev/binderfs/<node>]
+//   ./a15_qpr_interop [driver] [pre-r6|r6+]
+//
+// `driver` is the binder node ('' for the default). The optional second
+// argument pins which numbering the probe must have picked: without it a
+// green run proves the probe and the chosen module agree with the peer, but
+// not *which* peer that was — a pre-r6 servicemanager put where the r6+ one
+// belongs would pass both halves of the gate on the same numbering.
 //
 // Exit status is the verdict: 0 all passed.
 
@@ -92,11 +98,13 @@ fn main() -> ExitCode {
 
     let driver = std::env::args()
         .nth(1)
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_BINDER_PATH.to_string());
     println!("binder driver: {driver}");
 
     if let Err(e) = ProcessState::init(&driver, DEFAULT_MAX_BINDER_THREADS) {
-        eprintln!("ProcessState::init({driver}) failed: {e}");
+        // stdout on purpose: the gate script discards stderr.
+        println!("ProcessState::init({driver}) failed: {e}");
         return ExitCode::from(2);
     }
     // `onClients` and `echo` are inbound transactions.
@@ -104,9 +112,31 @@ fn main() -> ExitCode {
 
     // The probe runs here. A device whose numbering has no module compiled
     // in is refused, and that is a distinct outcome from any failure below.
-    if let Err(e) = hub::default() {
-        eprintln!("hub::default() refused this service manager: {e:?}");
-        return ExitCode::from(2);
+    let sm = match hub::default() {
+        Ok(sm) => sm,
+        Err(e) => {
+            // stdout on purpose: the gate script discards stderr.
+            println!("hub::default() refused this service manager: {e:?}");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(target_os = "android")]
+    let numbering = match &*sm {
+        hub::ServiceManager::Android14(_) => "pre-r6",
+        hub::ServiceManager::Android15(_) => "r6+",
+        _ => "neither Android 15 numbering",
+    };
+    // Off-device builds only ever see the Android 16 fallback variant.
+    #[cfg(not(target_os = "android"))]
+    let numbering = match &*sm {
+        hub::ServiceManager::Android16(_) => "neither Android 15 numbering",
+    };
+    println!("probe picked: the {numbering} module");
+    if let Some(expected) = std::env::args().nth(2) {
+        if expected != numbering {
+            println!("this run had to probe {expected}, but the peer speaks {numbering}");
+            return ExitCode::from(2);
+        }
     }
 
     let mut r = Report { pass: 0, fail: 0 };
@@ -158,7 +188,7 @@ fn main() -> ExitCode {
     // under test is that the call reaches `isDeclared` and returns a bool
     // rather than a parcel error.
     r.check(
-        "7/8",
+        "6/7",
         "isDeclared answers",
         hub::try_is_declared(ECHO_NAME)
             .map(|d| format!(" (declared={d})"))
