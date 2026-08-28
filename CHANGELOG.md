@@ -56,6 +56,25 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Added
 
+- **rsbinder (`hub`):** an `android_15` feature — the Android 15
+  service-manager protocol from `android-15.0.0_r6` on. That release inserted
+  `getService2` at index 1 of `IServiceManager` and shifted every transaction
+  code after it by one, without changing the SDK version, so Android 15 has
+  two protocols and no way to tell them apart by version. `android_14` still
+  serves the initial release; enable both (`android_14_plus` and everything
+  wider do) and `hub::default` probes the running service manager once to
+  pick between them. Only one enabled still works — the other numbering is
+  refused, with the missing feature named.
+
+  The module reaches services through `getService` (code 0) only, including
+  `check_service`. `getService2`/`checkService` return a `Service` union
+  whose payload *is* release-dependent (`r6` sends
+  `{binder, accessor}`, `r20`–`r36` send `{serviceWithMetadata, accessor}`),
+  and nothing on the wire says which; `getService` returns a bare
+  `@nullable IBinder` throughout. Not parsing that union is what lets one
+  module cover `r6` through `r36`. The union's `accessor` arm — VINTF
+  `<accessor>` resolution over RPC — is consequently not supported on
+  Android 15; that bridge remains Android 16 only.
 - **rsbinder (`lazy_service`):** `LazyServiceRegistrar::instance` — the
   process-wide registrar, AOSP `getInstance`. A registrar has to outlive the
   services it registers: the `IClientCallback` binder survives it (the
@@ -447,11 +466,11 @@ short form — and the first entry is the only one no compiler will catch.
   is registered, and the error says nothing about why.
   `hub::default` now measures which numbering the device speaks — one
   argument-free transaction to a code that exists in exactly one of the two —
-  and returns an error naming the situation when it is the shifted one.
-  Support for that protocol needs an `android_15` module and is not in this
-  release; the initial Android 15 release is unaffected and keeps working, and
-  so does every other version. Only kernel-binder use through `hub` is in
-  scope — the RPC transport does not go through the service manager.
+  and dispatches accordingly. The shifted numbering is served by the new
+  `android_15` feature (see *Added*); a build without it refuses the device
+  rather than addressing the wrong method, and says which feature is missing.
+  Every other version is unaffected. Only kernel-binder use through `hub` is
+  in scope — the RPC transport does not go through the service manager.
 - **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
   on Android 13/14 — each version generates its own `ConnectionInfo` and the
   dispatch arms returned the version's type where the unified one was

@@ -39,10 +39,13 @@
 //! - `android_10` … `android_16`, plus the `android_*_plus` ranges (e.g.
 //!   `android_11_plus`) — select which Android service-manager protocol
 //!   versions to support. Android 10 uses the legacy C service-manager
-//!   protocol. Android 15 and 17 need no dedicated flag: their
-//!   service-manager wire format is identical to Android 14 and
-//!   Android 16 respectively, so they are served by `android_14` /
-//!   `android_16`.
+//!   protocol. Android 17 needs no dedicated flag: its service-manager wire
+//!   format is identical to Android 16's, so `android_16` serves it.
+//!   Android 15 has **two** protocols and one SDK version —
+//!   `android-15.0.0_r6` renumbered the interface — so `android_14` serves
+//!   its initial release and `android_15` serves `r6` and later; enable both
+//!   to cover every Android 15 device. The choice is measured at runtime,
+//!   not derived from the SDK version.
 //!
 //! # Basic Usage
 //!

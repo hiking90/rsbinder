@@ -67,12 +67,20 @@ android_11 = []
 android_12 = []
 android_13 = []
 android_14 = []
+# Android 15 from `android-15.0.0_r6` on. That release inserted `getService2`
+# at index 1 of `IServiceManager.aidl`, shifting every later transaction code
+# by one, and kept the SDK at 35 — so the two Android 15 protocols are not
+# distinguishable by version and `hub::default` probes for the numbering. The
+# initial Android 15 release (`r1`-`r5`) is served by `android_14`; enable
+# both to cover every Android 15 device.
+android_15 = []
 android_16 = []
-android_10_plus = ["android_10", "android_11", "android_12", "android_13", "android_14", "android_16"]
-android_11_plus = ["android_11", "android_12", "android_13", "android_14", "android_16"]
-android_12_plus = ["android_12", "android_13", "android_14", "android_16"]
-android_13_plus = ["android_13", "android_14", "android_16"]
-android_14_plus = ["android_14", "android_16"]
+android_10_plus = ["android_10", "android_11", "android_12", "android_13", "android_14", "android_15", "android_16"]
+android_11_plus = ["android_11", "android_12", "android_13", "android_14", "android_15", "android_16"]
+android_12_plus = ["android_12", "android_13", "android_14", "android_15", "android_16"]
+android_13_plus = ["android_13", "android_14", "android_15", "android_16"]
+android_14_plus = ["android_14", "android_15", "android_16"]
+android_15_plus = ["android_15", "android_16"]
 android_16_plus = ["android_16"]
 
 [dependencies]

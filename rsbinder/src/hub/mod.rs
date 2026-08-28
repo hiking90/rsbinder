@@ -17,6 +17,13 @@
 //! For version-specific features, use the specific version modules directly
 //! (e.g., `android_16`, `android_14`, etc.).
 //!
+//! Version and protocol are not the same thing here. Android 17 reuses
+//! Android 16's interface, and Android 15 has two of its own —
+//! `android-15.0.0_r6` inserted a method in the middle and shifted every
+//! transaction code after it while keeping SDK 35. `hub::default` measures
+//! which one an Android 15 device speaks; see the `android_15` module for
+//! the split.
+//!
 //! ## Usage
 //!
 //! ### Common API (Version-Agnostic)
@@ -80,12 +87,18 @@
 use std::sync::{Arc, OnceLock};
 
 /// The common body of every per-version `servicemanager_N` module
-/// (Android 11 through 14). Each call expands to the same
+/// (Android 11 through 15). Each call expands to the same
 /// `BpServiceManager` re-exports + dispatch wrappers; version-specific
 /// additions (e.g. `get_service_debug_info` since 12) go in the
 /// `$($extra:tt)*` repetition. Caller emits `include!(...)` for the
 /// generated AIDL bindings *before* invoking this macro so that the
 /// `android::os::*` paths below resolve in the caller's scope.
+///
+/// The plain form also emits `check_service` over the `checkService` wire
+/// call. `@custom_check_service` omits it, for a version where that method
+/// does not return an `@nullable IBinder` — Android 15's returns a `Service`
+/// union, so `servicemanager_15` supplies its own (see the module docs there
+/// for why it does not parse the union).
 #[cfg(all(
     target_os = "android",
     any(
@@ -93,10 +106,11 @@ use std::sync::{Arc, OnceLock};
         feature = "android_12",
         feature = "android_13",
         feature = "android_14",
+        feature = "android_15",
     )
 ))]
 macro_rules! impl_sm_module_body {
-    ($($extra:tt)*) => {
+    (@custom_check_service $($extra:tt)*) => {
         use crate::*;
         pub use android::os::IServiceManager::{
             BnServiceManager, BpServiceManager, IServiceManager,
@@ -127,19 +141,6 @@ macro_rules! impl_sm_module_body {
         /// distinction AOSP `realGetService` carries in its `Status`.
         pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
             sm.getService(name).map_err(|e| e.into())
-        }
-
-        /// Retrieve an existing service called @a name from the service
-        /// manager. Non-blocking. Returns null if the service does not
-        /// exist.
-        pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
-            match sm.checkService(name) {
-                Ok(result) => result,
-                Err(err) => {
-                    log::error!("Failed to check service {}: {}", name, err);
-                    None
-                }
-            }
         }
 
         /// Return a list of all currently running services.
@@ -232,6 +233,24 @@ macro_rules! impl_sm_module_body {
 
         $($extra)*
     };
+    ($($extra:tt)*) => {
+        $crate::hub::impl_sm_module_body! { @custom_check_service
+            /// Retrieve an existing service called @a name from the service
+            /// manager. Non-blocking. Returns null if the service does not
+            /// exist.
+            pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
+                match sm.checkService(name) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        log::error!("Failed to check service {}: {}", name, err);
+                        None
+                    }
+                }
+            }
+
+            $($extra)*
+        }
+    };
 }
 #[cfg(all(
     target_os = "android",
@@ -240,6 +259,7 @@ macro_rules! impl_sm_module_body {
         feature = "android_12",
         feature = "android_13",
         feature = "android_14",
+        feature = "android_15",
     )
 ))]
 pub(crate) use impl_sm_module_body;
@@ -277,6 +297,66 @@ mod servicemanager_14;
 #[cfg(all(target_os = "android", feature = "android_14"))]
 pub mod android_14 {
     pub use super::servicemanager_14::*;
+}
+
+#[cfg(all(target_os = "android", feature = "android_15"))]
+mod servicemanager_15;
+/// The Android 15 service-manager protocol **from `android-15.0.0_r6` on**.
+///
+/// # Two protocols, one SDK version
+///
+/// `android-15.0.0_r6` inserted `getService2` at index 1 of
+/// `IServiceManager.aidl` and shifted every transaction code after it by one:
+/// `checkService` 1 → 2, `addService` 2 → 3, `registerClientCallback`
+/// 11 → 12, `tryUnregisterService` 12 → 13, `getServiceDebugInfo` 13 → 14.
+/// The SDK version stayed 35, and the interface is not a frozen
+/// `aidl_interface`, so nothing recorded the change. AOSP is unaffected —
+/// `servicemanager` and `libbinder` ship in one image and move together —
+/// but an out-of-tree client pins the numbers and has to be told which build
+/// it is talking to.
+///
+/// This module is the second numbering; `android_14` is the first, which
+/// serves `android-15.0.0_r1` through `r5`. **The feature name says 15
+/// because that is the platform version, not because it covers all of it**;
+/// enable `android_14` and `android_15` together to reach every Android 15
+/// device. Neither can be chosen from the SDK version, so
+/// [`default`] measures it: one argument-free transaction to
+/// code 14, which is `getServiceDebugInfo()` here and past the end of the
+/// interface there.
+///
+/// The numbering has not moved again through `android-15.0.0_r36`; only the
+/// `Service` union's payload has (see below).
+///
+/// # Why nothing here parses the `Service` union
+///
+/// `getService2` and `checkService` return `Service`, and that union is
+/// *not* stable across the Android 15 release trains: `r6` declares
+/// `{@nullable IBinder binder, @nullable IBinder accessor}`, while `r20`
+/// through `r36` declare `{ServiceWithMetadata serviceWithMetadata,
+/// @nullable IBinder accessor}`. The two shapes deserialize differently, and
+/// nothing on the wire says which one a device sends.
+///
+/// So this module resolves services through `getService` (code 0) alone —
+/// including `check_service`, which forwards to it. `getService` returns a
+/// plain `@nullable IBinder` on every release in the range, and AOSP's own
+/// AIDL comment records that it "is the same as checkService (returns
+/// immediately) but exists for legacy purposes". Not parsing the union is
+/// the design of this module, not an omission: it is what makes one module
+/// cover `r6` through `r36`.
+///
+/// `getService2`/`checkService` are still generated — the transaction codes
+/// depend on their being declared — and the vendored AIDL is
+/// `android-15.0.0_r20` verbatim, so calling them directly will mis-parse on
+/// an `r6`-era device. Use the functions in this module.
+///
+/// # Not supported
+///
+/// The union's `accessor` arm, and with it VINTF `<accessor>` resolution
+/// over RPC. rsbinder's accessor bridge is Android 16 only
+/// ([`android_16`]); reaching it from here would mean parsing the union.
+#[cfg(all(target_os = "android", feature = "android_15"))]
+pub mod android_15 {
+    pub use super::servicemanager_15::*;
 }
 
 #[cfg(feature = "rpc")]
@@ -373,6 +453,12 @@ pub enum ServiceManager {
     Android13(android_13::BpServiceManager),
     #[cfg(all(target_os = "android", feature = "android_14"))]
     Android14(android_14::BpServiceManager),
+    /// Android 15 from `android-15.0.0_r6` on; earlier Android 15 builds are
+    /// `Android14` (a different feature, so not linkable from here). Which
+    /// one a device speaks is measured, not derived from the SDK version —
+    /// see [`default`].
+    #[cfg(all(target_os = "android", feature = "android_15"))]
+    Android15(android_15::BpServiceManager),
     Android16(android_16::BpServiceManager),
 }
 
@@ -386,6 +472,22 @@ pub enum ServiceManager {
 /// codes. AOSP is unaffected: `servicemanager` and `libbinder` ship in one
 /// image and are always in step. Only an out-of-tree client pins the
 /// numbers, so only a probe can tell the two builds apart.
+#[cfg(all(
+    target_os = "android",
+    any(feature = "android_14", feature = "android_15")
+))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Android15Numbering {
+    /// `android-15.0.0_r1` through `r5`: the Android 14 interface unchanged,
+    /// served by `android_14`.
+    Original,
+    /// `android-15.0.0_r6` and later, QPR builds included: `getService2` at
+    /// index 1 and everything after it moved up one, served by
+    /// `android_15`.
+    Shifted,
+}
+
+/// Measure which numbering the running service manager answers to.
 ///
 /// Code 14 is the one code that answers the question without side effects —
 /// one past the last method of the pre-r6 interface, so it is rejected
@@ -393,49 +495,74 @@ pub enum ServiceManager {
 /// the r6+ one. The code below it would not do: 13 is `tryUnregisterService`
 /// on an r6+ device.
 ///
-/// `Ok(())` means this module's transaction codes are right for this device.
-#[cfg(all(target_os = "android", feature = "android_14"))]
-fn check_android_15_numbering(context: &SIBinder) -> Result<()> {
+/// Both interfaces carry the same descriptor, so the token written here is
+/// accepted either way and the reply distinguishes them on its own.
+#[cfg(all(
+    target_os = "android",
+    any(feature = "android_14", feature = "android_15")
+))]
+fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> {
     // One past `getServiceDebugInfo`, the last method of the pre-r6
     // interface.
     const PROBE_CODE: TransactionCode = 14;
 
+    #[cfg(feature = "android_15")]
+    let descriptor = <android_15::BpServiceManager as android_15::IServiceManager>::descriptor();
+    #[cfg(all(feature = "android_14", not(feature = "android_15")))]
+    let descriptor = <android_14::BpServiceManager as android_14::IServiceManager>::descriptor();
+
     let proxy = context.as_proxy().ok_or(StatusCode::BadType)?;
     let mut data = Parcel::new();
-    data.write_interface_token(
-        <android_14::BpServiceManager as android_14::IServiceManager>::descriptor(),
-    )?;
+    data.write_interface_token(descriptor)?;
 
     match proxy.submit_transact(FIRST_CALL_TRANSACTION + PROBE_CODE, &data, 0) {
-        // Rejected: 14 methods, so this is a pre-r6 build and the codes this
-        // module sends are the ones it answers.
-        Err(StatusCode::UnknownTransaction) => Ok(()),
-        // Answered: 15 methods. Every code from `checkService` on is one
-        // higher than this module sends. Measured against the real
+        // Rejected: 14 methods, so this is a pre-r6 build.
+        Err(StatusCode::UnknownTransaction) => Ok(Android15Numbering::Original),
+        // Answered: 15 methods, so every code from `checkService` on is one
+        // higher than the Android 14 module sends. Measured against the real
         // servicemanager from `BP11.241210.004`: `addService` lands on
         // `checkService`, which reads the name and leaves the rest, and
         // AOSP's generated `onTransact` rejects the leftovers as
-        // `BAD_PARCELABLE`. So the calls fail rather than corrupt — but they
-        // fail saying nothing about why, on every method that moved.
-        Ok(_) => {
-            log::error!(
-                "Android 15 service manager with shifted transaction codes \
-                 (android-15.0.0_r6 or later - a QPR build). rsbinder has no \
-                 module for that protocol; the android_14 one addresses the \
-                 wrong method for everything past `getService`, so the \
-                 service manager is refused here rather than left to fail one \
-                 call at a time. Only kernel-binder use through `hub` is \
-                 affected; the RPC transport is not."
-            );
-            Err(StatusCode::InvalidOperation)
-        }
+        // `BAD_PARCELABLE`. So the wrong module's calls fail rather than
+        // corrupt — but they fail saying nothing about why, on every method
+        // that moved.
+        Ok(_) => Ok(Android15Numbering::Shifted),
         // Neither answer: which protocol this device speaks is unknown, and
-        // guessing risks the silent loss above.
+        // guessing risks the failure above.
         Err(e) => {
             log::error!("could not probe the Android 15 service-manager protocol: {e:?}");
             Err(e)
         }
     }
+}
+
+/// The error for an Android 15 device whose numbering this build has no
+/// module for, naming the feature that would cover it.
+///
+/// Refusing here is deliberate: the other module's codes reach real methods,
+/// so the calls fail one at a time with errors that say nothing about the
+/// cause. Only kernel-binder use through `hub` is affected — the RPC
+/// transport does not go through the service manager.
+#[cfg(all(
+    target_os = "android",
+    any(
+        all(feature = "android_14", not(feature = "android_15")),
+        all(feature = "android_15", not(feature = "android_14")),
+    )
+))]
+fn android_15_feature_missing(numbering: Android15Numbering) -> StatusCode {
+    let (build, feature) = match numbering {
+        Android15Numbering::Original => ("android-15.0.0_r1 through r5", "android_14"),
+        Android15Numbering::Shifted => ("android-15.0.0_r6 or later", "android_15"),
+    };
+    log::error!(
+        "this Android 15 device speaks the {build} service-manager protocol, \
+         which needs the `{feature}` feature; rsbinder was built without it. \
+         The two numberings differ from `checkService` on and cannot be told \
+         apart by SDK version, so the service manager is refused rather than \
+         addressed with the wrong transaction codes."
+    );
+    StatusCode::InvalidOperation
 }
 
 /// Returns the global ServiceManager instance appropriate for the current Android version.
@@ -473,30 +600,42 @@ pub fn default() -> Result<Arc<ServiceManager>> {
             // Android 17 (SDK 37) shares Android 16's service-manager wire
             // format — the `android/os/*` AIDL is byte-identical between
             // android-16.0.0_r4 and android-17.0.0_r1 (and the kernel binder
-            // UAPI is unchanged), so it is served by the `android_16` module,
-            // mirroring how Android 15 is served by `android_14` (with the
-            // caveat recorded on that arm).
+            // UAPI is unchanged), so it is served by the `android_16` module.
             sdk_versions::ANDROID_16 | sdk_versions::ANDROID_17 => {
                 create_service_manager!(Android16, android_16)
             }
-            // Android 15 (SDK 35) is served by the `android_14` feature —
-            // there is no separate `android_15` feature. A build that
-            // enables only `android_16` therefore returns
-            // `InvalidOperation` on an Android 15 device.
-            //
-            // Only up to `android-15.0.0_r5`: a QPR build renumbered the
-            // interface without changing SDK 35, so which one this is has
-            // to be measured — see `check_android_15_numbering`. A QPR
-            // build is refused rather than served with the wrong codes;
-            // supporting it needs an `android_15` module, tracked
-            // separately.
             #[cfg(feature = "android_14")]
-            sdk_versions::ANDROID_14 | sdk_versions::ANDROID_15 => {
-                if sdk_version == sdk_versions::ANDROID_15 {
-                    check_android_15_numbering(&context)?;
+            sdk_versions::ANDROID_14 => create_service_manager!(Android14, android_14),
+            // Android 15 (SDK 35) has two service-manager protocols, and the
+            // SDK version does not say which: `android-15.0.0_r6` inserted
+            // `getService2` at index 1 and shifted every code after it. The
+            // original numbering is the Android 14 interface unchanged
+            // (`android_14`), the shifted one is `android_15`. Measure it,
+            // and refuse rather than address a real method with the wrong
+            // code — see `check_android_15_numbering`.
+            #[cfg(any(feature = "android_14", feature = "android_15"))]
+            sdk_versions::ANDROID_15 => match check_android_15_numbering(&context)? {
+                Android15Numbering::Original => {
+                    #[cfg(feature = "android_14")]
+                    {
+                        create_service_manager!(Android14, android_14)
+                    }
+                    #[cfg(not(feature = "android_14"))]
+                    {
+                        return Err(android_15_feature_missing(Android15Numbering::Original));
+                    }
                 }
-                create_service_manager!(Android14, android_14)
-            }
+                Android15Numbering::Shifted => {
+                    #[cfg(feature = "android_15")]
+                    {
+                        create_service_manager!(Android15, android_15)
+                    }
+                    #[cfg(not(feature = "android_15"))]
+                    {
+                        return Err(android_15_feature_missing(Android15Numbering::Shifted));
+                    }
+                }
+            },
             #[cfg(feature = "android_13")]
             sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
             #[cfg(feature = "android_12")]
@@ -548,7 +687,8 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         feature = "android_11",
         feature = "android_12",
         feature = "android_13",
-        feature = "android_14"
+        feature = "android_14",
+        feature = "android_15"
     )
 ))]
 struct ForwardServiceCallback(crate::SIBinder);
@@ -559,7 +699,8 @@ struct ForwardServiceCallback(crate::SIBinder);
         feature = "android_11",
         feature = "android_12",
         feature = "android_13",
-        feature = "android_14"
+        feature = "android_14",
+        feature = "android_15"
     )
 ))]
 impl crate::Interface for ForwardServiceCallback {
@@ -579,6 +720,7 @@ impl crate::Interface for ForwardServiceCallback {
         feature = "android_12",
         feature = "android_13",
         feature = "android_14",
+        feature = "android_15",
     )
 ))]
 macro_rules! wrap_callback {
@@ -594,7 +736,12 @@ macro_rules! wrap_callback {
 /// dispatch arms on Android 12–14 (16 returns the unified type directly).
 #[cfg(all(
     target_os = "android",
-    any(feature = "android_12", feature = "android_13", feature = "android_14",)
+    any(
+        feature = "android_12",
+        feature = "android_13",
+        feature = "android_14",
+        feature = "android_15",
+    )
 ))]
 macro_rules! collect_debug_info {
     ($modu:ident, $sm:expr) => {{
@@ -651,6 +798,7 @@ forward_service_callback_impl!(android_11, "android_11");
 forward_service_callback_impl!(android_12, "android_12");
 forward_service_callback_impl!(android_13, "android_13");
 forward_service_callback_impl!(android_14, "android_14");
+forward_service_callback_impl!(android_15, "android_15");
 
 /// `IClientCallback` analogue of [`ForwardServiceCallback`], used by
 /// `register_client_callback` on Android 11–14. Same rationale: the
@@ -665,7 +813,8 @@ forward_service_callback_impl!(android_14, "android_14");
         feature = "android_11",
         feature = "android_12",
         feature = "android_13",
-        feature = "android_14"
+        feature = "android_14",
+        feature = "android_15"
     )
 ))]
 struct ForwardClientCallback(crate::SIBinder);
@@ -676,7 +825,8 @@ struct ForwardClientCallback(crate::SIBinder);
         feature = "android_11",
         feature = "android_12",
         feature = "android_13",
-        feature = "android_14"
+        feature = "android_14",
+        feature = "android_15"
     )
 ))]
 impl crate::Interface for ForwardClientCallback {
@@ -695,6 +845,7 @@ impl crate::Interface for ForwardClientCallback {
         feature = "android_12",
         feature = "android_13",
         feature = "android_14",
+        feature = "android_15",
     )
 ))]
 macro_rules! wrap_client_callback {
@@ -729,6 +880,7 @@ forward_client_callback_impl!(android_11, "android_11");
 forward_client_callback_impl!(android_12, "android_12");
 forward_client_callback_impl!(android_13, "android_13");
 forward_client_callback_impl!(android_14, "android_14");
+forward_client_callback_impl!(android_15, "android_15");
 
 impl ServiceManager {
     /// Resolve a service by name through the `getService` wire call.
@@ -759,6 +911,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::get_service(sm, name),
             ServiceManager::Android16(sm) => {
                 android_16::get_service(sm, name).and_then(|s| s.service)
             }
@@ -791,6 +945,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::get_interface(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::get_interface(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::get_interface(sm, name),
             ServiceManager::Android16(sm) => android_16::get_interface(sm, name),
         }
     }
@@ -810,6 +966,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::check_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::check_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::check_service(sm, name),
             ServiceManager::Android16(sm) => {
                 android_16::check_service(sm, name).and_then(|s| s.service)
             }
@@ -850,6 +1008,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::IServiceManager::isDeclared(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::IServiceManager::isDeclared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::IServiceManager::isDeclared(sm, name),
             ServiceManager::Android16(sm) => android_16::IServiceManager::isDeclared(sm, name),
         }
     }
@@ -878,6 +1038,10 @@ impl ServiceManager {
             ServiceManager::Android14(sm) => {
                 android_14::IServiceManager::getDeclaredInstances(sm, iface)
             }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                android_15::IServiceManager::getDeclaredInstances(sm, iface)
+            }
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::getDeclaredInstances(sm, iface)
             }
@@ -898,7 +1062,7 @@ impl ServiceManager {
         /// Rebuild the unified `ConnectionInfo` from a version's own.
         #[cfg(all(
             target_os = "android",
-            any(feature = "android_13", feature = "android_14")
+            any(feature = "android_13", feature = "android_14", feature = "android_15")
         ))]
         macro_rules! unify {
             ($call:expr) => {
@@ -924,6 +1088,10 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
                 unify!(android_14::IServiceManager::getConnectionInfo(sm, name))
+            }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                unify!(android_15::IServiceManager::getConnectionInfo(sm, name))
             }
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::getConnectionInfo(sm, name)
@@ -963,6 +1131,10 @@ impl ServiceManager {
             ServiceManager::Android14(sm) => {
                 android_14::IServiceManager::listServices(sm, dump_priority)
             }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                android_15::IServiceManager::listServices(sm, dump_priority)
+            }
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::listServices(sm, dump_priority)
             }
@@ -987,6 +1159,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::is_declared(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::is_declared(sm, name),
             ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
         }
     }
@@ -1013,6 +1187,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::get_declared_instances(sm, iface),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::get_declared_instances(sm, iface),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::get_declared_instances(sm, iface),
             ServiceManager::Android16(sm) => android_16::get_declared_instances(sm, iface),
         }
     }
@@ -1055,6 +1231,13 @@ impl ServiceManager {
                     port: info.port,
                 })
             }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                android_15::get_connection_info(sm, name).map(|info| ConnectionInfo {
+                    ipAddress: info.ipAddress,
+                    port: info.port,
+                })
+            }
             ServiceManager::Android16(sm) => android_16::get_connection_info(sm, name),
         }
     }
@@ -1075,6 +1258,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::list_services(sm, dump_priority),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::list_services(sm, dump_priority),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::list_services(sm, dump_priority),
             ServiceManager::Android16(sm) => android_16::list_services(sm, dump_priority),
         }
     }
@@ -1101,6 +1286,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::add_service(sm, identifier, binder),
             ServiceManager::Android16(sm) => android_16::add_service(sm, identifier, binder),
         }
     }
@@ -1112,14 +1299,13 @@ impl ServiceManager {
     /// `rsb_service dump manager`. (`getServiceDebugInfo` does not carry it:
     /// `ServiceDebugInfo` is name and pid only.)
     ///
-    /// Only the `android_16` protocol sends the flag, and only it can act on
-    /// it: nothing reads the bit before `getService2` exists to carry
-    /// `isLazyService` back. AOSP added the constant in `android-15.0.0_r20`
-    /// and its `LazyServiceRegistrar` sets it from that release on — but the
-    /// same release train had already shifted every transaction code (see
-    /// the `android_14` note under [`ServiceManager::default`]), so the
-    /// `android_14` arm cannot reach those builds at all and gains nothing
-    /// by setting it. Android 11–14 register without the flag, exactly as
+    /// Only the `android_15` and `android_16` protocols send the flag, and
+    /// only they can act on it: nothing reads the bit before `getService2`
+    /// exists to carry `isLazyService` back. AOSP added the constant in
+    /// `android-15.0.0_r20` and its `LazyServiceRegistrar` sets it from that
+    /// release on; `r6`-`r19` accept it and ignore it, which is why the
+    /// `android_15` arm sends it unconditionally (that module's whole range
+    /// starts at `r6`). Android 11–14 register without the flag, exactly as
     /// their own libbinder did; Android 10 is refused outright — see below.
     /// Crate-private because AOSP's `LazyServiceRegistrar` is the only thing
     /// that may set it (it warns if a caller pre-set the bit).
@@ -1143,6 +1329,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::add_service(sm, identifier, binder),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::add_service(sm, identifier, binder),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::add_lazy_service(sm, identifier, binder),
             ServiceManager::Android16(sm) => android_16::add_lazy_service(sm, identifier, binder),
         }
     }
@@ -1174,6 +1362,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => collect_debug_info!(android_13, sm),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => collect_debug_info!(android_14, sm),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => collect_debug_info!(android_15, sm),
             ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
         }
     }
@@ -1189,7 +1379,12 @@ impl ServiceManager {
         /// Rebuild the unified `ServiceDebugInfo` from a version's own.
         #[cfg(all(
             target_os = "android",
-            any(feature = "android_12", feature = "android_13", feature = "android_14")
+            any(
+                feature = "android_12",
+                feature = "android_13",
+                feature = "android_14",
+                feature = "android_15"
+            )
         ))]
         macro_rules! unify {
             ($call:expr) => {
@@ -1219,6 +1414,10 @@ impl ServiceManager {
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => {
                 unify!(android_14::IServiceManager::getServiceDebugInfo(sm))
+            }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                unify!(android_15::IServiceManager::getServiceDebugInfo(sm))
             }
             ServiceManager::Android16(sm) => android_16::IServiceManager::getServiceDebugInfo(sm),
         }
@@ -1261,6 +1460,12 @@ impl ServiceManager {
                 sm,
                 name,
                 &wrap_callback!(android_14, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::register_for_notifications(
+                sm,
+                name,
+                &wrap_callback!(android_15, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::register_for_notifications(sm, name, callback)
@@ -1305,6 +1510,12 @@ impl ServiceManager {
                 sm,
                 name,
                 &wrap_callback!(android_14, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::unregister_for_notifications(
+                sm,
+                name,
+                &wrap_callback!(android_15, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
@@ -1360,6 +1571,13 @@ impl ServiceManager {
                 service,
                 &wrap_client_callback!(android_14, callback),
             ),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::register_client_callback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_15, callback),
+            ),
             ServiceManager::Android16(sm) => {
                 android_16::register_client_callback(sm, name, service, callback)
             }
@@ -1387,6 +1605,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::try_unregister_service(sm, name, service),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::try_unregister_service(sm, name, service),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::try_unregister_service(sm, name, service),
             ServiceManager::Android16(sm) => android_16::try_unregister_service(sm, name, service),
         }
     }
@@ -1415,6 +1635,8 @@ impl ServiceManager {
             ServiceManager::Android13(sm) => android_13::try_get_service(sm, name),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::try_get_service(sm, name),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::try_get_service(sm, name),
             ServiceManager::Android16(sm) => {
                 Ok(android_16::try_get_service(sm, name)?.and_then(|s| s.service))
             }

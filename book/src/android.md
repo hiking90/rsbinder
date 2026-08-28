@@ -17,10 +17,13 @@ See: [Android Build Environment Setup](./android-build.md)
 - **Android 12 (API 31) / 12L (API 32)**: `android_12` feature
 - **Android 13 (API 33)**: `android_13` feature
 - **Android 14 (API 34)**: `android_14` feature
+- **Android 15 (API 35)**: `android_14` **and** `android_15` — see below
 - **Android 16 (API 36)**: `android_16` feature
 - **Android 17 (API 37)**: served by the `android_16` feature
 
-> **Note**: Android 12L (API 32) uses the same Binder protocol as Android 12, so both are covered by the `android_12` feature flag. Similarly, Android 15 (API 35) uses the same Binder protocol as Android 14, so it is covered by the `android_14` or `android_14_plus` feature flag, and Android 17 (API 37) uses the same Binder protocol as Android 16, so it is covered by the `android_16` or `android_16_plus` feature flag. No separate `android_12l`, `android_15`, or `android_17` feature is needed.
+> **Note**: Android 12L (API 32) uses the same Binder protocol as Android 12, so both are covered by the `android_12` feature flag, and Android 17 (API 37) uses the same protocol as Android 16, so `android_16` or `android_16_plus` covers it. No separate `android_12l` or `android_17` feature is needed.
+
+> **Android 15 has two service-manager protocols**: `android-15.0.0_r6` inserted `getService2` at index 1 of `IServiceManager` and shifted every transaction code after it by one (`addService` 2 → 3, `registerClientCallback` 11 → 12, `tryUnregisterService` 12 → 13). The SDK version stayed 35, so the build alone does not say which numbering a device speaks. The initial release (`r1`–`r5`) is served by `android_14`; `r6` and later, QPR builds included, by `android_15`. Enable **both** — `android_14_plus` and everything wider does — and rsbinder probes the running service manager once at startup to pick the right one. With only one of the two enabled, a device that speaks the other is refused with an error naming the missing feature, rather than addressed with the wrong transaction codes.
 
 > **Android 10 caveat**: Android 10 uses the legacy C `IServiceManager` (the AIDL-based interface only landed in Android 11). The `android_10` dispatch supports `get_service`, `check_service`, `add_service`, and `list_services`. APIs introduced later — `is_declared`, `register_for_notifications`, `unregister_for_notifications`, and `get_service_debug_info` — return `false` or `StatusCode::UnknownTransaction` so callers can detect the gap rather than silently misbehave.
 
@@ -39,6 +42,7 @@ Available feature combinations:
 - `android_12_plus`: Supports Android 12 through 17
 - `android_13_plus`: Supports Android 13 through 17
 - `android_14_plus`: Supports Android 14 through 17
+- `android_15_plus`: Supports Android 15 (`r6` and later only) through 17
 - `android_16_plus`: Supports Android 16 and 17
 
 ### Protocol Compatibility
