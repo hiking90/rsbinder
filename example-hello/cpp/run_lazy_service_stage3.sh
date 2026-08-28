@@ -4,10 +4,15 @@
 # The Linux gate (`tests/scripts/run_lazy_service_ac.sh`) drives the same path
 # against `rsb_hub`, which is our own port of AOSP `ServiceManager.cpp`. This
 # one removes that circularity: the peer here is the AOSP binary, so what it
-# proves is that the wire rsbinder speaks — `addService` with
-# `FLAG_IS_LAZY_SERVICE`, `registerClientCallback`, the `onClients` a real
-# `handleClientCallbacks` timer sends, and `tryUnregisterService` — is the
-# wire AOSP expects.
+# proves is that the wire rsbinder speaks — `addService`,
+# `registerClientCallback`, the `onClients` a real `handleClientCallbacks`
+# timer sends, and `tryUnregisterService` — is the wire AOSP expects.
+#
+# Not covered here: the *value* of `FLAG_IS_LAZY_SERVICE`. AOSP reads that bit
+# in exactly one place (`ServiceManager.cpp`, to fill
+# `ServiceWithMetadata::isLazyService`), and nothing in this run consults it,
+# so dropping the flag would leave every check below green. The Linux gate's
+# `lazy=yes` column carries that half.
 #
 #   ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
 #     cargo ndk -t aarch64-linux-android build -p example-hello --bins
@@ -30,8 +35,7 @@ SERVICE=my.hello
 PASS=0; FAIL=0
 
 # `pkill -x` matches the 15-char-truncated comm. `pkill -f` would match the
-# adb shell's own command line and kill the shell instead — see the trap
-# notes in tests/scripts and the emulator memory.
+# adb shell's own command line and kill the shell instead.
 DEMO_COMM=hello_callback_
 CLIENT_COMM=hello_client
 
@@ -83,13 +87,14 @@ else
     bad "it exited early: $(sh_ "cat $DEV/lazy.log" | tail -5)"
 fi
 
-# `service check` prints "Service <name>: found" or "... : not found", so the
-# test has to be for the *absence* of "not found" — grepping for "found"
-# matches both.
-if sh_ "service check $SERVICE" | grep -q 'not found'; then
-    bad "service check says: $(sh_ "service check $SERVICE")"
-else
+# `service check` prints "Service <name>: found" or "... : not found", so
+# neither direction may be tested by grepping for "found" alone — and testing
+# for the *absence* of "not found" passes on empty output too (a dropped adb
+# connection, a servicemanager restart). Match the whole line each way.
+if sh_ "service check $SERVICE" | grep -q "Service $SERVICE: found"; then
     ok "registered with the platform servicemanager"
+else
+    bad "service check says: $(sh_ "service check $SERVICE")"
 fi
 
 # AOSP `ServiceManager::addService` only *warns* when no priority bit is set
@@ -184,7 +189,7 @@ fi
 # and this shell observing it.
 gone=0
 for _ in 1 2 3 4 5; do
-    sh_ "service check $SERVICE" | grep -q 'not found' && { gone=1; break; }
+    sh_ "service check $SERVICE" | grep -q "Service $SERVICE: not found" && { gone=1; break; }
     sleep 1
 done
 if [ "$gone" = 1 ]; then ok "the name is gone from the platform registry"

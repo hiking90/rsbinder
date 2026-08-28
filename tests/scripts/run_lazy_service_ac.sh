@@ -5,8 +5,7 @@
 # reach is the half that only exists on a wire: does `FLAG_IS_LAZY_SERVICE`
 # arrive at the service manager, does `registerClientCallback` land, does the
 # hub's 5-second poller actually drive `onClients(false)` into this process,
-# and does the process then take itself down. Until now the only thing
-# covering that was a demo someone had to read the output of.
+# and does the process then take itself down.
 #
 # Needs a Linux host with a working binder device and nothing else already
 # holding handle 0.
@@ -41,7 +40,14 @@ note() { printf '\n=== %s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$*"; }
 want_out()   { if grep -q "$1" "$OUT"; then ok "$2"; else bad "$2 (missing '$1' in: $(head -20 "$OUT"))"; fi; }
-reject_out() { if grep -q "$1" "$OUT"; then bad "$2 (leaked '$1')"; else ok "$2"; fi; }
+# Anchored on the dump header: without it a dump that failed outright (dead
+# hub, no binder device) leaves $OUT with nothing to match and reads as
+# "the name is gone".
+reject_out() {
+    if ! grep -q '^services (' "$OUT"; then bad "$2 (no dump to check: $(head -3 "$OUT"))"
+    elif grep -q "$1" "$OUT"; then bad "$2 (leaked '$1')"
+    else ok "$2"; fi
+}
 
 cleanup() {
     pkill -f 'target/debug/hello_client' 2>/dev/null
@@ -98,7 +104,10 @@ if kill -0 "$DEMO_PID" 2>/dev/null; then ok "demo is running"
 else bad "demo is not running: $(tail -5 "$DEMOLOG")"; fi
 
 $SVC dump manager > "$OUT" 2>&1
-want_out "$SERVICE" "the service is registered"
+# Anchored on the service row. A bare name match also hits the
+# `awaiting registration` section, which lists names that have a client
+# callback but no registration — the opposite of what this gates.
+want_out "^  $SERVICE\$" "the service is registered"
 # The whole point of the flag: without it the hub cannot tell a lazy service
 # from an ordinary one, and `rsb_service dump` reports it as ordinary.
 if grep -A2 "^  $SERVICE\$" "$OUT" | grep -q 'lazy=yes'; then
@@ -116,7 +125,11 @@ fi
 note "AC-L.2  a held client keeps the process alive across poller ticks"
 
 sleep $((TICK * 2 + 2))
-if kill -0 "$DEMO_PID" 2>/dev/null; then
+# Establish the premise first: "still running" proves nothing if whatever
+# was supposed to be holding it died during the wait.
+if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+    bad "the client died during the wait — this gate proved nothing"
+elif kill -0 "$DEMO_PID" 2>/dev/null; then
     ok "still running after two poller ticks with a client attached"
 else
     bad "shut down while a client was still holding it: $(tail -10 "$DEMOLOG")"
@@ -160,11 +173,23 @@ if [ "$rc" -eq 1 ]; then ok "checkService reports it as absent"; else bad "check
 note "AC-L.5  the hub logged the unregister rather than a death"
 
 # A lazy shutdown and a crash look the same from the outside if the only
-# evidence is "the name is gone". The hub distinguishes them.
+# evidence is "the name is gone" — a crash would clear the name too, through
+# the death notification. Only the hub's own log separates them, so gate on
+# the positive statement as well as the absence of a refusal.
+if grep -q "Unregistering $SERVICE" "$HUBLOG"; then
+    ok "the hub logged the unregister (AOSP ServiceManager.cpp:1128)"
+else
+    bad "no 'Unregistering $SERVICE' — reclaimed by the death notification, not by tryUnregisterService"
+fi
 if grep -q 'Tried to unregister' "$HUBLOG"; then
     bad "the hub refused the unregister: $(grep 'Tried to unregister' "$HUBLOG" | head -2)"
 else
     ok "no refusal logged"
+fi
+if grep -q 'binder died: retired [1-9]' "$HUBLOG"; then
+    bad "the obituary still had a registration to retire: $(grep 'binder died: retired' "$HUBLOG" | head -2)"
+else
+    ok "nothing left for the death notification to clean up"
 fi
 
 ######################################################################

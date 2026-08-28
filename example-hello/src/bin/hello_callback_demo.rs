@@ -12,8 +12,9 @@
 //
 // Expected trace, paired with rsb_hub and a short-lived `hello_client`:
 //   1. T+0        register_service → addService + registerClientCallback.
-//                 The service starts out assumed to have clients, so the
-//                 process cannot exit before the hub has said anything.
+//                 Nothing has looked the service up yet, so it starts with
+//                 no clients — and the hub reports only changes, so the
+//                 shutdown check waits for one to happen.
 //   2. T+x        `hello_client` looks the service up → the hub reports
 //                 clients → `has_clients=true`.
 //   3. T+x+1      `hello_client` exits → the kernel ref count drops.
@@ -28,8 +29,6 @@
 //
 // `tests/scripts/run_lazy_service_ac.sh` runs exactly that and gates on the
 // exit status.
-#![allow(non_snake_case)]
-
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,6 +51,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // `ProcessState` has to exist first.
     ProcessState::init_default()?;
 
+    // `echo` and the registrar's own `onClients` are both inbound
+    // transactions, so the pool has to be running to serve them.
+    ProcessState::start_thread_pool();
+
     let service = BnHello::new_binder(IHelloService {});
     // The process-wide registrar — it has to outlive what it registers.
     let registrar = LazyServiceRegistrar::instance();
@@ -68,14 +71,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         false
     }));
 
-    registrar.register_service(SERVICE_NAME, service.as_binder())?;
+    // The registrar holds the binder for as long as it tracks the service,
+    // so nothing here has to keep `service` alive.
+    registrar.register_service(SERVICE_NAME, service)?;
     println!("Registered lazy service: {SERVICE_NAME}");
 
-    // Keep the service binder alive for as long as the process runs.
-    let _keep_alive = service;
-
     // Returns only if the thread pool is torn down; the usual exit is
-    // `LazyServiceRegistrar`'s own, from the callback thread.
+    // `LazyServiceRegistrar`'s own, from the binder thread that took the
+    // `onClients`.
     ProcessState::join_thread_pool()?;
     Ok(())
 }

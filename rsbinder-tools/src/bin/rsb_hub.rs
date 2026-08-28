@@ -1719,6 +1719,11 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
+            // AOSP `ServiceManager.cpp:1128`. The only log that separates an
+            // honoured unregister from a death-driven cleanup, which is what
+            // the entry disappearing looks like either way.
+            log::info!("{context:?} Unregistering {name}");
+
             // Release this registration's reference on the subscription
             // before dropping the entry, so a register→tryUnregister cycle
             // (a lazy service idling and reactivating) is net-zero.
