@@ -28,7 +28,7 @@ short form — and the first entry is the only one no compiler will catch.
   `service::{kernel,rpc}::{Host,Broker}`. Use `serve` / `connect`; the
   call-by-call mapping is under *Removed*.
 - **`rsb_hub` refuses to start without an access-control policy.** Give it
-  `--policy <PATH>` (default `/etc/rsbinder/hub.d`) or, deliberately,
+  `--config <PATH>` (default `/etc/rsbinder/hub.d`) or, deliberately,
   `--insecure-allow-all`.
 - **`rsb_device` creates the binder node `0600`.** Grant access with
   `--group <group> --mode 0660` and put the users in that group.
@@ -45,7 +45,12 @@ short form — and the first entry is the only one no compiler will catch.
   exits when its last client goes away.** It used to touch nothing outside
   the struct. Code that called it *and* did its own `addService` /
   `registerClientCallback` must drop those calls; code that relied on it
-  being inert needs `set_active_services_callback` or `force_persist`.
+  being inert needs `set_active_services_callback` or `force_persist`. Its
+  signature moved too: it takes `impl Into<SIBinder>` (drop the
+  `.as_binder()`) and returns `Result<(), Status>`, which keeps the service
+  manager's refusal code and message. `?` into a `StatusCode` still compiles
+  — `From<Status> for StatusCode` covers it — but a binding or `map_err` that
+  named `StatusCode` has to be retyped.
 - **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
   is stamped at construction; only an exhaustive `match` on the enum notices.
 
@@ -74,6 +79,10 @@ short form — and the first entry is the only one no compiler will catch.
   `example-hello/cpp/run_lazy_service_stage3.sh` runs the same thing against
   Android's own `servicemanager` instead of `rsb_hub`, which removes the
   circularity of testing our port against our port.
+- **rsbinder-tools (`rsb_hub`):** an honoured `tryUnregisterService` now logs
+  `Unregistering <name>`, as AOSP `ServiceManager.cpp` does. Without it a
+  lazy shutdown and a crash are indistinguishable in the log — the name
+  disappears either way, since the death notification would clear it too.
 - **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
   manager what it knows — the Linux counterpart of Android's `service` and
   `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,
@@ -239,7 +248,7 @@ short form — and the first entry is the only one no compiler will catch.
   caller's uid and its NSS-resolved groups — the same policy model AOSP's
   `servicemanager` applies through SELinux, but keyed on credentials every
   platform reports rather than on an LSM that most Linux distributions do not
-  enable and macOS does not have. Policy is TOML, `--policy <PATH>` takes a
+  enable and macOS does not have. Policy is TOML, `--config <PATH>` takes a
   file or a directory of `*.toml` loaded in file-name order, and the first rule
   whose `name` pattern matches decides. `SIGHUP` reloads in place; a reload
   that fails to parse or resolve keeps the policy already in force. A denied
@@ -279,17 +288,32 @@ short form — and the first entry is the only one no compiler will catch.
   when the binder differs — AOSP keeps the first, which then fails to match
   its own `onClients` — but never registers a second client callback: the
   service manager stores those by name and de-duplicates nothing. The entry
-  is published before the `addService` / `registerClientCallback` round
-  trips rather than after, because the service manager dispatches `onClients`
-  from inside those calls and the driver lands it on the registering thread.
+  is published before the `addService` / `registerClientCallback` round trips
+  rather than after: the service manager dispatches `onClients` from inside
+  those calls, and since `IClientCallback` is `oneway` that notification runs
+  on a binder pool thread while the round trip is still open — an entry that
+  is not there yet would drop it, with no repeat coming. A newly registered
+  service starts with *no* clients, as AOSP's `Service::clients` does;
+  assuming one would be an assumption nothing takes back, because the service
+  manager reports only changes and never announces a name nobody looked up.
 
-  One deliberate departure from AOSP: the service-manager calls are made
-  without the registrar's lock held. A service manager may answer
-  `tryUnregisterService` by dispatching `onClients` back into this process,
-  and the binder driver delivers such a nested transaction on the very thread
-  that is waiting for the reply — which would deadlock on a non-reentrant
-  `Mutex`. The service manager is the authority on whether an unregister may
-  proceed, so nothing is lost by not holding it.
+  `register_service` takes `impl Into<SIBinder>` (so a `Strong<dyn IFoo>`
+  goes in directly, as with `hub::add_service`) and returns
+  `Result<(), Status>` rather than `Result<(), StatusCode>`, which kept the
+  service manager's refusal code and message. **Android 10 is refused before
+  `addService` is called**: that service manager has neither
+  `registerClientCallback` nor `tryUnregisterService`, so a service published
+  there could be neither tracked nor taken back down.
+
+  One deliberate departure from AOSP: the *state* lock is not held across the
+  service-manager calls, so an `onClients` arriving mid-round-trip is recorded
+  when it arrives instead of queueing behind the call it answers. What AOSP's
+  single `mMutex` also buys — no two service-manager sequences interleaving —
+  is kept by a second lock that spans a whole `register_service` or shutdown
+  decision. A shutdown that waited on a `register_service` runs the moment it
+  returns, so registering several services in a row can end mid-loop with the
+  process exiting; hold it with `force_persist(true)` if every service has to
+  be up first.
 - **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
   to `BINDER_SET_MAX_THREADS` **as written**, matching AOSP's
   `setThreadPoolMaxThreadCount`. Previously `0` was a sentinel meaning "use
@@ -326,7 +350,7 @@ short form — and the first entry is the only one no compiler will catch.
   it can load an access-control policy, and denies every request the policy
   does not allow. Previously any local process could register, overwrite, look
   up, and enumerate any service. Existing deployments must supply a policy
-  (`--policy <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
+  (`--config <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
   `--insecure-allow-all`, which is named that way on purpose and cannot be
   reached by accident. There is no permissive fallback for a policy that fails
   to load: a typo in a config file must never silently remove access control
@@ -408,6 +432,23 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (`hub`) — Android 15 QPR builds are now refused instead of
+  silently losing registrations.** `android-15.0.0_r6` inserted `getService2`
+  at index 1 of `IServiceManager.aidl`, shifting every transaction code after
+  it by one (`addService` 2 → 3, `registerClientCallback` 11 → 12,
+  `tryUnregisterService` 12 → 13) while leaving the SDK at 35 — the interface
+  is not a frozen `aidl_interface`, and AOSP is unaffected because
+  `servicemanager` and `libbinder` ship in one image. rsbinder picks its
+  protocol from the SDK version, so on such a build it sent `addService` to
+  `checkService`; that reply carries a successful status, so a service
+  reported itself registered and was not there, with no error anywhere.
+  `hub::default` now measures which numbering the device speaks — one
+  argument-free transaction to a code that exists in exactly one of the two —
+  and returns an error naming the situation when it is the shifted one.
+  Support for that protocol needs an `android_15` module and is not in this
+  release; the initial Android 15 release is unaffected and keeps working, and
+  so does every other version. Only kernel-binder use through `hub` is in
+  scope — the RPC transport does not go through the service manager.
 - **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
   on Android 13/14 — each version generates its own `ConnectionInfo` and the
   dispatch arms returned the version's type where the unified one was
