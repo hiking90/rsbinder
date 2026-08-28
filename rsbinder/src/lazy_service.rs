@@ -57,17 +57,22 @@
 //! * **Nothing aborts.** AOSP `LOG_ALWAYS_FATAL`s on an `onClients` for an
 //!   unknown service, on an `onClients` that repeats the state it already
 //!   believed, and on a failed re-register. Each is logged and survived here.
-//! * **Android 11 and up.** `registerClientCallback` does not exist in the
-//!   Android 10 service manager, so `register_service` reports
-//!   `UnknownTransaction` there — after its `addService` has already
-//!   succeeded, leaving the service registered but untracked. Call
+//! * **`register_service` is not atomic.** `addService` goes first, so a
+//!   failure to register the client callback after it leaves the service
+//!   registered with the service manager but untracked here — visible to
+//!   clients, never shutting down. Call
 //!   [`hub::try_unregister_service`](crate::hub::try_unregister_service) to
-//!   undo that, or register it as an ordinary service instead.
-//! * **Re-registering a name with a *different* binder replaces the entry**
-//!   and registers a fresh client callback for it. AOSP keeps the first
-//!   binder in `mRegisteredServices` while handing the new one to
-//!   `addService`, which leaves the callback keyed on a binder the service
-//!   manager no longer has under that name.
+//!   undo that, or retry (a retry re-runs both calls). **Android 10 always
+//!   lands here**: its service manager has no `registerClientCallback`, so
+//!   `register_service` reports `UnknownTransaction` on every call and lazy
+//!   services need Android 11 or newer.
+//! * **Re-registering a name with a *different* binder replaces the entry.**
+//!   AOSP keeps the first binder in `mRegisteredServices` while handing the
+//!   new one to `addService`, so its own `onClients` — which carries the
+//!   binder the service manager currently holds — then matches nothing and
+//!   trips `LOG_ALWAYS_FATAL`. Replacing keeps the lookup working. The
+//!   client callback is *not* re-registered either way: the service manager
+//!   stores callbacks by name and does not de-duplicate them.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -471,8 +476,7 @@ impl LazyServiceRegistrar {
     /// Register `binder` under `name` and start tracking its clients.
     ///
     /// `addService` with `FLAG_IS_LAZY_SERVICE`, then — for a name not
-    /// already tracked, or one tracked under a different binder —
-    /// `registerClientCallback`. AOSP
+    /// already tracked — `registerClientCallback`. AOSP
     /// [`registerServiceLocked`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/LazyServiceRegistrar.cpp;l=129).
     ///
     /// A new registration starts out assumed to have clients, so an idle
@@ -481,14 +485,22 @@ impl LazyServiceRegistrar {
     /// leaves that state alone — the service manager reports it only when it
     /// changes, so throwing it away here would strand the process.
     pub fn register_service(&self, name: &str, binder: SIBinder) -> Result<()> {
-        let tracked_same_binder = {
+        // Two different questions. The service manager stores client
+        // callbacks by *name*, so whether one is owed depends on the name
+        // alone (AOSP `registerServiceLocked`: `reRegister =
+        // mRegisteredServices.count(name) > 0`). Whether the tracking entry
+        // may be reused depends on the binder as well.
+        let (tracked, tracked_same_binder) = {
             let inner = self.shared.lock();
-            inner.services.get(name).map(|e| e.binder == binder) == Some(true)
+            match inner.services.get(name) {
+                Some(entry) => (true, entry.binder == binder),
+                None => (false, false),
+            }
         };
 
         log::info!(
             "{} service {name}",
-            if tracked_same_binder {
+            if tracked {
                 "Re-registering"
             } else {
                 "Registering"
@@ -503,7 +515,7 @@ impl LazyServiceRegistrar {
                 StatusCode::from(e)
             })?;
 
-        if !tracked_same_binder {
+        if !tracked {
             let callback = self.callback();
             self.shared
                 .registry
@@ -773,22 +785,32 @@ mod tests {
         );
     }
 
-    /// A different binder under the same name is a fresh registration: the
-    /// callback the service manager holds is keyed on the old binder.
+    /// A different binder under the same name replaces the entry but does
+    /// **not** register a second client callback. The service manager keys
+    /// callbacks by name and de-duplicates nothing (AOSP
+    /// `ServiceManager.cpp` `mNameToClientCallback[name].push_back(cb)`), so
+    /// a second registration would have it deliver every later `onClients`
+    /// twice.
     #[test]
-    fn re_registering_different_binder_registers_a_new_callback() {
+    fn re_registering_different_binder_does_not_register_a_second_callback() {
         let (reg, registry) = fixture();
         let second = fresh_binder();
         reg.register_service("dup", fresh_binder()).unwrap();
         reg.register_service("dup", second.clone()).unwrap();
-        assert_eq!(
-            registry.calls(),
-            vec!["add:dup", "cb:dup", "add:dup", "cb:dup"]
-        );
+        assert_eq!(registry.calls(), vec!["add:dup", "cb:dup", "add:dup"]);
+
+        // The entry must still follow the new binder: `onClients` carries
+        // the binder the service manager currently holds, and it is looked
+        // up by identity.
         let got = reg.binder_for("dup").unwrap();
         assert!(
             std::sync::Arc::ptr_eq(got.as_arc(), second.as_arc()),
             "second register_service wins"
+        );
+        reg.shared.on_clients_binder(&second, false);
+        assert!(
+            !reg.snapshot()[0].1,
+            "onClients for the new binder must resolve to this entry"
         );
     }
 

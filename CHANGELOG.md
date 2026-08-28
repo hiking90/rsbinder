@@ -275,7 +275,10 @@ short form — and the first entry is the only one no compiler will catch.
   `true`: AOSP `reRegisterLocked` leaves it alone, and inventing clients hides
   the state the service manager just reported. `LazyServiceRegistrar` is
   `Clone`, sharing one set of registrations the way AOSP's handle shares its
-  `ClientCounterCallback`.
+  `ClientCounterCallback`. Re-registering a name replaces the tracking entry
+  when the binder differs — AOSP keeps the first, which then fails to match
+  its own `onClients` — but never registers a second client callback: the
+  service manager stores those by name and de-duplicates nothing.
 
   One deliberate departure from AOSP: the service-manager calls are made
   without the registrar's lock held. A service manager may answer
