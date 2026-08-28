@@ -80,20 +80,22 @@ pgrep -f 'target/debug/rsb_hub' >/dev/null || { echo "rsb_hub did not start:"; c
 ######################################################################
 note "AC-L.1  register_service reaches the service manager"
 
+# Deliberately NOT disowned, unlike the hub above. `disown` drops the job
+# from bash's table, and `wait` on such a pid then returns 0 whatever the
+# process actually did — which would leave the exit-status gate in AC-L.3
+# passing for a segfault.
 RUST_LOG=info nohup $DEMO > "$DEMOLOG" 2>&1 &
 DEMO_PID=$!
-disown 2>/dev/null
 
 # Hold a client immediately: with none, the first poller tick would take the
 # process down before the later gates could look at it. That is the correct
 # behaviour, and AC-L.4 measures it deliberately.
 RUST_LOG=warn nohup $CLIENT > "$CLIENTLOG" 2>&1 &
 CLIENT_PID=$!
-disown 2>/dev/null
 sleep 3
 
 if kill -0 "$DEMO_PID" 2>/dev/null; then ok "demo is running"
-else bad "demo exited early (rc=$?): $(tail -5 "$DEMOLOG")"; fi
+else bad "demo is not running: $(tail -5 "$DEMOLOG")"; fi
 
 $SVC dump manager > "$OUT" 2>&1
 want_out "$SERVICE" "the service is registered"

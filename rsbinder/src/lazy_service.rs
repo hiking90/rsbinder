@@ -500,6 +500,16 @@ impl LazyServiceRegistrar {
     /// forward whatever binder comes with it — the service manager does the
     /// same, and reports it only when it changes, so throwing it away here
     /// would strand the process.
+    ///
+    /// **This call can be cut short by the process exiting.** Another
+    /// thread reaching the shutdown decision while this one is mid-register
+    /// takes the process down with it, so `register_service` never returns.
+    /// That is the lazy contract working, not a failure — but if the order
+    /// matters, hold the process with [`force_persist(true)`](Self::force_persist)
+    /// until every service is registered. AOSP has no such window because
+    /// `registerService` and `onClients` share one mutex; this port cannot
+    /// hold that lock across the service-manager calls (see the module docs
+    /// on nested `onClients`).
     pub fn register_service(&self, name: &str, binder: SIBinder) -> Result<()> {
         // Everything here turns on whether the *name* is already tracked.
         // The service manager keys the client-callback list on the name

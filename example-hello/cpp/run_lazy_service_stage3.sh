@@ -67,7 +67,10 @@ sh_ "chmod 755 $DEV/hello_callback_demo $DEV/hello_client" >/dev/null 2>&1
 ######################################################################
 note "L3-1  register_service is accepted by AOSP servicemanager"
 
-sh_ "cd $DEV && (TMPDIR=$DEV RUST_LOG=info nohup ./hello_callback_demo > lazy.log 2>&1 &)" >/dev/null 2>&1
+# Wrapped so the exit status survives the process: "it is gone" and "it
+# called exit(EXIT_SUCCESS)" are different claims, and AOSP's contract is
+# the second one.
+sh_ "cd $DEV && rm -f lazy.rc && (TMPDIR=$DEV RUST_LOG=info nohup sh -c './hello_callback_demo > lazy.log 2>&1; echo \$? > lazy.rc' >/dev/null 2>&1 &)" >/dev/null 2>&1
 # Hold a client straight away: with none, the servicemanager's own 5-second
 # timer would report zero clients and take the process down before the later
 # gates could look at it. That is the behaviour L3-3 measures deliberately.
@@ -140,6 +143,20 @@ if sh_ "cat $DEV/lazy.log" | grep -q 'has_clients=false'; then
     ok "the real servicemanager delivered onClients(false)"
 else
     bad "no has_clients=false: $(sh_ "cat $DEV/lazy.log" | tail -10)"
+fi
+
+# The wrapper writes the status after the process it started is reaped, so
+# give it a moment past the `pgrep` going quiet.
+rc=""
+for _ in 1 2 3 4 5; do
+    rc=$(sh_ "cat $DEV/lazy.rc 2>/dev/null" | tr -d '\r')
+    [ -n "$rc" ] && break
+    sleep 1
+done
+if [ "$rc" = 0 ]; then
+    ok "exit 0 (AOSP exit(EXIT_SUCCESS))"
+else
+    bad "exit ${rc:-<none recorded>}, want 0"
 fi
 
 ######################################################################
