@@ -894,7 +894,8 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     template()
         .render("interface", &context)
         .map_err(|e| AidlError::Template {
-            message: format!("Failed to render interface template: {e}"),
+            message: "failed to render the interface template".to_string(),
+            source: Box::new(e),
         })
 }
 
@@ -933,7 +934,8 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
     template()
         .render("parcelable", &context)
         .map_err(|e| AidlError::Template {
-            message: format!("Failed to render parcelable template: {e}"),
+            message: "failed to render the parcelable template".to_string(),
+            source: Box::new(e),
         })
 }
 
@@ -965,7 +967,8 @@ pub fn render_enum(r: &EnumRender) -> Result<String, AidlError> {
     template()
         .render("enum", &context)
         .map_err(|e| AidlError::Template {
-            message: format!("Failed to render enum template: {e}"),
+            message: "failed to render the enum template".to_string(),
+            source: Box::new(e),
         })
 }
 
@@ -1156,7 +1159,6 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
     .map(|expr| render_enforce_permission_check(&expr, crate_name));
 
     Ok(FnMembers {
-        // identifier: method.identifier.to_case(Case::Snake),
         identifier: method.identifier.to_owned(),
         args,
         args_async,
@@ -1192,15 +1194,8 @@ fn render_enforce_permission_check(
         );
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
-    // Route the crate prefix through the same `{{crate}}` selection used
-    // everywhere else (`crate::` for AIDL compiled inside the rsbinder crate
-    // via `set_crate_support(true)`, `rsbinder::` otherwise) — a hardcoded
-    // `rsbinder::` would not resolve for internally-compiled AIDL.
-    // Pass the inbound `_reader` parcel so the runtime can fail-closed when
-    // the transaction arrived over RPC (Plan 2-16 Phase A): `@EnforcePermission`
-    // is kernel-only and must deny over RPC instead of silently granting
-    // (uid 0 on the RPC path reads as root, which PMS unconditionally grants).
-    // `_reader` is in scope at the `on_transact` arm where this renders.
+    // `_reader` lets the runtime fail closed over RPC, where uid 0 reads as
+    // root and PMS would grant unconditionally (plan/2-16 Phase A).
     let call = |p: &str| {
         format!(
             "{crate_name}::permission_controller::check_permission(_reader, \"{}\")",
@@ -1354,9 +1349,8 @@ impl Generator {
         }
     }
 
-    /// Per-source version/hash metadata, mirroring AOSP `aidl --version N
-    /// --hash <s>` flags. Pass `None` for either to suppress the
-    /// corresponding emission (matches AOSP's per-flag conditional).
+    // Mirrors AOSP `aidl --version N --hash <s>`; `None` suppresses the
+    // corresponding emission, per AOSP's per-flag conditional.
     ///
     /// Crate-internal: the public entry points are [`crate::Builder::version`]
     /// and [`crate::Builder::hash`], which route through this method.
@@ -1409,8 +1403,7 @@ impl Generator {
                             parser::register_symbol(
                                 &constant.identifier,
                                 expr.clone(),
-                                parser::SymbolType::InterfaceConstant,
-                                Some(&d.name),
+                                Some(&d.namespace.to_string(Namespace::AIDL)),
                             );
                         }
                     }
@@ -1470,6 +1463,25 @@ impl Generator {
         Ok(content)
     }
 
+    /// Declaration-level semantic diagnostic carrying the current source
+    /// context, for declarations that cannot be represented in Rust.
+    fn decl_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
+        let (start, end) = span.unwrap_or((0, 0));
+        let source = parser::current_source_text();
+        let (start, end) = if source.is_empty() {
+            (start, end)
+        } else {
+            let start = start.min(source.len());
+            (start, end.clamp(start, source.len()))
+        };
+        SemanticError::InvalidOperation {
+            message: message.into(),
+            src: NamedSource::new(parser::current_source_name(), source),
+            span: SourceSpan::new(start.into(), end - start),
+        }
+        .into()
+    }
+
     fn decl_interface(
         &self,
         arg_decl: &parser::InterfaceDecl,
@@ -1477,8 +1489,19 @@ impl Generator {
     ) -> Result<String, AidlError> {
         let mut decl = arg_decl.clone();
 
-        let is_empty =
-            parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly);
+        if parser::has_annotation(
+            &decl.annotation_list,
+            parser::AnnotationType::JavaOnlyStableParcelable,
+        ) {
+            return Err(Self::decl_error(
+                format!(
+                    "interface '{}' is annotated @JavaOnlyStableParcelable: its definition \
+                     lives in Java, so no Rust type can be generated",
+                    decl.name
+                ),
+                decl.name_span,
+            ));
+        }
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
@@ -1489,38 +1512,35 @@ impl Generator {
         let mut const_members = Vec::new();
         let mut fn_members = Vec::new();
 
-        if !is_empty {
-            // First pass: register all interface constants for resolution
-            for constant in decl.constant_list.iter() {
-                if let Some(const_expr) = &constant.const_expr {
-                    parser::register_symbol(
-                        &constant.identifier,
-                        const_expr.clone(),
-                        parser::SymbolType::InterfaceConstant,
-                        Some(&decl.name),
-                    );
-                }
+        // First pass: register all interface constants for resolution
+        for constant in decl.constant_list.iter() {
+            if let Some(const_expr) = &constant.const_expr {
+                parser::register_symbol(
+                    &constant.identifier,
+                    const_expr.clone(),
+                    Some(&decl.namespace.to_string(Namespace::AIDL)),
+                );
             }
+        }
 
-            // Second pass: process constants with resolved values
-            for constant in decl.constant_list.iter() {
-                let generator = constant.r#type.to_generator()?;
-                generator.ensure_resolvable()?;
-                const_members.push((
-                    constant.const_identifier(),
-                    generator.const_type_decl()?,
-                    generator.init_value(
-                        constant.const_expr.as_ref(),
-                        InitParam::builder().with_const(true),
-                    )?,
-                ));
-            }
+        // Second pass: process constants with resolved values
+        for constant in decl.constant_list.iter() {
+            let generator = constant.r#type.to_generator()?;
+            generator.ensure_resolvable()?;
+            const_members.push((
+                constant.const_identifier(),
+                generator.const_type_decl()?,
+                generator.init_value(
+                    constant.const_expr.as_ref(),
+                    InitParam::builder().with_const(true),
+                )?,
+            ));
+        }
 
-            validate_transaction_codes(&decl)?;
+        validate_transaction_codes(&decl)?;
 
-            for method in decl.method_list.iter() {
-                fn_members.push(make_fn_member(method, self.get_crate_name())?);
-            }
+        for method in decl.method_list.iter() {
+            fn_members.push(make_fn_member(method, self.get_crate_name())?);
         }
 
         let nested = &self.declarations(&decl.members, indent + 1)?;
@@ -1562,7 +1582,6 @@ impl Generator {
         arg_decl: &parser::ParcelableDecl,
         indent: usize,
     ) -> Result<String, AidlError> {
-        let mut is_empty = false;
         let mut decl = arg_decl.clone();
 
         let is_vintf = parser::has_annotation(
@@ -1570,37 +1589,48 @@ impl Generator {
             parser::AnnotationType::VintfStability,
         );
 
-        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
-            eprintln!("Parcelable {} is only used for Java.", decl.name);
-            is_empty = true;
-            // return Ok(String::new())
-        }
-
+        // An unstructured parcelable that names its `rust_type` is
+        // representable: emit the alias and ignore the Java/NDK/C++ markers
+        // that only describe the other backends.
         if !decl.rust_type.is_empty() {
+            let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
     #![allow(non_upper_case_globals, non_snake_case, dead_code)]
     pub type {name} = {rust_type};
 }}
-"#, mod = decl.name, name = decl.name, rust_type = decl.rust_type);
+"#, mod = escaped, name = escaped, rust_type = decl.rust_type);
             return Ok(add_indent(indent, rendered.trim()));
         }
 
-        if !decl.cpp_header.is_empty() {
-            eprintln!(
-                "cpp_header {} for Parcelable {} is not supported.",
-                decl.cpp_header, decl.name
-            );
-            is_empty = true;
-            // return Ok(String::new())
+        if parser::has_annotation(
+            &decl.annotation_list,
+            parser::AnnotationType::JavaOnlyStableParcelable,
+        ) {
+            return Err(Self::decl_error(
+                format!(
+                    "parcelable '{}' is annotated @JavaOnlyStableParcelable and names no \
+                     `rust_type`: its definition lives in Java, so no Rust type can be generated",
+                    decl.name
+                ),
+                decl.name_span,
+            ));
         }
-        if !decl.ndk_header.is_empty() {
-            eprintln!(
-                "ndk_header {} for Parcelable {} is not supported.",
-                decl.ndk_header, decl.name
-            );
-            is_empty = true;
-            // return Ok(String::new())
+
+        for (kind, header) in [
+            ("cpp_header", &decl.cpp_header),
+            ("ndk_header", &decl.ndk_header),
+        ] {
+            if !header.is_empty() {
+                return Err(Self::decl_error(
+                    format!(
+                        "parcelable '{}' is unstructured ({kind} \"{header}\"): its definition \
+                         lives in C++/NDK, so no Rust type can be generated",
+                        decl.name
+                    ),
+                    decl.name_span,
+                ));
+            }
         }
 
         decl.pre_process();
@@ -1609,46 +1639,44 @@ pub mod {mod} {{
         let mut members = Vec::new();
         let mut declarations = Vec::new();
 
-        if !is_empty {
-            // Parse struct variables only.
-            for decl in &decl.members {
-                if let Some(var) = decl.is_variable() {
-                    let generator = var.r#type.to_generator()?;
-                    generator.ensure_resolvable()?;
-                    generator.ensure_sized()?;
+        // Parse struct variables only.
+        for decl in &decl.members {
+            if let Some(var) = decl.is_variable() {
+                let generator = var.r#type.to_generator()?;
+                generator.ensure_resolvable()?;
+                generator.ensure_sized()?;
 
-                    if var.constant {
-                        constant_members.push((
-                            var.const_identifier(),
-                            generator.const_type_decl()?,
-                            generator.init_value(
-                                var.const_expr.as_ref(),
-                                InitParam::builder().with_const(true),
-                            )?,
-                        ));
-                    } else {
-                        let init_value = match generator.value_type {
-                            ValueType::Holder => Some(ConstExpr::new(ValueType::Holder)),
-                            _ => var.const_expr.clone(),
-                        };
-
-                        members.push(ParcelableMember {
-                            identifier: var.identifier(),
-                            type_decl: generator.type_declaration(true),
-                            init: generator.init_value(
-                                init_value.as_ref(),
-                                InitParam::builder()
-                                    .with_const(false)
-                                    .with_vintf(is_vintf)
-                                    .with_crate_name(self.get_crate_name()),
-                            )?,
-                            is_holder: matches!(generator.value_type, ValueType::Holder),
-                            needs_unexpected_null: generator.is_option_but_not_nullable(),
-                        })
-                    }
+                if var.constant {
+                    constant_members.push((
+                        var.const_identifier(),
+                        generator.const_type_decl()?,
+                        generator.init_value(
+                            var.const_expr.as_ref(),
+                            InitParam::builder().with_const(true),
+                        )?,
+                    ));
                 } else {
-                    declarations.push(decl.clone());
+                    let init_value = match generator.value_type {
+                        ValueType::Holder => Some(ConstExpr::new(ValueType::Holder)),
+                        _ => var.const_expr.clone(),
+                    };
+
+                    members.push(ParcelableMember {
+                        identifier: var.identifier(),
+                        type_decl: generator.type_declaration(true),
+                        init: generator.init_value(
+                            init_value.as_ref(),
+                            InitParam::builder()
+                                .with_const(false)
+                                .with_vintf(is_vintf)
+                                .with_crate_name(self.get_crate_name()),
+                        )?,
+                        is_holder: matches!(generator.value_type, ValueType::Holder),
+                        needs_unexpected_null: generator.is_option_but_not_nullable(),
+                    })
                 }
+            } else {
+                declarations.push(decl.clone());
             }
         }
 
@@ -1676,10 +1704,6 @@ pub mod {mod} {{
     }
 
     fn register_enum_members(decl: &parser::EnumDecl) {
-        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
-            return;
-        }
-
         let enum_type = decl.namespace.to_string(Namespace::AIDL);
         let lookup_decl = parser::LookupDecl {
             decl: parser::Declaration::Enum(decl.clone()),
@@ -1692,19 +1716,24 @@ pub mod {mod} {{
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, member_name)
             {
-                parser::register_symbol(
-                    member_name,
-                    expr,
-                    parser::SymbolType::EnumMember,
-                    Some(&enum_type),
-                );
+                parser::register_symbol(member_name, expr, Some(&enum_type));
             }
         }
     }
 
     fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, AidlError> {
-        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
-            return Ok(String::new());
+        if parser::has_annotation(
+            &decl.annotation_list,
+            parser::AnnotationType::JavaOnlyStableParcelable,
+        ) {
+            return Err(Self::decl_error(
+                format!(
+                    "enum '{}' is annotated @JavaOnlyStableParcelable: its definition lives \
+                     in Java, so no Rust type can be generated",
+                    decl.name
+                ),
+                decl.name_span,
+            ));
         }
 
         let generator = &parser::get_backing_type(&decl.annotation_list, decl.name_span)?;
@@ -1752,6 +1781,20 @@ pub mod {mod} {{
                         )))
                     }
                 };
+                // The discriminant is emitted as a literal into a
+                // `[<backing>; N]` newtype, where an out-of-range literal is
+                // a deny-by-default rustc error in the *generated* crate.
+                // AOSP rejects it at AIDL-compile time; do the same.
+                let (min, max, backing) = match generator.value_type {
+                    ValueType::Byte(_) => (i8::MIN as i64, i8::MAX as i64, "byte"),
+                    ValueType::Int32(_) => (i32::MIN as i64, i32::MAX as i64, "int"),
+                    _ => (i64::MIN, i64::MAX, "long"),
+                };
+                if value < min || value > max {
+                    return Err(diag(format!(
+                        "{value} does not fit the '{backing}' backing type ({min}..={max})"
+                    )));
+                }
                 members.push((enumerator.identifier.to_owned(), value));
             }
         }
@@ -1773,8 +1816,18 @@ pub mod {mod} {{
     }
 
     fn decl_union(&self, decl: &parser::UnionDecl, indent: usize) -> Result<String, AidlError> {
-        if parser::has_annotation(&decl.annotation_list, parser::AnnotationType::JavaOnly) {
-            return Ok(String::new());
+        if parser::has_annotation(
+            &decl.annotation_list,
+            parser::AnnotationType::JavaOnlyStableParcelable,
+        ) {
+            return Err(Self::decl_error(
+                format!(
+                    "union '{}' is annotated @JavaOnlyStableParcelable: its definition lives \
+                     in Java, so no Rust type can be generated",
+                    decl.name
+                ),
+                decl.name_span,
+            ));
         }
 
         let is_vintf = parser::has_annotation(
@@ -1832,6 +1885,21 @@ pub mod {mod} {{
             }
         }
 
+        let mut seen_variants: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for (variant, _, field, _, _) in &members {
+            if let Some(previous) = seen_variants.insert(variant, field) {
+                return Err(Self::decl_error(
+                    format!(
+                        "union '{}': fields '{previous}' and '{field}' both map to the Rust \
+                         variant '{variant}'; rename one of them",
+                        decl.name
+                    ),
+                    decl.name_span,
+                ));
+            }
+        }
+
         let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
@@ -1852,7 +1920,8 @@ pub mod {mod} {{
         let rendered = template()
             .render("union", &context)
             .map_err(|e| AidlError::Template {
-                message: format!("Failed to render union template: {e}"),
+                message: "failed to render the union template".to_string(),
+                source: Box::new(e),
             })?;
 
         Ok(add_indent(indent, rendered.trim()))
@@ -1864,7 +1933,7 @@ mod tests {
     use super::*;
     use crate::error::SemanticError;
 
-    // 3.1f: NegativeTransactionCode — unreachable via AIDL grammar, verified by direct construction
+    // NegativeTransactionCode — unreachable via AIDL grammar, verified by direct construction
     #[test]
     fn test_negative_transaction_code() {
         let source = "interface ITest { void m() = -1; }";

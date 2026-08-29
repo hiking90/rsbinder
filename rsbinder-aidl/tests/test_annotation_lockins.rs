@@ -60,6 +60,9 @@ parcelable Foo {
 }
         "#,
     );
+    // Anchor the content too: "identical" degenerates into "identically
+    // empty" if parcelable codegen ever collapses.
+    assert!(plain.contains("pub struct Foo"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@FixedSize must not change parcelable codegen"
@@ -87,6 +90,7 @@ union FooUnion {
 }
         "#,
     );
+    assert!(plain.contains("pub enum r#FooUnion"), "{plain}");
     assert_eq!(plain, annotated, "@FixedSize must not change union codegen");
 }
 
@@ -219,6 +223,7 @@ interface IFoo {
 }
         "#,
     );
+    assert!(plain.contains("fn r#getBinder"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@PropagateAllowBlocking must not change Rust codegen (Java-only \

@@ -3,20 +3,26 @@
 
 //! AOSP `.aidl` fixture sweep.
 //!
-//! Walks `tests/aidl/android/aidl/tests/**/*.aidl` (the vendored AOSP
-//! fixture set) and runs each through `Builder::generate()`. Each
-//! fixture must either:
+//! Walks every vendored `.aidl` under `tests/aidl/` and runs each through
+//! `Builder::generate()`. Each fixture must either:
 //!
 //! 1. Generate successfully, in which case the emitted `.rs` is fed to
-//!    `syn::parse_file` — catching codegen regressions that emit
-//!    syntactically invalid Rust.
+//!    `syn::parse_file` and checked for an item named after the fixture —
+//!    catching codegen regressions that emit syntactically invalid Rust or
+//!    silently drop the declaration.
 //! 2. Match an entry in `EXPECTED_FAILURES`, in which case the error
 //!    message must contain the listed substring — catching silent
 //!    behavior drift in the expected-fail set itself.
 //!
 //! Any unexpected outcome (unlisted failure, allowlisted fixture that
-//! suddenly passes, or codegen output that won't `syn::parse_file`)
-//! fails the sweep with a single aggregated report.
+//! suddenly passes, or codegen output that fails those checks) fails the
+//! sweep with a single aggregated report.
+//!
+//! Scope limit worth knowing: `syn::parse_file` proves the output is valid
+//! Rust *syntax*, not that it type-checks. `tests/build.rs` compiles a
+//! subset of these fixtures for real (including the whole `tests/aidl_v1`
+//! tree, which is why it is not swept here); anything outside that subset
+//! is covered only to the depth described above.
 
 use rsbinder_aidl::Builder;
 use std::path::{Path, PathBuf};
@@ -48,6 +54,18 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[
         reason_substr: "unknown type 'Map'",
         rationale: "AOSP Rust/C++/NDK backends reject `Map<K,V>` \
                     (aidl_language.cpp:1612-1615). Java-only.",
+    },
+    ExpectedFailure {
+        relative_path: "android/aidl/tests/immutable/Foo.aidl",
+        reason_substr: "unknown type 'Map'",
+        rationale: "Declares `Map<String, Bar> d`. AOSP Rust/C++/NDK backends \
+                    reject `Map<K,V>` (aidl_language.cpp:1612-1615). Java-only.",
+    },
+    ExpectedFailure {
+        relative_path: "android/aidl/tests/immutable/IBaz.aidl",
+        reason_substr: "unknown type 'Map'",
+        rationale: "Imports `immutable/Foo.aidl`, which declares a Java-only \
+                    `Map<K,V>` field; the failure is inherited.",
     },
     ExpectedFailure {
         relative_path: "android/aidl/tests/permission/platform/IProtected.aidl",
@@ -85,14 +103,15 @@ fn sweep_out_dir() -> PathBuf {
 #[test]
 fn aidl_fixture_sweep() {
     let root = aidl_root();
-    let test_root = root.join("android/aidl/tests");
+    // Sweep the whole vendored tree: narrowing to a subdirectory silently
+    // drops fixtures (`android/aidl/loggable/*` was covered nowhere).
+    let test_root = root.clone();
     assert!(
         test_root.is_dir(),
         "AOSP fixture root not found at {test_root:?}"
     );
 
     let out_dir = sweep_out_dir();
-    std::env::set_var("OUT_DIR", &out_dir);
 
     let expected_map: std::collections::HashMap<&str, &ExpectedFailure> = EXPECTED_FAILURES
         .iter()
@@ -122,6 +141,9 @@ fn aidl_fixture_sweep() {
         let result = Builder::new()
             .source(path.clone())
             .include_dir(&root)
+            // `dest_dir` rather than mutating the process-wide `OUT_DIR`,
+            // which is not thread-safe under the test harness.
+            .dest_dir(&out_dir)
             .output(output_name.clone())
             .generate();
 
@@ -166,12 +188,27 @@ fn aidl_fixture_sweep() {
                         continue;
                     }
                 };
-                if let Err(e) = syn::parse_file(&source) {
-                    failures.push(format!(
+                match syn::parse_file(&source) {
+                    Err(e) => failures.push(format!(
                         "[syntactic regression] {rel}: generated Rust does \
                          not parse with syn::parse_file: {e}\n\
                          (generated file: {generated_path:?})"
-                    ));
+                    )),
+                    Ok(_) => {
+                        // An empty-but-valid file parses fine, so anchor on the
+                        // declaration actually being emitted.
+                        let stem = path.file_stem().unwrap().to_string_lossy();
+                        if !source.contains(&format!("pub mod {stem}"))
+                            && !source.contains(&format!("pub mod r#{stem}"))
+                        {
+                            failures.push(format!(
+                                "[missing declaration] {rel}: generated Rust \
+                                 contains no `pub mod {stem}` — the fixture's \
+                                 declaration was dropped\n\
+                                 (generated file: {generated_path:?})"
+                            ));
+                        }
+                    }
                 }
             }
         }

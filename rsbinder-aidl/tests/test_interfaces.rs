@@ -268,16 +268,18 @@ interface IExplicit {
 
 #[test]
 fn test_explicit_transaction_code_zero() -> Result<(), Box<dyn Error>> {
+    // The second code must not coincide with its implicit position, or this
+    // test cannot tell the explicit branch from the implicit one.
     let input = r#"
 interface IZero {
     void method1() = 0;
-    void method2() = 1;
+    void method2() = 7;
 }
     "#;
     aidl_generator_contains(input,
         "pub(crate) const r#method1: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;")?;
     aidl_generator_contains(input,
-        "pub(crate) const r#method2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;")?;
+        "pub(crate) const r#method2: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 7;")?;
     Ok(())
 }
 
@@ -346,7 +348,10 @@ interface ISelfRef {
         !out.contains("Box<"),
         "a binder handle needs no box:\n{out}"
     );
-    assert!(out.contains("rsbinder::Strong<dyn ISelfRef>"), "{out}");
+    assert!(
+        out.contains("_arg_cb: &rsbinder::Strong<dyn ISelfRef>"),
+        "a non-nullable interface parameter stays a bare Strong:\n{out}"
+    );
     assert!(
         out.contains("Option<rsbinder::Strong<dyn ISelfRef>>"),
         "@nullable must still be an Option:\n{out}"

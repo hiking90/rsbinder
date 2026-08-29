@@ -24,6 +24,17 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **rsbinder-aidl rejects `.aidl` it used to accept.** Four inputs that
+  previously generated silently-wrong or non-compiling Rust are now build
+  errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
+  declaration with no `rust_type`, an `in out` (or `out in`) argument,
+  `self`/`Self`/`super`/`crate` used as a method, argument, enum-member or
+  declaration name, and an enum discriminant outside its `@Backing` range.
+  Each error names the declaration.
+- **`out` arguments of `IBinder` / `ParcelFileDescriptor` / an interface are
+  now `&mut Option<T>`** in generated traits (matching AOSP). The wire is
+  unchanged; implementations need the parameter type updated. `inout` is
+  unaffected.
 - **`rsbinder::service` is gone** — `Registry`, `Broker`,
   `service::{kernel,rpc}::{Host,Broker}`. Use `serve` / `connect`; the
   call-by-call mapping is under *Removed*.
@@ -285,6 +296,43 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder-aidl — breaking:** declarations with no Rust representation are
+  now build errors instead of silently generating an empty type. A
+  `@JavaOnlyStableParcelable` declaration, or an unstructured parcelable
+  declared only with `cpp_header` / `ndk_header`, previously produced a
+  field-less `pub struct Foo {}` together with a live `Parcelable` impl that
+  wrote an empty payload — wire-incompatible with any peer that has the real
+  type, and announced only through an `eprintln!` that cargo hides without
+  `-vv`. Such a declaration is now an `AidlError::Semantic` naming the
+  declaration. A `rust_type "..."` alias is still generated as before, and
+  takes precedence over the other markers.
+- **rsbinder-aidl — breaking:** an `out` argument whose type has no `Default`
+  (`IBinder`, `ParcelFileDescriptor`, an interface `Strong<_>`) is now
+  declared as `&mut Option<T>`, matching AOSP
+  `aidl_to_rust.cpp::RustNameOf` for `OUT_ARGUMENT`. The previous `&mut T`
+  could not compile: the server's local is initialised with
+  `Default::default()`. `inout` arguments read their value from the parcel
+  and stay unwrapped. Implementations of affected traits need the parameter
+  type updated; the wire format is unchanged.
+- **rsbinder-aidl — breaking:** `in out` / `out in` argument declarations are
+  rejected. The grammar accepted a run of direction keywords and kept only
+  the last, so a mistyped `inout` silently generated one-way semantics. AOSP
+  `aidl_language_y.yy` allows a single direction; rsbinder now matches.
+- **rsbinder-aidl — breaking:** `self`, `Self`, `super` and `crate` are
+  rejected as method names, argument names, enum member names and declaration
+  names, not only as parcelable/union member names. None of the four is a
+  legal Rust raw identifier, so every emission site produced code that could
+  not compile.
+- **rsbinder-aidl:** the generic-nesting guard is now separate from the
+  bracket guard and much tighter (12 vs 256). Parse cost is exponential in
+  generic depth (~3.7x per level), so the old shared limit let a build hang
+  rather than report a diagnostic. The diagnostic now names which limit it
+  hit — bracket nesting, generic type nesting, or operators in one
+  expression.
+- **rsbinder-aidl:** `Builder::hash("")` now panics like `Builder::version(0)`
+  already did. An empty hash is falsy to Tera and silently suppressed
+  `getInterfaceHash()`.
+
 - **rsbinder (`lazy_service`) — breaking:** `LazyServiceRegistrar` now does
   what its name says. `register_service` makes the service-manager calls
   itself — `addService` with AOSP's `FLAG_IS_LAZY_SERVICE`, then
@@ -450,6 +498,74 @@ short form — and the first entry is the only one no compiler will catch.
   Services*, and the crate quick-start now use the entry API.
 
 ### Fixed
+
+- **rsbinder-aidl — an unqualified constant reference could resolve to an
+  unrelated declaration's constant.** Interface constants were registered in a
+  flat symbol table under their bare name, and that table was consulted before
+  the namespace-aware lookup. With `interface IX { const int A = 999; }`
+  anywhere in the build, a sibling `parcelable P { const int A = 1; const int
+  B = A + 1; }` generated `B = 1000`. Constants are now keyed by their
+  declaring namespace and resolved outward through enclosing scopes only.
+- **rsbinder-aidl — `@JavaOnlyImmutable` parcelables and unions lost all their
+  members.** The annotation check was a `starts_with("@JavaOnly")` prefix
+  match, so it also caught `@JavaOnlyImmutable` — a *structured* parcelable
+  that AOSP's Rust backend generates normally. Affected parcelables rendered
+  as `pub struct Foo {}`, and affected unions produced no type at all.
+- **rsbinder-aidl — enum references folded incorrectly in comparisons and
+  float expressions.** `ValueType::Reference` outranked every arithmetic type
+  in the promotion order, so `Status.OK == 0` folded to `false` while
+  `0 == Status.OK` folded to `true`, `Status.OK != Status.OK` folded to
+  `true`, and a float operand was truncated to the reference's integer width.
+  A reference now promotes to its integral value, per AOSP
+  `AidlConstantReference`. `to_bool`/`to_f64` accept references too, so
+  `E.FOO || false` no longer fails to build.
+- **rsbinder-aidl — the trait signature and the server local disagreed for
+  `inout` arrays.** For example `inout ParcelFileDescriptor[]` declared the
+  trait parameter as `&mut Vec<T>` while the server declared its local as
+  `Vec<Option<T>>` and passed `&mut` it straight in (E0308). The two are now
+  derived from the same predicate.
+- **rsbinder-aidl — a fixed-size array constant did not compile.**
+  `const int[3] X = {1,2,3};` emitted `pub const r#X: &[i32; 3] = [1,2,3,];`
+  — a reference type initialised with an array literal. Fixed-size constants
+  are now value types; the variable-length form still emits a slice.
+- **rsbinder-aidl — a directory source containing a symlink cycle never
+  finished.** `Path::is_dir()` follows symlinks and the visited set was keyed
+  by the path string, so `aidl/loop -> .` produced endlessly deeper paths.
+  The set is now keyed by the canonical path.
+- **rsbinder-aidl — the output directory was never created.** `generate()`
+  failed with a bare "No such file or directory (os error 2)" when `dest_dir`
+  did not exist (including the documented `aidl_gen/` fallback outside cargo)
+  or when `output` named a subdirectory. It is created on demand, and I/O
+  failures now name the path.
+- **rsbinder-aidl — a second `Builder` could inherit the first one's symbol
+  table.** Parsing happens in `generate()` but the parser was reset in
+  `Builder::new()`, so two builders constructed before either generated
+  shared state. The reset moved to the parse phase.
+- **rsbinder-aidl — legitimate AIDL was rejected as "nesting too deep".** The
+  pre-parse guard counted `>>` only as a shift, so generic depth accumulated
+  across a statement and a signature with 129 `List<List<T>>` arguments was
+  refused at a real nesting depth of 2.
+- **rsbinder-aidl — enum discriminants outside their `@Backing` range were
+  emitted anyway.** `@Backing(type="byte") enum E { A = 200 }` produced a
+  literal that is a deny-by-default rustc error in the generated crate,
+  pointing at `OUT_DIR` rather than the `.aidl`. The range is now checked at
+  AIDL-compile time, as AOSP does.
+- **rsbinder-aidl — two union fields could collapse into one Rust variant.**
+  `union U { int my_field; int myField; }` emitted `r#MyField` twice (E0428);
+  the collision is now a diagnostic naming both fields.
+- **rsbinder-aidl — `@RustDerive(Debug=true)` emitted `#[derive(Debug)]`
+  twice** (E0119); the templates already derive it unconditionally.
+- **rsbinder-aidl — a `rust_type` declaration named after a Rust keyword was
+  not escaped**, unlike every other declaration path.
+- **rsbinder-aidl — a negative out-of-range shift amount was reported by its
+  magnitude.** `1 << -100` said "shift amount 100", which does not match the
+  source.
+- **rsbinder-aidl — a package segment that is a Rust keyword was emitted
+  unescaped.** `package com.example.impl;` produced `pub mod impl {`, while
+  references to it were escaped as `super::r#impl::...`.
+- **rsbinder-aidl — the `#[allow(clippy::all)]` / `#[allow(unused_imports)]`
+  header applied only to the first top-level module** in the generated file;
+  it is now emitted per top-level module.
 
 - **rsbinder (`hub`) — Android 15 QPR builds are now refused instead of
   silently losing registrations.** `android-15.0.0_r6` inserted `getService2`

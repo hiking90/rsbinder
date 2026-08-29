@@ -14,6 +14,17 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     let filename = parser::current_source_name();
     let source = parser::current_source_text();
     let (start, end) = span.unwrap_or((0, 0));
+    // Clamp into the attached source so a stale offset cannot make miette
+    // replace the snippet with an `OutOfBounds` notice. With no source
+    // context (`Generator::document()` called outside `Builder::generate`)
+    // there is nothing to render either way, so the raw offsets are kept —
+    // they are still the AIDL positions a programmatic consumer reads.
+    let (start, end) = if source.is_empty() {
+        (start, end)
+    } else {
+        let start = start.min(source.len());
+        (start, end.clamp(start, source.len()))
+    };
     let src_name = if filename.is_empty() {
         "<type_generator>".to_string()
     } else {
@@ -21,7 +32,7 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     };
     (
         NamedSource::new(src_name, source),
-        SourceSpan::new(start.into(), end.saturating_sub(start)),
+        SourceSpan::new(start.into(), end - start),
     )
 }
 
@@ -35,9 +46,8 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
 }
 
 thread_local! {
-    // Thread-local like the rest of the compiler state (parser.rs); kept in
-    // sync by `Generator::new` (single source of truth) and reset by
-    // `Builder::new`.
+    // Thread-local like the rest of the compiler state (parser.rs); set by
+    // `Generator::new`, the single source of truth.
     static IS_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -367,14 +377,10 @@ impl TypeGenerator {
         }
     }
 
-    /// Would a by-value field of `lookup_decl`, inside the declaration being
-    /// generated, close a reference cycle and make the Rust struct infinitely
-    /// sized? A direct self-reference is only the shortest such cycle.
-    ///
-    /// Only a parcelable or a union can hold the enclosing declaration inline.
-    /// An interface renders as a `Strong<dyn …>` handle, and an enum — a
-    /// synthetic union `Tag` included, which reports its parent union's
-    /// namespace — is a scalar; neither closes a cycle.
+    // Would a by-value field of `lookup_decl` make the enclosing Rust struct
+    // infinitely sized? Only a parcelable or union holds its declaration
+    // inline; an interface is a `Strong<dyn …>` handle and an enum is a
+    // scalar, so neither can close a cycle.
     fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
         if !matches!(
             lookup_decl.decl,
@@ -729,7 +735,15 @@ impl TypeGenerator {
         let name = match &self.value_type {
             ValueType::Array(_) => self.list_type_decl(is_struct),
             _ => {
-                if !Self::can_be_defaulted(&self.value_type, is_struct) && is_struct {
+                // A type with no `Default` (IBinder / ParcelFileDescriptor /
+                // interface `Strong`) is stored as `Option<T>` for struct
+                // fields and for `out` arguments, whose local is initialised
+                // with `Default::default()`. `inout` reads its value from the
+                // parcel, so it stays unwrapped — AOSP
+                // `aidl_to_rust.cpp::RustNameOf` makes the same distinction.
+                if !Self::can_be_defaulted(&self.value_type, is_struct)
+                    && (is_struct || matches!(self.direction, Direction::Out))
+                {
                     is_nullable = true;
                 }
                 self.type_decl(&self.value_type, true)
@@ -823,14 +837,17 @@ impl TypeGenerator {
                 }
             }
             Direction::Inout => {
+                // Must mirror `list_type_decl`'s `Inout` arm exactly: the
+                // server declares its local with that type and passes
+                // `&mut` it straight into this signature.
                 if self.is_nullable {
-                    if Self::can_be_defaulted(&sub_type.value_type, false) {
-                        format!("&mut Option<Vec<{type_name}>>")
-                    } else {
-                        format!("&mut Option<Vec<Option<{type_name}>>>")
-                    }
-                } else {
+                    format!("&mut Option<Vec<Option<{type_name}>>>")
+                } else if Self::can_be_defaulted(&sub_type.value_type, true)
+                    || Self::is_interface(&sub_type.value_type)
+                {
                     format!("&mut Vec<{type_name}>")
+                } else {
+                    format!("&mut Vec<Option<{type_name}>>")
                 }
             }
             _ => {
@@ -874,7 +891,12 @@ impl TypeGenerator {
                         ));
                     }
                     let name = self.type_decl(&self.value_type, true);
-                    if self.is_nullable {
+                    // Mirrors `type_declaration`: an `out` argument of a type
+                    // with no `Default` is wrapped in `Option`.
+                    if self.is_nullable
+                        || (matches!(self.direction, Direction::Out)
+                            && !Self::can_be_defaulted(&self.value_type, false))
+                    {
                         format!("&mut Option<{name}>")
                     } else {
                         format!("&mut {name}")
@@ -904,6 +926,17 @@ impl TypeGenerator {
             if let Some(info) = self.array_types.first() {
                 if matches!(info.value_type, ValueType::String(_)) && !info.is_fixed() {
                     return Ok("&[&str]".into());
+                }
+                // A fixed-size array constant is emitted by value: its
+                // initializer is an array literal (`[1,2,3,]`), which does not
+                // coerce to a slice reference in const position.
+                if info.is_fixed() {
+                    let name = self.make_fixed_array(info, false);
+                    return Ok(if self.is_nullable {
+                        format!("Option<{name}>")
+                    } else {
+                        name
+                    });
                 }
             }
         }
@@ -1461,6 +1494,8 @@ mod tests {
                 .unwrap(),
             "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
         );
+        // Must equal `list_type_decl(false)` for the same generator: the
+        // server passes `&mut` its local of that type into this signature.
         assert_eq!(
             array_gen
                 .clone()
@@ -1468,7 +1503,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<rsbinder::ParcelFileDescriptor>"
+            "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();

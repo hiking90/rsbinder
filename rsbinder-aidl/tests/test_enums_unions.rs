@@ -22,7 +22,6 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-#[cfg(test)]
 const UNION: &str = r#"
     @JavaDerive(toString=true, equals=true)
     @RustDerive(Clone=true, PartialEq=true)
@@ -39,7 +38,6 @@ const UNION: &str = r#"
     }
 "#;
 
-#[cfg(test)]
 const CONSTANT_EXPRESSION_ENUM: &str = r#"
         @Backing(type="int")
         enum ConstantExpressionEnum {
@@ -67,7 +65,6 @@ const CONSTANT_EXPRESSION_ENUM: &str = r#"
         }
 "#;
 
-#[cfg(test)]
 const INT_ENUM: &str = r#"
         @Backing(type="int")
         enum IntEnum {
@@ -79,7 +76,6 @@ const INT_ENUM: &str = r#"
         }
 "#;
 
-#[cfg(test)]
 const LONG_ENUM: &str = r#"
         @Backing(type="long")
         enum LongEnum {
@@ -89,7 +85,6 @@ const LONG_ENUM: &str = r#"
         }
 "#;
 
-#[cfg(test)]
 const BYTE_ENUM: &str = r#"
         @Backing(type="byte")
         enum ByteEnum {

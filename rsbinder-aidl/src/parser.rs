@@ -17,19 +17,6 @@ use crate::const_expr::{ConstExpr, ValueType};
 use crate::type_generator;
 use crate::Namespace;
 
-#[derive(Debug, Clone)]
-pub enum SymbolType {
-    EnumMember,
-    InterfaceConstant,
-    // Future expansion: ParcelableDefault, Variable, etc.
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Symbol {
-    pub value: crate::const_expr::ConstExpr,
-    pub symbol_type: SymbolType,
-}
-
 thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     static DECLARATION_DOCUMENT_MAP: RefCell<HashMap<Namespace, DocumentContext>> = RefCell::new(HashMap::new());
@@ -37,7 +24,7 @@ thread_local! {
     static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
 
     // Universal Symbol Table - supports all types of named constants
-    static SYMBOL_TABLE: RefCell<HashMap<String, Symbol>> = RefCell::new(HashMap::new());
+    static SYMBOL_TABLE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
     static ENUM_VALUE_CACHE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
     static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
@@ -316,13 +303,10 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
     })
 }
 
-/// The one type name a member holds **by value** — the edges of the sizing
-/// graph in [`declaration_reaches`].
-///
-/// A variable-length array, a `List<T>` or a `Map<K, V>` is rendered as a
-/// `Vec`/`HashMap`, so it is a fixed-size handle whatever it holds and can
-/// never close a sizing cycle. Only a bare name, or one under fixed-size
-/// array dimensions, keeps its declaration inline.
+// The one type name a member holds by value — the edges of the sizing graph
+// in `declaration_reaches`. A `Vec`/`HashMap` member is a fixed-size handle
+// whatever it holds, so only a bare name (or one under fixed-size array
+// dimensions) can close a sizing cycle.
 fn by_value_type_name(ty: &Type) -> Option<&str> {
     if ty.array_types.iter().any(|a| a.const_expr.is_none()) {
         return None;
@@ -512,17 +496,10 @@ pub(crate) fn enum_member_const_expr_from_lookup(
     let _guard = NamespaceGuard::new(&lookup_decl.ns);
     let mut result = None;
 
-    // Resolve inside the enum declaration, not through a global member name.
-    //
-    // `carried` holds an explicit value that could NOT be folded into the
-    // auto-increment counter: a non-integral value (String/Array), an
-    // expression whose evaluation failed (`1/0`, overflowing shift), or a
-    // reference that stays unresolved (typo / circular chain). Any of these
-    // would otherwise fabricate a wrong, silently-zeroed wire discriminant —
-    // both for the member itself and for every auto-increment member after
-    // it — so the raw value is carried out (poisoning the counter until the
-    // next successfully-folded explicit value) and `decl_enum`'s `to_i64()`
-    // guard surfaces the diagnostic. AOSP rejects all of these at build time.
+    // `carried` holds an explicit value that would not fold (non-integral,
+    // failed evaluation, unresolved reference). Passing it through poisons the
+    // auto-increment counter so `decl_enum`'s `to_i64()` reports a diagnostic
+    // instead of fabricating a zeroed wire discriminant.
     let mut carried: Option<ConstExpr> = None;
     let mut result_is_carried = false;
     for enumerator in &enum_decl.enumerator_list {
@@ -640,55 +617,56 @@ pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> 
 }
 
 // Universal symbol registration - supports all types of named constants
-pub fn register_symbol(
-    name: &str,
-    value: ConstExpr,
-    symbol_type: SymbolType,
-    namespace: Option<&str>,
-) {
-    let symbol = Symbol { value, symbol_type };
+/// `self` / `Self` / `super` / `crate` are the four Rust keywords that cannot
+/// be written as raw identifiers, and every generated name is emitted as
+/// `r#<name>` or used bare in `mod` / `trait` / `struct` position — so an AIDL
+/// name matching one of them has no representation at all. AIDL itself permits
+/// them, so this is the only place they can be rejected.
+fn reject_unrepresentable_identifier(
+    ident: &str,
+    role: &str,
+    span: &pest::Span<'_>,
+) -> Result<(), AidlError> {
+    if matches!(ident, "self" | "Self" | "super" | "crate") {
+        return Err(make_parse_error(
+            format!(
+                "'{ident}' cannot be used as a{} {role} \
+                 (not representable as a Rust raw identifier)",
+                if role.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                    "n"
+                } else {
+                    ""
+                }
+            ),
+            span.start(),
+            span.end(),
+        ));
+    }
+    Ok(())
+}
 
+pub fn register_symbol(name: &str, value: ConstExpr, namespace: Option<&str>) {
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();
 
-        match &symbol.symbol_type {
-            SymbolType::EnumMember => {
-                // Enum members are only registered under their enum type.
-                // Simple enum member names are not globally unique.
-                if let Some(ns) = namespace {
-                    let qualified_name = format!("{}.{}", ns, name);
-                    table.insert(qualified_name, symbol);
-                }
+        // Always key by the declaring namespace. A bare simple name is not
+        // globally unique, and a bare key lets an unrelated declaration's
+        // constant win an unqualified lookup.
+        match namespace {
+            Some(ns) => {
+                table.insert(format!("{ns}.{name}"), value);
             }
-            _ => {
-                // Register with simple name
-                table.insert(name.to_string(), symbol.clone());
-
-                // Also register with qualified name if namespace is provided
-                if let Some(ns) = namespace {
-                    let qualified_name = format!("{}.{}", ns, name);
-                    table.insert(qualified_name, symbol);
-                }
+            None => {
+                table.insert(name.to_string(), value);
             }
         }
     });
 }
 
-// Note: register_enum_member removed as it's not used
-// Use register_symbol directly with SymbolType::EnumMember
-
 // Enhanced name resolution with universal symbol table
 pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     if let Some(expr) = name_to_enum_member_const_expr(name, None) {
         return Some(expr);
-    }
-
-    // First, try to resolve from universal symbol table (exact match)
-    let symbol_result =
-        SYMBOL_TABLE.with(|table| table.borrow().get(name).map(|symbol| symbol.value.clone()));
-
-    if symbol_result.is_some() {
-        return symbol_result;
     }
 
     // For dotted names, try namespace-aware declaration lookup before variant stripping.
@@ -703,15 +681,12 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
         }
     }
 
-    // Try alternative name formats for cross-references
+    // Variants are ordered scope-first (`<current_ns>.<name>` before the bare
+    // name), so an unqualified reference resolves against its own declaration
+    // rather than a same-named constant elsewhere.
     let alternative_formats = generate_name_variants(name);
     for variant in alternative_formats {
-        let variant_result = SYMBOL_TABLE.with(|table| {
-            table
-                .borrow()
-                .get(&variant)
-                .map(|symbol| symbol.value.clone())
-        });
+        let variant_result = SYMBOL_TABLE.with(|table| table.borrow().get(&variant).cloned());
         if variant_result.is_some() {
             return variant_result;
         }
@@ -725,24 +700,32 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     None
 }
 
-// Generate possible name variants for flexible resolution
+// Symbol-table keys for `name`, most specific first: an unqualified
+// reference resolves outward through its enclosing scopes only, so an
+// unrelated declaration's same-named constant can never win.
 fn generate_name_variants(name: &str) -> Vec<String> {
     let mut variants = Vec::new();
+    let dotted = name.contains('.');
 
-    // Handle dot notation: "A.B.C" -> ["A.B.C", "B.C", "C"]
-    // Try progressively shorter prefixes to find the best qualified match
-    if name.contains('.') {
+    if dotted {
+        variants.push(name.to_string());
+    }
+
+    let current_ns = current_namespace().to_string(crate::Namespace::AIDL);
+    if !current_ns.is_empty() {
+        let segments: Vec<&str> = current_ns.split('.').collect();
+        for end in (1..=segments.len()).rev() {
+            variants.push(format!("{}.{}", segments[..end].join("."), name));
+        }
+    }
+
+    if dotted {
+        // Progressively shorter suffixes: "A.B.C" -> "B.C", "C".
         let parts: Vec<&str> = name.split('.').collect();
-        for i in 0..parts.len() {
+        for i in 1..parts.len() {
             variants.push(parts[i..].join("."));
         }
     } else {
-        // For simple names, try with current namespace context
-        let current_ns = current_namespace().to_string(crate::Namespace::AIDL);
-
-        if !current_ns.is_empty() {
-            variants.push(format!("{}.{}", current_ns, name));
-        }
         variants.push(name.to_string());
     }
 
@@ -844,6 +827,7 @@ pub struct ParcelableDecl {
     pub annotation_list: Vec<Annotation>,
     pub namespace: Namespace,
     pub name: String,
+    pub name_span: Option<(usize, usize)>,
     pub type_params: Vec<String>,
     pub cpp_header: String,
     pub ndk_header: String,
@@ -1046,7 +1030,11 @@ impl Type {
 #[derive(PartialEq)]
 pub enum AnnotationType {
     IsNullable,
-    JavaOnly,
+    /// `@JavaOnlyStableParcelable` — the parcelable is declared outside AIDL
+    /// for the Java backend, so no Rust definition can be generated. Matched
+    /// exactly: `@JavaOnlyImmutable` is a *structured* parcelable that AOSP's
+    /// Rust backend generates normally.
+    JavaOnlyStableParcelable,
     VintfStability,
 }
 
@@ -1055,7 +1043,9 @@ pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType
     annotation_list.iter().any(|annotation| match query_type {
         AnnotationType::VintfStability => annotation.annotation == "@VintfStability",
         AnnotationType::IsNullable => annotation.annotation == "@nullable",
-        AnnotationType::JavaOnly => annotation.annotation.starts_with("@JavaOnly"),
+        AnnotationType::JavaOnlyStableParcelable => {
+            annotation.annotation == "@JavaOnlyStableParcelable"
+        }
     })
 }
 
@@ -1069,6 +1059,9 @@ pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
                 .parameter_list
                 .iter()
                 .filter(|param| param.const_expr.to_bool().unwrap_or(false))
+                // The templates always emit `#[derive(Debug)]`; repeating it
+                // here would be a conflicting `Debug` impl (E0119).
+                .filter(|param| param.identifier != "Debug")
                 .map(|param| param.identifier.to_owned())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -1514,16 +1507,10 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr
     Ok(lhs)
 }
 
-/// Parses a `C_STR` token into a `ValueType::String`, validating its bytes.
-///
-/// The string is emitted verbatim into a generated Rust `"..."`.
-/// rsbinder intentionally allows non-ASCII (UTF-8) here — e.g.
-/// `const String MSG = "한글";` — because it round-trips as a valid
-/// Rust string literal (more lenient than AOSP `isValidLiteralChar`,
-/// which rejects non-ASCII). But a control byte or a backslash would
-/// be emitted verbatim and fail to compile (a raw `\X` is not
-/// necessarily a valid Rust escape; rsbinder does not decode string
-/// escapes). Reject only those at parse time.
+// The string is emitted verbatim into a generated Rust `"..."`. Non-ASCII is
+// allowed (more lenient than AOSP `isValidLiteralChar`) because it round-trips
+// as a valid Rust literal; a control byte or backslash is not, and rsbinder
+// does not decode string escapes, so only those are rejected here.
 fn parse_c_str(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     let span = pair.as_span();
     let raw = pair.as_str();
@@ -1587,10 +1574,9 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                 // Map the supported C/AIDL escape sequences to their actual code
                 // points (e.g. `'\n'` becomes newline, not the literal 'n').
                 // rsbinder intentionally supports these (more lenient than AOSP,
-                // which only allows `'\0'`). An unrecognized escape used to fall
-                // through to the post-backslash char verbatim — silently
-                // producing the wrong code point (`'\a'` -> 'a' = 97, not bell).
-                // Reject it instead.
+                // which only allows `'\0'`). An unrecognized escape is rejected:
+                // passing the post-backslash char through verbatim would give
+                // the wrong code point (`'\a'` -> 'a' = 97, not bell).
                 match esc {
                     'n' => '\n',
                     't' => '\t',
@@ -1856,18 +1842,7 @@ fn parse_variable_decl(
             Rule::identifier => {
                 let span = pair.as_span();
                 let ident = pair.as_str();
-                // These four cannot be emitted: `r#self` etc. are not valid
-                // Rust raw identifiers (see `escape_rust_keyword` rustdoc).
-                if matches!(ident, "self" | "Self" | "super" | "crate") {
-                    return Err(make_parse_error(
-                        format!(
-                            "'{ident}' cannot be used as a member name \
-                             (not representable as a Rust raw identifier)"
-                        ),
-                        span.start(),
-                        span.end(),
-                    ));
-                }
+                reject_unrepresentable_identifier(ident, "member name", &span)?;
                 decl.identifier = ident.into();
             }
             Rule::const_expr => match pair.into_inner().next() {
@@ -1915,6 +1890,8 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Result<Arg, AidlError> {
                 arg.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
+                let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "argument name", &span)?;
                 arg.identifier = pair.as_str().into();
             }
             _ => unreachable!("Unexpected rule in parse_arg(): {}", pair),
@@ -1940,6 +1917,7 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, 
             }
             Rule::identifier => {
                 let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "method name", &span)?;
                 decl.identifier = pair.as_str().into();
                 decl.identifier_span = Some((span.start(), span.end()));
             }
@@ -2032,6 +2010,7 @@ fn parse_interface_decl(
 
             Rule::qualified_name => {
                 let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "interface name", &span)?;
                 interface.name = pair.as_str().into();
                 interface.name_span = Some((span.start(), span.end()));
             }
@@ -2145,6 +2124,9 @@ fn parse_parcelable_decl(
     for pair in pairs {
         match pair.as_rule() {
             Rule::qualified_name => {
+                let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "parcelable name", &span)?;
+                parcelable.name_span = Some((span.start(), span.end()));
                 parcelable.name = pair.as_str().into();
             }
 
@@ -2204,6 +2186,8 @@ fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, A
     for pair in pairs {
         match pair.as_rule() {
             Rule::identifier => {
+                let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "enum member name", &span)?;
                 res.identifier = pair.as_str().into();
             }
             Rule::const_expr => {
@@ -2239,6 +2223,7 @@ fn parse_enum_decl(
         match pair.as_rule() {
             Rule::qualified_name => {
                 let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "enum name", &span)?;
                 enum_decl.name = pair.as_str().into();
                 enum_decl.name_span = Some((span.start(), span.end()));
             }
@@ -2275,6 +2260,7 @@ fn parse_union_decl(
         match pair.as_rule() {
             Rule::qualified_name => {
                 let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "union name", &span)?;
                 union_decl.name = pair.as_str().into();
                 union_decl.name_span = Some((span.start(), span.end()));
             }
@@ -2380,11 +2366,17 @@ fn calculate_namespace(
     }
 }
 
-/// Maximum bracket/generic nesting depth accepted before parsing.
+/// Maximum `()[]{}` nesting depth accepted before parsing.
 /// Orders of magnitude above any legitimate AIDL, well below the stack-
 /// overflow threshold of the recursive parser/walkers — see
 /// [`check_nesting_depth`].
 const MAX_NESTING_DEPTH: usize = 256;
+
+// Much tighter than `MAX_NESTING_DEPTH`: `non_array_type`'s generic
+// alternatives re-parse the nested remainder per level, so cost is
+// exponential (~3.7x/level; depth 16 already ~1.7s on a debug build) rather
+// than merely stack-hungry. AOSP's deepest vendored generic is 3.
+const MAX_GENERIC_DEPTH: usize = 12;
 
 /// Maximum number of operator tokens accepted in a single statement/element
 /// (reset at `; , ( ) [ ] { }`). A const expression made of a long operator
@@ -2407,7 +2399,24 @@ const MAX_OPERATOR_RUN: usize = 1024;
 /// diagnostic. Angle-bracket depth is reset at `;` (a generic type never
 /// crosses a statement boundary) so shift/comparison operators in const
 /// expressions cannot drift the count into a false positive.
-fn check_nesting_depth(source: &str) -> Option<usize> {
+#[derive(Debug, Clone, Copy)]
+pub enum NestingLimit {
+    Bracket,
+    Generic,
+    OperatorRun,
+}
+
+impl NestingLimit {
+    pub fn describe(self) -> &'static str {
+        match self {
+            NestingLimit::Bracket => "bracket nesting",
+            NestingLimit::Generic => "generic type nesting",
+            NestingLimit::OperatorRun => "operators in one expression",
+        }
+    }
+}
+
+fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut bracket_depth: usize = 0; // () [] {}
@@ -2466,11 +2475,20 @@ fn check_nesting_depth(source: &str) -> Option<usize> {
                 continue;
             }
             b'<' => angle_depth += 1,
-            // `>>` shift / `>=` are not generic closers.
-            b'>' if matches!(next(i), Some(b'>') | Some(b'=')) => {
-                if bytes[i + 1] == b'>' {
+            // `>>` closes two open generics (`Map<int, List<int>>`); it is a
+            // shift operator only outside one.
+            b'>' if next(i) == Some(b'>') => {
+                if angle_depth >= 2 {
+                    angle_depth -= 2;
+                } else {
+                    angle_depth = 0;
                     op_run += 1;
                 }
+                i += 2;
+                continue;
+            }
+            // `>=` is a comparison, never a generic closer.
+            b'>' if next(i) == Some(b'=') => {
                 i += 2;
                 continue;
             }
@@ -2485,11 +2503,14 @@ fn check_nesting_depth(source: &str) -> Option<usize> {
             b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'!' | b'~' => op_run += 1,
             _ => {}
         }
-        if bracket_depth > MAX_NESTING_DEPTH
-            || angle_depth > MAX_NESTING_DEPTH
-            || op_run > MAX_OPERATOR_RUN
-        {
-            return Some(i);
+        if bracket_depth > MAX_NESTING_DEPTH {
+            return Some((i, NestingLimit::Bracket, MAX_NESTING_DEPTH));
+        }
+        if angle_depth > MAX_GENERIC_DEPTH {
+            return Some((i, NestingLimit::Generic, MAX_GENERIC_DEPTH));
+        }
+        if op_run > MAX_OPERATOR_RUN {
+            return Some((i, NestingLimit::OperatorRun, MAX_OPERATOR_RUN));
         }
         i += 1;
     }
@@ -2500,12 +2521,13 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
     let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
     // DoS guard: reject pathologically nested input *before* handing it to
     // the recursive pest parser, which would otherwise overflow the stack.
-    if let Some(offset) = check_nesting_depth(&ctx.source) {
+    if let Some((offset, limit, max)) = check_nesting_depth(&ctx.source) {
         return Err(ParseError::nesting_too_deep(
             &ctx.filename,
             &ctx.source,
             offset,
-            MAX_NESTING_DEPTH,
+            limit.describe(),
+            max,
         )
         .into());
     }
@@ -2646,34 +2668,6 @@ mod tests {
             })?;
 
         let expr = parse_expression(res.next().unwrap().into_inner())?;
-        // assert_eq!(
-        //     expr.clone(),
-        //     // Expression::Expr {
-        //     //     as_str: "1 + -3 * 2 << 2 | 4".into(),
-        //     //     lhs: Box::new(Expression::Expr {
-        //     //         as_str: "1 + -3 * 2 << 2 | 4".into(),
-        //     //         lhs: Box::new(Expression::Expr {
-        //     //             as_str: "1 + -3 * 2 << 2 | 4".into(),
-        //     //             lhs: Box::new(Expression::Int8(1)),
-        //     //             operator: "+".to_string(),
-        //     //             rhs: Box::new(Expression::Expr {
-        //     //                 as_str: "1 + -3 * 2 << 2 | 4".into(),
-        //     //                 lhs: Box::new(Expression::Unary {
-        //     //                     operator: "-".to_string(),
-        //     //                     expr: Box::new(Expression::Int8(3))
-        //     //                 }),
-        //     //                 operator: "*".to_string(),
-        //     //                 rhs: Box::new(Expression::Int8(2))
-        //     //             })
-        //     //         }),
-        //     //         operator: "<<".to_string(),
-        //     //         rhs: Box::new(Expression::Int8(2))
-        //     //     }),
-        //     //     operator: "|".to_string(),
-        //     //     rhs: Box::new(Expression::Int8(4))
-        //     // },
-        //     ConstExpr::default(),
-        // );
 
         // ((1 + 3*2) << 2) | 4 = 28 | 4 = 28
         assert_eq!(
@@ -2807,7 +2801,7 @@ mod tests {
         }
     }
 
-    // 1.1n: thread-local state is cleared after SourceGuard is dropped
+    // thread-local state is cleared after SourceGuard is dropped
     #[test]
     fn test_source_guard_cleanup_on_drop() {
         {
@@ -2820,7 +2814,7 @@ mod tests {
         assert_eq!(current_source_text(), "");
     }
 
-    // 1.1o: thread-local state is cleared even when a panic occurs inside SourceGuard
+    // thread-local state is cleared even when a panic occurs inside SourceGuard
     #[test]
     fn test_source_guard_cleanup_on_panic() {
         let result = std::panic::catch_unwind(|| {
