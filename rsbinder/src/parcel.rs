@@ -538,19 +538,7 @@ impl Parcel {
         self.data.as_ptr()
     }
 
-    /// Byte count that may be handed to the kernel alongside [`as_ptr`]
-    /// (`Self::as_ptr`).
-    ///
-    /// This is the number of bytes that actually exist in the backing
-    /// buffer, which is **not** always [`data_size`](Self::data_size):
-    /// that one is `max(len, pos)` (AOSP `Parcel::dataSize`), and the
-    /// public [`set_data_position`](Self::set_data_position) can move
-    /// `pos` past the end without writing anything. Sending
-    /// `data_size()` would then make the driver `copy_from_user` past
-    /// the end of our allocation and hand the surplus to the peer.
-    /// Every write path zero-fills the `[len..pos]` gap and grows `len`,
-    /// so for a parcel that was actually written this is identical to
-    /// `data_size()`.
+    /// `len`, not `data_size()` (= `max(len, pos)`): a forward `set_data_position` must not make the driver copy past the allocation.
     pub(crate) fn ipc_data_size(&self) -> usize {
         self.data.len()
     }
@@ -791,14 +779,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    /// Shrink the parcel to `new_len` bytes.
-    ///
-    /// Growing is refused: the bytes between `len` and `new_len` were
-    /// never initialized, and `capacity()` says nothing about that —
-    /// claiming them would be `Vec::set_len` UB even though the buffer
-    /// is large enough. The one legitimate grow (the binder driver
-    /// filling our read buffer through `as_mut_ptr`) goes through
-    /// [`set_data_size_driver_filled`](Self::set_data_size_driver_filled).
+    /// Shrink only: growing would claim uninitialized bytes (`set_data_size_driver_filled` is the one legitimate grow).
     pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.len() {
             log::error!(

@@ -460,13 +460,7 @@ impl Builder {
         // ambiguous, matching AOSP `import_resolver.cpp` ("Duplicate files
         // found").
         let mut includes: Vec<PathBuf> = Vec::new();
-        // Keyed by the canonical path like `seen` below: `./aidl`, `aidl` and
-        // an absolute spelling are one directory, and listing it twice turns
-        // every import under it into `AmbiguousImport`.
-        // `strip_package` yields an empty path when the source sits directly
-        // under its own package path. That names the working directory, not a
-        // directory of its own: left as `""` it neither dedups (canonicalize
-        // is ENOENT) nor survives as a `cargo:rerun-if-changed=` value.
+        // Canonical key: `./aidl` and `aidl` are one dir; `""` (source directly under its package path) means cwd.
         fn name_the_cwd(dir: PathBuf) -> PathBuf {
             if dir.as_os_str().is_empty() {
                 PathBuf::from(".")

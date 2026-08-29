@@ -1236,13 +1236,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 Ok(_) => StatusCode::Ok.into(),
                                 Err(err) => err.into(),
                             };
-                            // `write_transaction_data` stores raw pointers to
-                            // `reply`'s buffer / `status` in `out_parcel`. If
-                            // the flush below fails, that BC_REPLY must not
-                            // outlive them: the next flush would hand the
-                            // kernel a dangling pointer to copy into the peer
-                            // (cross-process use-after-free). Remember where
-                            // it was queued so it can be rewound.
+                            // The queued BC_REPLY points at `reply`/`status`; a failed flush must rewind it, not leave it.
                             let queued_at = thread_state.borrow().unflushed_mark();
                             thread_state.borrow_mut().write_transaction_data(
                                 binder::BC_REPLY,
@@ -1253,7 +1247,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 &status,
                             )?;
                             if let Err(e) = wait_for_response(UntilResponse::TransactionComplete) {
-                                discard_unflushed_commands(thread_state, queued_at);
+                                discard_unflushed_commands(thread_state, queued_at, true);
                                 return Err(e);
                             }
                         } else if let Err(err) = result {
@@ -1787,26 +1781,25 @@ pub(crate) fn transact(
     match waited {
         Ok(reply) => Ok(reply),
         Err(e) => {
-            THREAD_STATE.with(|thread_state| discard_unflushed_commands(thread_state, queued_at));
+            THREAD_STATE
+                .with(|thread_state| discard_unflushed_commands(thread_state, queued_at, false));
             Err(e)
         }
     }
 }
 
-/// After a failed flush, drop whatever is still queued in `out_parcel` from
-/// the `queued_at` mark onward — a command that carries pointers into memory
-/// the caller is about to release. One more flush is attempted first, while
-/// those pointers are still valid, so that a transient failure does not
-/// cost the peer its reply; only if the driver still has not consumed the
-/// buffer is it rewound. Anything queued *before* the mark (typically
-/// BC_FREE_BUFFER / BC_RELEASE) is left in place: it references nothing on
-/// our stack and dropping it would leak kernel buffers and remote refs. The
-/// mark carries the flush epoch so that, once the driver has consumed the
-/// command, commands queued afterwards at the same offsets (BC_*_DONE,
-/// BC_FREE_BUFFER) are not mistaken for it.
-fn discard_unflushed_commands(thread_state: &RefCell<ThreadState>, queued_at: (u64, usize)) {
-    if let Err(e) = talk_with_driver(false) {
-        log::warn!("flush after failed reply/transact also failed: {e}");
+/// Rewind `out_parcel` to the `queued_at` mark: the command there points into memory the caller is about to release.
+/// `retry_flush` (BC_REPLY only) tries one more flush first so a transient failure does not cost the peer its reply;
+/// a retried BC_TRANSACTION would instead leave a two-way call in flight whose BR_REPLY the next `transact` would take.
+fn discard_unflushed_commands(
+    thread_state: &RefCell<ThreadState>,
+    queued_at: (u64, usize),
+    retry_flush: bool,
+) {
+    if retry_flush {
+        if let Err(e) = talk_with_driver(false) {
+            log::warn!("flush after failed reply also failed: {e}");
+        }
     }
     let (epoch, queued_at) = queued_at;
     let mut ts = thread_state.borrow_mut();

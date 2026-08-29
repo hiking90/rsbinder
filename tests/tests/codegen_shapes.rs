@@ -1,9 +1,9 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end round trip for the argument shapes whose generated Rust changed
-//! with the 2026-08 AIDL review. The AOSP fixture corpus uses none of them, so
-//! without this the new codegen is only ever type-checked, never run.
+//! End-to-end round trip for the argument shapes the AOSP fixture corpus never
+//! uses (non-nullable `out` binder, `@nullable` primitive arrays, non-nullable
+//! `inout` binder array), so that their codegen is run, not only type-checked.
 //!
 //! Driven over the RPC transport so the same test runs on Linux, macOS and an
 //! Android device without a kernel binder node. The generated server stub and
@@ -128,7 +128,8 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         shapes
             .r#roundInoutBinders(&mut v)
             .expect("inout binder array");
-        assert_eq!(v.len(), 2, "the array round-trips at the same length");
+        // The service reversed it: the callee's mutation, not the input, comes back.
+        assert_eq!(v, vec![other, sib.clone()], "the reversed array comes back");
     }
 
     handle.join().expect("server thread");

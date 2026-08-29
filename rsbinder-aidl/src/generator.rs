@@ -591,7 +591,7 @@ pub mod {{mod}} {
                         {%- endif %}
                         {%- for arg in member.transaction_write %}
                         {%- if arg.needs_null_guard %}
-                        if {{ arg.identifier }}.iter().any(Option::is_none) { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                        if {{ arg.identifier }}.iter(){% for _i in range(end=arg.null_guard_flatten) %}.flatten(){% endfor %}.any(Option::is_none) { return Err({{crate}}::StatusCode::UnexpectedNull); }
                         {%- endif %}
                         {%- if arg.needs_unwrap %}
                         let {{ arg.identifier }} = {{ arg.identifier }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?;
@@ -986,6 +986,9 @@ pub struct TransactionWrite {
     /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
     /// writing this arg back (`TypeGenerator::out_array_needs_null_guard`).
     pub needs_null_guard: bool,
+    /// `.flatten()` count between `iter()` and the guard, one per nested
+    /// fixed-size dimension (`TypeGenerator::out_array_null_guard_flatten`).
+    pub null_guard_flatten: usize,
     /// Unwrap this arg's `Option<T>` into `UNEXPECTED_NULL` before writing it
     /// back (`TypeGenerator::out_scalar_needs_unwrap`).
     pub needs_unwrap: bool,
@@ -998,6 +1001,7 @@ impl TransactionWrite {
         Self {
             identifier: identifier.into(),
             needs_null_guard: false,
+            null_guard_flatten: 0,
             needs_unwrap: false,
         }
     }
@@ -1119,6 +1123,7 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
             transaction_write.push(TransactionWrite {
                 identifier: generator.identifier.to_owned(),
                 needs_null_guard: generator.out_array_needs_null_guard(),
+                null_guard_flatten: generator.out_array_null_guard_flatten(),
                 needs_unwrap: generator.out_scalar_needs_unwrap(),
             });
             read_onto_params.push(generator.identifier.to_owned());
@@ -1787,10 +1792,7 @@ pub mod {mod} {{
                         )))
                     }
                 };
-                // The discriminant is emitted as a literal into a
-                // `[<backing>; N]` newtype, where an out-of-range literal is
-                // a deny-by-default rustc error in the *generated* crate.
-                // AOSP rejects it at AIDL-compile time; do the same.
+                // An out-of-range literal would only fail in the generated crate; reject it here as AOSP does.
                 let (min, max, backing) = match generator.value_type {
                     ValueType::Byte(_) => (i8::MIN as i64, i8::MAX as i64, "byte"),
                     ValueType::Int32(_) => (i32::MIN as i64, i32::MAX as i64, "int"),

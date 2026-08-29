@@ -805,22 +805,7 @@ impl RpcSessionInner {
                     reentrant: false,
                 });
             }
-            // (4) Pool exhausted — wait. The `Condvar` is woken on
-            //     slot release (ConnGuard drop) or slot addition
-            //     (`add_*_slot`). Spurious wakes loop back to scan.
-            //
-            // Bounded by the session deadline when one is set: a slot
-            // pinned by a `serve_blocking` worker sitting in `recv` is
-            // released only when the *peer* sends something, so with a
-            // single slot a `client_transact` from another thread would
-            // otherwise park here forever — and the reply deadline is
-            // armed only after this returns, so `set_timeout` alone did
-            // not bound it. AOSP avoids the state structurally
-            // (`ExclusiveConnection::find` never hands a serve-driven
-            // `mIncoming` connection to a client call and returns
-            // `WOULD_BLOCK` with no `mOutgoing`); rsbinder's unified
-            // pool cannot tell the directions apart, so it bounds the
-            // wait instead.
+            // (4) Pool exhausted — wait, bounded by the session deadline: a serve-pinned slot is released only by the peer.
             let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
             st = match deadline {
                 Some(d) => {
@@ -1408,14 +1393,12 @@ impl RpcSessionInner {
             None => parcel.write(&0i32),
             Some(b) => {
                 let addr = if let Some(rp) = (**b).as_any().downcast_ref::<RpcProxy>() {
-                    // A remote object travelling back to its origin —
-                    // reuse its existing address (no new local node). The
-                    // parcel keeps the proxy alive until it is dropped, i.e.
-                    // past the send: otherwise a handler's argument proxy
-                    // dropped before the reply goes out would `DEC_STRONG`
-                    // ahead of it and the owner would free the node the
-                    // reply names (AOSP keeps argument refs until after
-                    // the reply is sent).
+                    // Another session's address means nothing to this peer (AOSP `onBinderLeaving`: INVALID_OPERATION).
+                    if !std::ptr::eq(rp.session_ptr(), self) {
+                        log::error!("RPC: cannot send a binder from an unrelated RPC session");
+                        return Err(StatusCode::InvalidOperation);
+                    }
+                    // Pinned in the parcel past the send, so its DEC_STRONG cannot precede the reply that names it.
                     parcel.rpc_pin_binder(b.clone());
                     rp.address()
                 } else {
@@ -2235,21 +2218,8 @@ impl RpcSessionInner {
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetFdMode) => {
-                // Body: i32 — does the client want `Unix`. Agree only
-                // if this endpoint also supports it (else `None`, never
-                // an error). The reply (0=None,1=Unix) is sent
-                // in the *current* (None) mode; both sides switch only
-                // after this exchange completes, so framing stays
-                // consistent.
-                //
-                // Once a session is in `Unix` mode (negotiated here, or by
-                // the android-13+ connection header) it stays there: a
-                // later GET_FD_MODE answers `1` and changes nothing. The
-                // agreed mode below only ever computes `Unix` on the
-                // server role (`set_supported_fd_modes`), so re-running
-                // it on an established session would flip a client to
-                // `None` on any peer's say-so — dropping in-flight fds and
-                // desynchronizing the R34 fd-aware receive buffer.
+                // Body: i32 "client wants Unix"; reply 0=None/1=Unix goes out in the current mode, both switch after.
+                // `Unix`, once set, is never renegotiated: a flip to `None` would drop in-flight fds and desync R34.
                 if self.fd_mode() == FileDescriptorTransportMode::Unix {
                     let mut reply = Parcel::new();
                     reply.write(&1i32)?;
@@ -2535,37 +2505,20 @@ impl RpcSession {
         Ok((transport, codec, client_fd_mode, client_id, incoming))
     }
 
-    /// Server: build the accepted connection's session from
-    /// a completed [`android13plus_accept_handshake`](RpcSession::android13plus_accept_handshake).
-    /// `shared = None` ⇒ a brand-new session (the default / new-session
-    /// path); `shared = Some(existing)` ⇒
-    /// **attach** this connection to a pre-existing session (id-demux),
-    /// so a binder published over the founding connection is reachable
-    /// here (shared `state`/`root`).
-    ///
-    /// **Anti-resurrection contract**: the caller MUST gate a
-    /// `Some(shared)` attach through
-    /// [`SharedSession::try_bump_live_conns`] *before* invoking this
-    /// function and reject the connection on `false`. Once
-    /// `live_conns` has been bumped this function takes ownership of
-    /// the bump for the session lifetime (the `serve_blocking_on` exit
-    /// hook does the matching `fetch_sub`). This split lets the
-    /// server's `serve_connection` decide reject-vs-attach atomically
-    /// against the race window between `resolve_session.upgrade()` and
-    /// the founding worker's `live_conns.fetch_sub` (the resurrection
-    /// race).
+    /// Server: build the accepted connection's session from a completed
+    /// [`android13plus_accept_handshake`](RpcSession::android13plus_accept_handshake).
+    /// Always a brand-new session: a later connection of the same session is
+    /// attached through `add_incoming_slot_capped`, never by building a
+    /// second `RpcSessionInner` over the same `SharedSession` — proxies minted
+    /// by one inner are refused by another's `write_binder`.
     pub(crate) fn from_android13plus(
         transport: Box<dyn RpcTransport>,
         codec: Android13PlusCodec,
         client_fd_mode: u8,
         server_fd_unix: bool,
-        shared: Option<Arc<SharedSession>>,
     ) -> RpcResult<RpcSession> {
         let negotiated = codec.version();
-        let shared = match shared {
-            Some(s) => s,
-            None => Self::fresh_shared(AddressSpace::Acceptor)?,
-        };
+        let shared = Self::fresh_shared(AddressSpace::Acceptor)?;
         let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
         if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
             *session
@@ -2723,7 +2676,7 @@ impl RpcSession {
         if incoming {
             return Err(StatusCode::BadType);
         }
-        Self::from_android13plus(transport, codec, client_fd_mode, server_fd_unix, None)
+        Self::from_android13plus(transport, codec, client_fd_mode, server_fd_unix)
             .map_err(StatusCode::from)
     }
 
@@ -2996,6 +2949,12 @@ impl RpcSession {
 
     /// Set the client reply/handshake wait deadline. `None`
     /// (default) blocks forever.
+    ///
+    /// The same deadline bounds how long a call waits for a free
+    /// connection slot when every slot is driven by another thread — a
+    /// session served on one thread and transacted on another needs more
+    /// than one connection, or its calls time out here without ever
+    /// reaching the peer.
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         *self.inner.shared.timeout.lock().expect("timeout poisoned") = timeout;
     }
@@ -3649,7 +3608,6 @@ mod tests {
             Android13PlusCodec::android14_15(),
             FD_MODE_NONE,
             false,
-            None,
         )
         .expect("build session");
 
@@ -3673,5 +3631,43 @@ mod tests {
         );
         assert_eq!(admitted, cap - base, "exactly cap-base slots admitted");
         assert!(refused >= 1, "attaches past the cap are refused");
+    }
+
+    /// A proxy minted by one session names a node in *that* peer's address
+    /// space; written into another session's parcel it would be resolved by
+    /// an unrelated peer against its own nodes. AOSP `onBinderLeaving`
+    /// refuses with `INVALID_OPERATION`; so does `write_binder`.
+    #[test]
+    fn proxy_of_another_session_is_refused() {
+        use crate::rpc::proxy::RpcProxy;
+        use crate::rpc::transport::MemTransport;
+        let make = || {
+            let (t, p) = MemTransport::pair();
+            let s = RpcSession::from_android13plus(
+                Box::new(t),
+                Android13PlusCodec::android14_15(),
+                FD_MODE_NONE,
+                false,
+            )
+            .expect("build session");
+            (s, p)
+        };
+        let (a, _pa) = make();
+        let (b, _pb) = make();
+        let mut counter = 0u64;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let proxy_of_a = SIBinder::new(Arc::new(RpcProxy::new(addr, a.inner.clone())))
+            .expect("SIBinder::new(RpcProxy)");
+
+        let mut parcel = Parcel::new();
+        assert_eq!(
+            b.inner.write_binder(Some(&proxy_of_a), &mut parcel),
+            Err(StatusCode::InvalidOperation),
+            "another session's proxy must not be addressed on this wire"
+        );
+        let mut parcel = Parcel::new();
+        a.inner
+            .write_binder(Some(&proxy_of_a), &mut parcel)
+            .expect("the owning session writes its own proxy back");
     }
 }

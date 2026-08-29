@@ -98,8 +98,8 @@ use crate::{Interface, Strong};
 ///
 /// Returning `true` means "I took care of it" and suppresses the automatic
 /// process exit; returning `false` leaves the registrar to shut down as
-/// usual. Called only when the answer *changes*, so a callback sees
-/// `true, false, true, …`, never the same value twice in a row. AOSP
+/// usual. Called only when the answer *changes* — never the same value
+/// twice in a row (the first call may be `false`). AOSP
 /// `setActiveServicesCallback`.
 pub type ActiveServicesCallback = Arc<dyn Fn(bool) -> bool + Send + Sync>;
 
@@ -135,7 +135,7 @@ impl Registry for HubRegistry {
         binder: &SIBinder,
         callback: &Strong<dyn IClientCallback>,
     ) -> std::result::Result<(), Status> {
-        crate::hub::register_client_callback(name, binder, callback).map_err(Status::from)
+        crate::hub::register_client_callback_status(name, binder, callback)
     }
 
     fn try_unregister_service(
@@ -143,7 +143,7 @@ impl Registry for HubRegistry {
         name: &str,
         binder: &SIBinder,
     ) -> std::result::Result<(), Status> {
-        crate::hub::try_unregister_service(name, binder).map_err(Status::from)
+        crate::hub::try_unregister_service_status(name, binder)
     }
 }
 
@@ -189,23 +189,9 @@ impl Inner {
     }
 }
 
-/// The registrar's state, shared with the `IClientCallback` bridge.
-///
-/// AOSP's `ClientCounterCallbackImpl` *is* the `BnClientCallback`, so the
-/// state and the callback are one object held by `sp<>`. Rust splits them:
-/// `Shared` holds the state and (transitively) the callback binder, and the
-/// bridge holds a `Weak<Shared>` so the two do not keep each other alive.
+/// Registrar state; the `IClientCallback` bridge holds it as `Weak` (AOSP fuses both into one `sp<>`).
 struct Shared {
-    /// Serializes the service-manager round trips against each other, the
-    /// way AOSP's single `mMutex` does — held across a whole
-    /// `register_service` and across a whole shutdown decision, so no two
-    /// of them can interleave into a state the service manager disagrees
-    /// with. Always taken *before* `inner`, never while holding it.
-    ///
-    /// `onClients` does not wait on it to record itself; only the shutdown
-    /// decision that follows does. A notification arriving mid-round-trip
-    /// therefore lands in `inner` at once and is acted on as soon as the
-    /// round trip finishes.
+    /// Serializes SM round trips (AOSP `mMutex`); taken before `inner`, never while holding it.
     ops: Mutex<()>,
     inner: Mutex<Inner>,
     force_persist: AtomicBool,
@@ -388,18 +374,10 @@ impl Shared {
         let mut inner = self.lock();
         match previous {
             Some(mut entry) => {
-                // Not what the notification and the public `try_unregister`
-                // may have changed under us: the service manager repeats
-                // neither, so a snapshot value would never be corrected.
+                // Keep what changed under us: the service manager repeats neither `onClients` nor an unregister.
                 if let Some(current) = inner.services.get(name) {
                     entry.has_clients = current.has_clients;
-                    // `current.registered` is the optimistic `true` this very
-                    // call published, not something the service manager
-                    // said — only a `false` written under us (a concurrent
-                    // `try_unregister`) is real. Otherwise keep the value
-                    // from before the call, which may itself be `false`
-                    // after a public `try_unregister`; copying `true` over
-                    // it would hide the service from `re_register` forever.
+                    // Only a `false` written under us is real; `true` is this call's own optimistic publish.
                     if !current.registered {
                         entry.registered = false;
                     }
@@ -558,9 +536,7 @@ impl LazyServiceRegistrar {
         // `registerServiceLocked`.
         let _ops = self.shared.ops.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Published before the round trips: `onClients` for this name can
-        // arrive on a pool thread while they are outstanding, and an entry
-        // that is not there yet would drop it with no repeat coming.
+        // Published before the round trips: `onClients` can land on a pool thread while they are outstanding.
         let previous = {
             let mut inner = self.shared.lock();
             let previous = inner.services.get(name).cloned();
@@ -595,9 +571,7 @@ impl LazyServiceRegistrar {
             return Err(e);
         }
 
-        // The service manager de-duplicates nothing, so registering the
-        // callback again would have it deliver every later `onClients`
-        // twice. AOSP `registerServiceLocked` guards on `!reRegister`.
+        // A second callback registration would double every later `onClients` (AOSP guards on `!reRegister`).
         if !tracked {
             let callback = self.callback();
             if let Err(e) = self
@@ -727,6 +701,7 @@ mod tests {
     use crate::{Parcel, Remotable, Result as RsResult, TransactionCode};
     use std::sync::atomic::AtomicUsize;
     use std::thread::JoinHandle;
+    use std::time::Duration;
 
     /// Spin until `f` holds. The notification a fake sends runs on its own
     /// thread (`onClients` is `oneway`); the fake waits here for its
@@ -1152,12 +1127,7 @@ mod tests {
         assert!(!reg.shared.exited.load(Ordering::Acquire));
     }
 
-    /// A service manager that dispatches `onClients` from inside
-    /// `registerClientCallback`, before it replies — which is what both
-    /// `rsb_hub` and AOSP do. It goes through the `IClientCallback` it was
-    /// handed, on its own thread, because that is what the wire does:
-    /// `onClients` is `oneway`, so it lands on a binder pool thread while
-    /// the round trip is still open.
+    /// Dispatches `onClients` from inside `registerClientCallback` on its own thread, as the oneway wire does.
     #[derive(Default)]
     struct ReentrantRegistry {
         shared: Mutex<Option<Weak<Shared>>>,
@@ -1288,19 +1258,24 @@ mod tests {
     /// `mMutex` spanning `registerServiceLocked`.
     #[test]
     fn registrations_do_not_overlap() {
+        const CALLERS: usize = 4;
         #[derive(Default)]
         struct DepthProbe {
             depth: AtomicUsize,
             max_depth: AtomicUsize,
+            /// Threads that have called `register_service` (set before the call).
+            arrived: AtomicUsize,
         }
         impl Registry for DepthProbe {
             fn add_lazy_service(&self, _: &str, _: &SIBinder) -> std::result::Result<(), Status> {
                 let depth = self.depth.fetch_add(1, Ordering::AcqRel) + 1;
                 self.max_depth.fetch_max(depth, Ordering::AcqRel);
-                // Widen the window a competing call would have to land in.
-                for _ in 0..100_000 {
-                    std::hint::spin_loop();
-                }
+                // Hold the round trip open until every caller is in `register_service`, then give
+                // them time to enter: without the `ops` lock they would, and `max_depth` would show it.
+                spin_until(|| self.arrived.load(Ordering::Acquire) == CALLERS);
+                std::thread::sleep(Duration::from_millis(20));
+                self.max_depth
+                    .fetch_max(self.depth.load(Ordering::Acquire), Ordering::AcqRel);
                 self.depth.fetch_sub(1, Ordering::AcqRel);
                 Ok(())
             }
@@ -1324,16 +1299,17 @@ mod tests {
         let registry = Arc::new(DepthProbe::default());
         let reg = LazyServiceRegistrar::with_registry(registry.clone());
         std::thread::scope(|scope| {
-            for i in 0..4 {
-                let reg = &reg;
+            for i in 0..CALLERS {
+                let (reg, registry) = (&reg, &registry);
                 scope.spawn(move || {
+                    registry.arrived.fetch_add(1, Ordering::AcqRel);
                     reg.register_service(&format!("svc{i}"), fresh_binder())
                         .unwrap()
                 });
             }
         });
 
-        assert_eq!(reg.registered_count(), 4);
+        assert_eq!(reg.registered_count(), CALLERS);
         assert_eq!(
             registry.max_depth.load(Ordering::Acquire),
             1,

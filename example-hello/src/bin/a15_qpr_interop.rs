@@ -166,10 +166,7 @@ fn main() -> ExitCode {
         },
     );
 
-    // ---- getService (the one code that did not move) ---------------------
-    // Every lookup in the Android 15 module routes through `getService`,
-    // including `check_service` — the `Service` union the other two return
-    // is not stable across the release trains.
+    // ---- getService (the one code that did not move; every A15 lookup routes through it) ----
     r.check(
         "0/0",
         "getService round-trips the service",
@@ -183,10 +180,7 @@ fn main() -> ExitCode {
         },
     );
 
-    // ---- isDeclared ------------------------------------------------------
-    // The answer is `false` (nothing here is in a VINTF manifest); what is
-    // under test is that the call reaches `isDeclared` and returns a bool
-    // rather than a parcel error.
+    // ---- isDeclared (answer is `false`; under test is a bool reply, not a parcel error) ----
     r.check(
         "6/7",
         "isDeclared answers",
@@ -230,9 +224,7 @@ fn main() -> ExitCode {
             .map_err(|e| format!("{e:?}")),
     );
 
-    // ---- tryUnregisterService --------------------------------------------
-    // Nothing has looked `LAZY_NAME` up, so AOSP's "known client" branch is
-    // not in the way and the status is about the transaction.
+    // ---- tryUnregisterService (nothing looked `LAZY_NAME` up, so no "known client" refusal) ----
     r.check(
         "12/13",
         "tryUnregisterService",

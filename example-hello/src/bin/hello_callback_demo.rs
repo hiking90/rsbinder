@@ -1,34 +1,40 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-//
-// Lazy service: registers `SERVICE_NAME` through `LazyServiceRegistrar` and
-// **exits by itself** once nothing is using it. That is the whole point of
-// the pattern — the service manager starts the process again on the next
-// lookup, so an idle service costs nothing.
-//
-// The registrar does the service-manager work: `addService` with
-// `FLAG_IS_LAZY_SERVICE`, `registerClientCallback`, and the `onClients`
-// bookkeeping. Nothing here registers a callback by hand.
-//
-// Expected trace, paired with rsb_hub and a short-lived `hello_client`:
-//   1. T+0        register_service → addService + registerClientCallback.
-//                 Nothing has looked the service up yet, so it starts with
-//                 no clients — and the hub reports only changes, so the
-//                 shutdown check waits for one to happen.
-//   2. T+x        `hello_client` looks the service up → the hub reports
-//                 clients → `has_clients=true`.
-//   3. T+x+1      `hello_client` exits → the kernel ref count drops.
-//   4. T+x+(≤5)   the hub's 5-second poller reports `onClients(false)` →
-//                 tryUnregisterService → the process exits 0.
-//
-// Use with:
-//   RUST_LOG=info ./hello_callback_demo &
-//   sleep 2
-//   timeout 3 ./hello_client          # touches my.hello + exits
-//   wait                              # the demo exits on its own
-//
-// `tests/scripts/run_lazy_service_ac.sh` runs exactly that and gates on the
-// exit status.
+
+//! Lazy service: registers `SERVICE_NAME` through `LazyServiceRegistrar` and
+//! **exits by itself** once nothing is using it. That is the whole point of
+//! the pattern — the service manager starts the process again on the next
+//! lookup, so an idle service costs nothing.
+//!
+//! The registrar does the service-manager work: `addService` with
+//! `FLAG_IS_LAZY_SERVICE`, `registerClientCallback`, and the `onClients`
+//! bookkeeping. Nothing here registers a callback by hand.
+//!
+//! Expected trace, paired with rsb_hub and a short-lived `hello_client`:
+//!
+//! ```text
+//!   1. T+0        register_service → addService + registerClientCallback.
+//!                 Nothing has looked the service up yet, so it starts with
+//!                 no clients — and the hub reports only changes, so the
+//!                 shutdown check waits for one to happen.
+//!   2. T+x        `hello_client` looks the service up → the hub reports
+//!                 clients → `has_clients=true`.
+//!   3. T+x+1      `hello_client` exits → the kernel ref count drops.
+//!   4. T+x+(≤5)   the hub's 5-second poller reports `onClients(false)` →
+//!                 tryUnregisterService → the process exits 0.
+//! ```
+//!
+//! Use with:
+//!
+//! ```sh
+//!   RUST_LOG=info ./hello_callback_demo &
+//!   sleep 2
+//!   timeout 3 ./hello_client          # touches my.hello + exits
+//!   wait                              # the demo exits on its own
+//! ```
+//!
+//! `tests/scripts/run_lazy_service_ac.sh` runs exactly that and gates on the
+//! exit status.
 use std::sync::Arc;
 use std::time::Instant;
 

@@ -225,28 +225,44 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
 
     let mut ns_vec = Vec::new();
 
-    // 1, check if the type exists in the current namespace.
+    // AOSP `AidlScope::ResolveName` order: enclosing scopes, imports, then the package.
+    let package_ns = DOCUMENT.with(|curr_doc| {
+        curr_doc
+            .borrow()
+            .package
+            .as_ref()
+            .map(|package| Namespace::new(package, Namespace::AIDL))
+    });
+
+    // 1. the current declaration and its enclosing one (a package-less document's empty scope stays).
     let mut curr_ns = current_namespace();
-    ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
+    for _ in 0..2 {
+        if package_ns.as_ref() == Some(&curr_ns) {
+            break;
+        }
+        ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
+        if curr_ns.pop().is_none() {
+            break;
+        }
+    }
 
-    curr_ns.pop(); // For parent namespace
-    ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
-
-    // 2. check if the type exists in the imports from the current document.
+    // 2. imports, then the package.
     DOCUMENT.with(|curr_doc| {
         let curr_doc = curr_doc.borrow();
-
-        if let Some(package) = &curr_doc.package {
-            let package_ns = Namespace::new(package, Namespace::AIDL);
-            ns_vec.append(&mut make_ns_candidate(&package_ns, &namespace));
-        }
-
         if let Some(imported) = curr_doc.imports.get(&namespace.ns[0]) {
             let mut new_ns = Namespace::new(imported, Namespace::AIDL);
             new_ns.ns.extend_from_slice(&namespace.ns[1..]);
-            ns_vec.push(new_ns);
+            ns_vec.push(new_ns.clone());
+            // Same shape as the other scopes: `IFoo.BAR` also tries the owner `a.IFoo`.
+            if namespace.ns.len() > 1 {
+                new_ns.pop();
+                ns_vec.push(new_ns);
+            }
         }
     });
+    if let Some(package_ns) = &package_ns {
+        ns_vec.append(&mut make_ns_candidate(package_ns, &namespace));
+    }
 
     // 3. check fully-qualified names as written.
     if namespace.ns.len() > 1 {
@@ -397,9 +413,36 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
     false
 }
 
+thread_local! {
+    // `<owner>.<ident>` constants being folded; a true cycle re-enters and bottoms out here.
+    static FOLDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+// Fold in the owner's scope: a raw `BASE + 1` would otherwise pick up the referencer's `BASE`.
+fn fold_in_owner_scope(expr: &ConstExpr, owner: &Namespace, ident: &str) -> ConstExpr {
+    if *owner == current_namespace() {
+        return expr.clone();
+    }
+    let key = format!("{}.{ident}", owner.to_string(Namespace::AIDL));
+    let re_entered = FOLDING.with(|s| s.borrow().contains(&key));
+    if re_entered {
+        return expr.clone();
+    }
+    FOLDING.with(|s| s.borrow_mut().push(key));
+    let document_context = declaration_document_context(owner);
+    let _document_guard = document_context.as_ref().map(DocumentGuard::new);
+    let _ns_guard = NamespaceGuard::new(owner);
+    let folded = expr.calculate().unwrap_or_else(|_| expr.clone());
+    FOLDING.with(|s| {
+        s.borrow_mut().pop();
+    });
+    folded
+}
+
 fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> ConstExpr {
     if let Some(expr) = const_expr {
-        expr.clone()
+        let ident = lookup_decl.name.ns.last().map_or("", String::as_str);
+        fold_in_owner_scope(expr, &lookup_decl.ns, ident)
     } else {
         let ns = current_namespace().relative_mod(&lookup_decl.ns);
 
@@ -433,7 +476,8 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
                     return Some(make_const_expr(var.const_expr.as_ref(), lookup_decl));
                 }
             }
-            lookup_name_members(&decl.members, lookup_decl)
+            // `members` holds only nested type declarations; constants live in `constant_list`.
+            None
         }
 
         Declaration::Parcelable(ref decl) => lookup_name_members(&decl.members, lookup_decl),
@@ -451,13 +495,12 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
     }
 }
 
-fn lookup_name_members(members: &Vec<Declaration>, lookup_decl: &LookupDecl) -> Option<ConstExpr> {
-    for decl in members {
-        if let Some(expr) = lookup_name_from_decl(decl, lookup_decl) {
-            return Some(expr);
-        }
-    }
-    None
+// Direct members only: `Outer.X` never means `Outer.Inner.X` (a nested owner is matched as a candidate itself).
+fn lookup_name_members(members: &[Declaration], lookup_decl: &LookupDecl) -> Option<ConstExpr> {
+    members
+        .iter()
+        .filter(|decl| matches!(decl, Declaration::Variable(_)))
+        .find_map(|decl| lookup_name_from_decl(decl, lookup_decl))
 }
 
 pub(crate) fn enum_member_const_expr_from_lookup(
@@ -616,11 +659,7 @@ pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> 
     })
 }
 
-/// `self` / `Self` / `super` / `crate` are the four Rust keywords that cannot
-/// be written as raw identifiers, and every generated name is emitted as
-/// `r#<name>` or used bare in `mod` / `trait` / `struct` position — so an AIDL
-/// name with a segment matching one of them has no representation at all. AIDL
-/// itself permits them, so this is the only place they can be rejected.
+// `self`/`Self`/`super`/`crate` cannot be raw identifiers, so no generated name can carry them.
 fn reject_unrepresentable_identifier(
     ident: &str,
     role: &str,
@@ -718,8 +757,14 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     let alternative_formats = generate_name_variants(name);
     for variant in alternative_formats {
         let variant_result = SYMBOL_TABLE.with(|table| table.borrow().get(&variant).cloned());
-        if variant_result.is_some() {
-            return variant_result;
+        if let Some(expr) = variant_result {
+            // The key is `<owner ns>.<name>`; fold in that owner's scope.
+            return Some(match variant.rsplit_once('.') {
+                Some((owner, ident)) => {
+                    fold_in_owner_scope(&expr, &Namespace::new(owner, Namespace::AIDL), ident)
+                }
+                None => expr,
+            });
         }
     }
 
@@ -1093,6 +1138,9 @@ const RUST_DERIVE_SCHEMA: &[&str] = &[
     "Hash",
 ];
 
+/// Impls the templates always emit; accepted in `@RustDerive` and dropped, so they are not derived twice.
+const RUST_DERIVE_ALWAYS_EMITTED: &[&str] = &["Debug", "Default"];
+
 pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     for annotation in annotation_list {
         if annotation.annotation == "@RustDerive" {
@@ -1100,10 +1148,7 @@ pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
                 .parameter_list
                 .iter()
                 .filter(|param| param.const_expr.to_bool().unwrap_or(false))
-                // AOSP `aidl_language.cpp` accepts exactly these seven.
-                // Anything else either duplicates an impl the templates always
-                // emit (`Debug`, `Default`) or names no trait at all.
-                .filter(|param| RUST_DERIVE_SCHEMA.contains(&param.identifier.as_str()))
+                .filter(|param| !RUST_DERIVE_ALWAYS_EMITTED.contains(&param.identifier.as_str()))
                 .map(|param| param.identifier.to_owned())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -1746,6 +1791,23 @@ fn parse_annotation_list(
                     filename, annotation.annotation
                 )));
             });
+        }
+
+        // A misspelt derive would otherwise vanish and surface as a missing trait in the user's crate (AOSP: error).
+        if annotation.annotation == "@RustDerive" {
+            if let Some(param) = annotation.parameter_list.iter().find(|p| {
+                let name = p.identifier.as_str();
+                !RUST_DERIVE_SCHEMA.contains(&name) && !RUST_DERIVE_ALWAYS_EMITTED.contains(&name)
+            }) {
+                return Err(make_invalid_operation_error(
+                    format!(
+                        "unknown @RustDerive parameter '{}'; expected one of {}",
+                        param.identifier,
+                        RUST_DERIVE_SCHEMA.join(", ")
+                    ),
+                    annotation.annotation_span,
+                ));
+            }
         }
 
         annotation_list.push(annotation);
@@ -2454,10 +2516,7 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut bracket_depth: usize = 0; // () [] {}
-                                      // Positions of `<` still waiting for a closer. An unmatched one is a
-                                      // comparison (`0 < 1`), not a generic, so only a `<` that a `>` closes
-                                      // counts toward `MAX_GENERIC_DEPTH`; the pending run itself is bounded
-                                      // only against the parser's recursion budget.
+                                      // Open `<` positions; only one a `>` closes counts as a generic (an unmatched one is `0 < 1`).
     let mut angle_open: Vec<usize> = Vec::new();
     let mut generic_depth: usize = 0;
     let mut op_run: usize = 0; // operator tokens in the current statement/element
@@ -2532,11 +2591,9 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            b'>' => {
-                if !angle_open.is_empty() {
-                    generic_depth = generic_depth.max(angle_open.len());
-                    angle_open.pop();
-                }
+            b'>' if !angle_open.is_empty() => {
+                generic_depth = generic_depth.max(angle_open.len());
+                angle_open.pop();
             }
             b';' => {
                 angle_open.clear();

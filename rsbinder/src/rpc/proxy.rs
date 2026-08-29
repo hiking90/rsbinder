@@ -65,6 +65,11 @@ pub struct RpcProxy {
 }
 
 impl RpcProxy {
+    /// Identity of the owning session, for `write_binder`'s same-session check.
+    pub(crate) fn session_ptr(&self) -> *const RpcSessionInner {
+        Arc::as_ptr(&self.session)
+    }
+
     pub(crate) fn new(addr: RpcAddress, session: Arc<RpcSessionInner>) -> Self {
         RpcProxy {
             addr,

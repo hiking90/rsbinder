@@ -170,12 +170,7 @@ pub mod binderfs;
 pub mod error;
 /// File descriptor wrapper for IPC
 pub mod file_descriptor;
-// `LazyServiceRegistrar` — AOSP
-// `frameworks/native/libs/binder/LazyServiceRegistrar.cpp`. Kept as a plain
-// (non-doc) comment for the reason spelled out at `entry` below: an outer
-// doc here merges with the module's inner `//!` docs and re-resolves their
-// intra-doc links at the crate root, where the module's own types are not
-// in scope.
+// `LazyServiceRegistrar`; documented inside (an outer doc would re-resolve its links at the crate root, as at `entry`).
 pub mod lazy_service;
 mod macros;
 /// Native service implementation helpers

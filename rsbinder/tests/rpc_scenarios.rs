@@ -528,11 +528,14 @@ fn oneway_call_does_not_wait_for_handler() {
 #[test]
 fn late_reply_of_a_timed_out_nested_call_is_skipped() {
     let b = boot("stale");
-    b.client.set_timeout(Some(Duration::from_millis(500)));
+    // The outer reply follows the server's `slow_ms` sleep, against a deadline
+    // re-armed when the nested call gives up: `timeout < slow_ms < 2 * timeout`,
+    // with a wide margin on both sides for a loaded CI runner.
+    b.client.set_timeout(Some(Duration::from_millis(1000)));
     let nested = Arc::new(Mutex::new(Vec::new()));
     let cb: SIBinder = Interface::as_binder(&Binder::new(BnNestingCallback {
         target: ScenarioProxy(b.proxy.0.clone()),
-        slow_ms: 800,
+        slow_ms: 1500,
         nested: Arc::clone(&nested),
     }));
 

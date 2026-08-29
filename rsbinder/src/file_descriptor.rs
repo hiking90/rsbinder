@@ -313,14 +313,7 @@ impl DeserializeOption for ParcelFileDescriptor {
         let has_comm = parcel.read::<i32>()?;
         let fd = read_raw_fd(parcel)?;
 
-        // Reliable-PFD comm channel (Java `createReliablePipe()` /
-        // `createReliableSocketPair()`): consume the second fd object so the
-        // parcel cursor stays aligned, and — as AOSP
-        // `Parcel::readParcelFileDescriptor` does — tell the sender the
-        // channel is detached (`DETACHED = 2`, big-endian). Without that
-        // notice the sender's `checkError()` reports a clean close instead
-        // of `FileDescriptorDetachedException`. The parcel still owns the
-        // comm fd and closes it on `BC_FREE_BUFFER`.
+        // Reliable-PFD comm socket: consume it and send `DETACHED` (AOSP `readParcelFileDescriptor`).
         if has_comm != 0 {
             let comm = parcel.read_object(true)?;
             if comm.header_type() != crate::sys::BINDER_TYPE_FD {
@@ -328,11 +321,23 @@ impl DeserializeOption for ParcelFileDescriptor {
             }
             const DETACHED: i32 = 2;
             let notice = DETACHED.to_be_bytes();
+            // A sender that already closed its end (oneway + `close()`) must not fail the fd: AOSP only logs.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let flags = rustix::net::SendFlags::NOSIGNAL;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let flags = rustix::net::SendFlags::empty();
             loop {
-                match rustix::io::write(comm.borrowed_fd(), &notice) {
+                match rustix::net::send(comm.borrowed_fd(), &notice, flags) {
                     Ok(n) if n == notice.len() => break,
+                    Ok(n) => {
+                        log::error!("short write of the DETACHED status to the comm fd: {n} bytes");
+                        break;
+                    }
                     Err(rustix::io::Errno::INTR) => continue,
-                    _ => return Err(StatusCode::BadType),
+                    Err(e) => {
+                        log::error!("failed to write the DETACHED status to the comm fd: {e}");
+                        break;
+                    }
                 }
             }
         }

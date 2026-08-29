@@ -33,17 +33,7 @@ crate::hub::impl_sm_module_body! { @custom_check_service
         get_service(sm, name)
     }
 
-    /// `add_service` with `FLAG_IS_LAZY_SERVICE` set, for
-    /// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
-    /// AOSP `LazyServiceRegistrar::registerServiceLocked` ORs the flag into
-    /// `dumpFlags` itself and warns if the caller pre-set it, so this is not
-    /// exposed as a general `dumpFlags` parameter.
-    ///
-    /// AOSP added the constant in `android-15.0.0_r20`; on `r6`-`r19` the
-    /// service manager stores `dumpPriority` verbatim and never reads the
-    /// bit, which is inert rather than an error (its only validation is a
-    /// warning when *no* `DUMP_FLAG_PRIORITY_*` bit is set, and
-    /// `DUMP_FLAG_PRIORITY_DEFAULT` is).
+    /// `add_service` + `FLAG_IS_LAZY_SERVICE`; `r6`–`r19` predate the constant and store the bit inert.
     pub(crate) fn add_lazy_service(
         sm: &BpServiceManager,
         identifier: &str,

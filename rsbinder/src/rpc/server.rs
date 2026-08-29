@@ -1315,7 +1315,6 @@ impl RpcServer {
                         codec,
                         client_fd_mode,
                         fd_unix,
-                        None,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1414,22 +1413,8 @@ impl RpcServer {
                 // r34 (default): build session (incl. its handshake-
                 // free first-contact shape) + serve inline. We're
                 // already on the worker thread — no nested spawn.
-                // r34 has no separate handshake (first contact is the
-                // first serve-loop frame), so the admission deadline must
-                // cover that first frame: a silent peer times out and
-                // releases its Arc + slot. `make_session`/`RpcSession::new`
-                // do no blocking read, so the still-armed deadline reaches
-                // the serve loop, which clears it after the first frame so
-                // an established idle session is not torn down by it.
-                //
-                // The serve loop lifts only the *read* deadline after that
-                // first frame (`clear_slot_read_timeout`). r34 writes
-                // nothing before the first frame, so the handshake write
-                // deadline has no phase to bound here — lift it now, or
-                // `SO_SNDTIMEO` stays armed for the session's whole life
-                // and a large reply to a slow reader fails with
-                // `WouldBlock`, contrary to the `set_handshake_timeout`
-                // contract.
+                // r34 writes nothing before its first frame: lift the handshake write deadline now, or
+                // `SO_SNDTIMEO` outlives the handshake (the serve loop clears only the read side).
                 if let Err(e) = transport.set_write_timeout(None) {
                     log::debug!("RPC r34: failed to lift handshake write deadline: {e:?}");
                 }

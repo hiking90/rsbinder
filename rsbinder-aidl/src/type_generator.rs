@@ -740,12 +740,7 @@ impl TypeGenerator {
         let name = match &self.value_type {
             ValueType::Array(_) => self.list_type_decl(is_struct),
             _ => {
-                // A type with no `Default` (IBinder / ParcelFileDescriptor /
-                // interface `Strong`) is stored as `Option<T>` for struct
-                // fields and for `out` arguments, whose local is initialised
-                // with `Default::default()`. `inout` reads its value from the
-                // parcel, so it stays unwrapped — AOSP
-                // `aidl_to_rust.cpp::RustNameOf` makes the same distinction.
+                // No-`Default` types are `Option<T>` for fields and `out` locals; `inout` is read from the parcel (AOSP `RustNameOf`).
                 if !Self::can_be_defaulted(&self.value_type, is_struct)
                     && (is_struct || matches!(self.direction, Direction::Out))
                 {
@@ -799,6 +794,18 @@ impl TypeGenerator {
                 .array_types
                 .first()
                 .is_some_and(|sub| matches!(sub.value_type, ValueType::FileDescriptor))
+    }
+
+    /// How many `.flatten()` the null guard needs to reach the `Option`
+    /// elements: one per nested fixed-size dimension beyond the first
+    /// (`[[Option<_>; 3]; 2]` → 1). Zero when no guard applies.
+    pub fn out_array_null_guard_flatten(&self) -> usize {
+        if !self.out_array_needs_null_guard() {
+            return 0;
+        }
+        self.array_types
+            .first()
+            .map_or(0, |sub| sub.sizes.len().saturating_sub(1))
     }
 
     /// True when this arg is a non-nullable, out-only *scalar* whose type has

@@ -1,8 +1,7 @@
 package shapes;
 
-// Argument shapes whose generated Rust changed with the 2026-08 AIDL review.
-// The AOSP fixture corpus uses none of them, so this interface is the only
-// place they are exercised end to end.
+// Argument shapes the AOSP fixture corpus never uses; this interface is the
+// only place they are exercised end to end.
 interface ICodegenShapes {
     // A non-nullable `out` scalar with no `Default` is stored as `Option<T>`
     // and must be unwrapped into UNEXPECTED_NULL when the service leaves it

@@ -85,15 +85,7 @@ impl BinderAsyncPool for Tokio {
         B: Send + 'a,
         E: From<crate::StatusCode>,
     {
-        // `is_handling_transaction()` is safe in a pure-RPC process (it
-        // consults the RPC calling context first and only touches the
-        // kernel thread-local when `ProcessState` exists), and it must be
-        // consulted for RPC too: an RPC handler that awaits a proxy of the
-        // same session has to issue that call on *this* thread. The
-        // session's re-entrancy pin (`DRIVING`) is thread-local — moving
-        // the call to the blocking pool loses it, and with the slot held
-        // by the dispatching thread the pooled call parks in `find_conn`
-        // while this thread waits on it: a deadlock.
+        // RPC too: a nested call must stay on this thread or it loses the thread-local `DRIVING` pin and deadlocks.
         if crate::is_handling_transaction() {
             // We are currently on the thread pool for a binder server, so we should execute the
             // transaction on the current thread so that the binder kernel driver is able to apply

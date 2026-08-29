@@ -493,7 +493,7 @@ fn trailing_line_comment_without_newline_parses() {
 }
 
 // ---------------------------------------------------------------
-// Codegen/API defects found in the 2026-08 review.
+// Codegen/API shape defects.
 // ---------------------------------------------------------------
 
 /// An unqualified constant reference must resolve inside its own declaration
@@ -798,7 +798,13 @@ fn symlink_cycle_in_a_source_directory_terminates() {
 
     match rx.recv_timeout(Duration::from_secs(20)) {
         Ok(ok) => assert!(ok, "generation over a symlinked directory must succeed"),
-        Err(_) => panic!("the directory walk did not terminate on a symlink cycle"),
+        Err(_) => {
+            // The walker is still descending; `abort` skips libtest's capture flush, so write stderr directly.
+            use std::io::Write;
+            let _ = std::io::stderr()
+                .write_all(b"symlink cycle test: the directory walk did not terminate; aborting\n");
+            std::process::abort();
+        }
     }
 }
 
@@ -1104,8 +1110,9 @@ fn an_out_of_range_enum_reference_is_not_truncated() {
     );
 }
 
-/// `@RustDerive` follows AOSP's seven-trait schema: a name outside it either
-/// duplicates an impl the templates always emit or names no trait at all.
+/// `@RustDerive` follows AOSP's seven-trait schema; a name of an impl the
+/// templates always emit (`Debug`, `Default`) is accepted and dropped, and
+/// anything else is an error (`unknown_rust_derive_parameter_is_an_error`).
 #[test]
 fn rust_derive_accepts_only_the_aosp_schema() {
     let out =
@@ -1186,10 +1193,240 @@ fn one_include_directory_under_two_spellings_is_not_ambiguous() {
 #[test]
 #[should_panic(expected = "the hash must be non-empty")]
 fn empty_interface_hash_is_rejected() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("empty_hash");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("I.aidl");
-    std::fs::write(&src, "package a; interface I { void m(); }").unwrap();
-    let _ = rsbinder_aidl::Builder::new().source(&src).hash("");
+    // `hash` checks the hash string; the source only needs to be a file path.
+    let _ = rsbinder_aidl::Builder::new().source("I.aidl").hash("");
+}
+
+/// A constant of an interface reached through `import` resolves by the
+/// imported simple name: `import a.IFoo;` makes `IFoo.BAR` mean `a.IFoo.BAR`.
+/// Same-package references never needed the import, so only a second package
+/// exercises this path.
+#[test]
+fn imported_interface_constant_resolves_across_packages() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("import_const");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b) = (root.join("aidl/a"), root.join("aidl/b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    // `BAR` is an expression over `IFoo`'s own `BASE`; `IBaz` shadows that name
+    // with a different value, so a fold in the wrong scope shows up as 101.
+    std::fs::write(
+        a.join("IFoo.aidl"),
+        "package a; interface IFoo { const int BASE = 10; const int BAR = BASE + 1; }",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("IBaz.aidl"),
+        "package b; import a.IFoo; interface IBaz { const int BASE = 100; const int X = IFoo.BAR; const int Y = a.IFoo.BAR; }",
+    )
+    .unwrap();
+
+    rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("`IFoo.BAR` resolves through the import");
+    let out = std::fs::read_to_string(root.join("out/gen.rs")).unwrap();
+    assert!(
+        out.contains("pub const r#X: i32 = 11;"),
+        "the imported constant folds in its owner's scope: {out}"
+    );
+    assert!(
+        out.contains("pub const r#Y: i32 = 11;"),
+        "so does the fully-qualified reference: {out}"
+    );
+}
+
+/// An explicit `import` outranks a same-named declaration in the referencing
+/// package (AOSP `AidlDocument::ResolveName`).
+#[test]
+fn an_import_outranks_a_same_named_package_declaration() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("import_shadow");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b) = (root.join("aidl/a"), root.join("aidl/b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        a.join("IFoo.aidl"),
+        "package a; interface IFoo { const int BAR = 7; }",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("IFoo.aidl"),
+        "package b; interface IFoo { const int BAR = 2; }",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("IBaz.aidl"),
+        "package b; import a.IFoo; interface IBaz { const int X = IFoo.BAR; }",
+    )
+    .unwrap();
+
+    rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("generates");
+    let out = std::fs::read_to_string(root.join("out/gen.rs")).unwrap();
+    assert!(
+        out.contains("pub const r#X: i32 = 7;"),
+        "`IFoo.BAR` must be the imported `a.IFoo`, not `b.IFoo`: {out}"
+    );
+}
+
+/// The `UNEXPECTED_NULL` guard on an `out ParcelFileDescriptor` array reaches
+/// the `Option` elements of a nested fixed-size array through one `.flatten()`
+/// per extra dimension, so a `None` left in any cell is refused before the
+/// reply is written, as for the one-dimensional form.
+#[test]
+fn out_fd_array_null_guard_flattens_nested_dimensions() {
+    let one = generate_str("package a; interface I { void f(out ParcelFileDescriptor[2] fds); }")
+        .expect("1-D generates");
+    assert!(
+        one.contains("fds.iter().any(Option::is_none)"),
+        "the 1-D guard stays: {one}"
+    );
+    let two =
+        generate_str("package a; interface I { void f(out ParcelFileDescriptor[2][3] fds); }")
+            .expect("2-D generates");
+    assert!(
+        two.contains("fds.iter().flatten().any(Option::is_none)"),
+        "a 2-D array is guarded through one flatten: {two}"
+    );
+}
+
+/// `@RustDerive` accepts exactly AOSP's schema; a name outside it is an error
+/// with the annotation's span, not a derive that silently goes missing.
+#[test]
+fn unknown_rust_derive_parameter_is_an_error() {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        "package a; @RustDerive(Cloen=true) parcelable P { int x; }",
+    );
+    let err = rsbinder_aidl::parse_document(&ctx).expect_err("a misspelt derive must not parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown @RustDerive parameter 'Cloen'"),
+        "got: {msg}"
+    );
+    assert!(
+        generate_ok("package a; @RustDerive(Clone=true, PartialEq=true) parcelable P { int x; }"),
+        "the schema itself still parses"
+    );
+}
+
+/// A dotted constant reference whose owner does not exist must stay
+/// unresolved: neither the lexical fallback (the current declaration) nor a
+/// parent declaration may supply the member.
+#[test]
+fn dotted_constant_with_a_phantom_owner_is_unresolved() {
+    assert!(
+        !generate_ok("package b; interface IBaz { const int BAR = 1; const int X = Nope.BAR; }"),
+        "`Nope.BAR` must not resolve to the current declaration's `BAR`"
+    );
+    assert!(
+        !generate_ok(
+            "package b; parcelable Outer { const int X = 5; const int Y = Outer.Nope.X; }"
+        ),
+        "`Outer.Nope.X` must not resolve to `Outer.X`"
+    );
+
+    // Through an import, a member the owner does not declare stays unresolved.
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("import_phantom");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b) = (root.join("aidl/a"), root.join("aidl/b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        a.join("IFoo.aidl"),
+        "package a; interface IFoo { const int BAR = 7; }",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("IBaz.aidl"),
+        "package b; import a.IFoo; interface IBaz { const int MISSING = 1; const int OK = IFoo.BAR; const int X = IFoo.MISSING; }",
+    )
+    .unwrap();
+    let err = rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect_err("`IFoo.MISSING` names nothing in `a.IFoo`");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("IFoo.MISSING") && !msg.contains("IFoo.BAR"),
+        "only the phantom member is diagnosed: {msg}"
+    );
+}
+
+/// A qualified constant names a *direct* member of its owner: `Outer.X` is
+/// not `Outer.Inner.X`, whose own scope would otherwise fold it wrongly.
+#[test]
+fn nested_declaration_constants_are_not_members_of_the_outer() {
+    assert!(
+        !generate_ok(
+            "package a; parcelable Outer { const int BASE = 1; parcelable Inner { const int BASE = 10; const int X = BASE + 1; } } \
+             interface IBaz { const int P = Outer.X; }"
+        ),
+        "`Outer.X` must not reach `Outer.Inner.X`"
+    );
+    let out = generate_str(
+        "package a; parcelable Outer { parcelable Inner { const int BASE = 10; const int X = BASE + 1; } const int BASE = 1; const int Y = BASE + 1; }",
+    )
+    .expect("generates");
+    assert!(out.contains("pub const r#X: i32 = 11;"), "got: {out}");
+    assert!(
+        out.contains("pub const r#Y: i32 = 2;"),
+        "`Outer.Y` folds against `Outer.BASE`, not `Inner.BASE`: {out}"
+    );
+}
+
+/// A diamond of cross-package references (`c` → `a` → `b` → `a`) folds every
+/// constant in its own owner's scope, even the one reached while its owner
+/// is already being folded: one constant has one value, wherever it is read.
+#[test]
+fn diamond_constant_references_fold_in_their_owners_scope() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("const_diamond");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b, c) = (
+        root.join("aidl/a"),
+        root.join("aidl/b"),
+        root.join("aidl/c"),
+    );
+    for d in [&a, &b, &c] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        a.join("IFoo.aidl"),
+        "package a; import b.IBaz; interface IFoo { const int BASE = 7; const int C2 = BASE; const int C1 = IBaz.X + 1; }",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("IBaz.aidl"),
+        "package b; import a.IFoo; interface IBaz { const int BASE = 99; const int X = IFoo.C2; }",
+    )
+    .unwrap();
+    std::fs::write(
+        c.join("IQux.aidl"),
+        "package c; import a.IFoo; interface IQux { const int Y = IFoo.C1; }",
+    )
+    .unwrap();
+
+    rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("generates");
+    let out = std::fs::read_to_string(root.join("out/gen.rs")).unwrap();
+    for pin in [
+        "pub const r#C1: i32 = 8;",
+        "pub const r#X: i32 = 7;",
+        "pub const r#Y: i32 = 8;",
+    ] {
+        assert!(out.contains(pin), "missing `{pin}`: {out}");
+    }
 }

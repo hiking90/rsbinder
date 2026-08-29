@@ -492,13 +492,7 @@ enum Android15Numbering {
     Shifted,
 }
 
-/// The transaction `check_android_15_numbering` probes with: one past
-/// `getServiceDebugInfo`, the last method of the pre-r6 interface, and
-/// exactly `getServiceDebugInfo` (argument-free, read-only) on r6+ — so it
-/// answers without side effects on either peer (13 would not: that is
-/// `tryUnregisterService` on r6+). Pinned against both generated interfaces
-/// by `hub::numbering_pins` on every host test run, which is why it lives
-/// here uncfg'd rather than inside the android-only probe.
+/// Side-effect-free on both numberings: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins` pins it).
 #[allow(dead_code)] // only issued on android; pinned everywhere
 pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
 
@@ -509,6 +503,12 @@ pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
     any(feature = "android_14", feature = "android_15")
 ))]
 fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> {
+    // The answer never changes for the process; a refused numbering would otherwise re-probe on every `default()`.
+    static PROBED: OnceLock<Android15Numbering> = OnceLock::new();
+    if let Some(&numbering) = PROBED.get() {
+        return Ok(numbering);
+    }
+
     #[cfg(feature = "android_15")]
     let descriptor = <android_15::BpServiceManager as android_15::IServiceManager>::descriptor();
     #[cfg(all(feature = "android_14", not(feature = "android_15")))]
@@ -518,17 +518,19 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     let mut data = Parcel::new();
     data.write_interface_token(descriptor)?;
 
-    match proxy.submit_transact(FIRST_CALL_TRANSACTION + ANDROID_15_PROBE_CODE, &data, 0) {
-        // Rejected: 14 methods, so this is a pre-r6 build.
-        Err(StatusCode::UnknownTransaction) => Ok(Android15Numbering::Original),
-        // Answered (an in-band exception counts): 15 methods, the r6+ build.
-        Ok(_) => Ok(Android15Numbering::Shifted),
-        // Neither answer: refuse rather than guess (see `android_15`'s docs).
-        Err(e) => {
-            log::error!("could not probe the Android 15 service-manager protocol: {e:?}");
-            Err(e)
-        }
-    }
+    let numbering =
+        match proxy.submit_transact(FIRST_CALL_TRANSACTION + ANDROID_15_PROBE_CODE, &data, 0) {
+            // Rejected: 14 methods, so this is a pre-r6 build.
+            Err(StatusCode::UnknownTransaction) => Android15Numbering::Original,
+            // Answered (an in-band exception counts): 15 methods, the r6+ build.
+            Ok(_) => Android15Numbering::Shifted,
+            // Neither answer: refuse rather than guess (see `android_15`'s docs).
+            Err(e) => {
+                log::error!("could not probe the Android 15 service-manager protocol: {e:?}");
+                return Err(e);
+            }
+        };
+    Ok(*PROBED.get_or_init(|| numbering))
 }
 
 /// Refuse an Android 15 numbering this build has no module for, naming the
@@ -542,17 +544,20 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     )
 ))]
 fn android_15_feature_missing(numbering: Android15Numbering) -> StatusCode {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
     let (build, feature) = match numbering {
         Android15Numbering::Original => ("android-15.0.0_r1 through r5", "android_14"),
         Android15Numbering::Shifted => ("android-15.0.0_r6 or later", "android_15"),
     };
-    log::error!(
-        "this Android 15 device speaks the {build} service-manager protocol, \
-         which needs the `{feature}` feature; rsbinder was built without it. \
-         The two numberings differ from `checkService` on and cannot be told \
-         apart by SDK version, so the service manager is refused rather than \
-         addressed with the wrong transaction codes."
-    );
+    LOGGED.call_once(|| {
+        log::error!(
+            "this Android 15 device speaks the {build} service-manager protocol, \
+             which needs the `{feature}` feature; rsbinder was built without it. \
+             The two numberings differ from `checkService` on and cannot be told \
+             apart by SDK version, so the service manager is refused rather than \
+             addressed with the wrong transaction codes."
+        );
+    });
     StatusCode::InvalidOperation
 }
 
@@ -597,13 +602,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
             }
             #[cfg(feature = "android_14")]
             sdk_versions::ANDROID_14 => create_service_manager!(Android14, android_14),
-            // Android 15 (SDK 35) has two service-manager protocols, and the
-            // SDK version does not say which: `android-15.0.0_r6` inserted
-            // `getService2` at index 1 and shifted every code after it. The
-            // original numbering is the Android 14 interface unchanged
-            // (`android_14`), the shifted one is `android_15`. Measure it,
-            // and refuse rather than address a real method with the wrong
-            // code — see `check_android_15_numbering`.
+            // Two numberings share SDK 35 — probe, never guess (see `android_15`).
             #[cfg(any(feature = "android_14", feature = "android_15"))]
             sdk_versions::ANDROID_15 => match check_android_15_numbering(&context)? {
                 Android15Numbering::Original => {
@@ -627,6 +626,14 @@ pub fn default() -> Result<Arc<ServiceManager>> {
                     }
                 }
             },
+            #[cfg(not(any(feature = "android_14", feature = "android_15")))]
+            sdk_versions::ANDROID_15 => {
+                log::error!(
+                    "Android 15 needs the `android_14` (android-15.0.0_r1 through r5) and/or \
+                     `android_15` (r6 or later) feature; rsbinder was built with neither"
+                );
+                return Err(StatusCode::InvalidOperation);
+            }
             #[cfg(feature = "android_13")]
             sdk_versions::ANDROID_13 => create_service_manager!(Android13, android_13),
             #[cfg(feature = "android_12")]
@@ -1286,23 +1293,7 @@ impl ServiceManager {
         }
     }
 
-    /// [`add_service`](Self::add_service) with AOSP's `FLAG_IS_LAZY_SERVICE`
-    /// set in `dumpPriority`, so the service manager can report the service
-    /// as lazy — `ServiceWithMetadata::isLazyService` on the
-    /// `getService2`/`checkService2` reply, and the `lazy=` column of
-    /// `rsb_service dump manager`. (`getServiceDebugInfo` does not carry it:
-    /// `ServiceDebugInfo` is name and pid only.)
-    ///
-    /// Only the `android_15` and `android_16` protocols send the flag, and
-    /// only they can act on it: nothing reads the bit before `getService2`
-    /// exists to carry `isLazyService` back. AOSP added the constant in
-    /// `android-15.0.0_r20` and its `LazyServiceRegistrar` sets it from that
-    /// release on; `r6`-`r19` accept it and ignore it, which is why the
-    /// `android_15` arm sends it unconditionally (that module's whole range
-    /// starts at `r6`). Android 11–14 register without the flag, exactly as
-    /// their own libbinder did; Android 10 is refused outright — see below.
-    /// Crate-private because AOSP's `LazyServiceRegistrar` is the only thing
-    /// that may set it (it warns if a caller pre-set the bit).
+    /// `add_service` + `FLAG_IS_LAZY_SERVICE` (15 r6+ and 16 only; 11–14 have no such bit, 10 is refused).
     pub(crate) fn add_lazy_service(
         &self,
         identifier: &str,
@@ -1513,6 +1504,96 @@ impl ServiceManager {
             ),
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
+            }
+        }
+    }
+
+    /// [`register_client_callback`](Self::register_client_callback) keeping the
+    /// service manager's own [`Status`] (`EX_SECURITY` and so on), for
+    /// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
+    pub(crate) fn register_client_callback_status(
+        &self,
+        name: &str,
+        service: &SIBinder,
+        callback: &crate::Strong<dyn IClientCallback>,
+    ) -> std::result::Result<(), Status> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("registerClientCallback", 11)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => android_11::IServiceManager::registerClientCallback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_11, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => android_12::IServiceManager::registerClientCallback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_12, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => android_13::IServiceManager::registerClientCallback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_13, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => android_14::IServiceManager::registerClientCallback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_14, callback),
+            ),
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => android_15::IServiceManager::registerClientCallback(
+                sm,
+                name,
+                service,
+                &wrap_client_callback!(android_15, callback),
+            ),
+            ServiceManager::Android16(sm) => {
+                android_16::IServiceManager::registerClientCallback(sm, name, service, callback)
+            }
+        }
+    }
+
+    /// [`try_unregister_service`](Self::try_unregister_service) keeping the
+    /// service manager's own [`Status`], for
+    /// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
+    pub(crate) fn try_unregister_service_status(
+        &self,
+        name: &str,
+        service: &SIBinder,
+    ) -> std::result::Result<(), Status> {
+        match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => Err(unsupported("tryUnregisterService", 11)),
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(sm) => {
+                android_11::IServiceManager::tryUnregisterService(sm, name, service)
+            }
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(sm) => {
+                android_12::IServiceManager::tryUnregisterService(sm, name, service)
+            }
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(sm) => {
+                android_13::IServiceManager::tryUnregisterService(sm, name, service)
+            }
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(sm) => {
+                android_14::IServiceManager::tryUnregisterService(sm, name, service)
+            }
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(sm) => {
+                android_15::IServiceManager::tryUnregisterService(sm, name, service)
+            }
+            ServiceManager::Android16(sm) => {
+                android_16::IServiceManager::tryUnregisterService(sm, name, service)
             }
         }
     }
@@ -1940,6 +2021,23 @@ pub(crate) fn add_lazy_service(
     binder: impl Into<SIBinder>,
 ) -> std::result::Result<(), Status> {
     default()?.add_lazy_service(identifier, binder)
+}
+
+/// `default().register_client_callback_status(..)`; see [`ServiceManager::register_client_callback_status`].
+pub(crate) fn register_client_callback_status(
+    name: &str,
+    service: &SIBinder,
+    callback: &crate::Strong<dyn IClientCallback>,
+) -> std::result::Result<(), Status> {
+    default()?.register_client_callback_status(name, service, callback)
+}
+
+/// `default().try_unregister_service_status(..)`; see [`ServiceManager::try_unregister_service_status`].
+pub(crate) fn try_unregister_service_status(
+    name: &str,
+    service: &SIBinder,
+) -> std::result::Result<(), Status> {
+    default()?.try_unregister_service_status(name, service)
 }
 
 /// Convenience function to get a service from the default ServiceManager.

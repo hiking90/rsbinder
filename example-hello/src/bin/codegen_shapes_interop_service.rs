@@ -1,14 +1,14 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-//
-// Server side of the real-libbinder cross-check for the argument shapes
-// whose generated Rust changed with the 2026-08 AIDL review. The client
-// (`cpp/codegen_shapes_interop.cpp`) drives these methods through
-// libbinder_ndk's own `AParcel_*` helpers, so the wire layout under test
-// is the one AOSP's runtime defines, not one this repo asserts.
-//
-// The rsbinder-to-rsbinder round trip in `tests/tests/codegen_shapes.rs`
-// cannot see a layout both sides agree on wrongly; this can.
+
+//! Server side of the real-libbinder cross-check for the argument shapes the
+//! AOSP fixture corpus never uses. The client
+//! (`cpp/codegen_shapes_interop.cpp`) drives these methods through
+//! libbinder_ndk's own `AParcel_*` helpers, so the wire layout under test
+//! is the one AOSP's runtime defines, not one this repo asserts.
+//!
+//! The rsbinder-to-rsbinder round trip in `tests/tests/codegen_shapes.rs`
+//! cannot see a layout both sides agree on wrongly; this can.
 
 use env_logger::Env;
 use rsbinder::*;
