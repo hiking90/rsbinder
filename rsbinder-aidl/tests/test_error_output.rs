@@ -40,7 +40,7 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
 }
 
 // ============================================================
-// 5.5a~5.5e: Error output format verification
+// Error output format verification
 // ============================================================
 
 // Parse error output includes filename, source snippet, diagnostic code
@@ -135,7 +135,7 @@ fn test_error_output_includes_source_snippet() {
 }
 
 // ============================================================
-// 5.5k~5.5r: Boundary condition tests
+// Boundary condition tests
 // ============================================================
 
 // Empty input

@@ -28,10 +28,6 @@ macro_rules! arithmetic_bit_op {
                     let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
                     Ok(ConstExpr::new(ValueType::Int64(value as _)))
                 }
-                ValueType::Reference { .. } => {
-                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
-                    Ok(ConstExpr::new(ValueType::Int64(value as _)))
-                }
                 _ => Err(ConstExprError::new(format!(
                     "can't apply bitwise operator '{}' to non-integer type: {} {:?}",
                     $desc, $lhs.raw_expr(), $rhs
@@ -126,9 +122,6 @@ macro_rules! arithmetic_basic_op {
                 }
                 ValueType::Bool(_) => {
                     Ok(ConstExpr::new(ValueType::Bool(int_op(lhs.to_i64()?, rhs.to_i64()?)? != 0)))
-                }
-                ValueType::Reference { .. } => {
-                    Ok(ConstExpr::new(ValueType::Int64(int_op(lhs.to_i64()?, rhs.to_i64()?)? as _)))
                 }
                 _ => {
                     Err(ConstExprError::new(format!(
@@ -285,6 +278,11 @@ impl ValueType {
             ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(!*v))),
             ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(!*v))),
             ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Int32(!i32::from(*v)))),
+            ValueType::Reference {
+                enum_type, value, ..
+            } => parser::enum_reference_promoted(enum_type, *value)
+                .value
+                .unary_not(),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
                 expr.value.unary_not()
@@ -340,6 +338,11 @@ impl ValueType {
             )),
             ValueType::Void | ValueType::Char(_) => Ok(ConstExpr::new(self.clone())),
             ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Int32(-i32::from(*v)))),
+            ValueType::Reference {
+                enum_type, value, ..
+            } => parser::enum_reference_promoted(enum_type, *value)
+                .value
+                .unary_minus(),
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(
                 v.checked_neg().ok_or_else(|| overflow(*v))?,
             ))),
@@ -782,7 +785,7 @@ impl ValueType {
                 // type instead silently miscompiles (e.g. `1 << 40` folds to
                 // 0). Reject an out-of-range amount up front to match AOSP.
                 let bits: u32 = match &promoted {
-                    ValueType::Int64(_) | ValueType::Reference { .. } => 64,
+                    ValueType::Int64(_) => 64,
                     // Int32 / Byte both integral-promote to `int` for the shift.
                     _ => 32,
                 };
@@ -833,7 +836,6 @@ impl ValueType {
                     ValueType::Int32(_) => Ok(ConstExpr::new(ValueType::Int32(value as _))),
                     ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(value as _))),
                     ValueType::Byte(_) => Ok(ConstExpr::new(ValueType::Byte(value as _))),
-                    ValueType::Reference { .. } => Ok(ConstExpr::new(ValueType::Int64(value as _))),
                     _ => Err(ConstExprError::new(format!(
                         "can't apply shift operator '{}' to non-integer type: {}",
                         operator,
@@ -1030,8 +1032,13 @@ fn integral_promotion(value_type: ValueType) -> ValueType {
     // arithmetic type in `order()`, so `type_conversion` would pick it as the
     // promoted type and comparisons would fall through to `partial_cmp`'s
     // `None` arm.
-    if let ValueType::Reference { value, .. } = value_type {
-        return ValueType::Int64(value);
+    if let ValueType::Reference {
+        ref enum_type,
+        value,
+        ..
+    } = value_type
+    {
+        return parser::enum_reference_promoted(enum_type, value).value;
     }
     let i32_order = ValueType::Int32(0).order();
     let value_order = value_type.order();

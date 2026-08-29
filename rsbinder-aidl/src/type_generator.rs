@@ -455,15 +455,15 @@ impl TypeGenerator {
         }
     }
 
-    fn is_interface(value_type: &ValueType) -> bool {
-        match value_type {
-            ValueType::UserDefined(name) => {
-                matches!(
-                    lookup_decl_from_name(name, crate::Namespace::AIDL),
-                    Some(lookup_decl) if matches!(lookup_decl.decl, Declaration::Interface(_))
-                )
-            }
-            _ => false,
+    // `@nullable T[]` wraps each element only for a non-primitive, non-enum
+    // element (AOSP `aidl_to_rust.cpp::UsesOptionInNullableVector`): a
+    // primitive is written bare, so `Vec<Option<i32>>` would put a null-marker
+    // word before every value that the peer does not expect.
+    fn nullable_element(value_type: &ValueType, type_name: &str) -> String {
+        if Self::is_primitive(value_type) {
+            type_name.to_owned()
+        } else {
+            format!("Option<{type_name}>")
         }
     }
 
@@ -629,10 +629,10 @@ impl TypeGenerator {
         } else {
             match self.direction {
                 Direction::Out | Direction::Inout => {
-                    if self.is_nullable
-                        || !Self::can_be_defaulted(&array_info.value_type, is_struct)
-                    {
+                    if !Self::can_be_defaulted(&array_info.value_type, is_struct) {
                         format!("Option<{type_name}>")
+                    } else if self.is_nullable {
+                        Self::nullable_element(&array_info.value_type, &type_name)
                     } else {
                         type_name
                     }
@@ -668,7 +668,10 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("Vec<Option<{type_name}>>")
+                    format!(
+                        "Vec<{}>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
                     format!("Vec<{type_name}>")
                 } else {
@@ -677,13 +680,15 @@ impl TypeGenerator {
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Vec<Option<{type_name}>>")
-                } else if Self::can_be_defaulted(&sub_type.value_type, true)
-                    || Self::is_interface(&sub_type.value_type)
-                {
-                    format!("Vec<{type_name}>")
+                    format!(
+                        "Vec<{}>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else {
-                    format!("Vec<Option<{type_name}>>")
+                    // AOSP `RustNameOf` keeps `element_mode = VALUE` for
+                    // `INOUT_ARGUMENT`: the vector is read from the parcel
+                    // fully populated, so no element needs a `Default`.
+                    format!("Vec<{type_name}>")
                 }
             }
             _ => {
@@ -790,9 +795,23 @@ impl TypeGenerator {
     pub fn out_array_needs_null_guard(&self) -> bool {
         matches!(self.direction, Direction::Out)
             && !self.is_nullable
-            && self.array_types.first().is_some_and(|sub| {
-                !sub.is_fixed() && matches!(sub.value_type, ValueType::FileDescriptor)
-            })
+            && self
+                .array_types
+                .first()
+                .is_some_and(|sub| matches!(sub.value_type, ValueType::FileDescriptor))
+    }
+
+    /// True when this arg is a non-nullable, out-only *scalar* whose type has
+    /// no `Default` and is therefore stored as `Option<T>`. The service may
+    /// leave it unset, and `None` has no wire form the `.aidl` allows, so the
+    /// server unwraps it into `UNEXPECTED_NULL` before writing the reply.
+    /// Mirrors AOSP `generate_rust.cpp`'s `!arg->IsIn() && TypeNeedsOption(..)`
+    /// → `.ok_or(binder::StatusCode::UNEXPECTED_NULL)?` arm.
+    pub fn out_scalar_needs_unwrap(&self) -> bool {
+        matches!(self.direction, Direction::Out)
+            && !self.is_nullable
+            && !matches!(self.value_type, ValueType::Array(_))
+            && !Self::can_be_defaulted(&self.value_type, false)
     }
 
     fn func_list_type_decl_fixed(&self, array_info: &ArrayInfo) -> String {
@@ -825,8 +844,10 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    // if nullable, it means that the array can have null elements.
-                    format!("&mut Option<Vec<Option<{type_name}>>>")
+                    format!(
+                        "&mut Option<Vec<{}>>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else if Self::can_be_defaulted(&sub_type.value_type, false)
                     || Self::is_primitive(&sub_type.value_type)
                 {
@@ -841,13 +862,12 @@ impl TypeGenerator {
                 // server declares its local with that type and passes
                 // `&mut` it straight into this signature.
                 if self.is_nullable {
-                    format!("&mut Option<Vec<Option<{type_name}>>>")
-                } else if Self::can_be_defaulted(&sub_type.value_type, true)
-                    || Self::is_interface(&sub_type.value_type)
-                {
-                    format!("&mut Vec<{type_name}>")
+                    format!(
+                        "&mut Option<Vec<{}>>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else {
-                    format!("&mut Vec<Option<{type_name}>>")
+                    format!("&mut Vec<{type_name}>")
                 }
             }
             _ => {
@@ -919,24 +939,45 @@ impl TypeGenerator {
     }
 
     pub fn const_type_decl(&self) -> Result<String, AidlError> {
-        // A String-element const array renders as `&[&str]`: its initializer
-        // elements are emitted as string literals, which do not coerce to a
-        // `&[String]` slice in const position.
+        // A String-element const array renders its elements as string
+        // literals, which do not coerce to `String` in const position.
         if matches!(self.value_type, ValueType::Array(_)) {
             if let Some(info) = self.array_types.first() {
-                if matches!(info.value_type, ValueType::String(_)) && !info.is_fixed() {
-                    return Ok("&[&str]".into());
+                // Must match `init_array_branch`'s predicate exactly: that is
+                // what decides whether each element is emitted as `Some(..)`.
+                let element = |name: &str| {
+                    if self.is_nullable && Self::is_aidl_nullable(&info.value_type) {
+                        format!("Option<{name}>")
+                    } else {
+                        name.to_owned()
+                    }
+                };
+                let outer = |name: String| {
+                    if self.is_nullable {
+                        format!("Option<{name}>")
+                    } else {
+                        name
+                    }
+                };
+                let is_str = matches!(info.value_type, ValueType::String(_));
+                if is_str && !info.is_fixed() {
+                    return Ok(outer(format!("&[{}]", element("&str"))));
                 }
                 // A fixed-size array constant is emitted by value: its
                 // initializer is an array literal (`[1,2,3,]`), which does not
                 // coerce to a slice reference in const position.
                 if info.is_fixed() {
-                    let name = self.make_fixed_array(info, false);
-                    return Ok(if self.is_nullable {
-                        format!("Option<{name}>")
+                    let base = if is_str {
+                        element("&str")
                     } else {
-                        name
-                    });
+                        element(&self.array_type_name(&info.value_type))
+                    };
+                    let name = info
+                        .sizes
+                        .iter()
+                        .rev()
+                        .fold(base, |acc, size| format!("[{acc}; {size}]"));
+                    return Ok(outer(name));
                 }
             }
         }
@@ -1429,13 +1470,15 @@ mod tests {
                 .type_declaration(false),
             "Vec<Option<rsbinder::SIBinder>>"
         );
+        // `inout` is read from the parcel fully populated, so its elements
+        // need no `Default` — AOSP `RustNameOf` keeps `element_mode = VALUE`.
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<Option<rsbinder::SIBinder>>"
+            "Vec<rsbinder::SIBinder>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
@@ -1503,7 +1546,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
+            "&mut Vec<rsbinder::ParcelFileDescriptor>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();

@@ -176,6 +176,14 @@ fn main() {
             .generate()
             .unwrap();
 
+        // Argument shapes the AOSP fixture corpus does not use, exercised
+        // end to end by `tests/codegen_shapes.rs`.
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/shapes/ICodegenShapes.aidl"))
+            .output(PathBuf::from("codegen_shapes.rs"))
+            .generate()
+            .unwrap();
+
         // Plan 2-19 P3: the `.aidl` half of the macro interop test
         // (`tests/macro_cross.rs`), which declares the same interface as a
         // Rust trait and calls in both directions.

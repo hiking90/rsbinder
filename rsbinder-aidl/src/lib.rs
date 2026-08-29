@@ -167,14 +167,15 @@ pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
 // `Self`/`super` cannot be raw identifiers at all and are rejected in the
 // parser (`reject_unrepresentable_identifier`), so they never reach here.
 pub(crate) fn escape_rust_keyword(ident: &str) -> std::borrow::Cow<'_, str> {
-    // Strict + reserved Rust 2021 keywords, minus `crate`/`self`/`Self`/`super`
-    // (invalid as raw identifiers; never need escaping in our output).
+    // Strict + reserved keywords through Rust 2024 (generated code is compiled
+    // in the consumer's edition), minus `crate`/`self`/`Self`/`super` (invalid
+    // as raw identifiers; never need escaping in our output).
     const KEYWORDS: &[&str] = &[
         "as", "async", "await", "break", "const", "continue", "dyn", "else", "enum", "extern",
         "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
         "pub", "ref", "return", "static", "struct", "trait", "true", "type", "unsafe", "use",
         "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
-        "typeof", "unsized", "virtual", "yield", "try",
+        "typeof", "unsized", "virtual", "yield", "try", "gen",
     ];
     if KEYWORDS.contains(&ident) {
         std::borrow::Cow::Owned(format!("r#{ident}"))
@@ -419,9 +420,10 @@ impl Builder {
                 mod_count = start;
 
                 for r#mod in &mod_list[start..] {
-                    // Outer attributes bind to the next item only and the
-                    // generated file is `include!`d (no inner attribute
-                    // possible), so repeat them per top-level module.
+                    // Lints against the package module itself — e.g.
+                    // `module_inception` when the `include!` site is a module
+                    // of the same name — need an outer attribute; each
+                    // generated leaf module carries its own inner allowances.
                     if mod_count == 0 {
                         content += "#[allow(clippy::all)]\n#[allow(unused_imports)]\n";
                     }
@@ -458,9 +460,25 @@ impl Builder {
         // ambiguous, matching AOSP `import_resolver.cpp` ("Duplicate files
         // found").
         let mut includes: Vec<PathBuf> = Vec::new();
+        // Keyed by the canonical path like `seen` below: `./aidl`, `aidl` and
+        // an absolute spelling are one directory, and listing it twice turns
+        // every import under it into `AmbiguousImport`.
+        // `strip_package` yields an empty path when the source sits directly
+        // under its own package path. That names the working directory, not a
+        // directory of its own: left as `""` it neither dedups (canonicalize
+        // is ENOENT) nor survives as a `cargo:rerun-if-changed=` value.
+        fn name_the_cwd(dir: PathBuf) -> PathBuf {
+            if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir
+            }
+        }
+        let include_key = |dir: &Path| fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut include_seen: HashSet<PathBuf> = HashSet::new();
         for dir in take(&mut self.includes) {
-            if include_seen.insert(dir.clone()) {
+            let dir = name_the_cwd(dir);
+            if include_seen.insert(include_key(&dir)) {
                 self.dependencies.push(dir.clone());
                 includes.push(dir);
             }
@@ -497,7 +515,8 @@ impl Builder {
                                 .as_ref()
                                 .and_then(|p| strip_package(path.parent()?, p))
                             {
-                                if include_seen.insert(dir.clone()) {
+                                let dir = name_the_cwd(dir);
+                                if include_seen.insert(include_key(&dir)) {
                                     includes.push(dir.clone());
                                     self.dependencies.push(dir);
                                 }

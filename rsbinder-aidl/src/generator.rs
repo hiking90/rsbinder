@@ -13,7 +13,7 @@ use crate::{add_indent, parser, Namespace};
 
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     {{crate}}::declare_binder_enum! {
         r#{{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
@@ -26,7 +26,7 @@ pub mod {{mod}} {
 
 const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
@@ -107,7 +107,7 @@ pub mod {{mod}} {
 
 const PARCELABLE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
@@ -175,7 +175,7 @@ pub mod {{mod}} {
 
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     {%- for member in const_members %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
@@ -593,6 +593,9 @@ pub mod {{mod}} {
                         {%- if arg.needs_null_guard %}
                         if {{ arg.identifier }}.iter().any(Option::is_none) { return Err({{crate}}::StatusCode::UnexpectedNull); }
                         {%- endif %}
+                        {%- if arg.needs_unwrap %}
+                        let {{ arg.identifier }} = {{ arg.identifier }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?;
+                        {%- endif %}
                         _reply.write(&{{ arg.identifier }})?;
                         {%- endfor %}
                     }
@@ -983,6 +986,9 @@ pub struct TransactionWrite {
     /// Emit an `iter().any(Option::is_none)` → `UNEXPECTED_NULL` guard before
     /// writing this arg back (`TypeGenerator::out_array_needs_null_guard`).
     pub needs_null_guard: bool,
+    /// Unwrap this arg's `Option<T>` into `UNEXPECTED_NULL` before writing it
+    /// back (`TypeGenerator::out_scalar_needs_unwrap`).
+    pub needs_unwrap: bool,
 }
 
 impl TransactionWrite {
@@ -992,6 +998,7 @@ impl TransactionWrite {
         Self {
             identifier: identifier.into(),
             needs_null_guard: false,
+            needs_unwrap: false,
         }
     }
 }
@@ -1112,6 +1119,7 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
             transaction_write.push(TransactionWrite {
                 identifier: generator.identifier.to_owned(),
                 needs_null_guard: generator.out_array_needs_null_guard(),
+                needs_unwrap: generator.out_scalar_needs_unwrap(),
             });
             read_onto_params.push(generator.identifier.to_owned());
         }
@@ -1350,10 +1358,8 @@ impl Generator {
     }
 
     // Mirrors AOSP `aidl --version N --hash <s>`; `None` suppresses the
-    // corresponding emission, per AOSP's per-flag conditional.
-    ///
-    /// Crate-internal: the public entry points are [`crate::Builder::version`]
-    /// and [`crate::Builder::hash`], which route through this method.
+    // corresponding emission, per AOSP's per-flag conditional. The public
+    // entry points are `Builder::version` / `Builder::hash`.
     pub(crate) fn with_version_meta(mut self, version: Option<i32>, hash: Option<String>) -> Self {
         self.version = version;
         self.hash = hash;
@@ -1596,7 +1602,7 @@ impl Generator {
             let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     pub type {name} = {rust_type};
 }}
 "#, mod = escaped, name = escaped, rust_type = decl.rust_type);

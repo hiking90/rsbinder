@@ -28,4 +28,12 @@ fn main() {
     aidl("aidl/authz/IAuthz.aidl", "authz.rs");
     // Shared-memory example interface (`bin/shm_{service,client}`).
     aidl("aidl/shm/IShm.aidl", "shm.rs");
+    // Argument shapes whose generated Rust changed with the 2026-08 AIDL
+    // review. One source of truth with `tests/aidl/shapes/`: the tests crate
+    // round-trips them rsbinder-to-rsbinder, `cpp/codegen_shapes_interop.cpp`
+    // cross-checks the same wire against real libbinder.
+    aidl(
+        "../tests/aidl/shapes/ICodegenShapes.aidl",
+        "codegen_shapes.rs",
+    );
 }

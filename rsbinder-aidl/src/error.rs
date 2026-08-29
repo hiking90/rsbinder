@@ -119,11 +119,12 @@ impl ParseError {
         Self {
             src: NamedSource::new(filename, source.to_string()),
             span: SourceSpan::new(offset.into(), len),
-            message: format!("too much {kind} here (limit {limit}); refusing to parse"),
-            help: Some(format!(
-                "{kind} beyond this limit is rejected as a denial-of-service guard: \
-                 parsing it would exhaust time or stack"
-            )),
+            message: format!("{kind} (limit {limit}); refusing to parse"),
+            help: Some(
+                "the limit is a denial-of-service guard: parsing past it would \
+                 exhaust time or stack"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -459,7 +460,6 @@ mod tests {
         SourceSpan::new(offset.into(), len)
     }
 
-    // ParseError Display trait
     #[test]
     fn test_parse_error_display() {
         let err = ParseError {
@@ -472,7 +472,6 @@ mod tests {
         assert!(display.contains("AIDL syntax error"), "Got: {display}");
     }
 
-    // ParseError diagnostic code
     #[test]
     fn test_parse_error_diagnostic_code() {
         use miette::Diagnostic;
@@ -486,7 +485,6 @@ mod tests {
         assert_eq!(code.to_string(), "aidl::parse_error");
     }
 
-    // ParseError source span
     #[test]
     fn test_parse_error_source_span() {
         use miette::Diagnostic;
@@ -503,7 +501,6 @@ mod tests {
         assert_eq!(label_span.len(), 3);
     }
 
-    // SemanticError variants Display
     #[test]
     fn test_semantic_error_variants_display() {
         let err = SemanticError::MixedTransactionIds {
@@ -522,7 +519,6 @@ mod tests {
         );
     }
 
-    // ResolutionError::ImportNotFound Display
     #[test]
     fn test_resolution_error_display() {
         let err = ResolutionError::ImportNotFound {
@@ -535,7 +531,6 @@ mod tests {
         assert!(display.contains("not found"), "Got: {display}");
     }
 
-    // AidlError From<ParseError> conversion
     #[test]
     fn test_aidl_error_from_parse_error() {
         let parse_err = ParseError {
@@ -548,7 +543,6 @@ mod tests {
         assert!(matches!(aidl_err, AidlError::Parse(_)));
     }
 
-    // AidlError → Box<dyn Error> conversion (API compatibility)
     #[test]
     fn test_aidl_error_into_box_dyn_error() {
         use std::error::Error;
@@ -562,7 +556,6 @@ mod tests {
         let _box_err: Box<dyn Error> = aidl_err.into();
     }
 
-    // pest Pos location → SourceSpan conversion
     #[test]
     fn test_pest_error_to_diagnostic_pos() {
         use miette::Diagnostic;
@@ -579,7 +572,6 @@ mod tests {
         assert_eq!(labels[0].inner().len(), 1);
     }
 
-    // pest Span location → SourceSpan conversion
     #[test]
     fn test_pest_error_to_diagnostic_span() {
         use miette::Diagnostic;
@@ -616,7 +608,6 @@ mod tests {
         assert_eq!(labels[0].inner().len(), 0);
     }
 
-    // AidlError::collect() — flattens nested Multiple variants
     #[test]
     fn test_aidl_error_collect_flatten() {
         let make_parse_err = |msg: &str| {
@@ -644,7 +635,6 @@ mod tests {
         }
     }
 
-    // AidlError::collect() — single error is not wrapped in Multiple
     #[test]
     fn test_aidl_error_collect_single() {
         let err = AidlError::Parse(Box::new(ParseError {
@@ -660,7 +650,6 @@ mod tests {
         );
     }
 
-    // AidlError::collect() — empty collection returns None
     #[test]
     fn test_aidl_error_collect_empty() {
         let result = AidlError::collect(vec![]);

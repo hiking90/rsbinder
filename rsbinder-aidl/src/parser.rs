@@ -616,35 +616,66 @@ pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> 
     })
 }
 
-// Universal symbol registration - supports all types of named constants
 /// `self` / `Self` / `super` / `crate` are the four Rust keywords that cannot
 /// be written as raw identifiers, and every generated name is emitted as
 /// `r#<name>` or used bare in `mod` / `trait` / `struct` position — so an AIDL
-/// name matching one of them has no representation at all. AIDL itself permits
-/// them, so this is the only place they can be rejected.
+/// name with a segment matching one of them has no representation at all. AIDL
+/// itself permits them, so this is the only place they can be rejected.
 fn reject_unrepresentable_identifier(
     ident: &str,
     role: &str,
     span: &pest::Span<'_>,
 ) -> Result<(), AidlError> {
-    if matches!(ident, "self" | "Self" | "super" | "crate") {
-        return Err(make_parse_error(
-            format!(
-                "'{ident}' cannot be used as a{} {role} \
-                 (not representable as a Rust raw identifier)",
-                if role.starts_with(['a', 'e', 'i', 'o', 'u']) {
-                    "n"
-                } else {
-                    ""
-                }
-            ),
-            span.start(),
-            span.end(),
-        ));
-    }
-    Ok(())
+    let Some(keyword) = ident
+        .split('.')
+        .find(|segment| matches!(*segment, "self" | "Self" | "super" | "crate"))
+    else {
+        return Ok(());
+    };
+    Err(make_parse_error(
+        format!(
+            "'{keyword}' cannot be used as a{} {role} \
+             (not representable as a Rust raw identifier)",
+            // No role here starts with a consonant-sounding vowel, and `u`
+            // is excluded because every one that starts with it reads "a"
+            // ("a union name").
+            if role.starts_with(['a', 'e', 'i', 'o']) {
+                "n"
+            } else {
+                ""
+            }
+        ),
+        span.start(),
+        span.end(),
+    ))
 }
 
+// The integral type an enum reference promotes to in a binary expression:
+// its `@Backing` type, with `byte` promoting to `int` as in C++ (AOSP
+// `AidlConstantReference` folds through the declared enum type). An enum whose
+// declaration is not in this translation unit keeps the widest type.
+pub(crate) fn enum_reference_promoted(enum_type: &str, value: i64) -> ConstExpr {
+    let backing = lookup_decl_from_name(enum_type, crate::Namespace::AIDL).and_then(|lookup| {
+        match lookup.decl {
+            Declaration::Enum(decl) => get_backing_type(&decl.annotation_list, decl.name_span)
+                .ok()
+                .map(|generator| generator.value_type),
+            _ => None,
+        }
+    });
+    match backing {
+        // A value too wide for the backing type is a `decl_enum` diagnostic,
+        // but that check only runs when the enum itself is generated; keep the
+        // value intact here rather than truncating it into a wrong constant.
+        Some(ValueType::Byte(_)) | Some(ValueType::Int32(_)) => match i32::try_from(value) {
+            Ok(v) => ConstExpr::new(ValueType::Int32(v)),
+            Err(_) => ConstExpr::new(ValueType::Int64(value)),
+        },
+        _ => ConstExpr::new(ValueType::Int64(value)),
+    }
+}
+
+// Universal symbol registration - supports all types of named constants
 pub fn register_symbol(name: &str, value: ConstExpr, namespace: Option<&str>) {
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();
@@ -1052,6 +1083,16 @@ pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType
 /// Collects the enabled `@RustDerive(...)` trait names as a comma-separated
 /// list (e.g. `"Clone,PartialEq"`), or an empty string when the annotation is
 /// absent. The result is interpolated directly into the generated `#[derive]`.
+const RUST_DERIVE_SCHEMA: &[&str] = &[
+    "Copy",
+    "Clone",
+    "PartialOrd",
+    "Ord",
+    "PartialEq",
+    "Eq",
+    "Hash",
+];
+
 pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     for annotation in annotation_list {
         if annotation.annotation == "@RustDerive" {
@@ -1059,9 +1100,10 @@ pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
                 .parameter_list
                 .iter()
                 .filter(|param| param.const_expr.to_bool().unwrap_or(false))
-                // The templates always emit `#[derive(Debug)]`; repeating it
-                // here would be a conflicting `Debug` impl (E0119).
-                .filter(|param| param.identifier != "Debug")
+                // AOSP `aidl_language.cpp` accepts exactly these seven.
+                // Anything else either duplicates an impl the templates always
+                // emit (`Debug`, `Default`) or names no trait at all.
+                .filter(|param| RUST_DERIVE_SCHEMA.contains(&param.identifier.as_str()))
                 .map(|param| param.identifier.to_owned())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -2387,18 +2429,6 @@ const MAX_GENERIC_DEPTH: usize = 12;
 /// multi-thousand recursion depth that aborts the process.
 const MAX_OPERATOR_RUN: usize = 1024;
 
-/// Pre-parse denial-of-service guard. pest's recursive-descent parser and
-/// the recursive AST walkers recurse once per nesting level, so deeply
-/// nested input (`((((...))))` or `List<List<...>>`) would overflow the
-/// stack and abort the whole process (an uncatchable SIGABRT) on
-/// untrusted or build-pipeline-influenced AIDL — `MAX_EXPR_DEPTH` only
-/// guards the post-parse expression evaluator, too late to help. This
-/// scans the raw source (skipping string/char literals and comments) and
-/// returns the byte offset at which `()[]{}` or `<>` nesting first exceeds
-/// [`MAX_NESTING_DEPTH`], so the caller can reject it as an ordinary
-/// diagnostic. Angle-bracket depth is reset at `;` (a generic type never
-/// crosses a statement boundary) so shift/comparison operators in const
-/// expressions cannot drift the count into a false positive.
 #[derive(Debug, Clone, Copy)]
 pub enum NestingLimit {
     Bracket,
@@ -2409,18 +2439,27 @@ pub enum NestingLimit {
 impl NestingLimit {
     pub fn describe(self) -> &'static str {
         match self {
-            NestingLimit::Bracket => "bracket nesting",
-            NestingLimit::Generic => "generic type nesting",
-            NestingLimit::OperatorRun => "operators in one expression",
+            NestingLimit::Bracket => "brackets are nested too deeply",
+            NestingLimit::Generic => "generic types are nested too deeply",
+            NestingLimit::OperatorRun => "too many operators in one expression",
         }
     }
 }
 
+// Pre-parse denial-of-service guard: the recursive parser and AST walkers
+// would overflow the stack (an uncatchable SIGABRT) on unbounded nesting or an
+// operator chain before `MAX_EXPR_DEPTH` applies. Returns the offset, which of
+// the three limits was hit, and its bound.
 fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut bracket_depth: usize = 0; // () [] {}
-    let mut angle_depth: usize = 0; // <> generics
+                                      // Positions of `<` still waiting for a closer. An unmatched one is a
+                                      // comparison (`0 < 1`), not a generic, so only a `<` that a `>` closes
+                                      // counts toward `MAX_GENERIC_DEPTH`; the pending run itself is bounded
+                                      // only against the parser's recursion budget.
+    let mut angle_open: Vec<usize> = Vec::new();
+    let mut generic_depth: usize = 0;
     let mut op_run: usize = 0; // operator tokens in the current statement/element
     let next = |i: usize| bytes.get(i + 1).copied();
     while i < bytes.len() {
@@ -2474,14 +2513,15 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            b'<' => angle_depth += 1,
+            b'<' => angle_open.push(i),
             // `>>` closes two open generics (`Map<int, List<int>>`); it is a
             // shift operator only outside one.
             b'>' if next(i) == Some(b'>') => {
-                if angle_depth >= 2 {
-                    angle_depth -= 2;
+                if angle_open.len() >= 2 {
+                    generic_depth = generic_depth.max(angle_open.len());
+                    angle_open.truncate(angle_open.len() - 2);
                 } else {
-                    angle_depth = 0;
+                    angle_open.clear();
                     op_run += 1;
                 }
                 i += 2;
@@ -2492,9 +2532,14 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            b'>' => angle_depth = angle_depth.saturating_sub(1),
+            b'>' => {
+                if !angle_open.is_empty() {
+                    generic_depth = generic_depth.max(angle_open.len());
+                    angle_open.pop();
+                }
+            }
             b';' => {
-                angle_depth = 0;
+                angle_open.clear();
                 op_run = 0;
             }
             // Unary / binary operator tokens. Each drives one
@@ -2506,8 +2551,11 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
         if bracket_depth > MAX_NESTING_DEPTH {
             return Some((i, NestingLimit::Bracket, MAX_NESTING_DEPTH));
         }
-        if angle_depth > MAX_GENERIC_DEPTH {
+        if generic_depth > MAX_GENERIC_DEPTH {
             return Some((i, NestingLimit::Generic, MAX_GENERIC_DEPTH));
+        }
+        if angle_open.len() > MAX_NESTING_DEPTH {
+            return Some((i, NestingLimit::Generic, MAX_NESTING_DEPTH));
         }
         if op_run > MAX_OPERATOR_RUN {
             return Some((i, NestingLimit::OperatorRun, MAX_OPERATOR_RUN));
@@ -2542,7 +2590,13 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
             for pair in pairs {
                 match pair.as_rule() {
                     Rule::package => {
-                        document.package = Some(pair.into_inner().next().unwrap().as_str().into());
+                        let name = pair.into_inner().next().unwrap();
+                        reject_unrepresentable_identifier(
+                            name.as_str(),
+                            "package segment",
+                            &name.as_span(),
+                        )?;
+                        document.package = Some(name.as_str().into());
                     }
 
                     Rule::imports => {

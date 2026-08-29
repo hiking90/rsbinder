@@ -209,13 +209,11 @@ fn deep_generic_nesting_is_rejected_with_a_naming_diagnostic() {
     let AidlError::Parse(pe) = &err else {
         panic!("expected a ParseError, got: {err:?}");
     };
-    let help = pe
-        .help()
-        .expect("nesting diagnostic must carry help")
-        .to_string();
+    assert!(pe.help().is_some(), "nesting diagnostic must carry help");
     assert!(
-        help.contains("generic type nesting"),
-        "the diagnostic must name the limit it hit, got: {help}"
+        pe.message.contains("generic types are nested too deeply"),
+        "the diagnostic must name the limit it hit, got: {}",
+        pe.message
     );
 
     // A long unbracketed operator chain trips a different limit, and must say so.
@@ -227,13 +225,11 @@ fn deep_generic_nesting_is_rejected_with_a_naming_diagnostic() {
     let AidlError::Parse(pe) = &err else {
         panic!("expected a ParseError, got: {err:?}");
     };
-    let help = pe
-        .help()
-        .expect("nesting diagnostic must carry help")
-        .to_string();
+    assert!(pe.help().is_some(), "nesting diagnostic must carry help");
     assert!(
-        help.contains("operators in one expression"),
-        "an operator-run rejection must not be reported as nesting: {help}"
+        pe.message.contains("too many operators in one expression"),
+        "an operator-run rejection must not be reported as nesting: {}",
+        pe.message
     );
 
     // A shallow generic still parses.

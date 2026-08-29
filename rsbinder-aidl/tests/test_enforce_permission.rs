@@ -242,6 +242,9 @@ interface IFoo {
 }
         "#,
     );
+    // Anchor the content: "identical" degenerates into "identically empty"
+    // if interface codegen ever collapses.
+    assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@PermissionManuallyEnforced must not change codegen"
@@ -267,6 +270,9 @@ interface IFoo {
 }
         "#,
     );
+    // Anchor the content: "identical" degenerates into "identically empty"
+    // if interface codegen ever collapses.
+    assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@RequiresNoPermission must not change codegen"

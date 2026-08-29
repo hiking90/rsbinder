@@ -9,9 +9,9 @@ use rsbinder_aidl::error::SemanticError;
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};
 use std::path::PathBuf;
 
-/// A fresh, per-test directory under the target dir — `std::env::temp_dir()`
-/// is shared, so two concurrent `cargo test` runs would delete each other's
-/// fixtures mid-generation.
+/// A per-test directory under the target dir: the name keeps tests in this
+/// binary from deleting each other's fixtures mid-generation, and the target
+/// dir keeps them out of the machine-wide `std::env::temp_dir()`.
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);

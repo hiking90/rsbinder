@@ -130,8 +130,8 @@ fn test_mixed_resolvable_unresolvable() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn test_large_enum_performance() -> Result<(), Box<dyn Error>> {
-    // Test with a larger enum to ensure performance is reasonable
+fn test_large_enum_auto_reference_chain_resolves() -> Result<(), Box<dyn Error>> {
+    // A 21-member chain of `Vn = Vn-1 + 1` must resolve every discriminant.
     let input = r##"
         package test.large;
         

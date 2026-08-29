@@ -43,10 +43,9 @@ fn list_of_array_is_rejected_not_panicked() {
     );
 }
 
-/// mutually-referential constants used to recurse until the stack
-/// overflowed (the cycle guard was abandoned when evaluation crossed a
-/// binary operator). Generation must now terminate; non-cyclic chains that
-/// also cross operators must still resolve.
+/// Mutually-referential constants must terminate rather than recurse until the
+/// stack overflows: the cycle guard has to survive a binary operator between
+/// the two references. Non-cyclic chains that cross operators must resolve.
 #[test]
 fn cyclic_constants_do_not_overflow() {
     // Reaching the end of this call without aborting is the assertion.
@@ -71,13 +70,11 @@ fn enum_autoincrement_overflow_wraps() {
     );
 }
 
-/// An empty `{}` initializer used to `unwrap()`-panic in five parser
-/// positions where an aggregate initializer is not a valid value
-/// (enumerator value, nested array element, annotation argument, named
-/// annotation parameter, array dimension). Each must now surface as a
-/// recoverable parse diagnostic. Reaching the assertions without aborting
-/// is itself the regression guard: a revert reintroduces the panic and
-/// fails the test. The legitimate empty-array initializer `int[] x = {}`
+/// An empty `{}` initializer must surface as a recoverable parse diagnostic in
+/// all five parser positions where an aggregate initializer is not a valid
+/// value (enumerator value, nested array element, annotation argument, named
+/// annotation parameter, array dimension), not as an `unwrap()` panic.
+/// Reaching the assertions without aborting is itself the regression guard. The legitimate empty-array initializer `int[] x = {}`
 /// (the one position where `{}` is valid) must still parse + generate.
 #[test]
 fn empty_brace_initializer_is_rejected_not_panicked() {
@@ -99,7 +96,7 @@ fn empty_brace_initializer_is_rejected_not_panicked() {
     );
 }
 
-/// a negative byte literal inside an array default must be re-emitted
+/// A negative byte literal inside an array default must be re-emitted
 /// as its unsigned `u8` representation (AOSP `aidl_to_rust.cpp`). The array's
 /// Rust element type is `u8` (i8 maps to u8 via `array_type_name`), which
 /// cannot hold a negated literal, so the previous `[-1, ...]` / `vec![-1, ...]`
@@ -123,7 +120,7 @@ fn negative_byte_array_default_emits_unsigned() {
     );
 }
 
-/// a float/double field default that folds to a non-finite value
+/// A float/double field default that folds to a non-finite value
 /// (e.g. `1.0e400` parses to infinity) must emit a valid Rust float constant
 /// (`f64::INFINITY` / `f32::INFINITY` / `NAN`), not `inff64` / `NaNf32` which
 /// do not compile. Finite defaults keep the suffixed-decimal form.
@@ -232,8 +229,8 @@ fn parcelable_non_nullable_binder_field_read_is_null_strict() {
 }
 
 /// A fixed-size array dimension that fails to evaluate (or is non-positive)
-/// used to fold to 0 via `unwrap_or(0)` and silently demote the field to a
-/// `Vec<T>` — a different wire format. AOSP rejects it at build time.
+/// must be a diagnostic, as in AOSP: folding it to 0 silently demotes the
+/// field to a `Vec<T>`, a different wire format.
 #[test]
 fn bad_fixed_array_dimension_is_diagnostic() {
     // Unresolvable dimension constant.
@@ -270,9 +267,9 @@ fn bad_fixed_array_dimension_is_diagnostic() {
 }
 
 /// A fixed-size array default must supply exactly the declared element count,
-/// and an array literal must not initialize a scalar target — both used to
-/// emit non-compiling Rust (`[i32; 2] = [1,2,3,]` / `i32 = &[]`) instead of
-/// an AIDL diagnostic.
+/// and an array literal must not initialize a scalar target — either one emits
+/// non-compiling Rust (`[i32; 2] = [1,2,3,]` / `i32 = &[]`) unless it is an
+/// AIDL diagnostic.
 #[test]
 fn array_literal_shape_mismatches_are_diagnostics() {
     assert!(
@@ -333,9 +330,9 @@ fn const_string_array_renders_as_str_slice() {
 }
 
 /// An enum discriminant referencing a sibling interface constant must fold to
-/// the constant's value with correct auto-increment afterwards — a stale
-/// cache entry from the pre-registration pass used to duplicate one wire
-/// discriminant across members (`A = X, B` became A=5, B=5).
+/// the constant's value with correct auto-increment afterwards: a stale cache
+/// entry from the pre-registration pass duplicates one wire discriminant
+/// across members (`A = X, B` folding to A=5, B=5).
 #[test]
 fn enum_discriminant_referencing_interface_constant_auto_increments() {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -355,7 +352,7 @@ fn enum_discriminant_referencing_interface_constant_auto_increments() {
 }
 
 /// Float / char enum discriminants must be diagnostics, not lossy `to_i64`
-/// truncations (`A = 1.5` used to silently become 1). Bool comparisons stay
+/// truncations (`A = 1.5` silently becoming 1). Bool comparisons stay
 /// legal — AOSP treats bool as integral in const expressions.
 #[test]
 fn non_integral_enum_discriminants_are_diagnostics() {
@@ -676,15 +673,19 @@ fn inout_array_signature_matches_server_local() {
     for (src, ty) in [
         (
             "package a; interface I { void m(inout ParcelFileDescriptor[] p); }",
-            "Vec<Option<rsbinder::ParcelFileDescriptor>>",
+            "Vec<rsbinder::ParcelFileDescriptor>",
         ),
         (
             "package a; interface I { void m(inout IBinder[] p); }",
-            "Vec<Option<rsbinder::SIBinder>>",
+            "Vec<rsbinder::SIBinder>",
         ),
         (
             "package a; interface I { void m(inout @nullable int[] p); }",
-            "Option<Vec<Option<i32>>>",
+            "Option<Vec<i32>>",
+        ),
+        (
+            "package a; interface I { void m(inout @nullable String[] p); }",
+            "Option<Vec<Option<String>>>",
         ),
     ] {
         let out = generate_str(src).expect("must generate");
@@ -754,10 +755,11 @@ fn rust_derive_does_not_duplicate_debug() {
         generate_str("package a; @RustDerive(Debug=true, Clone=true) parcelable D { int a; }")
             .expect("must generate");
     assert_eq!(
-        out.matches("#[derive(Debug)]").count(),
+        out.matches("Debug").count(),
         1,
         "Debug must be derived exactly once, got:\n{out}"
     );
+    assert!(out.contains("#[derive(Clone)]"), "got:\n{out}");
 }
 
 /// `rust_type` was the one declaration path that emitted the name unescaped.
@@ -800,8 +802,8 @@ fn symlink_cycle_in_a_source_directory_terminates() {
     }
 }
 
-/// The output directory is created on demand, and an I/O failure names the
-/// path it failed on.
+/// The output directory is created on demand, whether `dest_dir` is missing
+/// or `output` names a subdirectory.
 #[test]
 fn output_directory_is_created_on_demand() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("out_dir_create");
@@ -826,47 +828,363 @@ fn output_directory_is_created_on_demand() {
     assert!(dir.join("nested/gen.rs").is_file());
 }
 
-/// Parsing happens in `generate()`, so resetting the parser in `Builder::new()`
-/// let the first builder's symbol table leak into a second builder that was
-/// merely *constructed* earlier.
+/// Parsing happens in `generate()`, so the parser must be reset there: two
+/// builders constructed before either generates must not share declarations.
+/// `P` names `T` without importing it, so it resolves only if the first
+/// builder's declaration table leaked into the second.
 #[test]
-fn a_second_builder_does_not_inherit_the_first_symbol_table() {
+fn a_second_builder_does_not_inherit_the_first_declarations() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("two_builders");
     let _ = std::fs::remove_dir_all(&root);
     let (a, b) = (root.join("a"), root.join("b"));
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
-    std::fs::write(
-        a.join("A.aidl"),
-        "package pa; interface IX { const int A = 999; void z(); }",
-    )
-    .unwrap();
-    std::fs::write(
-        b.join("B.aidl"),
-        "package pb; parcelable P { const int A = 1; const int B = A + 1; }",
-    )
-    .unwrap();
+    std::fs::write(a.join("T.aidl"), "package p; parcelable T { int x; }").unwrap();
+    std::fs::write(b.join("P.aidl"), "package p; parcelable P { T item; }").unwrap();
 
     // Both builders are constructed before either generates.
     let first = rsbinder_aidl::Builder::new()
-        .source(a.join("A.aidl"))
+        .source(a.join("T.aidl"))
         .dest_dir(a.join("out"))
         .output("gen.rs");
     let second = rsbinder_aidl::Builder::new()
-        .source(b.join("B.aidl"))
+        .source(b.join("P.aidl"))
         .dest_dir(b.join("out"))
         .output("gen.rs");
     first.generate().expect("must generate");
-    second.generate().expect("must generate");
+    let err = second
+        .generate()
+        .expect_err("`T` is neither imported nor declared by the second builder");
+    assert!(err.to_string().contains("unknown type 'T'"), "got: {err:?}");
+}
 
-    let out = std::fs::read_to_string(b.join("out/gen.rs")).expect("output written");
-    assert!(out.contains("pub const r#B: i32 = 2;"), "got:\n{out}");
+/// A fixed-size `String` constant is a by-value array of the `&str` literals
+/// its initializer emits, like the `&[&str]` slice for the variable-length form.
+#[test]
+fn fixed_size_string_array_constant_is_a_str_array() {
+    let out = generate_str(
+        "package a; interface I { const String[2] X = {\"a\", \"b\"}; const int[2] N = {1, 2}; void p(); }",
+    )
+    .expect("must generate");
+    assert!(
+        out.contains("pub const r#X: [&str; 2] = [\"a\",\"b\",];"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("pub const r#N: [i32; 2] = [1,2,];"),
+        "got:\n{out}"
+    );
+}
+
+/// An enum reference folds at its `@Backing` width, so an expression is not
+/// widened just by naming a member of an `int`-backed enum.
+#[test]
+fn enum_reference_promotes_at_its_backing_width() {
+    let out = generate_str(
+        "package a; @Backing(type=\"int\") enum F { BIT = 1 } \
+         @Backing(type=\"long\") enum L { BIT = 1 } \
+         interface I { const int SIGN = F.BIT << 31; const long WIDE = L.BIT << 40; void p(); }",
+    )
+    .expect("must generate");
+    assert!(
+        out.contains("pub const r#SIGN: i32 = -2147483648;"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("pub const r#WIDE: i64 = 1099511627776;"),
+        "got:\n{out}"
+    );
+    // The same shift written as a literal must fold identically.
+    let literal = generate_str("package a; interface I { const int SIGN = 1 << 31; void p(); }")
+        .expect("must generate");
+    assert!(
+        literal.contains("pub const r#SIGN: i32 = -2147483648;"),
+        "got:\n{literal}"
+    );
+}
+
+/// `-E.A` and `~E.A` fold through the reference's integral value like `!E.A`
+/// already does, rather than failing on the unfolded reference.
+#[test]
+fn unary_operators_apply_to_enum_references() {
+    let out = generate_str(
+        "package a; @Backing(type=\"int\") enum E { A = 1 } \
+         interface I { const int NEG = -E.A; const int INV = ~E.A; const int NOT = !E.A; void p(); }",
+    )
+    .expect("must generate");
+    assert!(out.contains("pub const r#NEG: i32 = -1;"), "got:\n{out}");
+    assert!(out.contains("pub const r#INV: i32 = -2;"), "got:\n{out}");
+    assert!(out.contains("pub const r#NOT: i32 = 0;"), "got:\n{out}");
+}
+
+/// A package segment is emitted as a `mod` name, and `self`/`Self`/`super`/
+/// `crate` cannot be raw identifiers, so the four are rejected there like in
+/// every other name position. A dotted declaration name is checked per segment.
+#[test]
+fn unrepresentable_keywords_are_rejected_in_package_and_qualified_names() {
+    for src in [
+        "package com.self; interface I { void p(); }",
+        "package com.example.crate; interface I { void p(); }",
+        "package a; parcelable b.super.P { int x; }",
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", src);
+        let err = rsbinder_aidl::parse_document(&ctx).expect_err(src);
+        let rsbinder_aidl::AidlError::Parse(pe) = &err else {
+            panic!("expected a ParseError for {src:?}, got: {err:?}");
+        };
+        assert!(
+            pe.message
+                .contains("not representable as a Rust raw identifier"),
+            "expected the keyword diagnostic for {src:?}, got: {}",
+            pe.message
+        );
+    }
+    assert!(generate_ok(
+        "package com.example.impl; interface I { void p(); }"
+    ));
+}
+
+/// Every generated module carries the lint allowances as an inner attribute,
+/// so a declaration is covered wherever it lands — including a document with
+/// no `package`, which `generate_all` wraps in no module and therefore gives
+/// no outer attribute to.
+#[test]
+fn every_generated_module_carries_the_lint_allowances() {
+    let out =
+        generate_str("parcelable A { int x; } parcelable B { int y; }").expect("must generate");
+    assert_eq!(
+        out.matches("#![allow(clippy::all, unused_imports,").count(),
+        2,
+        "got:\n{out}"
+    );
+
+    // The package-less path through `Builder`: no wrapping module, so the
+    // inner attributes are the only ones there are.
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("package_less");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("INoPkg.aidl"),
+        "interface INoPkg { void ping(); }",
+    )
+    .unwrap();
+    rsbinder_aidl::Builder::new()
+        .source(root.join("INoPkg.aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("must generate");
+    let file = std::fs::read_to_string(root.join("out/gen.rs")).expect("output written");
+    assert!(file.starts_with("pub mod INoPkg {"), "got:\n{file}");
+    assert!(
+        file.contains("#![allow(clippy::all, unused_imports,"),
+        "got:\n{file}"
+    );
+}
+
+/// A non-nullable `out` argument with no `Default` is stored as `Option<T>`;
+/// leaving it unset must fail the transaction rather than write a null, and
+/// an out `ParcelFileDescriptor` array is guarded at both lengths.
+#[test]
+fn non_nullable_out_arguments_reject_an_unset_value() {
+    let out =
+        generate_str("package a; interface I { void f(out IBinder b, out @nullable IBinder n); }")
+            .expect("must generate");
+    assert!(
+        out.contains("let _arg_b = _arg_b.as_ref().ok_or(rsbinder::StatusCode::UnexpectedNull)?;"),
+        "got:\n{out}"
+    );
+    assert!(
+        !out.contains("let _arg_n = _arg_n"),
+        "@nullable must stay nullable, got:\n{out}"
+    );
+
+    let fds = generate_str(
+        "package a; interface I { void f(out ParcelFileDescriptor[3] p, out ParcelFileDescriptor[] q); }",
+    )
+    .expect("must generate");
+    assert_eq!(
+        fds.matches("iter().any(Option::is_none)").count(),
+        2,
+        "both fixed and variable out fd arrays are guarded, got:\n{fds}"
+    );
+}
+
+/// A `@nullable` array wraps its elements only for non-primitive, non-enum
+/// element types (AOSP `UsesOptionInNullableVector`) — fixed-size arrays
+/// included, where an `Option` element also has no `SerializeOption` impl.
+#[test]
+fn nullable_fixed_array_follows_the_vector_element_rule() {
+    let out = generate_str(
+        "package a; @Backing(type=\"int\") enum E { A = 1 } \
+         interface I { void f(out @nullable int[3] i, out @nullable E[3] e, out @nullable String[3] s); }",
+    )
+    .expect("must generate");
+    for expected in [
+        "_arg_i: &mut Option<[i32; 3]>",
+        "_arg_e: &mut Option<[super::E::E; 3]>",
+        "_arg_s: &mut Option<[Option<String>; 3]>",
+    ] {
+        assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
+    }
+}
+
+/// A `@nullable` `String` array constant declares the element `Option` its
+/// initializer emits, at both lengths.
+#[test]
+fn nullable_string_array_constant_type_matches_its_initializer() {
+    let out = generate_str(
+        "package a; interface I { const @nullable String[2] X = {\"a\",\"b\"}; \
+         const @nullable String[] Y = {\"a\"}; void p(); }",
+    )
+    .expect("must generate");
+    assert!(
+        out.contains(
+            "pub const r#X: Option<[Option<&str>; 2]> = Some([Some(\"a\"),Some(\"b\"),]);"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("pub const r#Y: Option<&[Option<&str>]> = Some(&[Some(\"a\"),]);"),
+        "got:\n{out}"
+    );
+}
+
+/// The pre-parse guard counts a `<` as generic nesting only once a `>` closes
+/// it, so a statement full of comparisons is not read as a deep generic.
+#[test]
+fn comparison_operators_do_not_trip_the_generic_guard() {
+    let cmp = format!(
+        "package p; parcelable P {{ int[] flags = {{ {}0<1 }}; }}",
+        "0<1, ".repeat(20)
+    );
+    assert!(
+        generate_ok(&cmp),
+        "20 comparisons in one statement must parse"
+    );
+
+    let deep = format!(
+        "package a; parcelable P {{ {}int{} x; }}",
+        "List<".repeat(15),
+        ">".repeat(15)
+    );
+    let ctx = rsbinder_aidl::SourceContext::new("t.aidl", &deep);
+    let err = rsbinder_aidl::parse_document(&ctx).expect_err("15 nested generics must be refused");
+    let rsbinder_aidl::AidlError::Parse(pe) = &err else {
+        panic!("expected a ParseError, got: {err:?}");
+    };
+    assert!(
+        pe.message.contains("generic types are nested too deeply"),
+        "got: {}",
+        pe.message
+    );
+}
+
+/// An enum reference keeps its value when it does not fit the `@Backing`
+/// type. `decl_enum`'s range check only runs when the enum itself is
+/// generated, so narrowing here would silently emit a wrong constant.
+#[test]
+fn an_out_of_range_enum_reference_is_not_truncated() {
+    let e = rsbinder_aidl::SourceContext::new(
+        "e.aidl",
+        "package a; @Backing(type=\"int\") enum E { A = 34359738367 }",
+    );
+    rsbinder_aidl::parse_document(&e).expect("the enum document parses");
+    let i = rsbinder_aidl::SourceContext::new(
+        "i.aidl",
+        "package a; interface I { const long X = E.A & -1; void p(); }",
+    );
+    let doc = rsbinder_aidl::parse_document(&i).expect("the interface document parses");
+    let (_, out) = rsbinder_aidl::Generator::new(false, false)
+        .document(&doc)
+        .expect("must generate");
+    assert!(
+        out.contains("pub const r#X: i64 = 34359738367;"),
+        "got:\n{out}"
+    );
+}
+
+/// `@RustDerive` follows AOSP's seven-trait schema: a name outside it either
+/// duplicates an impl the templates always emit or names no trait at all.
+#[test]
+fn rust_derive_accepts_only_the_aosp_schema() {
+    let out =
+        generate_str("package a; @RustDerive(Default=true, Clone=true) parcelable P { int x; }")
+            .expect("must generate");
+    assert!(!out.contains("#[derive(Default"), "got:\n{out}");
+    assert!(!out.contains("Default,"), "got:\n{out}");
+    assert!(out.contains("#[derive(Clone)]"), "got:\n{out}");
+    assert!(out.contains("impl Default for P"), "got:\n{out}");
+}
+
+/// An empty include path names the working directory — the spelling
+/// `strip_package` derives for a source sitting directly under its own
+/// package path. It must dedup against the other spellings of that directory
+/// rather than listing it twice (every import under it then resolves to two
+/// candidates) and rather than reaching cargo as a bare `rerun-if-changed=`.
+#[test]
+fn an_empty_include_path_is_the_working_directory() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("empty_include");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("P.aidl"), "package a; parcelable P { int x; }").unwrap();
+
+    let deps = rsbinder_aidl::Builder::new()
+        .include_dir(std::path::PathBuf::from(""))
+        .include_dir(std::path::PathBuf::from("."))
+        .source(root.join("P.aidl"))
+        .collect_aidl_dependencies()
+        .expect("collect_aidl_dependencies");
+    assert!(
+        !deps.iter().any(|d| d.as_os_str().is_empty()),
+        "an empty dependency path reaches cargo as a bare `rerun-if-changed=`: {deps:?}"
+    );
+    assert_eq!(
+        deps.iter()
+            .filter(|d| d.as_os_str() == "." || d.as_os_str().is_empty())
+            .count(),
+        1,
+        "`\"\"` and `\".\"` are one directory: {deps:?}"
+    );
+}
+
+/// Two spellings of one include directory (here a symlink and its target;
+/// `./aidl` versus an absolute path is the same case) are one directory: an
+/// import under it resolves to one file, not to an `AmbiguousImport`.
+#[cfg(unix)]
+#[test]
+fn one_include_directory_under_two_spellings_is_not_ambiguous() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("include_spellings");
+    let _ = std::fs::remove_dir_all(&root);
+    let aidl = root.join("aidl/hello");
+    std::fs::create_dir_all(&aidl).unwrap();
+    std::fs::write(
+        aidl.join("IHello.aidl"),
+        "package hello; import hello.IWorld; interface IHello { IWorld get(); }",
+    )
+    .unwrap();
+    std::fs::write(
+        aidl.join("IWorld.aidl"),
+        "package hello; interface IWorld { void ping(); }",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(root.join("aidl"), root.join("link")).unwrap();
+
+    // `include_dir` names the target; the source's package-derived include
+    // directory is the link.
+    rsbinder_aidl::Builder::new()
+        .include_dir(root.join("aidl"))
+        .source(root.join("link/hello/IHello.aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("one directory under two names must not be an ambiguous import");
 }
 
 /// An empty hash is falsy to Tera and would silently emit no
 /// `getInterfaceHash()` — the trap `Builder::version` already guards.
 #[test]
-#[should_panic(expected = "Builder::hash")]
+#[should_panic(expected = "the hash must be non-empty")]
 fn empty_interface_hash_is_rejected() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("empty_hash");
     let _ = std::fs::remove_dir_all(&dir);

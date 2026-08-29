@@ -114,7 +114,7 @@ fn test_unions() -> Result<(), Box<dyn Error>> {
             + UNION),
         r#"
 pub mod ByteEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ByteEnum : [i8; 3] {
             r#FOO = 1,
@@ -124,7 +124,7 @@ pub mod ByteEnum {
     }
 }
 pub mod Union {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
@@ -246,7 +246,7 @@ fn test_enums() -> Result<(), Box<dyn Error>> {
         BYTE_ENUM,
         r##"
 pub mod ByteEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ByteEnum : [i8; 3] {
             r#FOO = 1,
@@ -269,7 +269,7 @@ pub mod ByteEnum {
         "##,
         r##"
 pub mod BackendType {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#BackendType : [i8; 4] {
             r#CPP = 0,
@@ -286,7 +286,7 @@ pub mod BackendType {
         CONSTANT_EXPRESSION_ENUM,
         r##"
 pub mod ConstantExpressionEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ConstantExpressionEnum : [i32; 10] {
             r#decInt32_1 = 1,
@@ -309,7 +309,7 @@ pub mod ConstantExpressionEnum {
         INT_ENUM,
         r##"
 pub mod IntEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#IntEnum : [i32; 4] {
             r#FOO = 1000,
@@ -326,7 +326,7 @@ pub mod IntEnum {
         LONG_ENUM,
         r##"
 pub mod LongEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#LongEnum : [i64; 3] {
             r#FOO = 100000000000,
@@ -347,7 +347,7 @@ interface ITestService {
         "##),
         r##"
 pub mod ByteEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ByteEnum : [i8; 3] {
             r#FOO = 1,
@@ -357,7 +357,7 @@ pub mod ByteEnum {
     }
 }
 pub mod ITestService {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     pub trait ITestService: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "ITestService" }
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum>;
@@ -465,7 +465,7 @@ fn test_union_with_nested_enum() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod NestedUnion {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub enum r#NestedUnion {
         r#InnerField(Inner::Inner),
@@ -508,7 +508,7 @@ pub mod NestedUnion {
         }
     }
     pub mod Inner {
-        #![allow(non_upper_case_globals, non_snake_case)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
         rsbinder::declare_binder_enum! {
             r#Inner : [i32; 1] {
                 r#VALUE = 0,
@@ -538,7 +538,7 @@ fn test_union_with_nested_parcelable() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod OuterUnion {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub enum r#OuterUnion {
         r#SimpleField(i32),
@@ -591,7 +591,7 @@ pub mod OuterUnion {
         }
     }
     pub mod InnerData {
-        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
         #[derive(Debug)]
         pub struct InnerData {
             pub r#value: i32,
@@ -659,7 +659,7 @@ fn test_union_with_multiple_nested_types() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod MultiNestedUnion {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub enum r#MultiNestedUnion {
         r#RawValue(i32),
@@ -713,7 +713,7 @@ pub mod MultiNestedUnion {
         }
     }
     pub mod Status {
-        #![allow(non_upper_case_globals, non_snake_case)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
         rsbinder::declare_binder_enum! {
             r#Status : [i32; 2] {
                 r#OK = 0,
@@ -722,7 +722,7 @@ pub mod MultiNestedUnion {
         }
     }
     pub mod Metadata {
-        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
         #[derive(Debug)]
         pub struct Metadata {
             pub r#id: i32,
