@@ -211,7 +211,7 @@ impl IMemoryHeap for BpMemoryHeap {
     fn offset(&self) -> usize {
         self.mapped.get().map_or(0, |m| m.offset())
     }
-    fn base(&self) -> Option<&[u8]> {
+    fn base(&self) -> Option<super::SharedBytes<'_>> {
         self.mapped.get().and_then(|m| m.base())
     }
 }
@@ -527,7 +527,7 @@ impl IMemoryHeap for UnresolvedHeap {
     fn offset(&self) -> usize {
         0
     }
-    fn base(&self) -> Option<&[u8]> {
+    fn base(&self) -> Option<super::SharedBytes<'_>> {
         None
     }
 }

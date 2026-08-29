@@ -52,7 +52,7 @@ enum ParcelableHolderData {
         parcelable: Arc<dyn AnyParcelable>,
         name: String,
     },
-    Parcel(Parcel),
+    Parcel(Box<Parcel>),
 }
 
 /// A type-erased container for any parcelable object.
@@ -61,8 +61,9 @@ enum ParcelableHolderData {
 /// for runtime polymorphism over parcelable types. This is primarily used
 /// for AIDL union types and generic parcelable handling.
 ///
-/// Note: `ParcelableHolder` is currently not thread-safe (neither `Send` nor `Sync`)
-/// due to its internal `Parcel` which is not thread-safe.
+/// `ParcelableHolder` is `Send + Sync`: its state sits behind a `Mutex` and
+/// rsbinder's `Parcel` is plain owned data (unlike AOSP's, which wraps a raw
+/// `AParcel` pointer).
 #[derive(Debug)]
 pub struct ParcelableHolder {
     // This is a `Mutex` because of `get_parcelable`
@@ -332,7 +333,8 @@ impl Parcelable for ParcelableHolder {
         *self
             .data
             .get_mut()
-            .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Parcel(new_parcel);
+            .expect("Parcelable holder lock poisoned") =
+            ParcelableHolderData::Parcel(Box::new(new_parcel));
 
         // `append_from` checks whether `data_size` overflows
         // `parcel` and returns `BAD_VALUE` if that happens. We also

@@ -235,9 +235,14 @@ interface IHelper {
 
     assert!(
         contains_path(&deps, &helper_aidl),
-        "import unresolvable without package-derived include — \
-         either resolution is broken or the synthesised include is \
-         not being tracked: {deps:?}"
+        "import unresolvable without package-derived include: {deps:?}"
+    );
+    // The synthesised include *directory* is a separate push from the file;
+    // without it cargo never reruns when a sibling .aidl is added, leaving
+    // stale generated code behind.
+    assert!(
+        contains_path(&deps, root),
+        "package-derived include dir not recorded for rerun: {deps:?}"
     );
 }
 
@@ -278,7 +283,7 @@ interface IMain {
         .expect_err("duplicate import must be an error");
     let msg = format!("{err}");
     assert!(
-        msg.contains("multiple include directories") || msg.contains("Dep"),
+        msg.contains("multiple include directories"),
         "expected ambiguous-import diagnostic, got: {msg}"
     );
 

@@ -119,6 +119,9 @@ pub enum AsyncDecision {
 struct LocalNode {
     /// Strong ref keeps the local object alive while the peer holds it.
     binder: SIBinder,
+    /// `binder_ptr(&binder)` — the `local_by_ptr` key, kept so removal is
+    /// a map lookup rather than a scan of every node.
+    ptr: usize,
     /// RPC strong count the peer holds (0 ⇒ drop the node).
     strong: i64,
     /// AOSP `BinderNode::asyncNumber` (server side) — per-node, not
@@ -212,6 +215,7 @@ impl RpcState {
             addr,
             LocalNode {
                 binder: binder.clone(),
+                ptr,
                 strong: 1,
                 next_async_number: 0,
                 async_todo: BinaryHeap::new(),
@@ -237,14 +241,24 @@ impl RpcState {
     /// failure. The bump and this rollback are a commutative ±1 on a count, so
     /// this is safe even if another thread concurrently sends the same binder.
     /// Drops the node once the count reaches 0, exactly like an inbound DEC.
-    pub fn cancel_binder_leaving(&mut self, addr: &RpcAddress) {
+    ///
+    /// Returns the node's strong ref if this removed it; the caller must drop
+    /// it **outside** the state lock (see [`dec_strong_local`](Self::dec_strong_local)).
+    #[must_use = "drop the returned SIBinder outside the RpcState lock"]
+    pub fn cancel_binder_leaving(&mut self, addr: &RpcAddress) -> Option<SIBinder> {
         if let Some(node) = self.local_nodes.get_mut(addr) {
             node.strong -= 1;
             if node.strong <= 0 {
-                self.local_nodes.remove(addr);
-                self.local_by_ptr.retain(|_, a| a != addr);
+                return self.remove_local(addr);
             }
         }
+        None
+    }
+
+    fn remove_local(&mut self, addr: &RpcAddress) -> Option<SIBinder> {
+        let node = self.local_nodes.remove(addr)?;
+        self.local_by_ptr.remove(&node.ptr);
+        Some(node.binder)
     }
 
     /// Apply an inbound `DEC_STRONG` for `addr` by `amount` (AOSP
@@ -254,17 +268,21 @@ impl RpcState {
     /// (and its strong `SIBinder`) once the count reaches 0 — no leak. A hostile
     /// over-decrement simply removes the node early (contained: the peer loses
     /// access), and `strong: i64` cannot underflow for a `u32` amount.
-    /// Returns `true` if the node was removed.
-    pub fn dec_strong_local(&mut self, addr: &RpcAddress, amount: u32) -> bool {
+    ///
+    /// Returns the node's strong `SIBinder` if this removed it. The caller
+    /// **must drop it outside the state lock**, like [`clear_local`](Self::clear_local)'s
+    /// result: it may be the last ref to a user service whose `Drop` releases
+    /// an `RpcProxy` of this same session, and `RpcProxy::drop` re-takes this
+    /// lock (`forget_remote_if`) — dropping it in here deadlocks the session.
+    #[must_use = "drop the returned SIBinder outside the RpcState lock"]
+    pub fn dec_strong_local(&mut self, addr: &RpcAddress, amount: u32) -> Option<SIBinder> {
         if let Some(node) = self.local_nodes.get_mut(addr) {
             node.strong -= amount as i64;
             if node.strong <= 0 {
-                self.local_nodes.remove(addr);
-                self.local_by_ptr.retain(|_, a| a != addr);
-                return true;
+                return self.remove_local(addr);
             }
         }
-        false
+        None
     }
 
     /// Session death: release every local object the peer held (AOSP
@@ -292,19 +310,31 @@ impl RpcState {
     /// `RpcSessionInner::read_binder`). A fresh / re-minted proxy
     /// (dead `Weak`) is **not** excess: it is the single proxy that
     /// will itself `DEC_STRONG` at drop.
-    pub fn remote_proxy<F>(&mut self, addr: RpcAddress, make: F) -> (SIBinder, bool)
+    ///
+    /// An unknown address from **our own** subspace is refused
+    /// (`BadValue`): we mint those, so one we do not have in `local_nodes`
+    /// was forged by the peer. Minting a remote proxy for it would let a
+    /// single `RpcAddress` name both a local node and a remote proxy, and
+    /// the next legitimately minted node would collide with it (AOSP
+    /// `RpcState::onBinderEntering`: "Server received unrecognized address
+    /// which we should own the creation of").
+    pub fn remote_proxy<F>(&mut self, addr: RpcAddress, make: F) -> crate::Result<(SIBinder, bool)>
     where
         F: FnOnce() -> SIBinder,
     {
         if let Some(weak) = self.remote_proxies.get(&addr) {
             if let Some(arc) = weak.upgrade() {
-                return (SIBinder::from_arc(arc), true);
+                return Ok((SIBinder::from_arc(arc), true));
             }
+        }
+        if addr.space_tag() == self.space.tag() {
+            log::error!("RPC: peer sent an unknown address from our own subspace: {addr:?}");
+            return Err(crate::StatusCode::BadValue);
         }
         let sib = make();
         self.remote_proxies
             .insert(addr, Arc::downgrade(sib.as_arc()));
-        (sib, false)
+        Ok((sib, false))
     }
 
     /// Forget the remote-proxy table entry for `addr`, but **only if
@@ -591,11 +621,14 @@ mod tests {
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
         assert_eq!(st.local_node_count(), 1);
-        assert!(st.dec_strong_local(&a, 1), "node removed at strong 0");
+        assert!(
+            st.dec_strong_local(&a, 1).is_some(),
+            "node removed at strong 0"
+        );
         assert_eq!(st.local_node_count(), 0, "no leak");
         assert!(st.lookup_local(&a).is_none());
         // DEC_STRONG on an unknown address is safe (idempotent).
-        assert!(!st.dec_strong_local(&a, 1));
+        assert!(st.dec_strong_local(&a, 1).is_none());
     }
 
     /// A batched DEC_STRONG (`amount > 1`, as a compliant libbinder peer sends
@@ -610,7 +643,7 @@ mod tests {
         st.on_binder_leaving(&b).unwrap(); // strong 3
         assert_eq!(st.local_node_count(), 1);
         assert!(
-            st.dec_strong_local(&a, 3),
+            st.dec_strong_local(&a, 3).is_some(),
             "one batched DEC of amount 3 frees a node sent 3×"
         );
         assert_eq!(st.local_node_count(), 0, "no leak on batched drop");
@@ -628,7 +661,7 @@ mod tests {
         assert_eq!(a, a2);
         assert_eq!(st.local_node_count(), 1);
 
-        st.cancel_binder_leaving(&a);
+        let _ = st.cancel_binder_leaving(&a);
         assert_eq!(
             st.local_node_count(),
             1,
@@ -636,12 +669,12 @@ mod tests {
         );
         assert!(st.lookup_local(&a).is_some());
 
-        st.cancel_binder_leaving(&a);
+        let _ = st.cancel_binder_leaving(&a);
         assert_eq!(st.local_node_count(), 0, "last bump cancelled → node freed");
         assert!(st.lookup_local(&a).is_none());
 
         // Cancel on an unknown / already-freed address is safe.
-        st.cancel_binder_leaving(&a);
+        let _ = st.cancel_binder_leaving(&a);
     }
 
     /// A oneway send failure rolls back its reserved `async_number` only when
@@ -714,7 +747,7 @@ mod tests {
         assert_eq!(s2.local_node_count(), 0);
 
         // Mutating s1 never affects s2 (no shared storage).
-        s1.dec_strong_local(&a1, 1);
+        let _ = s1.dec_strong_local(&a1, 1);
         assert_eq!(s1.local_node_count(), 0);
         assert_eq!(s2.local_node_count(), 0);
     }
@@ -735,7 +768,9 @@ mod tests {
         // (cached `Weak` now dead) — but P1's `Drop` has not yet run.
         let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let p1 = Arc::as_ptr(sib1.as_arc()) as *const ();
-        let (got1, ex1) = st.remote_proxy(addr, || sib1.clone());
+        let (got1, ex1) = st
+            .remote_proxy(addr, || sib1.clone())
+            .expect("remote_proxy");
         assert!(!ex1, "first receipt mints a proxy — not an excess");
         drop(got1);
         drop(sib1);
@@ -743,14 +778,18 @@ mod tests {
         // Concurrent re-resolve: another `read_binder` for the SAME
         // address sees the dead `Weak` and mints + re-caches P2.
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let (got2, ex2) = st.remote_proxy(addr, || sib2.clone());
+        let (got2, ex2) = st
+            .remote_proxy(addr, || sib2.clone())
+            .expect("remote_proxy");
         assert!(!ex2, "dead-Weak ⇒ re-mint, not an excess receipt");
         let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
 
         // P1's delayed `Drop` now runs `forget_remote_if(addr, P1)`.
         // The old unconditional remove would evict the live P2 slot.
         st.forget_remote_if(&addr, p1);
-        let (again, ex_again) = st.remote_proxy(addr, || panic!("must dedup to P2, not re-make"));
+        let (again, ex_again) = st
+            .remote_proxy(addr, || panic!("must dedup to P2, not re-make"))
+            .expect("remote_proxy");
         assert!(
             Arc::ptr_eq(again.as_arc(), got2.as_arc()),
             "stale P1 Drop must not split the per-address dedup (AC-2.5/P5)"
@@ -767,10 +806,12 @@ mod tests {
         st.forget_remote_if(&addr, p2);
         let sib3 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let mut remade = false;
-        let (_p3, ex3) = st.remote_proxy(addr, || {
-            remade = true;
-            sib3.clone()
-        });
+        let (_p3, ex3) = st
+            .remote_proxy(addr, || {
+                remade = true;
+                sib3.clone()
+            })
+            .expect("remote_proxy");
         assert!(
             remade,
             "after identity-checked forget, the address re-mints"
@@ -790,7 +831,9 @@ mod tests {
         let addr = RpcAddress::from_wire_bytes([3u8; 32]);
 
         let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let (got1, _) = st.remote_proxy(addr, || sib1.clone());
+        let (got1, _) = st
+            .remote_proxy(addr, || sib1.clone())
+            .expect("remote_proxy");
         let p1 = Arc::as_ptr(got1.as_arc()) as *const ();
         assert_eq!(st.next_send_async_number(addr), 0);
         assert_eq!(st.next_send_async_number(addr), 1);
@@ -800,7 +843,9 @@ mod tests {
         drop(got1);
         drop(sib1);
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let (got2, _) = st.remote_proxy(addr, || sib2.clone());
+        let (got2, _) = st
+            .remote_proxy(addr, || sib2.clone())
+            .expect("remote_proxy");
         let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
         st.forget_remote_if(&addr, p1);
         assert_eq!(
@@ -842,18 +887,21 @@ mod tests {
         // receipts 2 and 3 are excess (2 flush DECs); proxy drop = 1.
         let mut peer = RpcState::new(AddressSpace::Initiator);
         let pb = SIBinder::new(Arc::new(Dummy)).unwrap();
-        let (_p, e1) = peer.remote_proxy(a, || pb.clone());
-        let (_p2, e2) = peer.remote_proxy(a, || pb.clone());
-        let (_p3, e3) = peer.remote_proxy(a, || pb.clone());
+        let (_p, e1) = peer.remote_proxy(a, || pb.clone()).expect("remote_proxy");
+        let (_p2, e2) = peer.remote_proxy(a, || pb.clone()).expect("remote_proxy");
+        let (_p3, e3) = peer.remote_proxy(a, || pb.clone()).expect("remote_proxy");
         assert_eq!(
             (e1, e2, e3),
             (false, true, true),
             "1st mints; 2nd/3rd are excess receipts (owe a flush DEC)"
         );
         // 2 excess DECs + 1 proxy-drop DEC = 3 = timesSent ⇒ freed.
-        assert!(!srv.dec_strong_local(&a, 1));
-        assert!(!srv.dec_strong_local(&a, 1));
-        assert!(srv.dec_strong_local(&a, 1), "3rd DEC frees the node");
+        assert!(srv.dec_strong_local(&a, 1).is_none());
+        assert!(srv.dec_strong_local(&a, 1).is_none());
+        assert!(
+            srv.dec_strong_local(&a, 1).is_some(),
+            "3rd DEC frees the node"
+        );
         assert_eq!(srv.local_node_count(), 0, "no leak (AC-2.5)");
 
         // (b) Same object sent once to each of 2 *independent* peer
@@ -866,11 +914,14 @@ mod tests {
         let x = s.on_binder_leaving(&o).unwrap(); // conn #1 send
         let _ = s.on_binder_leaving(&o).unwrap(); // conn #2 send (timesSent ⇒ 2)
         assert!(
-            !s.dec_strong_local(&x, 1),
+            s.dec_strong_local(&x, 1).is_none(),
             "conn #1 proxy drop must NOT free a node conn #2 still holds (F7)"
         );
         assert!(s.lookup_local(&x).is_some(), "sibling still reachable");
-        assert!(s.dec_strong_local(&x, 1), "conn #2 proxy drop frees it");
+        assert!(
+            s.dec_strong_local(&x, 1).is_some(),
+            "conn #2 proxy drop frees it"
+        );
         assert_eq!(s.local_node_count(), 0, "no leak");
     }
 

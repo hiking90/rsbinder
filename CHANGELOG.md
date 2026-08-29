@@ -24,6 +24,33 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **rsbinder-aidl rejects `.aidl` it used to accept.** Five inputs that
+  previously generated silently-wrong or non-compiling Rust are now build
+  errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
+  declaration with no `rust_type`, an `in out` (or `out in`) argument,
+  `self`/`Self`/`super`/`crate` used as a method, argument, enum-member,
+  declaration-name or package segment, an enum discriminant outside its
+  `@Backing` range, and a `@RustDerive` parameter outside AOSP's schema
+  (`Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`, `Eq`, `Hash`; `Debug`
+  and `Default` are accepted and dropped, since the templates always emit
+  them). All but the `in out` case (a plain syntax error) name the
+  declaration.
+- **rsbinder-aidl resolves names in AOSP's order** — enclosing scopes, then
+  imports, then the package. An `import a.IFoo` now outranks a top-level
+  `IFoo` declared in the referencing package (it used to lose to it), and a
+  qualified constant names a *direct* member of its owner: `Outer.X` no
+  longer reaches `Outer.Inner.X`. A build that leaned on either shadowing
+  fails with an unresolved-name diagnostic rather than changing value.
+- **`out` arguments of `IBinder` / `ParcelFileDescriptor` / an interface are
+  now `&mut Option<T>`** in generated traits (matching AOSP). The wire is
+  unchanged; implementations need the parameter type updated. `inout` is
+  unaffected.
+- **`@nullable` `out`/`inout` arrays of a primitive or enum are now
+  `&mut Option<Vec<T>>`**, not `&mut Option<Vec<Option<T>>>` — the element
+  `Option` encoded a null-marker word per element that libbinder does not
+  write (AOSP `UsesOptionInNullableVector`). Non-primitive elements keep the
+  `Option`, and fixed-size arrays follow the same rule. Implementations need
+  the parameter type updated.
 - **`rsbinder::service` is gone** — `Registry`, `Broker`,
   `service::{kernel,rpc}::{Host,Broker}`. Use `serve` / `connect`; the
   call-by-call mapping is under *Removed*.
@@ -53,9 +80,47 @@ short form — and the first entry is the only one no compiler will catch.
   named `StatusCode` has to be retyped.
 - **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
   is stamped at construction; only an exhaustive `match` on the enum notices.
+- **`IMemoryHeap::base` returns `Option<SharedBytes<'_>>`**, not `&[u8]`. The
+  window aliases memory another process writes at any moment, which a `&[u8]`
+  cannot soundly describe. The view is read-only (`load` / `copy_to` / `slice`
+  / `to_vec`); writes go through `write_at` on the concrete heap types, which
+  also refuses a `FLAG_READ_ONLY` mapping.
 
 ### Added
 
+- **rsbinder (`binder`):** `Strong::try_into_async` — the fallible form of
+  `into_async`. A local service published sync-only (`Bn*::new_binder`)
+  cannot back the async view; the generated cast reports `BadType`, which
+  `into_async` turns into a panic (now documented on it).
+- **rsbinder (RPC, `vsock`):** the vsock transport implements the raw
+  (unframed) byte access the android-13+ wire profile needs. Until now
+  `vsock://…?profile=android13plus` parsed and then failed at the first
+  handshake byte — on the Microdroid/AVF target the backend exists for, where
+  the peer is real libbinder and speaks only that profile.
+- **rsbinder (kernel):** a thread that talked to the binder driver now sends
+  `BINDER_THREAD_EXIT` (after a final flush) when it ends — AOSP
+  `IPCThreadState::threadDestructor`. Without it every short-lived thread that
+  made one call left a `binder_thread` behind in the kernel until the fd
+  closed, and a recycled tid inherited the dead thread's looper state.
+- **rsbinder (`hub`):** an `android_15` feature — the Android 15
+  service-manager protocol from `android-15.0.0_r6` on. That release inserted
+  `getService2` at index 1 of `IServiceManager` and shifted every transaction
+  code after it by one, without changing the SDK version, so Android 15 has
+  two protocols and no way to tell them apart by version. `android_14` still
+  serves the initial release; enable both (`android_14_plus` and everything
+  wider do) and `hub::default` probes the running service manager once to
+  pick between them. Only one enabled still works — the other numbering is
+  refused, with the missing feature named.
+
+  The module reaches services through `getService` (code 0) only, including
+  `check_service`. `getService2`/`checkService` return a `Service` union
+  whose payload *is* release-dependent (`r6` sends
+  `{binder, accessor}`, `r20`–`r36` send `{serviceWithMetadata, accessor}`),
+  and nothing on the wire says which; `getService` returns a bare
+  `@nullable IBinder` throughout. Not parsing that union is what lets one
+  module cover `r6` through `r36`. The union's `accessor` arm — VINTF
+  `<accessor>` resolution over RPC — is consequently not supported on
+  Android 15; that bridge remains Android 16 only.
 - **rsbinder (`lazy_service`):** `LazyServiceRegistrar::instance` — the
   process-wide registrar, AOSP `getInstance`. A registrar has to outlive the
   services it registers: the `IClientCallback` binder survives it (the
@@ -266,6 +331,115 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder (`shared_memory`) — breaking:** `IMemoryHeap::base` now returns
+  `Option<SharedBytes<'_>>`, a read-only view. A `&[u8]` over a `MAP_SHARED`
+  region promises the compiler an immutability the peer process does not
+  keep, so it was undefined behaviour to hold; the view copies through
+  atomics instead, and offers no store — a `FLAG_READ_ONLY` receiver maps
+  `PROT_READ`, so a writable view would let safe code fault. `read_at` /
+  `write_at` copy through the same atomics (word-sized wherever the window
+  is word-aligned), which also makes `MemoryHeapBase`'s `Sync` sound — two
+  threads writing the same window through one `Arc` used to be a data race
+  reachable from safe code. `MemoryDealer::allocate` now hands out a window
+  of the *requested* size rather than the granule-rounded one (AOSP
+  `MemoryDealer::allocate` does the same); the rounding exposed up to 31
+  bytes of whatever a freed neighbour had left in the granule.
+- **rsbinder (`shared_memory`):** `MappedHeap::from_fd` refuses a zero-length
+  fd unless it really is an ashmem device (previously any `st_size == 0` was
+  "trusted as ashmem"). A memfd the sender never `ftruncate`d mapped fine
+  and `SIGBUS`ed this process on first access — a remote crash. The Android
+  `ASHMEM_GET_SIZE` ioctl in `SharedMemory` is gated the same way, as
+  libcutils does, instead of being issued on whatever fd arrived.
+  `MemoryHeapBase::seal_future_write` reports `InvalidOperation` on
+  Linux/Android for a heap created without `FLAG_MEMFD_ALLOW_SEALING`
+  (`F_SEAL_SEAL` makes it impossible; the docs now say so — only the macOS
+  caveat was documented).
+- **rsbinder (`proxy`):** `ProxyHandle` equality is `(handle, generation)`,
+  as its own `generation` field documents, and it is now `Eq`. Comparing by
+  handle alone called two proxies equal when the kernel had recycled the
+  number for a different node.
+- **rsbinder (`Parcel`):** `set_data_position` ignores (and logs) a position
+  above `i32::MAX`, as AOSP's `LOG_ALWAYS_FATAL` guard does; and a forward
+  seek with nothing written behind it no longer inflates the byte count
+  handed to the kernel — see *Fixed*.
+- **rsbinder (entry):** `ClientOptions::tls` / `tls_server_name` on anything
+  but a `tls://` endpoint, and `ServeOptions::tls` on `unix-abstract://`, are
+  `BadValue`. Both were silently ignored — a caller asking for TLS got a
+  plaintext socket and no error. The option types already promised "never
+  ignored". A `ClientOptions::session_id` on the multi-connection path was
+  dropped the same way and opened a fresh session; it is forwarded now (the
+  session layer refuses the combination).
+- **rsbinder (RPC):** a `GET_FD_MODE` on a session already in `Unix` fd mode
+  answers `1` and changes nothing. It used to re-run the negotiation — which
+  on the client role can only ever compute `None` — so any peer packet
+  downgraded an established session, dropping in-flight fds and, on the r34
+  profile, desynchronising the fd-aware receive buffer. An unsolicited
+  `REPLY` now ends the session (AOSP `processCommand` does the same) instead
+  of being logged and skipped at wire speed. `find_conn` waits are bounded by
+  `RpcSession::set_timeout` (`TimedOut`) instead of parking forever when
+  every slot is driven by another thread. `RpcSession::shutdown` logs when it
+  finds nothing to tear down.
+- **rsbinder (`lazy_service`):** `force_persist` may **not** be called from
+  the active-services callback — the docs listed it as allowed, but it
+  re-takes the lock the callback runs under (AOSP's `forcePersist` does too,
+  and AOSP's header never allowed it either). `try_unregister` / `re_register`
+  remain the callback's tools.
+- **rsbinder-aidl — breaking:** declarations with no Rust representation are
+  now build errors instead of silently generating an empty type. A
+  `@JavaOnlyStableParcelable` declaration, or an unstructured parcelable
+  declared only with `cpp_header` / `ndk_header`, previously produced a
+  field-less `pub struct Foo {}` together with a live `Parcelable` impl that
+  wrote an empty payload — wire-incompatible with any peer that has the real
+  type, and announced only through an `eprintln!` that cargo hides without
+  `-vv`. Such a declaration is now an `AidlError::Semantic` naming the
+  declaration. A `rust_type "..."` alias is still generated as before, and
+  takes precedence over the other markers.
+- **rsbinder-aidl — breaking:** an `out` argument whose type has no `Default`
+  (`IBinder`, `ParcelFileDescriptor`, an interface `Strong<_>`) is now
+  declared as `&mut Option<T>`, matching AOSP
+  `aidl_to_rust.cpp::RustNameOf` for `OUT_ARGUMENT`. The previous `&mut T`
+  could not compile: the server's local is initialised with
+  `Default::default()`. `inout` arguments read their value from the parcel
+  and stay unwrapped. Implementations of affected traits need the parameter
+  type updated; the wire format is unchanged.
+- **rsbinder-aidl — breaking:** `in out` / `out in` argument declarations are
+  rejected. The grammar accepted a run of direction keywords and kept only
+  the last, so a mistyped `inout` silently generated one-way semantics. AOSP
+  `aidl_language_y.yy` allows a single direction; rsbinder now matches.
+- **rsbinder-aidl — breaking:** `AidlError::Template` gained a `source` field
+  carrying the underlying `tera::Error`, whose cause chain holds the detail its
+  `Display` omits. `AidlError` is not `#[non_exhaustive]`, so a `match` arm
+  written as `AidlError::Template { message }` needs `..` added.
+- **rsbinder-aidl — breaking:** `self`, `Self`, `super` and `crate` are
+  rejected as method names, argument names, enum member names, declaration
+  names and package segments (each segment of a dotted name is checked), not
+  only as parcelable/union member names. None of the four is a legal Rust raw
+  identifier, so every emission site produced code that could not compile.
+- **rsbinder-aidl — breaking:** a `@nullable` `out` or `inout` array of a
+  primitive or enum element is declared as `&mut Option<Vec<T>>`. The previous
+  `Vec<Option<T>>` element type serialised a null-marker word before every
+  element, which libbinder neither writes nor reads for primitives (AOSP
+  `aidl_to_rust.cpp::UsesOptionInNullableVector`); `in` arguments already
+  followed that rule. Elements that are parcelables, strings, binders or
+  interfaces keep the per-element `Option`.
+- **rsbinder-aidl — breaking:** `@RustDerive` accepts only the seven traits
+  AOSP's schema lists (`Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`,
+  `Eq`, `Hash`); anything else is dropped rather than interpolated into a
+  `#[derive(...)]`. `Debug` and `Default` were emitted a second time next to
+  the impl the templates always generate (E0119), and an unknown name became
+  E0405 in the generated crate.
+- **rsbinder-aidl:** the generic-nesting guard is now separate from the
+  bracket guard and much tighter (12 vs 256). Parse cost is exponential in
+  generic depth (~3.7x per level), so the old shared limit let a build hang
+  rather than report a diagnostic. Only a `<` that a `>` closes counts as
+  generic nesting, so a statement full of `<` comparisons is not mistaken for
+  one (an unclosed run is still bounded, at the looser bracket limit). The
+  diagnostic names which limit it hit — bracket nesting, generic type
+  nesting, or operators in one expression.
+- **rsbinder-aidl:** `Builder::hash("")` now panics like `Builder::version(0)`
+  already did. An empty hash is falsy to Tera and silently suppressed
+  `getInterfaceHash()`.
+
 - **rsbinder (`lazy_service`) — breaking:** `LazyServiceRegistrar` now does
   what its name says. `register_service` makes the service-manager calls
   itself — `addService` with AOSP's `FLAG_IS_LAZY_SERVICE`, then
@@ -432,6 +606,277 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
+  freed memory.** `write_transaction_data` stores raw pointers to the reply
+  parcel (or the status word on the stack) in the thread's command buffer.
+  When `wait_for_response` failed before the driver consumed that command —
+  a queued `BR_DEAD_REPLY`/`BR_FAILED_REPLY`, or an ioctl error — the
+  function returned through `?`, the reply was dropped, and the next flush
+  (`join_thread_pool`'s exit, or any later call on that thread) handed the
+  kernel the dangling pointer to copy into the peer: a cross-process
+  use-after-free. The panic path already rewound the buffer; the error path
+  did not. The reply path now retries the flush while the pointers are
+  still valid and rewinds the unconsumed tail otherwise; outbound
+  `transact` only rewinds — a retried `BC_TRANSACTION` would leave a
+  two-way call in flight whose reply the next call on that thread would
+  take as its own. An `IBinder::dec_strong` failure on the same path no longer
+  skips the reply (the two-way caller hung forever) or the transaction-state
+  restore (the next call inherited the previous caller's uid).
+- **rsbinder (`Parcel`) — a safe forward seek could make the kernel read past
+  the buffer.** `data_size()` is `max(len, pos)` (AOSP `dataSize`), and the
+  outbound path sent exactly that with `as_ptr()`, so
+  `set_data_position(1024)` on a 48-byte parcel followed by a transact made
+  the driver `copy_from_user` a kilobyte from a 256-byte allocation and
+  deliver the surplus heap to the peer — from `pub`, non-`unsafe` calls. The
+  kernel now receives the initialized length. The `Vec::set_len` contract in
+  `ParcelData` was also misstated (and one test violated it by claiming
+  never-written capacity); growing is now a separate `unsafe` entry used
+  only for the driver-filled read buffer, and the byte-copy generics
+  (`write_aligned` / `write_array` / `read_array`) are sealed behind a
+  `ParcelPod` marker instead of trusting whichever type instantiates them.
+- **rsbinder (kernel) — `become_context_manager` never asked for the
+  caller's security context.** AOSP registers with
+  `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`, the one bit the kernel reads to decide
+  whether the context manager gets `BR_TRANSACTION_SEC_CTX`; rsbinder passed
+  only `ACCEPTS_FDS`, so every transaction into `rsb_hub` arrived without a
+  security context and `get_calling_sid()` was always `None` there. The flag
+  is now set on Android and on Linux with SELinux mounted — and deliberately
+  *not* elsewhere, because a kernel that cannot produce a context fails every
+  transaction to such a node with `BR_FAILED_REPLY` (verified on a
+  non-SELinux box). `ACCEPTS_FDS` stays set, unlike AOSP, since `rsb_hub`
+  answers `DUMP_TRANSACTION`, which carries an fd.
+- **rsbinder (`parcelable`) — the array pre-allocation cap bounded the count,
+  not the bytes.** `Vec::with_capacity(min(len, data_avail()))` still
+  multiplies by `size_of::<T>()`: a 64 MiB RPC frame declaring
+  `len = 64_000_000` for `Vec<String>` requested ~1.5 GiB up front, and an
+  allocation failure aborts. Every element on that path costs at least 4 wire
+  bytes, so the cap is now `data_avail() / 4`.
+- **rsbinder (RPC) — a `DEC_STRONG` could deadlock the session.**
+  `RpcState::dec_strong_local` dropped the freed node's strong ref while the
+  state lock was held; if that was the last reference to a user service
+  holding a proxy of the same session, `RpcProxy::drop` re-took the lock on
+  the same thread. The removed reference is now handed back and dropped after
+  the guard, as `clear_local` already did. The same drop from inside a
+  dispatch used to send its `DEC_STRONG` inline, *ahead of the reply* being
+  built — so a binder passed as an argument and returned in the same call
+  (`repeatBinder`) came back to its owner after the owner had already freed
+  the node, and the owner minted a bogus proxy to itself. Such a `DEC` is
+  deferred until the slot is free, which is the ordering AOSP has.
+- **rsbinder (RPC) — a peer could plant a proxy entry in our own address
+  subspace.** `RpcState::remote_proxy` minted a remote proxy for any unknown
+  address; AOSP `onBinderEntering` refuses one the receiving side would have
+  created itself. A forged address could then alias a local node and the next
+  legitimately minted one. Refused as `BadValue` now.
+- **rsbinder (RPC, `tokio`) — a nested callback from an RPC handler
+  deadlocked in a pure-RPC process.** `BinderAsyncPool::spawn` gated the
+  run-on-this-thread arm on `ProcessState::is_initialized()`, a guard that
+  `is_handling_transaction()` had since taken over itself. Without kernel
+  binder the call went to the blocking pool, where the session's thread-local
+  re-entrancy pin does not follow it, and it parked on the slot the
+  dispatching thread was waiting on.
+- **rsbinder (RPC, macOS) — a non-`AF_UNIX` fd resolved to a root peer.**
+  `getpeereid` on a TCP socket *succeeds* on macOS with `euid = 0`
+  (measured), which the `rc != 0` ladder could not catch, so
+  `UnixTransport::from_owned_fd` on a foreign-family fd minted
+  `PeerIdentity::Local { uid: 0 }`. The socket family is checked first. On
+  Linux/Android `SO_PEERCRED` is read through libc rather than rustix's
+  `Pid(NonZeroI32)`, which the kernel's `pid == 0` (peer outside our PID
+  namespace) would have made an invalid value.
+- **rsbinder (RPC server) — the r34 (default) profile never lifted the
+  handshake *write* deadline.** Only the read side was cleared after the
+  first frame, so `SO_SNDTIMEO` stayed armed for the session's whole life and
+  a large reply to a slow reader failed with `WouldBlock` — contrary to
+  `set_handshake_timeout`'s contract. The incoming-slot cap on attach was a
+  check-then-act (concurrent attaches could overshoot it) and counted the
+  peer's callback connections against `setMaxIncomingThreads`; it is now one
+  critical section over serve-driven slots only, as AOSP counts.
+- **rsbinder (`proxy_count`) — a panicking `ProxyCountCallback` escaped a
+  `Drop`.** The remaining queued events were lost with it and, during an
+  unwind, the process aborted. Callbacks are isolated with `catch_unwind`
+  like death recipients already were.
+- **rsbinder (`lazy_service`) — a failed re-registration could hide a service
+  forever.** `restore` copied back the optimistic `registered: true` the call
+  itself had just written, so after a public `try_unregister` followed by a
+  refused `register_service` the entry said "registered" while the service
+  manager had nothing, and `re_register` skipped it for good.
+- **rsbinder (`lazy_service`) — a refused `registerClientCallback` came back
+  as `EX_TRANSACTION_FAILED`.** The service manager's own exception
+  (`EX_SECURITY` for a policy refusal, `EX_ILLEGAL_STATE` for a binder it
+  does not know) was folded into a `StatusCode` on the way through `hub`
+  and re-wrapped, so `register_service` could never report what its
+  `# Errors` section promises. The registrar now keeps the service
+  manager's `Status` for both round trips.
+- **rsbinder (`hub`, Android 15) — the numbering probe ran on every
+  `default()`.** A refused numbering (only one of `android_14` /
+  `android_15` compiled in) re-sent the probe transaction and re-logged the
+  five-line refusal on every lookup; the answer is now cached for the
+  process and logged once. A build with neither feature meeting an
+  Android 15 device also failed silently — it now names both features.
+- **rsbinder (RPC) — a proxy from another session was sent as a local
+  address.** `write_binder` reused an `RpcProxy`'s address without checking
+  which session minted it, so a proxy obtained over session A and written
+  into session B's parcel named one of A's peer's nodes on B's wire —
+  which B's peer resolved against its *own* nodes (the android-13+ address
+  is a small counter). AOSP `onBinderLeaving` refuses this with
+  `INVALID_OPERATION`; so does rsbinder now.
+- **rsbinder (`hub`, Android 15 r6+) — `check_service` starts lazy
+  services.** It is carried by `getService` (the only lookup that returns a
+  bare `IBinder` across the release range), and AOSP's servicemanager runs
+  `tryStartService` for an unregistered name on `getService` but not on
+  `checkService`. Documented on the function and in the lookup table; the
+  behaviour cannot change without parsing the release-dependent `Service`
+  union.
+- **rsbinder (`file_descriptor`) — the fd null marker accepted any non-zero
+  value** (AOSP rejects anything but `1` as `UNEXPECTED_NULL`), and a
+  reliable-pipe `ParcelFileDescriptor` from Java never received the
+  `DETACHED` notice on its comm channel, so the sender's `checkError()`
+  reported a clean close. The notice is best-effort, as in AOSP: a sender
+  that already closed its end (a oneway send followed by `close()`) no
+  longer fails the whole fd read with `BadType`, and the write cannot raise
+  `SIGPIPE`.
+- **rsbinder (RPC) — hardening and housekeeping:** `wire_android13` reads a
+  message body straight into its final buffer (a 16-byte header could commit
+  twice `bodySize` before any body byte arrived) and rejects unknown
+  `RpcWireAddress` option bits instead of normalizing them; the in-memory
+  test transport enforces `MAX_FRAME_LEN` like every real backend; a failed
+  `SCM_RIGHTS` attach is an error rather than a `debug_assert`; a reaper-thread
+  spawn failure is logged (it silently lost every deferred `DEC_STRONG`);
+  `unix-abstract` and `binder://name` URIs decode percent-escapes like their
+  siblings and `%+9` is no longer an escape.
+- **rsbinder — comments and tests that said the wrong thing:** the
+  `AccessorRoot` drop-order note (the proxy holds the session strongly), the
+  `ParcelableHolder` `!Send` claim (it is `Send + Sync`), the `obituary_sent`
+  ordering rationale, the `RefCounter` double-dec assertion (it could never
+  fire — the sentinel reset made `c == INITIAL_STRONG_VALUE`), the Android 15
+  probe pin (it never referenced the probe constant), and several tests that
+  could not fail or asserted on the wrong gate (`test_strong`, `test_errors`,
+  `test_try_from`, the `Status` round trip that could not see `message`, the
+  RPC parcel fuzz target's binder claim, the abstract-socket
+  `stdout` fd test that took ownership of fd 1).
+- **rsbinder-aidl — an unqualified constant reference could resolve to an
+  unrelated declaration's constant.** Interface constants were registered in a
+  flat symbol table under their bare name, and that table was consulted before
+  the namespace-aware lookup. With `interface IX { const int A = 999; }`
+  anywhere in the build, a sibling `parcelable P { const int A = 1; const int
+  B = A + 1; }` generated `B = 1000`. Constants are now keyed by their
+  declaring namespace and resolved outward through enclosing scopes only —
+  and an imported interface's constant (`import a.IFoo; … IFoo.BAR`) still
+  resolves, through the import's own candidate.
+- **rsbinder-aidl — a constant's expression was folded in the referencing
+  declaration's scope.** `IFoo.BAR` defined as `BASE + 1` and read from
+  `IBaz` resolved `BASE` against `IBaz`, so a same-named constant there
+  changed the value (or an absent one failed the build); the fully-qualified
+  spelling had the same problem. A constant is now folded where it is
+  declared, once per constant, so a diamond of cross-package references and
+  a genuine reference cycle (still reported as such) both terminate.
+- **rsbinder-aidl — `@JavaOnlyImmutable` parcelables and unions lost all their
+  members.** The annotation check was a `starts_with("@JavaOnly")` prefix
+  match, so it also caught `@JavaOnlyImmutable` — a *structured* parcelable
+  that AOSP's Rust backend generates normally. Affected parcelables rendered
+  as `pub struct Foo {}`, and affected unions produced no type at all.
+- **rsbinder-aidl — enum references folded incorrectly in comparisons and
+  float expressions.** `ValueType::Reference` outranked every arithmetic type
+  in the promotion order, so `Status.OK == 0` folded to `false` while
+  `0 == Status.OK` folded to `true`, `Status.OK != Status.OK` folded to
+  `true`, and a float operand was truncated to the reference's integer width.
+  A reference now promotes to its integral value, per AOSP
+  `AidlConstantReference`. `to_bool`/`to_f64` accept references too, so
+  `E.FOO || false` no longer fails to build, and unary `-E.FOO` / `~E.FOO`
+  fold like `!E.FOO` instead of failing on the unfolded reference.
+- **rsbinder-aidl — an enum reference widened the expression around it.** A
+  reference folded as `long` whatever its `@Backing` type, so with
+  `@Backing(type="int") enum F { BIT = 1 }`, `F.BIT << 31` was rejected as
+  out of range for `int` while the identical `1 << 31` folded to
+  `-2147483648`. A reference now folds at its backing width (`byte` promoting
+  to `int`, as in C++).
+- **rsbinder-aidl — a non-nullable `out` argument could send a null.** The
+  server's local for an `out` `IBinder` / `ParcelFileDescriptor` / interface
+  is `Option<T>` initialised to `None`; a service that left it unset had that
+  `None` written straight into the reply. The server now fails with
+  `UNEXPECTED_NULL` instead, as AOSP `generate_rust.cpp` does. The matching
+  guard for out `ParcelFileDescriptor` arrays now covers fixed-size arrays
+  too, which AOSP also guards.
+- **rsbinder-aidl — a `@nullable` fixed-size array wrapped its elements
+  unconditionally.** `@nullable out int[3]` became `Option<[Option<i32>; 3]>`,
+  prefixing every element with a null marker libbinder does not write, and
+  `@nullable out MyEnum[3]` did not compile at all (`declare_binder_enum!`
+  implements no `SerializeOption`). Fixed-size arrays now use the same
+  primitive/enum rule as vectors.
+- **rsbinder-aidl — the trait signature and the server local disagreed for
+  `inout` arrays.** For example `inout ParcelFileDescriptor[]` declared the
+  trait parameter as `&mut Vec<T>` while the server declared its local as
+  `Vec<Option<T>>` and passed `&mut` it straight in (E0308). Both are now
+  `Vec<T>`: an `inout` vector is read from the parcel fully populated, so its
+  elements need no `Default`, and AOSP `aidl_to_rust.cpp::RustNameOf` keeps
+  `element_mode = VALUE` for `INOUT_ARGUMENT` for the same reason.
+- **rsbinder-aidl — a fixed-size array constant did not compile.**
+  `const int[3] X = {1,2,3};` emitted `pub const r#X: &[i32; 3] = [1,2,3,];`
+  — a reference type initialised with an array literal. Fixed-size constants
+  are now value types (`[&str; N]` for `String` elements, whose initializer is
+  string literals); the variable-length form still emits a slice. A
+  `@nullable` `String` array constant now declares the element `Option` its
+  initializer actually emits — `const @nullable String[] X` was typed
+  `&[&str]` while initialised `Some(&[Some("a")])`.
+- **rsbinder-aidl — a directory source containing a symlink cycle never
+  finished.** `Path::is_dir()` follows symlinks and the visited set was keyed
+  by the path string, so `aidl/loop -> .` produced endlessly deeper paths.
+  The set is now keyed by the canonical path, and so is the include-directory
+  set: an absolute `include_dir` plus a relative `source` under the same
+  directory listed it twice, so every import beneath it was reported as an
+  `AmbiguousImport` between two spellings of one file. A source sitting
+  directly under its own package path (`source("android/os/IFoo.aidl")` with
+  `package android.os;`) derives an empty include path, which names the
+  working directory rather than a directory of its own — it no longer
+  collides with `include_dir(".")`, and no longer leaves an empty
+  `cargo:rerun-if-changed=`.
+- **rsbinder-aidl — the output directory was never created.** `generate()`
+  failed with a bare "No such file or directory (os error 2)" when `dest_dir`
+  did not exist (including the documented `aidl_gen/` fallback outside cargo)
+  or when `output` named a subdirectory. It is created on demand, and I/O
+  failures now name the path.
+- **rsbinder-aidl — a second `Builder` could inherit the first one's
+  declarations.** Parsing happens in `generate()` but the parser was reset in
+  `Builder::new()`, so two builders constructed before either generated shared
+  state: the second resolved types the first had declared without importing
+  them. The reset moved to the parse phase.
+- **rsbinder-aidl — legitimate AIDL was rejected as "nesting too deep".** The
+  pre-parse guard counted `>>` only as a shift, so generic depth accumulated
+  across a statement and a signature with 129 `List<List<T>>` arguments was
+  refused at a real nesting depth of 2.
+- **rsbinder-aidl — enum discriminants outside their `@Backing` range were
+  emitted anyway.** `@Backing(type="byte") enum E { A = 200 }` produced a
+  literal that is a deny-by-default rustc error in the generated crate,
+  pointing at `OUT_DIR` rather than the `.aidl`. The range is now checked at
+  AIDL-compile time, as AOSP does.
+- **rsbinder-aidl — two union fields could collapse into one Rust variant.**
+  `union U { int my_field; int myField; }` emitted `r#MyField` twice (E0428);
+  the collision is now a diagnostic naming both fields.
+- **rsbinder-aidl — `@RustDerive(Debug=true)` emitted `#[derive(Debug)]`
+  twice** (E0119); the templates already derive it unconditionally. A
+  parameter outside the schema (`@RustDerive(Cloen=true)`) is now a
+  diagnostic naming it; it used to be dropped silently and surface as a
+  missing trait in the user's crate.
+- **rsbinder-aidl — a nested fixed-size `out ParcelFileDescriptor` array did
+  not compile.** The `UNEXPECTED_NULL` guard iterated one level of
+  `[[Option<_>; 3]; 2]`; it now flattens one level per extra dimension.
+- **rsbinder-aidl — a `rust_type` declaration named after a Rust keyword was
+  not escaped**, unlike every other declaration path.
+- **rsbinder-aidl — a negative out-of-range shift amount was reported by its
+  magnitude.** `1 << -100` said "shift amount 100", which does not match the
+  source.
+- **rsbinder-aidl — a package segment that is a Rust keyword was emitted
+  unescaped.** `package com.example.impl;` produced `pub mod impl {`, while
+  references to it were escaped as `super::r#impl::...`. The escape list also
+  covers `gen`, reserved in Rust 2024 — generated code is compiled in the
+  consumer's edition.
+- **rsbinder-aidl — the `#[allow(clippy::all)]` / `#[allow(unused_imports)]`
+  header applied only to the first top-level module** in the generated file,
+  and to nothing at all in a document without a `package`. Both lints are now
+  part of every generated module's inner `#![allow(...)]`, alongside the
+  naming allowances; the header stays on each top-level package module, whose
+  own lints (e.g. `module_inception` against the `include!` site) an inner
+  attribute one level down cannot cover.
+
 - **rsbinder (`hub`) — Android 15 QPR builds are now refused instead of
   silently losing registrations.** `android-15.0.0_r6` inserted `getService2`
   at index 1 of `IServiceManager.aidl`, shifting every transaction code after
@@ -447,11 +892,11 @@ short form — and the first entry is the only one no compiler will catch.
   is registered, and the error says nothing about why.
   `hub::default` now measures which numbering the device speaks — one
   argument-free transaction to a code that exists in exactly one of the two —
-  and returns an error naming the situation when it is the shifted one.
-  Support for that protocol needs an `android_15` module and is not in this
-  release; the initial Android 15 release is unaffected and keeps working, and
-  so does every other version. Only kernel-binder use through `hub` is in
-  scope — the RPC transport does not go through the service manager.
+  and dispatches accordingly. The shifted numbering is served by the new
+  `android_15` feature (see *Added*); a build without it refuses the device
+  rather than addressing the wrong method, and says which feature is missing.
+  Every other version is unaffected. Only kernel-binder use through `hub` is
+  in scope — the RPC transport does not go through the service manager.
 - **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
   on Android 13/14 — each version generates its own `ConnectionInfo` and the
   dispatch arms returned the version's type where the unified one was

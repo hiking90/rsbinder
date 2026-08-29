@@ -117,7 +117,7 @@ interface IFoo {
 
 #[test]
 fn oneway_read_response_propagates_transport_error() {
-    // F4: a oneway proxy call must surface a `submit_transact` transport
+    // A oneway proxy call must surface a `submit_transact` transport
     // failure (dead object, bad type) rather than swallow it as `Ok(())`.
     // AOSP `generate_rust.cpp` emits `let _aidl_reply = _aidl_reply?;` for
     // oneway too — the `?` sits *outside* its oneway guard — so the generated
@@ -137,9 +137,9 @@ interface IFoo {
         .1;
 
     // The all-oneway interface's only `read_response` must propagate the
-    // reply Result via `?` (`_aidl_reply?;`); the non-oneway form would be
-    // `_aidl_reply?.ok_or(...)` instead, and the old buggy form was a bare
-    // `Ok(())` with no `?` at all.
+    // reply Result via `?` (`_aidl_reply?;`); the non-oneway form is
+    // `_aidl_reply?.ok_or(...)`. A bare `Ok(())` would swallow transport
+    // errors.
     assert!(
         out.contains("_aidl_reply?;"),
         "oneway read_response must propagate transport errors via `?`; generated:\n{out}"

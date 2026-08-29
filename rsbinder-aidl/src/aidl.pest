@@ -79,8 +79,10 @@ method_decl = {
 
 direction = @{ (INOUT | IN | OUT) ~ &WHITESPACE }
 
+// A single direction, as in AOSP `aidl_language_y.yy`
+// (`direction: IN | OUT | INOUT | empty`).
 arg = {
-    direction* ~ type ~ identifier
+    direction? ~ type ~ identifier
 }
 
 arg_list = { arg ~ ("," ~ arg)* }

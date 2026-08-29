@@ -30,20 +30,20 @@
 //! `SEAL_SEAL`).
 //!
 //! **Aliasing.** A shared mapping is, by definition, writable by other
-//! processes at any time. The safe accessors [`read_at`](MemoryHeapBase::read_at)
-//! / [`write_at`](MemoryHeapBase::write_at) copy through raw pointers
-//! and are always sound; [`IMemoryHeap::base`] hands out `&[u8]` for
-//! convenience and is only sound while no other party writes to the
-//! region for the lifetime of the borrow (the same caveat AOSP attaches
-//! to `IMemory::unsecurePointer()`).
+//! processes at any time, so no safe accessor ever exposes it as `&[u8]`:
+//! [`read_at`](MemoryHeapBase::read_at) / [`write_at`](MemoryHeapBase::write_at)
+//! copy through atomics, and [`IMemoryHeap::base`] returns the read-only
+//! [`SharedBytes`] view built on the same copies. Only the raw
+//! [`as_ptr`](MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
+//! caveat, and it is the caller's `unsafe` to dereference.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use super::{IMemoryHeap, FLAG_READ_ONLY};
+use super::{IMemoryHeap, Region, SharedBytes, FLAG_READ_ONLY, WORD};
 use crate::error::{Result, StatusCode};
 use crate::file_descriptor::ParcelFileDescriptor;
 
@@ -118,6 +118,32 @@ impl Mapping {
     }
 }
 
+impl Mapping {
+    /// The mapping as atomics (see [`Region`]): a plain `&[u8]` over
+    /// memory other processes write would assert an immutability the
+    /// hardware does not provide.
+    fn region(&self) -> Region<'_> {
+        let words = self.len / WORD;
+        let base = self.ptr.as_ptr();
+        // SAFETY: `ptr..ptr+len` is the live mapping owned by `self`
+        // (unmapped only in `Drop`) and the borrows cannot outlive it.
+        // `mmap` returns page-aligned memory, so the first `words * WORD`
+        // bytes are `usize`-aligned; `AtomicUsize` has `usize`'s size and
+        // alignment and `AtomicU8` is `repr(transparent)` over `u8`. The
+        // two slices are disjoint.
+        let (words, tail) = unsafe {
+            (
+                std::slice::from_raw_parts(base.cast::<AtomicUsize>(), words),
+                std::slice::from_raw_parts(
+                    base.add(words * WORD).cast::<AtomicU8>(),
+                    self.len - words * WORD,
+                ),
+            )
+        };
+        Region::new(words, tail)
+    }
+}
+
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: `ptr`/`len` came from a successful `mmap` in
@@ -142,50 +168,37 @@ struct HeapInner {
     writable: bool,
 }
 
-// SAFETY: the mapping is plain shared memory with no thread affinity;
-// the raw pointer is only dereferenced through bounds-checked copies
-// (or the documented `base()` borrow).
+// SAFETY: the only non-auto-`Send`/`Sync` member is `Mapping`'s raw
+// pointer. The region behind it has no thread affinity, and every safe
+// access through `HeapInner` goes via `Mapping::region` — atomic loads and
+// stores, uniformly word-sized on the word part — so concurrent
+// `read_at`/`write_at`/`base` from several threads (or another process)
+// are data races only in the hardware sense, never in Rust's model. Stores
+// are gated on `writable`, so a `PROT_READ` mapping is never written.
 unsafe impl Send for HeapInner {}
 unsafe impl Sync for HeapInner {}
 
 impl HeapInner {
-    fn check_range(&self, off: usize, len: usize) -> Result<NonNull<u8>> {
-        let map = self.map.as_ref().ok_or(StatusCode::InvalidOperation)?;
-        let end = off.checked_add(len).ok_or(StatusCode::BadValue)?;
-        if end > map.len {
-            return Err(StatusCode::BadValue);
-        }
-        // SAFETY: `off <= map.len` was just verified, so the offset stays
-        // inside (or one-past) the mapped allocation.
-        Ok(unsafe { NonNull::new_unchecked(map.ptr.as_ptr().add(off)) })
+    fn region(&self) -> Result<Region<'_>> {
+        self.map
+            .as_ref()
+            .map(Mapping::region)
+            .ok_or(StatusCode::InvalidOperation)
     }
 
     fn read_at(&self, off: usize, dst: &mut [u8]) -> Result<()> {
-        let src = self.check_range(off, dst.len())?;
-        // SAFETY: `src..src+len` is inside the live mapping (checked
-        // above) and `dst` is a distinct Rust buffer, so the ranges do
-        // not overlap.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), dst.len()) };
-        Ok(())
+        self.region()?.load(off, dst)
     }
 
     fn write_at(&self, off: usize, src: &[u8]) -> Result<()> {
         if !self.writable {
             return Err(StatusCode::PermissionDenied);
         }
-        let dst = self.check_range(off, src.len())?;
-        // SAFETY: as in `read_at`, with the mapping created `PROT_WRITE`
-        // (guarded by `writable`).
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), src.len()) };
-        Ok(())
+        self.region()?.store(off, src)
     }
 
-    fn base(&self) -> Option<&[u8]> {
-        // SAFETY: the mapping is live for `&self`; see the module doc
-        // for the single-writer caveat this borrow carries.
-        self.map
-            .as_ref()
-            .map(|m| unsafe { std::slice::from_raw_parts(m.ptr.as_ptr(), m.len) })
+    fn base(&self) -> Option<SharedBytes<'_>> {
+        self.region().ok().map(SharedBytes::whole)
     }
 
     fn as_ptr(&self) -> Option<*mut u8> {
@@ -212,8 +225,15 @@ impl HeapInner {
     /// Make every *future* exported mapping read-only
     /// (`F_SEAL_FUTURE_WRITE` on Linux/Android; switch to the
     /// `O_RDONLY` handle on macOS). Existing mappings stay as they are.
+    /// `InvalidOperation` when the fd refuses further seals (`F_SEAL_SEAL`).
     fn seal_future_write(&self) -> Result<()> {
-        backend::seal_future_write(&self.fd, self.ro_fd.as_ref())?;
+        backend::seal_future_write(&self.fd, self.ro_fd.as_ref()).map_err(|e| {
+            if e == StatusCode::PermissionDenied {
+                StatusCode::InvalidOperation
+            } else {
+                e
+            }
+        })?;
         self.export_ro.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -498,9 +518,19 @@ impl MemoryHeapBase {
     /// Make every mapping created from fds exported **after** this
     /// call read-only (`F_SEAL_FUTURE_WRITE` on Linux/Android; the
     /// `O_RDONLY` handle on macOS). The owner's own mapping stays
-    /// writable. Unlike Linux, macOS cannot revoke an `O_RDWR` fd that
-    /// was already handed out — create the heap with
-    /// [`FLAG_READ_ONLY`] when peers must never write.
+    /// writable.
+    ///
+    /// **Linux/Android**: only possible for a heap created with
+    /// [`FLAG_MEMFD_ALLOW_SEALING`]. Every other heap is created with
+    /// `F_SEAL_SEAL` (AOSP `MemoryHeapBase` does the same), after which
+    /// the kernel refuses further seals — this then returns
+    /// `InvalidOperation`. Decide at construction: `FLAG_READ_ONLY` for
+    /// a heap peers must never write, `FLAG_MEMFD_ALLOW_SEALING` for one
+    /// that should be sealable later.
+    ///
+    /// **macOS**: always succeeds, but cannot revoke an `O_RDWR` fd that
+    /// was already handed out — create the heap with [`FLAG_READ_ONLY`]
+    /// when peers must never write.
     pub fn seal_future_write(&self) -> Result<()> {
         self.0.seal_future_write()
     }
@@ -536,7 +566,7 @@ impl IMemoryHeap for MemoryHeapBase {
     fn offset(&self) -> usize {
         self.0.offset
     }
-    fn base(&self) -> Option<&[u8]> {
+    fn base(&self) -> Option<SharedBytes<'_>> {
         self.0.base()
     }
 }
@@ -568,16 +598,25 @@ impl std::fmt::Debug for MappedHeap {
 
 impl MappedHeap {
     /// Map `size` bytes at `offset` of `fd`. `offset` must be
-    /// page-aligned and `size` non-zero (`BadValue` otherwise). When the
-    /// fd reports a non-zero `st_size` (memfd, shm) the range must fit
-    /// inside it; ashmem char-device fds report `0` and are trusted.
+    /// page-aligned and `size` non-zero (`BadValue` otherwise). The range
+    /// must fit inside the fd's `st_size`; the one fd kind that reports
+    /// `0` yet backs a region — a legacy `/dev/ashmem` fd — is trusted
+    /// only after it is verified to *be* ashmem. Any other zero-length
+    /// fd (a memfd the sender never `ftruncate`d, say) is refused: the
+    /// `mmap` past EOF would succeed and the first access would `SIGBUS`
+    /// this process on the peer's behalf.
     pub fn from_fd(fd: OwnedFd, size: usize, offset: usize, flags: u32) -> Result<Self> {
         if size == 0 || offset % page_size() != 0 {
             return Err(StatusCode::BadValue);
         }
         let end = offset.checked_add(size).ok_or(StatusCode::BadValue)?;
         let st_size = rustix::fs::fstat(&fd)?.st_size;
-        if st_size > 0 && (end as u64) > st_size as u64 {
+        if st_size <= 0 {
+            if !super::shared::is_ashmem_fd(fd.as_fd()) {
+                log::error!("shared memory fd has no backing size and is not ashmem");
+                return Err(StatusCode::BadValue);
+            }
+        } else if (end as u64) > st_size as u64 {
             return Err(StatusCode::BadValue);
         }
         let writable = flags & FLAG_READ_ONLY == 0;
@@ -642,9 +681,10 @@ impl MappedHeap {
         self.0.seals()
     }
 
-    /// See [`MemoryHeapBase::seal_future_write`]. On macOS a received
-    /// fd cannot be re-opened read-only, so this is `InvalidOperation`
-    /// there.
+    /// See [`MemoryHeapBase::seal_future_write`]: `InvalidOperation` on a
+    /// Linux/Android fd sealed with `F_SEAL_SEAL` (every heap not created
+    /// with [`FLAG_MEMFD_ALLOW_SEALING`]), and on macOS for any received
+    /// fd, which cannot be re-opened read-only.
     pub fn seal_future_write(&self) -> Result<()> {
         self.0.seal_future_write()
     }
@@ -675,7 +715,7 @@ impl IMemoryHeap for MappedHeap {
     fn offset(&self) -> usize {
         self.0.offset
     }
-    fn base(&self) -> Option<&[u8]> {
+    fn base(&self) -> Option<SharedBytes<'_>> {
         self.0.base()
     }
 }
@@ -732,7 +772,52 @@ mod tests {
             h.read_at(usize::MAX, &mut buf).unwrap_err(),
             StatusCode::BadValue
         );
-        assert_eq!(&h.base().unwrap()[10..15], b"hello");
+        let base = h.base().unwrap();
+        assert_eq!(base.slice(10, 5).unwrap().to_vec(), b"hello");
+        assert_eq!(base.load(10), Some(b'h'));
+        assert_eq!(base.load(ps), None);
+        assert!(base.slice(ps - 1, 2).is_none());
+        let mut two = [0u8; 2];
+        assert_eq!(
+            base.copy_to(ps - 1, &mut two).unwrap_err(),
+            StatusCode::BadValue
+        );
+    }
+
+    /// Copies that start and end inside a word, span several words, and
+    /// run into the sub-word tail of an odd-sized mapping all round-trip,
+    /// and a partial-word store leaves its neighbours alone.
+    #[test]
+    fn unaligned_copies_round_trip_and_preserve_neighbours() {
+        let ps = page_size();
+        let owner = MemoryHeapBase::new(ps, 0).unwrap();
+        let odd = ps - 3;
+        let rx = MappedHeap::from_parcel_fd(owner.to_parcel_fd().unwrap(), odd, 0, 0).unwrap();
+        let pattern: Vec<u8> = (0..odd).map(|i| (i * 7 % 251) as u8).collect();
+        rx.write_at(0, &pattern).unwrap();
+        for (off, len) in [
+            (0, 1),
+            (3, 5),
+            (5, 11),
+            (7, 1),
+            (odd - 20, 20),
+            (odd - 1, 1),
+            (0, odd),
+        ] {
+            let mut got = vec![0u8; len];
+            rx.read_at(off, &mut got).unwrap();
+            assert_eq!(got, &pattern[off..off + len], "off={off} len={len}");
+            owner.read_at(off, &mut got).unwrap();
+            assert_eq!(got, &pattern[off..off + len], "owner off={off} len={len}");
+        }
+        rx.write_at(9, b"xyz").unwrap();
+        let mut word = [0u8; 16];
+        rx.read_at(8, &mut word).unwrap();
+        assert_eq!(&word[..1], &pattern[8..9]);
+        assert_eq!(&word[1..4], b"xyz");
+        assert_eq!(&word[4..], &pattern[12..24]);
+        assert_eq!(rx.base().unwrap().len(), odd);
+        assert_eq!(rx.base().unwrap().to_vec()[..8], pattern[..8]);
     }
 
     #[test]
@@ -827,6 +912,37 @@ mod tests {
     mod linux {
         use super::*;
 
+        // The macOS module has the mirror-image test (there the call is a
+        // no-op that always succeeds); this pins the Linux precondition so
+        // the platform split shows up in CI.
+        #[test]
+        fn seal_future_write_needs_allow_sealing() {
+            assert_eq!(
+                MemoryHeapBase::new(4096, 0)
+                    .unwrap()
+                    .seal_future_write()
+                    .unwrap_err(),
+                StatusCode::InvalidOperation
+            );
+            let h = MemoryHeapBase::new(4096, FLAG_MEMFD_ALLOW_SEALING).unwrap();
+            h.seal_future_write().unwrap();
+            assert_ne!(h.seals().unwrap() & SEAL_FUTURE_WRITE, 0);
+        }
+
+        #[test]
+        fn mapped_heap_reports_seal_seal_as_invalid_operation() {
+            let h = MemoryHeapBase::new(4096, 0).unwrap();
+            let rx = MappedHeap::from_parcel_fd(h.to_parcel_fd().unwrap(), h.size(), 0, 0).unwrap();
+            assert_eq!(
+                rx.seal_future_write().unwrap_err(),
+                StatusCode::InvalidOperation
+            );
+            let h = MemoryHeapBase::new(4096, FLAG_MEMFD_ALLOW_SEALING).unwrap();
+            let rx = MappedHeap::from_parcel_fd(h.to_parcel_fd().unwrap(), h.size(), 0, 0).unwrap();
+            rx.seal_future_write().unwrap();
+            assert_ne!(rx.seals().unwrap() & SEAL_FUTURE_WRITE, 0);
+        }
+
         #[test]
         fn default_seals_are_grow_shrink_seal() {
             let h = MemoryHeapBase::new(4096, 0).unwrap();
@@ -911,12 +1027,13 @@ mod tests {
 
         #[test]
         fn regular_file_is_not_shrink_protected() {
+            let path = std::env::temp_dir().join(format!("rsb-shm-probe-{}", std::process::id()));
             let f = std::fs::File::options()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(std::env::temp_dir().join(format!("rsb-shm-probe-{}", std::process::id())))
+                .open(&path)
                 .unwrap();
             f.set_len(page_size() as u64).unwrap();
             let fd = OwnedFd::from(f);
@@ -926,6 +1043,8 @@ mod tests {
                 MappedHeap::from_fd_strict(fd, page_size(), 0, 0).unwrap_err(),
                 StatusCode::InvalidOperation
             );
+            drop(probe);
+            let _ = std::fs::remove_file(path);
         }
 
         #[test]

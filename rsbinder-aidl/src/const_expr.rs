@@ -4,14 +4,8 @@
 use crate::error::ConstExprError;
 use crate::parser;
 
-/// Maximum structural nesting depth for constant-expression evaluation.
-///
-/// `.aidl` source is untrusted input to the compiler; a pathologically
-/// nested expression (e.g. thousands of parentheses) would otherwise
-/// recurse `calculate_with_visited` until the thread stack overflows and
-/// aborts the process. Real AIDL constants nest only a handful of levels,
-/// so this bound is far above any legitimate input while staying well
-/// below the frame budget that triggers a stack overflow.
+// Bounds `calculate_with_visited` recursion: untrusted `.aidl` nesting would
+// otherwise overflow the stack and abort the process.
 const MAX_EXPR_DEPTH: usize = 256;
 
 macro_rules! arithmetic_bit_op {
@@ -31,10 +25,6 @@ macro_rules! arithmetic_bit_op {
                     Ok(ConstExpr::new(ValueType::Int32(value as _)))
                 }
                 ValueType::Int64(_) => {
-                    let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
-                    Ok(ConstExpr::new(ValueType::Int64(value as _)))
-                }
-                ValueType::Reference { .. } => {
                     let value = ($lhs.to_i64()? $op $rhs.to_i64()?);
                     Ok(ConstExpr::new(ValueType::Int64(value as _)))
                 }
@@ -132,9 +122,6 @@ macro_rules! arithmetic_basic_op {
                 }
                 ValueType::Bool(_) => {
                     Ok(ConstExpr::new(ValueType::Bool(int_op(lhs.to_i64()?, rhs.to_i64()?)? != 0)))
-                }
-                ValueType::Reference { .. } => {
-                    Ok(ConstExpr::new(ValueType::Int64(int_op(lhs.to_i64()?, rhs.to_i64()?)? as _)))
                 }
                 _ => {
                     Err(ConstExprError::new(format!(
@@ -290,7 +277,12 @@ impl ValueType {
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(!*v))),
             ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(!*v))),
             ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(!*v))),
-            ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Bool(!*v))),
+            ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Int32(!i32::from(*v)))),
+            ValueType::Reference {
+                enum_type, value, ..
+            } => parser::enum_reference_promoted(enum_type, *value)
+                .value
+                .unary_not(),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
                 expr.value.unary_not()
@@ -344,9 +336,13 @@ impl ValueType {
             ValueType::String(_) => Err(ConstExprError::new(
                 "can't apply unary operator '-' to a string",
             )),
-            ValueType::Void | ValueType::Bool(_) | ValueType::Char(_) => {
-                Ok(ConstExpr::new(self.clone()))
-            }
+            ValueType::Void | ValueType::Char(_) => Ok(ConstExpr::new(self.clone())),
+            ValueType::Bool(v) => Ok(ConstExpr::new(ValueType::Int32(-i32::from(*v)))),
+            ValueType::Reference {
+                enum_type, value, ..
+            } => parser::enum_reference_promoted(enum_type, *value)
+                .value
+                .unary_minus(),
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(
                 v.checked_neg().ok_or_else(|| overflow(*v))?,
             ))),
@@ -389,6 +385,7 @@ impl ValueType {
             ValueType::Int32(v) => Ok(*v != 0),
             ValueType::Int64(v) => Ok(*v != 0),
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v != 0.),
+            ValueType::Reference { value, .. } => Ok(*value != 0),
             ValueType::Array(_) => Err(ConstExprError::new("to_bool() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
@@ -437,6 +434,7 @@ impl ValueType {
             ValueType::Int32(v) => Ok(*v as _),
             ValueType::Int64(v) => Ok(*v as _),
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
+            ValueType::Reference { value, .. } => Ok(*value as _),
             ValueType::Array(_) => Err(ConstExprError::new("to_f64() for Array is not supported")),
             ValueType::Name(name) => {
                 let expr = parser::name_to_const_expr(name);
@@ -787,13 +785,16 @@ impl ValueType {
                 // type instead silently miscompiles (e.g. `1 << 40` folds to
                 // 0). Reject an out-of-range amount up front to match AOSP.
                 let bits: u32 = match &promoted {
-                    ValueType::Int64(_) | ValueType::Reference { .. } => 64,
+                    ValueType::Int64(_) => 64,
                     // Int32 / Byte both integral-promote to `int` for the shift.
                     _ => 32,
                 };
                 if amount >= bits as u64 {
+                    // Report the amount as written: `amount` is its magnitude
+                    // after a negative value flipped the shift direction, so
+                    // quoting it would not match the source.
                     return Err(ConstExprError::new(format!(
-                        "shift amount {amount} out of range for operator '{operator}' \
+                        "shift amount {raw_amount} out of range for operator '{operator}' \
                          (operand width {bits} bits)"
                     )));
                 }
@@ -835,7 +836,6 @@ impl ValueType {
                     ValueType::Int32(_) => Ok(ConstExpr::new(ValueType::Int32(value as _))),
                     ValueType::Int64(_) => Ok(ConstExpr::new(ValueType::Int64(value as _))),
                     ValueType::Byte(_) => Ok(ConstExpr::new(ValueType::Byte(value as _))),
-                    ValueType::Reference { .. } => Ok(ConstExpr::new(ValueType::Int64(value as _))),
                     _ => Err(ConstExprError::new(format!(
                         "can't apply shift operator '{}' to non-integer type: {}",
                         operator,
@@ -1027,6 +1027,19 @@ fn type_conversion(lhs: ValueType, rhs: ValueType) -> ValueType {
 }
 
 fn integral_promotion(value_type: ValueType) -> ValueType {
+    // An enum reference is its integral value in a binary expression (AOSP
+    // `AidlConstantReference`). Left as its own type it outranks every
+    // arithmetic type in `order()`, so `type_conversion` would pick it as the
+    // promoted type and comparisons would fall through to `partial_cmp`'s
+    // `None` arm.
+    if let ValueType::Reference {
+        ref enum_type,
+        value,
+        ..
+    } = value_type
+    {
+        return parser::enum_reference_promoted(enum_type, value).value;
+    }
     let i32_order = ValueType::Int32(0).order();
     let value_order = value_type.order();
 
@@ -1367,7 +1380,7 @@ mod tests {
         assert_eq!(converted, ConstExpr::new(ValueType::Double(value)));
     }
 
-    // 4.3g: Array.to_bool() returns Err (not panic)
+    // Array.to_bool() returns Err (not panic)
     #[test]
     fn test_array_to_bool_returns_error() {
         let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
@@ -1375,7 +1388,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // 4.3h: Array.to_i64() returns Err (not panic)
+    // Array.to_i64() returns Err (not panic)
     #[test]
     fn test_array_to_i64_returns_error() {
         let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);
@@ -1383,7 +1396,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // 4.3i: Array.to_f64() returns Err (not panic)
+    // Array.to_f64() returns Err (not panic)
     #[test]
     fn test_array_to_f64_returns_error() {
         let arr = ValueType::Array(vec![ConstExpr::new(ValueType::Int32(1))]);

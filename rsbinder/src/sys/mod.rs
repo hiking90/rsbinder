@@ -1,21 +1,22 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(
+// Lint allowances scoped to the bindgen output so `dead_code` stays live
+// for the hand-written wrappers below (an ioctl the crate never issues is
+// then visible).
+#[allow(
     non_camel_case_types,
     non_upper_case_globals,
     dead_code,
     non_snake_case,
-    unused_qualifications
+    unused_qualifications,
+    clippy::unreadable_literal,
+    clippy::missing_safety_doc
 )]
-// `missing_safety_doc` is allowed for the bindgen-generated `sys.rs`
-// below: it emits many `pub unsafe fn` FFI bindings without `# Safety`
-// rustdoc and is not hand-editable. The hand-written ioctl wrappers in
-// this module are safe `pub(crate) fn`, so the lint does not apply to
-// them; their inner `unsafe` blocks carry explicit SAFETY comments.
-#![allow(clippy::unreadable_literal, clippy::missing_safety_doc)]
-
-include!("sys.rs");
+mod raw {
+    include!("sys.rs");
+}
+pub use raw::*;
 
 pub mod binder {
     pub use crate::sys::*;
@@ -61,8 +62,10 @@ pub mod binder {
     // "Unknown BR_ return" and the kernel wire stays byte-unchanged.
     pub const BR_TRANSACTION_PENDING_FROZEN: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_TRANSACTION_PENDING_FROZEN;
+    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BR_FROZEN_BINDER: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_FROZEN_BINDER;
+    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BR_CLEAR_FREEZE_NOTIFICATION_DONE: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_CLEAR_FREEZE_NOTIFICATION_DONE;
 
@@ -85,6 +88,9 @@ pub mod binder {
         binder_driver_command_protocol_BC_INCREFS_DONE;
     pub const BC_ACQUIRE_DONE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_ACQUIRE_DONE;
+    // Names the driver defines but neither AOSP libbinder nor rsbinder ever
+    // sends; kept so the table matches the UAPI header.
+    #[allow(dead_code)]
     pub const BC_ATTEMPT_ACQUIRE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_ATTEMPT_ACQUIRE;
     pub const BC_REGISTER_LOOPER: binder_driver_command_protocol =
@@ -99,8 +105,10 @@ pub mod binder {
         binder_driver_command_protocol_BC_CLEAR_DEATH_NOTIFICATION;
     pub const BC_DEAD_BINDER_DONE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_DEAD_BINDER_DONE;
+    #[allow(dead_code)] // never sent, see BC_ATTEMPT_ACQUIRE
     pub const BC_TRANSACTION_SG: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_TRANSACTION_SG;
+    #[allow(dead_code)] // never sent, see BC_ATTEMPT_ACQUIRE
     pub const BC_REPLY_SG: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_REPLY_SG;
 
@@ -109,10 +117,13 @@ pub mod binder {
     // these constants plus the `binder_handle_cookie` struct and
     // `binder_frozen_state_info` payload are exposed so call sites can
     // pattern-match on them once the dispatch arms land.
+    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BC_REQUEST_FREEZE_NOTIFICATION: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_REQUEST_FREEZE_NOTIFICATION;
+    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BC_CLEAR_FREEZE_NOTIFICATION: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_CLEAR_FREEZE_NOTIFICATION;
+    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BC_FREEZE_NOTIFICATION_DONE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_FREEZE_NOTIFICATION_DONE;
 
@@ -213,6 +224,8 @@ pub mod binder {
     }
 
     // nix::ioctl_readwrite!(binder_ctl_add, b'b', 1, binderfs_device);
+    // `binderfs::add_device` substitutes a mock under `cfg(test)`.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
         fd: Fd,
         device: &mut binderfs_device,
@@ -228,6 +241,8 @@ pub mod binder {
     }
 
     // nix::ioctl_write_ptr!(set_idle_timeout, b'b', 3, __s64);
+    // BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for UAPI completeness.
+    #[allow(dead_code)]
     pub(crate) fn set_idle_timeout<Fd: AsFd>(
         fd: Fd,
         timeout: i64,
@@ -240,6 +255,8 @@ pub mod binder {
     }
 
     // nix::ioctl_write_ptr!(set_idle_priority, b'b', 6, __s32);
+    // BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for UAPI completeness.
+    #[allow(dead_code)]
     pub(crate) fn set_idle_priority<Fd: AsFd>(
         fd: Fd,
         priority: i32,
@@ -261,6 +278,8 @@ pub mod binder {
     }
 
     // nix::ioctl_readwrite!(get_node_debug_info, b'b', 11, binder_node_debug_info);
+    // debug-only ioctl; no crate path issues it yet.
+    #[allow(dead_code)]
     pub(crate) fn get_node_debug_info<Fd: AsFd>(
         fd: Fd,
         node_debug_info: &mut binder_node_debug_info,
@@ -291,6 +310,8 @@ pub mod binder {
     }
 
     // nix::ioctl_write_ptr!(freeze, b'b', 14, binder_freeze_info);
+    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
+    #[allow(dead_code)]
     pub(crate) fn freeze<Fd: AsFd>(
         fd: Fd,
         info: binder_freeze_info,
@@ -306,6 +327,8 @@ pub mod binder {
     }
 
     // nix::ioctl_readwrite!(get_frozen_info, b'b', 15, binder_frozen_status_info);
+    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
+    #[allow(dead_code)]
     pub(crate) fn get_frozen_info<Fd: AsFd>(
         fd: Fd,
         frozen_info: &mut binder_frozen_status_info,

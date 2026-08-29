@@ -90,7 +90,7 @@ union FooUnion {
 
 #[test]
 fn no_descriptor_annotation_uses_package_path() {
-    // R2 regression: an interface without `@Descriptor` must still wire
+    // An interface without `@Descriptor` must still wire
     // up the package-derived descriptor (`test.pkg.IFoo`).
     let out = generate(
         r#"

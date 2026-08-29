@@ -47,6 +47,16 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Android 15 from `android-15.0.0_r6` on — the QPR numbering, with
+    // `getService2` inserted at index 1. Earlier Android 15 builds speak the
+    // Android 14 interface above; `hub::default` measures which one a device
+    // has. See `hub::servicemanager_15`.
+    new_builder()
+        .source(PathBuf::from("aidl/15/android/os/IServiceManager.aidl"))
+        .output(PathBuf::from("service_manager_15.rs"))
+        .generate()
+        .unwrap();
+
     new_builder()
         .source(PathBuf::from("aidl/16/android/os/IServiceManager.aidl"))
         .output(PathBuf::from("service_manager_16.rs"))

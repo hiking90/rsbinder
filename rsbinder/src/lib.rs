@@ -39,10 +39,13 @@
 //! - `android_10` … `android_16`, plus the `android_*_plus` ranges (e.g.
 //!   `android_11_plus`) — select which Android service-manager protocol
 //!   versions to support. Android 10 uses the legacy C service-manager
-//!   protocol. Android 15 and 17 need no dedicated flag: their
-//!   service-manager wire format is identical to Android 14 and
-//!   Android 16 respectively, so they are served by `android_14` /
-//!   `android_16`.
+//!   protocol. Android 17 needs no dedicated flag: its service-manager wire
+//!   format is identical to Android 16's, so `android_16` serves it.
+//!   Android 15 has **two** protocols and one SDK version —
+//!   `android-15.0.0_r6` renumbered the interface — so `android_14` serves
+//!   its initial release and `android_15` serves `r6` and later; enable both
+//!   to cover every Android 15 device. The choice is measured at runtime,
+//!   not derived from the SDK version.
 //!
 //! # Basic Usage
 //!
@@ -167,12 +170,7 @@ pub mod binderfs;
 pub mod error;
 /// File descriptor wrapper for IPC
 pub mod file_descriptor;
-// `LazyServiceRegistrar` — AOSP
-// `frameworks/native/libs/binder/LazyServiceRegistrar.cpp`. Kept as a plain
-// (non-doc) comment for the reason spelled out at `entry` below: an outer
-// doc here merges with the module's inner `//!` docs and re-resolves their
-// intra-doc links at the crate root, where the module's own types are not
-// in scope.
+// `LazyServiceRegistrar`; documented inside (an outer doc would re-resolve its links at the crate root, as at `entry`).
 pub mod lazy_service;
 mod macros;
 /// Native service implementation helpers
@@ -322,6 +320,8 @@ pub fn sdk_at_least(version: u32) -> bool {
     get_android_sdk_version() >= version
 }
 
+/// Returns `true` when the runtime Android SDK version is at least `version`.
+/// On non-Android platforms this always returns `true`.
 #[cfg(not(target_os = "android"))]
 #[inline]
 pub fn sdk_at_least(_version: u32) -> bool {

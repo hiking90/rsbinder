@@ -40,7 +40,7 @@ parcelable StructuredParcelable {
         "##,
         r##"
 pub mod ITestService {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     pub trait ITestService: rsbinder::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>>;
@@ -215,7 +215,7 @@ pub mod ITestService {
     }
 }
 pub mod StructuredParcelable {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub struct StructuredParcelable {
         pub r#value: i32,
@@ -283,7 +283,7 @@ parcelable FixedSizeArrayExample {
         "##,
         r##"
 pub mod FixedSizeArrayExample {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub struct FixedSizeArrayExample {
         pub r#int2x3: [[i32; 3]; 2],
@@ -331,7 +331,7 @@ pub mod FixedSizeArrayExample {
         fn descriptor() -> &'static str { "android.aidl.fixedsizearray.FixedSizeArrayExample" }
     }
     pub mod IRepeatFixedSizeArray {
-        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
         pub trait IRepeatFixedSizeArray: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]>;
@@ -416,7 +416,7 @@ pub mod FixedSizeArrayExample {
         }
     }
     pub mod ByteEnum {
-        #![allow(non_upper_case_globals, non_snake_case)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
         rsbinder::declare_binder_enum! {
             r#ByteEnum : [i8; 1] {
                 r#A = 0,
@@ -424,7 +424,7 @@ pub mod FixedSizeArrayExample {
         }
     }
     pub mod IntParcelable {
-        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
         #[derive(Debug)]
         #[derive(Clone,Copy,PartialEq)]
         pub struct IntParcelable {
@@ -459,7 +459,7 @@ pub mod FixedSizeArrayExample {
         }
     }
     pub mod IEmptyInterface {
-        #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
         pub trait IEmptyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface" }
             fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {

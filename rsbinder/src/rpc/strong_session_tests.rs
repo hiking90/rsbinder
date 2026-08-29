@@ -23,6 +23,7 @@ use crate::{
 const DESC: &str = "rsbinder.test.IHolder";
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_SET_CB: TransactionCode = FIRST_CALL_TRANSACTION + 1;
+const TX_REPEAT: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 
 /// A service that stores whatever binder it is handed — the shape that
 /// forms `session → local node → service → proxy → session`.
@@ -52,6 +53,11 @@ impl Remotable for Holder {
                 *self.cb.lock().unwrap() = Some(b);
                 reply.write(&Status::from(StatusCode::Ok))
             }
+            TX_REPEAT => {
+                let b: Option<SIBinder> = reader.read()?;
+                reply.write(&Status::from(StatusCode::Ok))?;
+                reply.write(&b)
+            }
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
@@ -76,6 +82,20 @@ fn echo(b: &SIBinder, s: &str) -> Result<String> {
         return Err(StatusCode::from(st));
     }
     r.read::<String>()
+}
+
+fn repeat(b: &SIBinder, arg: &SIBinder) -> Result<Option<SIBinder>> {
+    let rp = rpc_of(b);
+    let mut d = rp.build_request(DESC)?;
+    d.write(&Some(arg.clone()))?;
+    let mut r = rp
+        .transact(TX_REPEAT, &d, 0)?
+        .ok_or(StatusCode::UnexpectedNull)?;
+    let st: Status = r.read()?;
+    if !st.is_ok() {
+        return Err(StatusCode::from(st));
+    }
+    r.read::<Option<SIBinder>>()
 }
 
 fn set_cb(b: &SIBinder, cb: &SIBinder) -> Result<()> {
@@ -235,16 +255,88 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     drop(server);
 
     drop(cb);
-    // Still reachable through the local node the server never DEC'd.
-    assert!(
-        probe.upgrade().is_some(),
-        "pre-condition: cycle keeps inner alive"
-    );
+    // `root` is a proxy and so strong on the session: the inner is alive
+    // here whether or not the cycle through the local node exists, which
+    // is why the test asserts only on the state after `root` is dropped.
+    drop(client);
     assert!(echo(&root, "x").is_err(), "peer is gone");
     drop(root);
-    drop(client);
     assert!(
         wait_gone(&probe),
         "client session leaked through callback → root proxy"
     );
+}
+
+/// The `DEC_STRONG` for a proxy a handler received as an argument goes
+/// out *after* the reply and on the *same* connection — even when the
+/// session has an idle callback slot (a real-libbinder peer's incoming
+/// connection) that a free-slot scan would pick first. Sent there it
+/// races the reply on the serving connection, and a peer that handles
+/// the DEC first frees the node the reply names. In-crate because only
+/// the raw handshake helper can open a callback connection.
+#[test]
+fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
+    use crate::rpc::wire_android13::{client_connect_with_id, FD_MODE_NONE};
+    use crate::rpc::RpcServer;
+    use std::io::Read;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rsb_rpc_decorder_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(2);
+    server.set_root(Interface::as_binder(&Binder::new(Holder::default())));
+    let bg = server.run_background();
+    for _ in 0..400 {
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let client = RpcSession::setup_unix_client_android13plus(&path, 2).expect("connect");
+    let sid = client.get_session_id().expect("session id");
+    let mut callback_conn = UnixStream::connect(&path).expect("raw connect");
+    client_connect_with_id(&mut callback_conn, 2, true, FD_MODE_NONE, &sid)
+        .expect("attach an incoming (callback) connection");
+    // The callback slot is admitted asynchronously by the accept worker.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let root = client.get_root().expect("root");
+    let cb: SIBinder = Interface::as_binder(&Binder::new(Holder::default()));
+    for i in 0..100 {
+        let back = repeat(&root, &cb).expect("repeat");
+        assert_eq!(
+            back.as_ref(),
+            Some(&cb),
+            "iteration {i}: not the same local object"
+        );
+    }
+
+    // Nothing may have been sent on the callback connection: every DEC
+    // went out behind its reply on the serving connection.
+    callback_conn
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("read timeout");
+    let mut buf = [0u8; 64];
+    match callback_conn.read(&mut buf) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        other => panic!("callback connection carried traffic: {other:?}"),
+    }
+
+    drop(root);
+    drop(client);
+    server.shutdown();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
 }

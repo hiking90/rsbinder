@@ -1,12 +1,23 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 3 semantic error tests (task 5.3)
-//! Validates transaction code errors, import resolution errors, and error aggregation.
+//! Semantic diagnostics: transaction code errors, import resolution errors,
+//! and multi-file error aggregation.
 
 use miette::Diagnostic;
 use rsbinder_aidl::error::SemanticError;
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};
+use std::path::PathBuf;
+
+/// A per-test directory under the target dir: the name keeps tests in this
+/// binary from deleting each other's fixtures mid-generation, and the target
+/// dir keeps them out of the machine-wide `std::env::temp_dir()`.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 /// Helper: parse + generate, expect generation-phase error
 fn expect_generation_error(input: &str, filename: &str) -> AidlError {
@@ -19,7 +30,7 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
     }
 }
 
-// 3.1a: Mixed explicit/implicit transaction IDs
+// Mixed explicit/implicit transaction IDs
 #[test]
 fn test_mixed_transaction_ids() {
     let err = expect_generation_error(
@@ -48,7 +59,7 @@ interface IMixed {
     }
 }
 
-// 3.1b: Duplicate transaction codes
+// Duplicate transaction codes
 #[test]
 fn test_duplicate_transaction_codes() {
     let err = expect_generation_error(
@@ -81,7 +92,7 @@ interface IDup {
     }
 }
 
-// 3.1c: Transaction code exceeds u32::MAX
+// Transaction code exceeds u32::MAX
 #[test]
 fn test_transaction_code_u32_overflow() {
     let err = expect_generation_error(
@@ -110,24 +121,22 @@ interface IOver {
     }
 }
 
-// 3.1d: DuplicateTransactionCode span points to method identifiers
+// DuplicateTransactionCode span points to method identifiers
 #[test]
 fn test_duplicate_code_span_points_to_methods() {
-    let err = expect_generation_error(
-        r#"
+    let input = r#"
 interface IDup {
     void m1() = 10;
     void m2() = 10;
 }
-        "#,
-        "test.aidl",
-    );
+        "#;
+    let err = expect_generation_error(input, "test.aidl");
     if let AidlError::Semantic(se) = &err {
         if let SemanticError::DuplicateTransactionCode { span, related, .. } = se.as_ref() {
-            // span should be non-zero (pointing to first method)
-            assert!(
-                !span.is_empty() || span.offset() > 0,
-                "span should point to a method identifier"
+            let pointed = &input[span.offset()..span.offset() + span.len()];
+            assert_eq!(
+                pointed, "m1",
+                "span must cover the first colliding method identifier"
             );
             // related should have exactly 1 entry (the second method)
             assert_eq!(related.len(), 1, "expected 1 related diagnostic");
@@ -144,7 +153,7 @@ interface IDup {
     }
 }
 
-// 3.1e: MixedTransactionIds span points to interface name
+// MixedTransactionIds span points to interface name
 #[test]
 fn test_mixed_ids_span_points_to_interface() {
     let input = r#"
@@ -171,11 +180,10 @@ interface IMixed {
     }
 }
 
-// 3.2a: Import not found (using Builder with temp file)
+// Import not found (using Builder with temp file)
 #[test]
 fn test_import_not_found() {
-    let tmp = std::env::temp_dir().join("rsbinder_test_import_not_found");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = scratch_dir("import_not_found");
     let aidl_path = tmp.join("Foo.aidl");
     std::fs::write(&aidl_path, "import foo.bar.NonExistent;\nparcelable Foo {}").unwrap();
 
@@ -184,22 +192,18 @@ fn test_import_not_found() {
         .output(&tmp)
         .generate();
 
-    assert!(result.is_err(), "Expected import not found error");
-    let err = result.unwrap_err();
-    let err_msg = format!("{err}");
-    assert!(
-        err_msg.contains("not found") || err_msg.contains("import"),
-        "Error message should mention import: {err_msg}"
+    let err = result.expect_err("Expected import not found error");
+    assert_eq!(
+        err.to_string(),
+        "import 'foo.bar.NonExistent' not found",
+        "got: {err:?}"
     );
-
-    std::fs::remove_dir_all(&tmp).ok();
 }
 
-// 3.2b: ImportNotFound includes help message
+// ImportNotFound includes help message
 #[test]
 fn test_import_not_found_includes_help() {
-    let tmp = std::env::temp_dir().join("rsbinder_test_import_help");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = scratch_dir("import_help");
     let aidl_path = tmp.join("Bar.aidl");
     std::fs::write(&aidl_path, "import nonexistent.Type;\nparcelable Bar {}").unwrap();
 
@@ -208,31 +212,26 @@ fn test_import_not_found_includes_help() {
         .output(&tmp)
         .generate();
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    if let AidlError::Resolution(re) = &err {
-        let help = re.help().map(|h| h.to_string());
-        assert!(help.is_some(), "ImportNotFound should have a help message");
-        assert!(
-            help.unwrap().contains("include paths"),
-            "help should mention include paths"
-        );
-    }
-    // Note: error might be wrapped in Multiple, so also check the string form
-    let rendered = format!("{err:?}");
+    let err = result.expect_err("Expected import not found error");
+    let AidlError::Resolution(re) = &err else {
+        panic!("a single import failure must stay unwrapped, got: {err:?}");
+    };
+    let help = re.help().expect("ImportNotFound must carry a help message");
     assert!(
-        rendered.contains("not found") || rendered.contains("import"),
-        "Should mention import error: {rendered}"
+        help.to_string().contains("include paths"),
+        "help should mention include paths: {help}"
     );
-
-    std::fs::remove_dir_all(&tmp).ok();
+    assert_eq!(
+        err.to_string(),
+        "import 'nonexistent.Type' not found",
+        "got: {err:?}"
+    );
 }
 
-// 3.3a: Multiple file errors collected
+// Multiple file errors collected
 #[test]
 fn test_multiple_file_errors_collected() {
-    let tmp = std::env::temp_dir().join("rsbinder_test_multiple_errors");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = scratch_dir("multiple_errors");
 
     // Two files, each with an invalid import
     std::fs::write(
@@ -252,23 +251,27 @@ fn test_multiple_file_errors_collected() {
         .output(&tmp)
         .generate();
 
-    assert!(result.is_err(), "Expected errors from both files");
-    let err = result.unwrap_err();
-    let err_msg = format!("{err}");
-    // Should contain error information (either Multiple or individual error)
-    assert!(
-        err_msg.contains("not found") || err_msg.contains("error"),
-        "Error should mention the issues: {err_msg}"
+    let err = result.expect_err("Expected errors from both files");
+    let AidlError::Multiple { errors } = &err else {
+        panic!("two failing files must aggregate into Multiple, got: {err:?}");
+    };
+    // Import resolution walks a HashMap, so pin the set, not the order.
+    let mut messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    messages.sort();
+    assert_eq!(
+        messages,
+        vec![
+            "import 'nonexistent.TypeA' not found".to_string(),
+            "import 'nonexistent.TypeB' not found".to_string(),
+        ],
+        "one ImportNotFound per file: {err:?}"
     );
-
-    std::fs::remove_dir_all(&tmp).ok();
 }
 
-// 3.3b: Single file with one error — not wrapped in AidlError::Multiple
+// Single file with one error — not wrapped in AidlError::Multiple
 #[test]
 fn test_single_file_error_not_wrapped() {
-    let tmp = std::env::temp_dir().join("rsbinder_test_single_not_multiple");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = scratch_dir("single_not_multiple");
 
     // One file with an import error, one file valid
     std::fs::write(
@@ -291,19 +294,19 @@ fn test_single_file_error_not_wrapped() {
         !matches!(err, AidlError::Multiple { .. }),
         "Single import error should not be wrapped in Multiple, got: {err}"
     );
-
-    std::fs::remove_dir_all(&tmp).ok();
 }
 
-// 3.3c: Parse error in file A blocks semantic analysis of file B (cascading error prevention)
+// Parse error in file A blocks semantic analysis of file B (cascading error prevention)
 #[test]
 fn test_parse_error_blocks_semantic_analysis() {
-    let tmp = std::env::temp_dir().join("rsbinder_test_cascade_prevention");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = scratch_dir("cascade_prevention");
+
+    let pkg = tmp.join("test");
+    std::fs::create_dir_all(&pkg).unwrap();
 
     // A.aidl: intentional syntax error (missing semicolon after field)
     std::fs::write(
-        tmp.join("A.aidl"),
+        pkg.join("A.aidl"),
         "package test;\nparcelable A {\n    int field\n}",
     )
     .unwrap();
@@ -311,14 +314,14 @@ fn test_parse_error_blocks_semantic_analysis() {
     // B.aidl: syntactically valid, imports and uses A's type.
     // Without cascading prevention this would also fail with UnknownType at generation.
     std::fs::write(
-        tmp.join("B.aidl"),
+        pkg.join("B.aidl"),
         "package test;\nimport test.A;\nparcelable B {\n    A item;\n}",
     )
     .unwrap();
 
     let result = rsbinder_aidl::Builder::new()
-        .source(tmp.join("A.aidl"))
-        .source(tmp.join("B.aidl"))
+        .source(pkg.join("A.aidl"))
+        .source(pkg.join("B.aidl"))
         .include_dir(&tmp)
         .output(&tmp)
         .generate();
@@ -326,21 +329,21 @@ fn test_parse_error_blocks_semantic_analysis() {
     assert!(result.is_err(), "Expected parse error from A.aidl");
     let err = result.unwrap_err();
 
-    // Cascading prevention: only A's ParseError should be reported.
-    // B's generation-phase SemanticError::UnknownType must NOT appear.
-    let contains_semantic = match &err {
-        AidlError::Semantic(_) => true,
-        AidlError::Multiple { errors } => {
-            errors.iter().any(|e| matches!(e, AidlError::Semantic(_)))
-        }
-        _ => false,
+    // Cascading prevention: only A's ParseError may be reported. B's
+    // generation-phase `UnknownType` is a `ResolutionError`, so matching on
+    // `AidlError::Semantic` alone would never observe it.
+    let reported: Vec<&AidlError> = match &err {
+        AidlError::Multiple { errors } => errors.iter().collect(),
+        single => vec![single],
     };
     assert!(
-        !contains_semantic,
-        "Cascading SemanticError from B should be suppressed when A fails to parse: {err}"
+        reported.iter().all(|e| matches!(e, AidlError::Parse(_))),
+        "only A's ParseError may be reported, got: {err:?}"
     );
-
-    std::fs::remove_dir_all(&tmp).ok();
+    assert!(
+        !format!("{err:?}").contains("UnknownType"),
+        "B's generation-phase UnknownType must be suppressed: {err:?}"
+    );
 }
 
 // ── direction_span location verification ─────────────────────────────────────

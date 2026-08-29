@@ -369,21 +369,11 @@ mod tests {
                 let _ = a.join().unwrap();
             }
 
-            // Final state is Dead OR Live (depending on whether any
-            // attacker raced past the dropper) — but never `Live(0)`
-            // and never a `try_bump_live` *succeeded against `Dying`*.
-            match lc.snapshot() {
-                SessionLifecycleSnapshot::Dead => {}
-                SessionLifecycleSnapshot::Live(_) => {
-                    // An attacker won the race; the session is genuinely
-                    // alive again (NOT a resurrection of a dead session
-                    // — the attacker bumped while still Live, then the
-                    // dropper saw a higher count and didn't 1→0).
-                }
-                SessionLifecycleSnapshot::Dying => {
-                    panic!("Dying is transient — should have moved to Dead via mark_dead");
-                }
-            }
+            // Every credit is consumed by join time (the dropper spends the
+            // initial two, each attacker spends its own), so the only
+            // final state is `Dead`; `Live` here would mean a bump was
+            // never paid back, and `Dying` that `mark_dead` was skipped.
+            assert_eq!(lc.snapshot(), SessionLifecycleSnapshot::Dead);
         }
     }
 

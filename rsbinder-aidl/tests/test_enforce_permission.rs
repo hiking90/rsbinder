@@ -13,7 +13,7 @@
 //     `return Ok(())`) **before** any argument deserialization — the
 //     check appears earlier in the generated arm than the
 //     `let _arg_x: ... = _reader.read()` statements.
-//   * Leaves un-annotated methods byte-identical (R2) — `IPlain` arm
+//   * Leaves un-annotated methods byte-identical — the `IPlain` arm
 //     contains no `check_permission` reference.
 
 fn generate(input: &str) -> String {
@@ -98,10 +98,14 @@ interface IFoo {
         arm.contains("check_permission(_reader, \"INTERNET\")"),
         "{arm}"
     );
-    // Must NOT contain `&&` or `||` for the single form.
+    // A single permission must not be mis-parsed into an allOf/anyOf join.
     assert!(
         !arm.contains(" && "),
         "single form must not emit AND:\n{arm}"
+    );
+    assert!(
+        !arm.contains(" || "),
+        "single form must not emit OR:\n{arm}"
     );
 }
 
@@ -175,21 +179,22 @@ interface IFoo {
     let check_pos = arm
         .find("check_permission(_reader, \"INTERNET\")")
         .expect("check_permission must be emitted");
-    let read_pos = arm.find("_reader.read");
-    if let Some(read_pos) = read_pos {
-        assert!(
-            check_pos < read_pos,
-            "check_permission must precede argument deserialization. \
-             arm:\n{arm}"
-        );
-    }
+    let read_pos = arm.find("_reader.read").unwrap_or_else(|| {
+        panic!(
+            "no argument deserialization found — the `_reader.read` marker \
+             changed and this ordering guard is silently dead. arm:\n{arm}"
+        )
+    });
+    assert!(
+        check_pos < read_pos,
+        "check_permission must precede argument deserialization. arm:\n{arm}"
+    );
 }
 
 #[test]
 fn methods_without_enforce_permission_get_no_check() {
-    // R2 regression — un-annotated methods must produce byte-identical
-    // generated code (no permission scaffolding). Confirms the
-    // generator skips the check emit when annotation is absent.
+    // Un-annotated methods must produce byte-identical generated code: no
+    // permission scaffolding at all.
     let out = generate(
         r#"
 package test;
@@ -214,7 +219,7 @@ interface IPlain {
 /// `aidl` can enforce that *every* interface method declares its
 /// permission posture, but neither emits runtime checks. rsbinder-aidl
 /// must (a) recognize them (no `cargo:warning=` for typos) and (b) leave
-/// the generated arm byte-identical to the un-annotated version (R2).
+/// the generated arm byte-identical to the un-annotated version.
 ///
 /// Locking-in test: compare generated output for the same interface
 /// with and without the annotation — they MUST match exactly.
@@ -237,6 +242,9 @@ interface IFoo {
 }
         "#,
     );
+    // Anchor the content: "identical" degenerates into "identically empty"
+    // if interface codegen ever collapses.
+    assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@PermissionManuallyEnforced must not change codegen"
@@ -262,6 +270,9 @@ interface IFoo {
 }
         "#,
     );
+    // Anchor the content: "identical" degenerates into "identically empty"
+    // if interface codegen ever collapses.
+    assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
         "@RequiresNoPermission must not change codegen"
@@ -292,7 +303,8 @@ interface IFoo {
         .collect();
     assert!(
         manual_or_no_perm_warnings.is_empty(),
-        "Phase B annotations must be recognized as known: {manual_or_no_perm_warnings:?}"
+        "@PermissionManuallyEnforced / @RequiresNoPermission must be recognized \
+         as known annotations: {manual_or_no_perm_warnings:?}"
     );
 }
 

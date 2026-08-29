@@ -65,3 +65,13 @@ pub mod shm {
     /// Bytes of the dealer heap behind `nextFrame`.
     pub const DEALER_SIZE: usize = 1024 * 1024;
 }
+
+/// Argument shapes the AOSP fixture corpus never uses (`out` scalars with no
+/// `Default`, `@nullable` primitive arrays, non-nullable `inout` binder
+/// arrays). The `.aidl` is shared with the tests crate;
+/// `bin/codegen_shapes_interop_service` serves it to
+/// `cpp/codegen_shapes_interop`, a real-libbinder client.
+pub mod shapes {
+    rsbinder::include_aidl!("codegen_shapes", self::shapes::ICodegenShapes::*);
+    pub const SERVICE_NAME: &str = "rsbinder.test.shapes";
+}

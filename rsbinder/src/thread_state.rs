@@ -74,6 +74,47 @@ use crate::{binder::*, error::*, parcel::*, process_state::*, sys::*};
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
+    // Kept apart from `THREAD_STATE` on purpose: a `Drop` on `ThreadState`
+    // itself could not reach `THREAD_STATE.with` (its own destructor is
+    // running), so the guard carries everything it needs.
+    static THREAD_EXIT_GUARD: RefCell<Option<ThreadExitGuard>> = const { RefCell::new(None) };
+}
+
+/// AOSP `IPCThreadState::threadDestructor`: when a thread that talked to the
+/// driver ends, flush what it still has queued and send `BINDER_THREAD_EXIT`
+/// (without it the kernel keeps the thread's `binder_thread` until the fd
+/// closes, and a recycled tid inherits it).
+struct ThreadExitGuard {
+    driver: Arc<File>,
+}
+
+impl Drop for ThreadExitGuard {
+    fn drop(&mut self) {
+        // Thread-local destruction order is unspecified; `THREAD_STATE` may
+        // already be gone, in which case there is nothing left to flush.
+        if THREAD_STATE.try_with(|_| ()).is_ok() {
+            if let Err(e) = flush_commands() {
+                log::warn!("flush on binder thread exit failed: {e}");
+            }
+        }
+        if let Err(e) = binder::thread_exit(&*self.driver, 0) {
+            log::warn!("BINDER_THREAD_EXIT failed: {e}");
+        }
+    }
+}
+
+/// Arm [`ThreadExitGuard`] for this thread if it is not armed yet. Called
+/// from `talk_with_driver`, the one function every driver round-trip goes
+/// through, so any thread that ever touched the driver gets exactly one.
+fn ensure_thread_exit_guard(driver: &Arc<File>) {
+    let _ = THREAD_EXIT_GUARD.try_with(|g| {
+        let mut g = g.borrow_mut();
+        if g.is_none() {
+            *g = Some(ThreadExitGuard {
+                driver: Arc::clone(driver),
+            });
+        }
+    });
 }
 
 // ---- RPC calling context (Plan 2-16 Phase B) ------------------------
@@ -506,6 +547,10 @@ pub(crate) struct ThreadState {
     strict_mode_policy: i32,
     is_looper: bool,
     is_flushing: bool,
+    /// Bumped each time the driver consumes `out_parcel`; lets a failed
+    /// transact tell "my command is still queued" from "consumed, and the
+    /// buffer has been refilled since" (see `discard_unflushed_commands`).
+    out_flush_epoch: u64,
     call_restriction: CallRestriction,
     driver: Arc<File>,
 }
@@ -519,6 +564,7 @@ impl ThreadState {
             strict_mode_policy: 0,
             is_looper: false,
             is_flushing: false,
+            out_flush_epoch: 0,
             call_restriction: ProcessState::as_self().call_restriction(),
             driver: ProcessState::as_self().driver(),
         }
@@ -526,6 +572,12 @@ impl ThreadState {
 
     pub(crate) fn set_strict_mode_policy(&mut self, policy: i32) {
         self.strict_mode_policy = policy;
+    }
+
+    /// Where the next command will be queued: `(flush epoch, out_parcel
+    /// length)`, for `discard_unflushed_commands`.
+    fn unflushed_mark(&self) -> (u64, usize) {
+        (self.out_flush_epoch, self.out_parcel.data_size())
     }
 
     pub(crate) fn _strict_mode_policy(&self) -> i32 {
@@ -608,7 +660,7 @@ impl ThreadState {
                 flags,
                 sender_pid: 0,
                 sender_euid: 0,
-                data_size: data.data_size() as _,
+                data_size: data.ipc_data_size() as _,
                 offsets_size: (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _,
                 data: binder_transaction_data__bindgen_ty_2 {
                     ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
@@ -1125,7 +1177,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                                             Err(StatusCode::UnknownTransaction)
                                         }
                                     };
-                                    strong.decrease()?;
+                                    // Never `?` out of here: the reply
+                                    // send and the `transaction` restore
+                                    // below must run even if a user
+                                    // `IBinder::dec_strong` fails, or the
+                                    // two-way caller hangs on a reply that
+                                    // never comes and the next command
+                                    // inherits this call's identity.
+                                    if let Err(e) = strong.decrease() {
+                                        log::error!("dec_strong failed for native id {id}: {e:?}");
+                                    }
                                     result
                                 } else {
                                     log::warn!("Failed strong.attempt_increase for native id {id}");
@@ -1175,6 +1236,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 Ok(_) => StatusCode::Ok.into(),
                                 Err(err) => err.into(),
                             };
+                            // The queued BC_REPLY points at `reply`/`status`; a failed flush must rewind it, not leave it.
+                            let queued_at = thread_state.borrow().unflushed_mark();
                             thread_state.borrow_mut().write_transaction_data(
                                 binder::BC_REPLY,
                                 flags,
@@ -1183,7 +1246,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 &reply,
                                 &status,
                             )?;
-                            wait_for_response(UntilResponse::TransactionComplete)?;
+                            if let Err(e) = wait_for_response(UntilResponse::TransactionComplete) {
+                                discard_unflushed_commands(thread_state, queued_at, true);
+                                return Err(e);
+                            }
                         } else if let Err(err) = result {
                             let mut log = format!(
                                 "oneway function results for code {} on binder at {:X}",
@@ -1434,6 +1500,8 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
         //     }
         // }
 
+        ensure_thread_exit_guard(&thread_state.borrow().driver);
+
         loop {
             let res = binder::write_read(&thread_state.borrow().driver, &mut bwr);
             match res {
@@ -1467,12 +1535,20 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     );
                 }
                 thread_state.out_parcel.set_data_size(0)?;
+                thread_state.out_flush_epoch += 1;
             }
 
             if bwr.read_consumed > 0 {
-                thread_state
-                    .in_parcel
-                    .set_data_size(bwr.read_consumed as _)?;
+                // SAFETY: the driver just wrote `read_consumed` bytes into
+                // `in_parcel`'s spare capacity through the `read_buffer`
+                // pointer taken from `as_mut_ptr()` above, so `0..read_consumed`
+                // is initialized. This is the one grow `set_data_size` itself
+                // refuses.
+                unsafe {
+                    thread_state
+                        .in_parcel
+                        .set_data_size_driver_filled(bwr.read_consumed as _)?;
+                }
                 thread_state.in_parcel.set_data_position(0);
 
                 log::trace!(
@@ -1657,8 +1733,6 @@ pub(crate) fn transact(
     data: &Parcel,
     mut flags: u32,
 ) -> Result<Option<Parcel>> {
-    let mut reply: Option<Parcel> = None;
-
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
     // Enforce the call restriction BEFORE queuing BC_TRANSACTION into
@@ -1682,18 +1756,60 @@ pub(crate) fn transact(
         }
     }
 
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    // As in the BR_TRANSACTION reply path: the queued BC_TRANSACTION holds
+    // raw pointers into the caller's `data`. If the flush fails, rewind it
+    // before `data` can go out of scope in the caller.
+    let queued_at = THREAD_STATE.with(|thread_state| -> Result<(u64, usize)> {
         let mut thread_state = thread_state.borrow_mut();
-        thread_state.write_transaction_data(binder::BC_TRANSACTION, flags, handle, code, data, &0)
+        let queued_at = thread_state.unflushed_mark();
+        thread_state.write_transaction_data(
+            binder::BC_TRANSACTION,
+            flags,
+            handle,
+            code,
+            data,
+            &0,
+        )?;
+        Ok(queued_at)
     })?;
 
-    if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-        reply = wait_for_response(UntilResponse::Reply)?;
+    let waited = if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+        wait_for_response(UntilResponse::Reply)
     } else {
-        wait_for_response(UntilResponse::TransactionComplete)?;
+        wait_for_response(UntilResponse::TransactionComplete)
+    };
+    match waited {
+        Ok(reply) => Ok(reply),
+        Err(e) => {
+            THREAD_STATE
+                .with(|thread_state| discard_unflushed_commands(thread_state, queued_at, false));
+            Err(e)
+        }
     }
+}
 
-    Ok(reply)
+/// Rewind `out_parcel` to the `queued_at` mark: the command there points into memory the caller is about to release.
+/// `retry_flush` (BC_REPLY only) tries one more flush first so a transient failure does not cost the peer its reply;
+/// a retried BC_TRANSACTION would instead leave a two-way call in flight whose BR_REPLY the next `transact` would take.
+fn discard_unflushed_commands(
+    thread_state: &RefCell<ThreadState>,
+    queued_at: (u64, usize),
+    retry_flush: bool,
+) {
+    if retry_flush {
+        if let Err(e) = talk_with_driver(false) {
+            log::warn!("flush after failed reply also failed: {e}");
+        }
+    }
+    let (epoch, queued_at) = queued_at;
+    let mut ts = thread_state.borrow_mut();
+    if ts.out_flush_epoch == epoch && ts.out_parcel.data_size() > queued_at {
+        log::error!(
+            "discarding {} unflushed out_parcel bytes that reference released memory",
+            ts.out_parcel.data_size() - queued_at
+        );
+        let _ = ts.out_parcel.set_data_size(queued_at);
+    }
 }
 
 fn free_buffer(
@@ -1822,11 +1938,13 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
 
         {
             let mut thread_state = thread_state.borrow_mut();
-
+            // Flag first: if the write fails and `?` leaves, `is_looper` must
+            // not stay `true` — `flush_if_needed` would then never flush this
+            // thread's BC_FREE_BUFFER / BC_RELEASE again.
+            thread_state.is_looper = false;
             thread_state
                 .out_parcel
                 .write::<u32>(&binder::BC_EXIT_LOOPER)?;
-            thread_state.is_looper = false;
         }
 
         talk_with_driver(false)?;

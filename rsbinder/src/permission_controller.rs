@@ -246,8 +246,16 @@ mod tests {
     #[serial_test::serial(authority)]
     #[test]
     fn check_permission_denies_rpc_parcel() {
+        use crate::rpc::transport::PeerIdentity;
+        use crate::thread_state::RpcCallingGuard;
+        use std::sync::Arc;
+
         let mut rpc_parcel = Parcel::new();
         rpc_parcel.set_for_rpc(true);
+        // Inside a (simulated) RPC transaction, so `is_handling_transaction()`
+        // is `true` and only the `is_for_rpc` gate can produce the denial.
+        let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+        assert!(crate::is_handling_transaction());
         assert!(
             !check_permission(&rpc_parcel, "android.permission.INTERNET"),
             "RPC parcel must fail-closed regardless of uid/PMS"

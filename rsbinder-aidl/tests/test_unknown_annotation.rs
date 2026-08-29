@@ -1,12 +1,10 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! AOSP `AidlAnnotation::AllSchemas()` defines a
-//! closed set of 23 recognised annotations. Anything else used to be
-//! silently dropped — so a typo like `@RustDrive` would compile clean
-//! with no codegen effect and no diagnostic. The parser now records
-//! such cases as `Document::warnings`, which `Builder::generate()`
-//! relays to cargo as `cargo:warning=...` lines.
+//! AOSP `AidlAnnotation::AllSchemas()` defines a closed set of 23 recognised
+//! annotations. Anything outside it is recorded as a `Document::warnings`
+//! entry and relayed by `Builder::generate()` as a `cargo:warning=...` line,
+//! so a typo like `@RustDrive` cannot compile clean with no diagnostic.
 
 use rsbinder_aidl::{parse_document, SourceContext};
 

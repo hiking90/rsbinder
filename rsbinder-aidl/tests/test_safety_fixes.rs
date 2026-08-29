@@ -14,8 +14,7 @@ fn test_aidl_generation(input: &str) -> Result<String, Box<dyn Error>> {
 }
 
 #[test]
-fn test_circular_reference_warning() -> Result<(), Box<dyn Error>> {
-    // This should no longer cause stack overflow, instead show warning
+fn test_circular_enum_reference_is_a_diagnostic() -> Result<(), Box<dyn Error>> {
     let input = r##"
         package test.circular;
         
@@ -26,21 +25,15 @@ fn test_circular_reference_warning() -> Result<(), Box<dyn Error>> {
         }
     "##;
 
-    // Capture stderr to check for warnings
-    let result = test_aidl_generation(input);
-
-    match result {
-        Ok(_output) => {
-            // Success is acceptable - it means we handled the circular reference gracefully
-            println!("Circular reference handled successfully (graceful degradation)");
-            Ok(())
-        }
-        Err(e) => {
-            // Error is also acceptable as long as it doesn't crash
-            println!("Circular reference caused error (but no crash): {}", e);
-            Ok(())
-        }
-    }
+    // A cycle has no discriminant. Accepting it would bake a fabricated wire
+    // value, so it must be a diagnostic — not merely "did not crash".
+    let err = test_aidl_generation(input).expect_err("a 3-cycle must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("circular reference detected"),
+        "expected the cycle diagnostic, got: {msg}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -85,7 +78,7 @@ fn test_deep_nesting_stability() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn test_unresolvable_reference_graceful() -> Result<(), Box<dyn Error>> {
+fn test_unresolvable_reference_is_a_diagnostic() -> Result<(), Box<dyn Error>> {
     // Test reference to non-existent enum - should not crash
     let input = r##"
         package test.unresolvable;
@@ -97,19 +90,13 @@ fn test_unresolvable_reference_graceful() -> Result<(), Box<dyn Error>> {
         }
     "##;
 
-    let result = test_aidl_generation(input);
-
-    match result {
-        Ok(output) => {
-            // Should generate something reasonable
-            assert!(output.contains("pub mod TestEnum"));
-            println!("Unresolvable reference handled gracefully");
-        }
-        Err(e) => {
-            // Error is acceptable as long as it doesn't crash
-            println!("Unresolvable reference caused error (no crash): {}", e);
-        }
-    }
+    let err = test_aidl_generation(input)
+        .expect_err("a reference to a non-existent enum must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("NonExistentEnum"),
+        "the diagnostic must name the unresolved reference, got: {msg}"
+    );
 
     Ok(())
 }
@@ -131,25 +118,20 @@ fn test_mixed_resolvable_unresolvable() -> Result<(), Box<dyn Error>> {
         }
     "##;
 
-    let result = test_aidl_generation(input);
-
-    match result {
-        Ok(output) => {
-            assert!(output.contains("pub mod GoodEnum"));
-            assert!(output.contains("pub mod MixedEnum"));
-            println!("Mixed resolvable/unresolvable test passed");
-        }
-        Err(e) => {
-            println!("Mixed test caused error (acceptable): {}", e);
-        }
-    }
+    let err =
+        test_aidl_generation(input).expect_err("one unresolvable member must fail the whole enum");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("BadEnum"),
+        "the diagnostic must name the unresolved reference, got: {msg}"
+    );
 
     Ok(())
 }
 
 #[test]
-fn test_large_enum_performance() -> Result<(), Box<dyn Error>> {
-    // Test with a larger enum to ensure performance is reasonable
+fn test_large_enum_auto_reference_chain_resolves() -> Result<(), Box<dyn Error>> {
+    // A 21-member chain of `Vn = Vn-1 + 1` must resolve every discriminant.
     let input = r##"
         package test.large;
         
@@ -178,22 +160,11 @@ fn test_large_enum_performance() -> Result<(), Box<dyn Error>> {
         }
     "##;
 
-    use std::time::Instant;
-    let start = Instant::now();
-
     let result = test_aidl_generation(input)?;
 
-    let duration = start.elapsed();
-
-    // Should complete in reasonable time (less than 1 second)
-    assert!(
-        duration.as_secs() < 1,
-        "Large enum took too long: {:?}",
-        duration
-    );
     assert!(result.contains("pub mod LargeEnum"));
-
-    println!("Large enum test passed in {:?}", duration);
+    assert!(result.contains("r#V0 = 0,"), "{result}");
+    assert!(result.contains("r#V20 = 20,"), "{result}");
 
     Ok(())
 }
@@ -264,9 +235,9 @@ fn test_char_escape_sequences_decoded() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_unknown_type_is_diagnostic_not_panic() {
-    // A parcelable field referencing an undefined type previously panicked deep
-    // in code generation (`make_user_defined_type_name(...).expect()`). It must
-    // now surface as a `ResolutionError::UnknownType` diagnostic instead.
+    // An undefined field type must reach the user as a
+    // `ResolutionError::UnknownType` diagnostic, not as a panic inside
+    // `make_user_defined_type_name`.
     let input = r##"
         package test.unknown;
 
@@ -369,8 +340,8 @@ fn test_rust_keyword_type_names_are_escaped() {
     // AIDL permits type names that are Rust keywords (`type`, `loop`,
     // `match`, …); the generated mod/struct/trait declarations AND the
     // reference paths that name them must `r#`-escape so the output compiles
-    // (AOSP's Rust backend does the same). Previously only member names were
-    // escaped, so a keyword-named type emitted non-compiling Rust.
+    // (AOSP's Rust backend does the same). Escaping member names alone is not
+    // enough — a keyword-named type would emit non-compiling Rust.
     let parc = test_aidl_generation("package test.kw;\nparcelable type { int a; }")
         .expect("keyword parcelable should generate");
     assert!(parc.contains("pub mod r#type"), "got:\n{parc}");
@@ -397,7 +368,7 @@ fn test_rust_keyword_type_names_are_escaped() {
 
 #[test]
 fn test_enum_discriminant_eval_failure_is_diagnostic() {
-    // `A = 1/0` previously fell through `if let Ok` into the auto-increment
+    // `A = 1/0` must not fall through into the auto-increment
     // counter and generated `A = 0` — a silently wrong wire discriminant.
     // AOSP rejects the expression at build time.
     let result = test_aidl_generation("package test.e;\nenum E { A = 1/0 }");
@@ -417,8 +388,8 @@ fn test_enum_discriminant_eval_failure_is_diagnostic() {
 
 #[test]
 fn test_enum_discriminant_unresolved_reference_is_diagnostic() {
-    // `A = foo.Missing.X` previously resolved through the current-declaration
-    // lookup fallback (or stayed an unresolved Name and was skipped) and
+    // `A = foo.Missing.X` must not resolve through the current-declaration
+    // lookup fallback, and must not be skipped as an unresolved `Name`;
     // generated `A = 0`. AOSP rejects the reference at build time.
     let result = test_aidl_generation("package test.e;\nenum E { A = foo.Missing.X }");
     assert!(
@@ -429,7 +400,7 @@ fn test_enum_discriminant_unresolved_reference_is_diagnostic() {
 
 #[test]
 fn test_enum_discriminant_circular_reference_is_diagnostic() {
-    // `enum E { A = B, B = A }` previously generated the fabricated values
+    // `enum E { A = B, B = A }` must not generate the fabricated values
     // A=1, B=1. A discriminant cycle has no well-defined value; AOSP errors.
     let result = test_aidl_generation("package test.e;\nenum E { A = B, B = A }");
     assert!(
@@ -440,9 +411,9 @@ fn test_enum_discriminant_circular_reference_is_diagnostic() {
 
 #[test]
 fn test_phantom_package_type_is_diagnostic_not_self_reference() {
-    // A field typed as `<missing-package>.P` where the simple name equals the
-    // enclosing parcelable previously resolved to the parcelable itself via
-    // the lookup fallback and generated a self-referential `Box<P>` field.
+    // A field typed as `<missing-package>.P` whose simple name equals the
+    // enclosing parcelable must not resolve to that parcelable via the lookup
+    // fallback — that would emit a self-referential `Box<P>` field.
     let result = test_aidl_generation("package test.p;\nparcelable P { no.such.pkg.P other; }");
     let err = result.expect_err("phantom package type must produce an error");
     let msg = err.to_string();

@@ -66,6 +66,14 @@ impl RpcAddress {
         RpcAddress { bytes }
     }
 
+    /// The allocating-role tag byte (see [`unique`](Self::unique)): which
+    /// endpoint's subspace this address was minted in. A peer-supplied
+    /// address carrying *our* tag is one we would have minted ourselves —
+    /// and so must already be in our local table, never a fresh remote.
+    pub(crate) fn space_tag(&self) -> u8 {
+        self.bytes[8]
+    }
+
     /// Borrow the raw 32 wire bytes (crate-internal — wire codec only).
     pub(crate) fn as_wire_bytes(&self) -> &[u8; RPC_ADDR_LEN] {
         &self.bytes
@@ -103,7 +111,7 @@ pub enum AddressSpace {
 }
 
 impl AddressSpace {
-    fn tag(self) -> u8 {
+    pub(crate) fn tag(self) -> u8 {
         match self {
             AddressSpace::Initiator => 1,
             AddressSpace::Acceptor => 2,

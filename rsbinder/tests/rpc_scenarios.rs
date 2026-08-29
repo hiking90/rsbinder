@@ -13,12 +13,14 @@
 //! Coverage map (AOSP name → test here):
 //! - `SendLargeVector`              → `send_large_vector_round_trips`
 //! - `UnknownTransaction`           → `unknown_transaction_returns_unknown`
-//! - `RepeatBinder`                 → `repeat_binder_round_trips_non_null`
+//! - `RepeatBinder`                 → `repeat_binder_round_trips_as_the_same_local_binder`
 //! - `RepeatBinderNull`             → `repeat_binder_null`
 //! - `HoldBinder`/`getHeldBinder`   → `hold_and_get_binder`
 //! - `alwaysGiveMeTheSameBinder` /
 //!   `SameBinderEquality`           → `same_binder_returned_twice_is_equal`
 //! - `OnewayCallDoesNotWait`        → `oneway_call_does_not_wait_for_handler`
+//! - (rsbinder) a nested call that times out must not desync the
+//!   connection → `late_reply_of_a_timed_out_nested_call_is_skipped`
 
 #![cfg(feature = "rpc")]
 
@@ -41,7 +43,9 @@ const TX_HOLD_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 const TX_GET_HELD: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_SAME_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 4; // -> always the same IBinder
 const TX_PING_DELAY: TransactionCode = FIRST_CALL_TRANSACTION + 5; // oneway: sleep then bump
-                                                                   // Deliberately never handled by the server (tests UNKNOWN_TRANSACTION).
+const TX_CALL_CB: TransactionCode = FIRST_CALL_TRANSACTION + 6; // (IBinder cb, String) -> String via cb
+const TX_SLOW: TransactionCode = FIRST_CALL_TRANSACTION + 7; // (i64 ms) -> (): sleeps
+                                                             // Deliberately never handled by the server (tests UNKNOWN_TRANSACTION).
 const TX_UNKNOWN: TransactionCode = FIRST_CALL_TRANSACTION + 100;
 
 // Callback transaction the client's callback object answers.
@@ -106,6 +110,19 @@ impl Remotable for BnScenario {
                 s.delay_done.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
+            TX_CALL_CB => {
+                // Nested server → client call while this dispatch is open.
+                let cb: SIBinder = reader.read()?;
+                let s: String = reader.read()?;
+                let out = cb_echo(&cb, &s)?;
+                reply.write(&Status::from(StatusCode::Ok))?;
+                reply.write(&out)
+            }
+            TX_SLOW => {
+                let ms: i64 = reader.read()?;
+                std::thread::sleep(Duration::from_millis(ms as u64));
+                reply.write(&Status::from(StatusCode::Ok))
+            }
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
@@ -154,15 +171,82 @@ impl Remotable for BnScenarioCallback {
     }
 }
 
+/// A callback whose handler calls *back into the server* (a nested call on
+/// the connection it is being served on) and records the outcome.
+struct BnNestingCallback {
+    target: ScenarioProxy,
+    slow_ms: i64,
+    nested: Arc<Mutex<Vec<Result<()>>>>,
+}
+impl Interface for BnNestingCallback {}
+impl Remotable for BnNestingCallback {
+    fn descriptor() -> &'static str {
+        CB_DESC
+    }
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        match code {
+            TX_CB_ECHO => {
+                let s: String = reader.read()?;
+                let r = self.target.slow(self.slow_ms);
+                self.nested.lock().unwrap().push(r);
+                reply.write(&Status::from(StatusCode::Ok))?;
+                reply.write(&format!("cb:{s}"))
+            }
+            _ => Err(StatusCode::UnknownTransaction),
+        }
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn rpc_of(b: &SIBinder) -> &RpcProxy {
+    (**b).as_any().downcast_ref::<RpcProxy>().expect("RpcProxy")
+}
+
+/// `TX_CB_ECHO` on a (proxied) callback.
+fn cb_echo(cb: &SIBinder, s: &str) -> Result<String> {
+    let rp = rpc_of(cb);
+    let mut d = rp.build_request(CB_DESC)?;
+    d.write(&s)?;
+    let mut r = rp
+        .transact(TX_CB_ECHO, &d, 0)?
+        .ok_or(StatusCode::UnexpectedNull)?;
+    read_status(&mut r)?;
+    r.read::<String>()
+}
+
 // ---- client typed proxy ---------------------------------------------
 
 struct ScenarioProxy(SIBinder);
 impl ScenarioProxy {
     fn rp(&self) -> &RpcProxy {
-        (*self.0)
-            .as_any()
-            .downcast_ref::<RpcProxy>()
-            .expect("RpcProxy")
+        rpc_of(&self.0)
+    }
+    fn call_cb(&self, cb: &SIBinder, s: &str) -> Result<String> {
+        let mut d = self.rp().build_request(DESC)?;
+        d.write(cb)?;
+        d.write(&s)?;
+        let mut r = self
+            .rp()
+            .transact(TX_CALL_CB, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        read_status(&mut r)?;
+        r.read::<String>()
+    }
+    fn slow(&self, ms: i64) -> Result<()> {
+        let mut d = self.rp().build_request(DESC)?;
+        d.write(&ms)?;
+        let mut r = self
+            .rp()
+            .transact(TX_SLOW, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        read_status(&mut r)
     }
     fn big_echo(&self, v: &[u8]) -> Result<Vec<u8>> {
         let mut d = self.rp().build_request(DESC)?;
@@ -279,7 +363,7 @@ impl Drop for ServeCleanup {
 struct Booted {
     _cu: ServeCleanup,
     proxy: ScenarioProxy,
-    _client: RpcSession,
+    client: RpcSession,
     delay_entered: Arc<AtomicBool>,
 }
 
@@ -304,7 +388,7 @@ fn boot(tag: &str) -> Booted {
     Booted {
         _cu: cu,
         proxy,
-        _client: client,
+        client,
         delay_entered,
     }
 }
@@ -333,15 +417,14 @@ fn unknown_transaction_returns_unknown() {
 }
 
 /// AOSP `RepeatBinder` — a binder passed as an argument AND returned in the
-/// same transaction round-trips as a non-null binder (exercises the
-/// arg-and-return binder wire path in one call). Strict local-identity
-/// preservation across a round trip is covered by `hold_and_get_binder`,
-/// which uses two separate transactions; in the single-call echo path the
-/// client currently materializes a fresh proxy for its own address rather
-/// than mapping back to the local stub, so this test asserts only the
-/// non-null round trip.
+/// same transaction comes back as the **same local object** (exercises the
+/// arg-and-return binder wire path in one call). The server's argument
+/// proxy goes out of scope before the reply is sent; the reply parcel pins
+/// it (`write_binder`) so its `DEC_STRONG` follows the reply instead of
+/// overtaking it — otherwise the client frees the node before the address
+/// comes back and mints a fresh proxy for its own object.
 #[test]
-fn repeat_binder_round_trips_non_null() {
+fn repeat_binder_round_trips_as_the_same_local_binder() {
     let b = boot("repeat");
     let cb: SIBinder = Interface::as_binder(&Binder::new(BnScenarioCallback(Mutex::new(0))));
 
@@ -349,9 +432,10 @@ fn repeat_binder_round_trips_non_null() {
         .proxy
         .repeat_binder(Some(cb.clone()))
         .expect("repeat_binder");
-    assert!(
-        echoed.is_some(),
-        "a non-null binder argument must round-trip as non-null"
+    assert_eq!(
+        echoed.as_ref(),
+        Some(&cb),
+        "a binder that comes home in the same call must map back to the local stub"
     );
 }
 
@@ -432,5 +516,43 @@ fn oneway_call_does_not_wait_for_handler() {
     assert!(
         b.delay_entered.load(Ordering::SeqCst),
         "oneway handler never entered"
+    );
+}
+
+/// A nested call (client callback → server, on the connection the callback
+/// is being served on) that gives up on its reply (`set_timeout`) must not
+/// desync that connection: the late reply is skipped, the outer call still
+/// gets *its* reply, and the connection stays usable. The nested call
+/// cannot retire the slot — the outer frame owns it — so without the
+/// skip the late reply would be taken for the outer call's reply.
+#[test]
+fn late_reply_of_a_timed_out_nested_call_is_skipped() {
+    let b = boot("stale");
+    // The outer reply follows the server's `slow_ms` sleep, against a deadline
+    // re-armed when the nested call gives up: `timeout < slow_ms < 2 * timeout`,
+    // with a wide margin on both sides for a loaded CI runner.
+    b.client.set_timeout(Some(Duration::from_millis(1000)));
+    let nested = Arc::new(Mutex::new(Vec::new()));
+    let cb: SIBinder = Interface::as_binder(&Binder::new(BnNestingCallback {
+        target: ScenarioProxy(b.proxy.0.clone()),
+        slow_ms: 1500,
+        nested: Arc::clone(&nested),
+    }));
+
+    let got = b
+        .proxy
+        .call_cb(&cb, "hello")
+        .expect("outer call survives the nested call's timeout");
+    assert_eq!(got, "cb:hello");
+    assert_eq!(
+        nested.lock().unwrap().as_slice(),
+        &[Err(StatusCode::TimedOut)],
+        "the nested call timed out exactly once"
+    );
+    assert_eq!(
+        b.proxy
+            .big_echo(b"again")
+            .expect("connection still in sync"),
+        b"again"
     );
 }

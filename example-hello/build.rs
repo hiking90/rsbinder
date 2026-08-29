@@ -28,4 +28,9 @@ fn main() {
     aidl("aidl/authz/IAuthz.aidl", "authz.rs");
     // Shared-memory example interface (`bin/shm_{service,client}`).
     aidl("aidl/shm/IShm.aidl", "shm.rs");
+    // Shared with `tests/aidl/shapes/`; `cpp/codegen_shapes_interop.cpp` cross-checks the wire against libbinder.
+    aidl(
+        "../tests/aidl/shapes/ICodegenShapes.aidl",
+        "codegen_shapes.rs",
+    );
 }

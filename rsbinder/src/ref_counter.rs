@@ -137,7 +137,14 @@ impl RefCounter {
         // Use Release ordering to ensure all our writes are visible before the decrement.
         // This matches Android's RefBase::decStrong implementation.
         let c = self.count.fetch_sub(1, Ordering::Release);
-        debug_assert!(c >= 1, "RefCounter::dec underflow (double decStrong)");
+        // After the last `dec` the count is reset to INITIAL_STRONG_VALUE,
+        // so a double-dec is observed as `c == INITIAL_STRONG_VALUE`, not
+        // as `c < 1` — and once it happens the counter is wedged for good
+        // (never 0 again, `attempt_inc` always fast-succeeds).
+        debug_assert!(
+            c >= 1 && c != INITIAL_STRONG_VALUE,
+            "RefCounter::dec underflow (double decStrong), c = {c}"
+        );
         if c == 1
             && self
                 .count

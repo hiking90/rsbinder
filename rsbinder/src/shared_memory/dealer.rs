@@ -206,9 +206,11 @@ impl MemoryDealer {
         }))
     }
 
-    /// Carve `size` bytes out of the heap (rounded up to
-    /// [`ALLOCATION_ALIGNMENT`]). `NoMemory` when no free run is large
-    /// enough — fragmentation counts, see [`largest_free_block`](Self::largest_free_block).
+    /// Carve `size` bytes out of the heap. The block occupies a run rounded
+    /// up to [`ALLOCATION_ALIGNMENT`], but the window handed out is exactly
+    /// `size` bytes (AOSP `MemoryDealer::allocate`). `NoMemory` when no free
+    /// run is large enough — fragmentation counts, see
+    /// [`largest_free_block`](Self::largest_free_block).
     pub fn allocate(self: &Arc<Self>, size: usize) -> Result<Allocation> {
         self.allocate_inner(size, false)
     }
@@ -229,12 +231,16 @@ impl MemoryDealer {
             .unwrap_or_else(|e| e.into_inner())
             .alloc(size, page_aligned)
             .ok_or(StatusCode::NoMemory)?;
-        let rounded = size.div_ceil(ALLOCATION_ALIGNMENT) * ALLOCATION_ALIGNMENT;
+        // The allocator reserves whole granules, but the `IMemory` window
+        // handed out is the caller's `size` (AOSP `MemoryDealer::allocate`
+        // does the same): rounding it up would expose up to
+        // `ALLOCATION_ALIGNMENT - 1` bytes of whatever a previous, freed
+        // allocation left in the tail of the granule.
         let mem = MemoryBase::new(
             self.heap.clone() as Arc<dyn IMemoryHeap>,
             self.heap_binder.clone(),
             offset,
-            rounded,
+            size,
         )?;
         Ok(Allocation {
             mem: Arc::new(mem),
@@ -314,7 +320,8 @@ impl Allocation {
         self.mem.offset()
     }
 
-    /// Byte length of the block (rounded up to [`ALLOCATION_ALIGNMENT`]).
+    /// Byte length of the block, as requested from
+    /// [`allocate`](MemoryDealer::allocate).
     pub fn size(&self) -> usize {
         self.mem.size()
     }
@@ -432,7 +439,11 @@ mod tests {
         let total = d.free_space();
         let a = d.allocate(100).unwrap();
         let b = d.allocate(page()).unwrap();
-        assert_eq!(a.size(), 128);
+        assert_eq!(
+            a.size(),
+            100,
+            "the window is the requested size, not the granule"
+        );
         assert_eq!(b.size(), page());
         assert!(a.offset() + a.size() <= b.offset());
         assert_eq!(IMemory::memory(&a).size(), page() * 2);

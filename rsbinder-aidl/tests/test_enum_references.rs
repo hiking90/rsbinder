@@ -29,14 +29,14 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn test_keymint_style_enum_reference_panics() -> Result<(), Box<dyn Error>> {
-    // This test reproduces the exact issue from Android KeyMint
-    // where Tag enum values reference TagType enum values
-    // This used to panic with "to_i64() for Name is not supported" but now works correctly
+fn test_keymint_style_enum_reference_resolves() -> Result<(), Box<dyn Error>> {
+    // Cross-enum references at KeyMint scale: every `Tag` discriminant folds
+    // from a `TagType` member OR'd with an index.
     let input = r##"
         package android.hardware.security.keymint;
-        
+
         // Simplified version of TagType.aidl
+        @Backing(type="int")
         enum TagType {
             INVALID = 0,
             ENUM = 0x10000000,
@@ -52,6 +52,7 @@ fn test_keymint_style_enum_reference_panics() -> Result<(), Box<dyn Error>> {
         }
         
         // Simplified version of Tag.aidl that references TagType values
+        @Backing(type="int")
         enum Tag {
             INVALID = TagType.INVALID,  // 0
             PURPOSE = TagType.ENUM_REP | 1,  // 0x20000001
@@ -123,18 +124,22 @@ fn test_keymint_style_enum_reference_panics() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
     let document = rsbinder_aidl::parse_document(&ctx)?;
     let gen = rsbinder_aidl::Generator::new(false, false);
+    let out = gen.document(&document)?.1;
 
-    // This should now work correctly without panicking
-    let res = gen.document(&document)?;
-
-    // Verify that basic enum references work (the key achievement)
-    assert!(res.1.contains("pub mod TagType"));
-    assert!(res.1.contains("pub mod Tag"));
-    assert!(res.1.contains("r#INVALID = 0"));
-
-    // The important thing is that it doesn't panic anymore
-    // Complex enum references with large enums may have ordering issues
-    // but basic enum references now work correctly
+    // Pin the folded discriminants, not just "a module was emitted": these
+    // are wire values, and a resolution regression that zeroed them would
+    // otherwise still satisfy a `contains("pub mod Tag")` check.
+    for expected in [
+        "r#ENUM = 268435456,",
+        "r#ENUM_REP = 536870912,",
+        "r#UINT = 805306368,",
+        "r#PURPOSE = 536870913,",
+        "r#ALGORITHM = 268435458,",
+        "r#KEY_SIZE = 805306371,",
+        "r#MAX_BOOT_LEVEL = 805307378,",
+    ] {
+        assert!(out.contains(expected), "missing {expected} in:\n{out}");
+    }
 
     Ok(())
 }
@@ -158,7 +163,7 @@ fn test_simple_enum_reference_in_same_enum() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Status {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#Status : [i8; 5] {
             r#OK = 0,
@@ -197,7 +202,7 @@ fn test_enum_reference_across_enums() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod BaseEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#BaseEnum : [i8; 2] {
             r#BASE_VALUE = 10,
@@ -206,7 +211,7 @@ pub mod BaseEnum {
     }
 }
 pub mod DerivedEnum {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#DerivedEnum : [i8; 4] {
             r#FROM_BASE = 10,
@@ -244,7 +249,7 @@ fn test_enum_reference_with_bitwise_operations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Flags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#Flags : [i8; 5] {
             r#NONE = 0,
@@ -256,7 +261,7 @@ pub mod Flags {
     }
 }
 pub mod ExtendedFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ExtendedFlags : [i8; 3] {
             r#BASE_FLAGS = 7,
@@ -322,7 +327,7 @@ fn test_enum_reference_in_parcelable_default() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Priority {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#Priority : [i8; 3] {
             r#LOW = 0,
@@ -332,7 +337,7 @@ pub mod Priority {
     }
 }
 pub mod Task {
-    #![allow(non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
     #[derive(Debug)]
     pub struct Task {
         pub r#name: String,
@@ -399,7 +404,7 @@ fn test_keymint_style_simple_reference() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod TagType {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#TagType : [i32; 3] {
             r#INVALID = 0,
@@ -409,7 +414,7 @@ pub mod TagType {
     }
 }
 pub mod Tag {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#Tag : [i32; 3] {
             r#INVALID = 0,
@@ -454,7 +459,7 @@ fn test_backing_type_annotations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod ByteFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#ByteFlags : [i8; 3] {
             r#NONE = 0,
@@ -464,7 +469,7 @@ pub mod ByteFlags {
     }
 }
 pub mod IntFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#IntFlags : [i32; 4] {
             r#NONE = 0,
@@ -475,7 +480,7 @@ pub mod IntFlags {
     }
 }
 pub mod LongFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#LongFlags : [i64; 3] {
             r#NONE = 0,
@@ -510,7 +515,7 @@ fn test_simple_bitwise_operations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod BaseFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#BaseFlags : [i8; 3] {
             r#NONE = 0,
@@ -520,7 +525,7 @@ pub mod BaseFlags {
     }
 }
 pub mod CombinedFlags {
-    #![allow(non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
     rsbinder::declare_binder_enum! {
         r#CombinedFlags : [i8; 3] {
             r#NONE = 0,
@@ -647,7 +652,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     let reason_line = output
         .lines()
         .find(|l| l.contains("r#reason:") || l.contains("r#reason ="))
-        .unwrap_or("");
+        .expect("the reason field must be generated");
     assert!(
         !reason_line.contains("FoldState"),
         "reason field should not reference FoldState, got: {}",
@@ -657,7 +662,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     let wake_line = output
         .lines()
         .find(|l| l.contains("r#wakeReason:") || l.contains("r#wakeReason ="))
-        .unwrap_or("");
+        .expect("the wakeReason field must be generated");
     assert!(
         !wake_line.contains("FoldState"),
         "wakeReason field should not reference FoldState, got: {}",
@@ -717,19 +722,12 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// PR #121 — parcelable with a non-null interface field.
-//
-// Pre-#121 generated `pub r#op: rsbinder::Strong<dyn IFoo>` for this field,
-// which fails to compile because `Strong<_>` has no `Default` impl (verified
-// against master prior to PR #121 — produced exactly that non-compiling
-// output). PR #121 now wraps interface fields in `Option<>`, matching AOSP
-// `aidl_to_rust.cpp` `TypeNeedsOption` for PARCELABLE_FIELD storage.
-//
-// Note: the AIDL non-null contract is NOT enforced at the Rust type level
-// — a caller can send `None` and the peer will reject at unmarshal time.
-// This mirrors AOSP's Rust backend behavior.
+// Interface fields are wrapped in `Option<>` (AOSP `aidl_to_rust.cpp`
+// `TypeNeedsOption`): `Strong<_>` has no `Default`, so a bare field would not
+// compile. The non-null contract is enforced at unmarshal time, not by the
+// Rust type — same as AOSP's Rust backend.
 #[test]
-fn test_pr121_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Error>> {
+fn test_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
 
     let doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
@@ -767,21 +765,17 @@ fn test_pr121_parcelable_non_null_interface_field_is_option() -> Result<(), Box<
     Ok(())
 }
 
-// PR #121 — cross-enum mismatch is rejected.
-//
-// Pre-#121, a parcelable `HardwareAuthenticatorType` field defaulting to
-// `Digest.NONE` silently generated `super::Digest::Digest::NONE` — a wrong-
-// type initializer that would only be caught by rustc compiling the
-// generated code (or might compile accidentally if both enums share the
-// same backing and the value coerces). PR #121's `validate_enum_value`
-// now rejects this at AIDL-parse time with a clear diagnostic.
+// A field default drawn from a different enum must be rejected at AIDL time
+// by `validate_enum_value`. Emitting it produces a wrong-type initializer
+// (`super::Digest::Digest::NONE`) that rustc may or may not catch, depending
+// on whether the two enums share a backing type.
 //
 // AOSP `aidl_to_rust.cpp:89-93` silently re-targets `Bar.X` for a `Foo`
 // field to `Foo::X` (using only the suffix). rsbinder is intentionally
 // stricter; real AIDL never writes this pattern, so this test also
 // documents the divergence rather than guarding a common case.
 #[test]
-fn test_pr121_cross_enum_mismatch_is_rejected() -> Result<(), Box<dyn Error>> {
+fn test_cross_enum_default_mismatch_is_rejected() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
 
     let digest_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
@@ -829,8 +823,8 @@ fn test_pr121_cross_enum_mismatch_is_rejected() -> Result<(), Box<dyn Error>> {
     let err = result.expect_err("cross-enum mismatch must be rejected");
     let msg = format!("{err}");
     assert!(
-        msg.contains("does not match target enum") || msg.contains("HardwareAuthenticatorType"),
-        "error must mention the target-enum mismatch, got: {}",
+        msg.contains("does not match target enum keymint.HardwareAuthenticatorType"),
+        "expected the cross-enum mismatch diagnostic, got: {}",
         msg
     );
 

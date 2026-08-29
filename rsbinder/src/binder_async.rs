@@ -51,6 +51,14 @@ pub trait BinderAsyncPool {
     /// The only difference between different implementations should be which
     /// `spawn_thread` method is used. For Tokio, it would be `tokio::task::spawn_blocking`.
     ///
+    /// The returned future is **not cancel-safe**, and an implementation may
+    /// run `spawn_me` eagerly (the Tokio one does, on a binder thread that is
+    /// already handling a transaction). Dropping the future — a `timeout`
+    /// or `select!` losing — does not cancel a transaction that has already
+    /// been issued: the remote side still executes it and only the reply is
+    /// discarded. Callers wrapping a non-idempotent call in a timeout must
+    /// not assume "timed out" means "did not happen".
+    ///
     /// This method has the design it has because the only way to define a trait that
     /// allows the return type of the spawn to be chosen by the caller is to return a
     /// boxed `Future` trait object, and including `after_spawn` in the trait function

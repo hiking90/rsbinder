@@ -356,8 +356,23 @@ impl Android13PlusCodec {
     pub(crate) fn decode_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
         let options = rd_u32(buf, off)?;
         let address = rd_u32(buf, off + 4)?;
-        if options & ADDR_OPTION_CREATED == 0 && address == 0 {
+        // AOSP `RpcState::onBinderEntering` rejects unknown option bits
+        // ("could cause this process to accidentally proxy transactions for
+        // that binder"). Normalizing them instead would fold distinct
+        // `RpcWireAddress` values onto one `RpcAddress`.
+        if options & !(ADDR_OPTION_CREATED | ADDR_OPTION_FOR_SERVER) != 0 {
+            return Err(RpcError::Protocol("unknown RpcWireAddress option bit"));
+        }
+        // The reserved zero address is `{options: 0, address: 0}` exactly.
+        // AOSP keys nodes by the whole `{options, address}` pair, so an
+        // address without `CREATED` is a distinct name that never matches
+        // a node; `RpcAddress` records only `FOR_SERVER`, so rather than
+        // fold such a name onto the `CREATED` one it is refused.
+        if options == 0 && address == 0 {
             return Ok(RpcAddress::zero());
+        }
+        if options & ADDR_OPTION_CREATED == 0 {
+            return Err(RpcError::Protocol("RpcWireAddress without CREATED"));
         }
         let mut bytes = [0u8; super::address::RPC_ADDR_LEN];
         bytes[0..4].copy_from_slice(&address.to_le_bytes());
@@ -748,6 +763,15 @@ fn map_io(e: std::io::Error) -> RpcError {
 /// [`RpcError::Truncated`] (mirrors `transport::read_frame`).
 fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
+    read_exact_into(r, &mut buf)?;
+    Ok(buf)
+}
+
+/// Fill `buf` completely from `r`. Split from [`read_exact_raw`] so a
+/// message body can be read straight into its final buffer instead of
+/// through a second, equally large temporary.
+fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
+    let n = buf.len();
     let mut got = 0;
     while got < n {
         match r.read(&mut buf[got..]) {
@@ -759,12 +783,15 @@ fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
                 })
             }
             Ok(k) => got += k,
+            // A signal interrupted the read; retry like every other reader.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A read deadline elapsed (`RawTransportIo` surfaces
-            // `recv_raw`'s `Timeout` as `ErrorKind::TimedOut`): a clean
-            // `Timeout` before any byte of this read, else mid-frame
-            // `Truncated` — honoring the `set_read_timeout` contract rather
-            // than collapsing to a generic `Io` via `map_io`.
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // `recv_raw`'s `Timeout` as `ErrorKind::TimedOut`; a bare
+            // socket reader yields `WouldBlock`): a clean `Timeout` before
+            // any byte of this read, else mid-frame `Truncated` — honoring
+            // the `set_read_timeout` contract rather than collapsing to a
+            // generic `Io` via `map_io`.
+            Err(ref e) if super::transport::is_timeout(e) => {
                 return Err(if got == 0 {
                     RpcError::Timeout
                 } else {
@@ -774,7 +801,7 @@ fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
             Err(e) => return Err(map_io(e)),
         }
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// Write one message **AOSP-faithfully**: `msg` is the codec output
@@ -809,21 +836,24 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
             max: MAX_FRAME_LEN,
         });
     }
-    let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_size);
-    out.extend_from_slice(&header);
+    // One allocation for header + body: `bodySize` is peer-chosen (up to
+    // `MAX_FRAME_LEN`), and reading the body into a temporary first would
+    // let a 16-byte header commit twice that before a single body byte
+    // arrives.
+    let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
+    out[..WIRE_HEADER_LEN].copy_from_slice(&header);
     if body_size > 0 {
         // The header is already consumed, so either a deadline that elapses at
         // the start of the body (`Timeout`) or a clean EOF before the body
-        // (`PeerClosed`, which `read_exact_raw` reports for a 0-byte read) is
+        // (`PeerClosed`, which `read_exact_into` reports for a 0-byte read) is
         // mid-message, not frame-synchronized: report `Truncated` in both
         // cases (matches `read_aosp_message_with_fds`, which carries
         // `total_read` across header+body). Without the `PeerClosed` arm a peer
         // that sends only a header and dies would be recorded as a clean close.
-        let body = read_exact_raw(r, body_size).map_err(|e| match e {
+        read_exact_into(r, &mut out[WIRE_HEADER_LEN..]).map_err(|e| match e {
             RpcError::Timeout | RpcError::PeerClosed => RpcError::Truncated,
             other => other,
         })?;
-        out.extend_from_slice(&body);
     }
     Ok(out)
 }

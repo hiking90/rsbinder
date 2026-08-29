@@ -156,6 +156,11 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
 
 #[cfg(feature = "rpc")]
 fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
+    #[cfg(feature = "rpc-tls")]
+    let reject_option = |what: &str, endpoint: &Endpoint| {
+        log::error!("rsbinder::Client::open: option `{what}` does not apply to {endpoint:?}");
+        StatusCode::BadValue
+    };
     use crate::rpc::transport::RpcTransport;
     use crate::rpc::{AddressSpace, FileDescriptorTransportMode, RpcSession};
 
@@ -187,7 +192,26 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         if let Some(m) = o.fd_mode {
             cfg = cfg.fd_mode(m);
         }
+        // Forward rather than drop: the session layer refuses the
+        // combination (`BadValue`), which is the "never ignored" contract.
+        if let Some(id) = o.session_id.as_deref() {
+            cfg = cfg.session_id(id);
+        }
+        #[cfg(feature = "rpc-tls")]
+        if o.tls.is_some() || o.tls_server_name.is_some() {
+            return Err(reject_option("tls/tls_server_name", &uri.endpoint));
+        }
         return RpcSession::setup_unix_client_android13plus_with_config(cfg);
+    }
+
+    // `ClientOptions::tls` is honored only for `tls://`; every other
+    // endpoint would otherwise connect in plaintext while the caller
+    // believes the link is encrypted.
+    #[cfg(feature = "rpc-tls")]
+    if !matches!(uri.endpoint, Endpoint::Tls(..))
+        && (o.tls.is_some() || o.tls_server_name.is_some())
+    {
+        return Err(reject_option("tls/tls_server_name", &uri.endpoint));
     }
 
     let transport: Box<dyn RpcTransport> = match &uri.endpoint {

@@ -155,38 +155,27 @@ impl Namespace {
     }
 }
 
-/// Fully-qualified AIDL type names that the AOSP toolchain treats as
-/// **framework-builtin primitives** rather than user-defined parcelables —
-/// they are backed by the rsbinder runtime (`type_generator` maps them
-/// to native Rust types), so `import` statements for them do not need a
-/// resolvable `.aidl` source file alongside the vendored AOSP `.aidl`s.
-///
-/// Only fully-qualified names listed here are exempted; any unknown
-/// import still surfaces as `ResolutionError::ImportNotFound`.
+// Framework-builtin primitives: backed by the rsbinder runtime, so an
+// `import` of one needs no resolvable `.aidl`. Everything else still
+// surfaces as `ResolutionError::ImportNotFound`.
 pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
     matches!(fqcn, "android.os.ParcelFileDescriptor")
 }
 
-/// Wrap `ident` as a Rust raw identifier (`r#ident`) iff it is a Rust keyword
-/// that would otherwise fail to compile as a plain identifier.
-///
-/// AIDL's identifier grammar permits type and member names that are Rust
-/// keywords (`type`, `loop`, `match`, `move`, `impl`, …); the generated
-/// `mod` / `struct` / `trait` declarations and the `::`-joined reference paths
-/// that name them must escape those, exactly as AOSP's Rust backend does
-/// (`pub struct r#<Name>`, `::r#<segment>`). `crate`, `self`, `Self` and
-/// `super` cannot be raw identifiers — and are meaningful path keywords — so
-/// they are returned unchanged. Non-keyword identifiers are returned unchanged,
-/// so generated output for ordinary names is byte-for-byte identical.
+// AIDL permits names that are Rust keywords, so declarations and reference
+// paths must `r#`-escape them as AOSP's Rust backend does. `crate`/`self`/
+// `Self`/`super` cannot be raw identifiers at all and are rejected in the
+// parser (`reject_unrepresentable_identifier`), so they never reach here.
 pub(crate) fn escape_rust_keyword(ident: &str) -> std::borrow::Cow<'_, str> {
-    // Strict + reserved Rust 2021 keywords, minus `crate`/`self`/`Self`/`super`
-    // (invalid as raw identifiers; never need escaping in our output).
+    // Strict + reserved keywords through Rust 2024 (generated code is compiled
+    // in the consumer's edition), minus `crate`/`self`/`Self`/`super` (invalid
+    // as raw identifiers; never need escaping in our output).
     const KEYWORDS: &[&str] = &[
         "as", "async", "await", "break", "const", "continue", "dyn", "else", "enum", "extern",
         "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
         "pub", "ref", "return", "static", "struct", "trait", "true", "type", "unsafe", "use",
         "where", "while", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
-        "typeof", "unsized", "virtual", "yield", "try",
+        "typeof", "unsized", "virtual", "yield", "try", "gen",
     ];
     if KEYWORDS.contains(&ident) {
         std::borrow::Cow::Owned(format!("r#{ident}"))
@@ -241,15 +230,9 @@ pub struct Builder {
     /// to [`Builder::source`]. [`Builder::version`] and [`Builder::hash`]
     /// apply to the most recently added source.
     version_meta: HashMap<PathBuf, VersionMeta>,
-    /// Paths recorded during the parse phase for
-    /// `cargo:rerun-if-changed=` emission in [`Builder::generate`].
-    /// Captures every `.aidl` file that contributed to the generated
-    /// output (initial sources + transitively resolved imports) plus
-    /// every directory walked during resolution (user-supplied
-    /// `include_dir`s, source paths that resolve to a directory, and
-    /// package-derived include paths). cargo scans directories
-    /// recursively, so the file-level + dir-level entries together
-    /// trigger reruns on both modifications and additions/removals.
+    // Every `.aidl` that contributed to the output plus every directory
+    // walked: cargo scans directories recursively, so the two together
+    // trigger reruns on modifications and on additions/removals.
     dependencies: Vec<PathBuf>,
 }
 
@@ -261,10 +244,6 @@ impl Default for Builder {
 
 impl Builder {
     pub fn new() -> Self {
-        parser::reset();
-        // Each Builder starts from the default `rsbinder::` prefix; a
-        // previous Builder's `set_crate_support(true)` must not leak in.
-        type_generator::set_crate_support(false);
         Self {
             sources: Vec::new(),
             includes: Vec::new(),
@@ -333,7 +312,9 @@ impl Builder {
     /// does not validate it against the AIDL contents (AIDL API snapshot
     /// freeze is a separate workflow).
     ///
-    /// Panics if no source has been added yet.
+    /// Panics if no source has been added yet or if `h` is empty (an empty
+    /// hash is falsy to Tera and would silently emit no `getInterfaceHash()`,
+    /// the same trap [`Builder::version`] guards against).
     pub fn hash(mut self, h: impl Into<String>) -> Self {
         let last = self
             .sources
@@ -346,7 +327,12 @@ impl Builder {
             "Builder::hash() applies to a single .aidl file source, but the preceding \
              source() is a directory: {last:?}"
         );
-        self.version_meta.entry(last).or_default().hash = Some(h.into());
+        let h = h.into();
+        assert!(
+            !h.is_empty(),
+            "Builder::hash: the hash must be non-empty; omit the call for unhashed interfaces"
+        );
+        self.version_meta.entry(last).or_default().hash = Some(h);
         self
     }
 
@@ -376,7 +362,6 @@ impl Builder {
     /// It generates the rust output file with crate::??? instead of rsbinder::???.
     pub fn set_crate_support(mut self, enable: bool) -> Self {
         self.is_crate = enable;
-        type_generator::set_crate_support(enable);
         self
     }
 
@@ -408,9 +393,6 @@ impl Builder {
         let mut namespace = String::new();
         let mut mod_count: usize = 0;
 
-        content += "#[allow(clippy::all)]\n";
-        content += "#[allow(unused_imports)]\n\n";
-
         package_list.sort();
 
         for package in package_list {
@@ -438,8 +420,15 @@ impl Builder {
                 mod_count = start;
 
                 for r#mod in &mod_list[start..] {
+                    // Lints against the package module itself — e.g.
+                    // `module_inception` when the `include!` site is a module
+                    // of the same name — need an outer attribute; each
+                    // generated leaf module carries its own inner allowances.
+                    if mod_count == 0 {
+                        content += "#[allow(clippy::all)]\n#[allow(unused_imports)]\n";
+                    }
                     content += &indent_space(mod_count);
-                    content += &format!("pub mod {mod} {{\n");
+                    content += &format!("pub mod {} {{\n", escape_rust_keyword(r#mod));
                     mod_count += 1;
                 }
             }
@@ -458,6 +447,11 @@ impl Builder {
     fn parse_sources(
         &mut self,
     ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
+        // Reset here rather than in `Builder::new()`: parsing happens on
+        // `generate()`, so two builders constructed before either generates
+        // would otherwise let the first one's symbol table leak into the
+        // second.
+        parser::reset();
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
         // `includes` keeps insertion order (user `include_dir()`s first,
@@ -466,9 +460,19 @@ impl Builder {
         // ambiguous, matching AOSP `import_resolver.cpp` ("Duplicate files
         // found").
         let mut includes: Vec<PathBuf> = Vec::new();
+        // Canonical key: `./aidl` and `aidl` are one dir; `""` (source directly under its package path) means cwd.
+        fn name_the_cwd(dir: PathBuf) -> PathBuf {
+            if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir
+            }
+        }
+        let include_key = |dir: &Path| fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut include_seen: HashSet<PathBuf> = HashSet::new();
         for dir in take(&mut self.includes) {
-            if include_seen.insert(dir.clone()) {
+            let dir = name_the_cwd(dir);
+            if include_seen.insert(include_key(&dir)) {
                 self.dependencies.push(dir.clone());
                 includes.push(dir);
             }
@@ -488,7 +492,11 @@ impl Builder {
 
         while !sources.is_empty() {
             for path in take(&mut sources) {
-                if seen.contains(&path) {
+                // `Path::is_dir()` follows symlinks, so a link cycle
+                // (`aidl/loop -> .`) yields endlessly deeper distinct path
+                // strings; canonicalising makes the dedup terminate.
+                let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen.insert(key) {
                     continue;
                 }
 
@@ -501,7 +509,8 @@ impl Builder {
                                 .as_ref()
                                 .and_then(|p| strip_package(path.parent()?, p))
                             {
-                                if include_seen.insert(dir.clone()) {
+                                let dir = name_the_cwd(dir);
+                                if include_seen.insert(include_key(&dir)) {
                                     includes.push(dir.clone());
                                     self.dependencies.push(dir);
                                 }
@@ -604,8 +613,6 @@ impl Builder {
                         }
                     }
                 };
-
-                seen.insert(path);
             }
         }
 
@@ -691,7 +698,21 @@ impl Builder {
 
         let content = self.generate_all(package_list)?;
 
-        fs::write(self.dest_dir.join(&self.output), content)?;
+        let out_path = self.dest_dir.join(&self.output);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                std::io::Error::new(
+                    err.kind(),
+                    format!("cannot create output directory {parent:?}: {err}"),
+                )
+            })?;
+        }
+        fs::write(&out_path, content).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot write generated output {out_path:?}: {err}"),
+            )
+        })?;
 
         Ok(())
     }

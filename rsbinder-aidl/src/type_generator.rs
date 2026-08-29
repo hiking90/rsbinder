@@ -14,6 +14,17 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     let filename = parser::current_source_name();
     let source = parser::current_source_text();
     let (start, end) = span.unwrap_or((0, 0));
+    // Clamp into the attached source so a stale offset cannot make miette
+    // replace the snippet with an `OutOfBounds` notice. With no source
+    // context (`Generator::document()` called outside `Builder::generate`)
+    // there is nothing to render either way, so the raw offsets are kept —
+    // they are still the AIDL positions a programmatic consumer reads.
+    let (start, end) = if source.is_empty() {
+        (start, end)
+    } else {
+        let start = start.min(source.len());
+        (start, end.clamp(start, source.len()))
+    };
     let src_name = if filename.is_empty() {
         "<type_generator>".to_string()
     } else {
@@ -21,7 +32,7 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     };
     (
         NamedSource::new(src_name, source),
-        SourceSpan::new(start.into(), end.saturating_sub(start)),
+        SourceSpan::new(start.into(), end - start),
     )
 }
 
@@ -35,9 +46,8 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
 }
 
 thread_local! {
-    // Thread-local like the rest of the compiler state (parser.rs); kept in
-    // sync by `Generator::new` (single source of truth) and reset by
-    // `Builder::new`.
+    // Thread-local like the rest of the compiler state (parser.rs); set by
+    // `Generator::new`, the single source of truth.
     static IS_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -367,14 +377,10 @@ impl TypeGenerator {
         }
     }
 
-    /// Would a by-value field of `lookup_decl`, inside the declaration being
-    /// generated, close a reference cycle and make the Rust struct infinitely
-    /// sized? A direct self-reference is only the shortest such cycle.
-    ///
-    /// Only a parcelable or a union can hold the enclosing declaration inline.
-    /// An interface renders as a `Strong<dyn …>` handle, and an enum — a
-    /// synthetic union `Tag` included, which reports its parent union's
-    /// namespace — is a scalar; neither closes a cycle.
+    // Would a by-value field of `lookup_decl` make the enclosing Rust struct
+    // infinitely sized? Only a parcelable or union holds its declaration
+    // inline; an interface is a `Strong<dyn …>` handle and an enum is a
+    // scalar, so neither can close a cycle.
     fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
         if !matches!(
             lookup_decl.decl,
@@ -449,15 +455,15 @@ impl TypeGenerator {
         }
     }
 
-    fn is_interface(value_type: &ValueType) -> bool {
-        match value_type {
-            ValueType::UserDefined(name) => {
-                matches!(
-                    lookup_decl_from_name(name, crate::Namespace::AIDL),
-                    Some(lookup_decl) if matches!(lookup_decl.decl, Declaration::Interface(_))
-                )
-            }
-            _ => false,
+    // `@nullable T[]` wraps each element only for a non-primitive, non-enum
+    // element (AOSP `aidl_to_rust.cpp::UsesOptionInNullableVector`): a
+    // primitive is written bare, so `Vec<Option<i32>>` would put a null-marker
+    // word before every value that the peer does not expect.
+    fn nullable_element(value_type: &ValueType, type_name: &str) -> String {
+        if Self::is_primitive(value_type) {
+            type_name.to_owned()
+        } else {
+            format!("Option<{type_name}>")
         }
     }
 
@@ -623,10 +629,10 @@ impl TypeGenerator {
         } else {
             match self.direction {
                 Direction::Out | Direction::Inout => {
-                    if self.is_nullable
-                        || !Self::can_be_defaulted(&array_info.value_type, is_struct)
-                    {
+                    if !Self::can_be_defaulted(&array_info.value_type, is_struct) {
                         format!("Option<{type_name}>")
+                    } else if self.is_nullable {
+                        Self::nullable_element(&array_info.value_type, &type_name)
                     } else {
                         type_name
                     }
@@ -662,7 +668,10 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    format!("Vec<Option<{type_name}>>")
+                    format!(
+                        "Vec<{}>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
                     format!("Vec<{type_name}>")
                 } else {
@@ -671,13 +680,15 @@ impl TypeGenerator {
             }
             Direction::Inout => {
                 if self.is_nullable {
-                    format!("Vec<Option<{type_name}>>")
-                } else if Self::can_be_defaulted(&sub_type.value_type, true)
-                    || Self::is_interface(&sub_type.value_type)
-                {
-                    format!("Vec<{type_name}>")
+                    format!(
+                        "Vec<{}>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else {
-                    format!("Vec<Option<{type_name}>>")
+                    // AOSP `RustNameOf` keeps `element_mode = VALUE` for
+                    // `INOUT_ARGUMENT`: the vector is read from the parcel
+                    // fully populated, so no element needs a `Default`.
+                    format!("Vec<{type_name}>")
                 }
             }
             _ => {
@@ -729,7 +740,10 @@ impl TypeGenerator {
         let name = match &self.value_type {
             ValueType::Array(_) => self.list_type_decl(is_struct),
             _ => {
-                if !Self::can_be_defaulted(&self.value_type, is_struct) && is_struct {
+                // No-`Default` types are `Option<T>` for fields and `out` locals; `inout` is read from the parcel (AOSP `RustNameOf`).
+                if !Self::can_be_defaulted(&self.value_type, is_struct)
+                    && (is_struct || matches!(self.direction, Direction::Out))
+                {
                     is_nullable = true;
                 }
                 self.type_decl(&self.value_type, true)
@@ -776,9 +790,35 @@ impl TypeGenerator {
     pub fn out_array_needs_null_guard(&self) -> bool {
         matches!(self.direction, Direction::Out)
             && !self.is_nullable
-            && self.array_types.first().is_some_and(|sub| {
-                !sub.is_fixed() && matches!(sub.value_type, ValueType::FileDescriptor)
-            })
+            && self
+                .array_types
+                .first()
+                .is_some_and(|sub| matches!(sub.value_type, ValueType::FileDescriptor))
+    }
+
+    /// How many `.flatten()` the null guard needs to reach the `Option`
+    /// elements: one per nested fixed-size dimension beyond the first
+    /// (`[[Option<_>; 3]; 2]` → 1). Zero when no guard applies.
+    pub fn out_array_null_guard_flatten(&self) -> usize {
+        if !self.out_array_needs_null_guard() {
+            return 0;
+        }
+        self.array_types
+            .first()
+            .map_or(0, |sub| sub.sizes.len().saturating_sub(1))
+    }
+
+    /// True when this arg is a non-nullable, out-only *scalar* whose type has
+    /// no `Default` and is therefore stored as `Option<T>`. The service may
+    /// leave it unset, and `None` has no wire form the `.aidl` allows, so the
+    /// server unwraps it into `UNEXPECTED_NULL` before writing the reply.
+    /// Mirrors AOSP `generate_rust.cpp`'s `!arg->IsIn() && TypeNeedsOption(..)`
+    /// → `.ok_or(binder::StatusCode::UNEXPECTED_NULL)?` arm.
+    pub fn out_scalar_needs_unwrap(&self) -> bool {
+        matches!(self.direction, Direction::Out)
+            && !self.is_nullable
+            && !matches!(self.value_type, ValueType::Array(_))
+            && !Self::can_be_defaulted(&self.value_type, false)
     }
 
     fn func_list_type_decl_fixed(&self, array_info: &ArrayInfo) -> String {
@@ -811,8 +851,10 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out => {
                 if self.is_nullable {
-                    // if nullable, it means that the array can have null elements.
-                    format!("&mut Option<Vec<Option<{type_name}>>>")
+                    format!(
+                        "&mut Option<Vec<{}>>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else if Self::can_be_defaulted(&sub_type.value_type, false)
                     || Self::is_primitive(&sub_type.value_type)
                 {
@@ -823,12 +865,14 @@ impl TypeGenerator {
                 }
             }
             Direction::Inout => {
+                // Must mirror `list_type_decl`'s `Inout` arm exactly: the
+                // server declares its local with that type and passes
+                // `&mut` it straight into this signature.
                 if self.is_nullable {
-                    if Self::can_be_defaulted(&sub_type.value_type, false) {
-                        format!("&mut Option<Vec<{type_name}>>")
-                    } else {
-                        format!("&mut Option<Vec<Option<{type_name}>>>")
-                    }
+                    format!(
+                        "&mut Option<Vec<{}>>",
+                        Self::nullable_element(&sub_type.value_type, &type_name)
+                    )
                 } else {
                     format!("&mut Vec<{type_name}>")
                 }
@@ -874,7 +918,12 @@ impl TypeGenerator {
                         ));
                     }
                     let name = self.type_decl(&self.value_type, true);
-                    if self.is_nullable {
+                    // Mirrors `type_declaration`: an `out` argument of a type
+                    // with no `Default` is wrapped in `Option`.
+                    if self.is_nullable
+                        || (matches!(self.direction, Direction::Out)
+                            && !Self::can_be_defaulted(&self.value_type, false))
+                    {
                         format!("&mut Option<{name}>")
                     } else {
                         format!("&mut {name}")
@@ -897,13 +946,45 @@ impl TypeGenerator {
     }
 
     pub fn const_type_decl(&self) -> Result<String, AidlError> {
-        // A String-element const array renders as `&[&str]`: its initializer
-        // elements are emitted as string literals, which do not coerce to a
-        // `&[String]` slice in const position.
+        // A String-element const array renders its elements as string
+        // literals, which do not coerce to `String` in const position.
         if matches!(self.value_type, ValueType::Array(_)) {
             if let Some(info) = self.array_types.first() {
-                if matches!(info.value_type, ValueType::String(_)) && !info.is_fixed() {
-                    return Ok("&[&str]".into());
+                // Must match `init_array_branch`'s predicate exactly: that is
+                // what decides whether each element is emitted as `Some(..)`.
+                let element = |name: &str| {
+                    if self.is_nullable && Self::is_aidl_nullable(&info.value_type) {
+                        format!("Option<{name}>")
+                    } else {
+                        name.to_owned()
+                    }
+                };
+                let outer = |name: String| {
+                    if self.is_nullable {
+                        format!("Option<{name}>")
+                    } else {
+                        name
+                    }
+                };
+                let is_str = matches!(info.value_type, ValueType::String(_));
+                if is_str && !info.is_fixed() {
+                    return Ok(outer(format!("&[{}]", element("&str"))));
+                }
+                // A fixed-size array constant is emitted by value: its
+                // initializer is an array literal (`[1,2,3,]`), which does not
+                // coerce to a slice reference in const position.
+                if info.is_fixed() {
+                    let base = if is_str {
+                        element("&str")
+                    } else {
+                        element(&self.array_type_name(&info.value_type))
+                    };
+                    let name = info
+                        .sizes
+                        .iter()
+                        .rev()
+                        .fold(base, |acc, size| format!("[{acc}; {size}]"));
+                    return Ok(outer(name));
                 }
             }
         }
@@ -1396,13 +1477,15 @@ mod tests {
                 .type_declaration(false),
             "Vec<Option<rsbinder::SIBinder>>"
         );
+        // `inout` is read from the parcel fully populated, so its elements
+        // need no `Default` — AOSP `RustNameOf` keeps `element_mode = VALUE`.
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<Option<rsbinder::SIBinder>>"
+            "Vec<rsbinder::SIBinder>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
@@ -1461,6 +1544,8 @@ mod tests {
                 .unwrap(),
             "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
         );
+        // Must equal `list_type_decl(false)` for the same generator: the
+        // server passes `&mut` its local of that type into this signature.
         assert_eq!(
             array_gen
                 .clone()

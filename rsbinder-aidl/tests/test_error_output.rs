@@ -1,8 +1,8 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase 5 final integration tests (task 5.5)
-//! Validates miette error output format and boundary conditions.
+//! Rendering of AIDL diagnostics through miette: message, help, code, and
+//! the source snippet, plus boundary conditions.
 
 use std::error::Error;
 
@@ -40,10 +40,10 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
 }
 
 // ============================================================
-// 5.5a~5.5e: Error output format verification
+// Error output format verification
 // ============================================================
 
-// 5.5a: Parse error output includes filename, source snippet, diagnostic code
+// Parse error output includes filename, source snippet, diagnostic code
 #[test]
 fn test_parse_error_output_format() {
     let err = expect_parse_error("interface IHello {\n    void 123bad();\n}", "hello.aidl");
@@ -58,7 +58,7 @@ fn test_parse_error_output_format() {
     );
 }
 
-// 5.5b: Semantic error output shows duplicate transaction code info
+// Semantic error output shows duplicate transaction code info
 #[test]
 fn test_semantic_error_output_format() {
     let err = expect_generation_error(
@@ -81,7 +81,7 @@ interface IDup {
     );
 }
 
-// 5.5c: Multiple errors output format
+// Multiple errors output format
 #[test]
 fn test_multiple_errors_output_format() {
     // Create a Multiple error manually for output format testing
@@ -97,40 +97,48 @@ fn test_multiple_errors_output_format() {
     );
 }
 
-// 5.5d: Error output includes help section
+// Error output includes help section
 #[test]
 fn test_error_output_includes_help() {
+    // `UnsupportedType` is one of the diagnostics that carries a `help`;
+    // the point of this test is that the renderer surfaces it.
     let err = expect_generation_error(
         r#"
 parcelable Foo {
-    @nullable int val;
+    FileDescriptor fd;
 }
         "#,
         "test.aidl",
     );
     let rendered = render_error(&err);
-    // The error should have some diagnostic info (help or label)
-    assert!(!rendered.is_empty(), "Rendered output should not be empty");
+    // `render_report` always writes at least the severity and message, so a
+    // non-empty check would pass with every `#[diagnostic(help(...))]` gone.
+    assert!(
+        rendered.contains("help:"),
+        "the diagnostic must carry a help section:\n{rendered}"
+    );
 }
 
-// 5.5e: Error output includes source snippet
+// Error output includes source snippet
 #[test]
 fn test_error_output_includes_source_snippet() {
     let input = "parcelable Foo {\n    int field\n}";
     let err = expect_parse_error(input, "test.aidl");
     let rendered = render_error(&err);
-    // The rendered output should contain some part of the source
+    // Anchor on the rendered source line itself: the expectation list in the
+    // message ("expected parcelable_decl, interface_decl, ...") contains
+    // "int"/"parcelable" as substrings, so those alone prove nothing.
     assert!(
-        rendered.contains("int") || rendered.contains("field") || rendered.contains("parcelable"),
-        "Should contain source snippet:\n{rendered}"
+        rendered.contains("int field"),
+        "the rendered report must quote the offending source line:\n{rendered}"
     );
 }
 
 // ============================================================
-// 5.5k~5.5r: Boundary condition tests
+// Boundary condition tests
 // ============================================================
 
-// 5.5k: Empty input
+// Empty input
 #[test]
 fn test_empty_input() {
     let ctx = SourceContext::new("test.aidl", "");
@@ -138,7 +146,7 @@ fn test_empty_input() {
     assert!(result.is_err(), "Empty input should fail");
 }
 
-// 5.5l: Whitespace only input
+// Whitespace only input
 #[test]
 fn test_whitespace_only_input() {
     let ctx = SourceContext::new("test.aidl", "   \n\n  ");
@@ -146,7 +154,7 @@ fn test_whitespace_only_input() {
     assert!(result.is_err(), "Whitespace-only input should fail");
 }
 
-// 5.5m: Comment only input (no declarations)
+// Comment only input (no declarations)
 #[test]
 fn test_comment_only_input() {
     let ctx = SourceContext::new("test.aidl", "// just a comment\n/* block */\n");
@@ -154,7 +162,7 @@ fn test_comment_only_input() {
     assert!(result.is_err(), "Comment-only input should fail");
 }
 
-// 5.5n: Very long identifier (should not crash)
+// Very long identifier (should not crash)
 #[test]
 fn test_very_long_identifier() {
     let long_name = "A".repeat(10000);
@@ -166,7 +174,7 @@ fn test_very_long_identifier() {
     assert!(result.is_ok(), "Very long identifier should not crash");
 }
 
-// 5.5o: Deeply nested const expression
+// Deeply nested const expression
 #[test]
 fn test_deeply_nested_const_expr() -> Result<(), Box<dyn Error>> {
     let input = r#"
@@ -181,7 +189,7 @@ parcelable Foo {
     Ok(())
 }
 
-// 5.5p: Unicode in string constant
+// Unicode in string constant
 #[test]
 fn test_unicode_in_string_constant() -> Result<(), Box<dyn Error>> {
     let input = "parcelable Foo {\n    const String MSG = \"한글 테스트\";\n}";
@@ -230,7 +238,7 @@ interface IFoo {
     Ok(())
 }
 
-// 5.5r: Transaction code at u32::MAX + 1 should fail
+// Transaction code at u32::MAX + 1 should fail
 #[test]
 fn test_transaction_code_u32_max_plus_one() {
     let err = expect_generation_error(
@@ -250,7 +258,7 @@ interface IFoo {
 }
 
 // ============================================================
-// 2.6: fancy / non-fancy / ascii output format verification
+// fancy / non-fancy / ascii output format verification
 // ============================================================
 
 // Fancy mode: GraphicalTheme::unicode() — includes ANSI color codes

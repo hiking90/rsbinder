@@ -38,6 +38,10 @@ pub mod heap;
 pub mod shared;
 pub mod wire;
 
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+use crate::error::{Result, StatusCode};
+
 pub use dealer::{Allocation, MemoryDealer, ALLOCATION_ALIGNMENT};
 pub use heap::{
     is_supported, MappedHeap, MemoryHeapBase, FLAG_DONT_MAP_LOCALLY, FLAG_FORCE_MEMFD,
@@ -57,6 +61,178 @@ pub use wire::{
 /// mapping from a peer that ignores the flag; the owner's own mapping,
 /// created before the seal, stays writable.
 pub const FLAG_READ_ONLY: u32 = 0x0000_0001;
+
+pub(crate) const WORD: usize = std::mem::size_of::<usize>();
+
+/// A mapped shared region, split into its `usize`-aligned words and the
+/// `< WORD` trailing bytes. Every access is word-sized on the word part
+/// (partial words go through a CAS) and byte-sized on the tail: Rust's
+/// memory model makes overlapping atomic accesses of *different* sizes a
+/// data race when one is a write, so a byte-granular fast path here would
+/// race the word path of another thread writing the same window.
+#[derive(Clone, Copy)]
+pub(crate) struct Region<'a> {
+    words: &'a [AtomicUsize],
+    tail: &'a [AtomicU8],
+}
+
+impl<'a> Region<'a> {
+    pub(crate) fn new(words: &'a [AtomicUsize], tail: &'a [AtomicU8]) -> Self {
+        Self { words, tail }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.words.len() * WORD + self.tail.len()
+    }
+
+    fn check(&self, off: usize, len: usize) -> Result<()> {
+        let end = off.checked_add(len).ok_or(StatusCode::BadValue)?;
+        if end > self.len() {
+            return Err(StatusCode::BadValue);
+        }
+        Ok(())
+    }
+
+    /// Copy `dst.len()` bytes out, starting at `off` (relaxed loads).
+    pub(crate) fn load(&self, off: usize, dst: &mut [u8]) -> Result<()> {
+        self.check(off, dst.len())?;
+        let word_bytes = self.words.len() * WORD;
+        let mut done = 0;
+        while done < dst.len() && off + done < word_bytes {
+            let at = off + done;
+            let shift = at % WORD;
+            let n = (WORD - shift).min(dst.len() - done);
+            let w = self.words[at / WORD].load(Ordering::Relaxed).to_ne_bytes();
+            dst[done..done + n].copy_from_slice(&w[shift..shift + n]);
+            done += n;
+        }
+        let tail_at = (off + done).saturating_sub(word_bytes);
+        for (d, s) in dst[done..].iter_mut().zip(&self.tail[tail_at..]) {
+            *d = s.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Copy `src` in at `off` (relaxed stores; a partial word is merged
+    /// with a CAS so the neighbouring bytes of another writer survive).
+    pub(crate) fn store(&self, off: usize, src: &[u8]) -> Result<()> {
+        self.check(off, src.len())?;
+        let word_bytes = self.words.len() * WORD;
+        let mut done = 0;
+        while done < src.len() && off + done < word_bytes {
+            let at = off + done;
+            let shift = at % WORD;
+            let n = (WORD - shift).min(src.len() - done);
+            let w = &self.words[at / WORD];
+            let chunk = &src[done..done + n];
+            if n == WORD {
+                let full = usize::from_ne_bytes(chunk.try_into().expect("one word"));
+                w.store(full, Ordering::Relaxed);
+            } else {
+                let mut cur = w.load(Ordering::Relaxed);
+                loop {
+                    let mut bytes = cur.to_ne_bytes();
+                    bytes[shift..shift + n].copy_from_slice(chunk);
+                    let next = usize::from_ne_bytes(bytes);
+                    match w.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(seen) => cur = seen,
+                    }
+                }
+            }
+            done += n;
+        }
+        let tail_at = (off + done).saturating_sub(word_bytes);
+        for (d, s) in self.tail[tail_at..].iter().zip(&src[done..]) {
+            d.store(*s, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+/// Read-only view of a mapped shared-memory window — what
+/// [`IMemoryHeap::base`] returns.
+///
+/// The window aliases memory another process (or, through `write_at`,
+/// another thread) writes at any moment, so the view hands out neither a
+/// `&[u8]` — which would promise an immutability shared memory cannot keep
+/// — nor a way to store: reads copy through relaxed atomics, and writes go
+/// through the concrete heap's `write_at`, which also honours the mapping's
+/// protection (a [`FLAG_READ_ONLY`] mapping is `PROT_READ`; a store into it
+/// would fault). Any cross-process ordering is the surrounding protocol's
+/// business, as with AOSP `unsecurePointer()`
+/// ([IMemory.h:78-91](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=78)).
+#[derive(Clone, Copy)]
+pub struct SharedBytes<'a> {
+    region: Region<'a>,
+    off: usize,
+    len: usize,
+}
+
+impl<'a> SharedBytes<'a> {
+    pub(crate) fn whole(region: Region<'a>) -> Self {
+        Self {
+            region,
+            off: 0,
+            len: region.len(),
+        }
+    }
+
+    /// Length of the window in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The byte at `i`, or `None` past the end.
+    pub fn load(&self, i: usize) -> Option<u8> {
+        let mut b = [0u8; 1];
+        self.copy_to(i, &mut b).ok().map(|()| b[0])
+    }
+
+    /// Copy `dst.len()` bytes starting at `off` (relative to the window).
+    /// `BadValue` if the range is out of bounds.
+    pub fn copy_to(&self, off: usize, dst: &mut [u8]) -> Result<()> {
+        let end = off.checked_add(dst.len()).ok_or(StatusCode::BadValue)?;
+        if end > self.len {
+            return Err(StatusCode::BadValue);
+        }
+        self.region.load(self.off + off, dst)
+    }
+
+    /// The sub-window `[off, off + len)`, or `None` if out of bounds.
+    pub fn slice(&self, off: usize, len: usize) -> Option<SharedBytes<'a>> {
+        let end = off.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(Self {
+            region: self.region,
+            off: self.off + off,
+            len,
+        })
+    }
+
+    /// Snapshot of the whole window.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut v = vec![0u8; self.len];
+        self.region
+            .load(self.off, &mut v)
+            .expect("window is within the region");
+        v
+    }
+}
+
+impl std::fmt::Debug for SharedBytes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBytes")
+            .field("len", &self.len)
+            .finish()
+    }
+}
 
 /// Server-side representation of a heap. AOSP `IMemoryHeap` is keyed by
 /// the heap fd; this trait deliberately exposes the fd as a borrowed
@@ -81,17 +257,11 @@ pub trait IMemoryHeap: Send + Sync {
     /// AOSP `getOffset()`. Offset within the underlying fd at which
     /// this heap begins; `0` for a freshly-allocated heap.
     fn offset(&self) -> usize;
-    /// AOSP `getBase()`. Returns the local mapping if the heap is
-    /// currently mapped into this process, else `None`.
-    ///
-    /// **Aliasing contract.** The slice aliases memory that other
-    /// processes may write concurrently; holding it is sound only while
-    /// no other party writes to the region (single-writer discipline
-    /// established by the surrounding protocol). Prefer the copying
-    /// accessors `read_at` / `write_at` on the concrete heap types — see
-    /// AOSP `unsecurePointer()`
-    /// ([IMemory.h:78-91](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=78)).
-    fn base(&self) -> Option<&[u8]>;
+    /// AOSP `getBase()`. Returns a read-only view of the local mapping if
+    /// the heap is currently mapped into this process, else `None`. See
+    /// [`SharedBytes`] for why it is neither a `&[u8]` nor writable;
+    /// writes go through the concrete heap's `write_at`.
+    fn base(&self) -> Option<SharedBytes<'_>>;
 }
 
 /// Sub-region of an [`IMemoryHeap`]. AOSP
@@ -156,7 +326,7 @@ mod tests {
             fn offset(&self) -> usize {
                 0
             }
-            fn base(&self) -> Option<&[u8]> {
+            fn base(&self) -> Option<SharedBytes<'_>> {
                 None
             }
         }
