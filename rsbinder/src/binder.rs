@@ -143,11 +143,12 @@ pub trait Interface: Send + Sync {
              This is a programmer error - only Binder objects should implement Interface.",
             std::any::type_name::<Self>()
         );
-        // This should never happen in correct code, but we want a clear error
-        // rather than undefined behavior
-        unreachable!(
-            "as_binder() must be overridden by types that can be converted to SIBinder. \
-             Type: {}",
+        // Reachable from safe code (`Strong::new(Box::new(service))` on a
+        // type with an empty `impl Interface`), so a plain `panic!` with
+        // the actionable message — not `unreachable!`.
+        panic!(
+            "as_binder() called on a non-binder Interface impl ({}): wrap the \
+             service with Bn*::new_binder before creating a Strong handle",
             std::any::type_name::<Self>()
         )
     }
@@ -1129,14 +1130,31 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     }
 
     /// Convert this synchronous binder handle into an asynchronous one.
+    ///
+    /// # Panics
+    ///
+    /// When the handle is a **local** binder that was published as a
+    /// sync-only service (`Bn*::new_binder` rather than
+    /// `new_async_binder`): its adapter has no async view, and the cast
+    /// is refused as `BadType`. Use [`try_into_async`](Self::try_into_async)
+    /// where that is a possibility (a service looked up from the same
+    /// process, for instance). Remote proxies always convert.
     pub fn into_async<P>(self) -> Strong<<I as ToAsyncInterface<P>>::Target>
     where
         I: ToAsyncInterface<P>,
     {
-        // By implementing the ToAsyncInterface trait, it is guaranteed that the binder
-        // object is also valid for the target type.
+        self.try_into_async()
+            .expect("into_async on a sync-only local service; use try_into_async")
+    }
+
+    /// Fallible [`into_async`](Self::into_async): `Err(BadType)` when the
+    /// binder is a sync-only local service that cannot back the async
+    /// view, `Err` for any other cast failure.
+    pub fn try_into_async<P>(self) -> Result<Strong<<I as ToAsyncInterface<P>>::Target>>
+    where
+        I: ToAsyncInterface<P>,
+    {
         FromIBinder::try_from(self.0.as_binder())
-            .expect("ToAsyncInterface guarantees binder compatibility")
     }
 
     /// Convert this asynchronous binder handle into a synchronous one.
@@ -1350,16 +1368,16 @@ mod tests {
             Err(other) => panic!("expected DeadObject after Arc drop, got {other:?}"),
             Ok(_) => panic!(
                 "expected DeadObject after Arc drop, but upgrade succeeded \
-                 (regression: WIBinder::upgrade is no longer truly weak)"
+                 (regression: the WIBinderInner::Native arm of WIBinder::upgrade \
+                 is no longer truly weak — the Proxy arm is not covered here, \
+                 MockBinder never downcasts to a ProxyHandle)"
             ),
         }
     }
 
-    /// `Weak<I>::upgrade()` is the typed equivalent and shares the same
-    /// semantic. Verify the typed wrapper also surfaces DeadObject. Uses
-    /// the same MockBinder; we don't need a real Remotable + AIDL stack
-    /// to exercise the fallibility — we go through `WIBinder::upgrade`
-    /// and stop at `FromIBinder::try_from`'s expected failure mode.
+    /// `WIBinder::clone` and `PartialEq` are allocation-identity based:
+    /// two clones compare equal before and after the strong holder is
+    /// gone, and neither upgrades afterwards.
     #[test]
     fn test_wibinder_clone_and_ptr_eq_after_drop() {
         let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
@@ -1376,31 +1394,6 @@ mod tests {
         // ...but neither upgrades.
         assert!(matches!(weak1.upgrade(), Err(StatusCode::DeadObject)));
         assert!(matches!(weak2.upgrade(), Err(StatusCode::DeadObject)));
-    }
-
-    #[test]
-    fn test_strong() -> Result<()> {
-        // let descriptor = "interface";
-        // let strong = SIBinder::new(Box::new(ProxyHandle::new(0, descriptor, Default::default())), descriptor);
-        // assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 1);
-
-        // let strong2 = strong.clone();
-        // assert_eq!(strong2.inner.strong.load(Ordering::Relaxed), 2);
-
-        // let weak = SIBinder::downgrade(&strong);
-
-        // assert_eq!(weak.inner.strong.load(Ordering::Relaxed), 1);
-
-        // let strong = weak.upgrade();
-        // assert_eq!(strong.inner.strong.load(Ordering::Relaxed), 2);
-        // SIBinder::downgrade(&strong);
-        // assert_eq!(*strong2.0.lock().unwrap(), 101);
-
-        // let weak = strong2.downgrade();
-
-        // assert_eq!(*weak.0.lock().unwrap(), 1);
-
-        Ok(())
     }
 
     #[test]

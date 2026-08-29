@@ -280,8 +280,15 @@ impl DeserializeOption for ParcelFileDescriptor {
         // null fd = `writeInt32(0)`, 4 B — profile-independent). The
         // body mirrors `serialize`.
         let present = parcel.read::<i32>()?;
-        if present == 0 {
+        if present == crate::NULL_PARCELABLE_FLAG {
             return Ok(None);
+        }
+        // AOSP `Parcel::readData(Parcelable*)`: anything but the not-null
+        // flag (`1`) is `UNEXPECTED_NULL`, not "present". The default
+        // `DeserializeOption` and `ParcelableHolder` already reject this;
+        // the fd path must not be the one lenient decoder.
+        if present != crate::NON_NULL_PARCELABLE_FLAG {
+            return Err(StatusCode::UnexpectedNull);
         }
 
         #[cfg(feature = "rpc")]
@@ -306,13 +313,27 @@ impl DeserializeOption for ParcelFileDescriptor {
         let has_comm = parcel.read::<i32>()?;
         let fd = read_raw_fd(parcel)?;
 
-        // Reliable-PFD comm channel: consume the second fd object so the
-        // parcel cursor stays aligned; rsbinder has no comm channel, so
-        // drop it (the parcel owns it and closes it on `BC_FREE_BUFFER`).
+        // Reliable-PFD comm channel (Java `createReliablePipe()` /
+        // `createReliableSocketPair()`): consume the second fd object so the
+        // parcel cursor stays aligned, and — as AOSP
+        // `Parcel::readParcelFileDescriptor` does — tell the sender the
+        // channel is detached (`DETACHED = 2`, big-endian). Without that
+        // notice the sender's `checkError()` reports a clean close instead
+        // of `FileDescriptorDetachedException`. The parcel still owns the
+        // comm fd and closes it on `BC_FREE_BUFFER`.
         if has_comm != 0 {
             let comm = parcel.read_object(true)?;
             if comm.header_type() != crate::sys::BINDER_TYPE_FD {
                 return Err(StatusCode::BadType);
+            }
+            const DETACHED: i32 = 2;
+            let notice = DETACHED.to_be_bytes();
+            loop {
+                match rustix::io::write(comm.borrowed_fd(), &notice) {
+                    Ok(n) if n == notice.len() => break,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    _ => return Err(StatusCode::BadType),
+                }
             }
         }
 
@@ -419,16 +440,21 @@ mod tests {
 
     #[test]
     fn test_parcel_file_descriptor() {
-        let fd = unsafe { OwnedFd::from_raw_fd(1) };
-        let pfd = ParcelFileDescriptor::new(fd);
-
-        assert_eq!(pfd.as_raw_fd(), 1);
+        // A fd this test actually owns — not stdout (fd 1), which std and
+        // the test harness already own and which a failing assert would
+        // then close during unwind.
+        let f = std::fs::File::open("/dev/null").expect("/dev/null");
+        let raw = f.as_raw_fd();
+        let pfd = ParcelFileDescriptor::from(f);
+        assert_eq!(pfd.as_raw_fd(), raw);
 
         let owned_fd: OwnedFd = pfd.into();
-
         let pfd = ParcelFileDescriptor::new(owned_fd);
+        assert_eq!(pfd.into_raw_fd(), raw);
 
-        assert_eq!(pfd.into_raw_fd(), 1);
+        // SAFETY: `into_raw_fd` just relinquished ownership of `raw`, so
+        // nothing else in this process owns it; reclaim it here to close.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
     }
 
     // E9: From<File>/From<OwnedFd>, AsFd, and try_clone (dup) ergonomics.

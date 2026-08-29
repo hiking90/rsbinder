@@ -44,14 +44,14 @@ macro_rules! __declare_binder_interface {
                 /// reject a sync-only local binder up front instead of letting
                 /// [`Self::as_async`] panic when a method is later called.
                 #[allow(dead_code)]
-                fn try_as_async(&self) -> Option<&dyn $native_async>;
+                fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async>;
             }
 
-            pub struct $native(Box<dyn $native_adapter + Send + Sync + 'static>);
+            pub struct $native(::std::boxed::Box<dyn $native_adapter + ::core::marker::Send + ::core::marker::Sync + 'static>);
 
             impl $native {
                 /// Create a new binder service.
-                pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+                pub fn new_binder<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
                     Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
                 }
 
@@ -60,7 +60,7 @@ macro_rules! __declare_binder_interface {
                 /// Equivalent to [`Self::new_binder`] but lets the caller opt into
                 /// kernel-level features such as `set_requesting_sid`.
                 /// See `rsbinder::BinderFeatures`.
-                pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
+                pub fn new_binder_with_features<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(
                     inner: T,
                     features: $crate::BinderFeatures,
                 ) -> $crate::Strong<dyn $interface> {
@@ -69,7 +69,7 @@ macro_rules! __declare_binder_interface {
                     }
                     impl<T> $native_adapter for Wrapper<T>
                     where
-                        T: $interface + Sync + Send + 'static,
+                        T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static,
                     {
                         fn as_sync(&self) -> &dyn $interface { &self._inner }
                         fn as_async(&self) -> &dyn $native_async {
@@ -78,14 +78,14 @@ macro_rules! __declare_binder_interface {
                             // native, so no `dyn Async` handle ever reaches here.
                             unreachable!("{} doesn't support async interface.", stringify!($interface))
                         }
-                        fn try_as_async(&self) -> Option<&dyn $native_async> { None }
+                        fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
                     }
                     let binder = $crate::native::Binder::new_with_stability_and_features(
-                        $native(Box::new(Wrapper {_inner: inner})),
+                        $native(::std::boxed::Box::new(Wrapper {_inner: inner})),
                         $stability,
                         features,
                     );
-                    $crate::Strong::new(Box::new(binder))
+                    $crate::Strong::new(::std::boxed::Box::new(binder))
                 }
             }
 
@@ -98,7 +98,7 @@ macro_rules! __declare_binder_interface {
                     $on_transact(self.0.as_sync(), code, reader, reply)
                 }
 
-                fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
+                fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                     self.0.as_sync().dump(_writer, _args)
                 }
             }
@@ -107,24 +107,26 @@ macro_rules! __declare_binder_interface {
         $(
             // Async interface trait implementations.
             impl<P: $crate::BinderAsyncPool> $crate::FromIBinder for dyn $async_interface<P> {
-                fn try_from(ibinder: $crate::SIBinder) -> std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
+                fn try_from(ibinder: $crate::SIBinder) -> ::std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
-                        Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
-                        None => {
+                        ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
+                        ::core::option::Option::None => {
                             match $crate::native::Binder::<$native>::try_from(ibinder) {
-                                Ok(native) => {
+                                ::core::result::Result::Ok(native) => {
                                     // A local binder can back the async view only if it
                                     // was published as an async service. A sync-only
                                     // service's adapter answers `None` here, so reject
                                     // the cast now rather than panic in `as_async()` at
                                     // the first method call (AOSP returns `BadType` too).
+                                    // `Strong::into_async` still turns this `Err` into a
+                                    // panic; `Strong::try_into_async` surfaces it.
                                     if native.0.try_as_async().is_some() {
-                                        Ok($crate::Strong::new(Box::new(native)))
+                                        ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
                                     } else {
-                                        Err($crate::StatusCode::BadType)
+                                        ::core::result::Result::Err($crate::StatusCode::BadType)
                                     }
                                 }
-                                Err(err) => Err(err),
+                                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
                             }
                         }
                     }
@@ -132,20 +134,20 @@ macro_rules! __declare_binder_interface {
             }
 
             impl<P: $crate::BinderAsyncPool> $crate::Serialize for dyn $async_interface<P> + '_ {
-                fn serialize(&self, parcel: &mut $crate::Parcel) -> std::result::Result<(), $crate::StatusCode> {
+                fn serialize(&self, parcel: &mut $crate::Parcel) -> ::std::result::Result<(), $crate::StatusCode> {
                     let binder = $crate::Interface::as_binder(self);
                     parcel.write(&binder)
                 }
             }
 
             impl<P: $crate::BinderAsyncPool> $crate::SerializeOption for dyn $async_interface<P> + '_ {
-                fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> std::result::Result<(), $crate::StatusCode> {
+                fn serialize_option(this: ::core::option::Option<&Self>, parcel: &mut $crate::Parcel) -> ::std::result::Result<(), $crate::StatusCode> {
                     parcel.write(&this.map($crate::Interface::as_binder))
                 }
             }
 
-            impl<P: $crate::BinderAsyncPool> std::fmt::Debug for dyn $async_interface<P> + '_ {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            impl<P: $crate::BinderAsyncPool> ::std::fmt::Debug for dyn $async_interface<P> + '_ {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                     f.pad(stringify!($async_interface))
                 }
             }
@@ -187,11 +189,11 @@ macro_rules! __declare_binder_interface {
             stability: $stability:expr,
         }
     } => {
-        pub struct $native(Box<dyn $interface + Send + Sync + 'static>);
+        pub struct $native(::std::boxed::Box<dyn $interface + ::core::marker::Send + ::core::marker::Sync + 'static>);
 
         impl $native {
             /// Create a new binder service.
-            pub fn new_binder<T: $interface + Sync + Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+            pub fn new_binder<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
                 Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
             }
 
@@ -200,16 +202,16 @@ macro_rules! __declare_binder_interface {
             /// Equivalent to [`Self::new_binder`] but lets the caller opt into
             /// kernel-level features such as `set_requesting_sid`.
             /// See `rsbinder::BinderFeatures`.
-            pub fn new_binder_with_features<T: $interface + Sync + Send + 'static>(
+            pub fn new_binder_with_features<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(
                 inner: T,
                 features: $crate::BinderFeatures,
             ) -> $crate::Strong<dyn $interface> {
                 let binder = $crate::native::Binder::new_with_stability_and_features(
-                    $native(Box::new(inner)),
+                    $native(::std::boxed::Box::new(inner)),
                     $stability,
                     features,
                 );
-                $crate::Strong::new(Box::new(binder))
+                $crate::Strong::new(::std::boxed::Box::new(binder))
             }
         }
 
@@ -222,7 +224,7 @@ macro_rules! __declare_binder_interface {
                 $on_transact(&*self.0, code, reader, reply)
             }
 
-            fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> $crate::Result<()> {
+            fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                 self.0.dump(_writer, _args)
             }
         }
@@ -383,7 +385,7 @@ macro_rules! declare_binder_interface {
                 $descriptor
             }
 
-            fn from_binder(binder: $crate::SIBinder) -> std::option::Option<Self> {
+            fn from_binder(binder: $crate::SIBinder) -> ::core::option::Option<Self> {
                 // An `RpcProxy` resolved from the RPC wire carries no
                 // descriptor (the wire transmits only an address). Stamp
                 // this stub's descriptor onto the *cached* proxy in
@@ -407,12 +409,12 @@ macro_rules! declare_binder_interface {
                 // `RpcProxy::stamp_descriptor`'s one-address-one-
                 // interface note.
                 if binder.descriptor() != $descriptor {
-                    return None
+                    return ::core::option::Option::None
                 }
                 if binder.as_remote().is_some() {
-                    Some(Self { binder, $($fname: $finit),* })
+                    ::core::option::Option::Some(Self { binder, $($fname: $finit),* })
                 } else {
-                    None
+                    ::core::option::Option::None
                 }
             }
         }
@@ -435,11 +437,11 @@ macro_rules! declare_binder_interface {
         impl $crate::FromIBinder for dyn $interface {
             fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
-                    Some(proxy) => Ok($crate::Strong::new(Box::new(proxy))),
-                    None => {
+                    ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
+                    ::core::option::Option::None => {
                         match $crate::native::Binder::<$native>::try_from(binder) {
-                            Ok(native) => Ok($crate::Strong::new(Box::new(native))),
-                            Err(err) => Err(err),
+                            ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
+                            ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
                         }
                     }
                 }
@@ -453,18 +455,18 @@ macro_rules! declare_binder_interface {
             fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 let binder = $crate::Interface::as_binder(self);
                 parcel.write(&binder)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             }
         }
 
         impl $crate::parcelable::SerializeOption for dyn $interface + '_ {
-            fn serialize_option(this: Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
+            fn serialize_option(this: ::core::option::Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 parcel.write(&this.map($crate::Interface::as_binder))
             }
         }
 
-        impl std::fmt::Debug for dyn $interface + '_ {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl ::std::fmt::Debug for dyn $interface + '_ {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.pad(stringify!($interface))
             }
         }
@@ -482,7 +484,10 @@ macro_rules! impl_serialize_for_parcelable {
     ($parcelable:ident) => {
         impl $crate::Serialize for $parcelable {
             fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
-                <Self as $crate::SerializeOption>::serialize_option(Some(self), parcel)
+                <Self as $crate::SerializeOption>::serialize_option(
+                    ::core::option::Option::Some(self),
+                    parcel,
+                )
             }
         }
 
@@ -490,10 +495,10 @@ macro_rules! impl_serialize_for_parcelable {
 
         impl $crate::SerializeOption for $parcelable {
             fn serialize_option(
-                this: Option<&Self>,
+                this: ::core::option::Option<&Self>,
                 parcel: &mut $crate::Parcel,
             ) -> $crate::Result<()> {
-                if let Some(this) = this {
+                if let ::core::option::Option::Some(this) = this {
                     use $crate::Parcelable;
                     parcel.write(&$crate::NON_NULL_PARCELABLE_FLAG)?;
                     this.write_to_parcel(parcel)
@@ -518,12 +523,14 @@ macro_rules! impl_deserialize_for_parcelable {
             fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
                 $crate::DeserializeOption::deserialize_option(parcel)
                     .transpose()
-                    .unwrap_or(Err($crate::StatusCode::UnexpectedNull.into()))
+                    .unwrap_or(::core::result::Result::Err(
+                        $crate::StatusCode::UnexpectedNull.into(),
+                    ))
             }
             fn deserialize_from(&mut self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 let status: i32 = parcel.read()?;
                 if status == $crate::NULL_PARCELABLE_FLAG {
-                    Err($crate::StatusCode::UnexpectedNull.into())
+                    ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
                     use $crate::Parcelable;
                     self.read_from_parcel(parcel)
@@ -531,7 +538,7 @@ macro_rules! impl_deserialize_for_parcelable {
                     // Any flag other than NON_NULL is UNEXPECTED_NULL, matching
                     // AOSP C++ `Parcel::readData` and `DeserializeOption`'s
                     // default path.
-                    Err($crate::StatusCode::UnexpectedNull.into())
+                    ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }
@@ -539,19 +546,21 @@ macro_rules! impl_deserialize_for_parcelable {
         impl $crate::DeserializeArray for $parcelable {}
 
         impl $crate::DeserializeOption for $parcelable {
-            fn deserialize_option(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Self>> {
-                let mut result = None;
+            fn deserialize_option(
+                parcel: &mut $crate::Parcel,
+            ) -> $crate::Result<::core::option::Option<Self>> {
+                let mut result = ::core::option::Option::None;
                 Self::deserialize_option_from(&mut result, parcel)?;
-                Ok(result)
+                ::core::result::Result::Ok(result)
             }
             fn deserialize_option_from(
-                this: &mut Option<Self>,
+                this: &mut ::core::option::Option<Self>,
                 parcel: &mut $crate::Parcel,
             ) -> $crate::Result<()> {
                 let status: i32 = parcel.read()?;
                 if status == $crate::NULL_PARCELABLE_FLAG {
-                    *this = None;
-                    Ok(())
+                    *this = ::core::option::Option::None;
+                    ::core::result::Result::Ok(())
                 } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
                     use $crate::Parcelable;
                     this.get_or_insert_with(Self::default)
@@ -560,7 +569,7 @@ macro_rules! impl_deserialize_for_parcelable {
                     // Any flag other than NULL/NON_NULL is UNEXPECTED_NULL,
                     // matching AOSP C++ `Parcel::readData` and
                     // `DeserializeOption`'s default path.
-                    Err($crate::StatusCode::UnexpectedNull.into())
+                    ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }
@@ -646,7 +655,7 @@ macro_rules! declare_binder_enum {
 
         impl $crate::SerializeArray for $enum {
             fn serialize_array(slice: &[Self], parcel: &mut $crate::Parcel) -> $crate::Result<()> {
-                let v: Vec<$backing> = slice.iter().map(|x| x.0).collect();
+                let v: ::std::vec::Vec<$backing> = slice.iter().map(|x| x.0).collect();
                 <$backing as $crate::SerializeArray>::serialize_array(&v[..], parcel)
             }
         }
@@ -659,10 +668,10 @@ macro_rules! declare_binder_enum {
         }
 
         impl $crate::DeserializeArray for $enum {
-            fn deserialize_array(parcel: &mut $crate::Parcel) -> $crate::Result<Option<Vec<Self>>> {
-                let v: Option<Vec<$backing>> =
+            fn deserialize_array(parcel: &mut $crate::Parcel) -> $crate::Result<::core::option::Option<::std::vec::Vec<Self>>> {
+                let v: ::core::option::Option<::std::vec::Vec<$backing>> =
                     <$backing as $crate::DeserializeArray>::deserialize_array(parcel)?;
-                Ok(v.map(|v| v.into_iter().map(Self).collect()))
+                ::core::result::Result::Ok(v.map(|v| v.into_iter().map(Self).collect()))
             }
         }
     };
@@ -916,233 +925,5 @@ mod tests {
             sib.unlink_to_death_arc(&recipient).unwrap_err(),
             crate::StatusCode::InvalidOperation,
         );
-    }
-
-    #[cfg(feature = "async")]
-    #[test]
-    fn test_try_from() {
-        use async_trait::async_trait;
-
-        #[allow(dead_code)]
-        pub trait IEcho: Interface + Send {
-            fn echo(&self, echo: &str) -> crate::status::Result<String>;
-        }
-        pub trait IEchoAsync<P>: Interface + Send {
-            #[allow(dead_code)]
-            fn echo<'a>(
-                &'a self,
-                echo: &'a str,
-            ) -> crate::BoxFuture<'a, crate::status::Result<String>>;
-        }
-
-        #[allow(dead_code)]
-        #[async_trait]
-        pub trait IEchoAsyncService: Interface + Send {
-            async fn echo(&self, echo: &str) -> crate::status::Result<String>;
-        }
-        pub struct BpEcho {
-            binder: crate::SIBinder,
-        }
-        impl IEcho for BpEcho {
-            fn echo(&self, _echo: &str) -> crate::status::Result<String> {
-                todo!()
-            }
-        }
-        impl<P: crate::BinderAsyncPool> IEchoAsync<P> for BpEcho {
-            fn echo<'a>(
-                &'a self,
-                _echo: &'a str,
-            ) -> crate::BoxFuture<'a, crate::status::Result<String>> {
-                P::spawn(move || 0, |_| async move { Ok("".to_string()) })
-            }
-        }
-        impl Interface for BpEcho {
-            fn as_binder(&self) -> crate::SIBinder {
-                self.binder.clone()
-            }
-        }
-        impl crate::Proxy for BpEcho
-        where
-            BpEcho: IEcho,
-        {
-            fn descriptor() -> &'static str {
-                "my.echo"
-            }
-
-            fn from_binder(binder: crate::SIBinder) -> std::option::Option<Self> {
-                if binder.descriptor() != Self::descriptor() {
-                    return None;
-                }
-                if binder.as_proxy().is_some() {
-                    Some(Self { binder })
-                } else {
-                    None
-                }
-            }
-        }
-
-        #[allow(dead_code)]
-        pub trait BnEchoAdapter: Send + Sync {
-            fn as_sync(&self) -> &dyn IEcho;
-            fn as_async(&self) -> &dyn IEchoAsyncService;
-        }
-
-        #[allow(dead_code)]
-        struct Wrapper<T, R> {
-            inner: T,
-            rt: R,
-        }
-
-        impl<T, R> Interface for Wrapper<T, R>
-        where
-            T: IEchoAsyncService + Sync + Send + 'static,
-            R: crate::BinderAsyncRuntime + Send + Sync + 'static,
-        {
-            fn as_binder(&self) -> crate::SIBinder {
-                self.inner.as_binder()
-            }
-
-            fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
-                self.inner.dump(_writer, _args)
-            }
-        }
-
-        impl<T, R> IEcho for Wrapper<T, R>
-        where
-            T: IEchoAsyncService + Sync + Send + 'static,
-            R: crate::BinderAsyncRuntime + Send + Sync + 'static,
-        {
-            fn echo(&self, echo: &str) -> crate::status::Result<String> {
-                self.rt.block_on(self.inner.echo(echo))
-            }
-        }
-
-        impl<T, R> BnEchoAdapter for Wrapper<T, R>
-        where
-            T: IEchoAsyncService + Sync + Send + 'static,
-            R: crate::BinderAsyncRuntime + Send + Sync + 'static,
-        {
-            fn as_sync(&self) -> &dyn IEcho {
-                self
-            }
-            fn as_async(&self) -> &dyn IEchoAsyncService {
-                &self.inner
-            }
-        }
-
-        #[allow(dead_code)]
-        pub struct BnEcho(Box<dyn BnEchoAdapter>);
-
-        impl BnEcho {
-            /// Create a new binder service.
-            pub fn new_binder<T, R>(inner: T, rt: R) -> crate::Strong<dyn IEcho>
-            where
-                T: IEchoAsyncService + Sync + Send + 'static,
-                R: crate::BinderAsyncRuntime + Send + Sync + 'static,
-            {
-                let bn = BnEcho(Box::new(Wrapper { inner, rt }));
-                let binder =
-                    crate::native::Binder::new_with_stability(bn, crate::Stability::default());
-                crate::Strong::new(Box::new(binder))
-            }
-        }
-
-        impl crate::Remotable for BnEcho {
-            fn descriptor() -> &'static str
-            where
-                Self: Sized,
-            {
-                "my.echo"
-            }
-
-            fn on_transact(
-                &self,
-                _code: crate::TransactionCode,
-                _reader: &mut crate::Parcel,
-                _reply: &mut crate::Parcel,
-            ) -> crate::Result<()> {
-                todo!()
-            }
-
-            fn on_dump(
-                &self,
-                _writer: &mut dyn std::io::Write,
-                _args: &[String],
-            ) -> crate::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl IEcho for crate::Binder<BnEcho> {
-            fn echo(&self, echo: &str) -> crate::status::Result<String> {
-                self.0.as_sync().echo(echo)
-            }
-        }
-
-        impl<P: crate::BinderAsyncPool> IEchoAsync<P> for crate::Binder<BnEcho> {
-            fn echo<'a>(
-                &'a self,
-                echo: &'a str,
-            ) -> crate::BoxFuture<'a, crate::status::Result<String>> {
-                self.0.as_async().echo(echo)
-            }
-        }
-
-        impl crate::FromIBinder for dyn IEcho {
-            fn try_from(binder: crate::SIBinder) -> crate::Result<crate::Strong<dyn IEcho>> {
-                match <BpEcho as crate::Proxy>::from_binder(binder.clone()) {
-                    Some(proxy) => Ok(crate::Strong::new(Box::new(proxy))),
-                    None => match crate::native::Binder::<BnEcho>::try_from(binder) {
-                        Ok(native) => Ok(crate::Strong::new(Box::new(native.clone()))),
-                        Err(err) => Err(err),
-                    },
-                }
-            }
-        }
-
-        impl<P: crate::BinderAsyncPool> crate::FromIBinder for dyn IEchoAsync<P> {
-            fn try_from(
-                binder: crate::SIBinder,
-            ) -> crate::Result<crate::Strong<dyn IEchoAsync<P>>> {
-                match <BpEcho as crate::Proxy>::from_binder(binder.clone()) {
-                    Some(proxy) => Ok(crate::Strong::new(Box::new(proxy))),
-                    None => {
-                        match crate::native::Binder::<BnEcho>::try_from(binder) {
-                            Ok(native) => Ok(crate::Strong::new(Box::new(native.clone()))),
-                            Err(err) => Err(err),
-                        }
-                        // Err(crate::StatusCode::BadType.into())
-                    }
-                }
-            }
-        }
-
-        impl<P: crate::BinderAsyncPool> crate::ToAsyncInterface<P> for dyn IEcho {
-            type Target = dyn IEchoAsync<P>;
-        }
-
-        impl<P: crate::BinderAsyncPool> crate::ToSyncInterface for dyn IEchoAsync<P> {
-            type Target = dyn IEcho;
-        }
-
-        struct MyEcho {}
-        impl Interface for MyEcho {}
-        #[async_trait]
-        impl IEchoAsyncService for MyEcho {
-            async fn echo(&self, echo: &str) -> crate::status::Result<String> {
-                Ok(echo.to_owned())
-            }
-        }
-
-        struct MyRuntime {}
-        impl crate::BinderAsyncRuntime for MyRuntime {
-            fn block_on<F: std::future::Future>(&self, _future: F) -> F::Output {
-                todo!()
-            }
-        }
-
-        let _echo = BnEcho::new_binder(MyEcho {}, MyRuntime {});
-
-        // echo.into_async::<Tokio>().echo("hello");
     }
 }

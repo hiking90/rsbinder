@@ -245,7 +245,8 @@ fn bare_imemoryheap_root_maps() {
     let mut b = [0u8; 4];
     m.read_at(0, &mut b).unwrap();
     assert_eq!(&b, b"bare");
-    assert_eq!(&bp.base().unwrap()[..4], b"bare");
+    let head = bp.base().unwrap().slice(0, 4).unwrap().to_vec();
+    assert_eq!(head, b"bare");
 
     drop(m);
     drop(bp);

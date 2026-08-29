@@ -392,15 +392,9 @@ impl ProcessState {
     }
 
     /// Whether the kernel-binder `ProcessState` singleton has been
-    /// initialized (`init`/`init_default` called).
-    ///
-    /// Additive, read-only, and **not used by the kernel path** — its
-    /// only caller is the `Tokio` async pool's "are we currently
-    /// servicing a kernel binder transaction?" guard, which must answer
-    /// `false` (instead of panicking via [`as_self`]) in a pure RPC
-    /// process that never brought up kernel binder. When `ProcessState`
-    /// *is* initialized this returns `true`, so every kernel scenario is
-    /// byte-for-byte the prior behavior.
+    /// initialized (`init`/`init_default` called). Read-only; the way for
+    /// code that may run in a pure RPC process (one that never brought up
+    /// kernel binder) to check before [`as_self`], which panics there.
     ///
     /// [`as_self`]: ProcessState::as_self
     pub fn is_initialized() -> bool {
@@ -582,8 +576,14 @@ impl ProcessState {
             return Ok(());
         }
 
-        let obj =
-            binder::flat_binder_object::new_binder_with_flags(binder::FLAT_BINDER_FLAG_ACCEPTS_FDS);
+        // ACCEPTS_FDS stays set, unlike AOSP: `rsb_hub` answers
+        // DUMP_TRANSACTION, which carries an fd.
+        let mut flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        // TXN_SECURITY_CTX only where the kernel can honour it — see `selinux_available`.
+        if selinux_available() {
+            flags |= binder::FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
+        }
+        let obj = binder::flat_binder_object::new_binder_with_flags(flags);
 
         if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
             //     android_errorWriteLog(0x534e4554, "121035042");
@@ -1336,10 +1336,14 @@ impl ProcessState {
         if self.thread_pool_started.load(Ordering::Relaxed) {
             let name = self.make_binder_thread_name();
             log::info!("Spawning new pooled thread, name={name}");
-            match thread::Builder::new()
-                .name(name)
-                .spawn(move || thread_state::join_thread_pool(is_main))
-            {
+            match thread::Builder::new().name(name).spawn(move || {
+                // The `JoinHandle` is dropped below, so this is the only
+                // place a looper's exit error (BC_REGISTER_LOOPER /
+                // BC_EXIT_LOOPER write, final flush) can be seen.
+                if let Err(e) = thread_state::join_thread_pool(is_main) {
+                    log::error!("pooled binder thread exited with {e}");
+                }
+            }) {
                 Ok(_) => {
                     // Account into the per-origin counter so tests can verify
                     // the `start_thread_pool` spawn contract without racing
@@ -1426,6 +1430,22 @@ fn open_driver(
     Ok(fd)
 }
 
+/// Whether the running kernel can attach an SELinux context to a
+/// transaction, which decides if `become_context_manager` registers with
+/// `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (AOSP always does).
+///
+/// The flag is what makes the kernel deliver `BR_TRANSACTION_SEC_CTX` to the
+/// context manager — without it `get_calling_sid()` is always `None` there.
+/// But `binder_transaction` then calls `security_secid_to_secctx()` for every
+/// transaction to that node and fails the whole transaction with
+/// `BR_FAILED_REPLY` when that errors, which it does on a kernel without
+/// SELinux: every call into the service manager would fail. Android always
+/// has SELinux; on Linux a mounted selinuxfs is the signal (the same check
+/// libselinux's `is_selinux_enabled()` makes).
+fn selinux_available() -> bool {
+    cfg!(target_os = "android") || std::path::Path::new("/sys/fs/selinux/enforce").exists()
+}
+
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
         // This `Drop` runs on the `init` race loser too; a `munmap` failure is
@@ -1435,7 +1455,7 @@ impl Drop for ProcessState {
         // inconsistent — so unmap anyway rather than leak the mapping.
         let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `mmap.ptr`/`mmap.size` are exactly the address and length
-        // returned by the `mmap` call in `ProcessState::new`. This runs only
+        // returned by the `mmap` call in `ProcessState::inner_init`. This runs only
         // in `Drop`, so the mapping is still live and is unmapped exactly
         // once; no references into the region outlive `ProcessState`.
         unsafe {

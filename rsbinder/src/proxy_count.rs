@@ -41,7 +41,12 @@ pub enum ProxyCountEvent {
     /// below `warning`. AOSP `sWarningCallback`.
     Warning { uid: u32, count: u64 },
     /// Per-uid count reached the high watermark. Fired at most once per
-    /// uid until the count drops below `low`. AOSP `sLimitCallback`.
+    /// uid until the count drops below `low`. The rsbinder analogue of
+    /// AOSP `sLimitCallback`, with two deliberate simplifications: AOSP
+    /// re-fires every further `high` proxies while latched
+    /// (`lastLimitCallbackAt`), this fires once; and both edges here
+    /// compare the count *after* the update (AOSP compares before), so
+    /// the hysteresis band sits one proxy higher.
     Limit { uid: u32, count: u64 },
 }
 
@@ -52,7 +57,9 @@ pub enum ProxyCountEvent {
 /// freely re-enter both `proxy_count` APIs and the binder proxy cache
 /// (`get_service`, resolving/creating proxies). It must not block
 /// indefinitely — every proxy create/drop on the firing thread is gated on
-/// it returning.
+/// it returning. A panic inside it is caught and logged (never propagated
+/// into the proxy create/drop path that fired it), and does not stop other
+/// queued events from being delivered.
 pub type ProxyCountCallback = Arc<dyn Fn(ProxyCountEvent) + Send + Sync>;
 
 /// Process-global proxy count. Lock-free hot path: every
@@ -141,8 +148,24 @@ impl Drop for CallbackDeferGuard {
         // proxy fires its own watermark inline (the cache lock is released).
         let pending: Vec<_> = PENDING_CALLBACKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for (cb, event) in pending {
-            cb(event);
+            fire_callback(&cb, event);
         }
+    }
+}
+
+/// Invoke a user [`ProxyCountCallback`] with the same panic isolation the
+/// death-recipient path uses (`ProxyHandle::dispatch_obituary_callbacks`).
+/// This runs from `CallbackDeferGuard::drop` — a panic escaping a `Drop`
+/// during an unwind aborts the process, and a panic in the first of
+/// several queued callbacks would silently discard the rest.
+fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event))) {
+        let msg = payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        log::error!("ProxyCountCallback panicked for {event:?}: {msg}");
     }
 }
 
@@ -270,7 +293,7 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
         if CALLBACK_DEFER.with(|d| d.get()) {
             PENDING_CALLBACKS.with(|p| p.borrow_mut().push((cb, event)));
         } else {
-            cb(event);
+            fire_callback(&cb, event);
         }
     }
     true

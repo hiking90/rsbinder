@@ -20,10 +20,15 @@ crate::hub::impl_sm_module_body! { @custom_check_service
     /// Retrieve an existing service called @a name from the service manager.
     /// Non-blocking. Returns null if the service does not exist.
     ///
-    /// Sent as `getService` (code 0), not `checkService` — both answer from
-    /// the same table without blocking, and only `getService` returns a bare
-    /// `@nullable IBinder` on every release in this module's range. See the
-    /// module docs.
+    /// Sent as `getService` (code 0), not `checkService`: only `getService`
+    /// returns a bare `@nullable IBinder` on every release in this module's
+    /// range (see the module docs). Both answer from the same table without
+    /// blocking, but they are **not** side-effect free in the same way — for
+    /// a name that is not registered, AOSP's servicemanager runs
+    /// `tryStartService` (`ctl.interface_start aidl/<name>`) on `getService`
+    /// and not on `checkService`. On Android 15 r6+ a `check_service` for an
+    /// unregistered *lazy* service therefore starts it, where every other
+    /// Android version leaves it alone.
     pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
         get_service(sm, name)
     }

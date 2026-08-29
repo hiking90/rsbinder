@@ -64,7 +64,11 @@
 //! Use `wait_*` for a dependency expected to appear (client startup),
 //! `check_*` for an optional service probed once, and `try_*` when you must
 //! tell "not registered" (`Ok(None)`) apart from "service manager
-//! unreachable" (`Err`). The deprecated `get_service`/`get_interface` are
+//! unreachable" (`Err`). One caveat on `check_*`: on Android 15 r6+
+//! (`android_15`) it is carried by `getService`, which makes the service
+//! manager try to start an unregistered lazy service — see the docs on
+//! `hub::android_15::check_service` (an Android-only module, so not
+//! linkable from a host build). The deprecated `get_service`/`get_interface` are
 //! superseded by these. On the Android 10 legacy C service manager, which
 //! cannot distinguish not-found from a transport failure, the `try_*`
 //! functions map any failure to `Ok(None)`.
@@ -79,8 +83,10 @@
 //! // For Android 16 specific functionality
 //! #[cfg(all(target_os = "android", feature = "android_16"))]
 //! {
-//!     let sm = hub::android_16::BpServiceManager::getService().unwrap();
-//!     // Use Android 16 specific methods here
+//!     if let hub::ServiceManager::Android16(sm) = &*hub::default().unwrap() {
+//!         let _svc = hub::android_16::get_service(sm, "example_service");
+//!         // Use Android 16 specific methods on `sm` here
+//!     }
 //! }
 //! ```
 
@@ -486,19 +492,23 @@ enum Android15Numbering {
     Shifted,
 }
 
-/// Probe with code 14 — `getServiceDebugInfo()` (argument-free, read-only)
-/// on r6+ and past the end of the pre-r6 interface, so it answers without
-/// side effects on either peer (13 would not: that is `tryUnregisterService`
-/// on r6+). See [`android_15`].
+/// The transaction `check_android_15_numbering` probes with: one past
+/// `getServiceDebugInfo`, the last method of the pre-r6 interface, and
+/// exactly `getServiceDebugInfo` (argument-free, read-only) on r6+ — so it
+/// answers without side effects on either peer (13 would not: that is
+/// `tryUnregisterService` on r6+). Pinned against both generated interfaces
+/// by `hub::numbering_pins` on every host test run, which is why it lives
+/// here uncfg'd rather than inside the android-only probe.
+#[allow(dead_code)] // only issued on android; pinned everywhere
+pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
+
+/// Tell the two Android 15 service-manager numberings apart with one
+/// side-effect-free transaction ([`ANDROID_15_PROBE_CODE`]). See [`android_15`].
 #[cfg(all(
     target_os = "android",
     any(feature = "android_14", feature = "android_15")
 ))]
 fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> {
-    // One past `getServiceDebugInfo`, the last method of the pre-r6
-    // interface.
-    const PROBE_CODE: TransactionCode = 14;
-
     #[cfg(feature = "android_15")]
     let descriptor = <android_15::BpServiceManager as android_15::IServiceManager>::descriptor();
     #[cfg(all(feature = "android_14", not(feature = "android_15")))]
@@ -508,7 +518,7 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     let mut data = Parcel::new();
     data.write_interface_token(descriptor)?;
 
-    match proxy.submit_transact(FIRST_CALL_TRANSACTION + PROBE_CODE, &data, 0) {
+    match proxy.submit_transact(FIRST_CALL_TRANSACTION + ANDROID_15_PROBE_CODE, &data, 0) {
         // Rejected: 14 methods, so this is a pre-r6 build.
         Err(StatusCode::UnknownTransaction) => Ok(Android15Numbering::Original),
         // Answered (an in-band exception counts): 15 methods, the r6+ build.

@@ -48,6 +48,14 @@ use crate::{
 ///     fast-path Arc reuse without invoking cache-pin resurrection — so
 ///     there is no `BC_RELEASE`/`BC_ACQUIRE` thrash in this case
 ///     either.
+///
+///   * **Longer cycles are not broken.** Only the self-cycle is detected
+///     (`handle == parent.handle`). A remote that reports A's extension
+///     as B and B's as A leaves two strong caches pointing at each other
+///     once both `get_extension`s have run; neither `ProxyHandle` then
+///     drops, and neither `BC_RELEASE` is ever sent. Extension graphs are
+///     remote-controlled, so treat this as a known limit of the cache
+///     rather than a guarantee.
 enum ExtensionCache {
     /// Remote query has not been performed yet.
     NotQueried,
@@ -302,11 +310,18 @@ impl ProxyHandle {
             }
 
             if !recipients.is_empty() {
-                // Queue BC_CLEAR before draining. On queueing failure
-                // the recipients vector is unchanged and the caller
-                // (binder thread BR_DEAD_BINDER arm) can surface the
-                // error without losing the obituary.
-                thread_state::clear_death_notification(self.handle())?;
+                // Queue BC_CLEAR before draining. This is best-effort, as
+                // in AOSP `BpBinder::sendObituary`: BR_DEAD_BINDER is
+                // delivered once, so failing here must not abort the
+                // obituary — the recipients would never hear of the death
+                // and `obituary_sent` would never latch.
+                if let Err(e) = thread_state::clear_death_notification(self.handle()) {
+                    log::error!(
+                        "clear_death_notification failed for handle {}: {e:?}; \
+                         delivering the obituary anyway",
+                        self.handle()
+                    );
+                }
             }
 
             let snapshot = std::mem::take(&mut *recipients);
@@ -393,9 +408,15 @@ impl ProxyHandle {
     /// and under `rsb_service dump <name>` on Linux.
     ///
     /// `fd` is **consumed**: the parcel takes ownership of the descriptor
-    /// (AOSP `writeFileDescriptor(fd, takeOwnership = true)`) and closes it
-    /// once the transaction is done, so pass a duplicate when the caller
-    /// needs to keep writing to the same file. The remote's handler is
+    /// and closes it once the transaction is done, so pass a duplicate when
+    /// the caller needs to keep writing to the same file. (A deliberate
+    /// divergence from AOSP `BpBinder::dump`, which calls
+    /// `writeFileDescriptor(fd)` with `takeOwnership = false` and leaves
+    /// the caller's fd open — the `IntoRawFd` signature here makes the
+    /// transfer explicit instead.) The transaction is sent with
+    /// `FLAG_CLEAR_BUF` where AOSP passes `0`: the kernel then zeroes the
+    /// transaction buffer after the callee is done, harmless to the peer
+    /// and cheap insurance for a dump that may carry sensitive state. The remote's handler is
     /// [`crate::Remotable::on_dump`], which the AIDL backend routes to
     /// [`crate::Interface::dump`]; the default implementation writes
     /// nothing and succeeds.
@@ -451,11 +472,17 @@ impl Debug for ProxyHandle {
     }
 }
 
+/// Identity is `(handle, generation)`, as the `generation` field
+/// documents: the kernel recycles a handle number once its `binder_ref`
+/// slot is released, so two `ProxyHandle`s with the same handle can name
+/// different nodes. Matches `WIBinder`'s identity model.
 impl PartialEq for ProxyHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.handle() == other.handle()
+        self.handle() == other.handle() && self.generation() == other.generation()
     }
 }
+
+impl Eq for ProxyHandle {}
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
@@ -685,14 +712,15 @@ impl IBinder for ProxyHandle {
         // "atomically promote a weak ref to a strong ref" semantics — now
         // covered by `Weak<I>::upgrade()` (which uses Rust's
         // `sync::Weak::upgrade` CAS).
-        debug_assert!(
-            false,
-            "attempt_inc_strong called on ProxyHandle — should be unreachable \
-             (use Weak<I>::upgrade instead)"
+        // `IBinder` is a public trait and `SIBinder` derefs to it, so an
+        // external caller can reach this; it is meaningless for a proxy
+        // (the cache pin keeps the kernel slot alive), not a bug to
+        // assert on. Warn and honor the "succeed" contract.
+        log::warn!(
+            "attempt_inc_strong called on a ProxyHandle (handle {}); \
+             it is a no-op for proxies — use Weak<I>::upgrade",
+            self.handle()
         );
-        // Release-build fallback: the cache pin keeps the kernel slot
-        // alive, so the legacy "succeed" contract is upheld for any
-        // vestigial caller that slips through.
         true
     }
 

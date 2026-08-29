@@ -130,14 +130,38 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     // `libc::getpeereid` and break the aarch64-linux-android build).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        match rustix::net::sockopt::socket_peercred(stream) {
-            Ok(ucred) => PeerIdentity::Local {
-                uid: ucred.uid.as_raw(),
-                pid: ucred.pid.as_raw_nonzero().get(),
-            },
+        use std::os::fd::AsRawFd;
+        // Read `SO_PEERCRED` through libc rather than
+        // `rustix::net::sockopt::socket_peercred`: rustix types the pid as
+        // `Pid(NonZeroI32)` and does not check it, but the kernel reports
+        // `pid == 0` when the peer is not visible in our PID namespace
+        // (a container client on a bind-mounted host socket) — an invalid
+        // `NonZeroI32` there is UB before this function even sees it.
+        // SAFETY: `ucred` is three plain integers, for which all-zero is a
+        // valid value.
+        let mut uc: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `uc`/`len` are correctly typed and sized out-params for
+        // SO_PEERCRED on a connected socket fd that `stream` keeps open for
+        // the call; getsockopt retains nothing.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut uc as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
             // A socket without peer creds (rare) is anonymous, not a
             // forged local identity.
-            Err(_) => PeerIdentity::Anonymous,
+            return PeerIdentity::Anonymous;
+        }
+        PeerIdentity::Local {
+            uid: uc.uid,
+            // `-1` is the documented "unavailable" pid.
+            pid: if uc.pid > 0 { uc.pid } else { -1 },
         }
     }
     #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
@@ -156,8 +180,25 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
 /// `SO_PEERCRED`).
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
 fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     let fd = stream.as_raw_fd();
+
+    // `getpeereid` on a socket that is not `AF_UNIX` **succeeds** on macOS
+    // and reports uid 0 (measured on Darwin 25: a TCP socket yields
+    // `rc = 0, euid = 0`). The `rc != 0` ladder below cannot catch that,
+    // so a foreign-family fd handed to `from_owned_fd` would mint a root
+    // identity. Check the family first; anything else is `Anonymous`.
+    match rustix::net::getsockname(stream.as_fd()) {
+        Ok(local) if local.address_family() == rustix::net::AddressFamily::UNIX => {}
+        Ok(_) => {
+            log::warn!("RPC unix peer-cred: fd is not AF_UNIX; reporting Anonymous");
+            return PeerIdentity::Anonymous;
+        }
+        Err(e) => {
+            log::warn!("RPC unix peer-cred: getsockname failed ({e}); reporting Anonymous");
+            return PeerIdentity::Anonymous;
+        }
+    }
 
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
@@ -314,8 +355,15 @@ impl RpcTransport for UnixTransport {
         while sent < buf.len() {
             let mut anc = SendAncillaryBuffer::new(&mut space);
             if sent == 0 {
-                let ok = anc.push(SendAncillaryMessage::ScmRights(fds));
-                debug_assert!(ok, "cmsg_space sized for exactly these fds");
+                // `cmsg_space!` sizes `space` for exactly these fds; if the
+                // push still fails (an unusually-aligned allocator), sending
+                // the frame without them would hand the peer a parcel whose
+                // fd table points at nothing.
+                if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
+                    return Err(RpcError::Protocol(
+                        "failed to attach SCM_RIGHTS ancillary data",
+                    ));
+                }
             }
             let n = match rustix::net::sendmsg(
                 &self.stream,
@@ -456,8 +504,15 @@ impl RpcTransport for UnixTransport {
         while sent < framed.len() {
             let mut anc = SendAncillaryBuffer::new(&mut space);
             if sent == 0 {
-                let ok = anc.push(SendAncillaryMessage::ScmRights(fds));
-                debug_assert!(ok, "cmsg_space sized for exactly these fds");
+                // `cmsg_space!` sizes `space` for exactly these fds; if the
+                // push still fails (an unusually-aligned allocator), sending
+                // the frame without them would hand the peer a parcel whose
+                // fd table points at nothing.
+                if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
+                    return Err(RpcError::Protocol(
+                        "failed to attach SCM_RIGHTS ancillary data",
+                    ));
+                }
             }
             let n = match rustix::net::sendmsg(
                 &self.stream,

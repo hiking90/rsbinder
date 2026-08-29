@@ -308,6 +308,20 @@ impl Server {
                 RpcServer::setup_unix_server(path.clone())?
             }
             Endpoint::UnixAbstract(name) => {
+                // No TLS variant of the abstract listener exists; refusing
+                // is the "never silently ignored" contract — and it matters
+                // more here than anywhere: an abstract socket has no
+                // filesystem permissions, so mTLS may be the only
+                // authentication the operator configured.
+                #[cfg(feature = "rpc-tls")]
+                if tls.is_some() {
+                    log::error!(
+                        "rsbinder::serve: option `tls` does not apply to {:?} \
+                         (no TLS listener for abstract Unix sockets)",
+                        uri.endpoint
+                    );
+                    return Err(StatusCode::BadValue);
+                }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
                     RpcServer::setup_unix_server_abstract(name)?

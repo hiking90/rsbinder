@@ -190,14 +190,46 @@ pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
     ashmem_size(fd.as_fd())
 }
 
+/// libcutils `__ashmem_is_ashmem`: is `fd` open on the legacy `/dev/ashmem`
+/// character device? A peer-supplied fd must pass this before any
+/// ashmem ioctl is sent to it (and before an `st_size == 0` is trusted as
+/// "ashmem reports 0" rather than "never `ftruncate`d").
+#[cfg(target_os = "android")]
+pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    let Ok(st) = rustix::fs::fstat(fd) else {
+        return false;
+    };
+    if st.st_mode & libc::S_IFMT as u32 != libc::S_IFCHR as u32 {
+        return false;
+    }
+    match rustix::fs::stat("/dev/ashmem") {
+        Ok(dev) => st.st_rdev == dev.st_rdev,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn is_ashmem_fd(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    false
+}
+
 #[cfg(target_os = "android")]
 fn ashmem_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
     use std::os::fd::AsRawFd;
+    // The fd came out of a parcel: verify it really is ashmem before
+    // issuing an ashmem-specific ioctl on it, exactly as libcutils
+    // `ashmem_get_size_region` does. Another driver could interpret the
+    // request number (and the argument register) its own way.
+    if !is_ashmem_fd(fd) {
+        return Err(StatusCode::BadValue);
+    }
     // `ASHMEM_GET_SIZE` = `_IO(0x77, 4)`; the size is the ioctl's return
-    // value. Only a legacy `/dev/ashmem` fd reports `st_size == 0`.
+    // value.
     const ASHMEM_GET_SIZE: libc::c_ulong = 0x7704;
-    // SAFETY: plain ioctl on a borrowed, open fd with no pointer argument.
-    let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _) };
+    // SAFETY: `fd` was just verified to be an open `/dev/ashmem` fd, and
+    // ASHMEM_GET_SIZE takes no pointer argument (an explicit `0` is passed
+    // so the variadic slot is defined).
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _, 0) };
     if r < 0 {
         return Err(std::io::Error::last_os_error().into());
     }

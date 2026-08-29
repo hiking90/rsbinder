@@ -246,8 +246,10 @@ impl From<RpcError> for crate::StatusCode {
 /// Decode-only entrypoint for the `rpc_parcel_rpc_mode` fuzz target.
 /// Arbitrary bytes are interpreted as an **RPC-mode**
 /// `Parcel` body and run through the deserializers a real RPC
-/// transaction reaches: scalars, `String`, the generic `Vec<T>` array
-/// path, binder-as-`RpcAddress`, and the AIDL out-vec resizers.
+/// transaction reaches: scalars, `String` and the generic `Vec<T>` array
+/// path. (The binder reads below hit a stub `RpcParcelOps` that returns
+/// before touching the address bytes — `RpcAddress` decoding is covered
+/// by the `rpc_address_decode` target, not here.)
 /// Property: no panic / OOM / UB / unbounded pre-allocation on *any*
 /// input — every length is bounded by the bytes actually present.
 /// Not part of the supported API surface.
@@ -258,9 +260,8 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     use crate::parcel::{Parcel, RpcParcelOps};
     use std::sync::Arc;
 
-    // Binder hook with no live session: exercises the RPC `read_binder`
-    // path (i32 present flag + 32-byte `RpcAddress`, all bounds-checked)
-    // without needing a real connection.
+    // Binder hook with no live session: lets `read::<SIBinder>` be
+    // driven without a connection. It does not decode the address.
     struct NullOps;
     impl RpcParcelOps for NullOps {
         fn write_binder(&self, _b: Option<&SIBinder>, _p: &mut Parcel) -> Result<()> {

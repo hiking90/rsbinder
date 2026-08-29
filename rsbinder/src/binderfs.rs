@@ -65,12 +65,25 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
+    /// Stand-in for the `BINDER_CTL_ADD` ioctl that checks what `add_device`
+    /// put in the struct — a NUL-terminated copy of the name — and derives
+    /// the returned numbers from it, so a broken copy loop fails the test
+    /// instead of being masked by hard-coded values.
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
         _fd: Fd,
         device: &mut binder::binderfs_device,
     ) -> std::result::Result<(), rustix::io::Errno> {
+        let bytes: Vec<u8> = device.name.iter().map(|&c| c as u8).collect();
+        let nul = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(rustix::io::Errno::INVAL)?;
+        let name = std::str::from_utf8(&bytes[..nul]).map_err(|_| rustix::io::Errno::INVAL)?;
+        if name.is_empty() {
+            return Err(rustix::io::Errno::INVAL);
+        }
         device.major = 511;
-        device.minor = 0;
+        device.minor = name.len() as u32;
         Ok(())
     }
 
@@ -84,7 +97,18 @@ mod tests {
         let name = "rsbinder";
         let (major, minor) = add_device(driver, name).unwrap();
         assert_eq!(major, 511);
-        assert_eq!(minor, 0);
+        assert_eq!(
+            minor,
+            name.len() as u32,
+            "mock derives minor from the copied name"
+        );
+    }
+
+    #[test]
+    fn test_add_device_rejects_overlong_name() {
+        let name = "x".repeat(256);
+        let err = add_device(Path::new("/dev/null"), &name).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

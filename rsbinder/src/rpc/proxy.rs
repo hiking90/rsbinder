@@ -57,8 +57,9 @@ pub struct RpcProxy {
     /// object dies when its **session connection drops**, so the
     /// session fires every cached proxy's obituary when its serve loop
     /// ends (see [`RpcSessionInner::send_session_obituaries`]). Set
-    /// once when the obituary is dispatched (`Acquire`/`Release`
-    /// publishes the recipients teardown to lock-free readers).
+    /// once when the obituary is dispatched. Every access is under the
+    /// `recipients` write lock (kernel `mLock` parity), which supplies
+    /// the happens-before — hence `Relaxed` throughout.
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
 }
@@ -104,9 +105,7 @@ impl RpcProxy {
                 return;
             }
             let snapshot = std::mem::take(&mut *recipients);
-            // `Release` so a lock-free `link_to_death` Acquire-load that
-            // observes `true` also sees the drained vector.
-            self.obituary_sent.store(true, Ordering::Release);
+            self.obituary_sent.store(true, Ordering::Relaxed);
             snapshot
         };
         // Callbacks outside the lock so a recipient may re-enter

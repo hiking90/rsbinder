@@ -1047,12 +1047,15 @@ mod tests {
     // the same pattern (`gAccessorProviders` is global, tests
     // namespace their fake instances).
 
+    #[track_caller]
     fn unique_instance(tag: &str) -> String {
+        // `line!()` would expand to *this* line for every caller; the
+        // caller's line needs `#[track_caller]`.
         format!(
             "rsb.test.a4.{}.{}.{}",
             tag,
             std::process::id(),
-            line!() // distinct per-source-line at the call site (each !invocation)
+            std::panic::Location::caller().line()
         )
     }
 

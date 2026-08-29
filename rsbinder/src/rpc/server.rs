@@ -449,7 +449,7 @@ pub struct RpcServer {
     /// `[u8; 32]` for compatibility.
     /// Holds a `Weak` of the founding `RpcSessionInner` itself so
     /// id-echoing attaches add a slot onto the *single* inner via
-    /// [`RpcSession::add_incoming_slot`] —
+    /// [`RpcSession::add_incoming_slot_capped`] —
     /// `state.remote_proxies`-cached `RpcProxy`s' `Arc<RpcSessionInner>`
     /// then point to the only inner and any server worker's nested
     /// `proxy.transact` `find_conn`s stay within its own slot pool
@@ -880,7 +880,11 @@ impl RpcServer {
     /// is fresh — isolated). Shared by the r34 and android-13+
     /// connection paths.
     fn configure_session(&self, session: &RpcSession) {
-        if let Some(root) = self.root.lock().expect("root poisoned").clone() {
+        // Bind the clone first: an `if let` scrutinee temporary lives for
+        // the whole body, which would hold the server's `root` lock while
+        // taking the session's.
+        let root = self.root.lock().expect("root poisoned").clone();
+        if let Some(root) = root {
             session.set_root(root);
         }
         session.set_max_threads(*self.max_threads.lock().expect("max_threads poisoned"));
@@ -906,7 +910,7 @@ impl RpcServer {
     /// own; the entry does outlive session death while any proxy still
     /// pins the dead inner (proxies hold `Arc<RpcSessionInner>`), and an
     /// id echoed onto such a session is rejected by the lifecycle —
-    /// `add_incoming_slot`'s `try_bump_live_conns` refuses `Dying`/`Dead`
+    /// `add_incoming_slot_capped`'s `try_bump_live_conns` refuses `Dying`/`Dead`
     /// — not by a dangling `Weak`. The `Weak<RpcSessionInner>` (rather
     /// than of `SharedSession`) is what lets the attach path add a slot
     /// onto the founding inner directly.
@@ -927,7 +931,7 @@ impl RpcServer {
 
     /// Resolve a client-echoed id to a **live** founding inner
     /// (id-demux, returning the `RpcSessionInner` so the attach path
-    /// can `add_incoming_slot` on it directly). `None` for any
+    /// can `add_incoming_slot_capped` on it directly). `None` for any
     /// non-32-byte id (AOSP
     /// `kSessionIdBytes == 32`), an unknown id, or a stale `Weak`
     /// (session fully torn down) — all of which the caller rejects.
@@ -1069,11 +1073,11 @@ impl RpcServer {
                 // worker — and, with `set_max_connections`, the accept loop —
                 // forever. `run_connection_in_worker` re-arms (idempotent) and
                 // clears it before the long-lived serve.
-                if let Some(d) = *server
+                let handshake_timeout = *server
                     .handshake_timeout
                     .lock()
-                    .expect("handshake_timeout poisoned")
-                {
+                    .expect("handshake_timeout poisoned");
+                if let Some(d) = handshake_timeout {
                     if let Err(e) = raw.set_read_timeout(Some(d)) {
                         log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
                     }
@@ -1179,11 +1183,11 @@ impl RpcServer {
         // by `arm_serve_timeouts` before any long-lived serve (`None`
         // ⇒ idle unbounded, or the configured `set_idle_timeout`).
         // Best-effort: a set failure just means no deadline.
-        if let Some(d) = *server
+        let handshake_timeout = *server
             .handshake_timeout
             .lock()
-            .expect("handshake_timeout poisoned")
-        {
+            .expect("handshake_timeout poisoned");
+        if let Some(d) = handshake_timeout {
             if let Err(e) = transport.set_read_timeout(Some(d)) {
                 log::debug!("RPC: failed to arm handshake read timeout: {e:?}");
             }
@@ -1362,33 +1366,25 @@ impl RpcServer {
                     }
                     // AOSP-faithful `setMaxIncomingThreads` cap; see
                     // `RpcServer::set_max_threads` rustdoc for the
-                    // advertise vs. slot-cap split.
-                    //
-                    // Race: this check and the subsequent
-                    // `add_incoming_slot` are two separate critical
-                    // sections, so concurrent attach workers can
-                    // transiently overshoot `cap` by up to (N − 1),
-                    // bounded by `set_max_connections` (default
-                    // unlimited). A check-and-increment atomic would
-                    // tighten this further.
+                    // advertise vs. slot-cap split. The cap check, the
+                    // anti-resurrection gate (`try_bump_live_conns`) and
+                    // the slot push are one critical section, so N
+                    // concurrent attach workers cannot each pass a
+                    // pre-check and overshoot the cap — and only
+                    // serve-driven slots count, not the callback
+                    // connections this client opened toward us.
                     let cap = inner.max_threads_value() as usize;
-                    if inner.slot_count() >= cap {
-                        server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
-                        log::warn!(
-                            "android-13+ RPC: attach refused (incoming slot \
-                             cap reached: slot_count={}, max_threads={})",
-                            inner.slot_count(),
-                            cap
-                        );
-                        drop(transport);
-                        return;
-                    }
-                    // `add_incoming_slot` atomically combines the
-                    // anti-resurrection gate (`try_bump_live_
-                    // conns`) with the slot enqueue.
                     let session = RpcSession::wrap_inner(inner);
-                    let slot_id = match session.add_incoming_slot(transport) {
+                    let slot_id = match session.add_incoming_slot_capped(transport, cap) {
                         Ok(id) => id,
+                        Err(StatusCode::FailedTransaction) => {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: attach refused (incoming slot \
+                                 cap reached: max_threads={cap})"
+                            );
+                            return;
+                        }
                         Err(e) => {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(
@@ -1398,7 +1394,7 @@ impl RpcServer {
                             return;
                         }
                     };
-                    // Bump *after* `add_incoming_slot` succeeded
+                    // Bump *after* `add_incoming_slot_capped` succeeded
                     // so external observers never see a count for
                     // a slot that never reached the pool.
                     server.attached_count.fetch_add(1, Ordering::SeqCst);
@@ -1425,6 +1421,18 @@ impl RpcServer {
                 // do no blocking read, so the still-armed deadline reaches
                 // the serve loop, which clears it after the first frame so
                 // an established idle session is not torn down by it.
+                //
+                // The serve loop lifts only the *read* deadline after that
+                // first frame (`clear_slot_read_timeout`). r34 writes
+                // nothing before the first frame, so the handshake write
+                // deadline has no phase to bound here — lift it now, or
+                // `SO_SNDTIMEO` stays armed for the session's whole life
+                // and a large reply to a slow reader fails with
+                // `WouldBlock`, contrary to the `set_handshake_timeout`
+                // contract.
+                if let Err(e) = transport.set_write_timeout(None) {
+                    log::debug!("RPC r34: failed to lift handshake write deadline: {e:?}");
+                }
                 let session = match server.make_session(transport) {
                     Ok(s) => s,
                     Err(e) => {

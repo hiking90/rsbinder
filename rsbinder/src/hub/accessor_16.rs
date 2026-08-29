@@ -83,12 +83,11 @@ pub(crate) struct AccessorRoot {
     /// keeping proxies alive), so dropping `inner` is what fires
     /// `RpcProxy::drop`.
     inner: SIBinder,
-    /// **Load-bearing**: must drop *after* `inner` (Rust drops fields in
-    /// declaration order). Dropping `session` first kills the
-    /// `RpcSessionInner` before the inner `RpcProxy::drop` fires, so the
-    /// proxy's `queue_dec_strong` silent-skips on the dead session and
-    /// the peer leaks a strong ref until its own teardown. Reorder =
-    /// wire regression.
+    /// Belt and braces. `RpcProxy` holds a *strong* `Arc<RpcSessionInner>`
+    /// (see `rpc::proxy::RpcProxy::session`), so `inner` alone already keeps
+    /// the session — and its connection — alive until the proxy's
+    /// `DEC_STRONG` has gone out; this handle only makes that visible in
+    /// the type. Field order is not load-bearing.
     #[allow(dead_code)]
     session: RpcSession,
 }

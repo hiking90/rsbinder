@@ -72,16 +72,21 @@ fn transaction_codes_are_the_r6_numbering() {
 /// the last method of the Android 14 interface — the two facts this asserts.
 #[test]
 fn probe_code_14_separates_the_two_interfaces() {
+    // Pin the constant the probe actually sends, not a literal: a probe
+    // moved to 13 would hit `tryUnregisterService` on r6+ and
+    // `getServiceDebugInfo` on pre-r6 — answered on both, every Android
+    // 15 classified as r6+ — and a literal here would stay green.
+    let probe = FIRST_CALL_TRANSACTION + super::ANDROID_15_PROBE_CODE;
     assert_eq!(
         transactions::r#getServiceDebugInfo,
-        FIRST_CALL_TRANSACTION + 14,
-        "code 14 must be a method on r6+, or the probe reads `UnknownTransaction` \
+        probe,
+        "the probe must be a method on r6+, or it reads `UnknownTransaction` \
          on both interfaces"
     );
     assert_eq!(
         prev::r#getServiceDebugInfo,
-        FIRST_CALL_TRANSACTION + 13,
-        "code 14 must be past the end of the Android 14 interface, or the probe \
+        probe - 1,
+        "the probe must be one past the end of the Android 14 interface, or it \
          gets an answer on both"
     );
 

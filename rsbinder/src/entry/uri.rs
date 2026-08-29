@@ -136,7 +136,8 @@ pub fn parse(uri: &str) -> Result<Uri> {
                 if service.is_some() {
                     return Err(bad("both `binder://name` and `#name` given", uri));
                 }
-                service = Some(authority_path.to_string());
+                // Same decoding as the `#name` form it is shorthand for.
+                service = Some(percent_decode_str(authority_path, uri)?);
             }
             Endpoint::Kernel { driver, threads }
         }
@@ -196,6 +197,9 @@ fn percent_decode(s: &str, uri: &str) -> Result<Vec<u8>> {
         if b[i] == b'%' {
             let hex = b
                 .get(i + 1..i + 3)
+                // `from_str_radix` accepts a leading sign, so require two
+                // hex digits explicitly (`%+9` is not an escape).
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| bad("bad percent-escape", uri))?;

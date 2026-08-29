@@ -41,6 +41,46 @@ use crate::{
 
 const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
+/// Types whose bytes may be copied verbatim onto / off the wire.
+///
+/// `Parcel::write_aligned`, `write_array` and `read_array` reinterpret a
+/// `&T` / `&[T]` as raw bytes (and, on read, raw bytes as `T`). That is only
+/// sound for a type that has **no padding or otherwise-uninitialized
+/// bytes** (the bytes would leak process memory to the peer and reading them
+/// is UB) and for which **every bit pattern is a valid value** (a peer's
+/// bytes become a `T` without validation). A `T: Pod`-style bound carries
+/// that obligation in the signature instead of leaving it to whichever
+/// caller happens to instantiate the generic.
+///
+/// # Safety
+///
+/// Implementors must be `#[repr(C)]`/`#[repr(transparent)]` or a
+/// primitive, contain no padding, and be valid for every bit pattern of
+/// their size. For the bindgen binder-ABI structs this additionally means
+/// every union member must be written full-width by the constructor
+/// (`flat_binder_object::new_*` do; see the `*_full_width_init` tests in
+/// `binder_object.rs`).
+pub(crate) unsafe trait ParcelPod: Copy {}
+
+macro_rules! impl_parcel_pod {
+    ($($t:ty),* $(,)?) => { $(
+        // SAFETY: primitive integer/float types: no padding, every bit
+        // pattern valid.
+        unsafe impl ParcelPod for $t {}
+    )* };
+}
+impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
+
+// SAFETY: bindgen `#[repr(C)]` binder-ABI structs whose fields are
+// integers / pointers-as-integers / unions of those, laid out with no
+// padding (8-byte-multiple field groups); every bit pattern is a valid
+// value. The union members are written full-width by their constructors
+// (`binder_object.rs`) and by `write_transaction_data` (`ptr: 0` before
+// `.handle`).
+unsafe impl ParcelPod for flat_binder_object {}
+unsafe impl ParcelPod for crate::sys::binder_transaction_data {}
+unsafe impl ParcelPod for crate::sys::binder_transaction_data_secctx {}
+
 #[inline]
 pub(crate) fn pad_size(len: usize) -> usize {
     (len + 3) & (!3)
@@ -199,13 +239,20 @@ impl<T: Clone + Default> ParcelData<T> {
         self.as_slice().len()
     }
 
-    fn set_len(&mut self, len: usize) {
+    /// # Safety
+    ///
+    /// The caller must guarantee `len <= capacity()` **and** that bytes
+    /// `0..len` are initialized. Shrinking always satisfies the second
+    /// half; growing only does when something outside the `Vec` filled
+    /// the spare capacity through [`as_mut_ptr`](Parcel::as_mut_ptr) —
+    /// on this crate's paths, the binder driver writing the read buffer
+    /// in `talk_with_driver`.
+    unsafe fn set_len(&mut self, len: usize) {
         match self {
-            // SAFETY: Vec::set_len requires `len <= capacity` and that the
-            // first `len` bytes are initialized. Element type is `u8`, so any
-            // byte pattern is a valid value; every caller reserves capacity
-            // and writes the bytes (copy_nonoverlapping) before calling this,
-            // so the caller must uphold `len <= capacity`.
+            // SAFETY: the caller upholds `len <= capacity` and the
+            // initialization of `0..len` (see the method contract above).
+            // `u8` has no invalid bit patterns, so no per-element
+            // validity obligation remains.
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
             _ => panic!("&[u8] can't support set_len()."),
         }
@@ -308,6 +355,10 @@ struct RpcFields {
     /// Write-only on the success path (the peer's DEC balances the bumps), so
     /// the wire is byte-unchanged.
     leaving_addrs: Vec<crate::rpc::RpcAddress>,
+    /// Remote proxies flattened into this outgoing parcel, held until the
+    /// parcel is dropped so their `DEC_STRONG` cannot overtake the send
+    /// that names them (AOSP keeps argument refs until the reply is out).
+    pinned: Vec<crate::binder::SIBinder>,
 }
 
 /// The behaviour of the RPC serialization state lives here so that the
@@ -487,6 +538,23 @@ impl Parcel {
         self.data.as_ptr()
     }
 
+    /// Byte count that may be handed to the kernel alongside [`as_ptr`]
+    /// (`Self::as_ptr`).
+    ///
+    /// This is the number of bytes that actually exist in the backing
+    /// buffer, which is **not** always [`data_size`](Self::data_size):
+    /// that one is `max(len, pos)` (AOSP `Parcel::dataSize`), and the
+    /// public [`set_data_position`](Self::set_data_position) can move
+    /// `pos` past the end without writing anything. Sending
+    /// `data_size()` would then make the driver `copy_from_user` past
+    /// the end of our allocation and hand the surplus to the peer.
+    /// Every write path zero-fills the `[len..pos]` gap and grows `len`,
+    /// so for a parcel that was actually written this is identical to
+    /// `data_size()`.
+    pub(crate) fn ipc_data_size(&self) -> usize {
+        self.data.len()
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }
@@ -598,6 +666,15 @@ impl Parcel {
     pub(crate) fn rpc_record_leaving_addr(&mut self, addr: crate::rpc::RpcAddress) {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.leaving_addrs.push(addr);
+        }
+    }
+
+    /// Keep `binder` alive for this parcel's lifetime (see
+    /// `RpcFields::pinned`).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_pin_binder(&mut self, binder: crate::binder::SIBinder) {
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.pinned.push(binder);
         }
     }
 
@@ -714,18 +791,54 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
+    /// Shrink the parcel to `new_len` bytes.
+    ///
+    /// Growing is refused: the bytes between `len` and `new_len` were
+    /// never initialized, and `capacity()` says nothing about that —
+    /// claiming them would be `Vec::set_len` UB even though the buffer
+    /// is large enough. The one legitimate grow (the binder driver
+    /// filling our read buffer through `as_mut_ptr`) goes through
+    /// [`set_data_size_driver_filled`](Self::set_data_size_driver_filled).
     pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
-        if new_len > self.data.capacity() {
-            // The backing buffer cannot hold `new_len` bytes — a broken
-            // driver/buffer contract. Refuse rather than enter the
-            // `Vec::set_len` UB of claiming uninitialized capacity.
+        if new_len > self.data.len() {
             log::error!(
-                "set_data_size({new_len}) exceeds capacity {}",
+                "set_data_size({new_len}) would grow past the initialized length {}",
+                self.data.len()
+            );
+            return Err(StatusCode::BadValue);
+        }
+        // SAFETY: `new_len <= self.data.len() <= capacity`, and `0..new_len`
+        // is a prefix of the already-initialized region, so both halves of
+        // `ParcelData::set_len`'s contract hold.
+        unsafe { self.data.set_len(new_len) };
+        if new_len < self.pos {
+            self.pos = new_len;
+        }
+        Ok(())
+    }
+
+    /// Publish `new_len` bytes that were written into this parcel's spare
+    /// capacity from outside the `Vec` — i.e. by the binder driver filling
+    /// the read buffer it was handed via [`as_mut_ptr`](Self::as_mut_ptr).
+    ///
+    /// # Safety
+    ///
+    /// Bytes `0..new_len` must be initialized. `talk_with_driver` upholds
+    /// this by passing `read_consumed`, the count the driver reports having
+    /// written.
+    pub(crate) unsafe fn set_data_size_driver_filled(&mut self, new_len: usize) -> Result<()> {
+        if new_len > self.data.capacity() {
+            // The driver claims to have written more than the buffer holds —
+            // a broken driver/buffer contract, not something to trust.
+            log::error!(
+                "set_data_size_driver_filled({new_len}) exceeds capacity {}",
                 self.data.capacity()
             );
             return Err(StatusCode::BadValue);
         }
-        self.data.set_len(new_len);
+        // SAFETY: bounded by `capacity` just above, and the caller
+        // guarantees `0..new_len` was initialized by the driver.
+        unsafe { self.data.set_len(new_len) };
         if new_len < self.pos {
             self.pos = new_len;
         }
@@ -752,7 +865,19 @@ impl Parcel {
         }
     }
 
+    /// Move the read/write cursor. AOSP `Parcel::setDataPosition`.
+    ///
+    /// `pos` may legitimately sit past the end of the written bytes —
+    /// the write paths zero-fill the `[len..pos]` gap when they next
+    /// grow the buffer. A `pos` above `i32::MAX` is refused (and the
+    /// cursor left unchanged) rather than accepted: AOSP
+    /// `LOG_ALWAYS_FATAL`s there to catch a negative `int` that was
+    /// converted to `size_t`, and every wire length is an `i32`.
     pub fn set_data_position(&mut self, pos: usize) {
+        if pos > i32::MAX as usize {
+            log::error!("Parcel::set_data_position({pos}) exceeds i32::MAX; ignored");
+            return;
+        }
         self.pos = pos;
     }
 
@@ -1006,7 +1131,7 @@ impl Parcel {
         self.pos < end
     }
 
-    pub(crate) fn read_array<D: Deserialize>(&mut self) -> Result<Option<Vec<D>>> {
+    pub(crate) fn read_array<D: Deserialize + ParcelPod>(&mut self) -> Result<Option<Vec<D>>> {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
@@ -1052,6 +1177,8 @@ impl Parcel {
         // - result has capacity for `len` elements
         // - copy_nonoverlapping copies exactly `size` bytes
         // - setting length to `len` is valid as we just initialized those elements
+        // - `D: ParcelPod` means every bit pattern the peer sent is a valid
+        //   `D`, so the copied bytes need no per-element validation
         let mut result = Vec::with_capacity(len as usize);
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1181,7 +1308,7 @@ impl Parcel {
         parcelable.serialize(self)
     }
 
-    pub(crate) fn write_array<S: Serialize + Sized>(&mut self, parcelable: &[S]) -> Result<()> {
+    pub(crate) fn write_array<S: Serialize + ParcelPod>(&mut self, parcelable: &[S]) -> Result<()> {
         let len = parcelable.len();
         // The wire length word is an `i32`; a slice too large to fit is a
         // `BadValue`, not a silently truncated (possibly negative) count.
@@ -1203,8 +1330,8 @@ impl Parcel {
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
 
-        self.data.reserve(end);
-        // SAFETY: `reserve(end)` above guarantees the destination has at least
+        self.data.reserve(end.saturating_sub(self.data.len()));
+        // SAFETY: the `reserve` above guarantees the destination has at least
         // `end` bytes of capacity, so `add(pos)` and the `size`-byte copy
         // (size <= padded) stay in-bounds and the ranges do not overlap
         // (distinct allocations). The 0-3 trailing pad bytes are then zeroed
@@ -1257,7 +1384,7 @@ impl Parcel {
             .checked_add(padded)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
-        self.data.reserve(end);
+        self.data.reserve(end.saturating_sub(self.data.len()));
         for c in parcelable {
             self.write(&c.as_i32())?;
         }
@@ -1284,10 +1411,11 @@ impl Parcel {
         }
     }
 
-    pub(crate) fn write_aligned<T>(&mut self, val: &T) -> Result<()> {
+    pub(crate) fn write_aligned<T: ParcelPod>(&mut self, val: &T) -> Result<()> {
         let unaligned = std::mem::size_of::<T>();
-        // SAFETY: `val` is a live `&T`, so its `size_of::<T>()` bytes are
-        // valid to read as `u8` for the borrow's duration. The resulting
+        // SAFETY: `val` is a live `&T` for the borrow's duration and
+        // `T: ParcelPod` guarantees all `size_of::<T>()` bytes are
+        // initialized (no padding), so they are valid to read as `u8`. The
         // slice does not outlive `val` (consumed synchronously below).
         let val_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
@@ -1311,8 +1439,8 @@ impl Parcel {
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
 
-        self.data.reserve(end);
-        // SAFETY: `reserve(end)` guarantees capacity for `add(pos)` and the
+        self.data.reserve(end.saturating_sub(self.data.len()));
+        // SAFETY: the `reserve` above guarantees capacity for `add(pos)` and the
         // `unaligned`-byte copy (unaligned <= aligned). Source `data` and the
         // parcel buffer are distinct allocations (non-overlapping). The 0-3
         // trailing pad bytes are zeroed before `set_len`: `reserve` does not
@@ -1499,10 +1627,10 @@ impl Parcel {
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
 
-        self.data.reserve(end);
+        self.data.reserve(end.saturating_sub(self.data.len()));
         // SAFETY: the source range `other.data[offset..offset + size]` is
         // bounds-checked by the slice index above (panics if out of range),
-        // and `reserve(end)` guarantees the destination has capacity for
+        // and the `reserve` above guarantees the destination has capacity for
         // `add(self.pos)` plus `size` bytes. `other` and `self` are distinct
         // parcels (non-overlapping). `set_len` only grows up to the reserved
         // capacity over the `u8` bytes just copied.
@@ -1920,34 +2048,6 @@ mod tests {
         assert_eq!(reverse, res.unwrap());
     }
 
-    // #[test]
-    // fn test_dyn_ibinder() -> Result<()> {
-    //     let proxy: Arc<Box<dyn IBinder>> = Arc::new(proxy::Proxy::new_unknown(0));
-    //     let raw = Arc::into_raw(proxy.clone());
-
-    //     let mut parcel = Parcel::new();
-
-    //     {
-    //         parcel.write(&raw)?;
-    //     }
-    //     parcel.set_data_position(0);
-
-    //     let cloned = proxy.clone();
-    //     {
-    //         let restored = parcel.read::<*const dyn IBinder>()?;
-
-    //         assert_eq!(raw, restored);
-    //         assert_eq!(Arc::strong_count(&cloned), Arc::strong_count(&unsafe {Arc::from_raw(restored)}));
-    //     }
-
-    //     Ok(())
-    // }
-
-    #[test]
-    fn test_errors() -> Result<()> {
-        Ok(())
-    }
-
     // E8: typed scalar helpers must round-trip and stay wire-identical to the
     // generic read::<T>/write::<T> path they wrap.
     #[test]
@@ -2061,21 +2161,76 @@ mod tests {
         drop(parcel);
     }
 
-    // Hardening regression: `set_data_size` must reject a length larger
-    // than the backing buffer's capacity instead of entering the
-    // `Vec::set_len` UB of claiming uninitialized capacity. A broken
-    // driver/buffer contract is the untrusted-input source here.
+    // `set_data_size` may only shrink: `capacity()` says nothing about
+    // initialization, so growing into spare capacity would be `Vec::set_len`
+    // UB. The driver-filled grow has its own `unsafe` entry point.
     #[test]
-    fn set_data_size_rejects_over_capacity() {
+    fn set_data_size_only_shrinks() {
+        let mut parcel = Parcel::new();
+        parcel.write(&0u64).expect("write u64");
+        assert_eq!(parcel.data_size(), 8);
+
+        // Growing past the initialized length is refused, even though the
+        // capacity (256) would hold it.
+        assert!(parcel.capacity() > 8);
+        assert_eq!(parcel.set_data_size(9), Err(StatusCode::BadValue));
+        assert_eq!(parcel.data_size(), 8);
+
+        // Shrinking is fine and drags the cursor back with it.
+        assert!(parcel.set_data_size(4).is_ok());
+        assert_eq!(parcel.data_size(), 4);
+        assert_eq!(parcel.data_position(), 4);
+        assert!(parcel.set_data_size(0).is_ok());
+    }
+
+    #[test]
+    fn set_data_size_driver_filled_is_bounded_by_capacity() {
         let mut parcel = Parcel::new();
         let cap = parcel.capacity();
+        // Simulate the driver filling the spare capacity before publishing.
+        // SAFETY (test): we initialize every byte we then claim.
+        unsafe {
+            std::ptr::write_bytes(parcel.as_mut_ptr(), 0xAB, cap);
+            assert!(parcel.set_data_size_driver_filled(cap).is_ok());
+            assert_eq!(
+                parcel.set_data_size_driver_filled(cap + 1),
+                Err(StatusCode::BadValue)
+            );
+        }
+        assert_eq!(parcel.data_size(), cap);
+        assert!(parcel.data.as_slice().iter().all(|&b| b == 0xAB));
+    }
 
-        // Exactly at capacity is the boundary and must succeed.
-        assert!(parcel.set_data_size(cap).is_ok());
-        // One past capacity must be refused with BadValue, not panic/UB.
-        assert_eq!(parcel.set_data_size(cap + 1), Err(StatusCode::BadValue));
-        // Zero is always valid.
-        assert!(parcel.set_data_size(0).is_ok());
+    // A forward `set_data_position` with no write behind it must not make
+    // the kernel-facing length exceed the bytes that actually exist — the
+    // driver would `copy_from_user` past our allocation otherwise.
+    #[test]
+    fn ipc_data_size_never_exceeds_backing_buffer() {
+        let mut parcel = Parcel::new();
+        parcel.write(&1u32).expect("write");
+        parcel.set_data_position(1024);
+        assert_eq!(parcel.data_size(), 1024, "AOSP dataSize() = max(len, pos)");
+        assert_eq!(
+            parcel.ipc_data_size(),
+            4,
+            "only the written bytes go to the kernel"
+        );
+
+        // Once something is written the gap is zero-filled and the two agree.
+        parcel.write(&2u32).expect("write past gap");
+        assert_eq!(parcel.ipc_data_size(), 1028);
+        assert_eq!(parcel.ipc_data_size(), parcel.data_size());
+    }
+
+    #[test]
+    fn set_data_position_rejects_past_i32_max() {
+        let mut parcel = Parcel::new();
+        parcel.write(&7u32).expect("write");
+        parcel.set_data_position(0);
+        parcel.set_data_position(i32::MAX as usize + 1);
+        assert_eq!(parcel.data_position(), 0, "out-of-range seek is ignored");
+        parcel.set_data_position(i32::MAX as usize);
+        assert_eq!(parcel.data_position(), i32::MAX as usize);
     }
 
     // Hardening regression: `data_avail` must saturate when the cursor

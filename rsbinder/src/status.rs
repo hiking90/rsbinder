@@ -593,6 +593,12 @@ mod tests {
         parcel.set_data_position(0);
         let deserialized = Status::deserialize(&mut parcel).unwrap();
         assert_eq!(status, deserialized);
+        // `PartialEq` ignores `message` on purpose, so check the String16
+        // path explicitly — the only wire field that assertion cannot see.
+        assert!(
+            deserialized.to_string().ends_with("Parcelable"),
+            "message did not round-trip: {deserialized}"
+        );
 
         Ok(())
     }

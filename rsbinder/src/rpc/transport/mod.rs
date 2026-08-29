@@ -140,9 +140,10 @@ pub trait RpcTransport: Send + Sync {
     /// has no length prefix (`RpcState::rpcSend` writes the
     /// `RpcWireHeader` + body directly) — the android-13+ profile drives
     /// framing itself via `wire_android13`. The default is
-    /// **unsupported**, so `mem`/`tls`/`vsock` stay frame-only *by type*
-    /// (no extra code); only `unix` overrides it. The existing R34 path
-    /// never calls this — `send_frame`/`recv_frame` are byte-unchanged.
+    /// **unsupported**, so a backend that does not override it stays
+    /// frame-only *by type* (currently `mem`); `unix`, `tls` and `vsock`
+    /// override it. The existing R34 path never calls this —
+    /// `send_frame`/`recv_frame` are byte-unchanged.
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
@@ -378,7 +379,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
 }
 
 /// `WouldBlock`/`TimedOut` is how a socket read deadline surfaces.
-fn is_timeout(e: &std::io::Error) -> bool {
+pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 

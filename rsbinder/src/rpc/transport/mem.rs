@@ -70,6 +70,15 @@ pub(crate) fn self_identity() -> PeerIdentity {
 
 impl RpcTransport for MemTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
+        // Same cap the stream backends enforce in `write_frame`, so the
+        // hermetic test transport cannot pass a frame every real one
+        // rejects.
+        if buf.len() > super::MAX_FRAME_LEN {
+            return Err(RpcError::FrameTooLarge {
+                declared: buf.len(),
+                max: super::MAX_FRAME_LEN,
+            });
+        }
         // A channel send only fails once the peer's receiver is
         // dropped — i.e. the peer is gone. Lock-free (`Sender: Sync`).
         self.tx.send(buf.to_vec()).map_err(|_| RpcError::PeerClosed)

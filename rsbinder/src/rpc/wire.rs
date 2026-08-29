@@ -326,16 +326,12 @@ pub fn __fuzz_decode_wire(input: &[u8]) {
     let _ = R34Codec.decode_message(input);
 }
 
-/// Decode-only entrypoint for the `rpc_address_decode` fuzz target:
-/// the address sits inside a TRANSACT/DEC_STRONG body, so feeding
-/// arbitrary bytes through the message decoder also exercises the
-/// 32-byte address parse path with full bounds checking.
 /// Decode-only entrypoint for the `rpc_session_handshake` fuzz target:
-/// the first 4 bytes are fed to the session preamble decoder, the
-/// remainder through the message decoder — the
-/// exact untrusted path a session's negotiation/serve loop walks. No
-/// panic / OOM / hang on any input; bad negotiation values are
-/// rejected, not trusted.
+/// the first 4 bytes are fed to the R34 session preamble decoder, the
+/// remainder through the R34 message decoder. No panic / OOM / hang on
+/// any input; bad negotiation values are rejected, not trusted. (The
+/// android-13+ connection header has its own path — `server_accept` /
+/// `decode_connection_header` — and is not covered here.)
 #[doc(hidden)]
 pub fn __fuzz_session_handshake(input: &[u8]) {
     let c = R34Codec;
@@ -344,10 +340,15 @@ pub fn __fuzz_session_handshake(input: &[u8]) {
     let _ = c.decode_message(rest);
 }
 
+/// Decode-only entrypoint for the `rpc_address_decode` fuzz target: both
+/// address parsers — the R34 32-byte form and the android-13+ 8-byte
+/// form — are called *directly* on the input (a DEC_STRONG wrapper alone
+/// would stop at the body-length check for every input that is not
+/// exactly 32 bytes and never reach them), plus the framed path.
 #[doc(hidden)]
 pub fn __fuzz_decode_address(input: &[u8]) {
-    // Wrap as a DEC_STRONG frame so the address parser is reached even
-    // for short/garbage inputs without panicking.
+    let _ = rd_addr(input, 0);
+    let _ = super::wire_android13::Android13PlusCodec::decode_addr(input, 0);
     let Ok(header) = R34Codec::header(CMD_DEC_STRONG, input.len()) else {
         return;
     };

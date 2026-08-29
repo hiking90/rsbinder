@@ -393,7 +393,16 @@ impl Shared {
                 // neither, so a snapshot value would never be corrected.
                 if let Some(current) = inner.services.get(name) {
                     entry.has_clients = current.has_clients;
-                    entry.registered = current.registered;
+                    // `current.registered` is the optimistic `true` this very
+                    // call published, not something the service manager
+                    // said — only a `false` written under us (a concurrent
+                    // `try_unregister`) is real. Otherwise keep the value
+                    // from before the call, which may itself be `false`
+                    // after a public `try_unregister`; copying `true` over
+                    // it would hide the service from `re_register` forever.
+                    if !current.registered {
+                        entry.registered = false;
+                    }
                 }
                 inner.services.insert(name.to_string(), entry)
             }
@@ -630,15 +639,16 @@ impl LazyServiceRegistrar {
     /// mean.
     ///
     /// The callback runs inside the shutdown decision it is answering, so
-    /// [`try_unregister`](Self::try_unregister),
-    /// [`re_register`](Self::re_register) and
-    /// [`force_persist`](Self::force_persist) may be called from it — those
-    /// are what it is *for* — but [`register_service`](Self::register_service)
-    /// and [`on_clients`](Self::on_clients) may not: both re-enter the lock
-    /// the decision holds and would deadlock. AOSP has the same rule for the
-    /// same reason (`mActiveServicesCallback` is invoked under `mMutex`,
-    /// while its `tryUnregister` / `reRegister` deliberately do not re-take
-    /// it).
+    /// [`try_unregister`](Self::try_unregister) and
+    /// [`re_register`](Self::re_register) may be called from it — those are
+    /// what it is *for* — but [`register_service`](Self::register_service),
+    /// [`on_clients`](Self::on_clients) and
+    /// [`force_persist`](Self::force_persist) may not: all three re-enter the
+    /// lock the decision holds and would deadlock (`force_persist(false)`
+    /// re-runs the decision itself). AOSP has the same rule for the same
+    /// reason (`mActiveServicesCallback` is invoked under `mMutex`, while
+    /// its `tryUnregister` / `reRegister` deliberately do not re-take it and
+    /// `forcePersist` does).
     pub fn set_active_services_callback(&self, callback: ActiveServicesCallback) {
         self.shared.lock().active_services_callback = Some(callback);
     }

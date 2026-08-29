@@ -85,6 +85,35 @@ impl RpcTransport for VsockTransport {
         read_frame(&mut r)
     }
 
+    /// Raw, unframed write for the android-13+ profile (the real android
+    /// RPC wire has no length prefix). Mirrors `UnixTransport::send_raw`;
+    /// without it a `vsock://…?profile=android13plus` connection failed at
+    /// its first handshake byte — on the Microdroid/AVF target this module
+    /// exists for, where the peer is real libbinder and speaks only this.
+    fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        use std::io::Write;
+        let mut w = &self.stream;
+        w.write_all(buf)?;
+        w.flush()?;
+        Ok(())
+    }
+
+    /// Raw, unframed read (one `read`; `Ok(0)` = peer closed). Mirrors
+    /// `UnixTransport::recv_raw`, including the `Interrupted` retry and the
+    /// deadline → `Timeout` mapping.
+    fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        use std::io::Read;
+        let mut r = &self.stream;
+        loop {
+            return match r.read(buf) {
+                Ok(n) => Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if super::is_timeout(&e) => Err(crate::rpc::RpcError::Timeout),
+                Err(e) => Err(e.into()),
+            };
+        }
+    }
+
     fn peer_identity(&self) -> PeerIdentity {
         self.peer.clone()
     }

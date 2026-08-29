@@ -71,9 +71,28 @@ short form — and the first entry is the only one no compiler will catch.
   named `StatusCode` has to be retyped.
 - **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
   is stamped at construction; only an exhaustive `match` on the enum notices.
+- **`IMemoryHeap::base` returns `Option<SharedBytes<'_>>`**, not `&[u8]`. The
+  window aliases memory another process writes at any moment, which a `&[u8]`
+  cannot soundly describe. The view is read-only (`load` / `copy_to` / `slice`
+  / `to_vec`); writes go through `write_at` on the concrete heap types, which
+  also refuses a `FLAG_READ_ONLY` mapping.
 
 ### Added
 
+- **rsbinder (`binder`):** `Strong::try_into_async` — the fallible form of
+  `into_async`. A local service published sync-only (`Bn*::new_binder`)
+  cannot back the async view; the generated cast reports `BadType`, which
+  `into_async` turns into a panic (now documented on it).
+- **rsbinder (RPC, `vsock`):** the vsock transport implements the raw
+  (unframed) byte access the android-13+ wire profile needs. Until now
+  `vsock://…?profile=android13plus` parsed and then failed at the first
+  handshake byte — on the Microdroid/AVF target the backend exists for, where
+  the peer is real libbinder and speaks only that profile.
+- **rsbinder (kernel):** a thread that talked to the binder driver now sends
+  `BINDER_THREAD_EXIT` (after a final flush) when it ends — AOSP
+  `IPCThreadState::threadDestructor`. Without it every short-lived thread that
+  made one call left a `binder_thread` behind in the kernel until the fd
+  closed, and a recycled tid inherited the dead thread's looper state.
 - **rsbinder (`hub`):** an `android_15` feature — the Android 15
   service-manager protocol from `android-15.0.0_r6` on. That release inserted
   `getService2` at index 1 of `IServiceManager` and shifted every transaction
@@ -303,6 +322,59 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder (`shared_memory`) — breaking:** `IMemoryHeap::base` now returns
+  `Option<SharedBytes<'_>>`, a read-only view. A `&[u8]` over a `MAP_SHARED`
+  region promises the compiler an immutability the peer process does not
+  keep, so it was undefined behaviour to hold; the view copies through
+  atomics instead, and offers no store — a `FLAG_READ_ONLY` receiver maps
+  `PROT_READ`, so a writable view would let safe code fault. `read_at` /
+  `write_at` copy through the same atomics (word-sized wherever the window
+  is word-aligned), which also makes `MemoryHeapBase`'s `Sync` sound — two
+  threads writing the same window through one `Arc` used to be a data race
+  reachable from safe code. `MemoryDealer::allocate` now hands out a window
+  of the *requested* size rather than the granule-rounded one (AOSP
+  `MemoryDealer::allocate` does the same); the rounding exposed up to 31
+  bytes of whatever a freed neighbour had left in the granule.
+- **rsbinder (`shared_memory`):** `MappedHeap::from_fd` refuses a zero-length
+  fd unless it really is an ashmem device (previously any `st_size == 0` was
+  "trusted as ashmem"). A memfd the sender never `ftruncate`d mapped fine
+  and `SIGBUS`ed this process on first access — a remote crash. The Android
+  `ASHMEM_GET_SIZE` ioctl in `SharedMemory` is gated the same way, as
+  libcutils does, instead of being issued on whatever fd arrived.
+  `MemoryHeapBase::seal_future_write` reports `InvalidOperation` on
+  Linux/Android for a heap created without `FLAG_MEMFD_ALLOW_SEALING`
+  (`F_SEAL_SEAL` makes it impossible; the docs now say so — only the macOS
+  caveat was documented).
+- **rsbinder (`proxy`):** `ProxyHandle` equality is `(handle, generation)`,
+  as its own `generation` field documents, and it is now `Eq`. Comparing by
+  handle alone called two proxies equal when the kernel had recycled the
+  number for a different node.
+- **rsbinder (`Parcel`):** `set_data_position` ignores (and logs) a position
+  above `i32::MAX`, as AOSP's `LOG_ALWAYS_FATAL` guard does; and a forward
+  seek with nothing written behind it no longer inflates the byte count
+  handed to the kernel — see *Fixed*.
+- **rsbinder (entry):** `ClientOptions::tls` / `tls_server_name` on anything
+  but a `tls://` endpoint, and `ServeOptions::tls` on `unix-abstract://`, are
+  `BadValue`. Both were silently ignored — a caller asking for TLS got a
+  plaintext socket and no error. The option types already promised "never
+  ignored". A `ClientOptions::session_id` on the multi-connection path was
+  dropped the same way and opened a fresh session; it is forwarded now (the
+  session layer refuses the combination).
+- **rsbinder (RPC):** a `GET_FD_MODE` on a session already in `Unix` fd mode
+  answers `1` and changes nothing. It used to re-run the negotiation — which
+  on the client role can only ever compute `None` — so any peer packet
+  downgraded an established session, dropping in-flight fds and, on the r34
+  profile, desynchronising the fd-aware receive buffer. An unsolicited
+  `REPLY` now ends the session (AOSP `processCommand` does the same) instead
+  of being logged and skipped at wire speed. `find_conn` waits are bounded by
+  `RpcSession::set_timeout` (`TimedOut`) instead of parking forever when
+  every slot is driven by another thread. `RpcSession::shutdown` logs when it
+  finds nothing to tear down.
+- **rsbinder (`lazy_service`):** `force_persist` may **not** be called from
+  the active-services callback — the docs listed it as allowed, but it
+  re-takes the lock the callback runs under (AOSP's `forcePersist` does too,
+  and AOSP's header never allowed it either). `try_unregister` / `re_register`
+  remain the callback's tools.
 - **rsbinder-aidl — breaking:** declarations with no Rust representation are
   now build errors instead of silently generating an empty type. A
   `@JavaOnlyStableParcelable` declaration, or an unstructured parcelable
@@ -525,6 +597,128 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
+  freed memory.** `write_transaction_data` stores raw pointers to the reply
+  parcel (or the status word on the stack) in the thread's command buffer.
+  When `wait_for_response` failed before the driver consumed that command —
+  a queued `BR_DEAD_REPLY`/`BR_FAILED_REPLY`, or an ioctl error — the
+  function returned through `?`, the reply was dropped, and the next flush
+  (`join_thread_pool`'s exit, or any later call on that thread) handed the
+  kernel the dangling pointer to copy into the peer: a cross-process
+  use-after-free. The panic path already rewound the buffer; the error path
+  did not. Both the reply path and outbound `transact` now retry the flush
+  while the pointers are still valid and rewind the unconsumed tail
+  otherwise. An `IBinder::dec_strong` failure on the same path no longer
+  skips the reply (the two-way caller hung forever) or the transaction-state
+  restore (the next call inherited the previous caller's uid).
+- **rsbinder (`Parcel`) — a safe forward seek could make the kernel read past
+  the buffer.** `data_size()` is `max(len, pos)` (AOSP `dataSize`), and the
+  outbound path sent exactly that with `as_ptr()`, so
+  `set_data_position(1024)` on a 48-byte parcel followed by a transact made
+  the driver `copy_from_user` a kilobyte from a 256-byte allocation and
+  deliver the surplus heap to the peer — from `pub`, non-`unsafe` calls. The
+  kernel now receives the initialized length. The `Vec::set_len` contract in
+  `ParcelData` was also misstated (and one test violated it by claiming
+  never-written capacity); growing is now a separate `unsafe` entry used
+  only for the driver-filled read buffer, and the byte-copy generics
+  (`write_aligned` / `write_array` / `read_array`) are sealed behind a
+  `ParcelPod` marker instead of trusting whichever type instantiates them.
+- **rsbinder (kernel) — `become_context_manager` never asked for the
+  caller's security context.** AOSP registers with
+  `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`, the one bit the kernel reads to decide
+  whether the context manager gets `BR_TRANSACTION_SEC_CTX`; rsbinder passed
+  only `ACCEPTS_FDS`, so every transaction into `rsb_hub` arrived without a
+  security context and `get_calling_sid()` was always `None` there. The flag
+  is now set on Android and on Linux with SELinux mounted — and deliberately
+  *not* elsewhere, because a kernel that cannot produce a context fails every
+  transaction to such a node with `BR_FAILED_REPLY` (verified on a
+  non-SELinux box). `ACCEPTS_FDS` stays set, unlike AOSP, since `rsb_hub`
+  answers `DUMP_TRANSACTION`, which carries an fd.
+- **rsbinder (`parcelable`) — the array pre-allocation cap bounded the count,
+  not the bytes.** `Vec::with_capacity(min(len, data_avail()))` still
+  multiplies by `size_of::<T>()`: a 64 MiB RPC frame declaring
+  `len = 64_000_000` for `Vec<String>` requested ~1.5 GiB up front, and an
+  allocation failure aborts. Every element on that path costs at least 4 wire
+  bytes, so the cap is now `data_avail() / 4`.
+- **rsbinder (RPC) — a `DEC_STRONG` could deadlock the session.**
+  `RpcState::dec_strong_local` dropped the freed node's strong ref while the
+  state lock was held; if that was the last reference to a user service
+  holding a proxy of the same session, `RpcProxy::drop` re-took the lock on
+  the same thread. The removed reference is now handed back and dropped after
+  the guard, as `clear_local` already did. The same drop from inside a
+  dispatch used to send its `DEC_STRONG` inline, *ahead of the reply* being
+  built — so a binder passed as an argument and returned in the same call
+  (`repeatBinder`) came back to its owner after the owner had already freed
+  the node, and the owner minted a bogus proxy to itself. Such a `DEC` is
+  deferred until the slot is free, which is the ordering AOSP has.
+- **rsbinder (RPC) — a peer could plant a proxy entry in our own address
+  subspace.** `RpcState::remote_proxy` minted a remote proxy for any unknown
+  address; AOSP `onBinderEntering` refuses one the receiving side would have
+  created itself. A forged address could then alias a local node and the next
+  legitimately minted one. Refused as `BadValue` now.
+- **rsbinder (RPC, `tokio`) — a nested callback from an RPC handler
+  deadlocked in a pure-RPC process.** `BinderAsyncPool::spawn` gated the
+  run-on-this-thread arm on `ProcessState::is_initialized()`, a guard that
+  `is_handling_transaction()` had since taken over itself. Without kernel
+  binder the call went to the blocking pool, where the session's thread-local
+  re-entrancy pin does not follow it, and it parked on the slot the
+  dispatching thread was waiting on.
+- **rsbinder (RPC, macOS) — a non-`AF_UNIX` fd resolved to a root peer.**
+  `getpeereid` on a TCP socket *succeeds* on macOS with `euid = 0`
+  (measured), which the `rc != 0` ladder could not catch, so
+  `UnixTransport::from_owned_fd` on a foreign-family fd minted
+  `PeerIdentity::Local { uid: 0 }`. The socket family is checked first. On
+  Linux/Android `SO_PEERCRED` is read through libc rather than rustix's
+  `Pid(NonZeroI32)`, which the kernel's `pid == 0` (peer outside our PID
+  namespace) would have made an invalid value.
+- **rsbinder (RPC server) — the r34 (default) profile never lifted the
+  handshake *write* deadline.** Only the read side was cleared after the
+  first frame, so `SO_SNDTIMEO` stayed armed for the session's whole life and
+  a large reply to a slow reader failed with `WouldBlock` — contrary to
+  `set_handshake_timeout`'s contract. The incoming-slot cap on attach was a
+  check-then-act (concurrent attaches could overshoot it) and counted the
+  peer's callback connections against `setMaxIncomingThreads`; it is now one
+  critical section over serve-driven slots only, as AOSP counts.
+- **rsbinder (`proxy_count`) — a panicking `ProxyCountCallback` escaped a
+  `Drop`.** The remaining queued events were lost with it and, during an
+  unwind, the process aborted. Callbacks are isolated with `catch_unwind`
+  like death recipients already were.
+- **rsbinder (`lazy_service`) — a failed re-registration could hide a service
+  forever.** `restore` copied back the optimistic `registered: true` the call
+  itself had just written, so after a public `try_unregister` followed by a
+  refused `register_service` the entry said "registered" while the service
+  manager had nothing, and `re_register` skipped it for good.
+- **rsbinder (`hub`, Android 15 r6+) — `check_service` starts lazy
+  services.** It is carried by `getService` (the only lookup that returns a
+  bare `IBinder` across the release range), and AOSP's servicemanager runs
+  `tryStartService` for an unregistered name on `getService` but not on
+  `checkService`. Documented on the function and in the lookup table; the
+  behaviour cannot change without parsing the release-dependent `Service`
+  union.
+- **rsbinder (`file_descriptor`) — the fd null marker accepted any non-zero
+  value** (AOSP rejects anything but `1` as `UNEXPECTED_NULL`), and a
+  reliable-pipe `ParcelFileDescriptor` from Java never received the
+  `DETACHED` notice on its comm channel, so the sender's `checkError()`
+  reported a clean close.
+- **rsbinder (RPC) — hardening and housekeeping:** `wire_android13` reads a
+  message body straight into its final buffer (a 16-byte header could commit
+  twice `bodySize` before any body byte arrived) and rejects unknown
+  `RpcWireAddress` option bits instead of normalizing them; the in-memory
+  test transport enforces `MAX_FRAME_LEN` like every real backend; a failed
+  `SCM_RIGHTS` attach is an error rather than a `debug_assert`; a reaper-thread
+  spawn failure is logged (it silently lost every deferred `DEC_STRONG`);
+  `unix-abstract` and `binder://name` URIs decode percent-escapes like their
+  siblings and `%+9` is no longer an escape.
+- **rsbinder — comments and tests that said the wrong thing:** the
+  `AccessorRoot` drop-order note (the proxy holds the session strongly), the
+  `ParcelableHolder` `!Send` claim (it is `Send + Sync`), the `obituary_sent`
+  ordering rationale, the `RefCounter` double-dec assertion (it could never
+  fire — the sentinel reset made `c == INITIAL_STRONG_VALUE`), the Android 15
+  probe pin (it never referenced the probe constant), and several tests that
+  could not fail or asserted on the wrong gate (`test_strong`, `test_errors`,
+  `test_try_from`, the `Status` round trip that could not see `message`, the
+  RPC parcel fuzz target's binder claim, the abstract-socket
+  `stdout` fd test that took ownership of fd 1).
 - **rsbinder-aidl — an unqualified constant reference could resolve to an
   unrelated declaration's constant.** Interface constants were registered in a
   flat symbol table under their bare name, and that table was consulted before

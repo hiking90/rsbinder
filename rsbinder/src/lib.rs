@@ -325,6 +325,8 @@ pub fn sdk_at_least(version: u32) -> bool {
     get_android_sdk_version() >= version
 }
 
+/// Returns `true` when the runtime Android SDK version is at least `version`.
+/// On non-Android platforms this always returns `true`.
 #[cfg(not(target_os = "android"))]
 #[inline]
 pub fn sdk_at_least(_version: u32) -> bool {
