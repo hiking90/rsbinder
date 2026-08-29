@@ -26,5 +26,6 @@ rsbinder-macros/wip/
 example-hello/cpp/rpc_accessor_interop_launcher
 example-hello/cpp/rpc_accessor_register_interop_launcher
 example-hello/cpp/rpc_multiconn_interop_launcher
+example-hello/cpp/rpc_fd_interop_launcher
 example-hello/cpp/phasec_vintf_client
 example-hello/cpp/codegen_shapes_interop

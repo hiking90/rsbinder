@@ -91,6 +91,14 @@ required-features = ["rpc", "android_16"]
 name = "rpc_multiconn_interop_server"
 required-features = ["rpc"]
 
+# Plan 2-11 AC-11.3 STAGE3 — rsbinder side of the FD-over-RPC
+# real-libbinder gate. Pairs with cpp/rpc_fd_interop_launcher (a real
+# libbinder `ARpcSession` client with the `Unix` fd transport mode);
+# cpp/run_rpc_fd_interop.sh builds, pushes and runs both.
+[[bin]]
+name = "rpc_fd_interop_server"
+required-features = ["rpc"]
+
 # Shared-memory example (plans 4-7a/4-7b/Phase D). Kernel binder needs no
 # feature; pass `rpc` on the command line for the Unix-socket variant
 # (gated inside the binaries on the `rpc` feature):
