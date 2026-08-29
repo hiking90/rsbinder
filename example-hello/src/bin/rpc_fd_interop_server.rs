@@ -11,8 +11,8 @@
 //! client with `setFileDescriptorTransportMode(Unix)`) drives it via
 //! `cpp/run_rpc_fd_interop.sh`.
 //!
-//! Argv[1] = socket path (default `/data/local/tmp/rsfd.sock`);
-//! argv[2] = max RPC wire version offered (default 2; libbinder
+//! `argv[1]` = socket path (default `/data/local/tmp/rsfd.sock`);
+//! `argv[2]` = max RPC wire version offered (default 2; libbinder
 //! negotiates `min(its own, this)` — 1 on Android 15, 2 on Android 16).
 //! Transactions: 1=echo(String)->String, 2=fd_len(PFD)->i32,
 //! 3=give_fd()->PFD. No AIDL `Status` header, so the gate isolates the
