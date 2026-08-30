@@ -73,7 +73,8 @@ mod tests {
         _fd: Fd,
         device: &mut binder::binderfs_device,
     ) -> std::result::Result<(), rustix::io::Errno> {
-        let bytes: Vec<u8> = device.name.to_vec();
+        #[allow(clippy::unnecessary_cast)]
+        let bytes: Vec<u8> = device.name.iter().map(|&c| c as u8).collect();
         let nul = bytes
             .iter()
             .position(|&b| b == 0)
