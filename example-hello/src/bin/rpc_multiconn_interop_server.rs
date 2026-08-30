@@ -45,7 +45,7 @@
 //! just exposes the transactions and lets the genuine peer drive them.
 
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rsbinder::rpc::{RpcProxy, RpcServer};
@@ -64,8 +64,16 @@ const TX_SLOW_ECHO: TransactionCode = FIRST_CALL_TRANSACTION + 1;
 const TX_ONEWAY: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 const TX_GET_LOG: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_INVOKE_CALLBACK: TransactionCode = FIRST_CALL_TRANSACTION + 4;
-/// The callback's `on_transact` code on the C launcher side.
+/// `(cb: IBinder, s: String)` — park `cb` and, from a thread that is
+/// inside no handler, call `cb.echo(s)` (twoway) then `cb.notify()`
+/// (oneway) ~150 ms later (plan 2-20 gate (d)).
+const TX_SCHEDULE_CALLBACK: TransactionCode = FIRST_CALL_TRANSACTION + 5;
+/// `() -> String` — outcome of the scheduled callback: `pending`,
+/// `ok:<reply>` or `err:<StatusCode>`.
+const TX_GET_SCHED: TransactionCode = FIRST_CALL_TRANSACTION + 6;
+/// The callback's `on_transact` codes on the C launcher side.
 const TX_CALLBACK_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
+const TX_CALLBACK_NOTIFY: TransactionCode = FIRST_CALL_TRANSACTION + 1; // oneway
 
 struct MultiConn {
     /// Oneway log — every `TX_ONEWAY(i)` appends `i` here, in receipt
@@ -79,6 +87,9 @@ struct MultiConn {
     /// observable via `TX_GET_LOG`'s negative-index probe shouldn't be
     /// needed — overlap is decided by wall-clock at the launcher).
     in_flight: AtomicI32,
+    /// Outcome of the `TX_SCHEDULE_CALLBACK` thread (gate (d)); shared
+    /// with that thread.
+    sched: Arc<Mutex<Option<String>>>,
 }
 
 impl Interface for MultiConn {}
@@ -151,6 +162,56 @@ impl Remotable for MultiConn {
                 reply.write(&Status::from(StatusCode::Ok))?;
                 reply.write(&cb_reply)
             }
+            TX_SCHEDULE_CALLBACK => {
+                // Gate (d): the callback is driven **outside** this
+                // handler, from a plain thread. That send needs a slot the
+                // server may claim on its own — the client's incoming
+                // connection (`setMaxIncomingThreads(1)`), admitted as a
+                // callback slot. Without one it fails at once.
+                let cb: SIBinder = reader.read()?;
+                let s: String = reader.read()?;
+                *self.sched.lock().expect("sched poisoned") = None;
+                let sched = Arc::clone(&self.sched);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    let outcome = (|| -> Result<String> {
+                        let rp = (*cb)
+                            .as_any()
+                            .downcast_ref::<RpcProxy>()
+                            .ok_or(StatusCode::BadType)?;
+                        let mut d = rp.build_request(CALLBACK_DESC)?;
+                        d.write(&s)?;
+                        let mut r = rp
+                            .transact(TX_CALLBACK_ECHO, &d, 0)?
+                            .ok_or(StatusCode::UnexpectedNull)?;
+                        let st: Status = r.read()?;
+                        if !st.is_ok() {
+                            return Err(StatusCode::from(st));
+                        }
+                        let echoed: String = r.read()?;
+                        let d2 = rp.build_request(CALLBACK_DESC)?;
+                        rp.transact(TX_CALLBACK_NOTIFY, &d2, rsbinder::FLAG_ONEWAY)?;
+                        Ok(echoed)
+                    })();
+                    let text = match outcome {
+                        Ok(s) => format!("ok:{s}"),
+                        Err(e) => format!("err:{e:?}"),
+                    };
+                    eprintln!("[rsbinder-server] scheduled callback outside a handler: {text}");
+                    *sched.lock().expect("sched poisoned") = Some(text);
+                });
+                reply.write(&Status::from(StatusCode::Ok))
+            }
+            TX_GET_SCHED => {
+                let text = self
+                    .sched
+                    .lock()
+                    .expect("sched poisoned")
+                    .clone()
+                    .unwrap_or_else(|| "pending".to_string());
+                reply.write(&Status::from(StatusCode::Ok))?;
+                reply.write(&text)
+            }
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
@@ -191,6 +252,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     server.set_root(Interface::as_binder(&Binder::new(MultiConn {
         oneway_log: Mutex::new(Vec::new()),
         in_flight: AtomicI32::new(0),
+        sched: Arc::new(Mutex::new(None)),
     })));
 
     println!("[rsbinder-server] READY v2 max_threads={max_threads} on {sock}");

@@ -108,7 +108,15 @@ constexpr transaction_code_t TX_SLOW_ECHO = FIRST_CALL_TRANSACTION + 1;
 constexpr transaction_code_t TX_ONEWAY = FIRST_CALL_TRANSACTION + 2;
 constexpr transaction_code_t TX_GET_LOG = FIRST_CALL_TRANSACTION + 3;
 constexpr transaction_code_t TX_INVOKE_CALLBACK = FIRST_CALL_TRANSACTION + 4;
+constexpr transaction_code_t TX_SCHEDULE_CALLBACK = FIRST_CALL_TRANSACTION + 5;
+constexpr transaction_code_t TX_GET_SCHED = FIRST_CALL_TRANSACTION + 6;
 constexpr transaction_code_t TX_CALLBACK_ECHO = FIRST_CALL_TRANSACTION + 0;
+constexpr transaction_code_t TX_CALLBACK_NOTIFY = FIRST_CALL_TRANSACTION + 1; // oneway
+
+// Gate (d) observers: what the server's out-of-handler thread delivered
+// to our callback (dispatched on the libbinder incoming thread).
+std::atomic<int> g_cb_echo_seen{0};
+std::atomic<int> g_cb_notify_seen{0};
 
 // --- AParcel string allocator (std::string sink) -----------------
 bool read_string_into(void* opaque, int32_t length, char** outBuf) {
@@ -190,9 +198,16 @@ struct AStatusOwned {
 // convention). The NDK dispatches that to our `on_transact` here.
 binder_status_t callback_on_transact(AIBinder* /*binder*/, transaction_code_t code,
                                      const AParcel* in, AParcel* out) {
+    if (code == TX_CALLBACK_NOTIFY) {
+        // oneway from the server's out-of-handler thread (gate (d)).
+        g_cb_notify_seen.fetch_add(1);
+        fprintf(stderr, "[cpp-cb] notify (oneway) received\n");
+        return STATUS_OK;
+    }
     if (code != TX_CALLBACK_ECHO) {
         return STATUS_UNKNOWN_TRANSACTION;
     }
+    g_cb_echo_seen.fetch_add(1);
     std::string s;
     binder_status_t rc = AParcel_readString(in, &s, read_string_into);
     if (rc != STATUS_OK) {
@@ -338,6 +353,45 @@ bool do_invoke_callback(AIBinder* root, AIBinder* cb, const char* arg,
     rc = AParcel_readString(out.p, out_reply, read_string_into);
     if (rc != STATUS_OK) return false;
     if (!out_reply->empty() && out_reply->back() == '\0') out_reply->pop_back();
+    return true;
+}
+
+// Gate (d): `TX_SCHEDULE_CALLBACK(cb, arg)` returns at once; the server
+// drives `cb` later from a thread inside no handler.
+bool do_schedule_callback(AIBinder* root, AIBinder* cb, const char* arg) {
+    InParcel in;
+    binder_status_t rc = AIBinder_prepareTransaction(root, &in.p);
+    if (rc != STATUS_OK) return false;
+    rc = AParcel_writeStrongBinder(in.p, cb);
+    if (rc != STATUS_OK) return false;
+    rc = AParcel_writeString(in.p, arg, (int32_t)strlen(arg));
+    if (rc != STATUS_OK) return false;
+    OutParcel out;
+    rc = AIBinder_transact(root, TX_SCHEDULE_CALLBACK, &in.p, &out.p, 0);
+    in.p = nullptr;
+    if (rc != STATUS_OK) {
+        fprintf(stderr, "[cpp-client] transact(schedule_callback): %d\n", rc);
+        return false;
+    }
+    AStatusOwned st;
+    rc = AParcel_readStatusHeader(out.p, &st.s);
+    return rc == STATUS_OK && AStatus_isOk(st.s);
+}
+
+bool do_get_sched(AIBinder* root, std::string* out_text) {
+    InParcel in;
+    binder_status_t rc = AIBinder_prepareTransaction(root, &in.p);
+    if (rc != STATUS_OK) return false;
+    OutParcel out;
+    rc = AIBinder_transact(root, TX_GET_SCHED, &in.p, &out.p, 0);
+    in.p = nullptr;
+    if (rc != STATUS_OK) return false;
+    AStatusOwned st;
+    rc = AParcel_readStatusHeader(out.p, &st.s);
+    if (rc != STATUS_OK || !AStatus_isOk(st.s)) return false;
+    rc = AParcel_readString(out.p, out_text, read_string_into);
+    if (rc != STATUS_OK) return false;
+    if (!out_text->empty() && out_text->back() == '\0') out_text->pop_back();
     return true;
 }
 
@@ -570,6 +624,53 @@ int main(int argc, char** argv) {
             }
         }
         fprintf(stderr, "[cpp-client] (c) PASS — %d parallel nested callbacks round-tripped\n", kN);
+
+        // ---- (d) Callback from OUTSIDE a handler (plan 2-20) --------
+        // The server parks `cb` and, ~150 ms later, calls it from a plain
+        // thread: twoway `echo("later")` then oneway `notify()`. Those
+        // sends need a connection the server may claim on its own — the
+        // incoming connection this client opened via
+        // `setMaxIncomingThreads(1)`, which the rsbinder server admitted
+        // as a callback slot. libbinder dispatches both on that
+        // connection's thread. We then read the server's own view of the
+        // outcome (`ok:cb-echo:later`).
+        fprintf(stderr, "[cpp-client] (d) callback outside a handler: TX_SCHEDULE_CALLBACK\n");
+        g_cb_echo_seen.store(0);
+        g_cb_notify_seen.store(0);
+        if (!do_schedule_callback(root, cb, "later")) {
+            fprintf(stderr, "[cpp-client] (d) FAIL: schedule_callback\n");
+            return 40;
+        }
+        int waited_ms = 0;
+        while ((g_cb_echo_seen.load() < 1 || g_cb_notify_seen.load() < 1) && waited_ms < 3000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            waited_ms += 20;
+        }
+        if (g_cb_echo_seen.load() < 1 || g_cb_notify_seen.load() < 1) {
+            fprintf(stderr,
+                    "[cpp-client] (d) FAIL: after %d ms echo_seen=%d notify_seen=%d\n",
+                    waited_ms, g_cb_echo_seen.load(), g_cb_notify_seen.load());
+            return 41;
+        }
+        std::string sched;
+        int polls = 0;
+        do {
+            if (!do_get_sched(root, &sched)) {
+                fprintf(stderr, "[cpp-client] (d) FAIL: get_sched\n");
+                return 42;
+            }
+            if (sched != "pending") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (++polls < 100);
+        if (sched != "ok:cb-echo:later") {
+            fprintf(stderr, "[cpp-client] (d) FAIL: server outcome \"%.*s\"\n",
+                    (int)sched.size(), sched.data());
+            return 43;
+        }
+        fprintf(stderr,
+                "[cpp-client] (d) PASS — twoway+oneway from a server thread outside any handler "
+                "(after %d ms)\n",
+                waited_ms);
     }
 
     printf("AC-12.6 PASS — multi-conn real-libbinder ↔ rsbinder full transact\n");

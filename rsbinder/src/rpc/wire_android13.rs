@@ -1102,6 +1102,34 @@ pub fn server_accept<S: Read + Write>(
     stream: &mut S,
     server_max_version: u32,
 ) -> RpcResult<(Android13PlusCodec, u8, Vec<u8>, bool)> {
+    let accepted = server_accept_deferred_init(stream, server_max_version)?;
+    if accepted.3 {
+        server_write_connection_init(stream, &accepted.0)?;
+    }
+    Ok(accepted)
+}
+
+/// The server's `"cci"` for an **incoming** (callback) attach —
+/// `addOutgoingConnection(init=true)` → `sendConnectionInit`. Split out
+/// of [`server_accept`] so the server can admit the connection (its
+/// callback-slot budget) *before* telling the client the attach is
+/// good: a client whose attach is refused then reads EOF instead of
+/// `"cci"` and gets an error, rather than a connection that is silently
+/// dead. On the wire the success path is byte-identical.
+pub fn server_write_connection_init<S: Write>(
+    stream: &mut S,
+    codec: &Android13PlusCodec,
+) -> RpcResult<()> {
+    write_all_raw(stream, &codec.encode_connection_init())
+}
+
+/// [`server_accept`] minus the incoming-direction `"cci"` write, which
+/// the caller owes via [`server_write_connection_init`] once it has
+/// admitted the connection.
+pub fn server_accept_deferred_init<S: Read + Write>(
+    stream: &mut S,
+    server_max_version: u32,
+) -> RpcResult<(Android13PlusCodec, u8, Vec<u8>, bool)> {
     // Fixed 16-byte header first, then the variable session id.
     let head = read_exact_raw(stream, A13_CONN_HEADER_LEN)?;
     let client_version = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
@@ -1143,16 +1171,15 @@ pub fn server_accept<S: Read + Write>(
             "new-session request set RPC_CONNECTION_OPTION_INCOMING",
         ));
     }
-    if incoming {
-        // attach + incoming: server-driven send of the init okay
-        // (`addOutgoingConnection(init=true)`).
-        write_all_raw(stream, &codec.encode_connection_init())?;
-    } else {
+    if !incoming {
         // outgoing-from-client (both new and attach): server reads the
         // client's init (`preJoinSetup` → `readConnectionInit`).
         let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
         codec.decode_connection_init(&init)?;
     }
+    // attach + incoming: the server-driven init okay
+    // (`addOutgoingConnection(init=true)`) is the caller's, after
+    // admission — see `server_write_connection_init`.
     Ok((codec, fd_mode, session_id, incoming))
 }
 

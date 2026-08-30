@@ -126,3 +126,99 @@ fn vsock_loopback_e2e() {
     server.shutdown();
     let _ = bg.join();
 }
+
+/// Plan 2-20 (`RpcTransport::shutdown`): a thread blocked in `recv_frame`
+/// on a vsock connection returns once `shutdown()` is called on the same
+/// transport — the primitive that ends a client's incoming-connection
+/// threads and any user `serve_blocking` on session death.
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn vsock_shutdown_wakes_blocked_recv() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vsock::VMADDR_CID_LOCAL;
+
+    let port = TEST_PORT + 1;
+    let server = RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, port).expect("setup_vsock_server");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    let bg = server.run_background();
+
+    let t: Arc<dyn RpcTransport> =
+        Arc::new(VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect"));
+    let reader = {
+        let t = Arc::clone(&t);
+        std::thread::spawn(move || t.recv_frame())
+    };
+    // Give the reader time to park in `recv`.
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    t.shutdown().expect("shutdown");
+    let got = reader.join().expect("reader thread");
+    assert!(
+        got.is_err(),
+        "recv must not return a frame after shutdown: {got:?}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "shutdown must wake the reader promptly: {:?}",
+        t0.elapsed()
+    );
+    server.shutdown();
+    let _ = bg.join();
+}
+
+/// Plan 2-20 (`RpcSession::shutdown` on a vsock session): a user
+/// `serve_blocking` thread ends, the death recipient fires, and the
+/// server sees the connection go — the whole teardown path over vsock.
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn vsock_session_shutdown_ends_serve_thread() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use vsock::VMADDR_CID_LOCAL;
+
+    struct Flag(mpsc::SyncSender<()>);
+    impl rsbinder::DeathRecipient for Flag {
+        fn binder_died(&self, _who: &rsbinder::WIBinder) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let port = TEST_PORT + 2;
+    let server = RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, port).expect("setup_vsock_server");
+    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+        PingSvc,
+    )))));
+    let bg = server.run_background();
+
+    let client_t = VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect");
+    let client = RpcSession::new(Box::new(client_t), rsbinder::rpc::AddressSpace::Initiator)
+        .expect("RpcSession::new");
+    let root = client.get_root().expect("get_root over vsock");
+    assert_eq!(ping_via(&root, "pre").unwrap(), "pong:pre");
+    let (tx, rx) = mpsc::sync_channel::<()>(1);
+    let flag: Arc<Flag> = Arc::new(Flag(tx));
+    root.link_to_death(Arc::downgrade(&flag) as _)
+        .expect("link_to_death");
+    let serving = client.clone();
+    let serve = std::thread::spawn(move || serving.serve_blocking());
+
+    std::thread::sleep(Duration::from_millis(200));
+    client.shutdown();
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "shutdown must fire the linked recipient"
+    );
+    let _ = serve.join().expect("serve thread joins after shutdown");
+    assert!(
+        ping_via(&root, "post").is_err(),
+        "the session is dead after shutdown"
+    );
+    drop(root);
+    drop(client);
+    server.shutdown();
+    server.join_workers();
+    let _ = bg.join();
+}

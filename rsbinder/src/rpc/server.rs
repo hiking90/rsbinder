@@ -672,6 +672,11 @@ impl RpcServer {
     ///    attach attempts past `n` with `rejected_unknown_id` —
     ///    AOSP-faithful `setMaxIncomingThreads` (`RpcServer.cpp`
     ///    `session->setMaxIncomingThreads(server->mMaxThreads)`).
+    ///    Callback connections — the ones a client opens with
+    ///    `ARpcSession_setMaxIncomingThreads` / rsbinder's client-side
+    ///    incoming connections, on which this server *sends* — are
+    ///    budgeted separately at `2 * n` per session; served slots do
+    ///    not count against that budget.
     ///
     /// Distinct from [`set_max_connections`](RpcServer::set_max_connections),
     /// which caps *concurrent connection-worker threads*
@@ -765,6 +770,12 @@ impl RpcServer {
     /// legitimately reads a large reply slower than `d` is also dropped
     /// mid-send (the connection is torn down, not desynced). Size `d`
     /// against the slowest acceptable consumer, not just the idle gap.
+    ///
+    /// Callback connections (a client's incoming attaches, which this
+    /// server only ever *sends* on) are exempt: they have no serve loop,
+    /// and a sticky deadline there would cut short the server's own
+    /// reply wait on a callback issued outside a handler. Only the
+    /// session reply deadline bounds those sends.
     pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) {
         *self.idle_timeout.lock().expect("idle_timeout poisoned") = timeout;
     }
@@ -1229,11 +1240,24 @@ impl RpcServer {
                 // serve-phase deadline — `None` (default, unbounded idle) or
                 // the configured `set_idle_timeout` so a post-handshake
                 // silent peer is evicted instead of pinning its slot.
-                server.arm_serve_timeouts(transport.as_ref());
                 if incoming {
                     // Attach + incoming (`server_accept` already
                     // rejected new + incoming): resolve the session,
                     // register a callback slot, and exit the worker.
+                    //
+                    // A callback slot is never served, so the serve-phase
+                    // idle deadline must NOT be armed on it: `SO_RCVTIMEO`
+                    // is sticky, and the server's own reply wait on this
+                    // slot (a callback issued outside any handler) would
+                    // otherwise be cut short by `set_idle_timeout`. Lift
+                    // the handshake deadline instead — only the session
+                    // reply deadline bounds sends on this slot.
+                    if let Err(e) = transport.set_read_timeout(None) {
+                        log::debug!("RPC: failed to clear callback-slot read timeout: {e:?}");
+                    }
+                    if let Err(e) = transport.set_write_timeout(None) {
+                        log::debug!("RPC: failed to clear callback-slot write timeout: {e:?}");
+                    }
                     // The slot lives in the pool for server→client
                     // sends; there is no read loop because
                     // client→server traffic only uses outgoing
@@ -1273,9 +1297,10 @@ impl RpcServer {
                             // pool (and its held fds) without bound. AOSP opens
                             // symmetric incoming+outgoing connections (each
                             // bounded by the negotiated max-threads), so cap the
-                            // shared pool at `2 * max_threads` — tight enough to
-                            // bound the DoS, loose enough never to refuse a
-                            // well-behaved client's callback connections.
+                            // callback slots at `2 * max_threads` (served slots
+                            // are not counted) — tight enough to bound the DoS,
+                            // loose enough never to refuse a well-behaved
+                            // client's callback connections.
                             //
                             // The cap is enforced atomically inside
                             // `add_callback_slot` (check-and-push under the
@@ -1285,7 +1310,9 @@ impl RpcServer {
                             let incoming_cap =
                                 (inner.max_threads_value() as usize).saturating_mul(2);
                             let session = RpcSession::wrap_inner(inner);
-                            if let Err(e) = session.add_callback_slot(transport, incoming_cap) {
+                            if let Err(e) =
+                                session.add_callback_slot_and_init(transport, incoming_cap, &codec)
+                            {
                                 server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                                 log::warn!(
                                     "android-13+ RPC: incoming callback attach refused \
@@ -1305,6 +1332,7 @@ impl RpcServer {
                     }
                     return;
                 }
+                server.arm_serve_timeouts(transport.as_ref());
                 if client_id.is_empty() {
                     // New session: mint, register, serve. Registry
                     // entry is `Weak`; reclaimed by the next

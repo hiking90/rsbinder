@@ -108,6 +108,15 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
+    /// Shut the connection down in both directions so a thread blocked in
+    /// [`recv_frame`](Self::recv_frame) returns (`PeerClosed`) and later
+    /// sends fail. Used to end a client's incoming-connection threads on
+    /// session death / `RpcSession::shutdown`. Best-effort; the default
+    /// does nothing, for a transport that cannot be interrupted.
+    fn shutdown(&self) -> RpcResult<()> {
+        Ok(())
+    }
+
     /// Send one frame plus passed file descriptors out-of-band (opt-in
     /// `FileDescriptorTransportMode::Unix`).
     ///

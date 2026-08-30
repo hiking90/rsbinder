@@ -25,6 +25,12 @@ pub struct ClientOptions {
     /// RPC (android13plus profile, `unix`/`unix-abstract`): number of
     /// outgoing connections to open (AOSP `setupClient` fan-out).
     pub outgoing_connections: Option<u32>,
+    /// RPC, android-13+ profile, Unix sockets only: number of incoming
+    /// (callback) connections to open — AOSP `setMaxIncomingThreads`.
+    /// Needed for the server to call this client's callbacks from
+    /// outside a handler; see
+    /// [`RpcUnixClientConfig::incoming_connections`](crate::rpc::RpcUnixClientConfig::incoming_connections).
+    pub incoming_connections: Option<u32>,
     /// RPC: FD transport mode to negotiate. Requesting
     /// [`FileDescriptorTransportMode::Unix`](crate::rpc::FileDescriptorTransportMode)
     /// is rejected on a transport that cannot carry fds — see
@@ -69,7 +75,8 @@ impl std::fmt::Debug for ClientOptions {
         d.field("tls", &self.tls.is_some())
             .field("tls_server_name", &self.tls_server_name);
         d.field("session_id", &self.session_id.as_ref().map(|v| v.len()))
-            .field("outgoing_connections", &self.outgoing_connections);
+            .field("outgoing_connections", &self.outgoing_connections)
+            .field("incoming_connections", &self.incoming_connections);
         #[cfg(feature = "rpc")]
         d.field("fd_mode", &self.fd_mode);
         d.field("timeout", &self.timeout)
@@ -100,8 +107,14 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
     };
     match &uri.endpoint {
         Endpoint::Kernel { driver, threads } => {
-            if o.session_id.is_some() || o.outgoing_connections.is_some() || o.timeout.is_some() {
-                return Err(reject("session_id/outgoing_connections/timeout"));
+            if o.session_id.is_some()
+                || o.outgoing_connections.is_some()
+                || o.incoming_connections.is_some()
+                || o.timeout.is_some()
+            {
+                return Err(reject(
+                    "session_id/outgoing_connections/incoming_connections/timeout",
+                ));
             }
             #[cfg(feature = "rpc")]
             if o.fd_mode.is_some() {
@@ -166,17 +179,19 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
 
     let versioned = uri.wire_max_version;
     let fan_out = o.outgoing_connections.unwrap_or(1);
-    if versioned.is_none() && (o.session_id.is_some() || fan_out > 1) {
+    let incoming = o.incoming_connections.unwrap_or(0);
+    if versioned.is_none() && (o.session_id.is_some() || fan_out > 1 || incoming > 0) {
         log::error!(
-            "rsbinder::Client::open: session_id/outgoing_connections need \
-             `?profile=android13plus` ({:?})",
+            "rsbinder::Client::open: session_id/outgoing_connections/incoming_connections \
+             need `?profile=android13plus` ({:?})",
             uri.endpoint
         );
         return Err(StatusCode::BadValue);
     }
 
-    // The unix fan-out path has its own multi-connection setup.
-    if let (Some(v), true) = (versioned, fan_out > 1) {
+    // The unix fan-out / incoming-connection path has its own
+    // multi-connection setup.
+    if let (Some(v), true) = (versioned, fan_out > 1 || incoming > 0) {
         let mut cfg = match &uri.endpoint {
             Endpoint::Unix(path) => crate::rpc::RpcUnixClientConfig::path(path, v),
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -184,11 +199,15 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
                 crate::rpc::RpcUnixClientConfig::abstract_name(name.as_slice(), v)
             }
             _ => {
-                log::error!("rsbinder::Client::open: outgoing_connections > 1 is unix-only");
+                log::error!(
+                    "rsbinder::Client::open: outgoing_connections > 1 / incoming_connections \
+                     are unix-only"
+                );
                 return Err(StatusCode::BadValue);
             }
         }
-        .outgoing_connections(fan_out);
+        .outgoing_connections(fan_out)
+        .incoming_connections(incoming);
         if let Some(m) = o.fd_mode {
             cfg = cfg.fd_mode(m);
         }

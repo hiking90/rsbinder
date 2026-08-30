@@ -131,4 +131,9 @@ impl RpcTransport for VsockTransport {
         self.stream.set_write_timeout(timeout)?;
         Ok(())
     }
+
+    fn shutdown(&self) -> RpcResult<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
 }
