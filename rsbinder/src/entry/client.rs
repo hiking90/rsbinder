@@ -29,7 +29,15 @@ pub struct ClientOptions {
     /// (callback) connections to open — AOSP `setMaxIncomingThreads`.
     /// Needed for the server to call this client's callbacks from
     /// outside a handler; see
-    /// [`RpcUnixClientConfig::incoming_connections`](crate::rpc::RpcUnixClientConfig::incoming_connections).
+    // The target only exists with `rpc`, so only link it then.
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "[`RpcUnixClientConfig::incoming_connections`](crate::rpc::RpcUnixClientConfig::incoming_connections)."
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "`RpcUnixClientConfig::incoming_connections` (`rpc` feature)."
+    )]
     pub incoming_connections: Option<u32>,
     /// RPC: FD transport mode to negotiate. Requesting
     /// [`FileDescriptorTransportMode::Unix`](crate::rpc::FileDescriptorTransportMode)
