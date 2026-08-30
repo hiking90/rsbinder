@@ -282,6 +282,12 @@ impl IBinder for RpcProxy {
     /// connection runs the same death sequence (obituaries + local
     /// object release) — a documented rsbinder model property, faithful
     /// to AOSP's incoming-thread requirement.
+    ///
+    /// A client built with
+    /// [`RpcUnixClientConfig::incoming_connections`](super::session::RpcUnixClientConfig::incoming_connections)
+    /// `≥ 1` *is* served — by the threads on its incoming (callback)
+    /// connections — so it observes the drop at once (AOSP
+    /// `onSessionAllIncomingThreadsEnded`) with no serve loop of its own.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).

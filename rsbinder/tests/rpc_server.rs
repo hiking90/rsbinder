@@ -11,8 +11,8 @@
 #![cfg(feature = "rpc")]
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rsbinder::rpc::{RpcProxy, RpcServer, RpcSession, RpcUnixClientConfig};
 use rsbinder::{
@@ -26,6 +26,7 @@ const TX_BUMP: TransactionCode = FIRST_CALL_TRANSACTION + 1; // oneway
 const TX_COUNT: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 const TX_SLOW: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_ROUNDTRIP: TransactionCode = FIRST_CALL_TRANSACTION + 4; // nested
+const TX_HOLD_CB: TransactionCode = FIRST_CALL_TRANSACTION + 5; // store a callback for later
 
 trait IEcho2: Interface {
     fn echo(&self, s: &str) -> Result<String>;
@@ -35,6 +36,9 @@ trait IEcho2: Interface {
     /// Server calls `cb.echo("ping")` and returns its result
     /// (exercises a server→client nested callback).
     fn roundtrip(&self, cb: &SIBinder) -> Result<String>;
+    /// Server stores `cb`; a test then drives it from **outside** any
+    /// handler (plan 2-20).
+    fn hold(&self, cb: &SIBinder) -> Result<()>;
 }
 
 struct EchoSvc {
@@ -48,6 +52,8 @@ struct EchoSvc {
     /// fresh `AtomicBool` and ignore it. Set is one-way (no reset) —
     /// "at least one slow call entered" is the only signal needed.
     slow_entered: Arc<AtomicBool>,
+    /// Callback parked by `hold()` for out-of-handler use.
+    held: Arc<Mutex<Option<SIBinder>>>,
 }
 impl Interface for EchoSvc {}
 impl IEcho2 for EchoSvc {
@@ -81,6 +87,10 @@ impl IEcho2 for EchoSvc {
         let got: String = r.read()?;
         let _ = self.deeper;
         Ok(format!("rt:{got}"))
+    }
+    fn hold(&self, cb: &SIBinder) -> Result<()> {
+        *self.held.lock().unwrap() = Some(cb.clone());
+        Ok(())
     }
 }
 
@@ -117,6 +127,13 @@ fn echo_on_transact(
         TX_ROUNDTRIP => {
             let cb: SIBinder = reader.read()?;
             ok_str(reply, s.roundtrip(&cb))
+        }
+        TX_HOLD_CB => {
+            let cb: SIBinder = reader.read()?;
+            match s.hold(&cb) {
+                Ok(()) => reply.write(&Status::from(StatusCode::Ok)),
+                Err(e) => reply.write(&Status::from(e)),
+            }
         }
         _ => Err(StatusCode::UnknownTransaction),
     }
@@ -175,6 +192,17 @@ fn make_service_with_slow_signal(
         counter,
         deeper: false,
         slow_entered,
+        held: Arc::new(Mutex::new(None)),
+    }))))
+}
+/// Build an `EchoSvc` whose `hold()` parks the callback in `held`, so a
+/// test can drive that proxy from a thread that is inside no handler.
+fn make_service_with_hold(counter: Arc<AtomicI64>, held: Arc<Mutex<Option<SIBinder>>>) -> SIBinder {
+    Interface::as_binder(&Binder::new(BnEcho2(Box::new(EchoSvc {
+        counter,
+        deeper: false,
+        slow_entered: Arc::new(AtomicBool::new(false)),
+        held,
     }))))
 }
 
@@ -231,6 +259,15 @@ impl EchoProxy {
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
+    }
+    fn hold(&self, cb: &SIBinder) -> Result<()> {
+        let mut d = self.rp().build_request(DESC)?;
+        d.write(cb)?;
+        let mut r = self
+            .rp()
+            .transact(TX_HOLD_CB, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        read_status(&mut r)
     }
 }
 
@@ -2541,5 +2578,682 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
         let root = EchoProxy(client.get_root().expect("get_root (authorized)"));
         assert_eq!(root.echo("authorized").unwrap(), "authorized");
         // _cu (scope-end) handles teardown.
+    }
+}
+
+// ---- plan 2-20 Phase A: slot roles + fast-fail --------------------------
+
+/// Boot a server whose `hold()` parks the client callback in `held`, connect
+/// one r34 client, and hand the parked proxy back — the server side of a
+/// callback the server may later drive from outside any handler.
+struct HeldSetup {
+    client: RpcSession,
+    root: EchoProxy,
+    /// The client's local callback object (an `EchoSvc` by default, so
+    /// `TX_ECHO` / `TX_BUMP` / `TX_SLOW` answer on it).
+    cb: SIBinder,
+    /// `cb`'s `bump()` counter (oneway delivery check).
+    cb_counter: Arc<AtomicI64>,
+    /// The server's proxy to `cb`, taken out of `held` (`Option` so a test
+    /// can `take()` it — a `Drop` type cannot be moved out of).
+    server_cb: Option<SIBinder>,
+    held: Arc<Mutex<Option<SIBinder>>>,
+    /// The server's root as a *local* binder (for handing back to the
+    /// client inside a callback).
+    root_local: SIBinder,
+    server: Arc<RpcServer>,
+    /// Last field on purpose: fields drop in declaration order, and
+    /// `ServeCleanup::drop` joins the worker serving `client`'s connection —
+    /// it can only return once `client` and the proxies are gone.
+    _cu: ServeCleanup,
+}
+/// `HeldSetup::drop` runs before its fields drop: stop the client's
+/// incoming-connection threads first, or `ServeCleanup::join_workers`
+/// would wait on a founding connection those threads keep open.
+impl Drop for HeldSetup {
+    fn drop(&mut self) {
+        self.client.shutdown();
+    }
+}
+/// Everything `boot_held_cfg` can vary.
+struct HeldCfg {
+    /// android-13+ profile (needed for any multi-connection option).
+    a13: bool,
+    incoming: u32,
+    fan_out: u32,
+    max_threads: u32,
+    /// Custom callback object; default an `EchoSvc`.
+    cb: Option<SIBinder>,
+}
+impl Default for HeldCfg {
+    fn default() -> Self {
+        Self {
+            a13: false,
+            incoming: 0,
+            fan_out: 1,
+            max_threads: 1,
+            cb: None,
+        }
+    }
+}
+fn boot_held(tag: &str) -> HeldSetup {
+    boot_held_cfg(tag, HeldCfg::default())
+}
+fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
+    let path = tmp_sock(tag);
+    let held = Arc::new(Mutex::new(None));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    if cfg.a13 {
+        server.set_android13plus(2);
+    }
+    server.set_max_threads(cfg.max_threads);
+    let root_local = make_service_with_hold(Arc::new(AtomicI64::new(0)), Arc::clone(&held));
+    server.set_root(root_local.clone());
+    let bg = server.run_background();
+    let cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+    let client = if cfg.a13 {
+        RpcSession::setup_unix_client_android13plus_with_config(
+            RpcUnixClientConfig::path(&path, 2)
+                .outgoing_connections(cfg.fan_out)
+                .incoming_connections(cfg.incoming),
+        )
+        .expect("connect android13plus")
+    } else {
+        RpcSession::setup_unix_client(&path).expect("connect")
+    };
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    let cb_counter = Arc::new(AtomicI64::new(0));
+    let cb = cfg
+        .cb
+        .unwrap_or_else(|| make_service(Arc::clone(&cb_counter)));
+    root.hold(&cb).expect("hold");
+    let server_cb = held
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server parked the callback");
+    HeldSetup {
+        client,
+        root,
+        cb,
+        cb_counter,
+        server_cb: Some(server_cb),
+        held,
+        root_local,
+        server,
+        _cu: cu,
+    }
+}
+impl HeldSetup {
+    fn cb_proxy(&self) -> SIBinder {
+        self.server_cb.clone().expect("server callback proxy")
+    }
+}
+fn rpc_of(b: &SIBinder) -> &RpcProxy {
+    (**b).as_any().downcast_ref::<RpcProxy>().expect("RpcProxy")
+}
+/// `TX_SLOW` on a proxy.
+fn drive_slow(cb: &SIBinder, ms: i32) -> Result<()> {
+    let rp = rpc_of(cb);
+    let mut d = rp.build_request(DESC)?;
+    d.write(&ms)?;
+    let mut r = rp
+        .transact(TX_SLOW, &d, 0)?
+        .ok_or(StatusCode::UnexpectedNull)?;
+    read_status(&mut r)
+}
+/// `TX_ROUNDTRIP` on a proxy, handing it `target`: the callee calls
+/// `target.echo("ping")` back (a nested call from inside the callback).
+fn drive_roundtrip(cb: &SIBinder, target: &SIBinder) -> Result<String> {
+    let rp = rpc_of(cb);
+    let mut d = rp.build_request(DESC)?;
+    d.write(target)?;
+    let mut r = rp
+        .transact(TX_ROUNDTRIP, &d, 0)?
+        .ok_or(StatusCode::UnexpectedNull)?;
+    read_status(&mut r)?;
+    r.read::<String>()
+}
+/// Drive `cb` (a proxy) with `TX_ECHO` (twoway) or `TX_BUMP` (oneway).
+fn drive(cb: &SIBinder, oneway: bool) -> Result<()> {
+    let rp = (**cb)
+        .as_any()
+        .downcast_ref::<RpcProxy>()
+        .expect("RpcProxy");
+    let mut d = rp.build_request(DESC)?;
+    if oneway {
+        rp.transact(TX_BUMP, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+    } else {
+        d.write(&"x")?;
+        let mut r = rp
+            .transact(TX_ECHO, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        read_status(&mut r)?;
+        let got: String = r.read()?;
+        assert_eq!(got, "x");
+        Ok(())
+    }
+}
+
+/// AC-20.1 — the client opened no incoming connection, so the server has no
+/// `Outgoing` slot: a call on the parked proxy from a thread inside no handler
+/// must fail **at once** (AOSP `WOULD_BLOCK`), not block until a deadline that
+/// was never set. The served slot is untouched: the client's next calls and a
+/// nested callback (`roundtrip`) still work.
+#[test]
+fn a_outside_handler_call_without_outgoing_slot_fails_fast() {
+    let h = boot_held("a_fastfail");
+    for oneway in [false, true] {
+        let t0 = Instant::now();
+        let r = drive(&h.cb_proxy(), oneway);
+        assert!(
+            matches!(r, Err(StatusCode::FailedTransaction)),
+            "oneway={oneway}: expected FailedTransaction, got {r:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "oneway={oneway}: must fail immediately, took {:?}",
+            t0.elapsed()
+        );
+    }
+    assert_eq!(h.root.echo("still in sync").unwrap(), "still in sync");
+    assert_eq!(h.root.roundtrip(&h.cb).unwrap(), "rt:ping");
+}
+
+/// AC-20.9 — the served slot is momentarily free between two messages of the
+/// worker's loop. Before the role split a non-nested call could claim it in
+/// that window and write a transaction the idle client would never read. Now
+/// every out-of-handler attempt is refused while the client hammers the same
+/// connection, and the wire stays in sync.
+#[test]
+fn a_served_slot_never_taken_by_outside_transact() {
+    let h = boot_held("a_theft");
+    let stop = Arc::new(AtomicBool::new(false));
+    let hammer = {
+        let root = EchoProxy(h.client.get_root().expect("root"));
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let s = format!("m{n}");
+                assert_eq!(root.echo(&s).expect("echo under contention"), s);
+                n += 1;
+            }
+            n
+        })
+    };
+    let mut refused = 0;
+    for i in 0..200 {
+        match drive(&h.cb_proxy(), i % 2 == 1) {
+            Err(StatusCode::FailedTransaction) => refused += 1,
+            other => panic!("attempt {i}: expected FailedTransaction, got {other:?}"),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let echoed = hammer.join().expect("hammer thread");
+    assert_eq!(refused, 200);
+    assert!(echoed > 0, "the client thread must have made progress");
+    assert_eq!(h.root.echo("after").unwrap(), "after");
+}
+
+/// AC-20.10 — dropping the parked proxy from a thread inside no handler
+/// must neither block that thread nor desync the wire. The `DEC_STRONG` it
+/// queues has no reply, so it is allowed to ride the served slot (AOSP would
+/// refuse with `WOULD_BLOCK`); but that slot is only free between two of the
+/// worker's messages, so *when* it goes out is best-effort — the node is
+/// released at the latest at session end, and promptly once the client has
+/// an incoming connection (plan 2-20 Phase B). What this gate pins is the
+/// safety property, not the timing.
+#[test]
+fn a_dec_strong_outside_handler_does_not_block_or_desync() {
+    let h = boot_held("a_dec");
+    assert_eq!(
+        h.client.local_node_count(),
+        1,
+        "the parked callback is the one local node"
+    );
+    let held = Arc::clone(&h.held);
+    let mut h = h;
+    drop(h.server_cb.take());
+    let t0 = Instant::now();
+    std::thread::spawn(move || {
+        *held.lock().unwrap() = None;
+    })
+    .join()
+    .expect("drop thread");
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "dropping a proxy outside a handler must not block: {:?}",
+        t0.elapsed()
+    );
+    // The wire on the served slot is intact whether or not the deferred DEC
+    // has gone out yet.
+    for i in 0..20 {
+        let s = format!("tick{i}");
+        assert_eq!(h.root.echo(&s).unwrap(), s);
+    }
+    assert_eq!(h.root.roundtrip(&h.cb).unwrap(), "rt:ping");
+}
+
+// ---- plan 2-20 Phase B/C: client incoming connections ------------------
+
+/// AC-20.2 — with one incoming connection the server reaches the client's
+/// callback from a thread inside no handler: twoway returns, oneway lands.
+/// Also with an outgoing fan-out alongside (AOSP `setupClient` order).
+#[test]
+fn b_outside_handler_callback_completes() {
+    for (fan_out, max_threads) in [(1, 1), (2, 2)] {
+        let h = boot_held_cfg(
+            &format!("b_complete{fan_out}"),
+            HeldCfg {
+                a13: true,
+                incoming: 1,
+                fan_out,
+                max_threads,
+                ..Default::default()
+            },
+        );
+        assert_eq!(h.client.__incoming_thread_count(), 1);
+        let cb = h.cb_proxy();
+        let worker = std::thread::spawn(move || (drive(&cb, false), drive(&cb, true)));
+        let (twoway, oneway) = worker.join().expect("worker");
+        assert_eq!(
+            twoway,
+            Ok(()),
+            "fan_out={fan_out}: twoway outside a handler"
+        );
+        assert_eq!(
+            oneway,
+            Ok(()),
+            "fan_out={fan_out}: oneway outside a handler"
+        );
+        let counter = Arc::clone(&h.cb_counter);
+        assert!(
+            poll_until(|| counter.load(Ordering::SeqCst) == 1),
+            "fan_out={fan_out}: the oneway never reached the callback"
+        );
+        // The served connection is untouched by all of that.
+        assert_eq!(h.root.echo("still").unwrap(), "still");
+        assert_eq!(h.root.roundtrip(&h.cb).unwrap(), "rt:ping");
+    }
+}
+
+/// AC-20.3 — many server threads at once: one incoming connection
+/// serialises them (all succeed); two run them in parallel.
+#[test]
+fn b_outside_handler_parallel_callbacks() {
+    let h = boot_held_cfg(
+        "b_par1",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            ..Default::default()
+        },
+    );
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let cb = h.cb_proxy();
+            std::thread::spawn(move || (0..3).map(|_| drive(&cb, false)).collect::<Vec<_>>())
+        })
+        .collect();
+    for w in workers {
+        for r in w.join().expect("worker") {
+            assert_eq!(r, Ok(()));
+        }
+    }
+    // Serial on one slot: two 300 ms calls take ≥ 600 ms …
+    let t0 = Instant::now();
+    let a = {
+        let cb = h.cb_proxy();
+        std::thread::spawn(move || drive_slow(&cb, 300))
+    };
+    let b = {
+        let cb = h.cb_proxy();
+        std::thread::spawn(move || drive_slow(&cb, 300))
+    };
+    assert_eq!(a.join().unwrap(), Ok(()));
+    assert_eq!(b.join().unwrap(), Ok(()));
+    assert!(
+        t0.elapsed() >= Duration::from_millis(600),
+        "one incoming connection must serialise: {:?}",
+        t0.elapsed()
+    );
+    drop(h);
+    // … and in parallel on two (the default server budget is 2 × max_threads).
+    let h = boot_held_cfg(
+        "b_par2",
+        HeldCfg {
+            a13: true,
+            incoming: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(h.client.__slot_count(), 3);
+    let t0 = Instant::now();
+    let a = {
+        let cb = h.cb_proxy();
+        std::thread::spawn(move || drive_slow(&cb, 300))
+    };
+    let b = {
+        let cb = h.cb_proxy();
+        std::thread::spawn(move || drive_slow(&cb, 300))
+    };
+    assert_eq!(a.join().unwrap(), Ok(()));
+    assert_eq!(b.join().unwrap(), Ok(()));
+    assert!(
+        t0.elapsed() < Duration::from_millis(550),
+        "two incoming connections must run in parallel: {:?}",
+        t0.elapsed()
+    );
+}
+
+/// AC-20.4 — the callback's handler (on the client's incoming thread) calls
+/// the server back; that nested call re-enters the incoming slot and the
+/// server answers it from its own reply wait.
+#[test]
+fn b_nested_call_from_callback_handler() {
+    let h = boot_held_cfg(
+        "b_nested",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            ..Default::default()
+        },
+    );
+    let cb = h.cb_proxy();
+    let root = h.root_local.clone();
+    let got = std::thread::spawn(move || drive_roundtrip(&cb, &root))
+        .join()
+        .expect("worker");
+    assert_eq!(got, Ok("rt:ping".to_string()));
+    assert_eq!(h.root.echo("after").unwrap(), "after");
+}
+
+/// Configuration rules: r34 has no session id (`BadType`); an attach
+/// (echoed id) gets neither fan-out nor incoming (`BadValue`); the manual
+/// attach helpers reject a config carrying the other option.
+#[test]
+fn b_incoming_config_validation() {
+    let h = boot_held_cfg(
+        "b_cfg",
+        HeldCfg {
+            a13: true,
+            ..Default::default()
+        },
+    );
+    let path = h.server.path().expect("unix path").to_path_buf();
+    let sid = h.client.get_session_id().expect("session id");
+    assert!(matches!(
+        RpcSession::setup_unix_client_android13plus_with_config(
+            RpcUnixClientConfig::path(&path, 2)
+                .session_id(&sid)
+                .incoming_connections(1)
+        ),
+        Err(StatusCode::BadValue)
+    ));
+    assert!(matches!(
+        h.client.add_outgoing_connection_android13plus_with_config(
+            RpcUnixClientConfig::path(&path, 2)
+                .session_id(&sid)
+                .incoming_connections(1)
+        ),
+        Err(StatusCode::BadValue)
+    ));
+    assert!(matches!(
+        h.client.add_incoming_connection_android13plus_with_config(
+            RpcUnixClientConfig::path(&path, 2)
+                .session_id(&sid)
+                .outgoing_connections(2)
+        ),
+        Err(StatusCode::BadValue)
+    ));
+    // Manual attach works and is served.
+    let slot = h
+        .client
+        .add_incoming_connection_android13plus_with_config(
+            RpcUnixClientConfig::path(&path, 2).session_id(&sid),
+        )
+        .expect("manual incoming attach");
+    assert!(slot > 1);
+    assert_eq!(h.client.__incoming_thread_count(), 1);
+    let cb = h.cb_proxy();
+    assert_eq!(
+        std::thread::spawn(move || drive(&cb, false))
+            .join()
+            .unwrap(),
+        Ok(())
+    );
+    // r34: no session id to echo.
+    let r34 = boot_held("b_cfg_r34");
+    assert!(matches!(
+        r34.client
+            .add_incoming_connection_android13plus_with_config(
+                RpcUnixClientConfig::path(&path, 2).session_id(&[7u8; 32])
+            ),
+        Err(StatusCode::BadType)
+    ));
+}
+
+/// The server budgets callback slots at `2 * max_threads`: a third
+/// incoming connection on a default server is refused (and the partially
+/// built session is dropped), two are admitted.
+#[test]
+fn b_incoming_over_server_cap_is_refused() {
+    let h = boot_held_cfg(
+        "b_cap",
+        HeldCfg {
+            a13: true,
+            incoming: 2,
+            ..Default::default()
+        },
+    );
+    let sid: [u8; 32] = h
+        .client
+        .get_session_id()
+        .expect("sid")
+        .as_slice()
+        .try_into()
+        .unwrap();
+    assert!(poll_until(|| h.server.session_slot_count(&sid) == Some(3)));
+    let path = h.server.path().expect("unix path").to_path_buf();
+    let r = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
+    );
+    assert!(
+        r.is_err(),
+        "third callback slot must be refused: {:?}",
+        r.map(|_| ())
+    );
+}
+
+/// The unified entry: `ClientOptions::incoming_connections` reaches the
+/// session; it needs the android-13+ profile.
+#[test]
+fn b_entry_client_open_with_incoming() {
+    let h = boot_held_cfg(
+        "b_entry",
+        HeldCfg {
+            a13: true,
+            ..Default::default()
+        },
+    );
+    let path = h.server.path().expect("unix path").to_path_buf();
+    let uri = format!("unix://{}?profile=android13plus", path.display());
+    let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
+        .expect("open with incoming");
+    let session = client.session().expect("rpc session");
+    assert_eq!(session.__slot_count(), 2);
+    assert_eq!(session.__incoming_thread_count(), 1);
+    session.shutdown();
+    let r34 = format!("unix://{}", path.display());
+    assert!(matches!(
+        rsbinder::Client::open_with(&r34, |o, _| o.incoming_connections = Some(1)).map(|_| ()),
+        Err(StatusCode::BadValue)
+    ));
+}
+
+/// AC-20.5 — a client with an incoming connection learns of the server's
+/// death from that connection dropping; one without learns only from its
+/// next failed call.
+#[test]
+fn c_server_death_is_eager_with_incoming() {
+    if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server.set_android13plus(2);
+        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        let _ = server.run(); // blocks until killed
+        std::process::exit(0);
+    }
+    let path = tmp_sock("c_death");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "c_server_death_is_eager_with_incoming",
+            "--nocapture",
+        ])
+        .env("RSB_RPC_DEATH_A13_SERVER", &path)
+        .spawn()
+        .expect("spawn server child");
+    wait_for_sock(&path);
+    let eager = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::path(&path, 2).incoming_connections(1),
+    )
+    .expect("eager client");
+    let lazy = RpcSession::setup_unix_client_android13plus(&path, 2).expect("lazy client");
+    let eager_root = eager.get_root().expect("root");
+    let lazy_root = lazy.get_root().expect("root");
+    let (tx_e, rx_e) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_l, rx_l) = std::sync::mpsc::sync_channel::<()>(1);
+    let flag_e: Arc<DeathFlag> = Arc::new(DeathFlag(tx_e));
+    let flag_l: Arc<DeathFlag> = Arc::new(DeathFlag(tx_l));
+    eager_root
+        .link_to_death(Arc::downgrade(&flag_e) as _)
+        .expect("link eager");
+    lazy_root
+        .link_to_death(Arc::downgrade(&flag_l) as _)
+        .expect("link lazy");
+    child.kill().expect("kill server child");
+    child.wait().expect("reap server child");
+    assert!(
+        rx_e.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "the incoming connection's drop must fire the obituary at once"
+    );
+    assert!(
+        rx_l.recv_timeout(Duration::from_millis(500)).is_err(),
+        "without an incoming connection nothing observes the drop yet"
+    );
+    assert!(EchoProxy(lazy_root.clone()).echo("x").is_err());
+    assert!(
+        rx_l.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "the failed call declares the session dead"
+    );
+    eager.shutdown();
+    assert_eq!(eager.__incoming_thread_count(), 0);
+    lazy.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// AC-20.6 — `shutdown` ends and joins the incoming threads; the server
+/// sees the session go.
+#[test]
+fn c_shutdown_joins_incoming_threads() {
+    let h = boot_held_cfg(
+        "c_join",
+        HeldCfg {
+            a13: true,
+            incoming: 2,
+            ..Default::default()
+        },
+    );
+    let sid: [u8; 32] = h
+        .client
+        .get_session_id()
+        .expect("sid")
+        .as_slice()
+        .try_into()
+        .unwrap();
+    assert_eq!(h.client.__incoming_thread_count(), 2);
+    let t0 = Instant::now();
+    h.client.shutdown();
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(h.client.__incoming_thread_count(), 0);
+    // Idempotent.
+    h.client.shutdown();
+    let server = Arc::clone(&h.server);
+    assert!(
+        poll_until(|| server.session_slot_count(&sid).is_none_or(|n| n == 0)),
+        "the server still holds slots for the shut-down session"
+    );
+    assert!(matches!(h.root.echo("dead"), Err(StatusCode::DeadObject)));
+}
+
+/// A callback whose handler shuts its own session down: the incoming
+/// thread that runs it is not joined by itself (no deadlock), and the
+/// server's call returns.
+struct ShutdownCb(Mutex<Option<RpcSession>>);
+impl Interface for ShutdownCb {}
+impl Remotable for ShutdownCb {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, _c: TransactionCode, _r: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        if let Some(s) = self.0.lock().unwrap().as_ref() {
+            s.shutdown();
+        }
+        reply.write(&Status::from(StatusCode::Ok))
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+#[test]
+fn c_shutdown_from_callback_handler_does_not_self_join() {
+    let holder = Arc::new(ShutdownCb(Mutex::new(None)));
+    let cb: SIBinder = Interface::as_binder(&Binder::new(ShutdownCbRef(Arc::clone(&holder))));
+    let h = boot_held_cfg(
+        "c_selfjoin",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            cb: Some(cb),
+            ..Default::default()
+        },
+    );
+    *holder.0.lock().unwrap() = Some(h.client.clone());
+    let server_cb = h.cb_proxy();
+    let t0 = Instant::now();
+    let r = std::thread::spawn(move || drive(&server_cb, false))
+        .join()
+        .expect("worker");
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "shutdown inside the handler must not deadlock: {:?} ({r:?})",
+        t0.elapsed()
+    );
+    // The detached thread finishes on its own; the second shutdown is a
+    // no-op and the pool is torn down.
+    assert!(poll_until(|| h.client.__incoming_thread_count() == 0));
+    h.client.shutdown();
+    assert!(matches!(h.root.echo("dead"), Err(StatusCode::DeadObject)));
+    *holder.0.lock().unwrap() = None;
+}
+/// `Binder<T>` wants a value; forward to the shared `ShutdownCb`.
+struct ShutdownCbRef(Arc<ShutdownCb>);
+impl Interface for ShutdownCbRef {}
+impl Remotable for ShutdownCbRef {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, c: TransactionCode, r: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        self.0.on_transact(c, r, reply)
+    }
+    fn on_dump(&self, w: &mut dyn std::io::Write, a: &[String]) -> Result<()> {
+        self.0.on_dump(w, a)
     }
 }

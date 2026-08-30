@@ -427,7 +427,10 @@ kernel binder for, with a few extras specific to socket transport:
   interfaces, enums, unions, oneway methods.
 - **Callbacks (nested binders)** — a callback object created on the
   client crosses the socket like any other Binder and the server
-  invokes it back through the same session.
+  invokes it back through the same session. From inside a handler
+  this always works; to call a callback from *any other* server
+  thread the client must open an incoming connection — see
+  [Callbacks outside a handler](#callbacks-outside-a-handler).
 - **`ParcelFileDescriptor`** — opt in with
   `RpcSession::negotiate_fd_transport` and
   `RpcServer::set_supported_fd_modes`. File descriptors ride
@@ -457,6 +460,49 @@ worker-thread fan-out regardless of how many sessions a single client
 opens — use
 [`RpcServer::set_max_connections(N)`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_connections)
 (default: unlimited). Both knobs are independent and additive.
+
+### Callbacks outside a handler
+
+A server can always call a client's callback *while it is answering
+that client* — the nested call rides the connection the request came
+in on. Calling it from anywhere else (a timer, a worker thread, a
+oneway notification fired later) needs a connection the server can
+*send* on, and by default a session has none: the server fails such a
+call at once with `FailedTransaction` (AOSP `WOULD_BLOCK`) rather than
+waiting for a slot that will never free up.
+
+The client provides that connection, exactly as libbinder's
+`ARpcSession_setMaxIncomingThreads(n)` does:
+
+```rust
+use rsbinder::rpc::{RpcSession, RpcUnixClientConfig};
+
+let session = RpcSession::setup_unix_client_android13plus_with_config(
+    RpcUnixClientConfig::path(std::path::Path::new(RPC_SOCKET), 2)
+        .incoming_connections(1),
+)?;
+```
+
+or, through the unified entry, `Client::open_with(uri, |o, _| {
+o.incoming_connections = Some(1) })` on an `?profile=android13plus`
+URI. Each incoming connection is attached to the same session and
+served by a thread the session owns; `n` of them let `n` server
+threads call back in parallel. The server budgets them at
+`2 × set_max_threads` per session (two on a default server) and
+refuses the rest, which the client sees as a setup error.
+
+Two consequences worth knowing:
+
+- **Death is observed at once.** The serving thread sees the server's
+  connection drop and fires the linked death recipients immediately —
+  the session no longer waits for its next failed call to notice.
+- **Stop the session explicitly.** The serving threads keep the session
+  alive; dropping the `RpcSession` handle and every proxy does not end
+  them. Call `RpcSession::shutdown()` when you are done — it shuts the
+  connections down and joins the threads.
+
+This needs the android-13+ profile (the attach echoes the session id)
+and is currently offered for Unix-domain sockets.
 
 ## Bridging RPC and the service manager: the Accessor pattern
 

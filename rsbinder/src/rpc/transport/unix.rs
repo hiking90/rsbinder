@@ -470,6 +470,11 @@ impl RpcTransport for UnixTransport {
         Ok(())
     }
 
+    fn shutdown(&self) -> RpcResult<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
+
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band
     /// via `SCM_RIGHTS` (`Unix` fd-mode). The ancillary
     /// fds ride the **first** `sendmsg`; remaining bytes (rare — fd

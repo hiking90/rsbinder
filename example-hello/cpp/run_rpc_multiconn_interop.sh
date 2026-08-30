@@ -22,6 +22,12 @@
 #     out-of-order arrivals and the priority replay drains them when
 #     the matching expected `async_number` arrives — eventual per-
 #     node monotonic order, bounded poll window in the launcher.
+#   * (d) PASS (2026-08-30, plan 2-20): TX_SCHEDULE_CALLBACK parks the
+#     callback and the rsbinder server drives it ~150 ms later from a
+#     thread inside no handler (twoway echo + oneway notify). The send
+#     rides the client's `setMaxIncomingThreads(1)` connection, admitted
+#     by the server as a callback (`Outgoing`) slot; libbinder dispatches
+#     both on that connection's thread.
 #   * (c) PASS: 2 parallel TX_INVOKE_CALLBACK from 2 client threads
 #     each land on their own server incoming-slot worker; the nested
 #     server→client `cb.transact` rides the **same** slot via the
@@ -98,7 +104,20 @@ sleep 3
 adb -s "$DEVICE" shell "cat /data/local/tmp/rsmc.stderr"
 
 echo "==> running C++ launcher (libbinder client)"
-adb -s "$DEVICE" shell "/data/local/tmp/rpc_multiconn_interop_launcher $SOCK; echo client-exit=\$?"
+launcher_out=$(adb -s "$DEVICE" shell "/data/local/tmp/rpc_multiconn_interop_launcher $SOCK 2>&1; echo client-exit=\$?" | tr -d '\r')
+printf '%s\n' "$launcher_out"
 
 echo "==> stopping server"
 adb -s "$DEVICE" shell "pkill -9 -f rpc_multiconn_interop_server 2>/dev/null; rm -f $SOCK" || true
+
+# Gate: the launcher's exit status (0 only after (a)–(d) all passed) and
+# the (d) marker — the plan 2-20 out-of-handler callback gate.
+if ! grep -q '^client-exit=0$' <<<"$launcher_out"; then
+    echo "FAIL: launcher exited non-zero"
+    exit 1
+fi
+if ! grep -q '(d) PASS' <<<"$launcher_out"; then
+    echo "FAIL: gate (d) (callback outside a handler) did not pass"
+    exit 1
+fi
+echo "PASS: AC-12.6 (a)(b)(c) + plan 2-20 (d)"

@@ -88,6 +88,19 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Added
 
+- **rsbinder (RPC):** client-side **incoming (callback) connections** —
+  `RpcUnixClientConfig::incoming_connections(n)`,
+  `RpcSession::add_incoming_connection_android13plus_with_config`, and
+  `ClientOptions::incoming_connections` (AOSP `setMaxIncomingThreads`).
+  Until now a server could reach a client's callback only from inside a
+  handler answering that client; a call from any other server thread
+  blocked forever. With `n ≥ 1` the client attaches `n` connections the
+  server sends on, each served by a thread the session owns, so callbacks
+  work from timers, workers, and oneway notifications. Such a session also
+  observes the server's death as soon as the connection drops. The threads
+  keep the session alive until `RpcSession::shutdown()` (which now shuts
+  every connection down and joins them) or the server closes the session.
+  Android-13+ profile, Unix sockets.
 - **rsbinder (`binder`):** `Strong::try_into_async` — the fallible form of
   `into_async`. A local service published sync-only (`Bn*::new_binder`)
   cannot back the async view; the generated cast reports `BadType`, which
@@ -331,6 +344,24 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder (RPC):** a non-nested call on a session with no connection to
+  send on — a server calling a client callback outside any handler, the
+  client having opened no incoming connection — now fails immediately with
+  `FailedTransaction` (AOSP `WOULD_BLOCK`) and a log line naming the
+  remedy, instead of waiting forever (or until `set_timeout`). Connection
+  slots are now tagged with the direction they are used in (AOSP
+  `mOutgoing`/`mIncoming`), so a serve-driven connection is never claimed
+  by another thread's transaction between two of its messages.
+- **rsbinder (RPC):** the server's callback-slot budget (`2 × set_max_threads`
+  per session) now counts callback connections only; a client's outgoing
+  fan-out no longer eats into it (before, a default server admitted a single
+  callback connection). The server also no longer arms `set_idle_timeout` on
+  callback slots (it would have cut short a server's own reply wait there),
+  and confirms a callback attach only after admitting it, so a refused
+  attach is an error on the client instead of a silently dead connection.
+- **rsbinder (RPC):** on session death every connection slot's transport is
+  shut down and the pool is emptied, releasing callback-slot descriptors at
+  once rather than when the session object is finally dropped.
 - **rsbinder (`shared_memory`) — breaking:** `IMemoryHeap::base` now returns
   `Option<SharedBytes<'_>>`, a read-only view. A `&[u8]` over a `MAP_SHARED`
   region promises the compiler an immutability the peer process does not

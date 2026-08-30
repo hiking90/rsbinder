@@ -29,6 +29,12 @@ pub struct MemTransport {
     peer: PeerIdentity,
     desc: &'static str,
     timeout: Mutex<Option<std::time::Duration>>,
+    /// Set by [`shutdown`](RpcTransport::shutdown); `recv_frame` then
+    /// reports `PeerClosed` even if frames are queued. A blocked
+    /// `recv_frame` notices within one poll tick — a sender into our own
+    /// `rx` would have been a cleaner wake-up, but it would also keep the
+    /// channel alive past the peer's drop and hide `PeerClosed`.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl MemTransport {
@@ -46,6 +52,7 @@ impl MemTransport {
                 peer: peer.clone(),
                 desc: "mem",
                 timeout: Mutex::new(None),
+                closed: std::sync::atomic::AtomicBool::new(false),
             },
             MemTransport {
                 tx: b_tx,
@@ -53,6 +60,7 @@ impl MemTransport {
                 peer,
                 desc: "mem",
                 timeout: Mutex::new(None),
+                closed: std::sync::atomic::AtomicBool::new(false),
             },
         )
     }
@@ -85,17 +93,44 @@ impl RpcTransport for MemTransport {
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(RpcError::PeerClosed);
+        }
         let timeout = *self.timeout.lock().expect("mem timeout poisoned");
         let rx = self.rx.lock().expect("mem rx poisoned");
-        match timeout {
-            // `recv`/`recv_timeout` block until a frame arrives, the
-            // deadline elapses, or every sender drops (peer closed) —
-            // never spin, never panic.
-            None => rx.recv().map_err(|_| RpcError::PeerClosed),
-            Some(d) => rx.recv_timeout(d).map_err(|e| match e {
-                std::sync::mpsc::RecvTimeoutError::Timeout => RpcError::Timeout,
-                std::sync::mpsc::RecvTimeoutError::Disconnected => RpcError::PeerClosed,
-            }),
+        // Block in short `recv_timeout` ticks so a local `shutdown` is
+        // noticed; a frame or the peer's drop (every sender gone) returns
+        // at once, never spinning.
+        const TICK: std::time::Duration = std::time::Duration::from_millis(20);
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        loop {
+            let wait = match deadline {
+                Some(at) => {
+                    let left = at.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(RpcError::Timeout);
+                    }
+                    left.min(TICK)
+                }
+                None => TICK,
+            };
+            match rx.recv_timeout(wait) {
+                Ok(frame) => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(RpcError::PeerClosed);
+                    }
+                    return Ok(frame);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RpcError::PeerClosed);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(RpcError::PeerClosed);
+                    }
+                }
+            }
         }
     }
 
@@ -105,6 +140,11 @@ impl RpcTransport for MemTransport {
 
     fn describe(&self) -> &str {
         self.desc
+    }
+
+    fn shutdown(&self) -> RpcResult<()> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {

@@ -199,7 +199,7 @@ pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     let Ok(st) = rustix::fs::fstat(fd) else {
         return false;
     };
-    if st.st_mode & libc::S_IFMT as u32 != libc::S_IFCHR as u32 {
+    if st.st_mode & libc::S_IFMT != libc::S_IFCHR {
         return false;
     }
     match rustix::fs::stat("/dev/ashmem") {

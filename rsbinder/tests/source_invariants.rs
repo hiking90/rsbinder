@@ -55,7 +55,7 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
 /// caller counts too: raise the number deliberately rather than route around
 /// it.
 #[test]
-fn remove_slot_has_exactly_three_callers() {
+fn remove_slot_has_exactly_four_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     // `CARGO_MANIFEST_DIR` is baked in at compile time, so a binary copied
     // elsewhere (a device push, for one) cannot see the sources. Skip loudly
@@ -74,11 +74,12 @@ fn remove_slot_has_exactly_three_callers() {
     );
     assert_eq!(
         hits.len(),
-        3,
-        "RpcSessionInner::remove_slot must have exactly three callers. \
+        4,
+        "RpcSessionInner::remove_slot must have exactly four callers. \
          Found {} call sites: {:#?}\n\
-         INVARIANT: only serve_blocking_on's exit path and \
-         client_transact's send-failure / stale-reply poisons may call remove_slot — \
+         INVARIANT: only serve_blocking_on's exit path, \
+         client_transact's send-failure / stale-reply poisons, and the \
+         incoming-connection attach's spawn-failure rollback may call remove_slot — \
          find_conn / find_conn_pinned must return DeadObject (not panic) \
          on a missing slot. A new caller MUST audit every slot-lookup \
          path before being added.",

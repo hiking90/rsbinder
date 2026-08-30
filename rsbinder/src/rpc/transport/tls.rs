@@ -77,6 +77,9 @@ pub trait TlsStream: Send + Sync {
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
     /// Set the write deadline for subsequent `write`s (`None` = blocking).
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
+    /// Shut the underlying stream down in both directions (wakes a
+    /// blocked `read`).
+    fn shutdown(&self) -> std::io::Result<()>;
 }
 
 // All std stream types implement `Read`/`Write` for `&Stream`, so the
@@ -97,6 +100,9 @@ impl TlsStream for TcpStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, t)
     }
+    fn shutdown(&self) -> std::io::Result<()> {
+        TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
 }
 
 impl TlsStream for UnixStream {
@@ -114,6 +120,9 @@ impl TlsStream for UnixStream {
     }
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         UnixStream::set_write_timeout(self, t)
+    }
+    fn shutdown(&self) -> std::io::Result<()> {
+        UnixStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
 
@@ -133,6 +142,9 @@ impl TlsStream for vsock::VsockStream {
     }
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         vsock::VsockStream::set_write_timeout(self, t)
+    }
+    fn shutdown(&self) -> std::io::Result<()> {
+        vsock::VsockStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
 
@@ -461,6 +473,13 @@ impl RpcTransport for TlsTransport {
 
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
+    fn shutdown(&self) -> RpcResult<()> {
+        // TCP-level shutdown, not a TLS close_notify: the goal is to wake
+        // the reader, and the peer sees a truncated stream either way.
+        self.stream.shutdown()?;
         Ok(())
     }
 }
