@@ -37,9 +37,9 @@ rsbinder-aidl = { version = "0.11.0", path = "rsbinder-aidl" }
 rsbinder-macros = { version = "0.11.0", path = "rsbinder-macros" }
 pest = "2.8"
 pest_derive = "2.8"
-convert_case = "0.11"
+convert_case = "0.12"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"
 tera = { version = "1.20.*", default-features = false }
 similar = "3.1"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
@@ -56,4 +56,4 @@ thiserror = "2"
 #
 # Held at 3.x: 4.0 declares `rust-version = 1.93.1`, above this workspace's
 # 1.85, and the `rust_min` CI job builds dev-dependencies.
-serial_test = { version = "3", default-features = false }
+serial_test = { version = "4", default-features = false }
