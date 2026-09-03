@@ -505,10 +505,30 @@ jobs:
       run: |
         echo "Waiting for device..."
         adb wait-for-device
+        # Match `1` exactly: the property is empty until set, so a
+        # non-empty test would also accept a partial read.
         echo "Device detected, waiting for boot completion..."
-        timeout 300 bash -c 'while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do echo "Waiting for boot..."; sleep 5; done'
-        echo "Boot completed, unlocking screen..."
-        adb shell input keyevent 82
+        timeout 300 bash -c 'while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do echo "Waiting for boot..."; sleep 5; done'
+        # `sys.boot_completed` flips while zygote/system_server are still
+        # warming up, and the guest is short on memory in that window — an
+        # `adb shell` there fails with `fork failed: Out of memory`, which
+        # under `bash -e` kills whichever step ran first. Wait for the boot
+        # animation to stop and for the package manager to answer; together
+        # they mean system_server is actually serving.
+        # Wait while it is *running*, not until it reads `stopped`: the
+        # property is empty on images where the service already exited (or
+        # never registered), and testing for `stopped` there would burn the
+        # whole timeout on every job.
+        echo "Waiting for the boot animation to stop..."
+        timeout 180 bash -c 'while [ "$(adb shell getprop init.svc.bootanim 2>/dev/null | tr -d "\r")" = "running" ]; do sleep 5; done' || echo "bootanim still running at timeout; continuing"
+        echo "Waiting for the package manager..."
+        timeout 180 bash -c 'until adb shell pm path android >/dev/null 2>&1; do sleep 5; done' || echo "pm did not answer; continuing"
+        # Prove a fork actually succeeds in the guest before any step
+        # depends on it.
+        echo "Verifying the guest can fork a shell command..."
+        timeout 120 bash -c 'until adb shell true >/dev/null 2>&1; do sleep 5; done'
+        echo "Unlocking screen..."
+        adb shell input keyevent 82 || true
         echo "Emulator is ready"
 
     - name: Create REMOTE_ANDROID file

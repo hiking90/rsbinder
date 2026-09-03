@@ -95,13 +95,32 @@ function read_remote_android() {
 function ndk_prepare() {
     read_remote_android
 
-    adb root
-    if adb shell ls $remote_directory 1>/dev/null 2>&1; then
-        echo "Directory already exists: $remote_directory"
-    else
-        echo "Directory does not exist, creating: $remote_directory"
-        adb shell mkdir -p $remote_directory
-    fi
+    # Not fatal on its own: a production/PlayStore image refuses root, and
+    # the real symptom is then the mkdir below failing with a message that
+    # names the directory. Letting a non-zero exit here abort the caller
+    # (CI runs under `bash -e`) would hide that.
+    adb root || echo "ndk_prepare: 'adb root' failed; $remote_directory may be unwritable"
+    # `adb root` restarts adbd, so the device detaches and re-attaches.
+    # Without this the next command races that reconnect.
+    adb wait-for-device
+
+    # A guest that has just set `sys.boot_completed` is still bringing up
+    # zygote/system_server and can be short on memory, so an `adb shell`
+    # there dies with `fork failed: Out of memory` (exit 126). Retry
+    # instead of letting one transient failure abort the caller — CI runs
+    # this step under `bash -e`, where a single non-zero exit is fatal.
+    # `mkdir -p` is idempotent, so this doubles as the existence check.
+    local tries=0
+    until adb shell "mkdir -p $remote_directory" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 30 ]; then
+            echo "ndk_prepare: cannot create $remote_directory (gave up after $tries tries)" >&2
+            return 1
+        fi
+        echo "ndk_prepare: guest not ready yet, retrying ($tries/30)..."
+        sleep 2
+    done
+    echo "Directory ready: $remote_directory"
 }
 
 function aidl_gen_rust() {
