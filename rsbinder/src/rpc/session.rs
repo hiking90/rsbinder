@@ -508,6 +508,102 @@ impl Drop for HandshakeDeadline<'_> {
     }
 }
 
+/// Confirm that a peer actually **admitted** an android-13+ *attach* —
+/// a connection whose `RpcConnectionHeader` echoes a server-minted
+/// `session_id` instead of requesting a new session.
+///
+/// The attach wire carries no server→client acknowledgement in the
+/// outgoing direction: AOSP `RpcServer.cpp` writes an
+/// `RpcNewSessionResponse` only for `requestingNewSession`, and the
+/// `"cci"` of an outgoing connection flows client→server. A peer that
+/// refuses the attach — unknown or stale session id, its
+/// `set_max_threads` outgoing-slot cap already spent, shutdown, a
+/// teardown race — can only close the socket. Without this probe the
+/// refusal is invisible at attach time: the client keeps a dead
+/// connection (a dead pool slot, or a whole dead session) and the
+/// failure resurfaces much later, on whichever unrelated call
+/// [`RpcSessionInner::find_conn`] happens to route onto that slot.
+///
+/// The probe is one ordinary `GET_SESSION_ID` special transact on the
+/// fresh connection — the same round trip [`RpcSession::get_session_id`]
+/// makes, which a real libbinder server answers on any connection — and
+/// the reply must carry the very id we echoed: that is what proves the
+/// peer put *this* connection into *that* session. The incoming
+/// (callback) direction needs no probe: there the server writes `"cci"`
+/// *after* admitting the connection, which is already the
+/// acknowledgement (plan 2-20).
+fn confirm_attach(
+    transport: &dyn RpcTransport,
+    codec: &Android13PlusCodec,
+    session_id: &[u8],
+) -> RpcResult<()> {
+    let txn = WireTransaction {
+        address: RpcAddress::zero(),
+        code: SpecialTransaction::GetSessionId.code(),
+        flags: 0,
+        async_number: 0,
+        data: Vec::new(),
+        object_positions: Vec::new(),
+    };
+    let frame = codec.encode_transact(&txn)?;
+    let mut io = RawTransportIo(transport);
+    write_aosp_message(&mut io, &frame)?;
+    let reply = read_aosp_message(&mut io)?;
+    let peer_id = match codec.decode_message(&reply)? {
+        WireMessage::Reply(WireReply {
+            status: 0, data, ..
+        }) => {
+            let mut p = Parcel::from_vec(data);
+            p.set_data_position(0);
+            p.read::<Vec<u8>>()
+                .map_err(|_| RpcError::Protocol("malformed GET_SESSION_ID reply on an attach"))?
+        }
+        _ => {
+            return Err(RpcError::Protocol(
+                "peer did not answer GET_SESSION_ID on an attach",
+            ))
+        }
+    };
+    if peer_id == session_id {
+        Ok(())
+    } else {
+        Err(RpcError::Protocol(
+            "peer put this attach in a different session than the id it echoed",
+        ))
+    }
+}
+
+/// One line explaining what a refused attach looks like, shared by the
+/// two attach entries so the diagnosis does not drift between them.
+fn log_attach_refused(e: &RpcError) {
+    log::error!(
+        "android-13+ RPC: the peer refused this attach ({e}) — the session id is unknown or \
+         stale, the peer's outgoing-slot cap (`set_max_threads`) is spent, or it is shutting \
+         down. The id must be the server-minted one from `RpcSession::get_session_id()` (NOT \
+         `session_id()`, which is a client-local value), and the connection count must stay \
+         within `RpcSession::negotiate()`"
+    );
+}
+
+/// Map an android-13+ **client** handshake failure to a [`StatusCode`],
+/// logging the profile-mismatch hint when the peer hung up where its
+/// `RpcNewSessionResponse` was due. That is what an r34 (default
+/// profile) server looks like from here: it reads our 16-byte
+/// `RpcConnectionHeader` as an r34 frame, fails to decode it and
+/// closes — leaving the client with a bare `DeadObject` and the server
+/// with no log at all.
+fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
+    if requesting_new_session && matches!(e, RpcError::PeerClosed | RpcError::Truncated) {
+        log::error!(
+            "rsbinder RPC: the peer closed the connection during the android-13+ handshake, \
+             before its RpcNewSessionResponse — it may be speaking the r34 (default) profile. \
+             Connect without `?profile=android13plus`, or enable the android-13+ wire on the \
+             server (`RpcServer::set_android13plus`)"
+        );
+    }
+    StatusCode::from(e)
+}
+
 /// RAII pair for the *nested-dispatch* deadline window inside
 /// `client_transact`.
 ///
@@ -3241,13 +3337,18 @@ impl RpcSession {
     /// the session build is what lets the server inspect the id and decide
     /// **new vs. attach** *before* committing the connection to a
     /// `SharedSession`.
+    ///
+    /// The error keeps its [`RpcError`] form so the caller's log carries
+    /// the wire-level reason (`StatusCode::RpcError` would flatten every
+    /// cause into one opaque name — including the `"cci"` reject that
+    /// names a profile mismatch).
     pub(crate) fn android13plus_accept_handshake(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
-    ) -> Result<Android13PlusAccept> {
+    ) -> RpcResult<Android13PlusAccept> {
         let (codec, client_fd_mode, client_id, incoming) = {
             let mut io = RawTransportIo(transport.as_ref());
-            server_accept_deferred_init(&mut io, server_max_version).map_err(StatusCode::from)?
+            server_accept_deferred_init(&mut io, server_max_version)?
         };
         Ok((transport, codec, client_fd_mode, client_id, incoming))
     }
@@ -3370,8 +3471,23 @@ impl RpcSession {
                 .map_err(StatusCode::from)?;
             let mut io = RawTransportIo(transport.as_ref());
             client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, session_id)
-                .map_err(StatusCode::from)?
+                .map_err(|e| client_handshake_err(e, session_id.is_empty()))?
         };
+        if !session_id.is_empty() {
+            // Attach: no `RpcNewSessionResponse` and no server-written
+            // `"cci"` acknowledge it, so confirm admission here rather
+            // than hand the caller a session whose only connection the
+            // peer already closed (see `confirm_attach`). A new session
+            // (empty id) needs no probe — its `RpcNewSessionResponse`
+            // *is* the acknowledgement, so that path stays byte- and
+            // round-trip-identical.
+            let _hs = HandshakeDeadline::arm(transport.as_ref(), handshake_timeout)
+                .map_err(StatusCode::from)?;
+            if let Err(e) = confirm_attach(transport.as_ref(), &codec, session_id) {
+                log_attach_refused(&e);
+                return Err(StatusCode::from(e));
+            }
+        }
         let negotiated = codec.version();
         let session = RpcSession::with_profile(
             transport,
@@ -3434,7 +3550,8 @@ impl RpcSession {
         server_fd_unix: bool,
     ) -> Result<RpcSession> {
         let (transport, codec, client_fd_mode, _client_id, incoming) =
-            Self::android13plus_accept_handshake(transport, server_max_version)?;
+            Self::android13plus_accept_handshake(transport, server_max_version)
+                .map_err(StatusCode::from)?;
         // This wrapper has no callback-slot path; incoming-direction
         // attaches go through `super::RpcServer::serve_connection`.
         if incoming {
@@ -3460,6 +3577,22 @@ impl RpcSession {
     /// minted at session build and replied by the `GET_SESSION_ID`
     /// special transact; the multi-connection path uses it as the
     /// [`super::RpcServer`] registry key. Per-session, never global.
+    ///
+    /// **On a client session this is NOT the peer's session id.** A
+    /// client mints this value locally and never puts it on the wire —
+    /// it exists so a client session that serves callbacks can answer
+    /// `GET_SESSION_ID` — and the server's id is a different 32 bytes
+    /// that only [`RpcSession::get_session_id`] (one round trip, AOSP
+    /// `RpcSession::setupClient` → `readId()`) can tell you. Passing
+    /// this accessor's value to an attach API
+    /// ([`add_outgoing_connection_android13plus`](Self::add_outgoing_connection_android13plus),
+    /// [`add_incoming_connection_android13plus_with_config`](Self::add_incoming_connection_android13plus_with_config),
+    /// [`setup_unix_client_android13plus_with_id`](Self::setup_unix_client_android13plus_with_id),
+    /// `ClientOptions::session_id`) is therefore always wrong; those
+    /// entries refuse it (the peer never admits the connection, and the
+    /// refusal is reported — see `confirm_attach`), but the value
+    /// itself is indistinguishable from any other 32 random bytes, so
+    /// read the id you echo from `get_session_id()`.
     pub fn session_id(&self) -> [u8; 32] {
         *self.inner.shared.rpc_session_id.as_bytes()
     }
@@ -3908,6 +4041,11 @@ impl RpcSession {
     /// [`RpcSession::get_session_id`], then open the remaining
     /// connections here echoing that id. An **empty** `session_id` is
     /// byte-identical to `setup_unix_client_android13plus`.
+    ///
+    /// A non-empty id makes this an *attach*, and the server's
+    /// admission is confirmed before the session is returned (see
+    /// `confirm_attach`) — a refused attach is an error here, not a
+    /// session whose every call fails.
     pub fn setup_unix_client_android13plus_with_id(
         path: impl AsRef<std::path::Path>,
         max_version: u32,
@@ -3998,7 +4136,20 @@ impl RpcSession {
     /// id-demuxes the echo onto the same `SharedSession`, so
     /// state/root/proxies are shared with the founding connection.
     /// Profile uniformity is enforced: the additional connection's
-    /// negotiated wire version must equal this session's (else error).
+    /// negotiated wire version must equal this session's, so
+    /// `max_version` must be **at least**
+    /// [`wire_protocol_version()`](Self::wire_protocol_version) —
+    /// passing less can never attach ([`StatusCode::BadType`]), because
+    /// an attach gets no version negotiation of its own (the founding
+    /// connection already pinned it).
+    ///
+    /// The server's admission is confirmed before the new slot joins
+    /// the pool (one `GET_SESSION_ID` round trip on the fresh
+    /// connection, see `confirm_attach`): a refused attach — `session_id`
+    /// unknown or stale, the server's `set_max_threads` outgoing-slot
+    /// cap spent, server shutting down — is an error **here**, never a
+    /// dead slot that fails some unrelated call later. Stay within
+    /// [`negotiate()`](Self::negotiate) connections to avoid the cap.
     ///
     /// The default single-connection sessions never call this ⇒ the
     /// pool stays at one slot ⇒ `find_conn` is byte-identical to the
@@ -4083,7 +4234,29 @@ impl RpcSession {
             // connection's negotiation). A mixed-version pool would
             // silently route incompatible wire across one
             // `RpcSessionInner`; refuse instead.
+            log::error!(
+                "android-13+ RPC: this attach negotiated wire v{} but the session runs v{} — \
+                 a caller-supplied `max_version` below the session's negotiated version can \
+                 never attach; pass `RpcSession::wire_protocol_version()`",
+                codec.version(),
+                session_version
+            );
             return Err(StatusCode::BadType);
+        }
+        {
+            // Confirm the server admitted the attach before the slot
+            // joins the pool: an unadmitted slot would sit there until
+            // some unrelated later call drew it and failed
+            // (see `confirm_attach`). The probe is a reply wait, so it
+            // honors the session's `set_timeout` when no explicit
+            // handshake timeout is configured.
+            let probe_deadline = handshake_timeout
+                .or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
+            let _hs = HandshakeDeadline::arm(&t, probe_deadline).map_err(StatusCode::from)?;
+            if let Err(e) = confirm_attach(&t, &codec, session_id) {
+                log_attach_refused(&e);
+                return Err(StatusCode::from(e));
+            }
         }
         self.inner
             .add_outgoing_slot(Box::new(t))

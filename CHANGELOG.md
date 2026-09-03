@@ -705,6 +705,42 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC) — a refused attach was reported to the client as success.**
+  The outgoing direction of an android-13+ attach carries no acknowledgement
+  (AOSP writes `RpcNewSessionResponse` only for a new session, and an outgoing
+  connection's `"cci"` flows client→server), so a peer that refused the
+  connection — `session_id` unknown or stale, its `set_max_threads`
+  outgoing-slot cap already spent, shutting down — could only close the socket.
+  `RpcSession::add_outgoing_connection_android13plus` returned `Ok(slot)`
+  anyway and left the dead connection in the pool, where it broke one *later,
+  unrelated* call — whichever one the connection picker happened to route onto
+  that slot — and was then reclaimed, so a single-threaded client saw exactly
+  one inexplicable failure per run and a multi-threaded one saw them
+  intermittently. `setup_unix_client_android13plus_with_id` (and
+  `ClientOptions::session_id` over it) likewise handed back a session whose
+  only connection the peer had already closed. Both now confirm admission with
+  one `GET_SESSION_ID` round trip on the fresh connection *before* using it —
+  the reply must carry the id that was echoed — and report the refusal at the
+  attach call. Costs one extra round trip per attached connection; a new
+  session (empty id) is untouched, and so is the incoming (callback)
+  direction, whose post-admission `"cci"` already reported refusals. A
+  client's `RpcSession::session_id()` is a client-local value that is never
+  the peer's id (only `get_session_id()` fetches that), which is the mistake
+  this used to accept silently; its rustdoc now says so.
+- **rsbinder (RPC) — a wire-profile mismatch never mentioned the profile.**
+  An r34 (default) client's first frame parses as a *valid-looking* v0
+  `RpcConnectionHeader` — its leading `CMD_TRANSACT` reads as protocol
+  version 0 — so an android-13+ server accepted it, answered, and failed at
+  the `"cci"` check with a reject that named nothing an operator could act
+  on; the server's handshake log also flattened every cause into the opaque
+  `RpcError` status name. In the other direction an r34 server closed the
+  connection mid-handshake and the client surfaced a bare `DeadObject` with
+  no log at all. Both rejects now name the r34 profile as the likely cause,
+  in the same shape as the existing `Client::open` diagnostics. An attach
+  whose `max_version` is below the session's negotiated version (which can
+  never work — an attach does not negotiate) now logs that
+  `wire_protocol_version()` is the value to pass instead of failing with a
+  bare `BadType`.
 - **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
   freed memory.** `write_transaction_data` stores raw pointers to the reply
   parcel (or the status word on the stack) in the thread's command buffer.

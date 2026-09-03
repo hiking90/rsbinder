@@ -1211,9 +1211,11 @@ fn a0b_multi_connection_shared_session() {
         &sid1[..],
         "bogus id differs from the minted one"
     );
-    let c3 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &bogus)
-        .expect("handshake completes (reject is post-handshake — A0b residual)");
-    c3.set_timeout(Some(Duration::from_secs(3)));
+    // The reject lands past the handshake (the wire acknowledges an
+    // attach with nothing), so the attach confirmation round trip —
+    // `GET_SESSION_ID` on the fresh connection — is what makes the
+    // *constructor* fail instead of some later call on a dead
+    // connection.
     // Strengthen the unknown-id reject assertion: a plain `is_err()`
     // would also pass for an unrelated
     // error (e.g. handshake itself failed). Lock the contract to the
@@ -1236,7 +1238,9 @@ fn a0b_multi_connection_shared_session() {
     //
     // Anything outside this set means a different bug (and `Ok` is
     // the true mutant: server honored the unknown id).
-    let err = c3.get_root().expect_err("unknown id rejected");
+    let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &bogus)
+        .err()
+        .expect("unknown id rejected");
     assert!(
         matches!(
             err,
@@ -1297,7 +1301,6 @@ fn a0b_multi_connection_shared_session() {
 
     drop(root1);
     drop(c1);
-    drop(c3);
     // _cu's Drop handles shutdown/bg.join/join_workers/remove_file —
     // a panic above does not leak worker threads + socket file.
 }
@@ -1453,13 +1456,14 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let rejected_before = server.rejected_unknown_id_count();
 
     // 3rd attach with the same session id ⇒ would push slot_count to
-    // 3 > max_threads(2) ⇒ refused at the attach arm (cap).
-    let c3 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
-    c3.set_timeout(Some(Duration::from_secs(3)));
-    let err = c3
-        .get_root()
-        .expect_err("3rd attach must be rejected by the per-session cap");
+    // 3 > max_threads(2) ⇒ refused at the attach arm (cap). The reject
+    // is post-handshake, and the attach confirmation round trip
+    // (`GET_SESSION_ID` on the fresh connection) reports it from the
+    // constructor — a valid id refused by the cap is the case no
+    // client-side id check could catch.
+    let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
+        .err()
+        .expect("3rd attach must be rejected by the per-session cap");
     assert!(
         matches!(
             err,
@@ -1648,6 +1652,213 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     );
 }
 
+/// A **refused** outgoing attach must be an error at attach time, not
+/// an `Ok` slot the pool keeps. The outgoing attach wire has no
+/// server→client acknowledgement (the server refuses by closing), so
+/// `RpcSession::add_outgoing_connection_android13plus` confirms
+/// admission with one `GET_SESSION_ID` round trip on the fresh
+/// connection.
+///
+/// Reported from a downstream project (2026-09-03): with a wrong id the
+/// attach returned `Ok`, the dead slot stayed in the pool, and one
+/// later unrelated call — whichever one `find_conn` routed onto that
+/// slot — failed. Single-threaded clients always draw slot 1 first, so
+/// this drives 4 threads to make the pool actually reach the attached
+/// slot.
+///
+/// **Mutant gate**: dropping the `confirm_attach` call restores
+/// `Ok(2)` for both bogus ids and re-poisons the pool (the echo loop
+/// then fails ~1/4 of its calls).
+#[test]
+fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
+    let path = tmp_sock("badattach");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(4);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = Arc::new(RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect"));
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+
+    // (a) The client-local `session_id()` accessor is NOT the
+    //     server-minted id — the exact confusion that started this.
+    assert_ne!(
+        client.session_id().as_slice(),
+        sid.as_slice(),
+        "a client session's `session_id()` is a local value, never the peer's"
+    );
+    assert!(
+        client
+            .add_outgoing_connection_android13plus(&path, 1, &client.session_id())
+            .is_err(),
+        "attaching with the client-local id must fail here, not later"
+    );
+    // (b) Plain garbage.
+    assert!(
+        client
+            .add_outgoing_connection_android13plus(&path, 1, &[0xABu8; 32])
+            .is_err(),
+        "attaching with an unknown id must fail here, not later"
+    );
+    // Neither reached the server's pool, and the founding connection is
+    // untouched.
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(1),
+        "both refused attaches left the server session at its founding slot"
+    );
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == 2),
+        "server counted exactly the two unknown-id rejects"
+    );
+
+    // (c) The control: the server-minted id attaches, and the pool is
+    //     clean — 200 calls across 4 threads, zero failures. Before the
+    //     fix a bogus attach made ~1 in 4 of these fail.
+    assert_eq!(
+        client
+            .add_outgoing_connection_android13plus(&path, 1, &sid)
+            .expect("attach with the server-minted id"),
+        2
+    );
+    let mut handles = Vec::new();
+    for t in 0..4 {
+        let c = Arc::clone(&client);
+        handles.push(std::thread::spawn(move || {
+            let root = EchoProxy(c.get_root().expect("get_root"));
+            for i in 0..50 {
+                let msg = format!("clean-{t}-{i}");
+                assert_eq!(root.echo(&msg).expect("echo on a confirmed pool"), msg);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("client thread");
+    }
+}
+
+/// The same confirmation covers a refusal that is **nobody's mistake**:
+/// a perfectly valid session id attached past the server's
+/// `set_max_threads` outgoing-slot cap. No client-side id check could
+/// catch this one — only the round trip can — and a caller that skips
+/// `negotiate()` has no other way to learn the cap.
+///
+/// **Mutant gate**: without `confirm_attach` the over-cap attaches
+/// return `Ok(3)`/`Ok(4)` while the server stays at 2 slots.
+#[test]
+fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
+    let path = tmp_sock("capattach");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Founding + exactly one attach.
+    server.set_max_threads(2);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    let sid = client.get_session_id().expect("get_session_id");
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+
+    assert_eq!(
+        client
+            .add_outgoing_connection_android13plus(&path, 1, &sid)
+            .expect("first attach is under the cap"),
+        2
+    );
+    for n in 0..2 {
+        assert!(
+            client
+                .add_outgoing_connection_android13plus(&path, 1, &sid)
+                .is_err(),
+            "attach #{n} past max_threads=2 must be refused at attach time"
+        );
+    }
+    assert_eq!(
+        server.session_slot_count(&sid_arr),
+        Some(2),
+        "the server never went past its cap"
+    );
+    // The pool the client kept is exactly the pool the server has, so
+    // every call lands on a live slot.
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    for i in 0..20 {
+        let msg = format!("cap-{i}");
+        assert_eq!(root.echo(&msg).expect("echo after refused attaches"), msg);
+    }
+}
+
+/// An attach cannot negotiate its own version, so a `max_version`
+/// below the session's negotiated one can never work — that is
+/// `BadType`, and the log names `wire_protocol_version()` as the value
+/// to pass. Complements the R34 case in
+/// `real_process_e2e_and_negotiation`.
+#[test]
+fn attach_max_version_below_the_session_version_is_bad_type() {
+    let path = tmp_sock("attachver");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(2);
+    server.set_max_threads(3);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client_android13plus(&path, 2).expect("connect");
+    assert_eq!(client.wire_protocol_version(), Some(2));
+    let sid = client.get_session_id().expect("get_session_id");
+    assert!(matches!(
+        client.add_outgoing_connection_android13plus(&path, 1, &sid),
+        Err(StatusCode::BadType)
+    ));
+    // `wire_protocol_version()` is the value that works.
+    assert_eq!(
+        client
+            .add_outgoing_connection_android13plus(
+                &path,
+                client.wire_protocol_version().expect("versioned"),
+                &sid,
+            )
+            .expect("attach at the session's version"),
+        2
+    );
+}
+
+/// A standalone attach *session*
+/// ([`RpcSession::setup_unix_client_android13plus_with_id`], and the
+/// `ClientOptions::session_id` path over it) is confirmed the same way:
+/// a refused attach is an error from the constructor, not a session
+/// whose every call fails somewhere else.
+#[test]
+fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
+    let path = tmp_sock("standalone");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(3);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let founding = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    let sid = founding.get_session_id().expect("get_session_id");
+    assert!(
+        RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &[0xCDu8; 32]).is_err(),
+        "an unknown id must not yield a session object"
+    );
+    // Control: the real id builds a usable second session handle on the
+    // same server-side session.
+    let attached = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
+        .expect("attach session with the server-minted id");
+    let root = EchoProxy(attached.get_root().expect("get_root"));
+    assert_eq!(root.echo("standalone").unwrap(), "standalone");
+}
+
 /// Shutdown-reject e2e. The android-13+ attach arm sits past a
 /// successful handshake but before the per-slot enqueue; in production
 /// the `shutdown.load()` gate at that point sees a *sub-microsecond*
@@ -1722,8 +1933,12 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     let attach_path = path.clone();
     let attach_sid = sid.clone();
     let attach_handle = std::thread::spawn(move || -> std::result::Result<(), StatusCode> {
-        let c2 = RpcSession::setup_unix_client_android13plus_with_id(&attach_path, 1, &attach_sid)
-            .expect("handshake completes (reject is post-handshake — A0b/B.1 residual)");
+        // The reject lands past the handshake, where the attach
+        // confirmation round trip (`GET_SESSION_ID` on the fresh
+        // connection) now sees it — so the constructor itself fails.
+        // Folded into one result with the first call so the test still
+        // holds if a future reject arm moves to either side of it.
+        let c2 = RpcSession::setup_unix_client_android13plus_with_id(&attach_path, 1, &attach_sid)?;
         c2.set_timeout(Some(Duration::from_secs(3)));
         c2.get_root().map(|_| ())
     });

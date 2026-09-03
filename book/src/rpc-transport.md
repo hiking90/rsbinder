@@ -269,6 +269,15 @@ let session = RpcSession::setup_unix_client_android13plus_with_config(
 )?;
 ```
 
+> **The id you echo must come from `RpcSession::get_session_id()`** — one
+> round trip that asks the server for it. `RpcSession::session_id()` is a
+> *different* method: on a client session it returns a client-local value
+> that the server has never seen, so echoing it is always wrong. Both
+> return 32 opaque bytes, so nothing but the method name distinguishes
+> them; an attach that echoes the wrong id (or one the server refuses for
+> any other reason, such as more connections than its `set_max_threads`
+> allows) fails at the attach call.
+
 > **Security.** An abstract socket has **no filesystem permissions**:
 > any process in the same network namespace can connect (subject only to
 > LSM policy such as SELinux), so the directory-mode access control a

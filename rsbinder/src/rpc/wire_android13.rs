@@ -481,12 +481,25 @@ impl Android13PlusCodec {
     }
 
     /// Verify an `RpcOutgoingConnectionInit` (`strncmp(msg,"cci",4)`).
+    ///
+    /// The rejects name the r34 profile because that is what this check
+    /// catches in practice: an r34 client's first frame
+    /// (`[command|bodySize|reserved]`) parses as a *valid-looking*
+    /// v0 `RpcConnectionHeader` — `command == CMD_TRANSACT == 0` reads
+    /// as protocol version 0 — so a profile mismatch survives the header
+    /// and first fails here, where the `"cci"` magic cannot be faked by
+    /// an r34 transaction body.
     pub fn decode_connection_init(&self, buf: &[u8]) -> RpcResult<()> {
         if buf.len() < A13_CONN_INIT_LEN {
-            return Err(RpcError::Protocol("RpcOutgoingConnectionInit truncated"));
+            return Err(RpcError::Protocol(
+                "RpcOutgoingConnectionInit truncated (peer may be speaking the r34 profile)",
+            ));
         }
         if buf[0..4] != CONN_INIT_OKAY {
-            return Err(RpcError::Protocol("bad RpcOutgoingConnectionInit msg"));
+            return Err(RpcError::Protocol(
+                "expected RpcOutgoingConnectionInit \"cci\" — the peer may be speaking the \
+                 r34 (default) profile, not android-13+",
+            ));
         }
         Ok(())
     }
@@ -1433,6 +1446,20 @@ mod tests {
         let init = c1.encode_connection_init();
         assert_eq!(&init[0..4], b"cci\0");
         c1.decode_connection_init(&init).expect("\"cci\"");
+        // A profile mismatch first fails here (an r34 client's leading
+        // `CMD_TRANSACT == 0` passes as protocol version 0), so both
+        // rejects have to name r34 — that string is the only thing the
+        // server's handshake log can show an operator.
+        for bad in [&[0u8; 8][..], &[0u8; 2][..]] {
+            let why = match c1.decode_connection_init(bad) {
+                Err(RpcError::Protocol(why)) => why,
+                other => panic!("expected a protocol reject, got {other:?}"),
+            };
+            assert!(
+                why.contains("r34"),
+                "the \"cci\" reject must name the r34 profile: {why}"
+            );
+        }
 
         // Version acceptance (AOSP rule @ android-16.0.0_r4, _NEXT = 3):
         // accept 0,1,2,EXPERIMENTAL; reject 3 and above.
