@@ -1332,7 +1332,10 @@ impl RpcServer {
                             // Abnormal interop/security event
                             // (version mismatch, truncated header,
                             // hostile peer) — `warn!` not `debug!`.
-                            log::warn!("android-13+ RPC handshake failed: {e:?}");
+                            // `{e}` not `{e:?}`: the `RpcError` Display
+                            // carries the wire-level reason, which is
+                            // what names a profile mismatch.
+                            log::warn!("android-13+ RPC handshake failed: {e}");
                             return;
                         }
                     };
