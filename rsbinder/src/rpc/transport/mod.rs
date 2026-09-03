@@ -87,7 +87,7 @@ pub trait RpcTransport: Send + Sync {
     /// Set a read deadline for subsequent [`RpcTransport::recv_frame`]
     /// calls. `None` clears it (fully blocking). The
     /// default is a no-op for backends with no read-timeout notion;
-    /// `unix` / `mem` / `tcp_debug` override it. A deadline that
+    /// `unix` / `mem` / `tcp_debug` / `vsock` / `tls` override it. A deadline that
     /// elapses with **nothing consumed** surfaces as
     /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
     /// deadline that elapses mid-frame is [`RpcError::Truncated`].
@@ -113,6 +113,14 @@ pub trait RpcTransport: Send + Sync {
     /// sends fail. Used to end a client's incoming-connection threads on
     /// session death / `RpcSession::shutdown`. Best-effort; the default
     /// does nothing, for a transport that cannot be interrupted.
+    ///
+    /// **Override it if your transport can be interrupted at all.** With
+    /// the no-op default, `RpcSession::shutdown` has nothing to wake a
+    /// thread parked in `recv_frame` on this transport, so a
+    /// `serve_blocking` or incoming-connection thread on it never exits
+    /// and the documented teardown ("it exits on its own once the
+    /// transport is shut down") does not hold. Every in-tree
+    /// socket-backed transport overrides it.
     fn shutdown(&self) -> RpcResult<()> {
         Ok(())
     }

@@ -24,6 +24,13 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **`rpc::transport::TlsStream` gained a required `shutdown()`.** Custom
+  stream implementations must add `fn shutdown(&self) -> std::io::Result<()>`
+  (shut the underlying stream down in both directions). There is no default
+  body on purpose: silently doing nothing would leave a client's
+  incoming-connection threads blocked in `recv` with nothing to wake them, so
+  `RpcSession::shutdown` would hang on the join. The bundled
+  `TcpStream`/`UnixStream`/`VsockStream` impls are unaffected.
 - **rsbinder-aidl rejects `.aidl` it used to accept.** Five inputs that
   previously generated silently-wrong or non-compiling Rust are now build
   errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
@@ -97,10 +104,29 @@ short form — and the first entry is the only one no compiler will catch.
   blocked forever. With `n ≥ 1` the client attaches `n` connections the
   server sends on, each served by a thread the session owns, so callbacks
   work from timers, workers, and oneway notifications. Such a session also
-  observes the server's death as soon as the connection drops. The threads
+  observes the server's death as soon as the connection drops — eagerly, not
+  precisely: losing the last incoming connection *is* the session's death,
+  so a server that retires only that connection (its `set_reply_timeout`
+  elapsing on a slow callback, say) tears the whole session down, founding
+  connection included. The threads
   keep the session alive until `RpcSession::shutdown()` (which now shuts
   every connection down and joins them) or the server closes the session.
   Android-13+ profile, Unix sockets.
+- **rsbinder (RPC):** `ClientOptions::handshake_timeout` and
+  `RpcUnixClientConfig::handshake_timeout` — a deadline for the connection
+  **handshake**, the phase `timeout` cannot reach because it is applied to a
+  session that does not exist yet. Covers the founding connect and every
+  fan-out / incoming attach, plus the `tls://` `connect(2)`. `None`
+  (default) keeps the previous unbounded behavior; without it a peer that
+  accepts the socket and then writes nothing hangs `Client::open` forever.
+  The client-side counterpart of `ServeOptions::handshake_timeout`.
+- **rsbinder (RPC):** `RpcServer::set_reply_timeout` — bounds how long this
+  server waits for a reply to a callback it issued, by setting
+  `RpcSession::set_timeout` on every session the server builds. `None`
+  (default) keeps the previous block-forever behavior. Callback connections
+  are exempt from the `set_idle_timeout` *read* deadline (a sticky
+  `SO_RCVTIMEO` would cut this very wait short), so this is the only bound
+  available on that path.
 - **rsbinder (`binder`):** `Strong::try_into_async` — the fallible form of
   `into_async`. A local service published sync-only (`Bn*::new_binder`)
   cannot back the async view; the generated cast reports `BadType`, which
@@ -351,17 +377,56 @@ short form — and the first entry is the only one no compiler will catch.
   remedy, instead of waiting forever (or until `set_timeout`). Connection
   slots are now tagged with the direction they are used in (AOSP
   `mOutgoing`/`mIncoming`), so a serve-driven connection is never claimed
-  by another thread's transaction between two of its messages.
+  by another thread's transaction between two of its messages. A
+  same-thread nested call re-enters a serve-driven connection only while a
+  *twoway* handler is running on it (AOSP `RpcConnection::allowNested`):
+  from inside a **oneway** handler the peer is no longer reading that
+  socket, so the nested call now goes out on a connection the peer does
+  read — or fails with `FailedTransaction` if there is none — instead of
+  blocking forever on a reply that could never arrive.
+  **Breaking for `RpcSession::new(t, AddressSpace::Acceptor)`:** the
+  founding connection of an acceptor session is serve-driven, so such a
+  session can no longer open a transaction of its own — `get_root`,
+  `RpcProxy::transact` and `ping_binder` from outside a dispatch return
+  `FailedTransaction` where they used to round-trip on that connection.
+  Callbacks from inside a twoway handler are unaffected. To call out of
+  an acceptor otherwise the peer must open incoming connections, which
+  needs `?profile=android13plus`; the r34 profile has no such mechanism.
 - **rsbinder (RPC):** the server's callback-slot budget (`2 × set_max_threads`
   per session) now counts callback connections only; a client's outgoing
   fan-out no longer eats into it (before, a default server admitted a single
-  callback connection). The server also no longer arms `set_idle_timeout` on
-  callback slots (it would have cut short a server's own reply wait there),
-  and confirms a callback attach only after admitting it, so a refused
-  attach is an error on the client instead of a silently dead connection.
+  callback connection). The server also no longer arms the `set_idle_timeout`
+  *read* deadline on callback slots (it would have cut short a server's own
+  reply wait there) — the write deadline stays, as the only bound on a
+  callback send to a peer that has stopped reading — and confirms a callback
+  attach only after admitting it, so a refused attach is an error on the
+  client instead of a silently dead connection. With that read deadline gone,
+  `RpcServer::set_reply_timeout` is what bounds a callback's *reply* wait:
+  without it a client that accepts a callback and never answers pins the
+  sending worker — and everything queued behind it on that session — forever.
+- **rsbinder (RPC):** a `DEC_STRONG` no longer takes a **serve-driven**
+  connection slot from the scan; only a slot the calling thread already
+  drives (the reentrant pin) may carry one. This matches AOSP
+  `ExclusiveConnection::find`, which looks `mIncoming` up with
+  `available = nullptr`. The peer reads such a connection only inside its
+  own reply wait, so writing there is not a delayed frame but a send that
+  blocks once the socket buffer fills — while the sender holds the slot's
+  `exclusive_tid`, locking that slot's serve loop out of its own
+  connection. Consequence: on a session with no outgoing connection the
+  reference is released at session end instead of promptly, which is the
+  documented best-effort contract for refcounts. A client that wants
+  prompt release opens an incoming connection
+  (`RpcUnixClientConfig::incoming_connections`).
 - **rsbinder (RPC):** on session death every connection slot's transport is
   shut down and the pool is emptied, releasing callback-slot descriptors at
-  once rather than when the session object is finally dropped.
+  once rather than when the session object is finally dropped. The shutdown
+  now runs *first*, before the obituaries and the local-object drop, so a
+  `binder_died` handler (or a `Drop`) that calls `RpcSession::shutdown` can
+  join the incoming threads instead of deadlocking on them.
+- **rsbinder (RPC):** attaching a connection to a session that died during the
+  attach handshake now fails with `DeadObject` instead of pushing a slot no
+  serve loop will ever retire. The gate moved inside the pool lock, where it
+  is serialized against the death sequence emptying that pool.
 - **rsbinder (`shared_memory`) — breaking:** `IMemoryHeap::base` now returns
   `Option<SharedBytes<'_>>`, a read-only view. A `&[u8]` over a `MAP_SHARED`
   region promises the compiler an immutability the peer process does not
@@ -394,9 +459,12 @@ short form — and the first entry is the only one no compiler will catch.
   seek with nothing written behind it no longer inflates the byte count
   handed to the kernel — see *Fixed*.
 - **rsbinder (entry):** `ClientOptions::tls` / `tls_server_name` on anything
-  but a `tls://` endpoint, and `ServeOptions::tls` on `unix-abstract://`, are
-  `BadValue`. Both were silently ignored — a caller asking for TLS got a
-  plaintext socket and no error. The option types already promised "never
+  but a `tls://` endpoint, and `ServeOptions::tls` likewise, are `BadValue`.
+  Both were silently ignored — a caller asking for TLS got a plaintext socket
+  and no error. `ServeOptions::tls` had also accepted `unix://` and
+  `vsock://`, which no client this facade builds can reach; TLS over those
+  sockets stays available one layer down (`RpcServer::setup_unix_server_tls`
+  / `setup_vsock_server_tls`). The option types already promised "never
   ignored". A `ClientOptions::session_id` on the multi-connection path was
   dropped the same way and opened a fresh session; it is forwarded now (the
   session layer refuses the combination).

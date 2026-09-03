@@ -14,7 +14,7 @@
 //!         --features rpc --bin rpc_multiconn_interop_server
 //! adb -s emulator-5556 push <bin> /data/local/tmp/rsmc_srv
 //! adb -s emulator-5556 shell /data/local/tmp/rsmc_srv \
-//!     /data/local/tmp/rsmc.sock 2
+//!     /data/local/tmp/rsmc.sock 3
 //! ```
 //!
 //! What this harness verifies (*hermetic rsbinder↔rsbinder is
@@ -40,6 +40,13 @@
 //!       inside the original twoway (server→client nested call on the
 //!       *same* slot via DRIVING `(sess, slot)` re-entry pin). Reply
 //!       must round-trip the callback's response (`cb-echo:ping`).
+//!
+//!   (d) **Callback from outside any handler** (plan 2-20):
+//!       `TX_SCHEDULE_CALLBACK` parks a callback for a timer thread that
+//!       is answering nothing, then `TX_GET_SCHED` polls the result. The
+//!       server→client call therefore has to travel a connection the
+//!       client opened for incoming traffic (`setMaxIncomingThreads`),
+//!       not the slot some in-flight handler happens to own.
 //!
 //! The launcher is the only side that decides "PASS" — this server
 //! just exposes the transactions and lets the genuine peer drive them.

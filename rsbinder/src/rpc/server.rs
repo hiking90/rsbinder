@@ -358,8 +358,8 @@ pub struct RpcServer {
     wire_max_version: Mutex<Option<u32>>,
     /// Opt-in **server-side admission bound** on the number of
     /// *concurrent* connection-worker threads. `None` (default) ⇒
-    /// unbounded, byte-for-byte the prior behavior (additive
-    /// invariant). `Some(max)` ⇒ the accept loop stops accepting while
+    /// unbounded, byte-for-byte a server that never sets the bound
+    /// (additive invariant). `Some(max)` ⇒ the accept loop stops accepting while
     /// `max` workers are live (excess clients wait in the kernel listen
     /// backlog — clean backpressure, no reactor, no dropped client),
     /// resuming when a worker finishes. This is the rsbinder analogue
@@ -382,7 +382,7 @@ pub struct RpcServer {
     /// Optional per-connection *idle* read deadline applied to the
     /// android-13+ serve loop **after** the handshake completes. `None`
     /// (the default) ⇒ an established session idles between requests
-    /// unbounded (byte-identical to prior behavior). `Some(d)` ⇒ a peer
+    /// unbounded (byte-identical to a server that never sets it). `Some(d)` ⇒ a peer
     /// that completes the handshake and then goes silent surfaces as a
     /// serve-loop read error after `d`, releasing its worker and its
     /// [`set_max_connections`](Self::set_max_connections) admission slot —
@@ -391,13 +391,17 @@ pub struct RpcServer {
     /// phase only) does not cover. Set this only when the protocol has
     /// regular traffic or idle eviction is acceptable.
     idle_timeout: Mutex<Option<std::time::Duration>>,
+    reply_timeout: Mutex<Option<std::time::Duration>>,
     /// Opt-in authorization hook. `None`
     /// (default) ⇒ accept-all = byte-for-byte a server without the hook
-    /// (additive invariant). When set, it runs at
-    /// [`serve_connection`](RpcServer::serve_connection) entry —
-    /// **before** the wire-profile branch, session build, handshake,
-    /// or any `recv_frame` — so a rejected peer receives **zero RPC
-    /// bytes** (the connection is closed). Backend-independent: it is
+    /// (additive invariant). When set, it runs on the connection's own
+    /// worker thread (`run_connection_in_worker`, shared by the accept
+    /// loop and [`serve_connection`](RpcServer::serve_connection)),
+    /// concurrently across connections and never blocking the accept
+    /// loop — but **before** the wire-profile branch, session build,
+    /// handshake, or any `recv_frame`, so a rejected peer receives
+    /// **zero RPC bytes** (the connection is closed).
+    /// Backend-independent: it is
     /// pure on [`RpcTransport::peer_identity`] (unix `SO_PEERCRED`/
     /// `getpeereid`, tls cert, vsock cid, …). `Arc` (not `Box`) so the
     /// hook is cloned out of the lock and invoked **lock-free**, so a
@@ -415,7 +419,7 @@ pub struct RpcServer {
     /// re-reads the now-true flag and takes the reject branch — turning
     /// the otherwise sub-microsecond window into a deterministic test
     /// point. `None` default ⇒ no invocation, byte-identical to the
-    /// pre-hook attach path. `Arc<dyn Fn>` so the closure is cloned out
+    /// attach path without the probe. `Arc<dyn Fn>` so the closure is cloned out
     /// of the lock and invoked **lock-free** (same discipline as
     /// `authorizer` — re-entrant calls into `server` from the probe do
     /// not self-deadlock). Same `__`-prefix unstable-API discipline as
@@ -460,8 +464,9 @@ pub struct RpcServer {
     /// Observability counters. Plain atomics off the per-transaction
     /// path — zero-cost on the default (empty-id) flow.
     /// `session_registered` = new-session mints; `attached_count` =
-    /// id-demux attaches; `rejected_unknown_id` = non-empty ids that
-    /// resolved to no live session.
+    /// id-demux attaches; `rejected_unknown_id` = id-carrying
+    /// connections refused for any reason (see
+    /// [`rejected_unknown_id_count`](RpcServer::rejected_unknown_id_count)).
     session_registered: AtomicUsize,
     attached_count: AtomicUsize,
     rejected_unknown_id: AtomicUsize,
@@ -556,6 +561,7 @@ impl RpcServer {
             max_connections: Mutex::new(None),
             handshake_timeout: Mutex::new(Some(DEFAULT_HANDSHAKE_TIMEOUT)),
             idle_timeout: Mutex::new(None),
+            reply_timeout: Mutex::new(None),
             authorizer: Mutex::new(None),
             attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
@@ -693,8 +699,8 @@ impl RpcServer {
 
     /// Opt-in **server-side admission bound** on concurrent
     /// connection-worker threads (reactor-free backpressure). Default
-    /// (unset) is unbounded — byte-for-byte the prior behavior, so this
-    /// is purely additive. When set, the accept loop stops accepting
+    /// (unset) is unbounded — byte-for-byte a server that never calls
+    /// this, so it is purely additive. When set, the accept loop stops accepting
     /// while `n` workers are live; pending clients wait in the kernel
     /// listen backlog and are served as workers finish (no client is
     /// dropped, `shutdown` is still polled). `n` is clamped to ≥ 1.
@@ -740,7 +746,26 @@ impl RpcServer {
     /// way an established two-way session may then sit idle between requests
     /// unbounded (the per-call reply deadline is managed separately via
     /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
+    ///
+    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
+    /// rejects it, and every arming site would silently fail, leaving the
+    /// admission phase *unbounded* — worse than never calling this) and is
+    /// refused: it is logged and the default is kept. Pass `None` to
+    /// disable the deadline deliberately.
     pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) {
+        // Zero cannot fall back to `reject_zero_deadline`'s `None` here:
+        // this deadline's default is 10s, so `None` (unbounded) is just as
+        // wrong as zero. Keep the default instead.
+        let timeout = match timeout {
+            Some(d) if d.is_zero() => {
+                log::error!(
+                    "RpcServer::set_handshake_timeout: a zero duration is not a \
+                     valid deadline; keeping the default"
+                );
+                Some(DEFAULT_HANDSHAKE_TIMEOUT)
+            }
+            other => other,
+        };
         *self
             .handshake_timeout
             .lock()
@@ -750,7 +775,7 @@ impl RpcServer {
     /// Set (or disable) the **idle read deadline** applied to the
     /// android-13+ serve loop *after* the handshake completes. Default
     /// `None` ⇒ an established session may idle between requests unbounded
-    /// (byte-identical to prior behavior).
+    /// (byte-identical to a server that never calls this).
     ///
     /// [`set_handshake_timeout`](Self::set_handshake_timeout) only bounds
     /// the handshake/first-contact phase; once a peer completes the
@@ -771,13 +796,71 @@ impl RpcServer {
     /// mid-send (the connection is torn down, not desynced). Size `d`
     /// against the slowest acceptable consumer, not just the idle gap.
     ///
-    /// Callback connections (a client's incoming attaches, which this
-    /// server only ever *sends* on) are exempt: they have no serve loop,
-    /// and a sticky deadline there would cut short the server's own
-    /// reply wait on a callback issued outside a handler. Only the
-    /// session reply deadline bounds those sends.
+    /// On callback connections (a client's incoming attaches, which this
+    /// server only ever *sends* on) the **read** half is exempt: they
+    /// have no serve loop, and a sticky read deadline there would cut
+    /// short the server's own reply wait on a callback issued outside a
+    /// handler. The **write** half still applies, and bounds a callback
+    /// *send* to a peer that has stopped reading. The callback *reply*
+    /// wait is bounded separately by
+    /// [`set_reply_timeout`](Self::set_reply_timeout) — this deadline
+    /// cannot cover it, being a sticky read timeout armed before the send.
+    ///
+    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
+    /// rejects it) and is refused — logged and treated as `None`.
     pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) {
-        *self.idle_timeout.lock().expect("idle_timeout poisoned") = timeout;
+        *self.idle_timeout.lock().expect("idle_timeout poisoned") =
+            super::session::reject_zero_deadline(
+                timeout,
+                "RpcServer::set_idle_timeout: a zero duration is not a valid deadline; ignoring",
+            );
+    }
+
+    /// Bound how long this server waits for a **reply to a callback** it
+    /// issued to a client (`RpcSession::set_timeout` on every session this
+    /// server builds). `None` (default) blocks forever on a callback
+    /// issued *outside* a handler — the case this setter exists for —
+    /// which is byte-identical to not calling this at all.
+    ///
+    /// This is the only bound on **that** wait. The idle deadline cannot
+    /// serve there: callback connections are exempt from its *read* half
+    /// (see [`set_idle_timeout`](Self::set_idle_timeout)), because
+    /// `SO_RCVTIMEO` is sticky and would cut short exactly this wait.
+    ///
+    /// A callback issued from **inside** a handler is not on that path
+    /// and is not unbounded without this: it reuses the serve connection
+    /// it is answering on (the re-entrant nested-call pin), so its reply
+    /// wait already sits under whatever read deadline
+    /// [`set_idle_timeout`](Self::set_idle_timeout) armed there — a
+    /// handler slower than the idle deadline makes such a callback fail
+    /// with `StatusCode::TimedOut`. A value set here replaces that
+    /// deadline for the reply wait and the idle one is restored after.
+    /// Without a value here, a client that attaches an incoming connection,
+    /// accepts a callback and then never replies pins the sending worker
+    /// forever — and every later caller behind it, since they queue on the
+    /// same session's connection pool.
+    ///
+    /// Set it on any server that issues callbacks to clients it does not
+    /// control. Size it against the slowest legitimate handler, not the
+    /// round-trip: it bounds the peer's *think time*. It also bounds the
+    /// wait for a free connection slot on the same session
+    /// ([`RpcSession::set_timeout`](super::RpcSession::set_timeout)), so a
+    /// callback behind a busy pool can take up to twice this value
+    /// end-to-end.
+    ///
+    /// Read **once per session**, when the connection that founds it is
+    /// accepted: call this *before* [`run`](Self::run) /
+    /// [`run_background`](Self::run_background). Sessions already
+    /// established keep the value that was in force when they were built.
+    ///
+    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
+    /// rejects it) and is refused — logged and treated as `None`.
+    pub fn set_reply_timeout(&self, timeout: Option<std::time::Duration>) {
+        *self.reply_timeout.lock().expect("reply_timeout poisoned") =
+            super::session::reject_zero_deadline(
+                timeout,
+                "RpcServer::set_reply_timeout: a zero duration is not a valid deadline; ignoring",
+            );
     }
 
     /// Reap finished worker handles and return the live (concurrent)
@@ -806,7 +889,11 @@ impl RpcServer {
     /// `rpc-macos-codesign` feature,
     /// `matches!(p, PeerIdentity::CodeSigned(c) if c.team_id() == Some("TEAMID"))`.
     /// Backend-independent (unix/mem/tls/vsock). The hook must not
-    /// block indefinitely (it runs on the accept path).
+    /// block indefinitely: it runs on the connection's own worker
+    /// thread — concurrently across connections, not serialized by the
+    /// accept loop — and holds that connection's
+    /// [`set_max_connections`](Self::set_max_connections) admission slot
+    /// for its whole duration.
     pub fn set_authorizer<F>(&self, f: F)
     where
         F: Fn(&PeerIdentity) -> bool + Send + Sync + 'static,
@@ -822,7 +909,7 @@ impl RpcServer {
     /// (cloned out of the field's mutex first), so it may re-enter
     /// `server` without self-deadlock. `None` (default, no
     /// `__set_attach_shutdown_probe` call) = byte-identical to the
-    /// pre-hook attach path. Same `__`-prefix unstable-API discipline
+    /// attach path without the probe. Same `__`-prefix unstable-API discipline
     /// as `__fuzz_decode_rpc_parcel`; not part of the supported API
     /// surface.
     #[doc(hidden)]
@@ -899,6 +986,7 @@ impl RpcServer {
             session.set_root(root);
         }
         session.set_max_threads(*self.max_threads.lock().expect("max_threads poisoned"));
+        session.set_timeout(*self.reply_timeout.lock().expect("reply_timeout poisoned"));
         if self.fd_unix_supported.load(Ordering::SeqCst) {
             session.set_supported_fd_modes(&[crate::rpc::FileDescriptorTransportMode::Unix]);
         }
@@ -932,8 +1020,8 @@ impl RpcServer {
         // lifetime (random 32-byte ids never collide in practice, so a
         // dead `Weak` would otherwise linger forever). Explicit
         // `unregister_session` is unnecessary — the founding worker's
-        // exit is no longer the session's death (any *last* slot exit
-        // is), so prune-on-register suffices.
+        // exit is not the session's death (any *last* slot exit is), so
+        // prune-on-register suffices.
         map.retain(|_, w| w.strong_count() > 0);
         map.insert(id, Arc::downgrade(inner));
         drop(map);
@@ -957,9 +1045,14 @@ impl RpcServer {
 
     /// Observability counters.
     /// Respectively: new-session ids registered; **id-demux attaches**
-    /// (a 2nd+ connection bound to a pre-existing shared
-    /// session); non-empty ids that resolved to no live session and
-    /// were rejected. All zero on the default (empty-id) flow ⇒ a
+    /// (a 2nd+ connection bound to a pre-existing shared session);
+    /// **id-carrying connections refused for any reason** — an
+    /// unknown/stale id, a codec-version mismatch with the founding
+    /// session, an attach arriving after `shutdown`, or an attach past
+    /// the incoming/callback slot cap. The last one therefore counts
+    /// more than stale ids: a well-behaved client whose
+    /// `incoming_connections` exceeds this server's callback budget also
+    /// raises it. All zero on the default (empty-id) flow ⇒ a
     /// no-regression witness.
     pub fn session_registered_count(&self) -> usize {
         self.session_registered.load(Ordering::SeqCst)
@@ -980,9 +1073,9 @@ impl RpcServer {
     /// Lock ladder: collect the live `Arc<RpcSessionInner>` snapshot
     /// **first** (releasing the `sessions` mutex), then walk each
     /// session's `state` mutex (via the inner's `local_node_count`
-    /// delegate). Avoids the nested-lock pattern (`sessions` → `state`); a
-    /// poisoned `state` lock in one session no longer poisons
-    /// `sessions` as a side-effect.
+    /// delegate). Avoids the nested-lock pattern (`sessions` → `state`), so
+    /// a poisoned `state` lock in one session does not poison `sessions`
+    /// as a side-effect.
     pub fn live_session_node_count(&self) -> usize {
         let sessions: Vec<_> = self
             .sessions
@@ -1140,7 +1233,7 @@ impl RpcServer {
     /// to the long-lived serving phase (best-effort), arming **both** the
     /// read and write deadlines. By default both are lifted (`None`), so an
     /// established two-way session may idle between requests unbounded —
-    /// byte-identical to prior behavior. If
+    /// byte-identical to a server with no idle deadline set. If
     /// [`set_idle_timeout`](Self::set_idle_timeout) was called, the serve
     /// loop inherits that value on each side, so a peer that completes the
     /// handshake and then goes silent (or stops reading our replies) — a
@@ -1154,9 +1247,16 @@ impl RpcServer {
         }
         // Mirror the deadline onto the write side so a peer that idles
         // *and* stops reading can't pin the worker via a blocked reply
-        // send. `None` (the default) leaves writes unbounded — byte-
-        // identical to prior behavior; a configured idle timeout now
-        // bounds both directions.
+        // send. `None` (the default) leaves writes unbounded; a
+        // configured idle timeout bounds both directions.
+        self.arm_write_timeout(transport);
+    }
+
+    /// The write half of [`arm_serve_timeouts`](Self::arm_serve_timeouts),
+    /// on its own for the callback-slot path, which arms the write
+    /// deadline but must leave the read side unbounded.
+    fn arm_write_timeout(&self, transport: &dyn RpcTransport) {
+        let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
         if let Err(e) = transport.set_write_timeout(idle) {
             log::debug!("RPC: failed to set serve-phase write timeout: {e:?}");
         }
@@ -1236,28 +1336,17 @@ impl RpcServer {
                             return;
                         }
                     };
-                // Handshake done: transition the admission deadline to the
-                // serve-phase deadline — `None` (default, unbounded idle) or
-                // the configured `set_idle_timeout` so a post-handshake
-                // silent peer is evicted instead of pinning its slot.
                 if incoming {
-                    // Attach + incoming (`server_accept` already
-                    // rejected new + incoming): resolve the session,
-                    // register a callback slot, and exit the worker.
-                    //
-                    // A callback slot is never served, so the serve-phase
-                    // idle deadline must NOT be armed on it: `SO_RCVTIMEO`
-                    // is sticky, and the server's own reply wait on this
-                    // slot (a callback issued outside any handler) would
-                    // otherwise be cut short by `set_idle_timeout`. Lift
-                    // the handshake deadline instead — only the session
-                    // reply deadline bounds sends on this slot.
+                    // Attach + incoming: resolve the session, register a
+                    // callback slot, exit the worker (never served here).
+                    // A callback slot has no serve loop — a sticky
+                    // `SO_RCVTIMEO` here would cut short this server's own
+                    // reply wait, so only the write half is armed (see
+                    // `set_idle_timeout` / `set_reply_timeout`).
                     if let Err(e) = transport.set_read_timeout(None) {
                         log::debug!("RPC: failed to clear callback-slot read timeout: {e:?}");
                     }
-                    if let Err(e) = transport.set_write_timeout(None) {
-                        log::debug!("RPC: failed to clear callback-slot write timeout: {e:?}");
-                    }
+                    server.arm_write_timeout(transport.as_ref());
                     // The slot lives in the pool for server→client
                     // sends; there is no read loop because
                     // client→server traffic only uses outgoing
@@ -1332,6 +1421,10 @@ impl RpcServer {
                     }
                     return;
                 }
+                // Handshake done: transition the admission deadline to the
+                // serve-phase deadline — `None` (default, unbounded idle) or
+                // the configured `set_idle_timeout` so a post-handshake
+                // silent peer is evicted instead of pinning its slot.
                 server.arm_serve_timeouts(transport.as_ref());
                 if client_id.is_empty() {
                     // New session: mint, register, serve. Registry
@@ -1353,6 +1446,13 @@ impl RpcServer {
                     let id = RpcSessionId::new(session.session_id());
                     server.register_session(id, &session.inner_arc());
                     server.configure_session(&session);
+                    // Baseline `arm_serve_timeouts` just armed on this
+                    // connection: a callback's reply deadline must be
+                    // *restored* to it, not cleared, or the first nested
+                    // callback silently disables idle eviction here.
+                    session.set_serve_read_deadline(
+                        *server.idle_timeout.lock().expect("idle_timeout poisoned"),
+                    );
                     if let Err(e) = session.serve_blocking() {
                         log::debug!("RPC session ended: {e:?}");
                     }
@@ -1467,8 +1567,8 @@ impl RpcServer {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            // Admission bound (opt-in; `None` ⇒ skip entirely, prior
-            // behavior bit-identical). At capacity we simply don't
+            // Admission bound (opt-in; `None` ⇒ skip entirely, bit-
+            // identical to an unbounded server). At capacity we simply don't
             // accept this iteration: pending clients wait in the kernel
             // listen backlog (reactor-free backpressure, no client
             // dropped). `continue` re-checks `shutdown` every tick, so
@@ -1588,14 +1688,24 @@ impl RpcServer {
     ///
     /// `Drop` only flips the shutdown flag and removes the socket — it
     /// deliberately does **not** join in-flight session workers (they
-    /// drain on peer close). A worker that panicked is therefore only
-    /// observable through this call: for clean shutdown and worker
-    /// error/panic observability, call `join_workers` explicitly rather
-    /// than relying on `Drop`.
+    /// drain on peer close), so call `join_workers` explicitly rather
+    /// than relying on `Drop` for a clean shutdown.
+    ///
+    /// Panic observability is **best-effort**. Every accept and every
+    /// [`serve_connection`](RpcServer::serve_connection) reaps
+    /// already-finished handles out of `workers` — that is what bounds
+    /// the vector by *concurrent* rather than cumulative connections —
+    /// and reaping drops the `JoinHandle`, which detaches the thread;
+    /// `JoinHandle::is_finished` cannot tell a panicked worker from a
+    /// clean one. This call therefore warns for exactly the workers
+    /// still registered when it runs: a worker that panicked and was
+    /// then reaped by a later connection is not reported.
     pub fn join_workers(&self) {
         let handles: Vec<_> = std::mem::take(&mut *self.workers.lock().expect("workers poisoned"));
         for h in handles {
-            let _ = h.join();
+            if h.join().is_err() {
+                log::warn!("RPC: connection worker panicked");
+            }
         }
     }
 
@@ -1659,12 +1769,21 @@ impl Drop for RpcServer {
     /// reference indefinitely — the last external `Arc<RpcServer>`
     /// going out of scope does **not** trigger this `Drop` until the
     /// worker also releases its clone (peer close, kernel reset,
-    /// etc.). For deterministic teardown call
-    /// [`RpcServer::shutdown`] **and** [`RpcServer::join_workers`]
-    /// explicitly, or impose a `set_read_timeout` so a stalled peer
-    /// surfaces as a worker-loop error instead of an indefinite
-    /// hold. Closing socket-level paths so the kernel times out the
-    /// peer is also sufficient. (Using `Weak<Self>` plus periodic
+    /// etc.).
+    ///
+    /// [`RpcServer::shutdown`] does not help there: the flag it flips is
+    /// polled by the accept loop and read by the android-13+ attach arms
+    /// (which refuse a late attach), but a worker already blocked in
+    /// `recv` never reaches a gate that reads it. Nor does
+    /// [`RpcServer::join_workers`], which waits for exactly the workers
+    /// that are hung. What bounds a stalled peer is a deadline on its
+    /// own connection — [`set_handshake_timeout`](Self::set_handshake_timeout)
+    /// for a peer that stalls at first contact, and
+    /// [`set_idle_timeout`](Self::set_idle_timeout) for one that goes
+    /// silent afterwards (android-13+ serve path only; the default r34
+    /// profile clears its read deadline after the first frame and then
+    /// blocks unbounded) — or closing socket-level paths so the kernel
+    /// times the peer out. (Using `Weak<Self>` plus periodic
     /// upgrade-checks in worker hot paths would remove the hold
     /// entirely, at the cost of a larger refactor.)
     fn drop(&mut self) {

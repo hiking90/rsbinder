@@ -135,7 +135,7 @@ fn vsock_loopback_e2e() {
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_shutdown_wakes_blocked_recv() {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use vsock::VMADDR_CID_LOCAL;
 
     let port = TEST_PORT + 1;
@@ -147,26 +147,36 @@ fn vsock_shutdown_wakes_blocked_recv() {
 
     let t: Arc<dyn RpcTransport> =
         Arc::new(VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect"));
+    // The reader reports through a channel, so "shutdown must wake it"
+    // is a `recv_timeout` that *fails* on regression. Asserting on
+    // `elapsed()` after `reader.join()` cannot: if `shutdown` stops
+    // waking the reader, the join never returns and the test hangs
+    // until the CI timeout instead of failing here.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = {
         let t = Arc::clone(&t);
-        std::thread::spawn(move || t.recv_frame())
+        std::thread::spawn(move || {
+            let _ = tx.send(t.recv_frame());
+        })
     };
     // Give the reader time to park in `recv`.
     std::thread::sleep(Duration::from_millis(200));
-    let t0 = Instant::now();
     t.shutdown().expect("shutdown");
-    let got = reader.join().expect("reader thread");
+    let got = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("shutdown must wake the blocked reader");
     assert!(
         got.is_err(),
         "recv must not return a frame after shutdown: {got:?}"
     );
-    assert!(
-        t0.elapsed() < Duration::from_secs(2),
-        "shutdown must wake the reader promptly: {:?}",
-        t0.elapsed()
-    );
+    reader.join().expect("reader thread");
     server.shutdown();
-    let _ = bg.join();
+    // Join the workers before the accept loop, as the sibling test does:
+    // a worker still serving this client would otherwise outlive the test.
+    server.join_workers();
+    if let Err(p) = bg.join() {
+        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+    }
 }
 
 /// Plan 2-20 (`RpcSession::shutdown` on a vsock session): a user
@@ -220,5 +230,9 @@ fn vsock_session_shutdown_ends_serve_thread() {
     drop(client);
     server.shutdown();
     server.join_workers();
-    let _ = bg.join();
+    // Surface an accept-loop panic instead of discarding it — a future
+    // regression there would otherwise leave every test green.
+    if let Err(p) = bg.join() {
+        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+    }
 }

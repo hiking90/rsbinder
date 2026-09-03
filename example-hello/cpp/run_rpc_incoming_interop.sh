@@ -62,7 +62,10 @@ sleep 3
 adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
 
 echo "==> running rsbinder client"
-client_out=$(adb -s "$DEVICE" shell "/data/local/tmp/rpc_incoming_interop_client $SOCK 2>&1; echo client-exit=\$?" | tr -d '\r')
+# `timeout` so a wedged client fails the gate instead of hanging it; the
+# client carries its own 60 s watchdog, this is the backstop for a stall
+# before that thread starts (adb itself, a dead device).
+client_out=$(timeout 180 adb -s "$DEVICE" shell "/data/local/tmp/rpc_incoming_interop_client $SOCK 2>&1; echo client-exit=\$?" | tr -d '\r') || true
 printf '%s\n' "$client_out"
 
 echo "==> server log"
