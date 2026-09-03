@@ -1,0 +1,16 @@
+# Keep `cargo update` inside the workspace MSRV (`rust-version = "1.85"`).
+#
+# The workspace is on resolver v2, whose default is
+# `incompatible-rust-versions = "allow"` — a plain `cargo update` would
+# happily pull crates that declare a newer `rust-version` and break the
+# `rust_min` CI jobs. "fallback" makes the resolver prefer the newest
+# release that still builds on 1.85.
+#
+# Caveat: this only works for crates that declare `rust-version`
+# honestly. Known offender, held back by Cargo.lock alone:
+#   * ignore <= 0.4.29 — 0.4.30 declares no `rust-version` at all yet
+#     uses let-chains (needs 1.88). Reached via tera -> globwalk.
+# After a blanket `cargo update`, verify with:
+#   cargo +1.85 check --workspace --all-features
+[resolver]
+incompatible-rust-versions = "fallback"
