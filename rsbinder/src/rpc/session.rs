@@ -4250,8 +4250,8 @@ impl RpcSession {
             // (see `confirm_attach`). The probe is a reply wait, so it
             // honors the session's `set_timeout` when no explicit
             // handshake timeout is configured.
-            let probe_deadline = handshake_timeout
-                .or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
+            let probe_deadline =
+                handshake_timeout.or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
             let _hs = HandshakeDeadline::arm(&t, probe_deadline).map_err(StatusCode::from)?;
             if let Err(e) = confirm_attach(&t, &codec, session_id) {
                 log_attach_refused(&e);
