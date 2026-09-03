@@ -73,6 +73,8 @@ mod tests {
         _fd: Fd,
         device: &mut binder::binderfs_device,
     ) -> std::result::Result<(), rustix::io::Errno> {
+        // `c_char` is `i8` on x86_64-linux (cast required) and `u8` on
+        // aarch64-android (cast redundant) — only the latter trips the lint.
         #[allow(clippy::unnecessary_cast)]
         let bytes: Vec<u8> = device.name.iter().map(|&c| c as u8).collect();
         let nul = bytes

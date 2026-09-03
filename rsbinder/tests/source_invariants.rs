@@ -39,15 +39,18 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
     }
 }
 
-/// `RpcSessionInner::remove_slot` is `pub(crate)` and safe to call from more
+/// `RpcSessionInner::remove_slot` is private to `rpc/session.rs` and safe to call from more
 /// than one site now that `find_conn` / `find_conn_pinned` return
 /// `Err(StatusCode::DeadObject)` (not `expect`-panic) when their reentrant
-/// slot lookup misses. The three sanctioned callers are the slot's own
-/// `serve_blocking_on` exit and `client_transact`'s two poison paths (a
+/// slot lookup misses. The five sanctioned callers are the slot's own
+/// `serve_blocking_on` exit; `client_transact`'s two poison paths (a
 /// transport-level send failure, and a stale-reply read failure) — both
 /// retire a slot whose peer is gone / stream is desynced so it is never
 /// reused, and the send-failure one is what lets a serve-less client session
-/// reach death detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b).
+/// reach death detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
+/// and the two attach rollbacks, which un-push a slot the peer will never be
+/// able to use — an incoming connection whose serve thread failed to spawn,
+/// and a callback slot whose connection-init write never reached the client.
 /// A NEW caller MUST re-audit that every slot-lookup path tolerates a missing
 /// slot before being added — this bound guards against accidentally
 /// reintroducing a lookup that assumes the slot is always present. The scan is
@@ -55,7 +58,7 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
 /// caller counts too: raise the number deliberately rather than route around
 /// it.
 #[test]
-fn remove_slot_has_exactly_four_callers() {
+fn remove_slot_has_exactly_five_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     // `CARGO_MANIFEST_DIR` is baked in at compile time, so a binary copied
     // elsewhere (a device push, for one) cannot see the sources. Skip loudly
@@ -74,12 +77,13 @@ fn remove_slot_has_exactly_four_callers() {
     );
     assert_eq!(
         hits.len(),
-        4,
-        "RpcSessionInner::remove_slot must have exactly four callers. \
+        5,
+        "RpcSessionInner::remove_slot must have exactly five callers. \
          Found {} call sites: {:#?}\n\
          INVARIANT: only serve_blocking_on's exit path, \
-         client_transact's send-failure / stale-reply poisons, and the \
-         incoming-connection attach's spawn-failure rollback may call remove_slot — \
+         client_transact's send-failure / stale-reply poisons, the \
+         incoming-connection attach's spawn-failure rollback, and the \
+         callback attach's init-write-failure rollback may call remove_slot — \
          find_conn / find_conn_pinned must return DeadObject (not panic) \
          on a missing slot. A new caller MUST audit every slot-lookup \
          path before being added.",

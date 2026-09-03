@@ -19,19 +19,48 @@ pub type Authorizer = Box<dyn Fn(&crate::rpc::PeerIdentity) -> bool + Send + Syn
 #[derive(Default)]
 #[non_exhaustive]
 pub struct ServeOptions {
-    /// Kernel: `ProcessState` max threads (also settable as
-    /// `binder://?threads=`). RPC: `RpcServer::set_max_threads`.
+    /// RPC: `RpcServer::set_max_threads`.
+    ///
+    /// Kernel: **the URI form (`binder://?threads=`) is the only one
+    /// that takes effect.** [`serve`](super::serve) initializes the
+    /// process-wide `ProcessState` — where the kernel pool size is
+    /// fixed, once, for the life of the process — before this option
+    /// can be read, so a value set here is only compared against the
+    /// pool already in force and, on a mismatch, logged as ignored.
     pub threads: Option<u32>,
     /// RPC: `RpcServer::set_max_connections`.
     pub max_connections: Option<usize>,
-    /// RPC: `RpcServer::set_handshake_timeout`.
+    /// RPC: `RpcServer::set_handshake_timeout`. `None` here means
+    /// "leave it alone" — the setter is not called and the server keeps
+    /// its 10 s default. It is *not* the setter's own `None` (deadline
+    /// deliberately disabled), which this facade cannot express.
+    /// `Some(Duration::ZERO)` is passed through and refused by the
+    /// setter, which keeps the 10 s default (`idle_timeout` treats a
+    /// zero the other way — as `None`).
     pub handshake_timeout: Option<Duration>,
-    /// RPC: `RpcServer::set_idle_timeout`.
+    /// RPC: `RpcServer::set_idle_timeout`. `None` here means "leave it
+    /// alone"; the server's own default is already `None` (no idle
+    /// deadline), so the two coincide. `Some(Duration::ZERO)` is passed
+    /// through and the setter treats it as `None`.
     pub idle_timeout: Option<Duration>,
+    /// RPC: `RpcServer::set_reply_timeout` — bounds the wait for a reply
+    /// to a callback this server issues to a client outside a handler.
+    /// The only bound on that wait, so set it on any server that issues
+    /// callbacks to clients it does not control (see
+    /// [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections),
+    /// the client side of that path).
+    pub reply_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_authorizer` — accept/reject a peer by identity.
     #[cfg(feature = "rpc")]
     pub authorizer: Option<Authorizer>,
-    /// `tls://` (required there) or any RPC socket: TLS server config.
+    /// `tls://` only, and required there: TLS server config. Refused on
+    /// every other endpoint, because
+    /// [`ClientOptions::tls`](super::ClientOptions::tls) is `tls://`-only
+    /// too — a server this facade wrapped in TLS over a Unix or vsock
+    /// socket could not be reached by a client this facade built. TLS
+    /// over those sockets is still available one layer down
+    /// (`RpcServer::setup_unix_server_tls` / `setup_vsock_server_tls`),
+    /// with a hand-assembled `TlsTransport::connect_stream` client.
     #[cfg(feature = "rpc-tls")]
     pub tls: Option<std::sync::Arc<crate::rpc::rustls::ServerConfig>>,
     /// RPC: `RpcServer::set_supported_fd_modes`. Advertising
@@ -255,9 +284,12 @@ impl Server {
 
     fn apply_kernel_options(&self) -> Result<()> {
         let o = &self.options;
-        if o.max_connections.is_some() || o.handshake_timeout.is_some() || o.idle_timeout.is_some()
+        if o.max_connections.is_some()
+            || o.handshake_timeout.is_some()
+            || o.idle_timeout.is_some()
+            || o.reply_timeout.is_some()
         {
-            return Err(self.reject("max_connections/handshake_timeout/idle_timeout"));
+            return Err(self.reject("max_connections/handshake_timeout/idle_timeout/reply_timeout"));
         }
         #[cfg(feature = "rpc")]
         if o.authorizer.is_some() || o.fd_modes.is_some() {
@@ -295,33 +327,26 @@ impl Server {
         }
         #[cfg(feature = "rpc-tls")]
         let tls = o.tls.clone();
+        // Same gate as `ClientOptions::tls`: the facade has no TLS client
+        // over a Unix or vsock socket, so a TLS server it built there
+        // would be unreachable from it. Refusing is the "never silently
+        // ignored" contract — and it matters most on an abstract socket,
+        // which has no filesystem permissions, so mTLS may be the only
+        // authentication the operator configured.
+        #[cfg(feature = "rpc-tls")]
+        if tls.is_some() && !matches!(uri.endpoint, Endpoint::Tls(..)) {
+            log::error!(
+                "rsbinder::serve: option `tls` does not apply to {:?} \
+                 (only `tls://`; RpcServer::setup_unix_server_tls / \
+                 setup_vsock_server_tls are the direct forms)",
+                uri.endpoint
+            );
+            return Err(StatusCode::BadValue);
+        }
         let server = match &uri.endpoint {
             Endpoint::Kernel { .. } => unreachable!("kernel handled by caller"),
-            Endpoint::Unix(path) => {
-                #[cfg(feature = "rpc-tls")]
-                if let Some(cfg) = tls {
-                    RpcServer::setup_unix_server_tls(path.clone(), cfg)?
-                } else {
-                    RpcServer::setup_unix_server(path.clone())?
-                }
-                #[cfg(not(feature = "rpc-tls"))]
-                RpcServer::setup_unix_server(path.clone())?
-            }
+            Endpoint::Unix(path) => RpcServer::setup_unix_server(path.clone())?,
             Endpoint::UnixAbstract(name) => {
-                // No TLS variant of the abstract listener exists; refusing
-                // is the "never silently ignored" contract — and it matters
-                // more here than anywhere: an abstract socket has no
-                // filesystem permissions, so mTLS may be the only
-                // authentication the operator configured.
-                #[cfg(feature = "rpc-tls")]
-                if tls.is_some() {
-                    log::error!(
-                        "rsbinder::serve: option `tls` does not apply to {:?} \
-                         (no TLS listener for abstract Unix sockets)",
-                        uri.endpoint
-                    );
-                    return Err(StatusCode::BadValue);
-                }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
                     RpcServer::setup_unix_server_abstract(name)?
@@ -336,13 +361,6 @@ impl Server {
             Endpoint::Vsock(cid, port) => {
                 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
                 {
-                    #[cfg(feature = "rpc-tls")]
-                    if let Some(cfg) = tls {
-                        RpcServer::setup_vsock_server_tls(*cid, *port, cfg)?
-                    } else {
-                        RpcServer::setup_vsock_server(*cid, *port)?
-                    }
-                    #[cfg(not(feature = "rpc-tls"))]
                     RpcServer::setup_vsock_server(*cid, *port)?
                 }
                 #[cfg(not(all(
@@ -388,6 +406,12 @@ impl Server {
         }
         if let Some(t) = o.idle_timeout {
             server.set_idle_timeout(Some(t));
+        }
+        // Before `run`/`run_background`, which the caller reaches only
+        // after `build_rpc` returns — the setter is read once per session,
+        // when its founding connection is accepted.
+        if let Some(t) = o.reply_timeout {
+            server.set_reply_timeout(Some(t));
         }
         if let Some(f) = o.authorizer {
             server.set_authorizer(f);

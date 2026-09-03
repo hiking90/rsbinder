@@ -87,6 +87,14 @@ impl RpcTransport for MemTransport {
                 max: super::MAX_FRAME_LEN,
             });
         }
+        // `shutdown` closed this end in both directions, so a later send
+        // must fail as the socket backends' `shutdown(Both)` makes it
+        // fail (EPIPE) — callers rely on that to retire a slot whose
+        // handshake failed. Without it the frame would queue on an
+        // unbounded channel nobody reads.
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::PeerClosed);
+        }
         // A channel send only fails once the peer's receiver is
         // dropped — i.e. the peer is gone. Lock-free (`Sender: Sync`).
         self.tx.send(buf.to_vec()).map_err(|_| RpcError::PeerClosed)
@@ -103,7 +111,11 @@ impl RpcTransport for MemTransport {
         // noticed; a frame or the peer's drop (every sender gone) returns
         // at once, never spinning.
         const TICK: std::time::Duration = std::time::Duration::from_millis(20);
-        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        // `checked_add`, not `+`: `Instant + Duration` panics on overflow,
+        // and `timeout` is caller-supplied. A duration that cannot be added
+        // to `now` is effectively infinite, which is what `None` already
+        // means here.
+        let deadline = timeout.and_then(|d| std::time::Instant::now().checked_add(d));
         loop {
             let wait = match deadline {
                 Some(at) => {
@@ -168,6 +180,25 @@ mod tests {
         }
     }
 
+    /// `RpcTransport::shutdown` promises both directions: a blocked
+    /// `recv_frame` returns **and** later sends fail. The socket backends
+    /// get the second half from `shutdown(Both)`; `mem` has to model it,
+    /// or a teardown bug that a real transport would surface stays
+    /// invisible to every hermetic test.
+    #[test]
+    fn mem_shutdown_fails_later_sends() {
+        let (a, b) = MemTransport::pair();
+        a.send_frame(b"before").expect("send before shutdown");
+        a.shutdown().expect("shutdown");
+        assert!(
+            matches!(a.send_frame(b"after"), Err(RpcError::PeerClosed)),
+            "a send after shutdown must fail, not queue"
+        );
+        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+        // The peer end is untouched — only this side was shut down.
+        assert_eq!(b.recv_frame().expect("peer still reads"), b"before");
+    }
+
     #[test]
     fn mem_peer_identity_is_current_process() {
         let (a, _b) = MemTransport::pair();
@@ -225,5 +256,16 @@ mod tests {
         }
         a_send.join().unwrap();
         b_send.join().unwrap();
+    }
+
+    /// A read timeout too large to add to `Instant::now()` must read as
+    /// "no deadline", not panic — `set_read_timeout` is public API.
+    #[test]
+    fn unaddable_read_timeout_does_not_panic() {
+        let (a, b) = MemTransport::pair();
+        a.set_read_timeout(Some(std::time::Duration::MAX))
+            .expect("set_read_timeout");
+        b.send_frame(b"hi").expect("send");
+        assert_eq!(a.recv_frame().expect("recv"), b"hi");
     }
 }
