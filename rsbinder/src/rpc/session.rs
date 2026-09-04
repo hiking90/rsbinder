@@ -573,9 +573,17 @@ fn confirm_attach(
     }
 }
 
-/// One line explaining what a refused attach looks like, shared by the
-/// two attach entries so the diagnosis does not drift between them.
+/// Explain a failed attach, shared by the two attach entries so the
+/// diagnosis does not drift between them.
 fn log_attach_refused(e: &RpcError) {
+    if matches!(e, RpcError::Timeout | RpcError::Truncated) {
+        log::error!(
+            "android-13+ RPC: the attach admission probe (GET_SESSION_ID) did not complete \
+             ({e}) — a read deadline armed by this caller ends it this way too, so this is \
+             not necessarily a refusal"
+        );
+        return;
+    }
     log::error!(
         "android-13+ RPC: the peer refused this attach ({e}) — the session id is unknown or \
          stale, the peer's outgoing-slot cap (`set_max_threads`) is spent, or it is shutting \
@@ -585,36 +593,43 @@ fn log_attach_refused(e: &RpcError) {
     );
 }
 
-/// Map an android-13+ **client** handshake failure to a [`StatusCode`],
-/// logging the profile-mismatch hint when a *new-session* handshake
-/// dies at the transport. That is what an r34 (default profile) server
-/// looks like from here: it reads our 16-byte `RpcConnectionHeader` as
-/// an r34 frame, fails to decode it and closes — leaving the client
-/// with a bare dead-peer status and the server with no log at all.
-///
-/// The peer already accepted the connection (a refused `connect()`
-/// never reaches the handshake), so a transport failure *here* means it
-/// hung up or stalled mid-handshake, and a wire-profile mismatch is by
-/// far the likeliest cause — whichever side of the exchange notices
-/// first. Which side that is, is a race: the same mismatch surfaces as
-/// EOF on our response read (the peer closed before we wrote) or as
-/// `EPIPE`/`ECONNRESET` on our `"cci"` write, and the second shape is
-/// what a Linux host usually produces. A `Protocol` error is excluded:
-/// there the peer demonstrably speaks android-13+ and the error already
-/// says what was wrong with its answer.
+/// Map an android-13+ **client** handshake failure to a [`StatusCode`].
+/// A new-session handshake logs a hint first: an r34 (default profile)
+/// peer is the likeliest cause and the returned status cannot say so.
 fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
-    if requesting_new_session
-        && matches!(
-            e,
-            RpcError::PeerClosed | RpcError::Truncated | RpcError::Timeout | RpcError::Io(_)
-        )
-    {
-        log::error!(
-            "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after the \
-             peer accepted the connection — it may be speaking the r34 (default) profile. \
-             Connect without `?profile=android13plus`, or enable the android-13+ wire on the \
-             server (`RpcServer::set_android13plus`)"
-        );
+    if requesting_new_session {
+        match &e {
+            RpcError::PeerClosed => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
+                 the peer accepted the connection — it may be speaking the r34 (default) \
+                 profile. Connect without `?profile=android13plus`, or enable the android-13+ \
+                 wire on the server (`RpcServer::set_android13plus`)"
+            ),
+            RpcError::Truncated => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed part-way through a response \
+                 ({e}) — the peer may be speaking the r34 (default) profile, or a read \
+                 deadline armed on this connection landed mid-frame. Connect without \
+                 `?profile=android13plus`, or enable the android-13+ wire on the server \
+                 (`RpcServer::set_android13plus`)"
+            ),
+            RpcError::Timeout => log::error!(
+                "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
+                 this connection elapsed — that deadline is the caller's own \
+                 (`RpcUnixClientConfig::handshake_timeout`, the 10s \
+                 `RpcSession::from_preconnected_fd` arms, or one set on the transport \
+                 directly), so it may simply be shorter than this peer's legitimate response \
+                 time. A peer that should have answered well within it may be speaking the \
+                 r34 (default) profile instead"
+            ),
+            // The returned status drops the reason string, so this log
+            // is the only description of the violation a caller gets.
+            RpcError::Protocol(_) => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed ({e}) — either the peer's \
+                 answer violated the wire or the caller offered a `max_version` this build \
+                 does not implement"
+            ),
+            _ => {}
+        }
     }
     StatusCode::from(e)
 }

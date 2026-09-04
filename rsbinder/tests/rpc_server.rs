@@ -515,9 +515,7 @@ fn concurrent_calls_single_shared_session() {
     // 8 client threads on the SAME session.
     // ONE client session, its root proxy shared (Arc) across 8 threads
     // — exactly how a generated `Bp*` stub is used concurrently
-    // (`SIBinder` is `Send`/`Sync`). Before the per-connection lock
-    // this interleaved the framed stream / cross-delivered replies.
-    // Calls are internally serialized on the one
+    // (`SIBinder` is `Send`/`Sync`). Calls are internally serialized on the one
     // connection (the documented model: parallelism = multiple
     // connections), so wall time is also bounded well below a hang.
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -1219,35 +1217,23 @@ fn a0b_multi_connection_shared_session() {
     // Strengthen the unknown-id reject assertion: a plain `is_err()`
     // would also pass for an unrelated
     // error (e.g. handshake itself failed). Lock the contract to the
-    // actual post-handshake-reject status set observed on UDS:
-    //
-    //  - **DeadObject** — the canonical path: server `drop(transport)`
-    //    closes the socket; the client's next send/recv surfaces
-    //    `io::ErrorKind::{BrokenPipe,ConnectionReset,UnexpectedEof,…}`
-    //    which `RpcError::from(io)` maps to `PeerClosed` and then
-    //    `StatusCode::DeadObject` (see `rsbinder/src/rpc/mod.rs`
-    //    `From<io::Error> for RpcError` and the `PeerClosed →
-    //    DeadObject` arm).
-    //  - **TimedOut** — `set_timeout(3s)` fires before the close
-    //    propagates.
-    //  - **Unknown** — host-OS dependent: macOS in particular can
-    //    surface a socket-close as an `io::Error` whose
-    //    `raw_os_error() == None` (e.g. `ErrorKind::Other`), which
-    //    `StatusCode::from(io::Error)` maps to `Unknown` rather than
-    //    `PeerClosed`. Accepted as a reject status.
-    //
-    // Anything outside this set means a different bug (and `Ok` is
-    // the true mutant: server honored the unknown id).
+    // single status this reject produces: the server `drop(transport)`
+    // closes the socket, and a disconnect folds to `PeerClosed` and
+    // then `StatusCode::DeadObject` (see `rsbinder/src/rpc/mod.rs`,
+    // `From<io::Error> for RpcError`, kind-preserving in both
+    // directions per
+    // `rpc::tests::peer_closed_and_timeout_round_trip_through_io_error`).
+    // This path arms no deadline (`RpcUnixClientConfig`'s
+    // `handshake_timeout` defaults to `None`), so a `TimedOut` or an
+    // unclassified `Unknown` here means a different bug — as does `Ok`,
+    // the true mutant: server honored the unknown id.
     let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &bogus)
         .err()
         .expect("unknown id rejected");
-    assert!(
-        matches!(
-            err,
-            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
-        ),
-        "unknown id reject should surface as DeadObject (PeerClosed path) / \
-         TimedOut (deadline wins) / Unknown (host-OS-dependent close), got {err:?}"
+    assert_eq!(
+        err,
+        StatusCode::DeadObject,
+        "unknown id reject must surface as DeadObject (the PeerClosed path)"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == 1),
@@ -1464,13 +1450,11 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
         .err()
         .expect("3rd attach must be rejected by the per-session cap");
-    assert!(
-        matches!(
-            err,
-            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
-        ),
-        "cap-reject surfaces as the same reject set as unknown-id reject \
-         (post-handshake socket close), got {err:?}"
+    assert_eq!(
+        err,
+        StatusCode::DeadObject,
+        "cap-reject surfaces as the same status as the unknown-id reject \
+         (post-handshake socket close)"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
@@ -1659,12 +1643,8 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
 /// admission with one `GET_SESSION_ID` round trip on the fresh
 /// connection.
 ///
-/// Reported from a downstream project (2026-09-03): with a wrong id the
-/// attach returned `Ok`, the dead slot stayed in the pool, and one
-/// later unrelated call — whichever one `find_conn` routed onto that
-/// slot — failed. Single-threaded clients always draw slot 1 first, so
-/// this drives 4 threads to make the pool actually reach the attached
-/// slot.
+/// Single-threaded clients always draw slot 1 first, so this drives 4
+/// threads to make the pool actually reach the attached slot.
 ///
 /// **Mutant gate**: dropping the `confirm_attach` call restores
 /// `Ok(2)` for both bogus ids and re-poisons the pool (the echo loop
@@ -1717,8 +1697,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     );
 
     // (c) The control: the server-minted id attaches, and the pool is
-    //     clean — 200 calls across 4 threads, zero failures. Before the
-    //     fix a bogus attach made ~1 in 4 of these fail.
+    //     clean — 200 calls across 4 threads, zero failures.
     assert_eq!(
         client
             .add_outgoing_connection_android13plus(&path, 1, &sid)
@@ -1832,28 +1811,12 @@ fn attach_max_version_below_the_session_version_is_bad_type() {
 /// The r34-server / android-13+-client half of a wire-profile
 /// mismatch. The server is the default (r34) wire, so it reads the
 /// client's 16-byte `RpcConnectionHeader` as an r34 frame, fails to
-/// decode it and closes.
-///
-/// Two things are gated here, both reported from downstream:
-///
-/// 1. **The status is `DeadObject` on every host.** Which side notices
-///    the disconnect first is a race — the client either reads EOF
-///    where `RpcNewSessionResponse` was due (macOS, typically) or takes
-///    `EPIPE`/`ECONNRESET` on its `"cci"` write (Linux, typically) —
-///    and the write side used to lose the classification across
-///    `RawTransportIo`, reporting `StatusCode::Unknown`.
-/// 2. **A hint is logged naming the r34 profile** (the log itself is
-///    not asserted here; `client_handshake_err` keys it on exactly the
-///    transport-level variants this status covers, and
-///    `peer_closed_and_timeout_round_trip_through_io_error` pins the
-///    classification that gets it there).
+/// decode it and closes. The client must report `DeadObject`, not an
+/// unclassified `StatusCode::Unknown`.
 ///
 /// The opposite direction (r34 client, android-13+ server) is covered
 /// by the `"cci"` reject string in
-/// `wire_android13::tests::codec_roundtrip_and_handshake_frames`.
-///
-/// **Mutant gate**: stringifying `PeerClosed` in `From<RpcError> for
-/// io::Error` again turns the write-side race into `Unknown` here.
+/// `wire_android13::tests::android13plus_spec_golden_vectors`.
 #[test]
 fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     let path = tmp_sock("profmix");
@@ -2007,13 +1970,11 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
         .join()
         .expect("attach thread should not panic");
     let err = attach_result.expect_err("attach during shutdown must be rejected (mutant: success)");
-    assert!(
-        matches!(
-            err,
-            StatusCode::DeadObject | StatusCode::TimedOut | StatusCode::Unknown
-        ),
-        "shutdown-reject surfaces as the same reject set as cap/unknown-id reject \
-         (post-handshake socket close), got {err:?}"
+    assert_eq!(
+        err,
+        StatusCode::DeadObject,
+        "shutdown-reject surfaces as the same status as the cap/unknown-id reject \
+         (post-handshake socket close)"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),

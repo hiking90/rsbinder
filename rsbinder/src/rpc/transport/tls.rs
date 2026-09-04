@@ -511,9 +511,10 @@ impl Write for RawIo<'_> {
         Ok(buf.len())
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0
-            .send_raw(buf)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        // Kind-preserving like `RawTransportIo`: a write to a peer that
+        // already closed must reach `write_frame`'s `?` as `PeerClosed`
+        // (`DeadObject`), not an unclassified `Io(Other)`.
+        self.0.send_raw(buf).map_err(std::io::Error::from)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(()) // send_raw already flushes the socket
