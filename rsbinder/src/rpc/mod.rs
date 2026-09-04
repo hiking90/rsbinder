@@ -215,11 +215,21 @@ impl From<RpcError> for std::io::Error {
     /// `RpcServer::run` is the motivating site — its `accept_transport`
     /// helper must surface a `from_stream`-side `RpcError` through the
     /// same `io::ErrorKind` matching as the underlying `accept()`).
-    /// `RpcError::Io` round-trips the original `io::Error` unchanged;
-    /// other variants are wrapped with [`std::io::ErrorKind::Other`].
+    /// `RpcError::Io` round-trips the original `io::Error` unchanged.
+    /// [`RpcError::PeerClosed`] and [`RpcError::Timeout`] project onto
+    /// the `io::ErrorKind` they came from (`BrokenPipe` / `TimedOut`),
+    /// so `RpcError -> io::Error -> RpcError` is lossless for them:
+    /// wrapping a peer close as `Other` used to turn every write-side
+    /// disconnect on an android-13+ session into `RpcError::Io(Other)`
+    /// — i.e. `StatusCode::Unknown` instead of `DeadObject`, and a
+    /// handshake diagnosis that could no longer tell a dead peer from a
+    /// malformed one. The remaining variants have no `io::ErrorKind`
+    /// that means what they mean, so they stay `Other`.
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::Io(io) => io,
+            RpcError::PeerClosed => std::io::ErrorKind::BrokenPipe.into(),
+            RpcError::Timeout => std::io::ErrorKind::TimedOut.into(),
             other => std::io::Error::other(format!("{other}")),
         }
     }
@@ -341,6 +351,49 @@ mod tests {
         assert_eq!(
             StatusCode::from(RpcError::Protocol("bad")),
             StatusCode::RpcError
+        );
+    }
+
+    /// `RpcError -> io::Error -> RpcError` must be lossless for the two
+    /// variants that have an `io::ErrorKind` meaning the same thing.
+    /// `RawTransportIo` crosses that boundary on every android-13+ read
+    /// and write, so a variant that degrades to `Other` there comes back
+    /// as `Io(Other)`: a peer that closed before our write then reported
+    /// `StatusCode::Unknown` instead of `DeadObject`, and the handshake
+    /// diagnosis could no longer recognize a dead peer. Which side of an
+    /// exchange notices a disconnect first is a host- and timing-
+    /// dependent race, so both directions have to classify alike.
+    ///
+    /// **Mutant gate**: restoring `other => io::Error::other(...)` for
+    /// `PeerClosed` fails the round trip below (and the timeout arm
+    /// guards `read_exact_into`'s `is_timeout` path the same way).
+    #[test]
+    fn peer_closed_and_timeout_round_trip_through_io_error() {
+        let io = std::io::Error::from(RpcError::PeerClosed);
+        assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(RpcError::from(io), RpcError::PeerClosed));
+        assert_eq!(
+            StatusCode::from(RpcError::from(std::io::Error::from(RpcError::PeerClosed))),
+            StatusCode::DeadObject,
+            "a write-side disconnect must stay DeadObject, not Unknown"
+        );
+
+        let io = std::io::Error::from(RpcError::Timeout);
+        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            transport::is_timeout(&io),
+            "read_exact_into's deadline arm keys on this kind"
+        );
+
+        // An `Io` payload still round-trips unchanged, and a variant
+        // with no matching kind still degrades to `Other`.
+        let io = std::io::Error::from(RpcError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::io::Error::from(RpcError::Protocol("bad")).kind(),
+            std::io::ErrorKind::Other
         );
     }
 

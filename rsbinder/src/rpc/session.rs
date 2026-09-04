@@ -586,17 +586,32 @@ fn log_attach_refused(e: &RpcError) {
 }
 
 /// Map an android-13+ **client** handshake failure to a [`StatusCode`],
-/// logging the profile-mismatch hint when the peer hung up where its
-/// `RpcNewSessionResponse` was due. That is what an r34 (default
-/// profile) server looks like from here: it reads our 16-byte
-/// `RpcConnectionHeader` as an r34 frame, fails to decode it and
-/// closes — leaving the client with a bare `DeadObject` and the server
-/// with no log at all.
+/// logging the profile-mismatch hint when a *new-session* handshake
+/// dies at the transport. That is what an r34 (default profile) server
+/// looks like from here: it reads our 16-byte `RpcConnectionHeader` as
+/// an r34 frame, fails to decode it and closes — leaving the client
+/// with a bare dead-peer status and the server with no log at all.
+///
+/// The peer already accepted the connection (a refused `connect()`
+/// never reaches the handshake), so a transport failure *here* means it
+/// hung up or stalled mid-handshake, and a wire-profile mismatch is by
+/// far the likeliest cause — whichever side of the exchange notices
+/// first. Which side that is, is a race: the same mismatch surfaces as
+/// EOF on our response read (the peer closed before we wrote) or as
+/// `EPIPE`/`ECONNRESET` on our `"cci"` write, and the second shape is
+/// what a Linux host usually produces. A `Protocol` error is excluded:
+/// there the peer demonstrably speaks android-13+ and the error already
+/// says what was wrong with its answer.
 fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
-    if requesting_new_session && matches!(e, RpcError::PeerClosed | RpcError::Truncated) {
+    if requesting_new_session
+        && matches!(
+            e,
+            RpcError::PeerClosed | RpcError::Truncated | RpcError::Timeout | RpcError::Io(_)
+        )
+    {
         log::error!(
-            "rsbinder RPC: the peer closed the connection during the android-13+ handshake, \
-             before its RpcNewSessionResponse — it may be speaking the r34 (default) profile. \
+            "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after the \
+             peer accepted the connection — it may be speaking the r34 (default) profile. \
              Connect without `?profile=android13plus`, or enable the android-13+ wire on the \
              server (`RpcServer::set_android13plus`)"
         );

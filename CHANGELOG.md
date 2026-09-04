@@ -727,20 +727,33 @@ short form — and the first entry is the only one no compiler will catch.
   client's `RpcSession::session_id()` is a client-local value that is never
   the peer's id (only `get_session_id()` fetches that), which is the mistake
   this used to accept silently; its rustdoc now says so.
+- **rsbinder (RPC) — a write-side disconnect on an android-13+ session
+  reported `Unknown` instead of `DeadObject`.** `RawTransportIo` bridges the
+  transport to `std::io`, and its projection stringified every `RpcError`
+  into `io::Error::other`, so a `PeerClosed` raised while *sending* came
+  back from the other side of that boundary as `Io(Other)` — a peer that had
+  gone away was reported as an unclassified error, on the send path of every
+  call as well as the handshake. `From<RpcError> for io::Error` is now
+  kind-preserving for the two variants that have an `io::ErrorKind` meaning
+  the same thing (`PeerClosed` → `BrokenPipe`, `Timeout` → `TimedOut`), so
+  the round trip is lossless in both directions.
 - **rsbinder (RPC) — a wire-profile mismatch never mentioned the profile.**
   An r34 (default) client's first frame parses as a *valid-looking* v0
   `RpcConnectionHeader` — its leading `CMD_TRANSACT` reads as protocol
   version 0 — so an android-13+ server accepted it, answered, and failed at
   the `"cci"` check with a reject that named nothing an operator could act
   on; the server's handshake log also flattened every cause into the opaque
-  `RpcError` status name. In the other direction an r34 server closed the
-  connection mid-handshake and the client surfaced a bare `DeadObject` with
-  no log at all. Both rejects now name the r34 profile as the likely cause,
-  in the same shape as the existing `Client::open` diagnostics. An attach
-  whose `max_version` is below the session's negotiated version (which can
-  never work — an attach does not negotiate) now logs that
-  `wire_protocol_version()` is the value to pass instead of failing with a
-  bare `BadType`.
+  `RpcError` status name. In the other direction an r34 server hung up
+  mid-handshake and the client got a bare dead-peer status with no log at
+  all. Both rejects now name the r34 profile as the likely cause, in the
+  same shape as the existing `Client::open` diagnostics. Which side of that
+  exchange notices the disconnect first is a host- and timing-dependent race
+  (EOF on the client's response read, or `EPIPE`/`ECONNRESET` on its `"cci"`
+  write), so the client hint covers every transport-level handshake failure
+  rather than the clean-EOF shape alone. An attach whose `max_version` is
+  below the session's negotiated version (which can never work — an attach
+  does not negotiate) now logs that `wire_protocol_version()` is the value
+  to pass instead of failing with a bare `BadType`.
 - **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
   freed memory.** `write_transaction_data` stores raw pointers to the reply
   parcel (or the status word on the stack) in the thread's command buffer.

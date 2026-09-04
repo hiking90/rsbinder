@@ -1829,6 +1829,54 @@ fn attach_max_version_below_the_session_version_is_bad_type() {
     );
 }
 
+/// The r34-server / android-13+-client half of a wire-profile
+/// mismatch. The server is the default (r34) wire, so it reads the
+/// client's 16-byte `RpcConnectionHeader` as an r34 frame, fails to
+/// decode it and closes.
+///
+/// Two things are gated here, both reported from downstream:
+///
+/// 1. **The status is `DeadObject` on every host.** Which side notices
+///    the disconnect first is a race — the client either reads EOF
+///    where `RpcNewSessionResponse` was due (macOS, typically) or takes
+///    `EPIPE`/`ECONNRESET` on its `"cci"` write (Linux, typically) —
+///    and the write side used to lose the classification across
+///    `RawTransportIo`, reporting `StatusCode::Unknown`.
+/// 2. **A hint is logged naming the r34 profile** (the log itself is
+///    not asserted here; `client_handshake_err` keys it on exactly the
+///    transport-level variants this status covers, and
+///    `peer_closed_and_timeout_round_trip_through_io_error` pins the
+///    classification that gets it there).
+///
+/// The opposite direction (r34 client, android-13+ server) is covered
+/// by the `"cci"` reject string in
+/// `wire_android13::tests::codec_roundtrip_and_handshake_frames`.
+///
+/// **Mutant gate**: stringifying `PeerClosed` in `From<RpcError> for
+/// io::Error` again turns the write-side race into `Unknown` here.
+#[test]
+fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
+    let path = tmp_sock("profmix");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    // No `set_android13plus`: the default r34 wire.
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    for v in [0u32, 1, 2] {
+        match RpcSession::setup_unix_client_android13plus(&path, v) {
+            Ok(_) => panic!("an r34 server must not complete an android-13+ handshake (v{v})"),
+            Err(e) => assert_eq!(
+                e,
+                StatusCode::DeadObject,
+                "profile mismatch at max_version={v} must report the peer as dead, whichever \
+                 side of the handshake notices first"
+            ),
+        }
+    }
+}
+
 /// A standalone attach *session*
 /// ([`RpcSession::setup_unix_client_android13plus_with_id`], and the
 /// `ClientOptions::session_id` path over it) is confirmed the same way:

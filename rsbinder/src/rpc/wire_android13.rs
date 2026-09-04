@@ -1214,13 +1214,12 @@ pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.recv_raw(buf).map_err(|e| match e {
-            // Preserve the timeout kind across the `Read` boundary so
-            // `read_exact_raw` can honor the `Timeout`/`Truncated`
-            // contract; other errors keep their string form.
-            RpcError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut),
-            other => std::io::Error::other(other.to_string()),
-        })
+        // `From<RpcError>` is kind-preserving (`Timeout` -> `TimedOut`
+        // for `read_exact_into`'s `is_timeout` arm, `PeerClosed` ->
+        // `BrokenPipe`), so the `map_io` on the other side of this
+        // boundary recovers the same variant instead of a stringified
+        // `Io(Other)`.
+        self.0.recv_raw(buf).map_err(std::io::Error::from)
     }
 }
 
@@ -1230,9 +1229,10 @@ impl Write for RawTransportIo<'_> {
         Ok(buf.len())
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0
-            .send_raw(buf)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        // Kind-preserving, as on the read side: a peer that closed
+        // before our write must surface as `PeerClosed` (`DeadObject`),
+        // not as the `Io(Other)` a stringified error produced.
+        self.0.send_raw(buf).map_err(std::io::Error::from)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(()) // `send_raw` already flushes the underlying stream.
