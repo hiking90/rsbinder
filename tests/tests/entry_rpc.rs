@@ -191,8 +191,7 @@ fn entry_zero_handshake_timeout_is_refused() {
     let err = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
         o.handshake_timeout = Some(std::time::Duration::ZERO)
     })
-    .err()
-    .expect("a zero handshake deadline must be refused");
+    .expect_err("a zero handshake deadline must be refused");
     assert_eq!(err, rsbinder::StatusCode::BadValue);
 
     // Control: a positive deadline on the same endpoint connects.
