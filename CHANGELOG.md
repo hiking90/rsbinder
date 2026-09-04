@@ -727,6 +727,17 @@ short form — and the first entry is the only one no compiler will catch.
   client's `RpcSession::session_id()` is a client-local value that is never
   the peer's id (only `get_session_id()` fetches that), which is the mistake
   this used to accept silently; its rustdoc now says so.
+- **rsbinder (RPC) — a zero handshake deadline was neither honored nor
+  reported.** `RpcUnixClientConfig::handshake_timeout(Duration::ZERO)` and
+  `ClientOptions::handshake_timeout = Some(Duration::ZERO)` travelled to
+  `set_read_timeout` (and, on `tls://`, `TcpStream::connect_timeout`), both of
+  which document an error for a zero duration, so setup failed with an
+  unexplained `StatusCode::Unknown`. A zero duration cannot be a deadline and
+  `None` already means "no deadline", so it is now refused: the setup and
+  attach entries return `BadValue` naming the option, before any connect, and
+  the one place every handshake deadline is armed refuses it as well — no
+  `RpcTransport` implementation can be handed a value its socket rejects, or
+  quietly turn the caller's bound into no bound at all.
 - **rsbinder (RPC) — a write-side disconnect on an android-13+ session
   reported `Unknown` instead of `DeadObject`.** `RawTransportIo` bridges the
   transport to `std::io`, and its write side stringified the `RpcError`
