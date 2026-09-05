@@ -1647,7 +1647,7 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
 /// threads to make the pool actually reach the attached slot.
 ///
 /// **Mutant gate**: dropping the `confirm_attach` call restores
-/// `Ok(2)` for both bogus ids and re-poisons the pool (the echo loop
+/// `Ok(2)` for both bogus ids and re-corrupts the pool (the echo loop
 /// then fails ~1/4 of its calls).
 #[test]
 fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
@@ -3003,8 +3003,8 @@ fn a_outside_handler_call_without_outgoing_slot_fails_fast() {
             },
         };
         assert!(
-            matches!(r, Err(StatusCode::FailedTransaction)),
-            "oneway={oneway}: expected FailedTransaction, got {r:?}"
+            matches!(r, Err(StatusCode::WouldBlock)),
+            "oneway={oneway}: expected WouldBlock, got {r:?}"
         );
     }
     assert_eq!(h.root.echo("still in sync").unwrap(), "still in sync");
@@ -3056,8 +3056,8 @@ fn a_served_slot_never_taken_by_outside_transact() {
             let _ = tx.send(drive(&cb, i % 2 == 1));
         });
         match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Err(StatusCode::FailedTransaction)) => {}
-            other => panic!("attempt {i}: expected FailedTransaction, got {other:?}"),
+            Ok(Err(StatusCode::WouldBlock)) => {}
+            other => panic!("attempt {i}: expected WouldBlock, got {other:?}"),
         }
     }
     stop.store(true, Ordering::SeqCst);
@@ -4099,11 +4099,11 @@ impl Remotable for ShutdownCbRef {
 }
 
 /// A client with `incoming_connections > 0` that loses its only
-/// `Outgoing` slot to a reply-deadline poison must still declare the
+/// `Outgoing` slot to a reply-deadline retirement must still declare the
 /// session dead: the surviving callback slot keeps the pool non-empty,
 /// but nothing reads a request written on it, so without the
 /// last-outgoing check the session stayed `Live` forever — every later
-/// transact answered `FailedTransaction` with no obituary and no
+/// transact answered `WouldBlock` with no obituary and no
 /// `RpcState::clear`.
 #[test]
 fn c_losing_the_last_outgoing_slot_declares_death_with_incoming() {

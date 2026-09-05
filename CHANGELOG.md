@@ -55,6 +55,18 @@ short form — and the first entry is the only one no compiler will catch.
   serve loop of the session as `EndedBy::Local` with an intact stream; it
   used to come back as `Ok(())` or `Err(DeadObject)` depending on whether the
   worker was parked in `recv` or inside a handler at the time.
+- **A transaction that could not be sent fails with `StatusCode::WouldBlock`.**
+  Two cases that never reached the wire reported other codes: a call on a
+  session with no outgoing connection (a server calling a client proxy
+  outside any handler, the client having opened no incoming connection)
+  returned `FailedTransaction`, and a call whose wait for a free connection
+  slot hit the session deadline returned `TimedOut` — the same code as a
+  reply wait that expired after the peer may already have executed the
+  request. Both are now `WouldBlock`, AOSP's `WOULD_BLOCK` for exactly this:
+  nothing was sent, so the call is safe to retry. `TimedOut` from a transact
+  now means only that the request went out and no reply came in time;
+  `FailedTransaction` keeps its other meanings (an oneway backlog flushed, an
+  attach past the incoming-slot cap).
 - **Dropping a `ServerGuard` now ends the server, connected clients
   included.** It used to flip the accept flag and join the workers, which
   blocked for as long as any client stayed connected — a `?` or a panic that
@@ -741,6 +753,17 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC) — a slot a nested call had marked unreadable could still
+  be handed out for writing.** The mark gated only the two readers; the slot
+  selectors did not look at it, so a handler that swallowed the nested
+  call's error and returned normally had its reply written on the lost
+  stream, and a concurrent caller could claim the slot and send a request
+  the reply wait would then refuse — executed by the peer, answer thrown
+  away. The selectors now refuse it: the frame that owns it gets
+  `DeadObject` before writing, a scan for a free outgoing slot skips it (a
+  session whose only outgoing slot is unreadable fails fast with
+  `WouldBlock` rather than waiting), and the non-blocking selector declines
+  it.
 - **rsbinder (RPC) — a local shutdown ended a serve loop as `Ok(())` or
   `Err(DeadObject)` by race.** `on_session_dead` shuts the transports down
   and then clears the slot pool; a worker parked in `recv` woke with end of

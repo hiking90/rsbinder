@@ -109,7 +109,7 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
 /// slot lookup misses. The six sanctioned callers are the slot's own
 /// `serve_blocking_on` exit; `client_transact`'s three slot-retiring paths (a
 /// transport-level send failure, a stale-reply read failure, and the reply
-/// wait's refusal of a slot a nested call poisoned) — all retire a slot whose
+/// wait's refusal of a slot a nested call marked unreadable) — all retire a slot whose
 /// peer is gone / stream is desynced so it is never
 /// reused, and the send-failure one is what lets a serve-less client session
 /// reach death detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
@@ -146,7 +146,7 @@ fn remove_slot_has_exactly_six_callers() {
         "RpcSessionInner::remove_slot must have exactly six callers. \
          Found {} call sites: {:#?}\n\
          INVARIANT: only serve_blocking_on's exit path, \
-         client_transact's send-failure / stale-reply / poisoned-slot \
+         client_transact's send-failure / stale-reply / unreadable-slot \
          retirements, the \
          incoming-connection attach's spawn-failure rollback, and the \
          callback attach's init-write-failure rollback may call remove_slot — \

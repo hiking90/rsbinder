@@ -857,11 +857,11 @@ struct ConnSlot {
     /// [`RpcSessionInner::note_stale_reply`]).
     stale_replies: u32,
     /// Set by a nested (reentrant) frame that lost track of what the peer
-    /// sends next ([`Desync::ProtocolStateLost`]): whoever owns the slot
+    /// sends next ([`StreamPosition::StreamPositionUnknown`]): whoever owns the slot
     /// must not interpret another frame on it. Never cleared — the owner
     /// retires the slot instead (see
-    /// [`RpcSessionInner::mark_slot_poisoned`]).
-    poisoned: bool,
+    /// [`RpcSessionInner::mark_slot_unreadable`]).
+    unreadable: bool,
 }
 
 /// The session's connection pool + its monotonic slot-id
@@ -908,10 +908,10 @@ impl ConnGuard<'_> {
 /// What a failed step in `client_transact`'s reply wait left on the
 /// stream. Only a reentrant frame has to distinguish them: it cannot
 /// retire the slot, because the outer frame owns it.
-enum Desync {
+enum StreamPosition {
     /// Nothing came off the stream, so this call's `REPLY` may still be
     /// on its way and the outer frame has to skip one.
-    ReplyStillInbound,
+    FrameBoundaryIntact,
     /// What the peer sends next is unknowable — the pending `REPLY` may
     /// still arrive, or it may already be gone. Either a frame arrived
     /// and did not decode, or a read failed without the guarantee that
@@ -920,7 +920,7 @@ enum Desync {
     /// including one that consumed nothing at all. AOSP ends the whole
     /// session here (`RpcState::waitForReply`: "processCommand must
     /// shutdown on failure").
-    ProtocolStateLost,
+    StreamPositionUnknown,
 }
 
 impl Drop for ConnGuard<'_> {
@@ -1241,7 +1241,7 @@ impl RpcSessionInner {
     ///     never claimed by a non-nested call: it is a serve loop's
     ///     socket, read by the peer only inside its own reply wait.
     /// - **No `Outgoing` slot at all** — fail **immediately** with
-    ///   `Err(StatusCode::FailedTransaction)` (AOSP `WOULD_BLOCK`:
+    ///   `Err(StatusCode::WouldBlock)` (AOSP `WOULD_BLOCK`:
     ///   "Session has no outgoing connections"). This is a server
     ///   calling a client proxy outside any handler while the client
     ///   opened no incoming connection; waiting would never end,
@@ -1333,6 +1333,9 @@ impl RpcSessionInner {
                     // push and this reentrant lookup. Surface a typed dead
                     // error rather than panicking on the driver loop.
                     None => return Err(StatusCode::DeadObject),
+                    // A nested call lost the stream on it: nothing more is
+                    // written there, not even by the frame that owns it.
+                    Some(s) if s.unreadable => return Err(StatusCode::DeadObject),
                     Some(s)
                         if s.role == SlotRole::Outgoing
                             || s.allow_nested
@@ -1367,7 +1370,7 @@ impl RpcSessionInner {
             let pick = st
                 .slots
                 .iter()
-                .position(|s| free(s) && s.role == SlotRole::Outgoing);
+                .position(|s| free(s) && s.role == SlotRole::Outgoing && !s.unreadable);
             if let Some(idx) = pick {
                 let s = &mut st.slots[idx];
                 s.exclusive_tid = Some(tid);
@@ -1383,7 +1386,11 @@ impl RpcSessionInner {
             }
             // (3b) Nothing to wait for: no `Outgoing` slot exists, and only a
             //      peer attach can create one. AOSP `WOULD_BLOCK`.
-            if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
+            if !st
+                .slots
+                .iter()
+                .any(|s| s.role == SlotRole::Outgoing && !s.unreadable)
+            {
                 if refcount {
                     // Best-effort by contract, so this is a skip, not an
                     // error: the peer's node is released at session end
@@ -1424,7 +1431,7 @@ impl RpcSessionInner {
                          ARpcSession_setMaxIncomingThreads); refusing instead of waiting forever"
                     );
                 }
-                return Err(StatusCode::FailedTransaction);
+                return Err(StatusCode::WouldBlock);
             }
             // (4) Pool exhausted — wait, bounded by the session deadline: a serve-pinned slot is released only by the peer.
             let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
@@ -1441,9 +1448,9 @@ impl RpcSessionInner {
                             "RPC: no connection slot became available within {d:?} \
                              (every slot is driven by another thread — a session \
                              served on one thread and transacted on another needs \
-                             more than one connection)"
+                             more than one connection); nothing was sent"
                         );
-                        return Err(StatusCode::TimedOut);
+                        return Err(StatusCode::WouldBlock);
                     }
                     self.slot_cv
                         .wait_timeout(st, remaining)
@@ -1480,7 +1487,11 @@ impl RpcSessionInner {
                 .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
         }) {
             let st = self.conn_state.lock().expect("conn_state poisoned");
-            let transport = Arc::clone(&st.slots.iter().find(|s| s.id == slot_id)?.transport);
+            let slot = st.slots.iter().find(|s| s.id == slot_id)?;
+            if slot.unreadable {
+                return None;
+            }
+            let transport = Arc::clone(&slot.transport);
             drop(st);
             return Some(ConnGuard {
                 inner: self,
@@ -1497,10 +1508,9 @@ impl RpcSessionInner {
         //     blocks and this slot's serve loop is locked out of it.
         //     `None` here just defers to the reaper, then to session end.
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
-        let idx = st
-            .slots
-            .iter()
-            .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing)?;
+        let idx = st.slots.iter().position(|s| {
+            s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing && !s.unreadable
+        })?;
         let s = &mut st.slots[idx];
         s.exclusive_tid = Some(tid);
         let slot_id = s.id;
@@ -1546,7 +1556,7 @@ impl RpcSessionInner {
             let pick = st
                 .slots
                 .iter()
-                .position(|s| free(s) && s.role == SlotRole::Outgoing);
+                .position(|s| free(s) && s.role == SlotRole::Outgoing && !s.unreadable);
             if let Some(idx) = pick {
                 let s = &mut st.slots[idx];
                 s.exclusive_tid = Some(tid);
@@ -1564,7 +1574,11 @@ impl RpcSessionInner {
             // `Outgoing` slot, and parking here would hold the session's
             // strong `Arc` (the leak this function's doc guards against).
             // Skipping is the documented best-effort contract.
-            if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
+            if !st
+                .slots
+                .iter()
+                .any(|s| s.role == SlotRole::Outgoing && !s.unreadable)
+            {
                 return None;
             }
             st = self.slot_cv.wait(st).expect("slot_cv poisoned");
@@ -1722,7 +1736,7 @@ impl RpcSessionInner {
             role,
             allow_nested: false,
             stale_replies: 0,
-            poisoned: false,
+            unreadable: false,
         });
         drop(st);
         self.slot_cv.notify_all();
@@ -1764,7 +1778,7 @@ impl RpcSessionInner {
             role: SlotRole::Incoming,
             allow_nested: false,
             stale_replies: 0,
-            poisoned: false,
+            unreadable: false,
         });
         drop(st);
         self.slot_cv.notify_all();
@@ -1834,7 +1848,7 @@ impl RpcSessionInner {
             role: SlotRole::Outgoing,
             allow_nested: false,
             stale_replies: 0,
-            poisoned: false,
+            unreadable: false,
         });
         drop(st);
         self.slot_cv.notify_all();
@@ -1849,7 +1863,7 @@ impl RpcSessionInner {
     /// a frame boundary (`PeerClosed`, `Timeout`, or a failure before or
     /// after the read itself); a read that failed without that guarantee
     /// marks the slot unreadable instead
-    /// ([`mark_slot_poisoned`](Self::mark_slot_poisoned)).
+    /// ([`mark_slot_unreadable`](Self::mark_slot_unreadable)).
     fn note_stale_reply(&self, slot_id: u64) {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         if let Some(s) = st.slots.iter_mut().find(|s| s.id == slot_id) {
@@ -1866,18 +1880,18 @@ impl RpcSessionInner {
     /// discard its receive queue, a transport may hold a buffered
     /// leftover, the default impl does nothing), so nothing here assumes
     /// it discards anything; the flag holds on every transport.
-    fn mark_slot_poisoned(&self, slot_id: u64) {
+    fn mark_slot_unreadable(&self, slot_id: u64) {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         if let Some(s) = st.slots.iter_mut().find(|s| s.id == slot_id) {
-            s.poisoned = true;
+            s.unreadable = true;
         }
     }
 
-    /// Whether a nested call poisoned `slot_id`
-    /// ([`mark_slot_poisoned`](Self::mark_slot_poisoned)).
-    fn slot_poisoned(&self, slot_id: u64) -> bool {
+    /// Whether a nested call marked `slot_id` unreadable
+    /// ([`mark_slot_unreadable`](Self::mark_slot_unreadable)).
+    fn slot_unreadable(&self, slot_id: u64) -> bool {
         let st = self.conn_state.lock().expect("conn_state poisoned");
-        st.slots.iter().any(|s| s.id == slot_id && s.poisoned)
+        st.slots.iter().any(|s| s.id == slot_id && s.unreadable)
     }
 
     /// Whether a `REPLY` just read on `slot_id` is one an abandoned nested
@@ -1906,7 +1920,7 @@ impl RpcSessionInner {
     /// not a structural bug. `notify_all` so any `find_conn`
     /// (any-available) waiter re-evaluates against the shrunk pool.
     /// (Retiring is distinct from marking unreadable —
-    /// [`mark_slot_poisoned`](Self::mark_slot_poisoned) — which leaves
+    /// [`mark_slot_unreadable`](Self::mark_slot_unreadable) — which leaves
     /// the slot in the pool for its owner to retire.)
     ///
     /// **Not a pure pool mutation:** emptying the pool — or, on an
@@ -2499,7 +2513,7 @@ impl RpcSessionInner {
         let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
         // Post-send: a failed reply wait leaves this call's `REPLY` unaccounted
         // for, and `WireReply` carries no id to match it by later.
-        let poison_slot = |desync: Desync| {
+        let record_stream_position = |desync: StreamPosition| {
             if !conn.reentrant {
                 self.remove_slot(conn.slot_id);
                 return;
@@ -2507,16 +2521,16 @@ impl RpcSessionInner {
             // A reentrant frame owns nothing: the outer frame holds this
             // slot and will keep reading it.
             match desync {
-                Desync::ReplyStillInbound => self.note_stale_reply(conn.slot_id),
-                Desync::ProtocolStateLost => {
-                    self.mark_slot_poisoned(conn.slot_id);
+                StreamPosition::FrameBoundaryIntact => self.note_stale_reply(conn.slot_id),
+                StreamPosition::StreamPositionUnknown => {
+                    self.mark_slot_unreadable(conn.slot_id);
                     log::error!(
                         "RPC: a nested call lost track of the stream; what the peer sends next \
-                         is unknowable, so this connection is poisoned and shut down rather than \
-                         left for the outer call to read"
+                         is unknowable, so this connection is marked unreadable and shut down \
+                         rather than left for the outer call to read"
                     );
-                    // Only wakes a reader blocked in `recv`; the poison flag
-                    // above is what stops already-buffered frames.
+                    // Only wakes a reader blocked in `recv`; the mark above
+                    // is what stops already-buffered frames.
                     if let Err(e) = transport.shutdown() {
                         log::debug!("RPC: shutting the desynced connection down failed: {e:?}");
                     }
@@ -2524,19 +2538,19 @@ impl RpcSessionInner {
             }
         };
         // Arming is itself post-send, so a failure here desyncs the stream
-        // exactly like a failed recv: poison before propagating.
+        // exactly like a failed recv: record it before propagating.
         let restore = self.slot_baseline_read_deadline(conn.slot_id);
         let _deadline_guard = match ReplyDeadlineGuard::arm(transport, deadline, restore) {
             Ok(g) => g,
             Err(e) => {
-                poison_slot(Desync::ReplyStillInbound);
+                record_stream_position(StreamPosition::FrameBoundaryIntact);
                 return Err(e.into());
             }
         };
         loop {
             // A nested call on this slot lost track of the stream, and
             // `shutdown` does not drop what the peer already sent.
-            if self.slot_poisoned(conn.slot_id) {
+            if self.slot_unreadable(conn.slot_id) {
                 if !conn.reentrant {
                     self.remove_slot(conn.slot_id);
                 }
@@ -2548,18 +2562,18 @@ impl RpcSessionInner {
                     // Only a failure *at* a frame boundary leaves the reply
                     // inbound; the rest may have consumed part of one.
                     let desync = if e.leaves_frame_boundary_intact() {
-                        Desync::ReplyStillInbound
+                        StreamPosition::FrameBoundaryIntact
                     } else {
-                        Desync::ProtocolStateLost
+                        StreamPosition::StreamPositionUnknown
                     };
-                    poison_slot(desync);
+                    record_stream_position(desync);
                     return Err(e.into());
                 }
             };
             let message = match self.profile.codec().decode_message(&frame) {
                 Ok(m) => m,
                 Err(e) => {
-                    poison_slot(Desync::ProtocolStateLost);
+                    record_stream_position(StreamPosition::StreamPositionUnknown);
                     return Err(e.into());
                 }
             };
@@ -2620,13 +2634,13 @@ impl RpcSessionInner {
                     let _restore = match NestedDeadlineGuard::lift(transport, deadline) {
                         Ok(g) => g,
                         Err(e) => {
-                            poison_slot(Desync::ReplyStillInbound);
+                            record_stream_position(StreamPosition::FrameBoundaryIntact);
                             return Err(e.into());
                         }
                     };
                     let peer = transport.peer_identity();
                     if let Err(e) = self.dispatch_transact(t, in_fds, peer) {
-                        poison_slot(Desync::ReplyStillInbound);
+                        record_stream_position(StreamPosition::FrameBoundaryIntact);
                         return Err(e);
                     }
                 }
@@ -3028,7 +3042,7 @@ impl RpcSessionInner {
             return ServeStep::Ended(EndReason::Retired);
         };
         // A nested call lost track of the stream: what is buffered is not ours.
-        if self.slot_poisoned(slot_id) {
+        if self.slot_unreadable(slot_id) {
             return ServeStep::Ended(EndReason::Unreadable);
         }
         let transport = conn.transport();
@@ -3250,7 +3264,7 @@ impl RpcSession {
     /// session therefore **cannot open a transaction of its own** —
     /// `get_root`, `RpcProxy::transact` and `ping_binder` called on it
     /// from outside a dispatch fail with
-    /// [`StatusCode::FailedTransaction`], because writing a request into
+    /// [`StatusCode::WouldBlock`], because writing a request into
     /// a connection the peer only reads inside its own reply wait would
     /// sit unread. Callbacks *from inside a twoway handler* are
     /// unaffected (they re-enter the dispatching connection). To call
@@ -3336,7 +3350,7 @@ impl RpcSession {
             role: founding_role,
             allow_nested: false,
             stale_replies: 0,
-            poisoned: false,
+            unreadable: false,
         };
         let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
         let inner = Arc::new(RpcSessionInner {
@@ -4092,8 +4106,11 @@ impl RpcSession {
     /// The same deadline bounds how long a call waits for a free
     /// connection slot when every slot is driven by another thread — a
     /// session served on one thread and transacted on another needs more
-    /// than one connection, or its calls time out here without ever
-    /// reaching the peer.
+    /// than one connection. The two expiries are told apart by their
+    /// code: the slot wait fails with [`StatusCode::WouldBlock`] — the
+    /// request was never sent, so the call is safe to retry — where the
+    /// reply wait fails with [`StatusCode::TimedOut`], after the peer may
+    /// already have executed it.
     ///
     /// `Some(Duration::ZERO)` is **not** a valid deadline — the reply wait
     /// arms it as `SO_RCVTIMEO`, which rejects a zero duration — so it is
@@ -4921,9 +4938,9 @@ mod tests {
     /// has come off the wire undecoded, whether this call's `REPLY` is
     /// still coming is exactly what is unknown. If it is, the outer frame
     /// reads it and — `WireReply` carrying no transaction id — takes it as
-    /// its own answer. So the slot is poisoned (and the connection shut
-    /// down), which is what the non-reentrant arm achieves by retiring the
-    /// slot.
+    /// its own answer. So the slot is marked unreadable (and the
+    /// connection shut down), which is what the non-reentrant arm achieves
+    /// by retiring the slot.
     ///
     /// Two things are set up directly rather than driven through a peer:
     /// the `DRIVING` marker (what an outer frame's `find_conn` leaves
@@ -4934,8 +4951,8 @@ mod tests {
     /// the wire.
     ///
     /// **Mutant gate**: the flag *and* the refusal it exists for. Drop
-    /// the `mark_slot_poisoned` call and the flag assertion fails; drop
-    /// the poison check in `serve_once_on_slot` and the slot reads on as
+    /// the `mark_slot_unreadable` call and the flag assertion fails; drop
+    /// the unreadable check in `serve_once_on_slot` and the slot reads on as
     /// if nothing happened — the state in which the frame that owns the
     /// slot would go on to take the peer's next frame for its own.
     /// `shutdown` alone gates neither: what it does to already-received
@@ -4943,7 +4960,7 @@ mod tests {
     /// queue, a transport may hold a buffered leftover, the default impl
     /// is a no-op). The reply wait's half of the refusal needs a live
     /// connection, so it is gated by
-    /// `a_poisoned_slot_is_refused_by_the_reply_wait`.
+    /// `an_unreadable_slot_is_refused_before_a_request_is_sent`.
     #[test]
     fn a_nested_call_that_loses_the_stream_makes_the_slot_unreadable() {
         use crate::rpc::wire_android13::write_aosp_message;
@@ -5016,7 +5033,7 @@ mod tests {
             "a reentrant frame must not retire the outer frame's slot"
         );
         assert!(
-            session.inner.slot_poisoned(slot_id),
+            session.inner.slot_unreadable(slot_id),
             "the borrowed slot must be marked unreadable for its owner"
         );
         assert!(
@@ -5092,25 +5109,67 @@ mod tests {
         );
     }
 
-    /// The other reader of a poisoned slot — the reply wait inside
-    /// [`RpcSessionInner::client_transact`] — must refuse it too, and the
-    /// refusal must not rest on the connection being unusable.
+    /// Plan 2-21 B-7 — an unreadable slot is refused at *selection*, not
+    /// only at the two reads: the frame that owns it gets `DeadObject`
+    /// before writing anything, a scan for a free outgoing slot skips it
+    /// (and, this being the only one, fails fast with `WouldBlock`), and
+    /// the non-blocking selector declines it. Nothing is written on a
+    /// stream a nested call has already lost.
+    #[test]
+    fn an_unreadable_slot_is_never_selected_for_writing() {
+        let (a, _b) = super::super::transport::UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        let slot_id = session.inner.conn_state.lock().expect("conn_state").slots[0].id;
+        session.inner.mark_slot_unreadable(slot_id);
+
+        assert!(
+            matches!(session.inner.find_conn(), Err(StatusCode::WouldBlock)),
+            "the scan must not hand out the only outgoing slot once it is unreadable"
+        );
+        assert!(
+            session.inner.try_find_conn().is_none(),
+            "the non-blocking selector must decline it too"
+        );
+
+        // Reentrant: the frame that owns the slot asks for it again.
+        let sess_ptr = &*session.inner as *const RpcSessionInner as usize;
+        struct DrivingMark;
+        impl Drop for DrivingMark {
+            fn drop(&mut self) {
+                DRIVING.with(|d| {
+                    d.borrow_mut().pop();
+                });
+            }
+        }
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let _mark = DrivingMark;
+        assert!(
+            matches!(session.inner.find_conn(), Err(StatusCode::DeadObject)),
+            "the owning frame must be refused before it writes"
+        );
+        assert!(session.inner.try_find_conn().is_none());
+    }
+
+    /// An unreadable slot is refused before a request is written on it,
+    /// and the refusal does not rest on the connection being unusable.
     ///
     /// Here the connection is perfectly healthy and a well-formed `REPLY`
-    /// is already waiting on it: exactly the shape of the theft the poison
-    /// exists to stop, since `WireReply` carries no transaction id and the
+    /// is already waiting on it: exactly the shape of the theft the mark
+    /// exists to stop, since `WireReply` carries no transaction id and a
     /// waiting frame cannot tell the peer's answer to an abandoned nested
-    /// call from its own. The slot is poisoned directly rather than
-    /// through a nested call, because a nested call also shuts the
-    /// connection down and would hide which of the two mechanisms did the
-    /// work.
+    /// call from its own. The slot is marked directly rather than through
+    /// a nested call, because a nested call also shuts the connection down
+    /// and would hide which mechanism did the work. The call fails at slot
+    /// selection (Plan 2-21 B-7), and the peer sees nothing sent.
     ///
-    /// **Mutant gate**: drop the poison check at the top of the reply
-    /// loop and this call returns `Ok(Some(_))` — the queued reply handed
-    /// back as this call's answer.
+    /// The reply wait keeps its own check for the one path that reaches
+    /// it: a nested call made from inside this frame's dispatch marks the
+    /// slot *after* selection, and the outer frame's next loop pass must
+    /// refuse it rather than read the frame waiting there.
     #[test]
-    fn a_poisoned_slot_is_refused_by_the_reply_wait() {
+    fn an_unreadable_slot_is_refused_before_a_request_is_sent() {
         use crate::rpc::wire_android13::write_aosp_message;
+        use std::io::Read;
         use std::os::unix::net::UnixStream;
 
         let (client_fd, peer_fd) = unix_socketpair_fd();
@@ -5144,7 +5203,7 @@ mod tests {
             .expect("encode a REPLY frame");
         write_aosp_message(&mut peer, &reply).expect("queue the reply frame");
 
-        session.inner.mark_slot_poisoned(slot_id);
+        session.inner.mark_slot_unreadable(slot_id);
 
         assert_eq!(
             session
@@ -5155,9 +5214,17 @@ mod tests {
                     &Parcel::new(),
                     0,
                 )
-                .expect_err("a poisoned slot must not be read again"),
-            StatusCode::DeadObject,
-            "the reply wait must refuse the slot, not decode the frame waiting on it"
+                .expect_err("an unreadable slot must not be used again"),
+            StatusCode::WouldBlock,
+            "the session's only outgoing slot is unreadable: refused at selection"
+        );
+        // Nothing went out: the peer's read finds no request.
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+        let mut buf = [0u8; 16];
+        assert!(
+            matches!(peer.read(&mut buf), Err(e) if super::super::transport::is_timeout(&e)),
+            "no request may be written on an unreadable slot"
         );
     }
 
@@ -5314,7 +5381,7 @@ mod tests {
         assert!(
             matches!(
                 session.inner.find_conn_lenient(),
-                Err(StatusCode::FailedTransaction)
+                Err(StatusCode::WouldBlock)
             ),
             "a DEC_STRONG must not claim the free serve-driven slot"
         );
