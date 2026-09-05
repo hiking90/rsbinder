@@ -3939,6 +3939,10 @@ impl RpcSession {
         slot_id: u64,
         clear_deadline_after_first: bool,
     ) -> Result<()> {
+        // Read the slot's role now: a `RpcSession::shutdown` racing this
+        // loop clears the pool, and a role read after the loop would come
+        // back `false` for a slot that is simply gone.
+        let client_incoming = self.inner.is_client_incoming_slot(slot_id);
         let result = {
             let mut r = Ok(());
             let mut first = clear_deadline_after_first;
@@ -3981,12 +3985,11 @@ impl RpcSession {
         // A client's incoming (callback) slot never bumped `live_conns`,
         // so its exit must not decrement either; instead the session dies
         // once the **last** such slot is gone: the founding connection's
-        // `Live(1)` is what the CAS consumes. Its role is read before the
-        // slot is retired. Eager death by design, *not* AOSP (whose
+        // `Live(1)` is what the CAS consumes. Its role was read before the
+        // loop. Eager death by design, *not* AOSP (whose
         // client-side `onSessionAllIncomingThreadsEnded` is a no-op) —
         // the trade-off is on
         // [`RpcUnixClientConfig::incoming_connections`].
-        let client_incoming = self.inner.is_client_incoming_slot(slot_id);
         if !client_incoming && self.inner.shared.lifecycle.drop_connection() {
             self.inner.on_session_dead();
         }
