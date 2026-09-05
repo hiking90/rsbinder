@@ -162,14 +162,19 @@ fn entry_add_refuses_a_remote_binder() {
         "AC-22.4: a proxy cannot be re-published on another RPC server"
     );
 
-    // A local service on the same endpoint is still accepted — the
-    // refusal is about the binder, not about `b`.
+    // The gateway spelling — the same proxy, wrapped in a local `Bn*` —
+    // is accepted, and forwards to the upstream service.
+    let upstream: Strong<dyn IRpcSmoke> = client.get("svc").expect("svc");
     let _down = rsbinder::serve(&b.uri(""))
         .expect("serve")
-        .add("svc", tagged("downstream"))
-        .expect("add")
+        .add("svc", BnRpcSmoke::new_binder(upstream))
+        .expect("gateway add")
         .spawn()
         .expect("spawn");
+
+    let via_gateway: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(&b.uri("#svc")).expect("connect through gateway");
+    assert_eq!(via_gateway.r#echo("x").unwrap(), "upstream:x");
 }
 
 /// Misuse is loud and early: a `#service` on `Client::open`, no service

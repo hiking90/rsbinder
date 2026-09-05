@@ -208,6 +208,19 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Added
 
+- **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
+  `Interface` (delegating to the binder it holds), and generated interfaces —
+  from `.aidl` and from `#[interface]` alike — implement themselves for
+  `Strong<dyn IFoo>`, so a proxy satisfies `BnFoo::new_binder`'s bound:
+  `serve(uri)?.add("foo", BnFoo::new_binder(upstream_proxy))?` re-publishes a
+  service reached over one transport onto another. `getInterfaceVersion` /
+  `getInterfaceHash` report the *upstream's* values, not the delegating
+  module's. Binder-typed arguments still have to be re-wrapped by hand — see
+  the book's [cross-transport chapter], which also covers what stops at a
+  gateway (caller identity, fd rights, uid, death, one worker per forwarded
+  call), and `example-hello`'s new `gateway_service` binary.
+
+  [cross-transport chapter]: https://hiking90.github.io/rsbinder/cross-transport-services.html
 - **rsbinder (RPC):** client-side **incoming (callback) connections** —
   `RpcUnixClientConfig::incoming_connections(n)`,
   `RpcSession::add_incoming_connection_android13plus_with_config`, and
