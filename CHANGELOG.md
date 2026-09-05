@@ -727,6 +727,26 @@ short form — and the first entry is the only one no compiler will catch.
   client's `RpcSession::session_id()` is a client-local value that is never
   the peer's id (only `get_session_id()` fetches that), which is the mistake
   this used to accept silently; its rustdoc now says so.
+- **rsbinder (RPC) — a nested call that lost track of the stream left the
+  connection for the outer call to read.** A reentrant frame borrows the outer
+  frame's slot, so it cannot retire it, and the stale-reply marker it uses
+  instead does not fit bytes that came off the wire without yielding a frame:
+  whether this call's `REPLY` is still coming is then exactly what is unknown.
+  If it was, the outer frame read it next and — `WireReply` carrying no
+  transaction id — took it as its own answer. The slot is now marked
+  unreadable, so its owner retires it instead of interpreting another frame —
+  the path a non-reentrant frame already used; AOSP ends the whole session here
+  (`RpcState::waitForReply`: "processCommand must shutdown on failure"). The
+  connection is shut down too, but only to wake a blocked reader: what a
+  shutdown does to bytes already received is platform- and backend-dependent,
+  so the flag is what holds. A frame that does not decode is one way in (only
+  a peer that violates the wire reaches that: AOSP's command set is exactly the
+  three rsbinder decodes); a read that fails without the guarantee of having
+  stopped at a frame boundary — truncated, over-large, an I/O or protocol
+  error — is another, and is now classified the same way. A serve loop that
+  ends this way reports `StatusCode::DeadObject`, not the `Ok(())` of end of
+  stream, so `RpcSession::serve_blocking` callers and the `RpcServer` worker
+  log can still tell the two apart.
 - **rsbinder (RPC) — a zero handshake deadline was neither honored nor
   reported.** `RpcUnixClientConfig::handshake_timeout(Duration::ZERO)` and
   `ClientOptions::handshake_timeout = Some(Duration::ZERO)` travelled to
