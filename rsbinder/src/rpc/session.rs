@@ -5120,6 +5120,211 @@ mod tests {
         );
     }
 
+    /// AC-21.24 — a **real** nested dispatch whose nested call loses the
+    /// stream: the outer call must fail, and the frames the peer already
+    /// queued must not be taken as its reply.
+    ///
+    /// This thread is the client and makes the outer call; a scripted
+    /// peer thread reads the outer `TRANSACT` and answers with four frames
+    /// in one write — a nested `TRANSACT` into a local object of this
+    /// session, an undecodable frame (command 7), and two `REPLY`s. The
+    /// outer's reply wait dispatches the nested `TRANSACT` inline; the
+    /// handler makes a nested call on the same slot (reentrant), whose
+    /// reply wait reads the undecodable frame and marks the slot
+    /// unreadable; the handler swallows that error and returns `Ok` — the
+    /// worst case for the frame that owns the slot.
+    ///
+    /// What the outer sees: `DeadObject`, its slot retired, the session
+    /// dead. Which check fires: the reply to the nested `TRANSACT` is
+    /// refused at slot selection (`find_conn_impl` for `ConnUse::Reply`
+    /// declines an unreadable slot), so the dispatch fails and the outer
+    /// returns through its dispatch-error arm. The check at the top of the
+    /// reply-wait loop is not reached this way — the selector refuses the
+    /// slot before a send is attempted, and every in-tree transport fails
+    /// this end's sends after `shutdown` anyway — so it is defensive.
+    ///
+    /// **Mutant gate**: treat the nested loss as `FrameBoundaryIntact`
+    /// (`note_stale_reply` instead of `mark_slot_unreadable` + shutdown)
+    /// and the outer skips the first `REPLY` as its nested call's late
+    /// answer and takes the second as its own — `Ok(Some(_))`, the wire
+    /// now one reply out of step. Two `REPLY`s are queued for exactly
+    /// that: with one, that mutant would run into end of stream and fail
+    /// for the wrong reason. Platform-independent, because that mutant
+    /// never shuts the socket down and so the queue is intact on both;
+    /// the platform split (macOS discards the queue on shutdown, Linux
+    /// keeps it) is on the *correct* path, which is why no end-of-stream
+    /// reason is asserted here.
+    #[test]
+    fn a_real_nested_call_that_loses_the_stream_fails_the_outer_call() {
+        use crate::rpc::wire_android13::read_aosp_message;
+        use crate::{Binder, Interface, Remotable, TransactionCode};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        const DESC: &str = "rsbinder.test.INestedLoser";
+        const TX_OUTER: TransactionCode = crate::FIRST_CALL_TRANSACTION;
+        const TX_CALLBACK: TransactionCode = crate::FIRST_CALL_TRANSACTION + 1;
+        const TX_NESTED: TransactionCode = crate::FIRST_CALL_TRANSACTION + 2;
+
+        /// The local object the peer calls back into: its handler makes
+        /// the nested call and swallows its failure.
+        struct Loser {
+            session: Arc<Mutex<Option<Arc<RpcSessionInner>>>>,
+            nested: Arc<Mutex<Option<Result<()>>>>,
+        }
+        impl Interface for Loser {}
+        impl Remotable for Loser {
+            fn descriptor() -> &'static str {
+                DESC
+            }
+            fn on_transact(
+                &self,
+                code: TransactionCode,
+                _reader: &mut Parcel,
+                _reply: &mut Parcel,
+            ) -> Result<()> {
+                assert_eq!(code, TX_CALLBACK, "the peer's nested TRANSACT");
+                let session = self
+                    .session
+                    .lock()
+                    .expect("session cell")
+                    .clone()
+                    .expect("session installed before the outer call");
+                let r = session
+                    .client_transact(RpcAddress::zero(), TX_NESTED, &Parcel::new(), 0)
+                    .map(|_| ());
+                *self.nested.lock().expect("nested cell") = Some(r);
+                Ok(())
+            }
+            fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (client_fd, peer_fd) = unix_socketpair_fd();
+        let mut peer = UnixStream::from(peer_fd);
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer read timeout");
+        // Ends the peer thread's final read from here: whether this end's
+        // `shutdown` reaches a peer parked in `read` is the platform's
+        // business (pinned by the transport conformance suite), not this
+        // test's.
+        let peer_dup = peer.try_clone().expect("dup the peer socket");
+        let session = RpcSession::with_profile(
+            Box::new(
+                super::super::transport::UnixTransport::from_stream(UnixStream::from(client_fd))
+                    .expect("transport"),
+            ),
+            AddressSpace::Initiator,
+            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
+        )
+        .expect("session");
+        // A hang is a failure, not a wait: bound every reply wait.
+        session.set_timeout(Some(Duration::from_secs(10)));
+
+        let session_cell = Arc::new(Mutex::new(Some(Arc::clone(&session.inner))));
+        let nested_cell: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+        let cb: SIBinder = Interface::as_binder(&Binder::new(Loser {
+            session: Arc::clone(&session_cell),
+            nested: Arc::clone(&nested_cell),
+        }));
+        // Hand the peer an address for `cb` as sending it in a parcel
+        // would; the peer scripts its callback against that address.
+        let cb_addr = session
+            .inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state")
+            .on_binder_leaving(&cb)
+            .expect("address for the callback");
+        let (slot_id, slot_transport) = {
+            let st = session.inner.conn_state.lock().expect("conn_state");
+            (st.slots[0].id, Arc::clone(&st.slots[0].transport))
+        };
+
+        let peer_thread = std::thread::spawn(move || {
+            let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+            let frame = read_aosp_message(&mut peer).expect("the outer TRANSACT");
+            match codec
+                .decode_message(&frame)
+                .expect("decode the outer TRANSACT")
+            {
+                WireMessage::Transact(t) => assert_eq!(t.code, TX_OUTER),
+                other => panic!("expected the outer TRANSACT, got {other:?}"),
+            }
+            let mut token = Parcel::new();
+            write_rpc_interface_token(&mut token, DESC).expect("interface token");
+            let nested = codec
+                .encode_transact(&WireTransaction {
+                    address: cb_addr,
+                    code: TX_CALLBACK,
+                    flags: 0,
+                    async_number: 0,
+                    data: token.rpc_data_bytes().to_vec(),
+                    object_positions: Vec::new(),
+                })
+                .expect("encode the nested TRANSACT");
+            // Command 7 is none of AOSP's three, so the frame is
+            // well-formed to the framing reader and undecodable to the
+            // codec — what the nested call's reply wait will read.
+            let mut undecodable = [0u8; 16];
+            undecodable[0..4].copy_from_slice(&7u32.to_le_bytes());
+            let reply = codec
+                .encode_reply(&WireReply::default())
+                .expect("encode a REPLY");
+            let mut burst = nested;
+            burst.extend_from_slice(&undecodable);
+            burst.extend_from_slice(&reply);
+            burst.extend_from_slice(&reply);
+            peer.write_all(&burst).expect("queue the burst");
+            peer.flush().expect("flush the burst");
+            // Stay connected until the client ends the connection, so
+            // nothing here decides when the stream ends. What the client
+            // sent (the nested request) is drained and ignored.
+            let mut sink = Vec::new();
+            let _ = peer.read_to_end(&mut sink);
+        });
+
+        let outer = session
+            .inner
+            .client_transact(RpcAddress::zero(), TX_OUTER, &Parcel::new(), 0);
+        assert!(
+            matches!(outer, Err(StatusCode::DeadObject)),
+            "the outer call must fail as DeadObject, got {outer:?}"
+        );
+        assert!(
+            matches!(
+                *nested_cell.lock().expect("nested cell"),
+                Some(Err(StatusCode::RpcError))
+            ),
+            "the nested call must have run and failed on the undecodable frame"
+        );
+        assert!(
+            session
+                .inner
+                .conn_state
+                .lock()
+                .expect("conn_state")
+                .slots
+                .is_empty(),
+            "the outer frame owns slot {slot_id} and must retire it on the way out"
+        );
+        assert!(
+            session.inner.shared.lifecycle.is_torn_down(),
+            "the only connection is gone, so the session is dead"
+        );
+        assert!(
+            slot_transport.send_raw(b"x").is_err(),
+            "the lost connection must be shut down, not left usable"
+        );
+
+        session.close_session();
+        drop(slot_transport);
+        let _ = peer_dup.shutdown(std::net::Shutdown::Both);
+        peer_thread.join().expect("peer thread");
+    }
+
     /// Plan 2-21 B-7 — an unreadable slot is refused at *selection*, not
     /// only at the two reads: the frame that owns it gets `DeadObject`
     /// before writing anything, a scan for a free outgoing slot skips it
