@@ -134,6 +134,44 @@ fn entry_client_multi_lookup_and_proxy_outlives_client() {
     assert_eq!(second.r#echo("b").unwrap(), "second:b");
 }
 
+/// AC-22.4. Re-publishing a proxy of server A on server B is refused at
+/// `add`, not left to fail on B's first client call. This is the mistake
+/// the gateway pattern exists for: wrap the proxy in a local `Bn*`
+/// (`BnRpcSmoke::new_binder(proxy)`) instead of forwarding the binder.
+#[test]
+fn entry_add_refuses_a_remote_binder() {
+    let a = SockPath::new("gw_up");
+    let b = SockPath::new("gw_down");
+
+    let _up = rsbinder::serve(&a.uri(""))
+        .expect("serve")
+        .add("svc", tagged("upstream"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let client = rsbinder::Client::open(&a.uri("")).expect("open");
+
+    let refused = rsbinder::serve(&b.uri(""))
+        .expect("serve")
+        .add("svc", client.binder("svc").expect("binder"))
+        .err();
+    assert_eq!(
+        refused,
+        Some(StatusCode::InvalidOperation),
+        "AC-22.4: a proxy cannot be re-published on another RPC server"
+    );
+
+    // A local service on the same endpoint is still accepted — the
+    // refusal is about the binder, not about `b`.
+    let _down = rsbinder::serve(&b.uri(""))
+        .expect("serve")
+        .add("svc", tagged("downstream"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+}
+
 /// Misuse is loud and early: a `#service` on `Client::open`, no service
 /// on `connect`, an option for the wrong transport, and an unknown
 /// scheme are all `BadValue`.

@@ -146,7 +146,10 @@ fn imemory_window_roundtrips_over_uds_with_fd_mode() {
     let bound = Bound::new("ok");
     bound.server.set_supported_fd_modes(&[FdMode::Unix]);
     let served = serve(0);
-    bound.server.set_root(served.root.clone());
+    bound
+        .server
+        .set_root(served.root.clone())
+        .expect("set_root");
     let bg = bound.run();
 
     let client = bound.connect(true);
@@ -202,7 +205,10 @@ fn read_only_heap_is_read_only_at_the_client() {
     let served = serve(FLAG_READ_ONLY);
     // The owner may still write.
     served.heap.write_at(served.window_offset, b"ro").unwrap();
-    bound.server.set_root(served.root.clone());
+    bound
+        .server
+        .set_root(served.root.clone())
+        .expect("set_root");
     let bg = bound.run();
 
     let client = bound.connect(true);
@@ -233,7 +239,10 @@ fn bare_imemoryheap_root_maps() {
     let bound = Bound::new("heap");
     bound.server.set_supported_fd_modes(&[FdMode::Unix]);
     let heap = Arc::new(MemoryHeapBase::new(page(), 0).unwrap());
-    bound.server.set_root(export_heap(heap.clone()));
+    bound
+        .server
+        .set_root(export_heap(heap.clone()))
+        .expect("set_root");
     let bg = bound.run();
 
     let client = bound.connect(true);
@@ -261,7 +270,10 @@ fn bare_imemoryheap_root_maps() {
 fn heap_fd_rejected_without_fd_mode() {
     let bound = Bound::new("nofd");
     let served = serve(0);
-    bound.server.set_root(served.root.clone());
+    bound
+        .server
+        .set_root(served.root.clone())
+        .expect("set_root");
     let bg = bound.run();
 
     let client = bound.connect(false);
@@ -323,7 +335,8 @@ fn dealer_allocations_share_one_mapping_through_heap_cache() {
     let offsets: Vec<usize> = allocs.iter().map(|a| a.offset()).collect();
     bound
         .server
-        .set_root(Interface::as_binder(&Binder::new(BnAllocs(allocs))));
+        .set_root(Interface::as_binder(&Binder::new(BnAllocs(allocs))))
+        .expect("set_root");
     let bg = bound.run();
 
     let client = bound.connect(true);

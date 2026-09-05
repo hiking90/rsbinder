@@ -172,7 +172,9 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
     let path = tmp_sock("ok");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_supported_fd_modes(&[FdMode::Unix]);
-    server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
     let bg = server.run_background();
     wait_sock(&path);
 
@@ -227,7 +229,9 @@ fn fd_rejected_without_mutual_opt_in() {
     let path = tmp_sock("noopt");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     // intentionally NOT set_supported_fd_modes
-    server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
     let bg = server.run_background();
     wait_sock(&path);
 
@@ -261,7 +265,9 @@ fn fd_rejected_on_non_uds_transport() {
     let (a, b) = MemTransport::pair();
     let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_supported_fd_modes(&[FdMode::Unix]);
-    server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
     let srv = server.clone();
     let h = thread::spawn(move || {
         let _ = srv.serve_blocking();
@@ -308,7 +314,9 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(ver); // versioned AOSP wire
         server.set_supported_fd_modes(&[FdMode::Unix]); // opt in
-        server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+        server
+            .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+            .expect("set_root");
         let bg = server.run_background();
         wait_sock(&path);
 
@@ -374,7 +382,9 @@ fn fd_v1_abstract_unix_roundtrip_arg() {
     server.set_android13plus(1);
     server.set_max_threads(2);
     server.set_supported_fd_modes(&[FdMode::Unix]);
-    server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
     let bg = server.run_background();
 
     let client = RpcSession::setup_unix_client_android13plus_with_config(

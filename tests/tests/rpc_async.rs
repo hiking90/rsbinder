@@ -89,7 +89,9 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     let handle = rt.handle().clone();
 
     let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
-    server.set_root(async_root(TokioRuntime(handle.clone())));
+    server
+        .set_root(async_root(TokioRuntime(handle.clone())))
+        .expect("set_root");
     let server_for_thread = server.clone();
     let jh = thread::spawn(move || {
         let _ = server_for_thread.serve_blocking();

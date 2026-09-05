@@ -33,7 +33,7 @@
 //! // Server: bind, publish a root binder, accept in the background.
 //! let server = RpcServer::setup_unix_server("/tmp/demo.sock").unwrap();
 //! # let root: rsbinder::SIBinder = unimplemented!();
-//! server.set_root(root);
+//! server.set_root(root).unwrap();
 //! let _bg = server.run_background();
 //!
 //! // Client: connect, (optionally) negotiate, fetch the root object.
@@ -124,6 +124,20 @@ pub use transport::{CertId, PeerIdentity, RpcTransport};
 pub use rustls;
 
 use std::fmt;
+
+/// Reject a remote binder at registration time.
+///
+/// An RPC server / session can only publish objects this process owns. A proxy
+/// put here would either be handed back to its own peer or refused later, when
+/// the parcel is written (AOSP `RpcState::onBinderLeaving`); catching it at
+/// registration turns a confusing late failure into an immediate one.
+pub(crate) fn refuse_remote(binder: &crate::SIBinder, what: &str) -> crate::Result<()> {
+    if (**binder).is_remote() {
+        log::error!("{what}: refusing a remote binder; wrap it in a local Bn* (gateway) instead");
+        return Err(crate::StatusCode::InvalidOperation);
+    }
+    Ok(())
+}
 
 /// Result type for the RPC transport / protocol layer.
 ///

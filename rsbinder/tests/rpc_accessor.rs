@@ -198,7 +198,7 @@ impl EchoServerGuard {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(2); // android-16 v2 ceiling
         server.set_max_threads(2);
-        server.set_root(make_echo(calls.clone()));
+        server.set_root(make_echo(calls.clone())).expect("set_root");
         let bg = server.run_background();
         wait_for_sock(&path);
         EchoServerGuard {
@@ -274,6 +274,38 @@ fn accessor_arm_resolves_root_and_echoes() {
     // Drop the user-visible root: the wrapper's `Drop` must release the
     // inner proxy first (best-effort DEC_STRONG), then the session
     // (peer-side serve loop exits on EndOfStream). No leak / no panic.
+    drop(root);
+}
+
+/// AC-22.1. The `AccessorRoot` wrapper the bridge hands back is an RPC
+/// binder in a trench coat, so a kernel parcel must refuse it too.
+///
+/// `AccessorRoot::as_any` deliberately forwards to the inner `RpcProxy`
+/// (so `as_remote` / `as_proxy` see the concrete type); that forward is
+/// what makes the one check in `SerializeOption for SIBinder` cover the
+/// wrapper without a second branch. Dropping the forward turns this red.
+#[test]
+fn kernel_parcel_refuses_the_accessor_root_wrapper() {
+    let server = EchoServerGuard::start("xstack");
+    let addconn_calls = Arc::new(AtomicU32::new(0));
+    let accessor = make_mock_accessor(MockAccessor {
+        server_path: server.path.clone(),
+        name: "test.echo".to_string(),
+        add_connection_error: None,
+        addconnection_calls: addconn_calls.clone(),
+        nonblocking: false,
+    });
+
+    let swm = resolve_accessor("test.echo", accessor).expect("bridge resolves");
+    let root = swm.r#service.expect("bridge yields an RPC root binder");
+
+    let mut p = Parcel::new();
+    assert_eq!(
+        p.write(&root).unwrap_err(),
+        StatusCode::InvalidOperation,
+        "AC-22.1: an Accessor-bridged RPC root cannot cross into kernel binder"
+    );
+
     drop(root);
 }
 

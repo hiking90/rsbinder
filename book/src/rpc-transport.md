@@ -83,7 +83,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let server = RpcServer::setup_unix_server(RPC_SOCKET)?;
 
     // Publish a root binder. Clients fetch this via get_root().
-    server.set_root(BnHello::new_binder(IHelloService {}).as_binder());
+    server.set_root(BnHello::new_binder(IHelloService {}).as_binder())?;
 
     // Accept loop runs on this thread until stop_accepting().
     server.run()?;
@@ -197,7 +197,7 @@ The server picks the highest version both sides advertise:
 // Server: offer up to android-16 wire v2.
 let server = RpcServer::setup_unix_server("/tmp/foo.sock")?;
 server.set_android13plus(2);
-server.set_root(my_root);
+server.set_root(my_root)?;
 
 // Client: offer up to v2. Negotiation picks min(client, server).
 let session = RpcSession::setup_unix_client_android13plus(
@@ -345,7 +345,7 @@ let config = Arc::new(
 
 // TCP is TLS-only by design: there is no plaintext-TCP server constructor.
 let server = RpcServer::setup_tcp_server_tls("0.0.0.0:9999", config)?;
-server.set_root(my_root_binder);
+server.set_root(my_root_binder)?;
 server.run()?;                              // or server.run_background()
 ```
 
@@ -599,7 +599,7 @@ rsbinder implements **both sides** of this pattern:
   let sock = PathBuf::from("/data/local/tmp/my.sock");
   let server = RpcServer::setup_unix_server(&sock)?;
   server.set_android13plus(2);
-  server.set_root(my_root);
+  server.set_root(my_root)?;
   let _bg = server.run_background();
 
   // 2. Vend an IAccessor that hands clients an fd connected to

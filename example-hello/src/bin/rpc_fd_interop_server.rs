@@ -128,7 +128,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // byte only because this is set; v0 stays `None` (AOSP forbids fds
     // there), v1+ carries fds over `SCM_RIGHTS`.
     server.set_supported_fd_modes(&[rsbinder::rpc::FileDescriptorTransportMode::Unix]);
-    server.set_root(Interface::as_binder(&Binder::new(Interop)));
+    server.set_root(Interface::as_binder(&Binder::new(Interop)))?;
 
     println!("[rsbinder-server] READY android13plus(v{max_version}) fd=unix on {sock}");
     server.run()?;

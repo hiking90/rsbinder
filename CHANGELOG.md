@@ -24,6 +24,11 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **`RpcServer::set_root` / `RpcSession::set_root` return `Result<()>`.** They
+  now refuse a *remote* binder (see *Changed*), so they have a value to
+  report. An unused `Result` is only a warning, so a build without
+  `-D warnings` still compiles and the refusal goes unnoticed: add `?` or
+  `.expect(...)` at every call. Nothing else about them changed.
 - **`rpc::transport::TlsStream` gained a required `shutdown_stream()`.**
   Custom stream implementations must add
   `fn shutdown_stream(&self) -> std::io::Result<()>` (shut the underlying
@@ -486,6 +491,24 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder:** writing a binder that belongs to the *other* IPC stack — an
+  RPC proxy into a kernel parcel, or a kernel proxy into an RPC parcel — is
+  now refused at **write time** with `InvalidOperation`, matching libbinder
+  (`Parcel::flattenBinder`, `RpcState::onBinderLeaving`). It used to be
+  accepted and then fail on the receiver's *first call* with
+  `UnknownTransaction`, which pointed at the wrong process. rsbinder already
+  refused the third case libbinder does (a proxy from an unrelated RPC
+  session); that check is now pinned by a test. Registration refuses the same
+  mistake up front: `serve(rpc://…).add`, `RpcServer::add_service`,
+  `RpcServer::set_root` and `RpcSession::set_root` reject a remote binder. To
+  re-publish a service reached over one transport on another, wrap the proxy
+  in a local `Bn*` — `BnFoo::new_binder(proxy)`, the gateway pattern — rather
+  than forwarding the binder itself. Kernel `hub::add_service` is unchanged:
+  re-registering a proxy with the system service manager is legitimate.
+- **`RpcServer::set_root` and `RpcSession::set_root` return `Result<()>`**
+  (was `()`), so they can report the refusal above. Callers passing a local
+  binder are unaffected apart from handling the value — `?` in a function
+  that returns `Result`, `.expect("set_root")` in a test.
 - **rsbinder (RPC):** a non-nested call on a session with no connection to
   send on — a server calling a client callback outside any handler, the
   client having opened no incoming connection — now fails immediately with

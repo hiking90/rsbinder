@@ -101,9 +101,11 @@ fn vsock_loopback_e2e() {
     // Same `RpcServer` API as UDS, vsock-backed listener.
     let server =
         RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, TEST_PORT).expect("setup_vsock_server");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     // Accessor gates: vsock_address `Some`, fs path `None`.
     assert_eq!(server.vsock_address(), Some((VMADDR_CID_LOCAL, TEST_PORT)));
     assert_eq!(server.path(), None, "vsock server has no filesystem entry");
@@ -140,9 +142,11 @@ fn vsock_shutdown_wakes_blocked_recv() {
 
     let port = TEST_PORT + 1;
     let server = RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, port).expect("setup_vsock_server");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     let bg = server.run_background();
 
     let t: Arc<dyn RpcTransport> =
@@ -198,9 +202,11 @@ fn vsock_session_shutdown_ends_serve_thread() {
 
     let port = TEST_PORT + 2;
     let server = RpcServer::setup_vsock_server(VMADDR_CID_LOCAL, port).expect("setup_vsock_server");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     let bg = server.run_background();
 
     let client_t = VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect");

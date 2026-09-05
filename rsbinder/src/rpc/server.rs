@@ -665,8 +665,13 @@ impl RpcServer {
     }
 
     /// Publish the single root object (android `setRootObject`).
-    pub fn set_root(&self, binder: SIBinder) {
+    ///
+    /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`] — see
+    /// [`add_service`](Self::add_service) for why.
+    pub fn set_root(&self, binder: SIBinder) -> Result<()> {
+        super::refuse_remote(&binder, "RpcServer::set_root")?;
         *self.root.lock().expect("root poisoned") = Some(binder);
+        Ok(())
     }
 
     /// Register a named service. The first call installs a built-in
@@ -674,7 +679,15 @@ impl RpcServer {
     /// service map, so every later call is an O(1) insert seen through the
     /// same root — no rebuild or root swap. Clients reach it via
     /// [`RpcSession::get_service`].
+    ///
+    /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`]:
+    /// publishing a proxy here can never work. A proxy of *this* session would
+    /// be handed straight back to its own peer; a proxy of another session or
+    /// of kernel binder is refused when the parcel is written
+    /// (AOSP `RpcState::onBinderLeaving`). Wrap it in a local `Bn*` instead —
+    /// `BnFoo::new_binder(proxy)` — which is the gateway pattern.
     pub fn add_service(&self, name: &str, binder: SIBinder) -> Result<()> {
+        super::refuse_remote(&binder, "RpcServer::add_service")?;
         self.named
             .lock()
             .expect("named poisoned")
@@ -1012,7 +1025,12 @@ impl RpcServer {
         // taking the session's.
         let root = self.root.lock().expect("root poisoned").clone();
         if let Some(root) = root {
-            session.set_root(root);
+            // Unreachable: `set_root` / `add_service` already refused a remote
+            // root, so this can only fail on an invariant break. Logged, not
+            // panicked — we are on the accept loop.
+            if let Err(e) = session.set_root(root) {
+                log::error!("RPC: server root rejected by the new session: {e:?}");
+            }
         }
         let max_threads = *self.max_threads.lock().expect("max_threads poisoned");
         session.set_max_threads(max_threads);
