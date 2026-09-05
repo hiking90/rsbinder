@@ -1926,7 +1926,8 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                 Ok(set) => set,
                 Err(e) => {
                     log::error!(
-                        "rsb_hub: cannot build the signal set; reload and clean shutdown                          are disabled: {e}"
+                        "rsb_hub: cannot build the signal set; reload and clean shutdown \
+                         are disabled: {e}"
                     );
                     return;
                 }
@@ -1948,7 +1949,11 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                     // SIGTERM is `systemctl stop`; SIGINT is Ctrl-C from the
                     // terminal that started it. Same intent, same answer.
                     _ => {
-                        let name = if signo == libc::SIGINT { "SIGINT" } else { "SIGTERM" };
+                        let name = if signo == libc::SIGINT {
+                            "SIGINT"
+                        } else {
+                            "SIGTERM"
+                        };
                         log::info!("rsb_hub: {name} received, shutting down");
                         notifier.stopping("shutting down");
                         // Exit successfully: this was asked for. Nothing is
