@@ -504,7 +504,8 @@ impl<'a> HandshakeDeadline<'a> {
         // asked for. `None` is how "no deadline" is spelled.
         if deadline.is_some_and(|d| d.is_zero()) {
             log::error!(
-                "rsbinder RPC: a zero handshake deadline is not a deadline — pass a positive                  duration, or `None` to wait indefinitely on purpose"
+                "rsbinder RPC: a zero handshake deadline is not a deadline — pass a positive \
+                 duration, or `None` to wait indefinitely on purpose"
             );
             return Err(RpcError::Io(std::io::Error::from(
                 std::io::ErrorKind::InvalidInput,
