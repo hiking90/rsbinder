@@ -365,7 +365,10 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 
 /// Read exactly `buf.len()` bytes for a *frame header*. Zero bytes
 /// before any progress is a clean [`RpcError::PeerClosed`]; a partial
-/// header then EOF is [`RpcError::Truncated`].
+/// header then EOF is [`RpcError::Truncated`]. A transport that can tell
+/// an unclean end apart ([`RpcError::UncleanEndOfStream`], TLS with no
+/// `close_notify`) reports it as itself before any progress and as
+/// `Truncated` after — mid-frame, the stream position is what is lost.
 fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -389,6 +392,9 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
                     RpcError::Truncated
                 });
             }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
+                return Err(RpcError::Truncated);
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -411,6 +417,7 @@ fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             // Mid-frame deadline = desync, not a clean timeout.
             Err(e) if is_timeout(&e) => return Err(RpcError::Truncated),
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
             Err(e) => return Err(e.into()),
         }
     }

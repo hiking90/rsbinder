@@ -145,6 +145,16 @@ pub enum RpcError {
     /// The peer closed the connection cleanly with no frame pending
     /// (EOF / `BrokenPipe` / `ConnectionReset` before any header bytes).
     PeerClosed,
+    /// The stream ended at a frame boundary without the transport's own
+    /// close signal — a TLS session whose TCP stream ended with no
+    /// `close_notify`. Kept apart from [`PeerClosed`](Self::PeerClosed)
+    /// because on the one backend built for untrusted networks this is
+    /// exactly what a truncation attack looks like; a plain socket has no
+    /// close signal to miss and never reports it. The transport's own
+    /// [`shutdown`](transport::RpcTransport::shutdown) sends the signal,
+    /// so a deliberate close on this end is still `PeerClosed` on the
+    /// other. Projects to [`StatusCode::DeadObject`](crate::StatusCode).
+    UncleanEndOfStream,
     /// A frame length header was fully received but the body was
     /// truncated (peer closed mid-body, or declared more than it sent).
     Truncated,
@@ -171,6 +181,9 @@ impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RpcError::PeerClosed => write!(f, "RPC peer closed the connection"),
+            RpcError::UncleanEndOfStream => {
+                write!(f, "RPC stream ended without a close signal (truncated?)")
+            }
             RpcError::Truncated => write!(f, "RPC frame truncated (incomplete body)"),
             RpcError::FrameTooLarge { declared, max } => {
                 write!(
@@ -197,9 +210,16 @@ impl std::error::Error for RpcError {
 impl From<std::io::Error> for RpcError {
     /// Map a clean disconnect to [`RpcError::PeerClosed`]; everything
     /// else stays [`RpcError::Io`]. A truncated *body* is classified by
-    /// the framing reader, not here.
+    /// the framing reader, not here. An `RpcError` that travelled as the
+    /// `io::Error`'s payload (how the `Read` adapters carry
+    /// [`RpcError::UncleanEndOfStream`] through the framing readers)
+    /// comes back as itself rather than folded by kind.
     fn from(e: std::io::Error) -> Self {
         use std::io::ErrorKind::*;
+        let e = match e.downcast::<RpcError>() {
+            Ok(rpc) => return rpc,
+            Err(e) => e,
+        };
         match e.kind() {
             UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted => {
                 RpcError::PeerClosed
@@ -230,14 +250,21 @@ impl From<RpcError> for std::io::Error {
     /// — the status a caller's dead-peer check keys on.
     /// [`RpcError::Timeout`] projects onto `TimedOut`
     /// — kind-preserving rather than variant-preserving, since
-    /// `From<io::Error>` folds that kind into `Io(TimedOut)`. The
-    /// remaining variants have no `io::ErrorKind` that means what they
-    /// mean, so they stay `Other`.
+    /// `From<io::Error>` folds that kind into `Io(TimedOut)`.
+    /// [`RpcError::UncleanEndOfStream`] must survive the round trip —
+    /// folding it by kind would turn it back into `PeerClosed`, the very
+    /// thing it exists to be told apart from — so it goes out as an
+    /// `UnexpectedEof` carrying itself as the payload, which
+    /// `From<io::Error>` recovers first. The remaining variants have no
+    /// `io::ErrorKind` that means what they mean, so they stay `Other`.
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::Io(io) => io,
             RpcError::PeerClosed => std::io::ErrorKind::BrokenPipe.into(),
             RpcError::Timeout => std::io::ErrorKind::TimedOut.into(),
+            e @ RpcError::UncleanEndOfStream => {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
+            }
             other => std::io::Error::other(format!("{other}")),
         }
     }
@@ -252,6 +279,7 @@ impl From<RpcError> for crate::StatusCode {
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::PeerClosed => crate::StatusCode::DeadObject,
+            RpcError::UncleanEndOfStream => crate::StatusCode::DeadObject,
             RpcError::Truncated => crate::StatusCode::NotEnoughData,
             RpcError::FrameTooLarge { .. } => crate::StatusCode::BadValue,
             RpcError::Io(io) => crate::StatusCode::from(io),

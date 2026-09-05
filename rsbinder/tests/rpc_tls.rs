@@ -212,6 +212,52 @@ fn tls_over_unix_socket_e2e() {
     server.join().unwrap();
 }
 
+/// A TCP end without a TLS `close_notify` is not a clean close. On the
+/// one backend built for untrusted networks that is what a truncation
+/// attack looks like, so the transport reports it as
+/// [`RpcError::UncleanEndOfStream`] — not the `PeerClosed` a
+/// `close_notify` yields — even at a frame boundary, where the plain
+/// framing reader would otherwise see a clean end of stream.
+#[test]
+fn tls_eof_without_close_notify_is_unclean() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        // Dropped without `shutdown()`: the fd closes, no close_notify goes out.
+        drop(t);
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    server.join().unwrap();
+    match client.recv_frame() {
+        Err(RpcError::UncleanEndOfStream) => {}
+        other => panic!("expected UncleanEndOfStream at a frame boundary, got {other:?}"),
+    }
+}
+
+/// The transport's own `shutdown()` sends `close_notify` before the
+/// socket shutdown, so a deliberate local close is the clean end on the
+/// peer — the unclean report above is reserved for a stream that was cut.
+#[test]
+fn tls_shutdown_is_a_clean_close_for_the_peer() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        t.shutdown().expect("shutdown");
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    server.join().unwrap();
+    match client.recv_frame() {
+        Err(RpcError::PeerClosed) => {}
+        other => panic!("expected the clean PeerClosed after close_notify, got {other:?}"),
+    }
+}
+
 /// The one-call TCP+TLS client
 /// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
 /// handshake + R34 session — interoperates with a TLS server end to end.

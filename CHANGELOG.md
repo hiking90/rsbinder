@@ -31,6 +31,15 @@ short form — and the first entry is the only one no compiler will catch.
   incoming-connection threads blocked in `recv` with nothing to wake them, so
   `RpcSession::shutdown` would hang on the join. The bundled
   `TcpStream`/`UnixStream`/`VsockStream` impls are unaffected.
+- **A TLS stream that ends without `close_notify` is no longer a clean close.**
+  `rpc::RpcError` gained `UncleanEndOfStream` for it (projects to
+  `StatusCode::DeadObject`), and a serve loop that reaches it ends with
+  `Err(DeadObject)` where it used to return `Ok(())`. `TlsTransport::shutdown`
+  now sends `close_notify` before the socket shutdown, so a deliberate close
+  on one end is still the clean `PeerClosed` on the other; only a cut stream
+  is unclean. Plain-socket backends are unaffected — they have no close signal
+  to miss. Code that treated every TLS end of stream as clean now sees the
+  difference; code matching `RpcError` with a wildcard arm is unaffected.
 - **rsbinder-aidl rejects `.aidl` it used to accept.** Five inputs that
   previously generated silently-wrong or non-compiling Rust are now build
   errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
@@ -705,6 +714,20 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC, TLS) — a TCP end without `close_notify` read as a clean
+  close.** `TlsTransport::recv_raw` folded rustls's `UnexpectedEof` — the one
+  signal it gives for a stream that ended without the TLS close alert — into
+  a 0-byte read, and `pump_incoming` never told rustls about the EOF at all,
+  so the framing reader saw an ordinary end of stream and a serve loop
+  returned `Ok(())`. On the one backend built for untrusted networks that is
+  what a truncation attack at a frame boundary looks like (mid-frame it was
+  already `Truncated`). It is now `RpcError::UncleanEndOfStream`
+  (`StatusCode::DeadObject`, with a `warn!`), carried through the `Read`
+  adapters as the `io::Error` payload so the framing readers hand it back
+  unchanged; and `TlsTransport::shutdown` sends `close_notify` first, so
+  rsbinder's own deliberate close is still the clean end on the peer. No
+  transaction was ever misdelivered by this — a truncated reply already failed
+  the caller's wait; what was lost was the signal.
 - **rsbinder (RPC) — a refused attach was reported to the client as success.**
   The outgoing direction of an android-13+ attach carries no acknowledgement
   (AOSP writes `RpcNewSessionResponse` only for a new session, and an outgoing

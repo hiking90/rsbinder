@@ -344,7 +344,9 @@ impl TlsTransport {
     }
 
     /// Pull one chunk of ciphertext off the socket (lock-free) and feed
-    /// it into the crypto state. Returns `false` on a clean TCP EOF.
+    /// it into the crypto state. Returns `false` on TCP EOF — after
+    /// handing that EOF to rustls, so its reader can then tell a
+    /// `close_notify` (clean) from a cut stream (`UnexpectedEof`).
     fn pump_incoming(&self) -> RpcResult<bool> {
         let mut tmp = [0u8; TLS_READ_CHUNK];
         let k = loop {
@@ -360,10 +362,12 @@ impl TlsTransport {
                 Err(e) => return Err(e.into()),
             }
         };
-        if k == 0 {
-            return Ok(false); // peer closed the socket
-        }
         let mut c = self.conn.lock().expect("tls conn poisoned");
+        if k == 0 {
+            let mut eof: &[u8] = &[];
+            let _ = c.read_tls(&mut eof);
+            return Ok(false);
+        }
         let mut src: &[u8] = &tmp[..k];
         while !src.is_empty() {
             let n = c.read_tls(&mut src)?;
@@ -441,20 +445,23 @@ impl RpcTransport for TlsTransport {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
                 match c.reader().read(out) {
                     Ok(n) if n > 0 => return Ok(n),
-                    Ok(_) => return Ok(0), // clean close_notify, all drained
+                    Ok(_) => return Ok(0), // close_notify received, all drained
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    // Unclean TCP EOF after rustls drained: treat as close.
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
+                    // TCP EOF with no close_notify: on this backend that is
+                    // what a cut stream looks like, so it is not a close.
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        log::warn!("TLS stream ended without close_notify ({})", self.desc);
+                        return Err(RpcError::UncleanEndOfStream);
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
             // 2. Opportunistically flush any control-plane output rustls
             //    queued (non-blocking on `wlock`; see `flush_control`).
             self.flush_control()?;
-            // 3. Block on the socket (lock-free) for more ciphertext.
-            if !self.pump_incoming()? {
-                return Ok(0);
-            }
+            // 3. Block on the socket (lock-free) for more ciphertext. On EOF
+            //    rustls now knows, and the next pass of step 1 decides.
+            self.pump_incoming()?;
         }
     }
 
@@ -477,8 +484,21 @@ impl RpcTransport for TlsTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // TCP-level shutdown, not a TLS close_notify: the goal is to wake
-        // the reader, and the peer sees a truncated stream either way.
+        // close_notify first, so a deliberate close on this end is the clean
+        // end on the peer rather than the cut `recv_raw` reports. Best
+        // effort: a sender blocked on the socket holds `wlock`, and waking
+        // our own reader must not wait on it.
+        if let Ok(_g) = self.wlock.try_lock() {
+            let mut cipher = Vec::new();
+            {
+                let mut c = self.conn.lock().expect("tls conn poisoned");
+                c.send_close_notify();
+                let _ = c.write_tls(&mut cipher);
+            }
+            if !cipher.is_empty() {
+                let _ = self.write_socket_locked(&cipher);
+            }
+        }
         self.stream.shutdown()?;
         Ok(())
     }
@@ -501,6 +521,9 @@ impl Read for RawIo<'_> {
             // loses the Timeout/Truncated contract.
             Err(RpcError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
             Err(RpcError::PeerClosed) => Ok(0),
+            // Carried as the payload so `From<io::Error>` hands it back as
+            // itself on the far side of `read_header`.
+            Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
