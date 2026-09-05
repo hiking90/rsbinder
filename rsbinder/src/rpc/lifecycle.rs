@@ -13,6 +13,7 @@
 //!     ┌─── new() ──→  Live(n: NonZeroUsize) ───drop_connection (n==1)──→  Dying ──mark_dead──→ Dead
 //!                           │  ▲
 //!                           │  └─── drop_connection (n>1) decrements
+//!                           │       force_dying (any n) ─────────────→  Dying   (explicit shutdown)
 //!                           │
 //!                           └─── try_bump_live increments
 //! ```
@@ -211,6 +212,33 @@ impl SessionLifecycle {
             .is_ok()
     }
 
+    /// Explicit-shutdown counterpart of [`drop_connection`](Self::drop_connection),
+    /// which only ever takes the `1→0` edge: declare death from **any**
+    /// `Live(n)`. Exactly one caller gets `true` (`Live(n) → Dying`) and
+    /// owns the death sequence + [`mark_dead`](Self::mark_dead);
+    /// `Dying`/`Dead` return `false`. The live count is discarded on
+    /// purpose — the caller is shutting those connections down, and their
+    /// workers' later `drop_connection` calls find a settled state and
+    /// return `false` quietly, as they already do after a
+    /// [`try_drop_sole_connection`](Self::try_drop_sole_connection).
+    pub(crate) fn force_dying(&self) -> bool {
+        let mut v = self.inner.load(Ordering::SeqCst);
+        loop {
+            if v >> STATE_SHIFT != STATE_LIVE_TAG {
+                return false;
+            }
+            match self.inner.compare_exchange_weak(
+                v,
+                encode_dying(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => v = actual,
+            }
+        }
+    }
+
     /// Transition `Dying → Dead`. The caller MUST have just fired
     /// session obituaries (the only path that reaches `Dying`).
     pub(crate) fn mark_dead(&self) {
@@ -404,6 +432,30 @@ mod tests {
         assert!(lc.drop_connection(), "Live(1) -> Dying");
         assert!(!lc.try_drop_sole_connection());
         lc.mark_dead();
+    }
+
+    /// `force_dying` takes the edge from any live count, once; the
+    /// connections' own later `drop_connection`s are then quiet.
+    #[test]
+    fn force_dying_from_live_n_takes_the_edge_exactly_once() {
+        let lc = SessionLifecycle::new();
+        assert!(lc.try_bump_live());
+        assert!(lc.try_bump_live());
+        assert_eq!(lc.live_count(), 3);
+        assert!(lc.force_dying(), "Live(3) -> Dying");
+        assert_eq!(lc.snapshot(), SessionLifecycleSnapshot::Dying);
+        assert!(
+            !lc.force_dying(),
+            "a second caller does not own the death sequence"
+        );
+        assert!(
+            !lc.drop_connection(),
+            "the shut-down workers' exits are quiet"
+        );
+        assert!(!lc.try_bump_live(), "no attach after an explicit shutdown");
+        lc.mark_dead();
+        assert!(!lc.force_dying());
+        assert_eq!(lc.snapshot(), SessionLifecycleSnapshot::Dead);
     }
 
     #[test]

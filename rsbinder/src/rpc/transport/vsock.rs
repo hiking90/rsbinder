@@ -93,7 +93,7 @@ impl RpcTransport for VsockTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::io::Write;
         let mut w = &self.stream;
-        w.write_all(buf)?;
+        super::write_all_reporting(&mut w, buf)?;
         w.flush()?;
         Ok(())
     }
@@ -133,7 +133,6 @@ impl RpcTransport for VsockTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        Ok(())
+        super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }
 }

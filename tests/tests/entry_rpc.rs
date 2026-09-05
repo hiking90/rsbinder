@@ -74,6 +74,37 @@ fn entry_serve_and_connect_over_unix() {
     hello.r#ping().unwrap();
 }
 
+/// Plan 2-21 B-2 — dropping the guard while a client is still connected
+/// ends the server: the workers are woken and joined instead of waited
+/// on, and the client's next call fails. The guard is dropped on another
+/// thread under a deadline so a regression fails the test rather than
+/// hanging it: the guard's `stop_accepting` → join → `terminate` order is
+/// what this pins.
+#[test]
+fn entry_guard_drop_ends_a_connected_client() {
+    let sock = SockPath::new("guard-drop");
+    let guard = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add("svc", tagged("svc"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+    let svc: Strong<dyn IRpcSmoke> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
+    assert_eq!(svc.r#echo("x").unwrap(), "svc:x");
+
+    let dropped = std::thread::spawn(move || drop(guard));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !dropped.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ServerGuard::drop blocked with a client connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    dropped.join().expect("drop thread");
+    assert!(svc.r#echo("after").is_err(), "the server ended the session");
+}
+
 /// `Client` resolves several names on one session; dropping it leaves
 /// the proxies working (D5).
 #[test]
@@ -175,11 +206,38 @@ fn entry_options_apply_to_rpc_server() {
 /// carrying it to a `set_read_timeout`/`connect_timeout` that rejects it
 /// as an opaque I/O error, or (worse) dropping the caller's bound.
 ///
-/// **Mutant gate**: removing the check in `rpc_connect` turns this into
-/// a connect attempt whose failure names neither the option nor the
-/// reason.
+/// The zero is asserted on the **versioned** endpoint, where the option
+/// does apply: without the facade's check the value reaches
+/// `HandshakeDeadline::arm`, whose refusal is an opaque I/O error
+/// (`Unknown`), so the assertion below is a real gate on the facade. The
+/// r34 wire has no connection handshake for the option to bound, so there
+/// it is refused whatever its value — `ClientOptions` promises an option
+/// that does not apply is `BadValue`, never ignored.
 #[test]
 fn entry_zero_handshake_timeout_is_refused() {
+    let sock13 = SockPath::new("zerohs13");
+    let _guard13 = rsbinder::serve(&sock13.uri("?profile=android13plus"))
+        .expect("serve")
+        .add("svc", tagged("svc"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let err = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+        o.handshake_timeout = Some(std::time::Duration::ZERO)
+    })
+    .expect_err("a zero handshake deadline must be refused before any connect");
+    assert_eq!(err, rsbinder::StatusCode::BadValue);
+
+    // Control: on the same endpoint a positive deadline connects.
+    let ok = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+        o.handshake_timeout = Some(std::time::Duration::from_secs(5))
+    })
+    .and_then(|c| c.binder("svc"));
+    assert!(ok.is_ok(), "a positive deadline still connects");
+
+    // The r34 wire has no handshake phase, so the option is refused there
+    // whatever its value.
     let sock = SockPath::new("zerohs");
     let _guard = rsbinder::serve(&sock.uri(""))
         .expect("serve")
@@ -187,19 +245,11 @@ fn entry_zero_handshake_timeout_is_refused() {
         .expect("add")
         .spawn()
         .expect("spawn");
-
     let err = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
-        o.handshake_timeout = Some(std::time::Duration::ZERO)
-    })
-    .expect_err("a zero handshake deadline must be refused");
-    assert_eq!(err, rsbinder::StatusCode::BadValue);
-
-    // Control: a positive deadline on the same endpoint connects.
-    let ok = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
         o.handshake_timeout = Some(std::time::Duration::from_secs(5))
     })
-    .and_then(|c| c.binder("svc"));
-    assert!(ok.is_ok(), "a positive deadline still connects");
+    .expect_err("handshake_timeout does not apply to the r34 wire");
+    assert_eq!(err, rsbinder::StatusCode::BadValue);
 }
 
 /// `connect_async` (feature `tokio`) resolves through `spawn_blocking`

@@ -212,7 +212,7 @@ impl EchoServerGuard {
 
 impl Drop for EchoServerGuard {
     fn drop(&mut self) {
-        self.server.shutdown();
+        self.server.stop_accepting();
         if let Some(bg) = self.bg.take() {
             let _ = bg.join();
         }
@@ -273,7 +273,7 @@ fn accessor_arm_resolves_root_and_echoes() {
 
     // Drop the user-visible root: the wrapper's `Drop` must release the
     // inner proxy first (best-effort DEC_STRONG), then the session
-    // (peer-side serve loop exits on PeerClosed). No leak / no panic.
+    // (peer-side serve loop exits on EndOfStream). No leak / no panic.
     drop(root);
 }
 

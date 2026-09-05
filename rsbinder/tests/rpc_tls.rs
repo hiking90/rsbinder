@@ -212,6 +212,162 @@ fn tls_over_unix_socket_e2e() {
     server.join().unwrap();
 }
 
+/// A TCP end without a TLS `close_notify` is not a clean close. On the
+/// one backend built for untrusted networks that is what a truncation
+/// attack looks like, so the transport reports it as
+/// [`RpcError::UncleanEndOfStream`] — not the `EndOfStream` a
+/// `close_notify` yields — even at a frame boundary, where the plain
+/// framing reader would otherwise see a clean end of stream.
+#[test]
+fn tls_eof_without_close_notify_is_unclean() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        // Dropped without `shutdown()`: the fd closes, no close_notify goes out.
+        drop(t);
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    server.join().unwrap();
+    match client.recv_frame() {
+        Err(RpcError::UncleanEndOfStream) => {}
+        other => panic!("expected UncleanEndOfStream at a frame boundary, got {other:?}"),
+    }
+}
+
+/// The transport's own `shutdown()` sends `close_notify` before the
+/// socket shutdown, so a deliberate local close is the clean end on the
+/// peer — the unclean report above is reserved for a stream that was cut.
+#[test]
+fn tls_shutdown_is_a_clean_close_for_the_peer() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        t.shutdown().expect("shutdown");
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    server.join().unwrap();
+    match client.recv_frame() {
+        Err(RpcError::EndOfStream) => {}
+        other => panic!("expected the clean EndOfStream after close_notify, got {other:?}"),
+    }
+}
+
+/// Plan 2-21 D-3 — our own `shutdown()` wakes our own reader with an end
+/// of stream that carries no `close_notify` from the peer. That is the
+/// shape of a cut, but it is ours: the transport reports the clean
+/// `EndOfStream`, not `UncleanEndOfStream`, so a session this end shut
+/// down ends its serve loop cleanly. A second `shutdown()` is `Ok`.
+#[test]
+fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        // One frame proves the server's handshake I/O is over before the
+        // client shuts down — a client `SHUT_RD` while the server still has
+        // a post-handshake write pending fails that write with `EPIPE` on
+        // Linux. Then the server holds its end until the client has looked,
+        // so the only end the client sees is the one it made itself.
+        t.send_frame(b"hello").expect("send after handshake");
+        let _ = done_rx.recv();
+        drop(t);
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    assert_eq!(client.recv_frame().expect("server's frame"), b"hello");
+    client.shutdown().expect("shutdown");
+    client.shutdown().expect("a second shutdown is Ok");
+    match client.recv_frame() {
+        Err(RpcError::EndOfStream) => {}
+        other => panic!("our own shutdown must read as a clean end, got {other:?}"),
+    }
+    let _ = done_tx.send(());
+    server.join().unwrap();
+}
+
+/// A `shutdown()` racing this end's own in-flight send: the peer reads
+/// every frame that send was told went out, then a clean end.
+///
+/// Two promises, both of which a shutdown that simply cut the socket
+/// broke. The peer's: `UncleanEndOfStream` is reserved for a stream
+/// somebody cut, so a deliberate close owes it `close_notify` — and only
+/// the thread holding `wlock` may put that on the wire, so `shutdown` has
+/// to wait for the send in flight rather than strand the alert. The
+/// sender's: `Ok` means the frame went out. A send that started after
+/// `shutdown` is refused, and the alert is queued only once the lock is
+/// held, so no frame can be encrypted behind it — where the peer, having
+/// read the alert, would discard it (RFC 8446 §6.1) after the sender was
+/// told `Ok`. The wait is bounded, so a peer that has stopped reading
+/// still cannot hold teardown.
+///
+/// The window is a few instructions wide, so this races it repeatedly
+/// rather than pinning one interleaving, and counts on both ends: every
+/// `Ok` the sender saw is a frame the peer received, and the end the peer
+/// reads is never an unclean one. A cut *mid-frame* would read as
+/// `Truncated`, and the frame it cut was reported failed, so the counts
+/// still agree — the assertion tolerates it without naming it.
+#[test]
+fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
+    for round in 0..48u64 {
+        let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+        let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+        let (t_tx, t_rx) = std::sync::mpsc::channel::<Arc<TlsTransport>>();
+        let sender = thread::spawn(move || {
+            let t = Arc::new(
+                TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake"),
+            );
+            t_tx.send(Arc::clone(&t)).expect("hand the transport over");
+            // Small frames so a send never parks in the socket write and
+            // the boundary between two of them comes round often — that
+            // boundary is what the shutdown has to hit. Count what this
+            // end was told went out.
+            let mut sent_ok = 0usize;
+            while t.send_frame(b"tick").is_ok() {
+                sent_ok += 1;
+            }
+            sent_ok
+        });
+        let client =
+            TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+                .expect("client handshake");
+        let server_t = t_rx.recv().expect("transport from the sender thread");
+        // Walk the delay across the rounds so the shutdown lands at a
+        // different point of the send loop each time.
+        let closer = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_micros(round * 40));
+            server_t.shutdown().expect("shutdown");
+        });
+        let mut received = 0usize;
+        let end = loop {
+            match client.recv_frame() {
+                Ok(f) => {
+                    assert_eq!(f, b"tick", "frames must arrive intact until the end");
+                    received += 1;
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            !matches!(end, RpcError::UncleanEndOfStream),
+            "round {round}: a shutdown racing a send left the peer an unclean end"
+        );
+        closer.join().unwrap();
+        let sent_ok = sender.join().unwrap();
+        assert_eq!(
+            received, sent_ok,
+            "round {round}: the sender was told {sent_ok} frames went out, the peer read {received}"
+        );
+    }
+}
+
 /// The one-call TCP+TLS client
 /// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
 /// handshake + R34 session — interoperates with a TLS server end to end.
@@ -522,7 +678,7 @@ fn setup_tcp_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }
 
@@ -611,7 +767,7 @@ fn vsock_tls_loopback_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }
 
@@ -673,6 +829,6 @@ fn setup_unix_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }

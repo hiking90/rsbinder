@@ -47,7 +47,7 @@ pub struct RpcProxy {
     /// *local* object the peer holds; that is broken by
     /// [`RpcSessionInner::on_session_dead`], which runs when a serve loop
     /// ends, when a transaction fails on a lost connection, or on an
-    /// explicit [`RpcSession::shutdown`](super::RpcSession::shutdown) —
+    /// explicit [`RpcSession::close_session`](super::RpcSession::close_session) —
     /// the last being the only break available to a session that neither
     /// serves nor transacts again.
     session: Arc<RpcSessionInner>,

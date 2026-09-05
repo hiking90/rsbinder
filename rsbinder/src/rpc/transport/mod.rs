@@ -66,7 +66,7 @@ pub trait RpcTransport: Send + Sync {
     /// Receive exactly one logical frame.
     ///
     /// A clean peer close with nothing pending is
-    /// [`RpcError::PeerClosed`]; a header received but body short is
+    /// [`RpcError::EndOfStream`]; a header received but body short is
     /// [`RpcError::Truncated`]. Never panics or loops forever on a
     /// hostile peer.
     fn recv_frame(&self) -> RpcResult<Vec<u8>>;
@@ -90,7 +90,7 @@ pub trait RpcTransport: Send + Sync {
     /// `unix` / `mem` / `tcp_debug` / `vsock` / `tls` override it. A deadline that
     /// elapses with **nothing consumed** surfaces as
     /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
-    /// deadline that elapses mid-frame is [`RpcError::Truncated`].
+    /// deadline that elapses mid-frame is [`RpcError::DeadlineMidFrame`].
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -108,22 +108,53 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
-    /// Shut the connection down in both directions so a thread blocked in
-    /// [`recv_frame`](Self::recv_frame) returns (`PeerClosed`) and later
-    /// sends fail. Used to end a client's incoming-connection threads on
-    /// session death / `RpcSession::shutdown`. Best-effort; the default
-    /// does nothing, for a transport that cannot be interrupted.
+    /// Shut the connection down in both directions: wake a reader blocked
+    /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
+    /// and make this end's later sends fail. (The *peer's* sends are the
+    /// platform's business — a Linux `AF_UNIX` peer gets `EPIPE` at once,
+    /// a macOS one has its writes accepted and discarded, a TCP peer on
+    /// either sees the reset on a later write; it reads the end of stream
+    /// either way.)
+    /// This is how a session ends its
+    /// connections — `RpcSession::close_session`, `RpcServer::terminate`, a
+    /// slot retired after a lost stream. Required, with no default on
+    /// purpose: a transport that silently did nothing here would leave a
+    /// serve loop or an incoming-connection thread parked in `recv`
+    /// forever, and `RpcSession::close_session` would hang on the join. The
+    /// same reasoning already made [`TlsStream::shutdown_stream`] required.
     ///
-    /// **Override it if your transport can be interrupted at all.** With
-    /// the no-op default, `RpcSession::shutdown` has nothing to wake a
-    /// thread parked in `recv_frame` on this transport, so a
-    /// `serve_blocking` or incoming-connection thread on it never exits
-    /// and the documented teardown ("it exits on its own once the
-    /// transport is shut down") does not hold. Every in-tree
-    /// socket-backed transport overrides it.
-    fn shutdown(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// The contract is narrower than the name suggests, and every caller
+    /// in rsbinder is written to it (plan 2-21 §3.4):
+    ///
+    /// - **What happens to bytes already received is platform- and
+    ///   backend-dependent, and nothing may assume it.** A kernel may keep
+    ///   its receive queue across a local shutdown — Linux: a reader gets
+    ///   the queued bytes, then end of stream — or drop it (macOS). A
+    ///   transport's own buffer may survive (`tls`'s decrypted plaintext)
+    ///   or be cleared (`unix` fd-mode clears its leftover here). A caller
+    ///   that must not read what is buffered keeps that decision in
+    ///   session state — the slot's `unreadable` mark — not here. `mem`
+    ///   models the Linux behaviour, so a hermetic test exercises the case
+    ///   that hides bugs.
+    /// - **A reader woken by this returns the end of stream** —
+    ///   [`RpcError::EndOfStream`] at a frame boundary, [`RpcError::Truncated`]
+    ///   mid-frame — never a distinct "shut down locally" error. Who ended
+    ///   the connection is session knowledge (`SessionEnd::by`), not
+    ///   transport knowledge; a TLS transport does not report its own
+    ///   shutdown as an unclean end.
+    /// - **Idempotent.** A second call returns `Ok(())`; the socket
+    ///   backends absorb the `ENOTCONN` a second shutdown raises on macOS.
+    /// - **The `Err` is diagnostic.** The connection is being ended
+    ///   whatever it says; callers log it and never branch on it.
+    /// - **This is not `close`.** The kernel's queue is certainly gone only
+    ///   when the last `Arc<dyn RpcTransport>` drops.
+    ///
+    /// The measured behaviour of `unix` (both modes), `mem`, `tcp_debug`
+    /// and `tls` on both platforms is pinned by
+    /// `tests/rpc_transport_conformance.rs`. `vsock` is not measured: it
+    /// needs a VM peer, so its behaviour here is inferred from `vsock(7)`
+    /// and covered only by its own `#[ignore]`d tests.
+    fn shutdown(&self) -> RpcResult<()>;
 
     /// Send one frame plus passed file descriptors out-of-band (opt-in
     /// `FileDescriptorTransportMode::Unix`).
@@ -157,10 +188,13 @@ pub trait RpcTransport: Send + Sync {
     /// has no length prefix (`RpcState::rpcSend` writes the
     /// `RpcWireHeader` + body directly) — the android-13+ profile drives
     /// framing itself via `wire_android13`. The default is
-    /// **unsupported**, so a backend that does not override it stays
-    /// frame-only *by type* (currently `mem`); `unix`, `tls` and `vsock`
-    /// override it. The existing R34 path never calls this —
-    /// `send_frame`/`recv_frame` are byte-unchanged.
+    /// **unsupported**: right for a frame-only backend (`mem`), and a
+    /// silent trap for a byte-stream one — an android-13+ session over a
+    /// backend that forgot it fails at its first handshake byte (it
+    /// happened to `vsock`, then to `tcp_debug`). Every stream backend
+    /// (`unix`, `tcp_debug`, `vsock`, `tls`) must override both this and
+    /// [`recv_raw`](Self::recv_raw). The existing R34 path never calls
+    /// this — `send_frame`/`recv_frame` are byte-unchanged.
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
@@ -363,16 +397,51 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     Ok(())
 }
 
+/// `write_all`, but telling a failure that put **nothing** on the wire
+/// apart from one that stopped part-way.
+///
+/// `write_all` reports the same error either way, and the session's
+/// send-failure rule needs the difference: a frame that stopped part-way
+/// left the peer a header it will complete out of whatever arrives next,
+/// so its connection must be retired, while a frame that never started
+/// left the stream frame-synchronized and its connection healthy. A send
+/// deadline (`SO_SNDTIMEO`) that expires before the first byte is
+/// therefore [`RpcError::Timeout`] — the value a read deadline that
+/// consumed nothing already yields — and every other failure, at any
+/// position, stays the transport error.
+///
+/// `w` must report partial progress honestly, as a socket does. An
+/// adapter that hands the whole buffer to another all-or-nothing send does
+/// not, and classifies at its own level instead: `tls` never reports this,
+/// because a record its socket write dropped is gone from the sequence
+/// whether or not a byte of it went out.
+pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
+    let mut sent = 0;
+    while sent < buf.len() {
+        match w.write(&buf[sent..]) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero).into()),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if sent == 0 && is_timeout(&e) => return Err(RpcError::Timeout),
+            Err(e) => return Err(RpcError::from(e)),
+        }
+    }
+    Ok(())
+}
+
 /// Read exactly `buf.len()` bytes for a *frame header*. Zero bytes
-/// before any progress is a clean [`RpcError::PeerClosed`]; a partial
-/// header then EOF is [`RpcError::Truncated`].
+/// before any progress is a clean [`RpcError::EndOfStream`]; a partial
+/// header then EOF is [`RpcError::Truncated`]. A transport that can tell
+/// an unclean end apart ([`RpcError::UncleanEndOfStream`], TLS with no
+/// `close_notify`) reports it as itself before any progress and as
+/// `Truncated` after — mid-frame, the stream position is what is lost.
 fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(if filled == 0 {
-                    RpcError::PeerClosed
+                    RpcError::EndOfStream
                 } else {
                     RpcError::Truncated
                 });
@@ -386,22 +455,58 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
                 return Err(if filled == 0 {
                     RpcError::Timeout
                 } else {
-                    RpcError::Truncated
+                    RpcError::DeadlineMidFrame
                 });
             }
-            Err(e) => return Err(e.into()),
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
+                return Err(RpcError::Truncated);
+            }
+            // Past the first byte the header is committed, so a disconnect
+            // has lost the position whichever kind it arrived as: the ones
+            // `From<io::Error>` folds into `EndOfStream` (a reset among
+            // them) do not mean "nothing was pending" here.
+            Err(e) => {
+                return Err(match RpcError::from(e) {
+                    RpcError::EndOfStream if filled > 0 => RpcError::Truncated,
+                    other => other,
+                })
+            }
         }
     }
     Ok(())
 }
 
-/// `WouldBlock`/`TimedOut` is how a socket read deadline surfaces.
+/// Whether an I/O operation failed on a deadline this end armed:
+/// `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
+/// [`write_all_reporting`] and for `tls`'s teardown control flush. On the
+/// supported platforms both surface as `WouldBlock`; `TimedOut` is here
+/// because the `Read`
+/// adapters carry [`RpcError::Timeout`] across the `RpcError` ⇄
+/// `io::Error` boundary with exactly that kind, and the framing readers
+/// sit on top of both. The cost is that a raw socket's own `ETIMEDOUT` —
+/// a peer whose host stopped answering, not a deadline of ours — is
+/// `TimedOut` too and cannot be told apart here; what is decided on that
+/// distinction (see [`SessionEnd::new`](super::SessionEnd)) is decided
+/// from whether a deadline was armed at all.
 pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+/// The socket backends' `shutdown`: a second call raises `ENOTCONN` on
+/// macOS (Linux returns `Ok`), and the trait promises idempotence, so that
+/// one is absorbed. Anything else is the diagnostic the trait documents.
+pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotConnected => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Read exactly `buf.len()` body bytes. The header was already
-/// committed, so *any* short read is [`RpcError::Truncated`].
+/// committed, so any short read has lost the stream position:
+/// [`RpcError::Truncated`] if the stream ended, [`RpcError::DeadlineMidFrame`]
+/// if a read deadline cut it ([`is_timeout`] cannot say whose — see its doc).
 fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -409,9 +514,17 @@ fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Ok(0) => return Err(RpcError::Truncated),
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Mid-frame deadline = desync, not a clean timeout.
-            Err(e) if is_timeout(&e) => return Err(RpcError::Truncated),
-            Err(e) => return Err(e.into()),
+            Err(e) if is_timeout(&e) => return Err(RpcError::DeadlineMidFrame),
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
+            // The header is already consumed, so every disconnect here is a
+            // cut frame — including the kinds `From<io::Error>` folds into
+            // `EndOfStream` (`ConnectionReset` from a peer killed mid-frame).
+            Err(e) => {
+                return Err(match RpcError::from(e) {
+                    RpcError::EndOfStream => RpcError::Truncated,
+                    other => other,
+                })
+            }
         }
     }
     Ok(())
@@ -490,7 +603,7 @@ mod tests {
         // Empty input: clean peer-closed, no header at all.
         assert!(matches!(
             __fuzz_decode_frame(&[]),
-            Err(RpcError::PeerClosed)
+            Err(RpcError::EndOfStream)
         ));
 
         // Partial header (2 of 4 bytes): truncated, not a panic.
@@ -537,6 +650,45 @@ mod tests {
             write_frame(&mut Trap, &big),
             Err(RpcError::FrameTooLarge { .. })
         ));
+    }
+
+    /// A send deadline is only frame-synchronized while nothing has gone
+    /// out, and that is the whole difference the session's send-failure
+    /// rule acts on: `Timeout` keeps the connection, a transport error
+    /// retires it.
+    ///
+    /// **Mutant gate**: dropping the `sent == 0` guard makes the second
+    /// case report `Timeout` as well, and a peer left half a frame keeps
+    /// its slot.
+    #[test]
+    fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
+        struct Stall(usize);
+        impl Write for Stall {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                }
+                let n = self.0.min(buf.len());
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(matches!(
+            write_all_reporting(&mut Stall(0), b"frame"),
+            Err(RpcError::Timeout)
+        ));
+        assert!(
+            matches!(
+                write_all_reporting(&mut Stall(2), b"frame"),
+                Err(RpcError::Io(ref e)) if e.kind() == ErrorKind::WouldBlock
+            ),
+            "a deadline past the first byte left a partial frame on the wire"
+        );
+        assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
     }
 
     #[test]

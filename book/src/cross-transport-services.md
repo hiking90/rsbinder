@@ -58,7 +58,7 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
 | `add(name, svc)` | publish `svc` (anything `Into<SIBinder>`, e.g. `BnFoo::new_binder(..)`). Kernel: registered with the service manager right away. RPC: queued until the server starts. |
 | `with(\|o\| ..)` | set [`ServeOptions`](#options) |
 | `run()` | serve and block. Kernel: start the thread pool and join it (never returns normally). RPC: the accept loop, until shut down. |
-| `spawn()` | serve in the background; returns a `ServerGuard`. RPC: dropping the guard shuts the server down. Kernel: the guard is inert (the process thread pool has no shutdown). |
+| `spawn()` | serve in the background; returns a `ServerGuard`. RPC: dropping the guard (or `ServerGuard::stop_and_join()`) ends the server — every session is closed and the threads are joined. Kernel: the guard is inert (the process thread pool has no shutdown). |
 
 Kernel `serve("binder://")` initializes the process-wide `ProcessState`
 idempotently; a second kernel server in the same process reuses it and logs
@@ -145,7 +145,7 @@ Moving a service between transports changes its trust boundary — read
 | `get_calling_uid()` | kernel-vouched | kernel-vouched on `unix://`, fail-closed sentinel elsewhere |
 | death | process death | session disconnect |
 | `list_services`, notifications, lazy services | via [`hub`](./service-manager.md) | not available |
-| abandoning a session | nothing to do | call `RpcSession::shutdown()` if a service you exported holds a proxy back into it (`client.session()`) |
+| abandoning a session | nothing to do | call `RpcSession::close_session()` if a service you exported holds a proxy back into it (`client.session()`) |
 
 ## Async
 

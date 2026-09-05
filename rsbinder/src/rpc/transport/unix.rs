@@ -288,7 +288,7 @@ impl RpcTransport for UnixTransport {
     /// `&self` stays full-duplex (same as `send_frame`).
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         let mut w = &self.stream;
-        w.write_all(buf).map_err(RpcError::from)?;
+        super::write_all_reporting(&mut w, buf)?;
         w.flush().map_err(RpcError::from)?;
         Ok(())
     }
@@ -374,10 +374,20 @@ impl RpcTransport for UnixTransport {
                 Ok(n) => n,
                 // EINTR is benign — retry the syscall.
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(std::io::Error::from(e).into()),
+                // Same split `write_all_reporting` makes: a send deadline
+                // that expired before the first byte started no frame, so
+                // the stream is still frame-synchronized.
+                Err(e) => {
+                    let e = std::io::Error::from(e);
+                    return Err(if sent == 0 && super::is_timeout(&e) {
+                        RpcError::Timeout
+                    } else {
+                        e.into()
+                    });
+                }
             };
             if n == 0 {
-                return Err(RpcError::PeerClosed);
+                return Err(RpcError::EndOfStream);
             }
             sent += n;
         }
@@ -471,8 +481,18 @@ impl RpcTransport for UnixTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        Ok(())
+        // Socket first: a reader parked in `recvmsg` holds `fd_recv_buf`
+        // for the whole call and releases it only once it wakes, so taking
+        // the lock first deadlocks against it. What it appends on waking was
+        // queued in the kernel before this call (the platform's business);
+        // what is left in this buffer after it returns is ours — the prefix
+        // of a frame some error cut short — and a later reader must not
+        // decode the connection just ended out of it.
+        let shut = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Ok(mut leftover) = self.fd_recv_buf.lock() {
+            leftover.clear();
+        }
+        super::absorb_already_shut(shut)
     }
 
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band
@@ -531,7 +551,7 @@ impl RpcTransport for UnixTransport {
                 Err(e) => return Err(std::io::Error::from(e).into()),
             };
             if n == 0 {
-                return Err(RpcError::PeerClosed);
+                return Err(RpcError::EndOfStream);
             }
             sent += n;
         }
@@ -552,6 +572,10 @@ impl RpcTransport for UnixTransport {
 
         let mut leftover = self.fd_recv_buf.lock().expect("fd recv buf poisoned");
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+        // Reused across iterations — a frame costs at least two `recvmsg`s
+        // (header, then body), and `RecvAncillaryBuffer::new` resets it.
+        let mut space =
+            vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         loop {
             if leftover.len() >= 4 {
                 let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
@@ -568,8 +592,22 @@ impl RpcTransport for UnixTransport {
                 }
             }
             let mut tmp = [0u8; 8192];
-            let mut space =
-                vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
+            // Never read past this frame's last byte. `AF_UNIX` glues
+            // stream data across skbs and only stops *after* consuming the
+            // one that carried fds, so a `recvmsg` spilling into the next
+            // frame would hand that frame's `SCM_RIGHTS` fds back attached
+            // to this one — and leave the next frame with none. The
+            // android-13+ reader (`read_aosp_message_with_fds`) is exact
+            // for the same reason.
+            let want = if leftover.len() < 4 {
+                4 - leftover.len()
+            } else {
+                // Bounded by `MAX_FRAME_LEN` above, and short of `4 + len`
+                // (a complete frame returned already).
+                let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
+                4 + len - leftover.len()
+            };
+            let want = want.min(tmp.len());
             let mut anc = RecvAncillaryBuffer::new(&mut space);
             // `RecvFlags::CMSG_CLOEXEC` (`MSG_CMSG_CLOEXEC`) is
             // Linux-only; for portability set `FD_CLOEXEC` explicitly
@@ -577,7 +615,7 @@ impl RpcTransport for UnixTransport {
             let r = loop {
                 match rustix::net::recvmsg(
                     &self.stream,
-                    &mut [IoSliceMut::new(&mut tmp)],
+                    &mut [IoSliceMut::new(&mut tmp[..want])],
                     &mut anc,
                     RecvFlags::empty(),
                 ) {
@@ -585,19 +623,26 @@ impl RpcTransport for UnixTransport {
                     // EINTR retry.
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(e) => {
-                        // Map a read deadline to `Timeout` (frame-
-                        // synchronized, nothing consumed) or `Truncated`
-                        // (mid-frame desync) so callers can distinguish
-                        // — same contract as `read_header`/`read_body`.
+                        // Same contract as `read_header`/`read_body`: a
+                        // deadline with nothing consumed is a boundary
+                        // `Timeout`; mid-frame it is our own cut.
                         let io_err = std::io::Error::from(e);
                         if super::is_timeout(&io_err) {
                             return Err(if leftover.is_empty() && fds.is_empty() {
                                 RpcError::Timeout
                             } else {
-                                RpcError::Truncated
+                                RpcError::DeadlineMidFrame
                             });
                         }
-                        return Err(io_err.into());
+                        // Likewise for a disconnect: past the first byte or
+                        // fd of a message the position is lost, so the kinds
+                        // folded into `EndOfStream` are a cut, not a boundary.
+                        return Err(match RpcError::from(io_err) {
+                            RpcError::EndOfStream if !leftover.is_empty() || !fds.is_empty() => {
+                                RpcError::Truncated
+                            }
+                            other => other,
+                        });
                     }
                 }
             };
@@ -625,7 +670,7 @@ impl RpcTransport for UnixTransport {
             }
             if r.bytes == 0 {
                 return Err(if leftover.is_empty() && fds.is_empty() {
-                    RpcError::PeerClosed
+                    RpcError::EndOfStream
                 } else {
                     RpcError::Truncated
                 });
@@ -683,8 +728,73 @@ mod tests {
     fn unix_peer_closed_on_drop() {
         let (a, b) = UnixTransport::pair().expect("socketpair");
         drop(b);
-        // First recv sees EOF -> clean PeerClosed.
-        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+        // First recv sees EOF -> clean EndOfStream.
+        assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
+    }
+
+    /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. The reader
+    /// never reads past the frame in progress, so what this buffer can
+    /// hold is the prefix an error left behind; a deadline part-way
+    /// through a frame is the cheapest way to put one there. That prefix
+    /// belongs to a connection that has ended and must not be the head of
+    /// what a later reader decodes. What the *kernel* still holds is the
+    /// platform's business and is pinned by `rpc_transport_conformance`,
+    /// not here.
+    #[test]
+    fn unix_shutdown_drops_the_fd_mode_leftover() {
+        use std::io::Write;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("deadline");
+        // A header promising 8 bytes, then only 3 of them.
+        let mut partial = 8u32.to_le_bytes().to_vec();
+        partial.extend_from_slice(&[1, 2, 3]);
+        (&a.stream).write_all(&partial).expect("partial frame");
+        assert!(matches!(
+            b.recv_frame_with_fds(),
+            Err(RpcError::DeadlineMidFrame)
+        ));
+        assert!(
+            !b.fd_recv_buf.lock().unwrap().is_empty(),
+            "the prefix of the cut frame is buffered"
+        );
+        b.shutdown().expect("shutdown");
+        assert!(
+            b.fd_recv_buf.lock().unwrap().is_empty(),
+            "shutdown must drop what this end had buffered"
+        );
+        b.shutdown().expect("a second shutdown is Ok (idempotent)");
+    }
+
+    /// Plan 2-21 D-6 — a read deadline that elapses part-way through a
+    /// frame is this end's own cut (`DeadlineMidFrame`), told apart from
+    /// a stream that ended mid-frame (`Truncated`); with nothing consumed
+    /// it stays the boundary `Timeout`. Both the framed reader and the
+    /// fd-mode reader classify the same way.
+    #[test]
+    fn unix_mid_frame_deadline_is_our_own_cut() {
+        use std::io::Write;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("deadline");
+        assert!(matches!(b.recv_frame(), Err(RpcError::Timeout)));
+        assert!(matches!(b.recv_frame_with_fds(), Err(RpcError::Timeout)));
+
+        // A header promising 8 bytes, then only 3 of them.
+        let mut partial = 8u32.to_le_bytes().to_vec();
+        partial.extend_from_slice(&[1, 2, 3]);
+        let mut w = &a.stream;
+        w.write_all(&partial).expect("partial frame");
+        assert!(
+            matches!(b.recv_frame(), Err(RpcError::DeadlineMidFrame)),
+            "the framed reader must name our own deadline, not a truncation"
+        );
+
+        w.write_all(&partial).expect("partial frame");
+        assert!(
+            matches!(b.recv_frame_with_fds(), Err(RpcError::DeadlineMidFrame)),
+            "the fd-mode reader must classify the same way"
+        );
     }
 
     /// Adopt one half of a `socketpair` via `from_owned_fd` and verify
@@ -722,7 +832,7 @@ mod tests {
     fn unix_partial_header_then_close_is_truncated() {
         // The spec is deterministic — 2-of-4 header bytes consumed
         // *then* EOF MUST surface as `Truncated` (see `read_header` in
-        // transport/mod.rs: `filled == 0` ⇒ `PeerClosed`, `filled > 0`
+        // transport/mod.rs: `filled == 0` ⇒ `EndOfStream`, `filled > 0`
         // ⇒ `Truncated`). The kernel does not coalesce these into an
         // immediate EOF.
         let (a, b) = UnixTransport::pair().expect("socketpair");

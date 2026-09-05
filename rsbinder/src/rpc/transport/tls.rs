@@ -58,6 +58,93 @@ use crate::rpc::{RpcError, RpcResult};
 /// most a record-or-so worth of bytes per blocking socket `read`.
 const TLS_READ_CHUNK: usize = 16 * 1024;
 
+/// How long [`TlsTransport::shutdown`] may spend putting `close_notify` on
+/// the wire. Teardown must stay finite: without a bound, a peer that
+/// stopped reading (its send buffer full) holds `shutdown` — and every
+/// transport queued behind it in `shutdown_all_transports` — forever.
+const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long [`TlsTransport::shutdown`] waits for the send in flight before
+/// giving up on `close_notify` and cutting the socket anyway.
+///
+/// Only the thread holding `wlock` may put records on the wire, and
+/// `shutdown` refuses every send that starts after it, so there is at
+/// most one such send and it ends in one of two ways. It completes — the
+/// lock's release wakes `shutdown` at once, and this bound is never felt.
+/// Or it is parked in a socket write to a peer that has stopped reading —
+/// then nothing short of the cut unparks it, the alert could not reach
+/// that peer regardless, and this is how long teardown spends finding
+/// that out. `shutdown_all_transports` walks slots one at a time, so it is
+/// paid once per stalled connection.
+const CLOSE_NOTIFY_WLOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// The write-path lock. A mutex with a bounded acquire, which `std`'s
+/// lacks: [`TlsTransport::shutdown`] must wait for the send in flight, but
+/// not for a sender parked on a peer that has stopped reading.
+///
+/// Every release signals `freed`, so a waiter wakes the moment the send
+/// ends rather than on a poll tick.
+struct WriteLock {
+    busy: Mutex<bool>,
+    freed: std::sync::Condvar,
+}
+
+/// Holding this is holding `wlock`; dropping it releases and signals.
+struct WriteGuard<'a>(&'a WriteLock);
+
+impl WriteLock {
+    fn new() -> Self {
+        Self {
+            busy: Mutex::new(false),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> WriteGuard<'_> {
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        while *busy {
+            busy = self.freed.wait(busy).expect("tls wlock poisoned");
+        }
+        *busy = true;
+        WriteGuard(self)
+    }
+
+    fn try_lock(&self) -> Option<WriteGuard<'_>> {
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(WriteGuard(self))
+    }
+
+    /// `None` once `wait` has passed with the lock still held.
+    fn lock_timeout(&self, wait: Duration) -> Option<WriteGuard<'_>> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        while *busy {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _) = self
+                .freed
+                .wait_timeout(busy, deadline - now)
+                .expect("tls wlock poisoned");
+            busy = guard;
+        }
+        *busy = true;
+        Some(WriteGuard(self))
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().expect("tls wlock poisoned") = false;
+        self.0.freed.notify_all();
+    }
+}
+
 /// A connected, byte-oriented stream that TLS can run over.
 ///
 /// Methods take `&self` (not the `&mut self` of `Read`/`Write`) so a
@@ -79,7 +166,7 @@ pub trait TlsStream: Send + Sync {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
     /// Shut the underlying stream down in both directions (wakes a
     /// blocked `read`).
-    fn shutdown(&self) -> std::io::Result<()>;
+    fn shutdown_stream(&self) -> std::io::Result<()>;
 }
 
 // All std stream types implement `Read`/`Write` for `&Stream`, so the
@@ -100,7 +187,7 @@ impl TlsStream for TcpStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         TcpStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -121,7 +208,7 @@ impl TlsStream for UnixStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         UnixStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         UnixStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -143,7 +230,7 @@ impl TlsStream for vsock::VsockStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         vsock::VsockStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         vsock::VsockStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -175,12 +262,18 @@ pub struct TlsTransport {
     /// every writer (data send and control flush) so the on-wire TLS
     /// record order always equals rustls's sequence-number order. The
     /// reader takes it with `try_lock` for an opportunistic control
-    /// flush and never blocks on it (see `flush_control`).
-    wlock: Mutex<()>,
+    /// flush and never blocks on it (see `flush_control`); `shutdown`
+    /// takes it with a bound, after the send in flight (see
+    /// `CLOSE_NOTIFY_WLOCK_WAIT`).
+    wlock: WriteLock,
     /// The byte stream; reads are lock-free, writes go under `wlock`.
     stream: Box<dyn TlsStream>,
     peer: PeerIdentity,
     desc: String,
+    /// Set by [`shutdown`](RpcTransport::shutdown): the end of stream our
+    /// own reader then sees carries no `close_notify` from the peer, and
+    /// must not be reported as a cut — it is ours.
+    shut: std::sync::atomic::AtomicBool,
 }
 
 /// SHA-256 of the peer's leaf certificate, as a [`CertId`]. `subject`
@@ -235,10 +328,11 @@ impl TlsTransport {
         let peer = PeerIdentity::Certificate(cert_identity(conn.peer_certificates(), server_name)?);
         Ok(TlsTransport {
             conn: Mutex::new(conn),
-            wlock: Mutex::new(()),
+            wlock: WriteLock::new(),
             stream,
             peer,
             desc: format!("tls:{server_name}"),
+            shut: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -266,10 +360,11 @@ impl TlsTransport {
         };
         Ok(TlsTransport {
             conn: Mutex::new(conn),
-            wlock: Mutex::new(()),
+            wlock: WriteLock::new(),
             stream,
             peer,
             desc: "tls:server".to_string(),
+            shut: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -306,7 +401,7 @@ impl TlsTransport {
         let mut off = 0;
         while off < cipher.len() {
             match self.stream.write(&cipher[off..]) {
-                Ok(0) => return Err(RpcError::PeerClosed),
+                Ok(0) => return Err(RpcError::EndOfStream),
                 Ok(n) => off += n,
                 // EINTR: a signal interrupted the write — retry (matches the
                 // plain-socket backends).
@@ -328,7 +423,7 @@ impl TlsTransport {
     /// socket write — preserving the lock-free-duplex liveness, while
     /// still ordering every write_tls → transmit under `wlock`.
     fn flush_control(&self) -> RpcResult<()> {
-        let Ok(_g) = self.wlock.try_lock() else {
+        let Some(_g) = self.wlock.try_lock() else {
             return Ok(());
         };
         let cipher = {
@@ -344,7 +439,9 @@ impl TlsTransport {
     }
 
     /// Pull one chunk of ciphertext off the socket (lock-free) and feed
-    /// it into the crypto state. Returns `false` on a clean TCP EOF.
+    /// it into the crypto state. Returns `false` on TCP EOF — after
+    /// handing that EOF to rustls, so its reader can then tell a
+    /// `close_notify` (clean) from a cut stream (`UnexpectedEof`).
     fn pump_incoming(&self) -> RpcResult<bool> {
         let mut tmp = [0u8; TLS_READ_CHUNK];
         let k = loop {
@@ -360,10 +457,12 @@ impl TlsTransport {
                 Err(e) => return Err(e.into()),
             }
         };
-        if k == 0 {
-            return Ok(false); // peer closed the socket
-        }
         let mut c = self.conn.lock().expect("tls conn poisoned");
+        if k == 0 {
+            let mut eof: &[u8] = &[];
+            let _ = c.read_tls(&mut eof);
+            return Ok(false);
+        }
         let mut src: &[u8] = &tmp[..k];
         while !src.is_empty() {
             let n = c.read_tls(&mut src)?;
@@ -396,13 +495,25 @@ impl RpcTransport for TlsTransport {
     }
 
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        // After our own `shutdown` a send fails here, before touching
+        // rustls or the lock. It is what the trait promises ("later sends
+        // fail"), and it is what makes `shutdown`'s wait a handoff: with
+        // new senders refused, the one already holding `wlock` is the only
+        // one there is, and its release is the only event to wait for.
+        // Without this a busy sender re-takes the lock the moment it lets
+        // go and can starve `shutdown` past its bound — and every frame it
+        // sent meanwhile, queued behind an alert the peer discards it
+        // after (RFC 8446 §6.1), was reported `Ok`.
+        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::EndOfStream);
+        }
         // `wlock` spans BOTH the rustls encrypt-drain and the socket
         // transmit so the on-wire record order equals the sequence-number
         // order even under a concurrent recv-side control flush (the
         // `conn` lock is released before the blocking transmit, so the
         // reader's `pump_incoming` can still drain — no flow-control
         // deadlock).
-        let _g = self.wlock.lock().expect("tls wlock poisoned");
+        let _g = self.wlock.lock();
         // rustls bounds its plaintext sendable buffer (`DEFAULT_BUFFER_LIMIT`,
         // ~64 KiB); feeding a larger frame in a single `write_all` fails with
         // `WriteZero`. Chunk the plaintext and interleave encrypt
@@ -441,20 +552,55 @@ impl RpcTransport for TlsTransport {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
                 match c.reader().read(out) {
                     Ok(n) if n > 0 => return Ok(n),
-                    Ok(_) => return Ok(0), // clean close_notify, all drained
+                    Ok(_) => return Ok(0), // close_notify received, all drained
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    // Unclean TCP EOF after rustls drained: treat as close.
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
+                    // TCP EOF with no close_notify: on this backend that is
+                    // what a cut stream looks like, so it is not a close.
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Our own shutdown produces exactly this on our
+                        // side: an end of stream, no close_notify from the
+                        // peer. That is a close, not a cut.
+                        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Ok(0);
+                        }
+                        log::warn!("TLS stream ended without close_notify ({})", self.desc);
+                        return Err(RpcError::UncleanEndOfStream);
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
             // 2. Opportunistically flush any control-plane output rustls
             //    queued (non-blocking on `wlock`; see `flush_control`).
-            self.flush_control()?;
-            // 3. Block on the socket (lock-free) for more ciphertext.
-            if !self.pump_incoming()? {
-                return Ok(0);
+            if let Err(e) = self.flush_control() {
+                if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Our own `shutdown` breaks the write half on purpose,
+                    // and the trait promises a reader it wakes sees the end
+                    // of the stream, never a distinct "shut down locally"
+                    // error. `shutdown` bounds its own close_notify write, so
+                    // between setting the flag and breaking the stream that
+                    // write can expire rather than fail outright; report that
+                    // deadline as the end too, since with no deadline of ours
+                    // armed a timeout reads as the kernel's and the session
+                    // would end saying the stream was lost.
+                    let deadline = matches!(&e, RpcError::Io(io) if super::is_timeout(io));
+                    return Err(if deadline { RpcError::EndOfStream } else { e });
+                }
+                // Otherwise the outbound half is lost: those records left
+                // rustls before the write, so the peer never sees them —
+                // and a write that stopped part-way (a send deadline on a
+                // full socket buffer) left it a truncated record it can
+                // decrypt nothing after. That must not surface on the read
+                // side as a boundary-preserving error, which would keep the
+                // connection in the pool as if the stream were still good.
+                log::warn!(
+                    "TLS control flush failed, outbound half lost: {e} ({})",
+                    self.desc
+                );
+                return Err(RpcError::UncleanEndOfStream);
             }
+            // 3. Block on the socket (lock-free) for more ciphertext. On EOF
+            //    rustls now knows, and the next pass of step 1 decides.
+            self.pump_incoming()?;
         }
     }
 
@@ -477,10 +623,42 @@ impl RpcTransport for TlsTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // TCP-level shutdown, not a TLS close_notify: the goal is to wake
-        // the reader, and the peer sees a truncated stream either way.
-        self.stream.shutdown()?;
-        Ok(())
+        // Refuse every send from here on (`send_raw` checks this first). At
+        // most one send is then still running — the one already holding
+        // `wlock` — and it is the only thing the wait below is for.
+        self.shut.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Bound the socket writes from here: that send's remaining chunks
+        // and our own alert. `write_socket_locked` blocks until the whole
+        // buffer is on the wire, and this is a teardown path whose caller
+        // (`shutdown_all_transports`, then `terminate`'s join) has no other
+        // way out. A peer that stalled sees a partial record — an unclean
+        // end, which is what a stalled peer is getting anyway.
+        let _ = self.stream.set_write_timeout(Some(CLOSE_NOTIFY_TIMEOUT));
+        // Only the `wlock` holder may put records on the wire, so take it —
+        // after the send in flight, if there is one — and only then queue
+        // and transmit `close_notify`: the alert follows a complete frame
+        // rather than cutting into one, and the peer reads that frame,
+        // then a clean end. Keep holding it across the socket cut: released
+        // before, a sender could slip a frame in between, be told `Ok`, and
+        // the peer would discard it (RFC 8446 §6.1).
+        let held = self.wlock.lock_timeout(CLOSE_NOTIFY_WLOCK_WAIT);
+        if held.is_some() {
+            let mut cipher = Vec::new();
+            {
+                let mut c = self.conn.lock().expect("tls conn poisoned");
+                c.send_close_notify(); // idempotent in rustls
+                let _ = c.write_tls(&mut cipher);
+            }
+            if !cipher.is_empty() {
+                let _ = self.write_socket_locked(&cipher);
+            }
+        }
+        // `None`: the sender is parked in a socket write to a peer that has
+        // stopped reading. No alert could reach that peer; the cut is what
+        // unparks the sender (`EPIPE`), and it reports its frame as failed.
+        let cut = super::absorb_already_shut(self.stream.shutdown_stream());
+        drop(held);
+        cut
     }
 }
 
@@ -500,7 +678,10 @@ impl Read for RawIo<'_> {
             // otherwise it degrades to a generic `Other` and the frame path
             // loses the Timeout/Truncated contract.
             Err(RpcError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
-            Err(RpcError::PeerClosed) => Ok(0),
+            Err(RpcError::EndOfStream) => Ok(0),
+            // Carried as the payload so `From<io::Error>` hands it back as
+            // itself on the far side of `read_header`.
+            Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
@@ -512,7 +693,7 @@ impl Write for RawIo<'_> {
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         // Kind-preserving like `RawTransportIo`: a write to a peer that
-        // already closed must reach `write_frame`'s `?` as `PeerClosed`
+        // already closed must reach `write_frame`'s `?` as `EndOfStream`
         // (`DeadObject`), not an unclassified `Io(Other)`.
         self.0.send_raw(buf).map_err(std::io::Error::from)
     }

@@ -111,7 +111,7 @@ impl Bound {
     }
 
     fn finish(self, bg: thread::JoinHandle<()>) {
-        self.server.shutdown();
+        self.server.stop_accepting();
         let _ = bg.join();
         #[cfg(not(target_os = "android"))]
         let _ = std::fs::remove_file(&self.path);

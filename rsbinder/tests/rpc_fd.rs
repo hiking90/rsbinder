@@ -214,7 +214,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
     let _ = std::fs::remove_file(&path);
 }
@@ -249,7 +249,7 @@ fn fd_rejected_without_mutual_opt_in() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
     let _ = std::fs::remove_file(&path);
 }
@@ -358,7 +358,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
 
         drop(root);
         drop(client);
-        server.shutdown();
+        server.stop_accepting();
         let _ = bg.join();
         let _ = std::fs::remove_file(&path);
     }
@@ -397,6 +397,6 @@ fn fd_v1_abstract_unix_roundtrip_arg() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }

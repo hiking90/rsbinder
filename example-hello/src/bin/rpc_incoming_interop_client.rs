@@ -21,7 +21,7 @@
 //!    outgoing (founding) connection instead — AOSP gates this with
 //!    `RpcConnection::allowNested`, and pinning it to the incoming
 //!    connection blocks until the session dies;
-//! 4. `RpcSession::shutdown` ends the incoming thread cleanly.
+//! 4. `RpcSession::close_session` ends the incoming thread cleanly.
 //!
 //! Exit code 0 = PASS; non-zero = the failing step.
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -247,10 +247,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     // Teardown: the incoming thread is joined here. `__incoming_thread_
-    // count` cannot witness that — `shutdown` empties the handle list
+    // count` cannot witness that — `close_session` empties the handle list
     // before joining any of it — so check the join counter and that the
     // thread really finished.
-    session.shutdown();
+    session.close_session();
     if session.__incoming_thread_joined_count() != 1 || session.__incoming_thread_live_count() != 0
     {
         eprintln!(
