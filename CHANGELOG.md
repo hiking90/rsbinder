@@ -55,6 +55,32 @@ short form — and the first entry is the only one no compiler will catch.
   serve loop of the session as `EndedBy::Local` with an intact stream; it
   used to come back as `Ok(())` or `Err(DeadObject)` depending on whether the
   worker was parked in `recv` or inside a handler at the time.
+- **`rpc::transport::RpcTransport::shutdown` is a required method.** The
+  default did nothing and returned `Ok(())`, so a transport that inherited it
+  left every serve loop and incoming-connection thread parked in `recv` with
+  nothing to wake them, and `RpcSession::shutdown` hung on the join — the
+  reason `TlsStream::shutdown` was already required. Every in-tree backend
+  overrides it; a custom transport must now implement it (or return an
+  error and accept that its session cannot be joined). Its rustdoc now
+  states the contract in full: what happens to bytes already received is
+  platform- and backend-dependent and must not be assumed; a reader woken
+  by it returns the end of stream; it is idempotent; its `Err` is
+  diagnostic; it is not `close`.
+- **`rpc::transport::MemTransport::shutdown` models a Linux socket.** Frames
+  already queued on either side are still delivered, then the end of
+  stream, and sends on either side fail — where it used to drop what was
+  queued on its own side and leave the peer untouched. Linux is the
+  deployment target and the platform where a caller that assumes a
+  shutdown discards the queue is wrong; the hermetic backend now exercises
+  that case instead of certifying the assumption. A test that relied on a
+  queued frame vanishing at `shutdown`, or on the peer reading on after it,
+  sees the difference.
+- **`rpc::RpcError` gained `DeadlineMidFrame`.** A read deadline that
+  elapses part-way through a frame was `Truncated` (`NotEnoughData`), the
+  same as a stream that ended mid-frame; it is now `DeadlineMidFrame`
+  (`TimedOut`), and a serve loop that hits it ends with
+  `EndReason::DeadlineMidFrame` — this end's own policy, a lost position.
+  Code matching `RpcError::Truncated` for a deadline case needs the new arm.
 - **A transaction that could not be sent fails with `StatusCode::WouldBlock`.**
   Two cases that never reached the wire reported other codes: a call on a
   session with no outgoing connection (a server calling a client proxy
@@ -753,6 +779,21 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC, TLS) — a session's own shutdown read as a truncation on
+  its own side.** With `UncleanEndOfStream` in place, the end of stream
+  rsbinder's own `shutdown()` produced for its own reader — no
+  `close_notify` from the peer, by construction — would have been reported
+  as a cut, and a session this end shut down would have ended its serve loop
+  with a lost stream. The transport remembers that it shut itself down and
+  reports the clean end.
+- **rsbinder (RPC) — a second `shutdown()` on a socket transport failed on
+  macOS.** `shutdown(2)` raises `ENOTCONN` the second time there (Linux
+  returns `Ok`), and a normal teardown calls it twice on the same slot —
+  `on_session_dead` shuts every transport down, then the unreadable-slot
+  path shuts its own — so every such teardown logged a failure. The socket
+  backends absorb it; `shutdown` is idempotent on every backend, and the
+  failures that remain are logged at `warn!` with what the backend said,
+  not at `debug!` with a guess.
 - **rsbinder (RPC) — a slot a nested call had marked unreadable could still
   be handed out for writing.** The mark gated only the two readers; the slot
   selectors did not look at it, so a handler that swallowed the nested

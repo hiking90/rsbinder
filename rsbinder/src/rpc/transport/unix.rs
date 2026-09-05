@@ -477,8 +477,7 @@ impl RpcTransport for UnixTransport {
         if let Ok(mut leftover) = self.fd_recv_buf.lock() {
             leftover.clear();
         }
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        Ok(())
+        super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }
 
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band
@@ -591,16 +590,15 @@ impl RpcTransport for UnixTransport {
                     // EINTR retry.
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(e) => {
-                        // Map a read deadline to `Timeout` (frame-
-                        // synchronized, nothing consumed) or `Truncated`
-                        // (mid-frame desync) so callers can distinguish
-                        // — same contract as `read_header`/`read_body`.
+                        // Same contract as `read_header`/`read_body`: a
+                        // deadline with nothing consumed is a boundary
+                        // `Timeout`; mid-frame it is our own cut.
                         let io_err = std::io::Error::from(e);
                         if super::is_timeout(&io_err) {
                             return Err(if leftover.is_empty() && fds.is_empty() {
                                 RpcError::Timeout
                             } else {
-                                RpcError::Truncated
+                                RpcError::DeadlineMidFrame
                             });
                         }
                         return Err(io_err.into());
@@ -713,6 +711,38 @@ mod tests {
         assert!(
             !matches!(&second, Ok((f, _)) if f == b"second"),
             "a frame of the ended connection was handed out after shutdown: {second:?}"
+        );
+        b.shutdown().expect("a second shutdown is Ok (idempotent)");
+    }
+
+    /// Plan 2-21 D-6 — a read deadline that elapses part-way through a
+    /// frame is this end's own cut (`DeadlineMidFrame`), told apart from
+    /// a stream that ended mid-frame (`Truncated`); with nothing consumed
+    /// it stays the boundary `Timeout`. Both the framed reader and the
+    /// fd-mode reader classify the same way.
+    #[test]
+    fn unix_mid_frame_deadline_is_our_own_cut() {
+        use std::io::Write;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("deadline");
+        assert!(matches!(b.recv_frame(), Err(RpcError::Timeout)));
+        assert!(matches!(b.recv_frame_with_fds(), Err(RpcError::Timeout)));
+
+        // A header promising 8 bytes, then only 3 of them.
+        let mut partial = 8u32.to_le_bytes().to_vec();
+        partial.extend_from_slice(&[1, 2, 3]);
+        let mut w = &a.stream;
+        w.write_all(&partial).expect("partial frame");
+        assert!(
+            matches!(b.recv_frame(), Err(RpcError::DeadlineMidFrame)),
+            "the framed reader must name our own deadline, not a truncation"
+        );
+
+        w.write_all(&partial).expect("partial frame");
+        assert!(
+            matches!(b.recv_frame_with_fds(), Err(RpcError::DeadlineMidFrame)),
+            "the fd-mode reader must classify the same way"
         );
     }
 

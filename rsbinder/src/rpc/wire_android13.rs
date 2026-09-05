@@ -774,12 +774,16 @@ fn map_io(e: std::io::Error) -> RpcError {
 /// Classify a failed read by `progress`, the amount the **caller**
 /// counts as already arrived (this call's bytes for
 /// [`read_exact_into`], the whole message for the FD reader): at zero a
-/// clean close or an elapsed deadline stands as itself; above zero
-/// either one leaves the stream desynchronized ⇒
-/// [`RpcError::Truncated`].
+/// clean close or an elapsed deadline stands as itself; above zero the
+/// stream position is lost — [`RpcError::Truncated`] if the stream ended,
+/// [`RpcError::DeadlineMidFrame`] if our own deadline cut it.
 fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
     if progress > 0 && e.leaves_frame_boundary_intact() {
-        RpcError::Truncated
+        if matches!(e, RpcError::Timeout) {
+            RpcError::DeadlineMidFrame
+        } else {
+            RpcError::Truncated
+        }
     } else {
         e
     }

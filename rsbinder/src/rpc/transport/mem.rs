@@ -8,11 +8,20 @@
 //! entirely. Two `MemTransport`s from [`MemTransport::pair`] are wired
 //! cross-over so a write on one is a read on the other.
 //!
+//! `shutdown` models a **Linux** socket, deliberately: frames already
+//! queued on either side are still delivered, then the end of stream;
+//! later sends on either side fail. Linux is the deployment target, and
+//! it is the platform where a caller that assumes a shutdown discards
+//! what was queued is wrong — a hermetic backend that modelled the other
+//! platform (macOS drops its queue) would certify that assumption on the
+//! developer's machine and let it break on the device.
+//!
 //! There is no global state — every test makes its own independent
 //! pair, so the RPC test suite is parallel-safe by construction.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::{PeerIdentity, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
@@ -29,12 +38,18 @@ pub struct MemTransport {
     peer: PeerIdentity,
     desc: &'static str,
     timeout: Mutex<Option<std::time::Duration>>,
-    /// Set by [`shutdown`](RpcTransport::shutdown); `recv_frame` then
-    /// reports `PeerClosed` even if frames are queued. A blocked
-    /// `recv_frame` notices within one poll tick — a sender into our own
-    /// `rx` would have been a cleaner wake-up, but it would also keep the
-    /// channel alive past the peer's drop and hide `PeerClosed`.
-    closed: std::sync::atomic::AtomicBool,
+    /// Set by this end's [`shutdown`](RpcTransport::shutdown); shared with
+    /// the peer as its `peer_closed`. Frames already queued are still
+    /// delivered (the Linux model — see the module doc); once the queue is
+    /// empty `recv_frame` reports `PeerClosed`, and sends on either side
+    /// fail. A blocked `recv_frame` notices within one poll tick — a
+    /// sender into our own `rx` would have been a cleaner wake-up, but it
+    /// would also keep the channel alive past the peer's drop and hide
+    /// `PeerClosed`.
+    closed: Arc<AtomicBool>,
+    /// The peer's `closed`: its shutdown is our end of stream and our
+    /// `EPIPE`, as a socket peer's `shutdown(Both)` would be.
+    peer_closed: Arc<AtomicBool>,
 }
 
 impl MemTransport {
@@ -45,6 +60,8 @@ impl MemTransport {
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
         let peer = self_identity();
+        let a_closed = Arc::new(AtomicBool::new(false));
+        let b_closed = Arc::new(AtomicBool::new(false));
         (
             MemTransport {
                 tx: a_tx,
@@ -52,7 +69,8 @@ impl MemTransport {
                 peer: peer.clone(),
                 desc: "mem",
                 timeout: Mutex::new(None),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: Arc::clone(&a_closed),
+                peer_closed: Arc::clone(&b_closed),
             },
             MemTransport {
                 tx: b_tx,
@@ -60,9 +78,14 @@ impl MemTransport {
                 peer,
                 desc: "mem",
                 timeout: Mutex::new(None),
-                closed: std::sync::atomic::AtomicBool::new(false),
+                closed: b_closed,
+                peer_closed: a_closed,
             },
         )
+    }
+
+    fn either_end_shut(&self) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.peer_closed.load(Ordering::SeqCst)
     }
 }
 
@@ -87,12 +110,11 @@ impl RpcTransport for MemTransport {
                 max: super::MAX_FRAME_LEN,
             });
         }
-        // `shutdown` closed this end in both directions, so a later send
-        // must fail as the socket backends' `shutdown(Both)` makes it
-        // fail (EPIPE) — callers rely on that to retire a slot whose
-        // handshake failed. Without it the frame would queue on an
-        // unbounded channel nobody reads.
-        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        // A shutdown on either end makes a later send fail, as the socket
+        // backends' `shutdown(Both)` does on both sides (EPIPE) — callers
+        // rely on that to retire a slot whose handshake failed. Without it
+        // the frame would queue on an unbounded channel nobody reads.
+        if self.either_end_shut() {
             return Err(RpcError::PeerClosed);
         }
         // A channel send only fails once the peer's receiver is
@@ -101,10 +123,6 @@ impl RpcTransport for MemTransport {
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        use std::sync::atomic::Ordering;
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(RpcError::PeerClosed);
-        }
         let timeout = *self.timeout.lock().expect("mem timeout poisoned");
         let rx = self.rx.lock().expect("mem rx poisoned");
         // Block in short `recv_timeout` ticks so a local `shutdown` is
@@ -128,17 +146,14 @@ impl RpcTransport for MemTransport {
                 None => TICK,
             };
             match rx.recv_timeout(wait) {
-                Ok(frame) => {
-                    if self.closed.load(Ordering::SeqCst) {
-                        return Err(RpcError::PeerClosed);
-                    }
-                    return Ok(frame);
-                }
+                // Queued before a shutdown on either end: still delivered,
+                // as a Linux socket delivers what it has queued.
+                Ok(frame) => return Ok(frame),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(RpcError::PeerClosed);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if self.closed.load(Ordering::SeqCst) {
+                    if self.either_end_shut() {
                         return Err(RpcError::PeerClosed);
                     }
                 }
@@ -155,7 +170,7 @@ impl RpcTransport for MemTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closed.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -180,23 +195,33 @@ mod tests {
         }
     }
 
-    /// `RpcTransport::shutdown` promises both directions: a blocked
-    /// `recv_frame` returns **and** later sends fail. The socket backends
-    /// get the second half from `shutdown(Both)`; `mem` has to model it,
-    /// or a teardown bug that a real transport would surface stays
-    /// invisible to every hermetic test.
+    /// `RpcTransport::shutdown` on a Linux socket: what either side had
+    /// queued is still delivered, then the end of stream; later sends on
+    /// either side fail. `mem` models exactly that (module doc), so a
+    /// teardown bug that a real transport would surface on the device is
+    /// visible to every hermetic test.
     #[test]
-    fn mem_shutdown_fails_later_sends() {
+    fn mem_shutdown_models_a_linux_socket() {
         let (a, b) = MemTransport::pair();
-        a.send_frame(b"before").expect("send before shutdown");
+        a.send_frame(b"a->b before").expect("send before shutdown");
+        b.send_frame(b"b->a before").expect("send before shutdown");
         a.shutdown().expect("shutdown");
+        a.shutdown().expect("a second shutdown is Ok");
+        // Our side: the queued frame first, then the end of stream; sends fail.
+        assert_eq!(
+            a.recv_frame().expect("queued frame survives"),
+            b"b->a before"
+        );
+        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
         assert!(
             matches!(a.send_frame(b"after"), Err(RpcError::PeerClosed)),
             "a send after shutdown must fail, not queue"
         );
-        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
-        // The peer end is untouched — only this side was shut down.
-        assert_eq!(b.recv_frame().expect("peer still reads"), b"before");
+        // The peer: drains what we sent, then sees our shutdown as its
+        // end of stream, and its sends fail (EPIPE on a socket).
+        assert_eq!(b.recv_frame().expect("peer drains"), b"a->b before");
+        assert!(matches!(b.recv_frame(), Err(RpcError::PeerClosed)));
+        assert!(matches!(b.send_frame(b"x"), Err(RpcError::PeerClosed)));
     }
 
     #[test]

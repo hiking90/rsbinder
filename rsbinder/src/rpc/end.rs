@@ -73,6 +73,10 @@ pub enum EndReason {
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.
     Interrupted,
+    /// A deadline this end armed elapsed part-way through a frame
+    /// ([`RpcError::DeadlineMidFrame`](super::RpcError::DeadlineMidFrame)):
+    /// this end's own decision, and a lost position.
+    DeadlineMidFrame,
     /// Reading or decoding a frame failed; the code is what the read or
     /// the decoder produced (`TimedOut` for a deadline that elapsed
     /// between frames, `NotEnoughData` for one that cut a frame, …).
@@ -109,6 +113,7 @@ impl SessionEnd {
     /// | `EndOfStream` | local decision? | `InSync` |
     /// | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut or undecodable) | local decision? | `Lost` |
     /// | `Frame(TimedOut)` (a deadline between frames) | `Local` | `InSync` |
+    /// | `DeadlineMidFrame` (a deadline inside one) | `Local` | `Lost` |
     /// | `Interrupted` | `Local` | `InSync` |
     /// | `Retired`, `Dispatch(_)` | local decision? | `InSync` if this end decided, else `Lost` |
     ///
@@ -120,7 +125,11 @@ impl SessionEnd {
     pub(crate) fn new(reason: EndReason, ended_locally: bool) -> Self {
         use EndReason::*;
         use StreamState::*;
-        let decided = ended_locally || matches!(reason, Interrupted | Frame(StatusCode::TimedOut));
+        let decided = ended_locally
+            || matches!(
+                reason,
+                Interrupted | DeadlineMidFrame | Frame(StatusCode::TimedOut)
+            );
         let by = if decided {
             EndedBy::Local
         } else {
@@ -128,7 +137,7 @@ impl SessionEnd {
         };
         let stream = match reason {
             EndOfStream | Interrupted | Frame(StatusCode::TimedOut) => InSync,
-            UncleanEndOfStream | Unreadable | Frame(_) => Lost,
+            UncleanEndOfStream | Unreadable | DeadlineMidFrame | Frame(_) => Lost,
             Retired | Dispatch(_) => {
                 if ended_locally {
                     InSync
@@ -221,6 +230,7 @@ mod tests {
             (Retired, false, NotLocal, Lost, false),
             (Retired, true, Local, InSync, true),
             (Interrupted, true, Local, InSync, true),
+            (DeadlineMidFrame, false, Local, Lost, false),
             (Frame(TimedOut), false, Local, InSync, true),
             (Frame(NotEnoughData), false, NotLocal, Lost, false),
             (Frame(BadType), true, Local, Lost, false),

@@ -182,8 +182,7 @@ impl RpcTransport for TcpDebugTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        Ok(())
+        super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }
 }
 

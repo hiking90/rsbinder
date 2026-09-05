@@ -90,7 +90,7 @@ pub trait RpcTransport: Send + Sync {
     /// `unix` / `mem` / `tcp_debug` / `vsock` / `tls` override it. A deadline that
     /// elapses with **nothing consumed** surfaces as
     /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
-    /// deadline that elapses mid-frame is [`RpcError::Truncated`].
+    /// deadline that elapses mid-frame is [`RpcError::DeadlineMidFrame`].
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -108,22 +108,45 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
-    /// Shut the connection down in both directions so a thread blocked in
-    /// [`recv_frame`](Self::recv_frame) returns (`PeerClosed`) and later
-    /// sends fail. Used to end a client's incoming-connection threads on
-    /// session death / `RpcSession::shutdown`. Best-effort; the default
-    /// does nothing, for a transport that cannot be interrupted.
+    /// Shut the connection down in both directions: wake a reader blocked
+    /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
+    /// and make later sends fail. This is how a session ends its
+    /// connections — `RpcSession::shutdown`, `RpcServer::terminate`, a
+    /// slot retired after a lost stream. Required, with no default on
+    /// purpose: a transport that silently did nothing here would leave a
+    /// serve loop or an incoming-connection thread parked in `recv`
+    /// forever, and `RpcSession::shutdown` would hang on the join. The
+    /// same reasoning already made [`TlsStream::shutdown`] required.
     ///
-    /// **Override it if your transport can be interrupted at all.** With
-    /// the no-op default, `RpcSession::shutdown` has nothing to wake a
-    /// thread parked in `recv_frame` on this transport, so a
-    /// `serve_blocking` or incoming-connection thread on it never exits
-    /// and the documented teardown ("it exits on its own once the
-    /// transport is shut down") does not hold. Every in-tree
-    /// socket-backed transport overrides it.
-    fn shutdown(&self) -> RpcResult<()> {
-        Ok(())
-    }
+    /// The contract is narrower than the name suggests, and every caller
+    /// in rsbinder is written to it (plan 2-21 §3.4):
+    ///
+    /// - **What happens to bytes already received is platform- and
+    ///   backend-dependent, and nothing may assume it.** A kernel may keep
+    ///   its receive queue across a local shutdown — Linux: a reader gets
+    ///   the queued bytes, then end of stream — or drop it (macOS). A
+    ///   transport's own buffer may survive (`tls`'s decrypted plaintext)
+    ///   or be cleared (`unix` fd-mode clears its leftover here). A caller
+    ///   that must not read what is buffered keeps that decision in
+    ///   session state — the slot's `unreadable` mark — not here. `mem`
+    ///   models the Linux behaviour, so a hermetic test exercises the case
+    ///   that hides bugs.
+    /// - **A reader woken by this returns the end of stream** —
+    ///   [`RpcError::PeerClosed`] at a frame boundary, [`RpcError::Truncated`]
+    ///   mid-frame — never a distinct "shut down locally" error. Who ended
+    ///   the connection is session knowledge (`SessionEnd::by`), not
+    ///   transport knowledge; a TLS transport does not report its own
+    ///   shutdown as an unclean end.
+    /// - **Idempotent.** A second call returns `Ok(())`; the socket
+    ///   backends absorb the `ENOTCONN` a second shutdown raises on macOS.
+    /// - **The `Err` is diagnostic.** The connection is being ended
+    ///   whatever it says; callers log it and never branch on it.
+    /// - **This is not `close`.** The kernel's queue is certainly gone only
+    ///   when the last `Arc<dyn RpcTransport>` drops.
+    ///
+    /// The measured behaviour of every in-tree backend on both platforms
+    /// is pinned by `tests/rpc_transport_conformance.rs`.
+    fn shutdown(&self) -> RpcResult<()>;
 
     /// Send one frame plus passed file descriptors out-of-band (opt-in
     /// `FileDescriptorTransportMode::Unix`).
@@ -392,7 +415,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
                 return Err(if filled == 0 {
                     RpcError::Timeout
                 } else {
-                    RpcError::Truncated
+                    RpcError::DeadlineMidFrame
                 });
             }
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
@@ -409,8 +432,21 @@ pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+/// The socket backends' `shutdown`: a second call raises `ENOTCONN` on
+/// macOS (Linux returns `Ok`), and the trait promises idempotence, so that
+/// one is absorbed. Anything else is the diagnostic the trait documents.
+pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotConnected => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Read exactly `buf.len()` body bytes. The header was already
-/// committed, so *any* short read is [`RpcError::Truncated`].
+/// committed, so any short read has lost the stream position:
+/// [`RpcError::Truncated`] if the stream ended, [`RpcError::DeadlineMidFrame`]
+/// if our own deadline cut it.
 fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -418,8 +454,7 @@ fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Ok(0) => return Err(RpcError::Truncated),
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Mid-frame deadline = desync, not a clean timeout.
-            Err(e) if is_timeout(&e) => return Err(RpcError::Truncated),
+            Err(e) if is_timeout(&e) => return Err(RpcError::DeadlineMidFrame),
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
             Err(e) => return Err(e.into()),
         }

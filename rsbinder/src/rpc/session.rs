@@ -2183,7 +2183,7 @@ impl RpcSessionInner {
             .collect();
         for t in transports {
             if let Err(e) = t.shutdown() {
-                log::debug!("RPC: transport shutdown failed (already closed?): {e:?}");
+                log::warn!("RPC: shutting a connection's transport down failed: {e}");
             }
         }
     }
@@ -2532,7 +2532,7 @@ impl RpcSessionInner {
                     // Only wakes a reader blocked in `recv`; the mark above
                     // is what stops already-buffered frames.
                     if let Err(e) = transport.shutdown() {
-                        log::debug!("RPC: shutting the desynced connection down failed: {e:?}");
+                        log::warn!("RPC: shutting the desynced connection down failed: {e}");
                     }
                 }
             }
@@ -3052,6 +3052,9 @@ impl RpcSessionInner {
             Err(RpcError::UncleanEndOfStream) => {
                 return ServeStep::Ended(EndReason::UncleanEndOfStream)
             }
+            Err(RpcError::DeadlineMidFrame) => {
+                return ServeStep::Ended(EndReason::DeadlineMidFrame)
+            }
             Err(e) => return ServeStep::Ended(EndReason::Frame(e.into())),
         };
         // This end ended the session while the frame was in flight (a
@@ -3488,7 +3491,9 @@ impl RpcSession {
                 // Retire now, not on the first send: a corpse slot still
                 // eats the callback budget and `find_conn` would draw it
                 // first (see this fn's rustdoc).
-                let _ = transport.shutdown();
+                if let Err(e) = transport.shutdown() {
+                    log::warn!("RPC: shutting a failed callback connection down failed: {e}");
+                }
                 self.inner.remove_slot(slot_id);
                 Err(StatusCode::from(e))
             }

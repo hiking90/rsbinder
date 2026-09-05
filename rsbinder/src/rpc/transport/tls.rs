@@ -181,6 +181,10 @@ pub struct TlsTransport {
     stream: Box<dyn TlsStream>,
     peer: PeerIdentity,
     desc: String,
+    /// Set by [`shutdown`](RpcTransport::shutdown): the end of stream our
+    /// own reader then sees carries no `close_notify` from the peer, and
+    /// must not be reported as a cut — it is ours.
+    shut: std::sync::atomic::AtomicBool,
 }
 
 /// SHA-256 of the peer's leaf certificate, as a [`CertId`]. `subject`
@@ -239,6 +243,7 @@ impl TlsTransport {
             stream,
             peer,
             desc: format!("tls:{server_name}"),
+            shut: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -270,6 +275,7 @@ impl TlsTransport {
             stream,
             peer,
             desc: "tls:server".to_string(),
+            shut: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -450,6 +456,12 @@ impl RpcTransport for TlsTransport {
                     // TCP EOF with no close_notify: on this backend that is
                     // what a cut stream looks like, so it is not a close.
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Our own shutdown produces exactly this on our
+                        // side: an end of stream, no close_notify from the
+                        // peer. That is a close, not a cut.
+                        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Ok(0);
+                        }
                         log::warn!("TLS stream ended without close_notify ({})", self.desc);
                         return Err(RpcError::UncleanEndOfStream);
                     }
@@ -488,19 +500,19 @@ impl RpcTransport for TlsTransport {
         // end on the peer rather than the cut `recv_raw` reports. Best
         // effort: a sender blocked on the socket holds `wlock`, and waking
         // our own reader must not wait on it.
+        self.shut.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(_g) = self.wlock.try_lock() {
             let mut cipher = Vec::new();
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
-                c.send_close_notify();
+                c.send_close_notify(); // idempotent in rustls
                 let _ = c.write_tls(&mut cipher);
             }
             if !cipher.is_empty() {
                 let _ = self.write_socket_locked(&cipher);
             }
         }
-        self.stream.shutdown()?;
-        Ok(())
+        super::absorb_already_shut(self.stream.shutdown())
     }
 }
 

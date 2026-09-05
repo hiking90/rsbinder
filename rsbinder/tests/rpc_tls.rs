@@ -258,6 +258,41 @@ fn tls_shutdown_is_a_clean_close_for_the_peer() {
     }
 }
 
+/// Plan 2-21 D-3 — our own `shutdown()` wakes our own reader with an end
+/// of stream that carries no `close_notify` from the peer. That is the
+/// shape of a cut, but it is ours: the transport reports the clean
+/// `PeerClosed`, not `UncleanEndOfStream`, so a session this end shut
+/// down ends its serve loop cleanly. A second `shutdown()` is `Ok`.
+#[test]
+fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
+        // One frame proves the server's handshake I/O is over before the
+        // client shuts down — a client `SHUT_RD` while the server still has
+        // a post-handshake write pending fails that write with `EPIPE` on
+        // Linux. Then the server holds its end until the client has looked,
+        // so the only end the client sees is the one it made itself.
+        t.send_frame(b"hello").expect("send after handshake");
+        let _ = done_rx.recv();
+        drop(t);
+    });
+    let client =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    assert_eq!(client.recv_frame().expect("server's frame"), b"hello");
+    client.shutdown().expect("shutdown");
+    client.shutdown().expect("a second shutdown is Ok");
+    match client.recv_frame() {
+        Err(RpcError::PeerClosed) => {}
+        other => panic!("our own shutdown must read as a clean end, got {other:?}"),
+    }
+    let _ = done_tx.send(());
+    server.join().unwrap();
+}
+
 /// The one-call TCP+TLS client
 /// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
 /// handshake + R34 session — interoperates with a TLS server end to end.

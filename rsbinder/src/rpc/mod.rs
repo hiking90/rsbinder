@@ -160,6 +160,12 @@ pub enum RpcError {
     /// A frame length header was fully received but the body was
     /// truncated (peer closed mid-body, or declared more than it sent).
     Truncated,
+    /// A read deadline this end armed elapsed part-way through a frame.
+    /// The stream position is as lost as after [`Truncated`](Self::Truncated),
+    /// but the cause is this end's own policy (a reply deadline, a
+    /// server's idle timeout), not the peer — so a log can say which.
+    /// Projects to [`StatusCode::TimedOut`](crate::StatusCode).
+    DeadlineMidFrame,
     /// A declared frame length exceeds [`transport::MAX_FRAME_LEN`].
     /// Rejected *before* any allocation (anti-OOM).
     FrameTooLarge {
@@ -187,6 +193,9 @@ impl fmt::Display for RpcError {
                 write!(f, "RPC stream ended without a close signal (truncated?)")
             }
             RpcError::Truncated => write!(f, "RPC frame truncated (incomplete body)"),
+            RpcError::DeadlineMidFrame => {
+                write!(f, "RPC read deadline elapsed part-way through a frame")
+            }
             RpcError::FrameTooLarge { declared, max } => {
                 write!(
                     f,
@@ -281,6 +290,9 @@ impl From<RpcError> for std::io::Error {
             e @ RpcError::UncleanEndOfStream => {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
             }
+            // Same carriage: by kind alone it would come back as a
+            // boundary `Timeout`, the opposite of what it means.
+            e @ RpcError::DeadlineMidFrame => std::io::Error::new(std::io::ErrorKind::TimedOut, e),
             other => std::io::Error::other(format!("{other}")),
         }
     }
@@ -297,6 +309,7 @@ impl From<RpcError> for crate::StatusCode {
             RpcError::PeerClosed => crate::StatusCode::DeadObject,
             RpcError::UncleanEndOfStream => crate::StatusCode::DeadObject,
             RpcError::Truncated => crate::StatusCode::NotEnoughData,
+            RpcError::DeadlineMidFrame => crate::StatusCode::TimedOut,
             RpcError::FrameTooLarge { .. } => crate::StatusCode::BadValue,
             RpcError::Io(io) => crate::StatusCode::from(io),
             RpcError::Protocol(_) => crate::StatusCode::RpcError,
