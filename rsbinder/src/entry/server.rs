@@ -88,10 +88,12 @@ pub struct Server {
     pending: Vec<(String, SIBinder)>,
 }
 
-/// Handle for a [`Server::spawn`]ed server. Dropping it shuts an RPC
-/// server down (listener closed, workers joined). For the kernel there
-/// is nothing to stop — the process thread pool has no shutdown — so
-/// the guard is inert.
+/// Handle for a [`Server::spawn`]ed server. Dropping it ends an RPC
+/// server: the listener is closed, every session is ended (connected
+/// clients see the connection go) and the workers are joined — so a
+/// drop returns whether or not clients are still attached. For the
+/// kernel there is nothing to stop — the process thread pool has no
+/// shutdown — so the guard is inert.
 pub struct ServerGuard {
     #[cfg(feature = "rpc")]
     rpc: Option<(
@@ -113,7 +115,8 @@ impl std::fmt::Debug for ServerGuard {
 }
 
 impl ServerGuard {
-    /// Stop the server now (RPC) and wait for its threads. Kernel: no-op.
+    /// End the server now (RPC): stop accepting, end every session, join
+    /// the threads. Same as dropping the guard. Kernel: no-op.
     pub fn shutdown(mut self) {
         self.stop();
     }
@@ -131,9 +134,11 @@ impl ServerGuard {
     fn stop(&mut self) {
         #[cfg(feature = "rpc")]
         if let Some((server, jh)) = self.rpc.take() {
+            // Flag first so the accept loop exits; join it so nothing is
+            // accepted past this point; then end what is connected.
             server.shutdown();
             let _ = jh.join();
-            server.join_workers();
+            server.terminate();
         }
     }
 }

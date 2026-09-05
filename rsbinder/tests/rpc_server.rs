@@ -3621,6 +3621,165 @@ fn c_server_death_is_eager_with_incoming() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Plan 2-21 B-2 — `terminate` ends what `shutdown` only lets drain. An
+/// r34 client and an android-13+ client (the two minting paths — only
+/// the latter has a session id, so only it was ever in the id registry)
+/// stay connected; `terminate` still returns, wakes every worker out of
+/// `recv`, joins them, and the android-13+ session — driven by two
+/// workers, so `Live(2)` — dies whole instead of being skipped as
+/// "still live".
+#[test]
+fn terminate_ends_every_session_and_joins_workers() {
+    // r34 (the default profile): the minting path with no session id, so
+    // nothing in the id registry ever knew this session. A server speaks
+    // one profile, so the two paths need two servers.
+    let r34_path = tmp_sock("term34");
+    let r34_server = RpcServer::setup_unix_server(&r34_path).expect("bind r34");
+    r34_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let r34_bg = r34_server.run_background();
+    wait_for_sock(&r34_path);
+    let r34 = RpcSession::setup_unix_client(&r34_path).expect("r34 connect");
+    let r34_root = EchoProxy(r34.get_root().expect("root"));
+    assert_eq!(r34_root.echo("r34").unwrap(), "r34");
+
+    // android-13+ with two outgoing connections: a `Live(2)` server
+    // session, which `RpcSession::shutdown` used to skip as "still live".
+    let a13_path = tmp_sock("term13");
+    let a13_server = RpcServer::setup_unix_server(&a13_path).expect("bind a13");
+    a13_server.set_android13plus(2);
+    a13_server.set_max_threads(2);
+    a13_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    let a13_bg = a13_server.run_background();
+    wait_for_sock(&a13_path);
+    let a13 = RpcSession::setup_unix_client_android13plus_with_config(
+        RpcUnixClientConfig::path(&a13_path, 2).outgoing_connections(2),
+    )
+    .expect("android-13+ connect");
+    let a13_root = EchoProxy(a13.get_root().expect("root"));
+    assert_eq!(a13_root.echo("a13").unwrap(), "a13");
+    let sid: [u8; 32] = a13
+        .get_session_id()
+        .expect("sid")
+        .as_slice()
+        .try_into()
+        .unwrap();
+    assert!(
+        poll_until(|| a13_server.session_live_conns(&sid) == Some(2)),
+        "two outgoing connections drive the android-13+ session: {:?}",
+        a13_server.session_live_conns(&sid)
+    );
+
+    // Off-thread with a channel deadline: a `terminate` that blocks on a
+    // connected client must fail the test, not hang the runner.
+    for (name, server) in [("r34", &r34_server), ("android-13+", &a13_server)] {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let terminating = Arc::clone(server);
+        let t = std::thread::spawn(move || {
+            terminating.terminate();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("{name}: terminate blocked with a client still connected")
+            }
+        }
+        t.join().expect("terminate thread");
+    }
+    r34_bg.join().expect("r34 accept loop");
+    a13_bg.join().expect("android-13+ accept loop");
+    // Every worker exited (their `Arc<RpcServer>` clones are gone) and the
+    // android-13+ session is dead, not merely "still live".
+    for (name, server) in [("r34", &r34_server), ("android-13+", &a13_server)] {
+        assert!(
+            poll_until(|| Arc::strong_count(server) == 1),
+            "{name}: a worker still holds the server ({} refs)",
+            Arc::strong_count(server)
+        );
+    }
+    assert!(
+        poll_until(|| matches!(a13_server.session_live_conns(&sid), None | Some(0))),
+        "the android-13+ session must be dead after terminate"
+    );
+    assert!(
+        r34_root.echo("after").is_err(),
+        "the r34 connection was ended"
+    );
+    assert!(
+        a13_root.echo("after").is_err(),
+        "the android-13+ connection was ended"
+    );
+    let _ = std::fs::remove_file(&r34_path);
+    let _ = std::fs::remove_file(&a13_path);
+}
+
+/// Plan 2-21 B-2 — a service that ends its own server calls `terminate`
+/// from inside a handler, on the very worker thread `terminate` would
+/// join. That handle is skipped; the worker exits when the handler
+/// returns, and nothing deadlocks.
+#[test]
+fn terminate_from_a_handler_does_not_join_itself() {
+    const STOP_DESC: &str = "rsbinder.test.IStopper";
+    struct Stopper(Mutex<Option<Arc<RpcServer>>>);
+    impl Remotable for Stopper {
+        fn descriptor() -> &'static str {
+            STOP_DESC
+        }
+        fn on_transact(
+            &self,
+            _code: TransactionCode,
+            _reader: &mut Parcel,
+            reply: &mut Parcel,
+        ) -> Result<()> {
+            if let Some(server) = self.0.lock().unwrap().take() {
+                server.terminate();
+            }
+            reply.write(&Status::from(StatusCode::Ok))
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let path = tmp_sock("termre");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    // The service holds the server until the call takes it, so the strong
+    // count below can reach 1 once the worker is gone.
+    server.set_root(Interface::as_binder(&Binder::new(Stopper(Mutex::new(
+        Some(Arc::clone(&server)),
+    )))));
+    let bg = server.run_background();
+    wait_for_sock(&path);
+    let client = RpcSession::setup_unix_client(&path).expect("connect");
+    let root = client.get_root().expect("root");
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let caller = std::thread::spawn(move || {
+        let rp = (*root)
+            .as_any()
+            .downcast_ref::<RpcProxy>()
+            .expect("RpcProxy");
+        let d = rp.build_request(STOP_DESC).expect("request");
+        // The reply is written after the transport went down, so the call
+        // ends in an error — what matters is that it ends.
+        let _ = rp.transact(FIRST_CALL_TRANSACTION, &d, 0);
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+        Err(RecvTimeoutError::Timeout) => panic!("terminate from a handler deadlocked"),
+    }
+    caller.join().expect("caller thread");
+    bg.join().expect("accept loop");
+    assert!(
+        poll_until(|| Arc::strong_count(&server) == 1),
+        "the handler's own worker must exit on its own ({} refs)",
+        Arc::strong_count(&server)
+    );
+    client.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// AC-20.6 — `shutdown` ends and joins the incoming threads; the server
 /// sees the session go.
 #[test]

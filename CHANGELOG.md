@@ -40,6 +40,18 @@ short form — and the first entry is the only one no compiler will catch.
   is unclean. Plain-socket backends are unaffected — they have no close signal
   to miss. Code that treated every TLS end of stream as clean now sees the
   difference; code matching `RpcError` with a wildcard arm is unaffected.
+- **Dropping a `ServerGuard` now ends the server, connected clients
+  included.** It used to flip the accept flag and join the workers, which
+  blocked for as long as any client stayed connected — a `?` or a panic that
+  dropped the guard before the client hung there. `RpcServer::terminate` is
+  new: it stops accepting, ends every session the server minted (their
+  transports are shut down, so workers parked in `recv` wake and exit) and
+  joins the workers; the guard's drop calls it. `RpcServer::shutdown` keeps
+  its drain meaning — stop accepting, let peers leave — and reaches nothing a
+  peer keeps open; code that relied on it to end a server wants `terminate`.
+  `RpcSession::shutdown` now ends a session whatever its connection count; it
+  used to log a warning and do nothing on a session driven by more than one
+  connection.
 - **rsbinder-aidl rejects `.aidl` it used to accept.** Five inputs that
   previously generated silently-wrong or non-compiling Rust are now build
   errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
@@ -714,6 +726,22 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC) — `ServerGuard::drop` blocked for as long as a client
+  stayed connected.** `RpcServer::shutdown` only sets a flag the accept loop
+  polls; a worker already parked in `recv` never reads it, and the server had
+  no path that shut a session's transports down, so `join_workers` waited on
+  exactly the workers that were hung. The guard's own rustdoc promised
+  "workers joined"; `join_workers`' said not to rely on `Drop`.
+  `RpcServer::terminate` now ends every minted session — an r34 session has
+  no id and was never in the id registry, so the server keeps a second,
+  `Weak` list of all of them — and joins the workers, repeating until a pass
+  finds nothing, so a connection accepted as the flag went up is ended too
+  (its worker ends the session itself on seeing the flag). Calling it from a
+  handler skips that worker's own handle instead of self-joining.
+  `RpcSession::shutdown` on a session with more than one live connection
+  used to warn and return without tearing anything down;
+  `SessionLifecycle::force_dying` takes `Live(n) → Dying` for any `n`, so it
+  — and `terminate` through it — ends the session whole.
 - **rsbinder (RPC, TLS) — a TCP end without `close_notify` read as a clean
   close.** `TlsTransport::recv_raw` folded rustls's `UnexpectedEof` — the one
   signal it gives for a stream that ended without the TLS close alert — into

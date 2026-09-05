@@ -1929,6 +1929,18 @@ impl RpcSessionInner {
         }
     }
 
+    /// End this session now, whatever its connection count: declare
+    /// death (`Live(n) → Dying`) and run the death sequence. Exactly one
+    /// caller does the work; from `Dying`/`Dead` it is a no-op. Both
+    /// [`RpcSession::shutdown`] and the server's
+    /// [`terminate`](super::RpcServer::terminate) land here, so a session
+    /// several workers drive ends the same way a sole-connection one does.
+    pub(crate) fn close(&self) {
+        if self.shared.lifecycle.force_dying() {
+            self.on_session_dead();
+        }
+    }
+
     /// Full session death (the `Dying` state has just been entered):
     /// fire the obituaries, settle to `Dead`, then release every local
     /// object the peer held (AOSP `RpcState::clear`) — the step that
@@ -4019,7 +4031,10 @@ impl RpcSession {
     /// Declare this session dead now: fire every cached proxy's
     /// `binder_died` and release every local object the peer held (AOSP
     /// `RpcState::clear`). Idempotent; subsequent transactions on proxies
-    /// of this session fail with [`StatusCode::DeadObject`].
+    /// of this session fail with [`StatusCode::DeadObject`]. The
+    /// connection count does not matter: a session several workers drive
+    /// (a server session with attached connections) is ended the same
+    /// way — every slot's transport is shut down and its workers exit.
     ///
     /// Normally death is detected on its own — a serve loop ending, or a
     /// transaction failing on a lost connection. This is the explicit
@@ -4041,15 +4056,7 @@ impl RpcSession {
     /// the founding slot is not joined; it exits on its own once the
     /// transport is shut down.
     pub fn shutdown(&self) {
-        let lifecycle = &self.inner.shared.lifecycle;
-        if lifecycle.try_drop_sole_connection() {
-            self.inner.on_session_dead();
-        } else if !lifecycle.is_torn_down() {
-            log::warn!(
-                "RpcSession::shutdown: {} connections still live; nothing torn down",
-                lifecycle.live_count()
-            );
-        }
+        self.inner.close();
         let me = std::thread::current().id();
         for (slot_id, handle) in self.inner.take_incoming_threads() {
             if handle.thread().id() == me {

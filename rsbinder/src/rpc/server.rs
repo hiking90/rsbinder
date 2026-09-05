@@ -472,6 +472,12 @@ pub struct RpcServer {
     rejected_unknown_id: AtomicUsize,
     shutdown: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+    /// Every session this server minted, for
+    /// [`terminate`](RpcServer::terminate). The id-keyed `sessions` map
+    /// above knows only android-13+ sessions — an r34 session has no id
+    /// — so this is the list that can end them all. `Weak`, pruned on
+    /// push; an attach adds a slot to an inner already listed here.
+    live_sessions: Mutex<Vec<std::sync::Weak<RpcSessionInner>>>,
 }
 
 impl RpcServer {
@@ -570,6 +576,7 @@ impl RpcServer {
             rejected_unknown_id: AtomicUsize::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
+            live_sessions: Mutex::new(Vec::new()),
         })
     }
 
@@ -998,7 +1005,33 @@ impl RpcServer {
         // The server accepted this connection ⇒ Acceptor subspace.
         let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor)?;
         self.configure_session(&session);
+        self.track_session(&session.inner_arc());
         Ok(session)
+    }
+
+    /// List a freshly minted session for [`terminate`](Self::terminate).
+    /// Both minting paths call this (r34 [`make_session`](Self::make_session),
+    /// android-13+ new session); an attach lands on an inner already
+    /// listed. The worker checks the shutdown flag right after, so a
+    /// session minted as `terminate` runs is either in the list it takes
+    /// or ends itself.
+    fn track_session(&self, inner: &Arc<RpcSessionInner>) {
+        let mut live = self.live_sessions.lock().expect("live_sessions poisoned");
+        live.retain(|w| w.strong_count() > 0);
+        live.push(Arc::downgrade(inner));
+    }
+
+    /// The worker's half of the [`terminate`](Self::terminate) handshake:
+    /// once listed, a session minted after the flag went up ends itself
+    /// instead of serving — `terminate` stored the flag *before* taking
+    /// the list, so a session it did not take always sees it here.
+    fn minted_after_terminate(&self, session: &RpcSession) -> bool {
+        if self.shutdown.load(Ordering::SeqCst) {
+            log::debug!("RPC: connection accepted as the server was terminating; ending it");
+            session.shutdown();
+            return true;
+        }
+        false
     }
 
     // --- session-id → shared-session registry
@@ -1448,6 +1481,10 @@ impl RpcServer {
                     };
                     let id = RpcSessionId::new(session.session_id());
                     server.register_session(id, &session.inner_arc());
+                    server.track_session(&session.inner_arc());
+                    if server.minted_after_terminate(&session) {
+                        return;
+                    }
                     server.configure_session(&session);
                     // Baseline `arm_serve_timeouts` just armed on this
                     // connection: a callback's reply deadline must be
@@ -1556,6 +1593,9 @@ impl RpcServer {
                         return;
                     }
                 };
+                if server.minted_after_terminate(&session) {
+                    return;
+                }
                 if let Err(e) = session.serve_blocking_clearing_deadline_after_first() {
                     log::debug!("RPC session ended: {e:?}");
                 }
@@ -1681,18 +1721,60 @@ impl RpcServer {
         })
     }
 
-    /// Request shutdown: stop accepting and let in-flight sessions
-    /// drain as their peers disconnect.
+    /// Stop accepting and let in-flight sessions drain as their peers
+    /// disconnect — the graceful form. This reaches nothing a peer keeps
+    /// open: a worker parked in `recv` never reads the flag, so a client
+    /// that stays connected keeps its worker alive. To end those too,
+    /// use [`terminate`](Self::terminate).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Join all session workers (call after the clients disconnect).
+    /// End the server now: stop accepting, end every session it serves,
+    /// and join the workers. This is what a dropped
+    /// [`ServerGuard`](crate::ServerGuard) does. Where
+    /// [`shutdown`](Self::shutdown) waits for peers to leave, this ends
+    /// each session as [`RpcSession::shutdown`] would — whatever its
+    /// connection count — so every slot's transport is shut down, the
+    /// workers wake out of `recv`, exit, and are joined. Peers see the
+    /// connection end.
+    ///
+    /// Repeats until a pass finds no session and no worker, so a
+    /// connection accepted just as the flag went up is ended too (its
+    /// worker ends the session itself on seeing the flag). Callable from
+    /// a handler — a service stopping its own server: the worker it runs
+    /// on is skipped rather than self-joined and exits when the handler
+    /// returns. Idempotent. The accept loop's thread is the caller's to
+    /// join ([`run_background`](Self::run_background) returned it); join
+    /// it before this for a fully joined server, as `ServerGuard` does.
+    pub fn terminate(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        loop {
+            let live: Vec<Arc<RpcSessionInner>> =
+                std::mem::take(&mut *self.live_sessions.lock().expect("live_sessions poisoned"))
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .collect();
+            let handles: Vec<JoinHandle<()>> =
+                std::mem::take(&mut *self.workers.lock().expect("workers poisoned"));
+            if live.is_empty() && handles.is_empty() {
+                return;
+            }
+            for session in &live {
+                session.close();
+            }
+            drop(live);
+            Self::join_handles(handles);
+        }
+    }
+
+    /// Join all session workers (call after the clients disconnect, or
+    /// use [`terminate`](Self::terminate), which ends the sessions first
+    /// and then joins).
     ///
     /// `Drop` only flips the shutdown flag and removes the socket — it
     /// deliberately does **not** join in-flight session workers (they
-    /// drain on peer close), so call `join_workers` explicitly rather
-    /// than relying on `Drop` for a clean shutdown.
+    /// drain on peer close).
     ///
     /// Panic observability is **best-effort**. Every accept and every
     /// [`serve_connection`](RpcServer::serve_connection) reaps
@@ -1705,7 +1787,21 @@ impl RpcServer {
     /// then reaped by a later connection is not reported.
     pub fn join_workers(&self) {
         let handles: Vec<_> = std::mem::take(&mut *self.workers.lock().expect("workers poisoned"));
+        Self::join_handles(handles);
+    }
+
+    /// Join `handles`, skipping the calling thread's own — a handler that
+    /// ends its server would otherwise deadlock on itself; that worker
+    /// exits when the handler returns, and dropping the handle detaches it.
+    fn join_handles(handles: Vec<JoinHandle<()>>) {
+        let me = std::thread::current().id();
         for h in handles {
+            if h.thread().id() == me {
+                log::debug!(
+                    "RPC: server ended from a connection worker; not joining its own thread"
+                );
+                continue;
+            }
             if h.join().is_err() {
                 log::warn!("RPC: connection worker panicked");
             }
@@ -1779,7 +1875,9 @@ impl Drop for RpcServer {
     /// (which refuse a late attach), but a worker already blocked in
     /// `recv` never reaches a gate that reads it. Nor does
     /// [`RpcServer::join_workers`], which waits for exactly the workers
-    /// that are hung. What bounds a stalled peer is a deadline on its
+    /// that are hung. [`RpcServer::terminate`] is the answer: it shuts
+    /// every session's transports down, which wakes those workers.
+    /// Short of that, what bounds a stalled peer is a deadline on its
     /// own connection — [`set_handshake_timeout`](Self::set_handshake_timeout)
     /// for a peer that stalls at first contact, and
     /// [`set_idle_timeout`](Self::set_idle_timeout) for one that goes

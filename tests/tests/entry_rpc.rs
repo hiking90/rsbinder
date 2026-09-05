@@ -74,6 +74,36 @@ fn entry_serve_and_connect_over_unix() {
     hello.r#ping().unwrap();
 }
 
+/// Plan 2-21 B-2 — dropping the guard while a client is still connected
+/// ends the server: the workers are woken and joined instead of waited
+/// on, and the client's next call fails. The guard is dropped on another
+/// thread under a deadline so a regression fails the test rather than
+/// hanging it — this is the order that used to block forever.
+#[test]
+fn entry_guard_drop_ends_a_connected_client() {
+    let sock = SockPath::new("guard-drop");
+    let guard = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add("svc", tagged("svc"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+    let svc: Strong<dyn IRpcSmoke> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
+    assert_eq!(svc.r#echo("x").unwrap(), "svc:x");
+
+    let dropped = std::thread::spawn(move || drop(guard));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !dropped.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ServerGuard::drop blocked with a client connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    dropped.join().expect("drop thread");
+    assert!(svc.r#echo("after").is_err(), "the server ended the session");
+}
+
 /// `Client` resolves several names on one session; dropping it leaves
 /// the proxies working (D5).
 #[test]
