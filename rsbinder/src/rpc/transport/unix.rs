@@ -471,13 +471,17 @@ impl RpcTransport for UnixTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // What the kernel does with its receive queue is the platform's
-        // business; this buffer is ours, and a reader woken by this call
-        // must not be handed a frame of the connection just ended.
+        // Socket first: a reader parked in `recvmsg` holds `fd_recv_buf`
+        // for the whole call and releases it only once it wakes, so taking
+        // the lock first deadlocks against it. What it appends on waking was
+        // queued in the kernel before this call (the platform's business);
+        // what is left in this buffer after it returns is ours, and a later
+        // reader must not be handed a frame of the connection just ended.
+        let shut = self.stream.shutdown(std::net::Shutdown::Both);
         if let Ok(mut leftover) = self.fd_recv_buf.lock() {
             leftover.clear();
         }
-        super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
+        super::absorb_already_shut(shut)
     }
 
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band

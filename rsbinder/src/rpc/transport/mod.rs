@@ -110,7 +110,12 @@ pub trait RpcTransport: Send + Sync {
 
     /// Shut the connection down in both directions: wake a reader blocked
     /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
-    /// and make later sends fail. This is how a session ends its
+    /// and make this end's later sends fail. (The *peer's* sends are the
+    /// platform's business — a Linux `AF_UNIX` peer gets `EPIPE` at once,
+    /// a macOS one has its writes accepted and discarded, a TCP peer on
+    /// either sees the reset on a later write; it reads the end of stream
+    /// either way.)
+    /// This is how a session ends its
     /// connections — `RpcSession::shutdown`, `RpcServer::terminate`, a
     /// slot retired after a lost stream. Required, with no default on
     /// purpose: a transport that silently did nothing here would leave a
