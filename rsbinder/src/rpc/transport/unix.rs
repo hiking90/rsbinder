@@ -471,6 +471,12 @@ impl RpcTransport for UnixTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
+        // What the kernel does with its receive queue is the platform's
+        // business; this buffer is ours, and a reader woken by this call
+        // must not be handed a frame of the connection just ended.
+        if let Ok(mut leftover) = self.fd_recv_buf.lock() {
+            leftover.clear();
+        }
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }
@@ -685,6 +691,29 @@ mod tests {
         drop(b);
         // First recv sees EOF -> clean PeerClosed.
         assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+    }
+
+    /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. Two frames
+    /// arrive in one `recvmsg`; the first is returned and the second stays
+    /// buffered. A reader woken by `shutdown` must not be handed that
+    /// second frame — it belongs to a connection that has ended. What the
+    /// *kernel* still holds is the platform's business (macOS drops its
+    /// queue, Linux keeps it); this buffer is ours to clear.
+    #[test]
+    fn unix_shutdown_drops_the_fd_mode_leftover() {
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        // Both frames sit in b's socket buffer before b reads once.
+        a.send_frame(b"first").unwrap();
+        a.send_frame(b"second").unwrap();
+        let (first, fds) = b.recv_frame_with_fds().expect("first frame");
+        assert_eq!(first, b"first");
+        assert!(fds.is_empty());
+        b.shutdown().expect("shutdown");
+        let second = b.recv_frame_with_fds();
+        assert!(
+            !matches!(&second, Ok((f, _)) if f == b"second"),
+            "a frame of the ended connection was handed out after shutdown: {second:?}"
+        );
     }
 
     /// Adopt one half of a `socketpair` via `from_owned_fd` and verify

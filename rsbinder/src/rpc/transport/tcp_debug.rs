@@ -130,6 +130,36 @@ impl RpcTransport for TcpDebugTransport {
         read_frame(&mut r)
     }
 
+    /// Raw, unframed write for the android-13+ profile (the real android
+    /// RPC wire has no length prefix). Same shape as `VsockTransport`'s;
+    /// the trait default refuses raw access, which is right for a
+    /// frame-only backend and wrong here — `RpcSession::from_preconnected_fd`
+    /// wraps an `AF_INET` fd in this transport and goes straight into the
+    /// android-13+ handshake, whose first byte is a raw write.
+    fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        use std::io::Write;
+        let mut w = &self.stream;
+        w.write_all(buf)?;
+        w.flush()?;
+        Ok(())
+    }
+
+    /// Raw, unframed read (one `read`; `Ok(0)` = end of stream), with the
+    /// `Interrupted` retry and the deadline → `Timeout` mapping the other
+    /// stream backends share.
+    fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        use std::io::Read;
+        let mut r = &self.stream;
+        loop {
+            return match r.read(buf) {
+                Ok(n) => Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if super::is_timeout(&e) => Err(crate::rpc::RpcError::Timeout),
+                Err(e) => Err(e.into()),
+            };
+        }
+    }
+
     /// **Always** [`PeerIdentity::Anonymous`]. There is deliberately no
     /// other return path: plaintext TCP carries no trustworthy peer
     /// identity, so ACL against it is impossible *by type*.
@@ -213,6 +243,18 @@ mod tests {
         };
         assert_eq!(server.recv_frame().expect("recv"), payload);
         sender.join().unwrap();
+    }
+
+    /// Plan 2-21 B-4 — the raw (unframed) path the android-13+ profile
+    /// needs. The trait default refuses it; `from_preconnected_fd` wraps
+    /// an `AF_INET` fd here and goes straight into that handshake.
+    #[test]
+    fn tcp_debug_raw_bytes_roundtrip() {
+        let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
+        client.send_raw(b"\x01\x02\x03").expect("send_raw");
+        let mut buf = [0u8; 8];
+        let n = server.recv_raw(&mut buf).expect("recv_raw");
+        assert_eq!(&buf[..n], b"\x01\x02\x03");
     }
 
     #[test]

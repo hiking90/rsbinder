@@ -726,6 +726,21 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC, fd-mode) — `UnixTransport::shutdown` left a buffered frame
+  for the next reader.** An fd-mode connection reads with `recvmsg` into its
+  own buffer, and two frames that arrive together leave the second there.
+  `shutdown` shut the socket down and left that buffer alone, so a serve loop
+  woken by a session teardown was handed a frame of the connection just
+  ended — before it touched the socket — and dispatched it on a dead session,
+  on every platform, since the bytes were already in userspace. The buffer is
+  now cleared before the socket shutdown.
+- **rsbinder (RPC, `rpc-tcp-debug`) — a preconnected `AF_INET` fd could not
+  complete the android-13+ handshake.** `RpcSession::from_preconnected_fd`
+  wraps such an fd in `TcpDebugTransport`, whose first handshake byte is a
+  raw write; the transport had no `send_raw`/`recv_raw`, so the trait default
+  refused it with `Protocol("this transport has no raw byte access")`.
+  `vsock` had been broken and fixed the same way; `tcp_debug` was not fixed
+  with it. Both raw methods are now implemented.
 - **rsbinder (RPC) — `ServerGuard::drop` blocked for as long as a client
   stayed connected.** `RpcServer::shutdown` only sets a flag the accept loop
   polls; a worker already parked in `recv` never reads it, and the server had

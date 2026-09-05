@@ -3621,6 +3621,41 @@ fn c_server_death_is_eager_with_incoming() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Plan 2-21 B-4 — an `AF_INET` fd handed to `from_preconnected_fd` is
+/// wrapped in `TcpDebugTransport` and goes straight into the android-13+
+/// handshake, whose first byte is a raw write. Without that transport's
+/// `send_raw`/`recv_raw` the write hit the trait default's `Protocol`
+/// refusal — the omission that had already broken `vsock` once.
+#[cfg(feature = "rpc-tcp-debug")]
+#[test]
+fn preconnected_inet_fd_handshakes_over_tcp_debug() {
+    use rsbinder::rpc::transport::TcpDebugTransport;
+    use std::os::fd::OwnedFd;
+
+    let listener = TcpDebugTransport::bind_loopback().expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let client_stream = std::net::TcpStream::connect(addr).expect("connect");
+    let (server_stream, _) = listener.accept().expect("accept");
+    let server_t = TcpDebugTransport::from_stream(server_stream).expect("server transport");
+
+    // The server object needs a listener to exist; it is never run.
+    let path = tmp_sock("pcfd");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(2);
+    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server.serve_connection(Box::new(server_t));
+
+    let client = RpcSession::from_preconnected_fd(OwnedFd::from(client_stream), 2)
+        .expect("android-13+ handshake over a preconnected AF_INET fd");
+    assert_eq!(client.wire_protocol_version(), Some(2));
+    let root = EchoProxy(client.get_root().expect("root"));
+    assert_eq!(root.echo("inet").unwrap(), "inet");
+    drop(root);
+    drop(client);
+    server.terminate();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Plan 2-21 B-2 — `terminate` ends what `shutdown` only lets drain. An
 /// r34 client and an android-13+ client (the two minting paths — only
 /// the latter has a session id, so only it was ever in the id registry)
