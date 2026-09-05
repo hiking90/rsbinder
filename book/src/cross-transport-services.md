@@ -188,10 +188,31 @@ fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
 ```
 
 Forwarding `cb` as-is fails with `InvalidOperation`, reported back to the
-original caller. Note each `new_binder` makes a *new* object, so C sees a
-different callback identity every time; an interface that pairs
-register/unregister by identity needs B to cache one wrapper per upstream
-callback.
+original caller.
+
+That inline `new_binder` is correct for one call and wrong across calls:
+each one mints a *new* object, so `register(cb)` and `unregister(cb)` reach C
+as two unrelated binders and the removal matches nothing.
+[`bridge::Rewrap`](https://docs.rs/rsbinder/latest/rsbinder/bridge/struct.Rewrap.html)
+is the table that fixes it — same remote in, same local out:
+
+```rust
+struct Gateway {
+    upstream: Strong<dyn IFoo>,
+    callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(|p| BnCallback::new_binder(p))
+}
+
+fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+    self.upstream.register(&self.callbacks.wrap(cb))
+}
+fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+    self.upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+}
+```
+
+It holds only weak references, so it never keeps a wrapper alive: the
+wrapper lives as long as C holds it, and the entry goes when the remote dies
+or the wrapper is dropped.
 
 What a gateway costs, all of it visible in B:
 

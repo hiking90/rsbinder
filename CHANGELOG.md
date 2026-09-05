@@ -221,6 +221,15 @@ short form — and the first entry is the only one no compiler will catch.
   call), and `example-hello`'s new `gateway_service` binary.
 
   [cross-transport chapter]: https://hiking90.github.io/rsbinder/cross-transport-services.html
+- **`rsbinder::bridge::Rewrap`** — one local wrapper per remote binder, for
+  gateways that forward a binder *argument*. Re-wrapping inline
+  (`BnCallback::new_binder(cb.clone())`) is correct per call and wrong across
+  calls: it mints a new object each time, so an upstream that pairs
+  `register(cb)` with `unregister(cb)` by identity never matches the second.
+  `Rewrap::new(|p| BnCallback::new_binder(p))` then `.wrap(cb)` returns the
+  same object for the same live remote. It holds only weak references, so it
+  never keeps a wrapper alive; entries go when the remote dies (death
+  notification), when the wrapper is dropped, or on `purge_dead()`.
 - **rsbinder (RPC):** client-side **incoming (callback) connections** —
   `RpcUnixClientConfig::incoming_connections(n)`,
   `RpcSession::add_incoming_connection_android13plus_with_config`, and

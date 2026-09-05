@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rsbinder::bridge::Rewrap;
 use rsbinder::{Interface, StatusCode, Strong};
 
 include!(concat!(env!("OUT_DIR"), "/mesh.rs"));
@@ -261,31 +262,35 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
         .expect("spawn C");
 
     // B's delegate overrides exactly one method: the one with a binder
-    // argument. Everything else rides the generated delegation.
-    struct RewrappingGateway(Strong<dyn IMeshNode>);
+    // argument. Everything else rides the generated delegation. The
+    // re-wrap goes through `Rewrap`, so the same observer always yields
+    // the same local object (see `rewrap_*` below).
+    struct RewrappingGateway {
+        upstream: Strong<dyn IMeshNode>,
+        observers: Rewrap<dyn IMeshObserver>,
+    }
     impl Interface for RewrappingGateway {}
     impl IMeshNode for RewrappingGateway {
         fn r#exchange(&self, req: &MeshMessage) -> rsbinder::status::Result<MeshMessage> {
-            self.0.r#exchange(req)
+            self.upstream.r#exchange(req)
         }
         fn r#accumulate(&self, v: &MeshValue) -> rsbinder::status::Result<i64> {
-            self.0.r#accumulate(v)
+            self.upstream.r#accumulate(v)
         }
         fn r#notify(&self, msg: &MeshMessage) -> rsbinder::status::Result<()> {
-            self.0.r#notify(msg)
+            self.upstream.r#notify(msg)
         }
         fn r#registerObserver(
             &self,
             obs: &Strong<dyn IMeshObserver>,
         ) -> rsbinder::status::Result<()> {
             // The re-wrap: a *local* binder of B's, delegating to A's
-            // observer. Phase D's helper replaces this hand-written line
-            // and keeps one local object per remote.
-            self.0
-                .r#registerObserver(&BnMeshObserver::new_binder(obs.clone()))
+            // observer. `Rewrap` mints it once and hands the same object
+            // back on every later call for the same observer.
+            self.upstream.r#registerObserver(&self.observers.wrap(obs))
         }
         fn r#receivedCount(&self) -> rsbinder::status::Result<i32> {
-            self.0.r#receivedCount()
+            self.upstream.r#receivedCount()
         }
     }
 
@@ -294,7 +299,13 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
     let c_proxy: Strong<dyn IMeshNode> = b_to_c.get("mesh").expect("B→C mesh");
     let _b = rsbinder::serve(&format!("{}{A13}", b_sock.uri("")))
         .expect("serve B")
-        .add("mesh", BnMeshNode::new_binder(RewrappingGateway(c_proxy)))
+        .add(
+            "mesh",
+            BnMeshNode::new_binder(RewrappingGateway {
+                upstream: c_proxy,
+                observers: Rewrap::new(|p| BnMeshObserver::new_binder(p)),
+            }),
+        )
         .expect("add B")
         .spawn()
         .expect("spawn B");
@@ -414,5 +425,131 @@ fn gateway_reports_the_upstream_version_and_hash() {
         a.r#getInterfaceHash().expect("hash"),
         "88311b9118fb6fe9eff4a2ca19121de0587f6d5f",
         "AC-22.13: and C's hash"
+    );
+}
+
+// ---- AC-22.11: Rewrap keeps one local object per remote -------------
+
+/// A `Rewrap` server: it hands every observer it is given to `Rewrap` and
+/// records what came back, so a test can ask whether two registrations of
+/// the same remote produced the same local object.
+struct Recorder {
+    rewrap: Rewrap<dyn IMeshObserver>,
+    seen: Mutex<Vec<Strong<dyn IMeshObserver>>>,
+}
+impl Interface for Recorder {}
+impl IMeshNode for Recorder {
+    fn r#exchange(&self, req: &MeshMessage) -> rsbinder::status::Result<MeshMessage> {
+        Ok(req.clone())
+    }
+    fn r#accumulate(&self, _v: &MeshValue) -> rsbinder::status::Result<i64> {
+        Ok(0)
+    }
+    fn r#notify(&self, _msg: &MeshMessage) -> rsbinder::status::Result<()> {
+        Ok(())
+    }
+    fn r#registerObserver(&self, obs: &Strong<dyn IMeshObserver>) -> rsbinder::status::Result<()> {
+        self.seen.lock().expect("seen").push(self.rewrap.wrap(obs));
+        Ok(())
+    }
+    /// Reports how many **distinct** local objects `Rewrap` handed out —
+    /// the number the test cares about. Without the table this equals the
+    /// number of `registerObserver` calls.
+    fn r#receivedCount(&self) -> rsbinder::status::Result<i32> {
+        let seen = self.seen.lock().expect("seen");
+        let mut distinct: Vec<rsbinder::SIBinder> = Vec::new();
+        for s in seen.iter() {
+            let b = s.as_binder();
+            if !distinct.contains(&b) {
+                distinct.push(b);
+            }
+        }
+        Ok(distinct.len() as i32)
+    }
+}
+
+/// AC-22.11. The same remote wrapped twice is the same local binder; a
+/// different remote is a different one. This is what makes an upstream's
+/// `register(cb)` / `unregister(cb)` pair up — without it the second call
+/// names an object the upstream has never seen.
+#[test]
+fn rewrap_returns_one_local_object_per_remote() {
+    let sock = SockPath::new("rewrap");
+    let rewrap = Rewrap::new(|p| BnMeshObserver::new_binder(p));
+    // The table is inside the service, so probe it through the calls.
+    let svc = Recorder {
+        rewrap,
+        seen: Mutex::new(Vec::new()),
+    };
+    let _s = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add("mesh", BnMeshNode::new_binder(svc))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let client = rsbinder::Client::open(&sock.uri("")).expect("open");
+    let node: Strong<dyn IMeshNode> = client.get("mesh").expect("mesh");
+
+    let one = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));
+    let two = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));
+
+    node.r#registerObserver(&one).expect("register one");
+    node.r#registerObserver(&one).expect("register one again");
+    node.r#registerObserver(&two).expect("register two");
+
+    // Everything above crossed a real session, so the service saw three
+    // separate proxy arrivals — but two of them name the same remote
+    // object, and `Rewrap` must collapse those onto one wrapper.
+    assert_eq!(
+        node.r#receivedCount().unwrap(),
+        2,
+        "AC-22.11: three registrations of two remotes must yield two wrappers"
+    );
+}
+
+/// The table holds only weak references, so it neither keeps a wrapper
+/// alive nor grows without bound. Driven directly (no session needed):
+/// the "remote" here is a local binder, which `wrap` treats the same way.
+#[test]
+fn rewrap_holds_nothing_alive_and_collects_dead_entries() {
+    let rewrap: Rewrap<dyn IMeshObserver> = Rewrap::new(|p| BnMeshObserver::new_binder(p));
+    assert!(rewrap.is_empty());
+
+    let remote = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));
+
+    let first = rewrap.wrap(&remote);
+    let second = rewrap.wrap(&remote);
+    assert_eq!(
+        first.as_binder(),
+        second.as_binder(),
+        "AC-22.11: the same remote must map to the same local object"
+    );
+    assert_eq!(rewrap.len(), 1, "one remote, one entry");
+
+    // Nothing else holds the wrapper: dropping both handles must let it go,
+    // because the table's reference is weak.
+    drop(first);
+    drop(second);
+    assert_eq!(
+        rewrap.purge_dead(),
+        1,
+        "AC-22.11: an entry whose wrapper is gone is collected"
+    );
+    assert!(rewrap.is_empty());
+
+    // And a later call mints a fresh one rather than resurrecting.
+    let third = rewrap.wrap(&remote);
+    assert_eq!(rewrap.len(), 1);
+    drop(third);
+
+    // A different remote is a different entry.
+    let other = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));
+    let a = rewrap.wrap(&remote);
+    let b = rewrap.wrap(&other);
+    assert_ne!(
+        a.as_binder(),
+        b.as_binder(),
+        "AC-22.11: distinct remotes must not collapse onto one wrapper"
     );
 }
