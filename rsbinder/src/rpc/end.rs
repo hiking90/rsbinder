@@ -25,7 +25,7 @@ use crate::StatusCode;
 #[non_exhaustive]
 pub enum EndedBy {
     /// This end decided to: an explicit
-    /// [`RpcSession::shutdown`](super::RpcSession::shutdown) or
+    /// [`RpcSession::close_session`](super::RpcSession::close_session) or
     /// [`RpcServer::terminate`](super::RpcServer::terminate), or a
     /// deadline this end armed and let expire between frames (idle
     /// eviction). Every end observed after that decision is `Local`,

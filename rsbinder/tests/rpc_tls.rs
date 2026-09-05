@@ -215,7 +215,7 @@ fn tls_over_unix_socket_e2e() {
 /// A TCP end without a TLS `close_notify` is not a clean close. On the
 /// one backend built for untrusted networks that is what a truncation
 /// attack looks like, so the transport reports it as
-/// [`RpcError::UncleanEndOfStream`] — not the `PeerClosed` a
+/// [`RpcError::UncleanEndOfStream`] — not the `EndOfStream` a
 /// `close_notify` yields — even at a frame boundary, where the plain
 /// framing reader would otherwise see a clean end of stream.
 #[test]
@@ -253,15 +253,15 @@ fn tls_shutdown_is_a_clean_close_for_the_peer() {
             .expect("client handshake");
     server.join().unwrap();
     match client.recv_frame() {
-        Err(RpcError::PeerClosed) => {}
-        other => panic!("expected the clean PeerClosed after close_notify, got {other:?}"),
+        Err(RpcError::EndOfStream) => {}
+        other => panic!("expected the clean EndOfStream after close_notify, got {other:?}"),
     }
 }
 
 /// Plan 2-21 D-3 — our own `shutdown()` wakes our own reader with an end
 /// of stream that carries no `close_notify` from the peer. That is the
 /// shape of a cut, but it is ours: the transport reports the clean
-/// `PeerClosed`, not `UncleanEndOfStream`, so a session this end shut
+/// `EndOfStream`, not `UncleanEndOfStream`, so a session this end shut
 /// down ends its serve loop cleanly. A second `shutdown()` is `Ok`.
 #[test]
 fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
@@ -286,7 +286,7 @@ fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     client.shutdown().expect("shutdown");
     client.shutdown().expect("a second shutdown is Ok");
     match client.recv_frame() {
-        Err(RpcError::PeerClosed) => {}
+        Err(RpcError::EndOfStream) => {}
         other => panic!("our own shutdown must read as a clean end, got {other:?}"),
     }
     let _ = done_tx.send(());
@@ -603,7 +603,7 @@ fn setup_tcp_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }
 
@@ -692,7 +692,7 @@ fn vsock_tls_loopback_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }
 
@@ -754,6 +754,6 @@ fn setup_unix_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }

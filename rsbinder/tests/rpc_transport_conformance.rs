@@ -124,7 +124,7 @@ fn queued_then_shutdown(
     }
     let end = recv(&**local, fd_mode);
     assert!(
-        matches!(end, Err(RpcError::PeerClosed)),
+        matches!(end, Err(RpcError::EndOfStream)),
         "{name}: after shutdown (and any queued frame) the read is the end of stream, got {end:?}"
     );
     // A second shutdown is Ok (idempotent).
@@ -132,7 +132,7 @@ fn queued_then_shutdown(
     // The peer: our shutdown is its end of stream.
     let peer_end = peer.recv_frame();
     assert!(
-        matches!(peer_end, Err(RpcError::PeerClosed)),
+        matches!(peer_end, Err(RpcError::EndOfStream)),
         "{name}: the peer reads our shutdown as its end of stream, got {peer_end:?}"
     );
     // Its first send afterwards is measured per backend and platform (the
@@ -164,7 +164,7 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     std::thread::sleep(Duration::from_millis(50));
     shutdown_within(name, local);
     match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Err(RpcError::PeerClosed)) => {}
+        Ok(Err(RpcError::EndOfStream)) => {}
         Ok(other) => panic!("{name}: the woken reader must see the end of stream, got {other:?}"),
         Err(RecvTimeoutError::Timeout) => panic!("{name}: shutdown did not wake the parked reader"),
         Err(RecvTimeoutError::Disconnected) => panic!("{name}: the reader thread died"),

@@ -187,7 +187,7 @@ fn server_side_callback_cycle_reclaimed_on_client_disconnect() {
 }
 
 /// The cycle case the runtime cannot detect on its own: a client that
-/// neither serves nor transacts again. `RpcSession::shutdown` is the
+/// neither serves nor transacts again. `RpcSession::close_session` is the
 /// explicit break — without it the graph would stay alive for the
 /// process lifetime.
 #[test]
@@ -209,7 +209,7 @@ fn explicit_shutdown_breaks_cycle_without_any_transaction() {
 
     // Abandon the session: no serve loop here, no further transactions.
     drop(root);
-    client.shutdown();
+    client.close_session();
     drop(client);
     drop(server);
 
@@ -336,7 +336,7 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
 
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
     let _ = std::fs::remove_file(&path);
 }

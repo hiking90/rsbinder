@@ -41,7 +41,7 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
 
 /// Prose the code contradicts. Each phrase below was once written in a serve-loop
 /// rustdoc or the CHANGELOG and later shown false: the serve loop's `Ok(())` is
-/// reached by a local `RpcSession::shutdown` exactly as by a peer close, and
+/// reached by a local `RpcSession::close_session` exactly as by a peer close, and
 /// what a transport `shutdown` does to bytes already received is platform- and
 /// backend-dependent (macOS discards the kernel queue, Linux keeps it, `mem`
 /// discards logically, a transport may hold a buffered leftover). The same

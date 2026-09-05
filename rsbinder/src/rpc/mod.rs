@@ -144,17 +144,27 @@ pub type RpcResult<T> = std::result::Result<T, RpcError>;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum RpcError {
-    /// The peer closed the connection cleanly with no frame pending
-    /// (EOF / `BrokenPipe` / `ConnectionReset` before any header bytes).
-    PeerClosed,
+    /// The stream ended at a frame boundary: EOF with no frame pending,
+    /// or a disconnect kind (`BrokenPipe` / `ConnectionReset` /
+    /// `ConnectionAborted`) from a read or a write. It says nothing about
+    /// **who** ended the stream or whether the end was **clean**: this
+    /// end's own write failing after its own
+    /// [`shutdown`](transport::RpcTransport::shutdown) folds here just as
+    /// a peer's EOF does, and so does a reset. Whether this end decided
+    /// is [`SessionEnd::by`]; whether the transport's close signal
+    /// arrived is [`UncleanEndOfStream`](Self::UncleanEndOfStream). A
+    /// disconnect part-way through a frame is
+    /// [`Truncated`](Self::Truncated), never this. Projects to
+    /// [`StatusCode::DeadObject`](crate::StatusCode).
+    EndOfStream,
     /// The stream ended at a frame boundary without the transport's own
     /// close signal — a TLS session whose TCP stream ended with no
-    /// `close_notify`. Kept apart from [`PeerClosed`](Self::PeerClosed)
+    /// `close_notify`. Kept apart from [`EndOfStream`](Self::EndOfStream)
     /// because on the one backend built for untrusted networks this is
     /// exactly what a truncation attack looks like; a plain socket has no
     /// close signal to miss and never reports it. The transport's own
     /// [`shutdown`](transport::RpcTransport::shutdown) sends the signal,
-    /// so a deliberate close on this end is still `PeerClosed` on the
+    /// so a deliberate close on this end is still `EndOfStream` on the
     /// other. Projects to [`StatusCode::DeadObject`](crate::StatusCode).
     UncleanEndOfStream,
     /// A frame length header was fully received but the body was
@@ -188,7 +198,7 @@ pub enum RpcError {
 impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RpcError::PeerClosed => write!(f, "RPC peer closed the connection"),
+            RpcError::EndOfStream => write!(f, "RPC stream ended"),
             RpcError::UncleanEndOfStream => {
                 write!(f, "RPC stream ended without a close signal (truncated?)")
             }
@@ -220,7 +230,7 @@ impl std::error::Error for RpcError {
 
 impl RpcError {
     /// Whether a read that failed with this error is documented to have
-    /// left the stream at a frame boundary: [`PeerClosed`](Self::PeerClosed)
+    /// left the stream at a frame boundary: [`EndOfStream`](Self::EndOfStream)
     /// ("no frame pending") and [`Timeout`](Self::Timeout) ("reported only
     /// when nothing partial was consumed"). Every other read failure lacks
     /// that guarantee — including ones that in fact consumed nothing — and
@@ -228,12 +238,12 @@ impl RpcError {
     /// the framing readers (promoting a mid-frame case to `Truncated`),
     /// the reply wait and the serve loop all ask here.
     pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
-        matches!(self, RpcError::PeerClosed | RpcError::Timeout)
+        matches!(self, RpcError::EndOfStream | RpcError::Timeout)
     }
 }
 
 impl From<std::io::Error> for RpcError {
-    /// Map a clean disconnect to [`RpcError::PeerClosed`]; everything
+    /// Map a clean disconnect to [`RpcError::EndOfStream`]; everything
     /// else stays [`RpcError::Io`]. A truncated *body* is classified by
     /// the framing reader, not here. An `RpcError` that travelled as the
     /// `io::Error`'s payload (how the `Read` adapters carry
@@ -247,7 +257,7 @@ impl From<std::io::Error> for RpcError {
         };
         match e.kind() {
             UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted => {
-                RpcError::PeerClosed
+                RpcError::EndOfStream
             }
             _ => RpcError::Io(e),
         }
@@ -264,12 +274,12 @@ impl From<RpcError> for std::io::Error {
     ///
     /// `RpcError::Io` hands its payload back as-is, but the reverse
     /// direction folds the disconnect kinds, so an `Io` carrying one of
-    /// them returns as `PeerClosed`.
-    /// [`RpcError::PeerClosed`] projects onto a single representative
+    /// them returns as `EndOfStream`.
+    /// [`RpcError::EndOfStream`] projects onto a single representative
     /// disconnect kind (`BrokenPipe`): the four kinds `From<io::Error>`
-    /// folds into `PeerClosed` are not distinguished, and a
-    /// `PeerClosed` raised from a 0-byte read never had one. That kind
-    /// folds back into `PeerClosed`, so a write-side disconnect on an
+    /// folds into `EndOfStream` are not distinguished, and a
+    /// `EndOfStream` raised from a 0-byte read never had one. That kind
+    /// folds back into `EndOfStream`, so a write-side disconnect on an
     /// android-13+ session stays `StatusCode::DeadObject` rather than
     /// degrading to an unclassified `Io(Other)` (`StatusCode::Unknown`)
     /// — the status a caller's dead-peer check keys on.
@@ -277,7 +287,7 @@ impl From<RpcError> for std::io::Error {
     /// — kind-preserving rather than variant-preserving, since
     /// `From<io::Error>` folds that kind into `Io(TimedOut)`.
     /// [`RpcError::UncleanEndOfStream`] must survive the round trip —
-    /// folding it by kind would turn it back into `PeerClosed`, the very
+    /// folding it by kind would turn it back into `EndOfStream`, the very
     /// thing it exists to be told apart from — so it goes out as an
     /// `UnexpectedEof` carrying itself as the payload, which
     /// `From<io::Error>` recovers first. The remaining variants have no
@@ -285,7 +295,7 @@ impl From<RpcError> for std::io::Error {
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::Io(io) => io,
-            RpcError::PeerClosed => std::io::ErrorKind::BrokenPipe.into(),
+            RpcError::EndOfStream => std::io::ErrorKind::BrokenPipe.into(),
             RpcError::Timeout => std::io::ErrorKind::TimedOut.into(),
             e @ RpcError::UncleanEndOfStream => {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
@@ -306,7 +316,7 @@ impl From<RpcError> for crate::StatusCode {
     /// [`StatusCode::RpcError`]: crate::StatusCode::RpcError
     fn from(e: RpcError) -> Self {
         match e {
-            RpcError::PeerClosed => crate::StatusCode::DeadObject,
+            RpcError::EndOfStream => crate::StatusCode::DeadObject,
             RpcError::UncleanEndOfStream => crate::StatusCode::DeadObject,
             RpcError::Truncated => crate::StatusCode::NotEnoughData,
             RpcError::DeadlineMidFrame => crate::StatusCode::TimedOut,
@@ -389,7 +399,7 @@ mod tests {
             std::io::ErrorKind::ConnectionAborted,
         ] {
             let e: RpcError = std::io::Error::from(kind).into();
-            assert!(matches!(e, RpcError::PeerClosed), "{kind:?} -> {e:?}");
+            assert!(matches!(e, RpcError::EndOfStream), "{kind:?} -> {e:?}");
         }
         // A non-disconnect I/O error stays Io(..).
         let other: RpcError = std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
@@ -399,7 +409,7 @@ mod tests {
     #[test]
     fn rpc_error_projects_onto_status_code() {
         assert_eq!(
-            StatusCode::from(RpcError::PeerClosed),
+            StatusCode::from(RpcError::EndOfStream),
             StatusCode::DeadObject
         );
         assert_eq!(
@@ -428,19 +438,19 @@ mod tests {
     /// `StatusCode::DeadObject`, not `Unknown`. Which side of an
     /// exchange notices a disconnect first is a host- and timing-
     /// dependent race, so both directions have to classify alike.
-    /// `PeerClosed` returns as the same variant; `Timeout` is only
+    /// `EndOfStream` returns as the same variant; `Timeout` is only
     /// kind-preserving — it comes back as `Io(TimedOut)`.
     ///
     /// **Mutant gate**: restoring `other => io::Error::other(...)` for
-    /// `PeerClosed` fails the round trip below (and the timeout arm
+    /// `EndOfStream` fails the round trip below (and the timeout arm
     /// guards `read_exact_into`'s `is_timeout` path the same way).
     #[test]
     fn peer_closed_and_timeout_round_trip_through_io_error() {
-        let io = std::io::Error::from(RpcError::PeerClosed);
+        let io = std::io::Error::from(RpcError::EndOfStream);
         assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe);
-        assert!(matches!(RpcError::from(io), RpcError::PeerClosed));
+        assert!(matches!(RpcError::from(io), RpcError::EndOfStream));
         assert_eq!(
-            StatusCode::from(RpcError::from(std::io::Error::from(RpcError::PeerClosed))),
+            StatusCode::from(RpcError::from(std::io::Error::from(RpcError::EndOfStream))),
             StatusCode::DeadObject,
             "a write-side disconnect must stay DeadObject, not Unknown"
         );

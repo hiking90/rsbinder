@@ -123,7 +123,7 @@ fn vsock_loopback_e2e() {
     // Teardown — explicit shutdown + bg.join (same shape as UDS tests).
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     let _ = bg.join();
 }
 
@@ -170,7 +170,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
         "recv must not return a frame after shutdown: {got:?}"
     );
     reader.join().expect("reader thread");
-    server.shutdown();
+    server.stop_accepting();
     // Join the workers before the accept loop, as the sibling test does:
     // a worker still serving this client would otherwise outlive the test.
     server.join_workers();
@@ -179,7 +179,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
     }
 }
 
-/// Plan 2-20 (`RpcSession::shutdown` on a vsock session): a user
+/// Plan 2-20 (`RpcSession::close_session` on a vsock session): a user
 /// `serve_blocking` thread ends, the death recipient fires, and the
 /// server sees the connection go — the whole teardown path over vsock.
 #[test]
@@ -216,7 +216,7 @@ fn vsock_session_shutdown_ends_serve_thread() {
     let serve = std::thread::spawn(move || serving.serve_blocking());
 
     std::thread::sleep(Duration::from_millis(200));
-    client.shutdown();
+    client.close_session();
     assert!(
         rx.recv_timeout(Duration::from_secs(3)).is_ok(),
         "shutdown must fire the linked recipient"
@@ -228,7 +228,7 @@ fn vsock_session_shutdown_ends_serve_thread() {
     );
     drop(root);
     drop(client);
-    server.shutdown();
+    server.stop_accepting();
     server.join_workers();
     // Surface an accept-loop panic instead of discarding it — a future
     // regression there would otherwise leave every test green.

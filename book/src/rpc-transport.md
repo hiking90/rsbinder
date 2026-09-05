@@ -85,7 +85,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Publish a root binder. Clients fetch this via get_root().
     server.set_root(BnHello::new_binder(IHelloService {}).as_binder());
 
-    // Accept loop runs on this thread until shutdown().
+    // Accept loop runs on this thread until stop_accepting().
     server.run()?;
     Ok(())
 }
@@ -102,9 +102,13 @@ Key points:
   equivalent of `hub::wait_for_interface(name)` for kernel binder, just
   without a service manager.
 - **`server.run()`** runs the accept loop until
-  [`RpcServer::shutdown`] is called. Use
+  [`RpcServer::stop_accepting`] is called from another thread. Use
   [`RpcServer::run_background`] to spawn it on a dedicated thread
-  instead.
+  instead. `stop_accepting` only raises the flag — sessions already
+  connected drain as their peers leave. [`RpcServer::terminate`] ends
+  those too (every session closed, every worker joined); it is what
+  dropping a `ServerGuard` does. See [How a connection
+  ends](#how-a-connection-ends).
 
 ### Client
 
@@ -507,11 +511,44 @@ Two consequences worth knowing:
   the session no longer waits for its next failed call to notice.
 - **Stop the session explicitly.** The serving threads keep the session
   alive; dropping the `RpcSession` handle and every proxy does not end
-  them. Call `RpcSession::shutdown()` when you are done — it shuts the
-  connections down and joins the threads.
+  them. Call `RpcSession::close_session()` when you are done — it shuts
+  the connections down and joins the threads.
 
 This needs the android-13+ profile (the attach echoes the session id)
 and is currently offered for Unix-domain sockets.
+
+### How a connection ends
+
+A serve loop — `RpcSession::serve_blocking` and its variants — returns
+`rpc::SessionEnd`, not `Result<()>`. It answers three questions a
+status code cannot hold at once:
+
+- **`stream`** — is the stream still at a frame boundary
+  (`StreamState::InSync`), or is its position lost (`Lost`: a cut
+  frame, a TLS stream that ended without `close_notify`, a deadline
+  that expired part-way through a frame)?
+- **`by`** — did this end decide (`EndedBy::Local`: `close_session`,
+  `terminate`, an idle deadline this end armed), or not (`NotLocal`)?
+- **`reason`** — what happened (`EndReason`), for logs.
+
+`SessionEnd::into_result()` is the one projection back to a `Result`:
+`Ok(())` for an intact stream, `Err(DeadObject)` for a lost one. Only
+`stream` decides it; `by` is attribution.
+
+Each call on the ending side means one thing:
+
+| call | does |
+|---|---|
+| `RpcSession::close_session()` | declare the session dead: every connection's transport is shut down, cached proxies get `binder_died`, the session's incoming threads are joined |
+| `RpcServer::stop_accepting()` | raise the accept flag; connected sessions drain as their peers leave; nothing is joined |
+| `RpcServer::terminate()` | stop accepting, close every session the server minted, join the workers |
+| `ServerGuard::stop_and_join()` | `terminate`, after joining the accept thread — the same as dropping the guard |
+| `RpcTransport::shutdown()` | the transport half-close itself (`shutdown(2)` in both directions): wakes a reader blocked on this end, fails this end's later sends |
+
+What the *peer* sees after this end's `shutdown` is platform-dependent —
+Linux delivers frames already queued ahead of the EOF, macOS discards
+them — so code must not assume a queued frame arrives, or that it does
+not.
 
 ## Bridging RPC and the service manager: the Accessor pattern
 

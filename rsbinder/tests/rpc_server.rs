@@ -310,8 +310,8 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
-/// **RAII test cleanup** — guarantees `shutdown` + `bg.join` +
-/// `join_workers` + socket-file removal on **any** drop path, including
+/// **RAII test cleanup** — guarantees `stop_accepting` + `bg.join` +
+/// `terminate` + socket-file removal on **any** drop path, including
 /// an `assert!`/`unwrap`/`expect` panic mid-test. Without this an
 /// assertion failure leaks the background accept loop + every spawned
 /// `serve_blocking` worker into the test binary process for the
@@ -339,7 +339,7 @@ impl ServeCleanup {
 }
 impl Drop for ServeCleanup {
     fn drop(&mut self) {
-        self.server.shutdown();
+        self.server.stop_accepting();
         if let Some(h) = self.bg.take() {
             // A panic in the background accept loop is a real SUT
             // bug (`RpcServer::run()` is supposed to return cleanly).
@@ -363,7 +363,10 @@ impl Drop for ServeCleanup {
                 );
             }
         }
-        self.server.join_workers();
+        // `terminate`, not `join_workers`: a client a test left connected
+        // (or parked in another thread) would otherwise hang the whole
+        // binary here instead of failing that test.
+        self.server.terminate();
         if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
         }
@@ -1218,7 +1221,7 @@ fn a0b_multi_connection_shared_session() {
     // would also pass for an unrelated
     // error (e.g. handshake itself failed). Lock the contract to the
     // single status this reject produces: the server `drop(transport)`
-    // closes the socket, and a disconnect folds to `PeerClosed` and
+    // closes the socket, and a disconnect folds to `EndOfStream` and
     // then `StatusCode::DeadObject` (see `rsbinder/src/rpc/mod.rs`,
     // `From<io::Error> for RpcError`, kind-preserving in both
     // directions per
@@ -1233,7 +1236,7 @@ fn a0b_multi_connection_shared_session() {
     assert_eq!(
         err,
         StatusCode::DeadObject,
-        "unknown id reject must surface as DeadObject (the PeerClosed path)"
+        "unknown id reject must surface as DeadObject (the EndOfStream path)"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == 1),
@@ -1287,7 +1290,7 @@ fn a0b_multi_connection_shared_session() {
 
     drop(root1);
     drop(c1);
-    // _cu's Drop handles shutdown/bg.join/join_workers/remove_file —
+    // _cu's Drop handles stop_accepting/bg.join/terminate/remove_file —
     // a panic above does not leak worker threads + socket file.
 }
 
@@ -1874,13 +1877,13 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
 /// successful handshake but before the per-slot enqueue; in production
 /// the `shutdown.load()` gate at that point sees a *sub-microsecond*
 /// window between an accepted late attach and a concurrent
-/// `server.shutdown()`, so the branch is otherwise only observable by
+/// `server.stop_accepting()`, so the branch is otherwise only observable by
 /// code inspection + the `rejected_unknown_id_count` counter.
 ///
 /// The `__set_attach_shutdown_probe` `#[doc(hidden)]` test-only barrier
 /// makes the window deterministic: it
 /// fires after the codec check passes and *before* `shutdown.load()`,
-/// so the test can park the worker, flip `server.shutdown()`, then
+/// so the test can park the worker, flip `server.stop_accepting()`, then
 /// release the worker. The worker re-reads the now-true flag and
 /// takes the reject branch — exactly the production semantics, with
 /// no scheduler-luck dependency.
@@ -1960,7 +1963,7 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
         .expect("attach worker should reach the shutdown barrier");
 
     // Flip shutdown *while* the worker is parked at the probe.
-    server.shutdown();
+    server.stop_accepting();
 
     // Release the worker — it re-reads `shutdown.load() == true`
     // and takes the reject branch (drops the transport).
@@ -2663,7 +2666,7 @@ impl rsbinder::DeathRecipient for DeathFlag {
 /// connection drops** (AOSP `RpcState::sendObituaries`). The peer that
 /// wants the notification runs a serve loop (the AOSP "incoming
 /// thread" requirement); when the server process is killed the
-/// client's `serve_blocking` ends on `PeerClosed` and delivers the
+/// client's `serve_blocking` ends on `EndOfStream` and delivers the
 /// obituary. Also covers `unlink_to_death` (an unlinked recipient must
 /// NOT fire) and the post-death `link_to_death`→`DeadObject` contract.
 ///
@@ -2827,11 +2830,12 @@ struct HeldSetup {
     _cu: ServeCleanup,
 }
 /// `HeldSetup::drop` runs before its fields drop: stop the client's
-/// incoming-connection threads first, or `ServeCleanup::join_workers`
-/// would wait on a founding connection those threads keep open.
+/// incoming-connection threads first, so the client ends the session on
+/// its own terms rather than having `ServeCleanup`'s `terminate` end it
+/// from the server side underneath those threads.
 impl Drop for HeldSetup {
     fn drop(&mut self) {
-        self.client.shutdown();
+        self.client.close_session();
     }
 }
 /// Everything `boot_held_cfg` can vary.
@@ -2882,14 +2886,13 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
         RpcSession::setup_unix_client(&path).expect("connect")
     };
     // From here on a panic must still shut the session down: its incoming
-    // threads hold the connection open, and `ServeCleanup`'s `join_workers`
-    // would then wait on a server worker forever — turning a setup failure
-    // into a hang instead of a report.
+    // threads keep the session alive, and a setup failure would otherwise
+    // leak them into the rest of the suite.
     struct ClientGuard(Option<RpcSession>);
     impl Drop for ClientGuard {
         fn drop(&mut self) {
             if let Some(c) = self.0.take() {
-                c.shutdown();
+                c.close_session();
             }
         }
     }
@@ -3125,7 +3128,7 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let root = EchoProxy(client.get_root().expect("root"));
     // Longer than the handshake deadline: a leaked deadline fails here.
     assert_eq!(root.slow(500).map(|_| "ok"), Ok("ok"));
-    client.shutdown();
+    client.close_session();
 
     drop(keep);
     std::mem::drop(acceptor);
@@ -3501,11 +3504,10 @@ fn b_incoming_over_server_cap_is_refused() {
         RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
     );
     // The regression this guards against *admits* the third slot. Leaking
-    // that session would leave its incoming threads serving, and the panic
-    // below would then hang the whole binary in `ServeCleanup`'s
-    // `join_workers` instead of failing.
+    // that session would leave its incoming threads serving past the panic
+    // below, into the rest of the suite.
     if let Ok(s) = &r {
-        s.shutdown();
+        s.close_session();
     }
     assert!(
         matches!(r, Err(StatusCode::DeadObject)),
@@ -3531,12 +3533,12 @@ fn b_entry_client_open_with_incoming() {
     let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
         .expect("open with incoming");
     let session = client.session().expect("rpc session");
-    // Read first, shut down, then assert: a session with a live incoming
-    // thread that is never shut down hangs the fixture's `join_workers`,
-    // so a failing assertion here must not skip the `shutdown`.
+    // Read first, close, then assert: a session with a live incoming
+    // thread that is never closed leaks that thread into the rest of the
+    // suite, so a failing assertion here must not skip the `close_session`.
     let slots = session.__slot_count();
     let threads = session.__incoming_thread_count();
-    session.shutdown();
+    session.close_session();
     assert_eq!(slots, 2);
     assert_eq!(threads, 1);
     let r34 = format!("unix://{}", path.display());
@@ -3614,10 +3616,10 @@ fn c_server_death_is_eager_with_incoming() {
         rx_l.recv_timeout(Duration::from_secs(3)).is_ok(),
         "the failed call declares the session dead"
     );
-    eager.shutdown();
+    eager.close_session();
     assert_eq!(eager.__incoming_thread_live_count(), 0);
     assert_eq!(eager.__incoming_thread_count(), 0);
-    lazy.shutdown();
+    lazy.close_session();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -3664,7 +3666,7 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
                 "the handler must be running when the session is shut down"
             );
         }
-        server.shutdown();
+        server.close_session();
         let end = serve.join().expect("serve thread");
         assert_eq!(end.by, EndedBy::Local, "dispatching={dispatching}: {end}");
         assert!(end.is_clean(), "dispatching={dispatching}: {end}");
@@ -3672,7 +3674,7 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
         if let Some(c) = caller {
             c.join().expect("caller thread");
         }
-        client.shutdown();
+        client.close_session();
     }
 }
 
@@ -3733,7 +3735,7 @@ fn terminate_ends_every_session_and_joins_workers() {
     assert_eq!(r34_root.echo("r34").unwrap(), "r34");
 
     // android-13+ with two outgoing connections: a `Live(2)` server
-    // session, which `RpcSession::shutdown` used to skip as "still live".
+    // session, which `close_session` must end although it is "still live".
     let a13_path = tmp_sock("term13");
     let a13_server = RpcServer::setup_unix_server(&a13_path).expect("bind a13");
     a13_server.set_android13plus(2);
@@ -3866,7 +3868,7 @@ fn terminate_from_a_handler_does_not_join_itself() {
         "the handler's own worker must exit on its own ({} refs)",
         Arc::strong_count(&server)
     );
-    client.shutdown();
+    client.close_session();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -3898,7 +3900,7 @@ fn c_shutdown_joins_incoming_threads() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let shutting = h.client.clone();
     let t = std::thread::spawn(move || {
-        shutting.shutdown();
+        shutting.close_session();
         let _ = tx.send(());
     });
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -3909,8 +3911,9 @@ fn c_shutdown_joins_incoming_threads() {
         Err(RecvTimeoutError::Disconnected) => {}
         Err(RecvTimeoutError::Timeout) => {
             // Report the failure instead of hanging the runner: dropping `h`
-            // would run `HeldSetup::drop` → `join_workers()`, which a regression
-            // that leaves the transports up would never return from.
+            // would run `HeldSetup::drop` → `ServeCleanup`'s `terminate`, which
+            // ends the same wedged session and joins the same workers — a
+            // regression that leaves the transports up would never return.
             std::mem::forget(h);
             panic!("shutdown deadlocked");
         }
@@ -3929,7 +3932,7 @@ fn c_shutdown_joins_incoming_threads() {
     assert_eq!(h.client.__incoming_thread_live_count(), 0);
     assert_eq!(h.client.__incoming_thread_count(), 0);
     // Idempotent.
-    h.client.shutdown();
+    h.client.close_session();
     let server = Arc::clone(&h.server);
     assert!(
         poll_until(|| server.session_slot_count(&sid).is_none_or(|n| n == 0)),
@@ -3945,7 +3948,7 @@ impl rsbinder::DeathRecipient for ShutdownOnDeath {
     fn binder_died(&self, _who: &rsbinder::WIBinder) {
         self.1.store(true, Ordering::SeqCst);
         if let Some(s) = self.0.lock().unwrap().take() {
-            s.shutdown();
+            s.close_session();
         }
     }
 }
@@ -3980,7 +3983,7 @@ fn c_shutdown_from_death_recipient_does_not_deadlock() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let victim = h.client.clone();
     let t = std::thread::spawn(move || {
-        victim.shutdown();
+        victim.close_session();
         let _ = tx.send(());
     });
     match rx.recv_timeout(Duration::from_secs(10)) {
@@ -3990,7 +3993,7 @@ fn c_shutdown_from_death_recipient_does_not_deadlock() {
         Err(RecvTimeoutError::Disconnected) => {}
         Err(RecvTimeoutError::Timeout) => {
             // The session is wedged, so dropping the fixture would block in
-            // `ServeCleanup`'s `join_workers` and turn this failure into a CI
+            // `ServeCleanup`'s `terminate` and turn this failure into a CI
             // timeout. Leak it and report instead.
             std::mem::forget(h);
             panic!("shutdown from a death recipient deadlocked");
@@ -4021,7 +4024,7 @@ impl Remotable for ShutdownCb {
         // Echo like `EchoSvc` so `drive(.., false)` can assert on the reply.
         let a: String = r.read()?;
         if let Some(s) = self.0.lock().unwrap().as_ref() {
-            s.shutdown();
+            s.close_session();
         }
         reply.write(&Status::from(StatusCode::Ok))?;
         reply.write(&a)
@@ -4079,7 +4082,7 @@ fn c_shutdown_from_callback_handler_does_not_self_join() {
     // `shutdown` returned — poll for it.
     assert!(poll_until(|| h.client.__incoming_thread_live_count() == 0));
     assert_eq!(h.client.__incoming_thread_count(), 0);
-    h.client.shutdown();
+    h.client.close_session();
     assert!(matches!(h.root.echo("dead"), Err(StatusCode::DeadObject)));
     *holder.0.lock().unwrap() = None;
 }

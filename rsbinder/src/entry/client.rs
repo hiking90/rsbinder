@@ -31,7 +31,7 @@ pub struct ClientOptions {
     /// outside a handler.
     ///
     /// Setting this `> 0` makes the resulting [`Client`] one that must be
-    /// shut down explicitly (`client.session().unwrap().shutdown()`):
+    /// shut down explicitly (`client.session().unwrap().close_session()`):
     /// the serving threads keep the session alive, so dropping every
     /// handle reclaims nothing. It also makes the loss of the last such
     /// connection this session's death — including a connection the
@@ -107,7 +107,7 @@ pub struct ClientOptions {
 /// serving those connections, and each of them holds the session alive:
 /// dropping the `Client` *and* every proxy reclaims nothing, so the
 /// threads, the session and both ends' sockets survive until the process
-/// exits. Call `client.session().unwrap().shutdown()` when you are done
+/// exits. Call `client.session().unwrap().close_session()` when you are done
 /// with such a client.
 pub struct Client {
     endpoint: Endpoint,

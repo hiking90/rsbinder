@@ -42,6 +42,12 @@
 //! callbacks routinely make outgoing binder calls from inside an incoming
 //! `BR_TRANSACTION`, so this is not a theoretical concern.
 //!
+//! The RPC stack's thread-locals are bound by the same rule:
+//! `rpc::session::DRIVING` (the nested-call recursion marker) and
+//! `RPC_CALLING` (below) both live across user callbacks — `rpc_transact`,
+//! `binder_died` — and every access copies its value out inside `with`,
+//! holding no guard across the callout.
+//!
 //! ## Patterns to satisfy R1
 //!
 //! - **P2 — Minimal scope**: scope each borrow as tightly as "read value →
@@ -130,10 +136,10 @@ fn ensure_thread_exit_guard(driver: &Arc<File>) {
 //
 // The store holds an `Arc<PeerIdentity>` (the full peer, so handler-side
 // authorization can see uid *and* the cert/vsock identity), borrowed only
-// momentarily (clone-out) and never across the user handler, so the R1
-// borrow discipline that governs `THREAD_STATE`/`BINDER_DEREFS` does not
-// apply here (set → run handler → restore, no live borrow during the
-// callout). `Arc` keeps the per-dispatch and oneway-drain installs cheap.
+// momentarily (clone-out) and never across the user handler — the R1
+// borrow discipline (module doc) satisfied by construction: set → run
+// handler → restore, no live borrow during the callout. `Arc` keeps the
+// per-dispatch and oneway-drain installs cheap.
 #[cfg(feature = "rpc")]
 thread_local! {
     static RPC_CALLING: std::cell::RefCell<Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>> =

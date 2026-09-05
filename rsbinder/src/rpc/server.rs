@@ -415,7 +415,7 @@ pub struct RpcServer {
     /// `server.shutdown.load()` gate (the very race window the test
     /// targets, otherwise un-bound by code observability alone). An integration
     /// test acquires the worker at this barrier, calls
-    /// [`shutdown`](RpcServer::shutdown), then releases the worker so it
+    /// [`stop_accepting`](RpcServer::stop_accepting), then releases the worker so it
     /// re-reads the now-true flag and takes the reject branch — turning
     /// the otherwise sub-microsecond window into a deterministic test
     /// point. `None` default ⇒ no invocation, byte-identical to the
@@ -1028,7 +1028,7 @@ impl RpcServer {
     fn minted_after_terminate(&self, session: &RpcSession) -> bool {
         if self.shutdown.load(Ordering::SeqCst) {
             log::debug!("RPC: connection accepted as the server was terminating; ending it");
-            session.shutdown();
+            session.close_session();
             return true;
         }
         false
@@ -1601,7 +1601,7 @@ impl RpcServer {
         }
     }
 
-    /// Run the accept loop until [`RpcServer::shutdown`]. Each accepted
+    /// Run the accept loop until [`RpcServer::stop_accepting`]. Each accepted
     /// connection gets its own session + worker thread.
     pub fn run(self: &Arc<Self>) -> Result<()> {
         loop {
@@ -1720,19 +1720,20 @@ impl RpcServer {
     }
 
     /// Stop accepting and let in-flight sessions drain as their peers
-    /// disconnect — the graceful form. This reaches nothing a peer keeps
-    /// open: a worker parked in `recv` never reads the flag, so a client
-    /// that stays connected keeps its worker alive. To end those too,
-    /// use [`terminate`](Self::terminate).
-    pub fn shutdown(&self) {
+    /// disconnect — the graceful form. Only the accept flag is raised;
+    /// nothing is joined. This reaches nothing a peer keeps open: a
+    /// worker parked in `recv` never reads the flag, so a client that
+    /// stays connected keeps its worker alive. To end those too, use
+    /// [`terminate`](Self::terminate).
+    pub fn stop_accepting(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
     /// End the server now: stop accepting, end every session it serves,
     /// and join the workers. This is what a dropped
     /// [`ServerGuard`](crate::ServerGuard) does. Where
-    /// [`shutdown`](Self::shutdown) waits for peers to leave, this ends
-    /// each session as [`RpcSession::shutdown`] would — whatever its
+    /// [`stop_accepting`](Self::stop_accepting) waits for peers to leave,
+    /// this ends each session as [`RpcSession::close_session`] would — whatever its
     /// connection count — so every slot's transport is shut down, the
     /// workers wake out of `recv`, exit, and are joined. Peers see the
     /// connection end.
@@ -1868,7 +1869,7 @@ impl Drop for RpcServer {
     /// worker also releases its clone (peer close, kernel reset,
     /// etc.).
     ///
-    /// [`RpcServer::shutdown`] does not help there: the flag it flips is
+    /// [`RpcServer::stop_accepting`] does not help there: the flag it flips is
     /// polled by the accept loop and read by the android-13+ attach arms
     /// (which refuse a late attach), but a worker already blocked in
     /// `recv` never reaches a gate that reads it. Nor does

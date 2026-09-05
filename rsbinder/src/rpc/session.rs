@@ -164,7 +164,7 @@ impl<'a> RpcUnixClientConfig<'a> {
     /// session you do not own). Bounded on the server by twice its
     /// `RpcServer::set_max_threads` value. Default 0. The threads end
     /// when the server closes the session or on
-    /// [`RpcSession::shutdown`]; dropping the `RpcSession` handle alone
+    /// [`RpcSession::close_session`]; dropping the `RpcSession` handle alone
     /// does not stop them.
     pub fn incoming_connections(mut self, n: u32) -> Self {
         self.incoming_connections = n;
@@ -636,7 +636,7 @@ fn log_attach_refused(e: &RpcError) {
 fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
     if requesting_new_session {
         match &e {
-            RpcError::PeerClosed => log::error!(
+            RpcError::EndOfStream => log::error!(
                 "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
                  the peer accepted the connection — it may be speaking the r34 (default) \
                  profile. Connect without `?profile=android13plus`, or enable the android-13+ \
@@ -739,6 +739,11 @@ thread_local! {
     /// per-session in [`RpcState`]. It mirrors kernel binder's
     /// thread-local `IPCThreadState`. Documented exception in the
     /// `rpc_stack_has_no_globals` gate.
+    ///
+    /// Bound by the borrow-discipline invariant R1 (`thread_state`
+    /// module doc): every `DRIVING.with` copies its answer out of the
+    /// closure, and no guard is held across the user callback a nested
+    /// dispatch runs.
     static DRIVING: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -915,7 +920,7 @@ enum StreamPosition {
     /// What the peer sends next is unknowable — the pending `REPLY` may
     /// still arrive, or it may already be gone. Either a frame arrived
     /// and did not decode, or a read failed without the guarantee that
-    /// it stopped at a frame boundary: only `PeerClosed` and `Timeout`
+    /// it stopped at a frame boundary: only `EndOfStream` and `Timeout`
     /// carry that guarantee, so every other read failure lands here,
     /// including one that consumed nothing at all. AOSP ends the whole
     /// session here (`RpcState::waitForReply`: "processCommand must
@@ -1180,7 +1185,7 @@ pub(crate) struct RpcSessionInner {
     /// one place.
     shared: Arc<SharedSession>,
     /// Threads serving this client's incoming (callback) connections,
-    /// keyed by slot id. Joined by [`RpcSession::shutdown`].
+    /// keyed by slot id. Joined by [`RpcSession::close_session`].
     incoming_threads: Mutex<Vec<(u64, std::thread::JoinHandle<()>)>>,
     /// How many of those threads are still running. Bumped before the
     /// spawn and dropped by the thread itself as its very last act.
@@ -1188,7 +1193,7 @@ pub(crate) struct RpcSessionInner {
     /// `incoming_threads` is `mem::take`n before the first `join()`, so
     /// its length is zero either way.
     incoming_live: AtomicUsize,
-    /// How many of those threads [`RpcSession::shutdown`] has actually
+    /// How many of those threads [`RpcSession::close_session`] has actually
     /// `join()`ed. `incoming_live` cannot stand in for this: the serve
     /// threads are woken by the transport shutdown that `shutdown`
     /// performs first, so they usually finish on their own while it is
@@ -1860,7 +1865,7 @@ impl RpcSessionInner {
     /// so the reply is still inbound; count it so the stream re-syncs by
     /// skipping it rather than tearing the connection down as
     /// "unsolicited". Only for a wait that ended with the stream still at
-    /// a frame boundary (`PeerClosed`, `Timeout`, or a failure before or
+    /// a frame boundary (`EndOfStream`, `Timeout`, or a failure before or
     /// after the read itself); a read that failed without that guarantee
     /// marks the slot unreadable instead
     /// ([`mark_slot_unreadable`](Self::mark_slot_unreadable)).
@@ -1953,7 +1958,7 @@ impl RpcSessionInner {
     /// End this session now, whatever its connection count: declare
     /// death (`Live(n) → Dying`) and run the death sequence. Exactly one
     /// caller does the work; from `Dying`/`Dead` it is a no-op. Both
-    /// [`RpcSession::shutdown`] and the server's
+    /// [`RpcSession::close_session`] and the server's
     /// [`terminate`](super::RpcServer::terminate) land here, so a session
     /// several workers drive ends the same way a sole-connection one does.
     pub(crate) fn close(&self) {
@@ -1975,7 +1980,7 @@ impl RpcSessionInner {
     ///
     /// **Unblock before user code.** Every step that can wake a thread of
     /// this session runs ahead of the obituaries, because an obituary (or
-    /// a local `Drop`) may call [`RpcSession::shutdown`], which *joins*
+    /// a local `Drop`) may call [`RpcSession::close_session`], which *joins*
     /// those threads — one still parked would deadlock that join. Two
     /// steps are needed, not one: `shutdown_all_transports` wakes only
     /// threads blocked in `recv`/`send`, while a thread waiting on
@@ -2068,7 +2073,7 @@ impl RpcSessionInner {
         if self.profile.aosp_framing() {
             // android-13+: read `RpcWireHeader` then exactly `bodySize`
             // bytes (capped vs `MAX_FRAME_LEN`); a clean EOF before
-            // any byte surfaces as `PeerClosed` so the `serve_blocking`
+            // any byte surfaces as `EndOfStream` so the `serve_blocking`
             // loop terminates exactly like the R34 path. On a v1+ `Unix`
             // session the same connection always
             // uses `recvmsg` (never mixes with `Read`), accumulating the
@@ -2170,7 +2175,7 @@ impl RpcSessionInner {
 
     /// Shut every slot's transport down (best-effort) so a thread blocked
     /// in `recv` on this session — a client's incoming-connection thread,
-    /// a user `serve_blocking` — returns with `PeerClosed`. Transports are
+    /// a user `serve_blocking` — returns with `EndOfStream`. Transports are
     /// cloned out first: the lock is never held across the syscalls.
     fn shutdown_all_transports(&self) {
         let transports: Vec<Arc<dyn RpcTransport>> = self
@@ -2496,9 +2501,10 @@ impl RpcSessionInner {
         // (empty unless `Unix` fd-mode).
         if let Err(e) = self.send_msg(transport, &frame, data.rpc_out_fds()) {
             rollback();
-            // Transport-level send failure ⇒ peer gone on this connection;
-            // retire the slot like the reply path (encode errors are not).
-            if matches!(e, RpcError::PeerClosed | RpcError::Io(_)) && !conn.reentrant {
+            // Transport-level send failure ⇒ this connection is done (peer
+            // gone, or shut down on this end); retire the slot like the
+            // reply path (encode errors are not).
+            if matches!(e, RpcError::EndOfStream | RpcError::Io(_)) && !conn.reentrant {
                 self.remove_slot(conn.slot_id);
             }
             return Err(e.into());
@@ -3048,7 +3054,7 @@ impl RpcSessionInner {
         let transport = conn.transport();
         let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
-            Err(RpcError::PeerClosed) => return ServeStep::Ended(EndReason::EndOfStream),
+            Err(RpcError::EndOfStream) => return ServeStep::Ended(EndReason::EndOfStream),
             Err(RpcError::UncleanEndOfStream) => {
                 return ServeStep::Ended(EndReason::UncleanEndOfStream)
             }
@@ -3235,13 +3241,13 @@ impl RpcSessionInner {
 /// That leaves one case the runtime cannot notice: a local object handed
 /// to the peer may itself hold a proxy back into this session, and if the
 /// session neither serves nor transacts again, nothing runs the release.
-/// [`RpcSession::shutdown`] is the explicit break for it.
+/// [`RpcSession::close_session`] is the explicit break for it.
 ///
 /// A client session with incoming (callback) connections
 /// ([`RpcUnixClientConfig::incoming_connections`]) owns the threads that
 /// serve them, and those threads keep the session alive: dropping every
 /// handle and proxy does not stop them. They end when the server closes
-/// the session or on [`RpcSession::shutdown`] — call it when you are done
+/// the session or on [`RpcSession::close_session`] — call it when you are done
 /// with such a session.
 #[derive(Clone)]
 pub struct RpcSession {
@@ -3926,7 +3932,7 @@ impl RpcSession {
     /// ([`reason`](SessionEnd::reason)). A caller that wants only
     /// "did it end well" calls [`into_result`](SessionEnd::into_result):
     /// `Ok(())` for an intact stream — a peer that closed, or this end's
-    /// own [`shutdown`](RpcSession::shutdown), read the same — and
+    /// own [`close_session`](RpcSession::close_session), read the same — and
     /// `Err(`[`StatusCode::DeadObject`]`)` for a lost one, whatever the
     /// cause; the cause is in the value, not in the code.
     pub fn serve_blocking(&self) -> SessionEnd {
@@ -3969,7 +3975,7 @@ impl RpcSession {
         slot_id: u64,
         clear_deadline_after_first: bool,
     ) -> SessionEnd {
-        // Read the slot's role now: a `RpcSession::shutdown` racing this
+        // Read the slot's role now: a `RpcSession::close_session` racing this
         // loop clears the pool, and a role read after the loop would come
         // back `false` for a slot that is simply gone.
         let client_incoming = self.inner.is_client_incoming_slot(slot_id);
@@ -4024,7 +4030,7 @@ impl RpcSession {
         // the lifecycle transition + obituary so a concurrent
         // `RpcProxy::drop`'s best-effort `send_dec_strong` sees either
         // (i) the slot still present (`find_conn` picks it, send returns
-        // `PeerClosed`, best-effort path Err — no deadlock) or (ii) the
+        // `EndOfStream`, best-effort path Err — no deadlock) or (ii) the
         // lifecycle in Dying/Dead (the `send_dec_strong` early-out
         // short-circuits, skipping `find_conn` entirely). Removing the
         // slot *before* the lifecycle transition opened a window where a
@@ -4079,22 +4085,22 @@ impl RpcSession {
     /// The threads serving this client's incoming (callback) connections
     /// (`RpcUnixClientConfig::incoming_connections`) are stopped and
     /// joined here — every slot's transport is shut down, which ends
-    /// their serve loops — except a thread that calls `shutdown` from
+    /// their serve loops — except a thread that calls `close_session` from
     /// inside its own callback handler, which is left to finish on its
     /// own (joining it would deadlock). Unlike AOSP
     /// `RpcSession::shutdownAndWait`, a user-driven `serve_blocking` on
     /// the founding slot is not joined; it exits on its own once the
     /// transport is shut down.
-    pub fn shutdown(&self) {
+    pub fn close_session(&self) {
         self.inner.close();
         let me = std::thread::current().id();
         for (slot_id, handle) in self.inner.take_incoming_threads() {
             if handle.thread().id() == me {
-                // `shutdown` from inside this connection's own dispatch:
+                // `close_session` from inside this connection's own dispatch:
                 // the loop ends when the handler returns; dropping the
                 // handle detaches it.
                 log::debug!(
-                    "RPC: shutdown from incoming connection {slot_id}'s own thread; not joined"
+                    "RPC: close_session from incoming connection {slot_id}'s own thread; not joined"
                 );
                 continue;
             }
@@ -4350,7 +4356,7 @@ impl RpcSession {
             // No degradation: the partial session is torn down here —
             // including any incoming threads already serving — since the
             // caller never gets a handle to do it.
-            session.shutdown();
+            session.close_session();
             return Err(e);
         }
         Ok(session)
@@ -5513,7 +5519,7 @@ mod tests {
         let codec = Android13PlusCodec::android14_15();
         let session = RpcSession::from_android13plus(Box::new(t0), codec, FD_MODE_NONE, false)
             .expect("build session");
-        session.shutdown();
+        session.close_session();
 
         let (t, _p) = MemTransport::pair();
         assert!(

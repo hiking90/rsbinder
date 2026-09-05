@@ -377,7 +377,7 @@ impl RpcTransport for UnixTransport {
                 Err(e) => return Err(std::io::Error::from(e).into()),
             };
             if n == 0 {
-                return Err(RpcError::PeerClosed);
+                return Err(RpcError::EndOfStream);
             }
             sent += n;
         }
@@ -540,7 +540,7 @@ impl RpcTransport for UnixTransport {
                 Err(e) => return Err(std::io::Error::from(e).into()),
             };
             if n == 0 {
-                return Err(RpcError::PeerClosed);
+                return Err(RpcError::EndOfStream);
             }
             sent += n;
         }
@@ -633,7 +633,7 @@ impl RpcTransport for UnixTransport {
             }
             if r.bytes == 0 {
                 return Err(if leftover.is_empty() && fds.is_empty() {
-                    RpcError::PeerClosed
+                    RpcError::EndOfStream
                 } else {
                     RpcError::Truncated
                 });
@@ -691,8 +691,8 @@ mod tests {
     fn unix_peer_closed_on_drop() {
         let (a, b) = UnixTransport::pair().expect("socketpair");
         drop(b);
-        // First recv sees EOF -> clean PeerClosed.
-        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+        // First recv sees EOF -> clean EndOfStream.
+        assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
     }
 
     /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. Two frames
@@ -785,7 +785,7 @@ mod tests {
     fn unix_partial_header_then_close_is_truncated() {
         // The spec is deterministic — 2-of-4 header bytes consumed
         // *then* EOF MUST surface as `Truncated` (see `read_header` in
-        // transport/mod.rs: `filled == 0` ⇒ `PeerClosed`, `filled > 0`
+        // transport/mod.rs: `filled == 0` ⇒ `EndOfStream`, `filled > 0`
         // ⇒ `Truncated`). The kernel does not coalesce these into an
         // immediate EOF.
         let (a, b) = UnixTransport::pair().expect("socketpair");

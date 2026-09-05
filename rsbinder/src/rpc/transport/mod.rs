@@ -66,7 +66,7 @@ pub trait RpcTransport: Send + Sync {
     /// Receive exactly one logical frame.
     ///
     /// A clean peer close with nothing pending is
-    /// [`RpcError::PeerClosed`]; a header received but body short is
+    /// [`RpcError::EndOfStream`]; a header received but body short is
     /// [`RpcError::Truncated`]. Never panics or loops forever on a
     /// hostile peer.
     fn recv_frame(&self) -> RpcResult<Vec<u8>>;
@@ -116,12 +116,12 @@ pub trait RpcTransport: Send + Sync {
     /// either sees the reset on a later write; it reads the end of stream
     /// either way.)
     /// This is how a session ends its
-    /// connections — `RpcSession::shutdown`, `RpcServer::terminate`, a
+    /// connections — `RpcSession::close_session`, `RpcServer::terminate`, a
     /// slot retired after a lost stream. Required, with no default on
     /// purpose: a transport that silently did nothing here would leave a
     /// serve loop or an incoming-connection thread parked in `recv`
-    /// forever, and `RpcSession::shutdown` would hang on the join. The
-    /// same reasoning already made [`TlsStream::shutdown`] required.
+    /// forever, and `RpcSession::close_session` would hang on the join. The
+    /// same reasoning already made [`TlsStream::shutdown_stream`] required.
     ///
     /// The contract is narrower than the name suggests, and every caller
     /// in rsbinder is written to it (plan 2-21 §3.4):
@@ -137,7 +137,7 @@ pub trait RpcTransport: Send + Sync {
     ///   models the Linux behaviour, so a hermetic test exercises the case
     ///   that hides bugs.
     /// - **A reader woken by this returns the end of stream** —
-    ///   [`RpcError::PeerClosed`] at a frame boundary, [`RpcError::Truncated`]
+    ///   [`RpcError::EndOfStream`] at a frame boundary, [`RpcError::Truncated`]
     ///   mid-frame — never a distinct "shut down locally" error. Who ended
     ///   the connection is session knowledge (`SessionEnd::by`), not
     ///   transport knowledge; a TLS transport does not report its own
@@ -395,7 +395,7 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 }
 
 /// Read exactly `buf.len()` bytes for a *frame header*. Zero bytes
-/// before any progress is a clean [`RpcError::PeerClosed`]; a partial
+/// before any progress is a clean [`RpcError::EndOfStream`]; a partial
 /// header then EOF is [`RpcError::Truncated`]. A transport that can tell
 /// an unclean end apart ([`RpcError::UncleanEndOfStream`], TLS with no
 /// `close_notify`) reports it as itself before any progress and as
@@ -406,7 +406,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(if filled == 0 {
-                    RpcError::PeerClosed
+                    RpcError::EndOfStream
                 } else {
                     RpcError::Truncated
                 });
@@ -540,7 +540,7 @@ mod tests {
         // Empty input: clean peer-closed, no header at all.
         assert!(matches!(
             __fuzz_decode_frame(&[]),
-            Err(RpcError::PeerClosed)
+            Err(RpcError::EndOfStream)
         ));
 
         // Partial header (2 of 4 bytes): truncated, not a panic.

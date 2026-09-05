@@ -79,7 +79,7 @@ pub trait TlsStream: Send + Sync {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
     /// Shut the underlying stream down in both directions (wakes a
     /// blocked `read`).
-    fn shutdown(&self) -> std::io::Result<()>;
+    fn shutdown_stream(&self) -> std::io::Result<()>;
 }
 
 // All std stream types implement `Read`/`Write` for `&Stream`, so the
@@ -100,7 +100,7 @@ impl TlsStream for TcpStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         TcpStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -121,7 +121,7 @@ impl TlsStream for UnixStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         UnixStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         UnixStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -143,7 +143,7 @@ impl TlsStream for vsock::VsockStream {
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
         vsock::VsockStream::set_write_timeout(self, t)
     }
-    fn shutdown(&self) -> std::io::Result<()> {
+    fn shutdown_stream(&self) -> std::io::Result<()> {
         vsock::VsockStream::shutdown(self, std::net::Shutdown::Both)
     }
 }
@@ -312,7 +312,7 @@ impl TlsTransport {
         let mut off = 0;
         while off < cipher.len() {
             match self.stream.write(&cipher[off..]) {
-                Ok(0) => return Err(RpcError::PeerClosed),
+                Ok(0) => return Err(RpcError::EndOfStream),
                 Ok(n) => off += n,
                 // EINTR: a signal interrupted the write — retry (matches the
                 // plain-socket backends).
@@ -512,7 +512,7 @@ impl RpcTransport for TlsTransport {
                 let _ = self.write_socket_locked(&cipher);
             }
         }
-        super::absorb_already_shut(self.stream.shutdown())
+        super::absorb_already_shut(self.stream.shutdown_stream())
     }
 }
 
@@ -532,7 +532,7 @@ impl Read for RawIo<'_> {
             // otherwise it degrades to a generic `Other` and the frame path
             // loses the Timeout/Truncated contract.
             Err(RpcError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
-            Err(RpcError::PeerClosed) => Ok(0),
+            Err(RpcError::EndOfStream) => Ok(0),
             // Carried as the payload so `From<io::Error>` hands it back as
             // itself on the far side of `read_header`.
             Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),
@@ -547,7 +547,7 @@ impl Write for RawIo<'_> {
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         // Kind-preserving like `RawTransportIo`: a write to a peer that
-        // already closed must reach `write_frame`'s `?` as `PeerClosed`
+        // already closed must reach `write_frame`'s `?` as `EndOfStream`
         // (`DeadObject`), not an unclassified `Io(Other)`.
         self.0.send_raw(buf).map_err(std::io::Error::from)
     }

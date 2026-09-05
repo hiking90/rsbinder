@@ -350,7 +350,7 @@ struct ServeCleanup {
 }
 impl Drop for ServeCleanup {
     fn drop(&mut self) {
-        self.server.shutdown();
+        self.server.stop_accepting();
         if let Some(h) = self.bg.take() {
             let _ = h.join();
         }

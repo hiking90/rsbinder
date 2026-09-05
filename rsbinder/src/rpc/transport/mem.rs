@@ -41,11 +41,11 @@ pub struct MemTransport {
     /// Set by this end's [`shutdown`](RpcTransport::shutdown); shared with
     /// the peer as its `peer_closed`. Frames already queued are still
     /// delivered (the Linux model — see the module doc); once the queue is
-    /// empty `recv_frame` reports `PeerClosed`, and sends on either side
+    /// empty `recv_frame` reports `EndOfStream`, and sends on either side
     /// fail. A blocked `recv_frame` notices within one poll tick — a
     /// sender into our own `rx` would have been a cleaner wake-up, but it
     /// would also keep the channel alive past the peer's drop and hide
-    /// `PeerClosed`.
+    /// `EndOfStream`.
     closed: Arc<AtomicBool>,
     /// The peer's `closed`: its shutdown is our end of stream and our
     /// `EPIPE`, as a socket peer's `shutdown(Both)` would be.
@@ -115,11 +115,13 @@ impl RpcTransport for MemTransport {
         // rely on that to retire a slot whose handshake failed. Without it
         // the frame would queue on an unbounded channel nobody reads.
         if self.either_end_shut() {
-            return Err(RpcError::PeerClosed);
+            return Err(RpcError::EndOfStream);
         }
         // A channel send only fails once the peer's receiver is
         // dropped — i.e. the peer is gone. Lock-free (`Sender: Sync`).
-        self.tx.send(buf.to_vec()).map_err(|_| RpcError::PeerClosed)
+        self.tx
+            .send(buf.to_vec())
+            .map_err(|_| RpcError::EndOfStream)
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
@@ -150,11 +152,11 @@ impl RpcTransport for MemTransport {
                 // as a Linux socket delivers what it has queued.
                 Ok(frame) => return Ok(frame),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(RpcError::PeerClosed);
+                    return Err(RpcError::EndOfStream);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if self.either_end_shut() {
-                        return Err(RpcError::PeerClosed);
+                        return Err(RpcError::EndOfStream);
                     }
                 }
             }
@@ -212,16 +214,16 @@ mod tests {
             a.recv_frame().expect("queued frame survives"),
             b"b->a before"
         );
-        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
+        assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
         assert!(
-            matches!(a.send_frame(b"after"), Err(RpcError::PeerClosed)),
+            matches!(a.send_frame(b"after"), Err(RpcError::EndOfStream)),
             "a send after shutdown must fail, not queue"
         );
         // The peer: drains what we sent, then sees our shutdown as its
         // end of stream, and its sends fail (EPIPE on a socket).
         assert_eq!(b.recv_frame().expect("peer drains"), b"a->b before");
-        assert!(matches!(b.recv_frame(), Err(RpcError::PeerClosed)));
-        assert!(matches!(b.send_frame(b"x"), Err(RpcError::PeerClosed)));
+        assert!(matches!(b.recv_frame(), Err(RpcError::EndOfStream)));
+        assert!(matches!(b.send_frame(b"x"), Err(RpcError::EndOfStream)));
     }
 
     #[test]
@@ -241,8 +243,8 @@ mod tests {
     fn mem_peer_closed_on_drop() {
         let (a, b) = MemTransport::pair();
         drop(b);
-        assert!(matches!(a.recv_frame(), Err(RpcError::PeerClosed)));
-        assert!(matches!(a.send_frame(b"x"), Err(RpcError::PeerClosed)));
+        assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
+        assert!(matches!(a.send_frame(b"x"), Err(RpcError::EndOfStream)));
     }
 
     /// Bidirectional simultaneous traffic must not deadlock or
