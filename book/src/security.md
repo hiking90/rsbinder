@@ -99,6 +99,21 @@ fn authorize() -> rsbinder::status::Result<()> {
 `Caller` and `PeerIdentity` are `#[non_exhaustive]`, so the compiler forces
 a catch-all arm — which nudges you toward a fail-closed default.
 
+### Identity stops at a bridge
+
+A [gateway or Accessor](./cross-transport-services.md) re-publishes an
+upstream service on another transport, and the caller identity **does not
+travel with the call**. In `A → B → C`, C's handler sees `B` — B's uid, B's
+certificate, B's `sid`. C's `@EnforcePermission` checks therefore pass with
+B's credentials, and a uid allowlist in C authorizes B, not A.
+
+That makes B the trust boundary. If C is meant to be reachable only by
+certain callers, B has to enforce it, on B's own endpoint — via
+`ServeOptions::authorizer`, or a `calling_caller()` check in the forwarding
+method. A gateway that forwards unconditionally *widens* C's exposure to
+everyone who can reach B, which over TCP or vsock is everyone who can reach
+the port, since B cannot learn A's uid there at all.
+
 ## Four ways to authorize
 
 | When | Use |

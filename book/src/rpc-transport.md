@@ -625,6 +625,11 @@ process-local registry when the service manager returns nothing.
 Both sides of the Accessor pattern have been validated against real
 Android 16 `libbinder` on the emulator.
 
+The Accessor solves one direction — a **kernel** client reaching an RPC
+service. For the reverse, and for the rule that binder objects never cross
+between the two stacks, see
+[Cross-Transport Services § Bridging two transports in one process](./cross-transport-services.md).
+
 ## Async over RPC
 
 The blocking I/O the RPC stack uses is **deliberate** — it matches

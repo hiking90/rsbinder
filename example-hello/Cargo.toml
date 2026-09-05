@@ -40,6 +40,15 @@ required-features = ["rpc"]
 name = "unified_client"
 required-features = ["rpc"]
 
+# The gateway: front an `IHello` reached over one transport on another,
+# with `BnHello::new_binder(upstream_proxy)`. See
+# `book/src/cross-transport-services.md`.
+#   cargo run -p example-hello --features rpc --bin gateway_service \
+#       binder://my.hello unix:///tmp/rsb_gw.sock
+[[bin]]
+name = "gateway_service"
+required-features = ["rpc"]
+
 # Plan 2-16 handler-side authorization example: the service impl authorizes
 # each call via `rsbinder::calling_caller()` and denies with EX_SECURITY.
 # Uses `rsbinder::Caller` / `rpc::PeerIdentity`, so gated on the `rpc` feature.
