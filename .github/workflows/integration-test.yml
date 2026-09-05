@@ -255,6 +255,21 @@ jobs:
             exit 1
           }
 
+      - name: Run gateway_kernel (RPC client -> gateway -> kernel service)
+        run: |
+          # Plan 2-22 Phase E. A socket client reaching a kernel-binder
+          # service through a gateway process that re-publishes an
+          # upstream proxy (`BnFoo::new_binder(proxy)`). #[ignore]'d: it
+          # needs /dev/binder + a permissive rsb_hub, both up already. It
+          # spawns its own kernel service (a re-exec of the test binary),
+          # so it is independent of the shared test_service. Also pins
+          # that handing the kernel proxy over directly is refused.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test gateway_kernel -- --ignored || {
+            echo "::error::gateway_kernel (rpc -> gateway -> kernel) failed"
+            cp -f rsb_hub.log artifacts/gateway-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live
