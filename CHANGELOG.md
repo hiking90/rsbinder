@@ -40,6 +40,21 @@ short form — and the first entry is the only one no compiler will catch.
   is unclean. Plain-socket backends are unaffected — they have no close signal
   to miss. Code that treated every TLS end of stream as clean now sees the
   difference; code matching `RpcError` with a wildcard arm is unaffected.
+- **`RpcSession::serve_blocking`, `serve_blocking_on` and
+  `serve_blocking_clearing_deadline_after_first` return `rpc::SessionEnd`,
+  not `Result<()>`.** The value says how the loop ended on three axes —
+  `stream` (still intact?), `by` (did this end decide?), `reason` (what
+  happened) — and `SessionEnd::into_result()` is the one projection back:
+  `Ok(())` for an intact stream, `Err(StatusCode::DeadObject)` for a lost one.
+  Migration is `.into_result()` on the call. Two ends project differently
+  from before: a deadline that elapsed between frames (idle eviction) is an
+  intact stream and is now `Ok(())` where it was `Err(TimedOut)`; and every
+  lost stream is `DeadObject` — an unexpected `REPLY` (`BadType`) and a frame
+  that was cut (`NotEnoughData`) are told apart by `reason`, not by the code.
+  A local `RpcSession::shutdown` or `RpcServer::terminate` now ends every
+  serve loop of the session as `EndedBy::Local` with an intact stream; it
+  used to come back as `Ok(())` or `Err(DeadObject)` depending on whether the
+  worker was parked in `recv` or inside a handler at the time.
 - **Dropping a `ServerGuard` now ends the server, connected clients
   included.** It used to flip the accept flag and join the workers, which
   blocked for as long as any client stayed connected — a `?` or a panic that
@@ -726,6 +741,21 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (RPC) — a local shutdown ended a serve loop as `Ok(())` or
+  `Err(DeadObject)` by race.** `on_session_dead` shuts the transports down
+  and then clears the slot pool; a worker parked in `recv` woke with end of
+  stream (`Ok(())`), while one inside a handler found its slot gone on the
+  next pass (`Err(DeadObject)`). No contract could be written for that, and
+  four attempts at one were each wrong in a new way. The session now records
+  the local decision (`ended_locally`) before the transports go down, and
+  the serve loop reads it both at its exit — every end after the decision is
+  `EndedBy::Local` — and right after a read, so a frame that a kernel which
+  keeps its queue hands over after the shutdown ends the loop
+  (`EndReason::Interrupted`) instead of being dispatched on a dead session.
+  The frame-boundary guarantee (`PeerClosed`/`Timeout` only) that the reply
+  wait and the serve loop both classify by now has one owner,
+  `RpcError::leaves_frame_boundary_intact`; the two had already diverged on
+  `Truncated`.
 - **rsbinder (RPC, fd-mode) — `UnixTransport::shutdown` left a buffered frame
   for the next reader.** An fd-mode connection reads with `recvmsg` into its
   own buffer, and two frames that arrive together leave the second there.

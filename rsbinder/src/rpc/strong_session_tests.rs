@@ -154,7 +154,7 @@ fn proxy_outlives_session_handle() {
     );
     drop(root);
     // Last proxy gone ⇒ client transport closed ⇒ server serve loop ends.
-    jh.join().expect("serve thread").ok();
+    let _ = jh.join().expect("serve thread");
     drop(server);
 }
 
@@ -179,7 +179,7 @@ fn server_side_callback_cycle_reclaimed_on_client_disconnect() {
     drop(client);
     drop(cb);
 
-    jh.join().expect("serve thread").ok();
+    let _ = jh.join().expect("serve thread");
     assert!(
         wait_gone(&probe),
         "server session leaked through root → Holder → callback proxy"
@@ -220,7 +220,7 @@ fn explicit_shutdown_breaks_cycle_without_any_transaction() {
         wait_gone(&probe),
         "shutdown() must release the peer's local objects and break the cycle"
     );
-    jh.join().expect("serve thread").ok();
+    let _ = jh.join().expect("serve thread");
 }
 
 /// A.1b / test 2b: the **client** has no serve thread and stores the
@@ -251,7 +251,7 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     server_dup
         .shutdown(Shutdown::Both)
         .expect("kill server socket");
-    jh.join().expect("serve thread").ok();
+    let _ = jh.join().expect("serve thread");
     drop(server);
 
     drop(cb);

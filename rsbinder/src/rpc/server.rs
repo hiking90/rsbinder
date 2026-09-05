@@ -1493,9 +1493,7 @@ impl RpcServer {
                     session.set_serve_read_deadline(
                         *server.idle_timeout.lock().expect("idle_timeout poisoned"),
                     );
-                    if let Err(e) = session.serve_blocking() {
-                        log::debug!("RPC session ended: {e:?}");
-                    }
+                    session.serve_blocking().log("RPC session ended");
                 } else if let Some(inner) = server.resolve_session(&client_id) {
                     // Attach: add a slot on the founding inner so
                     // proxy-cache + slot-pool stay unified (no
@@ -1565,9 +1563,9 @@ impl RpcServer {
                     // so external observers never see a count for
                     // a slot that never reached the pool.
                     server.attached_count.fetch_add(1, Ordering::SeqCst);
-                    if let Err(e) = session.serve_blocking_on(slot_id) {
-                        log::debug!("RPC attached connection ended: {e:?}");
-                    }
+                    session
+                        .serve_blocking_on(slot_id)
+                        .log("RPC attached connection ended");
                 } else {
                     server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                     log::warn!(
@@ -1596,9 +1594,9 @@ impl RpcServer {
                 if server.minted_after_terminate(&session) {
                     return;
                 }
-                if let Err(e) = session.serve_blocking_clearing_deadline_after_first() {
-                    log::debug!("RPC session ended: {e:?}");
-                }
+                session
+                    .serve_blocking_clearing_deadline_after_first()
+                    .log("RPC session ended");
             }
         }
     }

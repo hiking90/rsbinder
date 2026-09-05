@@ -83,6 +83,7 @@
 //! macOS) no longer panics on an uninitialized `ProcessState`.
 
 pub mod address;
+pub mod end;
 pub mod fd_mode;
 pub(crate) mod lifecycle;
 pub mod proxy;
@@ -109,6 +110,7 @@ pub use wire::{__fuzz_decode_address, __fuzz_decode_wire, __fuzz_session_handsha
 pub(crate) mod wire_android13;
 
 pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
+pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
@@ -204,6 +206,20 @@ impl std::error::Error for RpcError {
             RpcError::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl RpcError {
+    /// Whether a read that failed with this error is documented to have
+    /// left the stream at a frame boundary: [`PeerClosed`](Self::PeerClosed)
+    /// ("no frame pending") and [`Timeout`](Self::Timeout) ("reported only
+    /// when nothing partial was consumed"). Every other read failure lacks
+    /// that guarantee — including ones that in fact consumed nothing — and
+    /// is treated as a lost position. The single owner of the distinction:
+    /// the framing readers (promoting a mid-frame case to `Truncated`),
+    /// the reply wait and the serve loop all ask here.
+    pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
+        matches!(self, RpcError::PeerClosed | RpcError::Timeout)
     }
 }
 

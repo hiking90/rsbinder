@@ -3621,6 +3621,61 @@ fn c_server_death_is_eager_with_incoming() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Plan 2-21 C-0 — a local `shutdown` ends the serve loop the same way
+/// wherever its worker is: parked in `recv`, or inside a handler whose
+/// reply then has nowhere to go. Both report `EndedBy::Local` with an
+/// intact stream, so `into_result` is `Ok(())`. It used to be `Ok(())`
+/// or `Err(DeadObject)` depending on which of the two the worker
+/// happened to be doing — a contract no rustdoc could state.
+#[test]
+fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
+    use rsbinder::rpc::transport::UnixTransport;
+    use rsbinder::rpc::{AddressSpace, EndedBy};
+
+    for dispatching in [false, true] {
+        let (srv_t, cli_t) = UnixTransport::pair().expect("socketpair");
+        let server = Arc::new(
+            RpcSession::new(Box::new(srv_t), AddressSpace::Acceptor).expect("server session"),
+        );
+        let slow_entered = Arc::new(AtomicBool::new(false));
+        server.set_root(make_service_with_slow_signal(
+            Arc::new(AtomicI64::new(0)),
+            slow_entered.clone(),
+        ));
+        let serving = Arc::clone(&server);
+        let serve = std::thread::spawn(move || serving.serve_blocking());
+        let client =
+            RpcSession::new(Box::new(cli_t), AddressSpace::Initiator).expect("client session");
+        let root = EchoProxy(client.get_root().expect("root"));
+        assert_eq!(root.echo("warm").unwrap(), "warm");
+
+        let caller = dispatching.then(|| {
+            let root = EchoProxy(root.0.clone());
+            std::thread::spawn(move || {
+                let mut d = root.rp().build_request(DESC).expect("request");
+                d.write(&300i32).expect("arg");
+                // Ends in an error once the session is shut down under it.
+                let _ = root.rp().transact(TX_SLOW, &d, 0);
+            })
+        });
+        if dispatching {
+            assert!(
+                poll_until(|| slow_entered.load(Ordering::SeqCst)),
+                "the handler must be running when the session is shut down"
+            );
+        }
+        server.shutdown();
+        let end = serve.join().expect("serve thread");
+        assert_eq!(end.by, EndedBy::Local, "dispatching={dispatching}: {end}");
+        assert!(end.is_clean(), "dispatching={dispatching}: {end}");
+        assert_eq!(end.into_result(), Ok(()), "dispatching={dispatching}");
+        if let Some(c) = caller {
+            c.join().expect("caller thread");
+        }
+        client.shutdown();
+    }
+}
+
 /// Plan 2-21 B-4 — an `AF_INET` fd handed to `from_preconnected_fd` is
 /// wrapped in `TcpDebugTransport` and goes straight into the android-13+
 /// handshake, whose first byte is a raw write. Without that transport's

@@ -778,9 +778,10 @@ fn map_io(e: std::io::Error) -> RpcError {
 /// either one leaves the stream desynchronized ⇒
 /// [`RpcError::Truncated`].
 fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
-    match e {
-        RpcError::PeerClosed | RpcError::Timeout if progress > 0 => RpcError::Truncated,
-        other => other,
+    if progress > 0 && e.leaves_frame_boundary_intact() {
+        RpcError::Truncated
+    } else {
+        e
     }
 }
 
