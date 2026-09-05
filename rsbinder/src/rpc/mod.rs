@@ -170,13 +170,14 @@ pub enum RpcError {
     /// because on the one backend built for untrusted networks this is
     /// exactly what a truncation attack looks like; a plain socket has no
     /// close signal to miss and never reports it. The transport's own
-    /// [`shutdown`](transport::RpcTransport::shutdown) sends the signal
-    /// before it cuts the socket, waiting briefly for a send another
-    /// thread has in flight (only the thread holding the write side may
-    /// transmit), so a deliberate close on this end is `EndOfStream` on
-    /// the other. That wait is bounded so teardown stays finite: a peer
-    /// that has stopped reading holds its sender past it, and reads the
-    /// unclean end it was heading for anyway. Projects to
+    /// [`shutdown`](transport::RpcTransport::shutdown) refuses every send
+    /// from that point, lets the one already in flight finish, and only
+    /// then sends the signal and cuts the socket — so a deliberate close
+    /// on this end is `EndOfStream` on the other, and every frame a sender
+    /// was told went out is one the peer reads before it. The wait for
+    /// that send is bounded so teardown stays finite: a peer that has
+    /// stopped reading holds its sender past it, and reads the unclean end
+    /// it was heading for anyway. Projects to
     /// [`StatusCode::DeadObject`](crate::StatusCode).
     UncleanEndOfStream,
     /// A frame was cut short: the length header itself arrived incomplete,

@@ -59,10 +59,13 @@ short form — and the first entry is the only one no compiler will catch.
   `Err(DeadObject)` where it used to return `Ok(())`. `TlsTransport::shutdown`
   now sends `close_notify` before the socket shutdown, so a deliberate close
   on one end is the clean `EndOfStream` on the other; only a cut stream is
-  unclean. A shutdown racing another thread's in-flight send on the same
-  connection waits briefly for it — only the sending thread may transmit —
-  and that wait is bounded, so a peer that has stopped reading still cannot
-  hold teardown and still reads the unclean end it was heading for.
+  unclean. From the moment `shutdown` is called, this end's own sends fail
+  at once with `EndOfStream` — the contract every other backend already
+  met by cutting the socket — and the one send already in flight is
+  allowed to finish before the alert goes out, so every frame a sender was
+  told went out is one the peer reads. That wait is bounded, so a peer
+  that has stopped reading cannot hold teardown; it reads the unclean end
+  it was heading for.
   Plain-socket backends are unaffected — they have no close signal
   to miss. Code that treated every TLS end of stream as clean now sees the
   difference; code matching `RpcError` with a wildcard arm is unaffected.
@@ -903,10 +906,12 @@ short form — and the first entry is the only one no compiler will catch.
   (`StatusCode::DeadObject`, with a `warn!`), carried through the `Read`
   adapters as the `io::Error` payload so the framing readers hand it back
   unchanged; and `TlsTransport::shutdown` sends `close_notify` first, so
-  rsbinder's own deliberate close is the clean end on the peer. A send
-  another thread has in flight holds the write lock, and only its holder
-  may transmit, so the shutdown waits for it — bounded, so a peer that has
-  stopped reading cannot hold teardown. No
+  rsbinder's own deliberate close is the clean end on the peer. Only the
+  thread holding the write lock may transmit, so `shutdown` refuses every
+  new send, waits for the one in flight, and only then queues and sends the
+  alert — a frame can no longer be encrypted behind it, where the peer would
+  discard it after the sender was told it went out. The wait is bounded, so
+  a peer that has stopped reading cannot hold teardown. No
   transaction was ever misdelivered by this — a truncated reply already failed
   the caller's wait; what was lost was the signal.
 - **rsbinder (RPC) — a refused attach was reported to the client as success.**

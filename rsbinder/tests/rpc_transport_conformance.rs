@@ -11,11 +11,11 @@
 //! refactor that quietly relies on a queued frame vanishing (or
 //! surviving) fails here, on whichever platform it would have been wrong.
 //!
-//! | backend | queued frame, then local shutdown | blocked reader | peer after our shutdown | 2nd shutdown |
-//! |---|---|---|---|---|
-//! | unix, unix fd-mode, tls (over unix) | **macOS:** end of stream (queue dropped) · **Linux:** the frame, then end of stream | end of stream | reads end of stream; its first send **fails at once on Linux (`EPIPE`), is accepted on macOS** | `Ok` |
-//! | tcp_debug | as above | end of stream | reads end of stream; its first send is **accepted on both** — TCP reports the reset on a later write | `Ok` |
-//! | mem | the frame, then end of stream (models Linux unix) | end of stream (≤ one 20 ms tick) | reads end of stream; its sends fail at once | `Ok` |
+//! | backend | queued frame, then local shutdown | blocked reader | peer after our shutdown | our send after our shutdown | 2nd shutdown |
+//! |---|---|---|---|---|---|
+//! | unix, unix fd-mode, tls (over unix) | **macOS:** end of stream (queue dropped) · **Linux:** the frame, then end of stream | end of stream | reads end of stream; its first send **fails at once on Linux (`EPIPE`), is accepted on macOS** | fails at once, `EndOfStream` (tls: refused before the lock) | `Ok` |
+//! | tcp_debug | as above | end of stream | reads end of stream; its first send is **accepted on both** — TCP reports the reset on a later write | fails at once, `EndOfStream` | `Ok` |
+//! | mem | the frame, then end of stream (models Linux unix) | end of stream (≤ one 20 ms tick) | reads end of stream; its sends fail at once | fails at once, `EndOfStream` | `Ok` |
 //!
 //! `vsock` is not here: it needs a VM peer (its own tests are `#[ignore]`),
 //! and its behaviour is inferred from `vsock(7)`, not measured.
@@ -181,6 +181,26 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     reader.join().expect("reader thread");
 }
 
+/// Scenario E: this end's own first send after its own shutdown fails —
+/// as the end of stream, on every backend and platform.
+///
+/// The trait says a shutdown makes this end's later sends fail; the
+/// session's send rule reads every failure but `Timeout` as "retire the
+/// slot", and `Ok` as "the frame went out". A backend that let a send
+/// through after its own shutdown would report `Ok` for a frame the peer
+/// never reads — a socket cut in both directions refuses at once with
+/// `EPIPE`, `mem` by design, and `tls` gates the send itself: its cut is
+/// deferred behind the close signal, and a frame accepted in between would
+/// be one the peer discards after reading the alert (RFC 8446 §6.1).
+fn our_send_after_our_shutdown_fails(name: &str, local: &Shared) {
+    shutdown_within(name, local);
+    let sent = local.send_frame(b"after");
+    assert!(
+        matches!(sent, Err(RpcError::EndOfStream)),
+        "{name}: our own send after our own shutdown fails as the end of stream, got {sent:?}"
+    );
+}
+
 /// The suite's own read deadline, armed on both ends of every pair. The
 /// reads here expect an end of stream that a regressed `shutdown` would
 /// never produce — the peer is still alive — and libtest has no per-test
@@ -244,6 +264,12 @@ fn unix_fd_mode_blocked_reader_is_woken() {
 }
 
 #[test]
+fn unix_our_send_after_our_shutdown_fails() {
+    let (local, _peer) = unix_pair();
+    our_send_after_our_shutdown_fails("unix", &local);
+}
+
+#[test]
 fn mem_queued_frame_then_shutdown() {
     let (local, peer) = mem_pair();
     queued_then_shutdown(
@@ -260,6 +286,12 @@ fn mem_queued_frame_then_shutdown() {
 fn mem_blocked_reader_is_woken() {
     let (local, _peer) = mem_pair();
     blocked_reader_is_woken("mem", &local, false);
+}
+
+#[test]
+fn mem_our_send_after_our_shutdown_fails() {
+    let (local, _peer) = mem_pair();
+    our_send_after_our_shutdown_fails("mem", &local);
 }
 
 #[cfg(feature = "rpc-tcp-debug")]
@@ -291,6 +323,12 @@ mod tcp {
     fn tcp_debug_blocked_reader_is_woken() {
         let (local, _peer) = tcp_pair();
         blocked_reader_is_woken("tcp_debug", &local, false);
+    }
+
+    #[test]
+    fn tcp_debug_our_send_after_our_shutdown_fails() {
+        let (local, _peer) = tcp_pair();
+        our_send_after_our_shutdown_fails("tcp_debug", &local);
     }
 }
 
@@ -362,5 +400,11 @@ mod tls {
     fn tls_blocked_reader_is_woken() {
         let (local, _peer) = tls_pair();
         blocked_reader_is_woken("tls", &local, false);
+    }
+
+    #[test]
+    fn tls_our_send_after_our_shutdown_fails() {
+        let (local, _peer) = tls_pair();
+        our_send_after_our_shutdown_fails("tls", &local);
     }
 }

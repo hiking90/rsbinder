@@ -64,19 +64,86 @@ const TLS_READ_CHUNK: usize = 16 * 1024;
 /// transport queued behind it in `shutdown_all_transports` — forever.
 const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How long [`TlsTransport::shutdown`] may wait for the write lock before
-/// transmitting `close_notify`. A send in flight holds `wlock`, and only
-/// the thread holding it may put records on the wire, so a shutdown that
-/// took the lock-free path would cut the socket with the alert still
-/// queued and hand the peer an unclean end.
+/// How long [`TlsTransport::shutdown`] waits for the send in flight before
+/// giving up on `close_notify` and cutting the socket anyway.
 ///
-/// Short on purpose. What this covers is a send about to release the lock
-/// — microseconds — not a peer that has stopped reading: that peer holds
-/// the sender for as long as its window stays shut, and is getting the
-/// unclean end either way. The wait is therefore what teardown latency
-/// this adds per stalled connection, and `shutdown_all_transports` walks
-/// its slots one at a time, so it is additive.
+/// Only the thread holding `wlock` may put records on the wire, and
+/// `shutdown` refuses every send that starts after it, so there is at
+/// most one such send and it ends in one of two ways. It completes — the
+/// lock's release wakes `shutdown` at once, and this bound is never felt.
+/// Or it is parked in a socket write to a peer that has stopped reading —
+/// then nothing short of the cut unparks it, the alert could not reach
+/// that peer regardless, and this is how long teardown spends finding
+/// that out. `shutdown_all_transports` walks slots one at a time, so it is
+/// paid once per stalled connection.
 const CLOSE_NOTIFY_WLOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// The write-path lock. A mutex with a bounded acquire, which `std`'s
+/// lacks: [`TlsTransport::shutdown`] must wait for the send in flight, but
+/// not for a sender parked on a peer that has stopped reading.
+///
+/// Every release signals `freed`, so a waiter wakes the moment the send
+/// ends rather than on a poll tick.
+struct WriteLock {
+    busy: Mutex<bool>,
+    freed: std::sync::Condvar,
+}
+
+/// Holding this is holding `wlock`; dropping it releases and signals.
+struct WriteGuard<'a>(&'a WriteLock);
+
+impl WriteLock {
+    fn new() -> Self {
+        Self {
+            busy: Mutex::new(false),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> WriteGuard<'_> {
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        while *busy {
+            busy = self.freed.wait(busy).expect("tls wlock poisoned");
+        }
+        *busy = true;
+        WriteGuard(self)
+    }
+
+    fn try_lock(&self) -> Option<WriteGuard<'_>> {
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(WriteGuard(self))
+    }
+
+    /// `None` once `wait` has passed with the lock still held.
+    fn lock_timeout(&self, wait: Duration) -> Option<WriteGuard<'_>> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut busy = self.busy.lock().expect("tls wlock poisoned");
+        while *busy {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _) = self
+                .freed
+                .wait_timeout(busy, deadline - now)
+                .expect("tls wlock poisoned");
+            busy = guard;
+        }
+        *busy = true;
+        Some(WriteGuard(self))
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().expect("tls wlock poisoned") = false;
+        self.0.freed.notify_all();
+    }
+}
 
 /// A connected, byte-oriented stream that TLS can run over.
 ///
@@ -195,8 +262,10 @@ pub struct TlsTransport {
     /// every writer (data send and control flush) so the on-wire TLS
     /// record order always equals rustls's sequence-number order. The
     /// reader takes it with `try_lock` for an opportunistic control
-    /// flush and never blocks on it (see `flush_control`).
-    wlock: Mutex<()>,
+    /// flush and never blocks on it (see `flush_control`); `shutdown`
+    /// takes it with a bound, after the send in flight (see
+    /// `CLOSE_NOTIFY_WLOCK_WAIT`).
+    wlock: WriteLock,
     /// The byte stream; reads are lock-free, writes go under `wlock`.
     stream: Box<dyn TlsStream>,
     peer: PeerIdentity,
@@ -259,7 +328,7 @@ impl TlsTransport {
         let peer = PeerIdentity::Certificate(cert_identity(conn.peer_certificates(), server_name)?);
         Ok(TlsTransport {
             conn: Mutex::new(conn),
-            wlock: Mutex::new(()),
+            wlock: WriteLock::new(),
             stream,
             peer,
             desc: format!("tls:{server_name}"),
@@ -291,7 +360,7 @@ impl TlsTransport {
         };
         Ok(TlsTransport {
             conn: Mutex::new(conn),
-            wlock: Mutex::new(()),
+            wlock: WriteLock::new(),
             stream,
             peer,
             desc: "tls:server".to_string(),
@@ -354,7 +423,7 @@ impl TlsTransport {
     /// socket write — preserving the lock-free-duplex liveness, while
     /// still ordering every write_tls → transmit under `wlock`.
     fn flush_control(&self) -> RpcResult<()> {
-        let Ok(_g) = self.wlock.try_lock() else {
+        let Some(_g) = self.wlock.try_lock() else {
             return Ok(());
         };
         let cipher = {
@@ -367,35 +436,6 @@ impl TlsTransport {
             v
         };
         self.write_socket_locked(&cipher)
-    }
-
-    /// Take `wlock` for [`shutdown`](RpcTransport::shutdown), waiting up to
-    /// [`CLOSE_NOTIFY_WLOCK_WAIT`]. `None` ⇒ a sender still holds it and the
-    /// caller must cut the socket without transmitting.
-    ///
-    /// Spins first, then sleeps: the case worth catching is a send one
-    /// instruction from releasing the lock, and yielding catches that
-    /// without a millisecond of latency. A poisoned lock returns `None`
-    /// at once rather than waiting out a deadline nothing can meet.
-    fn wlock_for_close(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        let deadline = std::time::Instant::now() + CLOSE_NOTIFY_WLOCK_WAIT;
-        let mut spins = 0u32;
-        loop {
-            match self.wlock.try_lock() {
-                Ok(g) => return Some(g),
-                Err(std::sync::TryLockError::Poisoned(_)) => return None,
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            if spins < 64 {
-                spins += 1;
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
     }
 
     /// Pull one chunk of ciphertext off the socket (lock-free) and feed
@@ -455,13 +495,25 @@ impl RpcTransport for TlsTransport {
     }
 
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        // After our own `shutdown` a send fails here, before touching
+        // rustls or the lock. It is what the trait promises ("later sends
+        // fail"), and it is what makes `shutdown`'s wait a handoff: with
+        // new senders refused, the one already holding `wlock` is the only
+        // one there is, and its release is the only event to wait for.
+        // Without this a busy sender re-takes the lock the moment it lets
+        // go and can starve `shutdown` past its bound — and every frame it
+        // sent meanwhile, queued behind an alert the peer discards it
+        // after (RFC 8446 §6.1), was reported `Ok`.
+        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::EndOfStream);
+        }
         // `wlock` spans BOTH the rustls encrypt-drain and the socket
         // transmit so the on-wire record order equals the sequence-number
         // order even under a concurrent recv-side control flush (the
         // `conn` lock is released before the blocking transmit, so the
         // reader's `pump_incoming` can still drain — no flow-control
         // deadlock).
-        let _g = self.wlock.lock().expect("tls wlock poisoned");
+        let _g = self.wlock.lock();
         // rustls bounds its plaintext sendable buffer (`DEFAULT_BUFFER_LIMIT`,
         // ~64 KiB); feeding a larger frame in a single `write_all` fails with
         // `WriteZero`. Chunk the plaintext and interleave encrypt
@@ -571,39 +623,42 @@ impl RpcTransport for TlsTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // close_notify first, so a deliberate close on this end is the clean
-        // end on the peer rather than the cut `recv_raw` reports.
+        // Refuse every send from here on (`send_raw` checks this first). At
+        // most one send is then still running — the one already holding
+        // `wlock` — and it is the only thing the wait below is for.
         self.shut.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Bound that write: `write_socket_locked` blocks until the whole
+        // Bound the socket writes from here: that send's remaining chunks
+        // and our own alert. `write_socket_locked` blocks until the whole
         // buffer is on the wire, and this is a teardown path whose caller
         // (`shutdown_all_transports`, then `terminate`'s join) has no other
         // way out. A peer that stalled sees a partial record — an unclean
         // end, which is what a stalled peer is getting anyway.
         let _ = self.stream.set_write_timeout(Some(CLOSE_NOTIFY_TIMEOUT));
-        // Queue it whatever `wlock` says — that lock guards the socket, not
-        // the crypto state, and a concurrent sender's next `write_tls`
-        // drains the shared output buffer in sequence order, so a sender
-        // that still has records to write carries this one out for us.
-        {
-            let mut c = self.conn.lock().expect("tls conn poisoned");
-            c.send_close_notify(); // idempotent in rustls
-        }
-        // Transmitting is this call's own job for every send that is not
-        // still running: only the `wlock` holder may put records on the
-        // wire, so cutting the socket while a sender holds it would strand
-        // the queued alert and leave the peer an unclean end. Wait for the
-        // lock, but briefly — see `CLOSE_NOTIFY_WLOCK_WAIT`.
-        if let Some(_g) = self.wlock_for_close() {
+        // Only the `wlock` holder may put records on the wire, so take it —
+        // after the send in flight, if there is one — and only then queue
+        // and transmit `close_notify`: the alert follows a complete frame
+        // rather than cutting into one, and the peer reads that frame,
+        // then a clean end. Keep holding it across the socket cut: released
+        // before, a sender could slip a frame in between, be told `Ok`, and
+        // the peer would discard it (RFC 8446 §6.1).
+        let held = self.wlock.lock_timeout(CLOSE_NOTIFY_WLOCK_WAIT);
+        if held.is_some() {
             let mut cipher = Vec::new();
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
+                c.send_close_notify(); // idempotent in rustls
                 let _ = c.write_tls(&mut cipher);
             }
             if !cipher.is_empty() {
                 let _ = self.write_socket_locked(&cipher);
             }
         }
-        super::absorb_already_shut(self.stream.shutdown_stream())
+        // `None`: the sender is parked in a socket write to a peer that has
+        // stopped reading. No alert could reach that peer; the cut is what
+        // unparks the sender (`EPIPE`), and it reports its frame as failed.
+        let cut = super::absorb_already_shut(self.stream.shutdown_stream());
+        drop(held);
+        cut
     }
 }
 

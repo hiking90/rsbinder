@@ -293,22 +293,27 @@ fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     server.join().unwrap();
 }
 
-/// A `shutdown()` racing this end's own in-flight send still leaves the
-/// peer a clean end — `UncleanEndOfStream` stays reserved for a stream
-/// somebody cut.
+/// A `shutdown()` racing this end's own in-flight send: the peer reads
+/// every frame that send was told went out, then a clean end.
 ///
-/// Only the thread holding `wlock` may put records on the wire, so a
-/// `shutdown` that queued `close_notify` while a send held the lock has
-/// to wait for it; cutting the socket there would strand the alert and
-/// hand the peer a boundary end with no close signal —
-/// `UncleanEndOfStream`, which projects to `DeadObject`, where a
-/// deliberate close owes `EndOfStream`. Waiting is bounded, so a peer
-/// that has stopped reading still cannot hold teardown.
+/// Two promises, both of which a shutdown that simply cut the socket
+/// broke. The peer's: `UncleanEndOfStream` is reserved for a stream
+/// somebody cut, so a deliberate close owes it `close_notify` — and only
+/// the thread holding `wlock` may put that on the wire, so `shutdown` has
+/// to wait for the send in flight rather than strand the alert. The
+/// sender's: `Ok` means the frame went out. A send that started after
+/// `shutdown` is refused, and the alert is queued only once the lock is
+/// held, so no frame can be encrypted behind it — where the peer, having
+/// read the alert, would discard it (RFC 8446 §6.1) after the sender was
+/// told `Ok`. The wait is bounded, so a peer that has stopped reading
+/// still cannot hold teardown.
 ///
 /// The window is a few instructions wide, so this races it repeatedly
-/// rather than pinning one interleaving. A cut *mid-frame* is a different
-/// (correct) outcome and reads as `Truncated`, so the assertion names the
-/// one error that must never appear rather than the one that must.
+/// rather than pinning one interleaving, and counts on both ends: every
+/// `Ok` the sender saw is a frame the peer received, and the end the peer
+/// reads is never an unclean one. A cut *mid-frame* would read as
+/// `Truncated`, and the frame it cut was reported failed, so the counts
+/// still agree — the assertion tolerates it without naming it.
 #[test]
 fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
     for round in 0..48u64 {
@@ -322,8 +327,13 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
             t_tx.send(Arc::clone(&t)).expect("hand the transport over");
             // Small frames so a send never parks in the socket write and
             // the boundary between two of them comes round often — that
-            // boundary is what the shutdown has to hit.
-            while t.send_frame(b"tick").is_ok() {}
+            // boundary is what the shutdown has to hit. Count what this
+            // end was told went out.
+            let mut sent_ok = 0usize;
+            while t.send_frame(b"tick").is_ok() {
+                sent_ok += 1;
+            }
+            sent_ok
         });
         let client =
             TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
@@ -335,9 +345,13 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
             thread::sleep(std::time::Duration::from_micros(round * 40));
             server_t.shutdown().expect("shutdown");
         });
+        let mut received = 0usize;
         let end = loop {
             match client.recv_frame() {
-                Ok(f) => assert_eq!(f, b"tick", "frames must arrive intact until the end"),
+                Ok(f) => {
+                    assert_eq!(f, b"tick", "frames must arrive intact until the end");
+                    received += 1;
+                }
                 Err(e) => break e,
             }
         };
@@ -346,7 +360,11 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
             "round {round}: a shutdown racing a send left the peer an unclean end"
         );
         closer.join().unwrap();
-        sender.join().unwrap();
+        let sent_ok = sender.join().unwrap();
+        assert_eq!(
+            received, sent_ok,
+            "round {round}: the sender was told {sent_ok} frames went out, the peer read {received}"
+        );
     }
 }
 
