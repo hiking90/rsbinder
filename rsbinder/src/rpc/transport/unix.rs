@@ -288,7 +288,7 @@ impl RpcTransport for UnixTransport {
     /// `&self` stays full-duplex (same as `send_frame`).
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         let mut w = &self.stream;
-        w.write_all(buf).map_err(RpcError::from)?;
+        super::write_all_reporting(&mut w, buf)?;
         w.flush().map_err(RpcError::from)?;
         Ok(())
     }
@@ -374,7 +374,17 @@ impl RpcTransport for UnixTransport {
                 Ok(n) => n,
                 // EINTR is benign — retry the syscall.
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(std::io::Error::from(e).into()),
+                // Same split `write_all_reporting` makes: a send deadline
+                // that expired before the first byte started no frame, so
+                // the stream is still frame-synchronized.
+                Err(e) => {
+                    let e = std::io::Error::from(e);
+                    return Err(if sent == 0 && super::is_timeout(&e) {
+                        RpcError::Timeout
+                    } else {
+                        e.into()
+                    });
+                }
             };
             if n == 0 {
                 return Err(RpcError::EndOfStream);
@@ -475,8 +485,9 @@ impl RpcTransport for UnixTransport {
         // for the whole call and releases it only once it wakes, so taking
         // the lock first deadlocks against it. What it appends on waking was
         // queued in the kernel before this call (the platform's business);
-        // what is left in this buffer after it returns is ours, and a later
-        // reader must not be handed a frame of the connection just ended.
+        // what is left in this buffer after it returns is ours — the prefix
+        // of a frame some error cut short — and a later reader must not
+        // decode the connection just ended out of it.
         let shut = self.stream.shutdown(std::net::Shutdown::Both);
         if let Ok(mut leftover) = self.fd_recv_buf.lock() {
             leftover.clear();
@@ -561,6 +572,10 @@ impl RpcTransport for UnixTransport {
 
         let mut leftover = self.fd_recv_buf.lock().expect("fd recv buf poisoned");
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+        // Reused across iterations — a frame costs at least two `recvmsg`s
+        // (header, then body), and `RecvAncillaryBuffer::new` resets it.
+        let mut space =
+            vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         loop {
             if leftover.len() >= 4 {
                 let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
@@ -577,8 +592,22 @@ impl RpcTransport for UnixTransport {
                 }
             }
             let mut tmp = [0u8; 8192];
-            let mut space =
-                vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
+            // Never read past this frame's last byte. `AF_UNIX` glues
+            // stream data across skbs and only stops *after* consuming the
+            // one that carried fds, so a `recvmsg` spilling into the next
+            // frame would hand that frame's `SCM_RIGHTS` fds back attached
+            // to this one — and leave the next frame with none. The
+            // android-13+ reader (`read_aosp_message_with_fds`) is exact
+            // for the same reason.
+            let want = if leftover.len() < 4 {
+                4 - leftover.len()
+            } else {
+                // Bounded by `MAX_FRAME_LEN` above, and short of `4 + len`
+                // (a complete frame returned already).
+                let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
+                4 + len - leftover.len()
+            };
+            let want = want.min(tmp.len());
             let mut anc = RecvAncillaryBuffer::new(&mut space);
             // `RecvFlags::CMSG_CLOEXEC` (`MSG_CMSG_CLOEXEC`) is
             // Linux-only; for portability set `FD_CLOEXEC` explicitly
@@ -586,7 +615,7 @@ impl RpcTransport for UnixTransport {
             let r = loop {
                 match rustix::net::recvmsg(
                     &self.stream,
-                    &mut [IoSliceMut::new(&mut tmp)],
+                    &mut [IoSliceMut::new(&mut tmp[..want])],
                     &mut anc,
                     RecvFlags::empty(),
                 ) {
@@ -605,7 +634,15 @@ impl RpcTransport for UnixTransport {
                                 RpcError::DeadlineMidFrame
                             });
                         }
-                        return Err(io_err.into());
+                        // Likewise for a disconnect: past the first byte or
+                        // fd of a message the position is lost, so the kinds
+                        // folded into `EndOfStream` are a cut, not a boundary.
+                        return Err(match RpcError::from(io_err) {
+                            RpcError::EndOfStream if !leftover.is_empty() || !fds.is_empty() => {
+                                RpcError::Truncated
+                            }
+                            other => other,
+                        });
                     }
                 }
             };
@@ -695,26 +732,36 @@ mod tests {
         assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
     }
 
-    /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. Two frames
-    /// arrive in one `recvmsg`; the first is returned and the second stays
-    /// buffered. A reader woken by `shutdown` must not be handed that
-    /// second frame — it belongs to a connection that has ended. What the
-    /// *kernel* still holds is the platform's business (macOS drops its
-    /// queue, Linux keeps it); this buffer is ours to clear.
+    /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. The reader
+    /// never reads past the frame in progress, so what this buffer can
+    /// hold is the prefix an error left behind; a deadline part-way
+    /// through a frame is the cheapest way to put one there. That prefix
+    /// belongs to a connection that has ended and must not be the head of
+    /// what a later reader decodes. What the *kernel* still holds is the
+    /// platform's business and is pinned by `rpc_transport_conformance`,
+    /// not here.
     #[test]
     fn unix_shutdown_drops_the_fd_mode_leftover() {
+        use std::io::Write;
         let (a, b) = UnixTransport::pair().expect("socketpair");
-        // Both frames sit in b's socket buffer before b reads once.
-        a.send_frame(b"first").unwrap();
-        a.send_frame(b"second").unwrap();
-        let (first, fds) = b.recv_frame_with_fds().expect("first frame");
-        assert_eq!(first, b"first");
-        assert!(fds.is_empty());
-        b.shutdown().expect("shutdown");
-        let second = b.recv_frame_with_fds();
+        b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("deadline");
+        // A header promising 8 bytes, then only 3 of them.
+        let mut partial = 8u32.to_le_bytes().to_vec();
+        partial.extend_from_slice(&[1, 2, 3]);
+        (&a.stream).write_all(&partial).expect("partial frame");
+        assert!(matches!(
+            b.recv_frame_with_fds(),
+            Err(RpcError::DeadlineMidFrame)
+        ));
         assert!(
-            !matches!(&second, Ok((f, _)) if f == b"second"),
-            "a frame of the ended connection was handed out after shutdown: {second:?}"
+            !b.fd_recv_buf.lock().unwrap().is_empty(),
+            "the prefix of the cut frame is buffered"
+        );
+        b.shutdown().expect("shutdown");
+        assert!(
+            b.fd_recv_buf.lock().unwrap().is_empty(),
+            "shutdown must drop what this end had buffered"
         );
         b.shutdown().expect("a second shutdown is Ok (idempotent)");
     }

@@ -293,6 +293,63 @@ fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     server.join().unwrap();
 }
 
+/// A `shutdown()` racing this end's own in-flight send still leaves the
+/// peer a clean end — `UncleanEndOfStream` stays reserved for a stream
+/// somebody cut.
+///
+/// Only the thread holding `wlock` may put records on the wire, so a
+/// `shutdown` that queued `close_notify` while a send held the lock has
+/// to wait for it; cutting the socket there would strand the alert and
+/// hand the peer a boundary end with no close signal —
+/// `UncleanEndOfStream`, which projects to `DeadObject`, where a
+/// deliberate close owes `EndOfStream`. Waiting is bounded, so a peer
+/// that has stopped reading still cannot hold teardown.
+///
+/// The window is a few instructions wide, so this races it repeatedly
+/// rather than pinning one interleaving. A cut *mid-frame* is a different
+/// (correct) outcome and reads as `Truncated`, so the assertion names the
+/// one error that must never appear rather than the one that must.
+#[test]
+fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
+    for round in 0..48u64 {
+        let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+        let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+        let (t_tx, t_rx) = std::sync::mpsc::channel::<Arc<TlsTransport>>();
+        let sender = thread::spawn(move || {
+            let t = Arc::new(
+                TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake"),
+            );
+            t_tx.send(Arc::clone(&t)).expect("hand the transport over");
+            // Small frames so a send never parks in the socket write and
+            // the boundary between two of them comes round often — that
+            // boundary is what the shutdown has to hit.
+            while t.send_frame(b"tick").is_ok() {}
+        });
+        let client =
+            TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+                .expect("client handshake");
+        let server_t = t_rx.recv().expect("transport from the sender thread");
+        // Walk the delay across the rounds so the shutdown lands at a
+        // different point of the send loop each time.
+        let closer = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_micros(round * 40));
+            server_t.shutdown().expect("shutdown");
+        });
+        let end = loop {
+            match client.recv_frame() {
+                Ok(f) => assert_eq!(f, b"tick", "frames must arrive intact until the end"),
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            !matches!(end, RpcError::UncleanEndOfStream),
+            "round {round}: a shutdown racing a send left the peer an unclean end"
+        );
+        closer.join().unwrap();
+        sender.join().unwrap();
+    }
+}
+
 /// The one-call TCP+TLS client
 /// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
 /// handshake + R34 session — interoperates with a TLS server end to end.

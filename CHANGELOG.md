@@ -58,8 +58,12 @@ short form — and the first entry is the only one no compiler will catch.
   `StatusCode::DeadObject`), and a serve loop that reaches it ends with
   `Err(DeadObject)` where it used to return `Ok(())`. `TlsTransport::shutdown`
   now sends `close_notify` before the socket shutdown, so a deliberate close
-  on one end is still the clean `EndOfStream` on the other; only a cut stream
-  is unclean. Plain-socket backends are unaffected — they have no close signal
+  on one end is the clean `EndOfStream` on the other; only a cut stream is
+  unclean. A shutdown racing another thread's in-flight send on the same
+  connection waits briefly for it — only the sending thread may transmit —
+  and that wait is bounded, so a peer that has stopped reading still cannot
+  hold teardown and still reads the unclean end it was heading for.
+  Plain-socket backends are unaffected — they have no close signal
   to miss. Code that treated every TLS end of stream as clean now sees the
   difference; code matching `RpcError` with a wildcard arm is unaffected.
 - **`RpcSession::serve_blocking`, `serve_blocking_on` and
@@ -112,9 +116,13 @@ short form — and the first entry is the only one no compiler will catch.
   reply wait that expired after the peer may already have executed the
   request. Both are now `WouldBlock`, AOSP's `WOULD_BLOCK` for exactly this:
   nothing was sent, so the call is safe to retry. `TimedOut` from a transact
-  now means only that the request went out and no reply came in time;
-  `FailedTransaction` keeps its other meanings (an oneway backlog flushed, an
-  attach past the incoming-slot cap).
+  means the reply wait expired after the request went out — with one
+  exception: on an android-13+ connection whose write deadline is armed
+  (`RpcServer::set_idle_timeout`, which the server applies to its serve-phase
+  and callback slots), a send deadline that expires before the first byte is
+  `TimedOut` too, and nothing was sent in that case either (see the
+  send-failure entry below). `FailedTransaction` keeps its other meanings (an
+  oneway backlog flushed, an attach past the incoming-slot cap).
 - **Dropping a `ServerGuard` now ends the server, connected clients
   included.** It used to flip the accept flag and join the workers, which
   blocked for as long as any client stayed connected — a `?` or a panic that
@@ -213,10 +221,15 @@ short form — and the first entry is the only one no compiler will catch.
   `RpcUnixClientConfig::handshake_timeout` — a deadline for the connection
   **handshake**, the phase `timeout` cannot reach because it is applied to a
   session that does not exist yet. Covers the founding connect and every
-  fan-out / incoming attach, plus the `tls://` `connect(2)`. `None`
-  (default) keeps the previous unbounded behavior; without it a peer that
-  accepts the socket and then writes nothing hangs `Client::open` forever.
-  The client-side counterpart of `ServeOptions::handshake_timeout`.
+  fan-out / incoming attach on `?profile=android13plus`, plus the `tls://`
+  `connect(2)` and TLS handshake. `None` (default) keeps the previous
+  unbounded behavior; without it a peer that accepts the socket and then
+  writes nothing hangs `Client::open` forever. The r34 wire has no
+  connection handshake for it to bound, so setting it on a plain
+  (non-`tls://`, non-versioned) endpoint is `StatusCode::BadValue` — per
+  `ClientOptions`' rule that an option which does not apply is refused,
+  never ignored. The client-side counterpart of
+  `ServeOptions::handshake_timeout`.
 - **rsbinder (RPC):** `RpcServer::set_reply_timeout` — bounds how long this
   server waits for a reply to a callback it issued, by setting
   `RpcSession::set_timeout` on every session the server builds. `None`
@@ -404,7 +417,10 @@ short form — and the first entry is the only one no compiler will catch.
   (obituaries + release of the peer's local objects, AOSP `RpcState::clear`).
   This is the only way to break the `session → local object → stored proxy →
   session` cycle for a session that has no serve loop and will never transact
-  again; unlike AOSP `shutdownAndWait` it does not join workers.
+  again. It shuts every connection down and joins the session's own incoming
+  (callback) threads; unlike AOSP `shutdownAndWait` it does not join a
+  user-driven `serve_blocking` on the founding slot — that loop exits on its
+  own once the transport is shut down.
 - **rsbinder (shared memory):** `shared_memory` is now a working
   implementation instead of a trait skeleton. `MemoryHeapBase` allocates an
   anonymous shared region (`memfd_create` + `F_ADD_SEALS` on Linux/Android,
@@ -470,7 +486,7 @@ short form — and the first entry is the only one no compiler will catch.
 - **rsbinder (RPC):** a non-nested call on a session with no connection to
   send on — a server calling a client callback outside any handler, the
   client having opened no incoming connection — now fails immediately with
-  `FailedTransaction` (AOSP `WOULD_BLOCK`) and a log line naming the
+  `WouldBlock` (AOSP `WOULD_BLOCK`) and a log line naming the
   remedy, instead of waiting forever (or until `set_timeout`). Connection
   slots are now tagged with the direction they are used in (AOSP
   `mOutgoing`/`mIncoming`), so a serve-driven connection is never claimed
@@ -479,13 +495,13 @@ short form — and the first entry is the only one no compiler will catch.
   *twoway* handler is running on it (AOSP `RpcConnection::allowNested`):
   from inside a **oneway** handler the peer is no longer reading that
   socket, so the nested call now goes out on a connection the peer does
-  read — or fails with `FailedTransaction` if there is none — instead of
+  read — or fails with `WouldBlock` if there is none — instead of
   blocking forever on a reply that could never arrive.
   **Breaking for `RpcSession::new(t, AddressSpace::Acceptor)`:** the
   founding connection of an acceptor session is serve-driven, so such a
   session can no longer open a transaction of its own — `get_root`,
   `RpcProxy::transact` and `ping_binder` from outside a dispatch return
-  `FailedTransaction` where they used to round-trip on that connection.
+  `WouldBlock` where they used to round-trip on that connection.
   Callbacks from inside a twoway handler are unaffected. To call out of
   an acceptor otherwise the peer must open incoming connections, which
   needs `?profile=android13plus`; the r34 profile has no such mechanism.
@@ -572,7 +588,7 @@ short form — and the first entry is the only one no compiler will catch.
   profile, desynchronising the fd-aware receive buffer. An unsolicited
   `REPLY` now ends the session (AOSP `processCommand` does the same) instead
   of being logged and skipped at wire speed. `find_conn` waits are bounded by
-  `RpcSession::set_timeout` (`TimedOut`) instead of parking forever when
+  `RpcSession::set_timeout` (`WouldBlock`) instead of parking forever when
   every slot is driven by another thread. `RpcSession::close_session` logs when it
   finds nothing to tear down.
 - **rsbinder (`lazy_service`):** `force_persist` may **not** be called from
@@ -843,14 +859,16 @@ short form — and the first entry is the only one no compiler will catch.
   wait and the serve loop both classify by now has one owner,
   `RpcError::leaves_frame_boundary_intact`; the two had already diverged on
   `Truncated`.
-- **rsbinder (RPC, fd-mode) — `UnixTransport::shutdown` left a buffered frame
+- **rsbinder (RPC, fd-mode) — `UnixTransport::shutdown` left buffered bytes
   for the next reader.** An fd-mode connection reads with `recvmsg` into its
-  own buffer, and two frames that arrive together leave the second there.
-  `shutdown` shut the socket down and left that buffer alone, so a serve loop
-  woken by a session teardown was handed a frame of the connection just
-  ended — before it touched the socket — and dispatched it on a dead session,
-  on every platform, since the bytes were already in userspace. The buffer is
-  now cleared before the socket shutdown.
+  own buffer, and an error that cut a frame short leaves that frame's prefix
+  there. `shutdown` shut the socket down and left that buffer alone, so a
+  serve loop woken by a session teardown could go on decoding the connection
+  just ended out of it — before it touched the socket — on every platform,
+  since the bytes were already in userspace. The socket now goes down first
+  (a reader parked in `recvmsg` holds that buffer's lock for the whole call,
+  so taking the lock first would deadlock against it) and the buffer is
+  cleared right after.
 - **rsbinder (RPC, `rpc-tcp-debug`) — a preconnected `AF_INET` fd could not
   complete the android-13+ handshake.** `RpcSession::from_preconnected_fd`
   wraps such an fd in `TcpDebugTransport`, whose first handshake byte is a
@@ -885,7 +903,10 @@ short form — and the first entry is the only one no compiler will catch.
   (`StatusCode::DeadObject`, with a `warn!`), carried through the `Read`
   adapters as the `io::Error` payload so the framing readers hand it back
   unchanged; and `TlsTransport::shutdown` sends `close_notify` first, so
-  rsbinder's own deliberate close is still the clean end on the peer. No
+  rsbinder's own deliberate close is the clean end on the peer. A send
+  another thread has in flight holds the write lock, and only its holder
+  may transmit, so the shutdown waits for it — bounded, so a peer that has
+  stopped reading cannot hold teardown. No
   transaction was ever misdelivered by this — a truncated reply already failed
   the caller's wait; what was lost was the signal.
 - **rsbinder (RPC) — a refused attach was reported to the client as success.**
@@ -930,6 +951,26 @@ short form — and the first entry is the only one no compiler will catch.
   ends this way reports `StatusCode::DeadObject`, not the `Ok(())` of end of
   stream, so `RpcSession::serve_blocking` callers and the `RpcServer` worker
   log can still tell the two apart.
+- **rsbinder (RPC) — a send that stopped part-way left its connection in the
+  pool.** A write that stops mid-frame leaves the peer a header it will
+  complete out of whatever arrives next, and no transport makes such a
+  failure sticky, so the slot must never carry another frame — but only a
+  client call's request send acted on it: a reply, and a `DEC_STRONG` from
+  any of its three senders, discarded the error and returned the connection
+  for the next frame to be written on. Every send now funnels through one
+  rule — the frame that owns the slot retires it, a reentrant frame (which
+  owns nothing, the outer frame holds the slot) marks it unreadable and shuts
+  the transport down. A failure that put nothing on the wire is exempt: a
+  codec or protocol error, raised before the first byte, and a send deadline
+  that expired before the first byte, which the socket backends' android-13+
+  senders now report as `RpcError::Timeout` (`StatusCode::TimedOut`) rather
+  than as a transport error.
+  Both leave the stream frame-synchronized and the connection serving, so a
+  best-effort `DEC_STRONG` timing out on a socket-backed server with
+  `set_idle_timeout` no longer takes a live connection down. `rpc-tls` is the
+  exception, and deliberately so: a record its socket write dropped is gone
+  from the AEAD sequence however far it got, so a TLS send failure always
+  retires its slot.
 - **rsbinder (RPC) — a zero handshake deadline was neither honored nor
   reported.** `RpcUnixClientConfig::handshake_timeout(Duration::ZERO)` and
   `ClientOptions::handshake_timeout = Some(Duration::ZERO)` travelled to

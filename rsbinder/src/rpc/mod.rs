@@ -144,36 +144,53 @@ pub type RpcResult<T> = std::result::Result<T, RpcError>;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum RpcError {
-    /// The stream ended at a frame boundary: EOF with no frame pending,
-    /// or a disconnect kind (`BrokenPipe` / `ConnectionReset` /
-    /// `ConnectionAborted`) from a read or a write. It says nothing about
+    /// The stream ended: EOF with no frame pending, or a disconnect kind
+    /// (`BrokenPipe` / `ConnectionReset` / `ConnectionAborted`) from a
+    /// read or a write. It says nothing about
     /// **who** ended the stream or whether the end was **clean**: this
     /// end's own write failing after its own
     /// [`shutdown`](transport::RpcTransport::shutdown) folds here just as
     /// a peer's EOF does, and so does a reset. Whether this end decided
     /// is [`SessionEnd::by`]; whether the transport's close signal
-    /// arrived is [`UncleanEndOfStream`](Self::UncleanEndOfStream). A
-    /// disconnect part-way through a frame is
-    /// [`Truncated`](Self::Truncated), never this. Projects to
-    /// [`StatusCode::DeadObject`](crate::StatusCode).
+    /// arrived is [`UncleanEndOfStream`](Self::UncleanEndOfStream). The
+    /// frame-boundary guarantee is **read-side only**: a read that
+    /// disconnects part-way through a frame is
+    /// [`Truncated`](Self::Truncated), never this. A *send* that
+    /// disconnects past its first byte is this variant with the position
+    /// lost — no writer can report how much of the frame went out — which
+    /// is why the session's send-failure rule retires a slot on it.
+    /// Projects to [`StatusCode::DeadObject`](crate::StatusCode).
     EndOfStream,
-    /// The stream ended at a frame boundary without the transport's own
-    /// close signal — a TLS session whose TCP stream ended with no
-    /// `close_notify`. Kept apart from [`EndOfStream`](Self::EndOfStream)
+    /// The stream ended without the transport's own close signal — a TLS
+    /// session whose TCP stream ended with no `close_notify`. It arrives at
+    /// a frame boundary or part-way through one, and the position is not
+    /// assumed intact either way (the r34 framing readers promote it to
+    /// [`Truncated`](Self::Truncated) mid-frame; the android-13+ ones leave
+    /// it as itself). Kept apart from [`EndOfStream`](Self::EndOfStream)
     /// because on the one backend built for untrusted networks this is
     /// exactly what a truncation attack looks like; a plain socket has no
     /// close signal to miss and never reports it. The transport's own
-    /// [`shutdown`](transport::RpcTransport::shutdown) sends the signal,
-    /// so a deliberate close on this end is still `EndOfStream` on the
-    /// other. Projects to [`StatusCode::DeadObject`](crate::StatusCode).
+    /// [`shutdown`](transport::RpcTransport::shutdown) sends the signal
+    /// before it cuts the socket, waiting briefly for a send another
+    /// thread has in flight (only the thread holding the write side may
+    /// transmit), so a deliberate close on this end is `EndOfStream` on
+    /// the other. That wait is bounded so teardown stays finite: a peer
+    /// that has stopped reading holds its sender past it, and reads the
+    /// unclean end it was heading for anyway. Projects to
+    /// [`StatusCode::DeadObject`](crate::StatusCode).
     UncleanEndOfStream,
-    /// A frame length header was fully received but the body was
-    /// truncated (peer closed mid-body, or declared more than it sent).
+    /// A frame was cut short: the length header itself arrived incomplete,
+    /// or the header arrived in full and the body did not (peer closed
+    /// mid-body, or declared more than it sent).
     Truncated,
-    /// A read deadline this end armed elapsed part-way through a frame.
-    /// The stream position is as lost as after [`Truncated`](Self::Truncated),
-    /// but the cause is this end's own policy (a reply deadline, a
-    /// server's idle timeout), not the peer — so a log can say which.
+    /// A read deadline elapsed part-way through a frame. The stream
+    /// position is as lost as after [`Truncated`](Self::Truncated). Whose
+    /// deadline it was is not knowable here: a read deadline of this end's
+    /// (a reply deadline, a server's idle timeout) and the kernel's own
+    /// `ETIMEDOUT` from a peer whose host went away arrive as the same
+    /// io error kind and are not told apart. Attribution is
+    /// [`SessionEnd::by`], which is decided with the knowledge of whether
+    /// a deadline of this end's was armed at all.
     /// Projects to [`StatusCode::TimedOut`](crate::StatusCode).
     DeadlineMidFrame,
     /// A declared frame length exceeds [`transport::MAX_FRAME_LEN`].
@@ -188,10 +205,15 @@ pub enum RpcError {
     Io(std::io::Error),
     /// A protocol-level violation (used by the wire codec).
     Protocol(&'static str),
-    /// A configured wait deadline elapsed with no frame boundary
-    /// reached (reply / negotiation timeout). Reported
-    /// only when nothing partial was consumed, so the stream stays
-    /// frame-synchronized.
+    /// A wait deadline elapsed with no frame boundary crossed: a read that
+    /// consumed nothing (a reply or negotiation deadline), or a send that
+    /// put nothing on the wire. The stream stays frame-synchronized either
+    /// way, which is what lets the connection keep serving. Whose deadline
+    /// it was is not knowable here — one of this end's and the kernel's own
+    /// `ETIMEDOUT` arrive as the same io error kind; attribution is
+    /// [`SessionEnd::by`], decided with the knowledge of whether a deadline
+    /// of this end's was armed at all.
+    /// Projects to [`StatusCode::TimedOut`](crate::StatusCode).
     Timeout,
 }
 
@@ -231,12 +253,16 @@ impl std::error::Error for RpcError {
 impl RpcError {
     /// Whether a read that failed with this error is documented to have
     /// left the stream at a frame boundary: [`EndOfStream`](Self::EndOfStream)
-    /// ("no frame pending") and [`Timeout`](Self::Timeout) ("reported only
-    /// when nothing partial was consumed"). Every other read failure lacks
+    /// ("no frame pending") and [`Timeout`](Self::Timeout) ("no frame
+    /// boundary crossed"). Every other read failure lacks
     /// that guarantee — including ones that in fact consumed nothing — and
-    /// is treated as a lost position. The single owner of the distinction:
-    /// the framing readers (promoting a mid-frame case to `Truncated`),
-    /// the reply wait and the serve loop all ask here.
+    /// is treated as a lost position. Two callers ask: the android-13+
+    /// reader, which promotes a mid-frame case to `Truncated` /
+    /// `DeadlineMidFrame`, and `client_transact`'s reply wait, which decides
+    /// whether an abandoned nested call left its `REPLY` inbound. The r34
+    /// framing readers and the serve loop reimplement the same split inline
+    /// — against the io error kind and the `RpcError` variants
+    /// respectively — so a change to the set here has to be made there too.
     pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
         matches!(self, RpcError::EndOfStream | RpcError::Timeout)
     }
@@ -300,8 +326,11 @@ impl From<RpcError> for std::io::Error {
             e @ RpcError::UncleanEndOfStream => {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
             }
-            // Same carriage: by kind alone it would come back as a
-            // boundary `Timeout`, the opposite of what it means.
+            // Same carriage, so the variant is at least recoverable on the
+            // far side: by kind alone it would come back as a boundary
+            // `Timeout`, the opposite of what it means. No reader takes it
+            // yet — each checks `is_timeout` by kind before the downcast —
+            // and no producer sends this variant across this boundary.
             e @ RpcError::DeadlineMidFrame => std::io::Error::new(std::io::ErrorKind::TimedOut, e),
             other => std::io::Error::other(format!("{other}")),
         }

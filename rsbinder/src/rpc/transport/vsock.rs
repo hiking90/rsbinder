@@ -93,7 +93,7 @@ impl RpcTransport for VsockTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::io::Write;
         let mut w = &self.stream;
-        w.write_all(buf)?;
+        super::write_all_reporting(&mut w, buf)?;
         w.flush()?;
         Ok(())
     }

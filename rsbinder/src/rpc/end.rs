@@ -8,10 +8,9 @@
 //! asks about them are few: *is the stream still intact where the loop
 //! left it?* (decides whether anything more can be read), *did this end
 //! decide to stop?* (decides whether the end was expected), and *what
-//! happened?* (goes in the log). Before this type those three answers
-//! were spread over a `Result<bool>`, a `StatusCode` and a per-slot
-//! flag, and whatever none of them could carry ended up in prose. Here
-//! each is an axis: [`StreamState`], [`EndedBy`], [`EndReason`].
+//! happened?* (goes in the log). Each is one axis of this value, and no
+//! axis is derivable from another: [`StreamState`], [`EndedBy`],
+//! [`EndReason`].
 //!
 //! [`SessionEnd::into_result`] is the one projection back to
 //! `Result<()>`, and it reads a single axis — see its table.
@@ -27,9 +26,9 @@ pub enum EndedBy {
     /// This end decided to: an explicit
     /// [`RpcSession::close_session`](super::RpcSession::close_session) or
     /// [`RpcServer::terminate`](super::RpcServer::terminate), or a
-    /// deadline this end armed and let expire between frames (idle
-    /// eviction). Every end observed after that decision is `Local`,
-    /// whichever side's bytes reached the loop first.
+    /// deadline this end armed and let expire — between frames (idle
+    /// eviction) or part-way through one. Every end observed after that
+    /// decision is `Local`, whichever side's bytes reached the loop first.
     Local,
     /// Not this end's decision: the peer closed, went away, or the
     /// stream failed. Whether the *peer* chose it is not knowable at the
@@ -43,13 +42,22 @@ pub enum EndedBy {
 #[non_exhaustive]
 pub enum StreamState {
     /// The read stopped at a frame boundary with nothing unaccounted
-    /// for: an end of stream that was signaled, a deadline that elapsed
-    /// between frames, or a slot this end had already retired.
+    /// for: an end of stream that was signaled, a deadline *of this
+    /// end's* that elapsed between frames, or an end this loop reached
+    /// after this end had already decided to stop — a frame it
+    /// discarded, a slot it had already retired, or a dispatch that
+    /// failed.
     InSync,
     /// Not known to be intact — a frame stopped part-way or did not
-    /// decode, a nested call lost the position, or the stream ended
-    /// without its close signal. Nothing further should be read from it,
-    /// and the peer's side of the story is not known either.
+    /// decode, a nested call lost the position, the stream ended
+    /// without its close signal, or a read timed out with none of this
+    /// end's deadlines armed (the kernel's `ETIMEDOUT`, a peer whose
+    /// host went away). Also the ends this loop cannot place — a slot
+    /// already gone from the pool, a dispatch that failed — when this
+    /// end had not decided to stop, since whatever retired the slot or
+    /// failed the dispatch may have left a frame half-written. Nothing
+    /// further should be read from it, and the peer's side of the story
+    /// is not known either.
     Lost,
 }
 
@@ -73,13 +81,24 @@ pub enum EndReason {
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.
     Interrupted,
-    /// A deadline this end armed elapsed part-way through a frame
+    /// A read deadline elapsed part-way through a frame
     /// ([`RpcError::DeadlineMidFrame`](super::RpcError::DeadlineMidFrame)):
-    /// this end's own decision, and a lost position.
+    /// a lost position. Not by itself this end's decision — with none of
+    /// this end's deadlines armed it is the kernel's `ETIMEDOUT`, a peer
+    /// whose host went away, which is why [`SessionEnd::by`] is decided
+    /// with that knowledge.
     DeadlineMidFrame,
-    /// Reading or decoding a frame failed; the code is what the read or
-    /// the decoder produced (`TimedOut` for a deadline that elapsed
-    /// between frames, `NotEnoughData` for one that cut a frame, …).
+    /// A frame did not become a message this loop could act on; the code
+    /// is what the read or the decoder produced (`TimedOut` for a deadline
+    /// that elapsed between frames, `NotEnoughData` for one that cut a
+    /// frame, …). The loop also raises it on the one wire violation it
+    /// judges itself: an unsolicited `REPLY` no call is waiting for, which
+    /// AOSP's `RpcState::processCommand` likewise ends the session for, as
+    /// `Frame(BadType)`. That frame read and decoded cleanly, so it is the
+    /// one case here whose stream position is not in fact lost.
+    /// `TimedOut` is not by itself this end's deadline: with none armed
+    /// it is the kernel's `ETIMEDOUT` — a TCP peer whose host went away
+    /// — which is why the axes below are decided with that knowledge.
     Frame(StatusCode),
     /// Dispatching a frame failed — the handler, or writing its reply.
     Dispatch(StatusCode),
@@ -94,6 +113,7 @@ pub enum EndReason {
 /// this value says how it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[must_use = "the serve loop's end says whether the stream was lost; call into_result() or is_clean()"]
 pub struct SessionEnd {
     /// Who ended it.
     pub by: EndedBy,
@@ -104,16 +124,19 @@ pub struct SessionEnd {
 }
 
 impl SessionEnd {
-    /// Build the value from the mechanism and whether this end had
-    /// already decided to end the session. The two axes follow from
+    /// Build the value from the mechanism, whether this end had already
+    /// decided to end the session, and whether a read deadline of this
+    /// end's was armed when the loop ended. The two axes follow from
     /// those; the rules are the whole contract, so they are listed:
     ///
     /// | reason | `by` | `stream` |
     /// |---|---|---|
     /// | `EndOfStream` | local decision? | `InSync` |
-    /// | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut or undecodable) | local decision? | `Lost` |
-    /// | `Frame(TimedOut)` (a deadline between frames) | `Local` | `InSync` |
-    /// | `DeadlineMidFrame` (a deadline inside one) | `Local` | `Lost` |
+    /// | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut, undecodable, or a wire violation) | local decision? | `Lost` |
+    /// | `Frame(TimedOut)`, a deadline armed (idle eviction) | `Local` | `InSync` |
+    /// | `Frame(TimedOut)`, no deadline armed (the kernel's `ETIMEDOUT`) | local decision? | `Lost` |
+    /// | `DeadlineMidFrame`, a deadline armed (one of ours cut the frame) | `Local` | `Lost` |
+    /// | `DeadlineMidFrame`, no deadline armed (the kernel's `ETIMEDOUT`) | local decision? | `Lost` |
     /// | `Interrupted` | `Local` | `InSync` |
     /// | `Retired`, `Dispatch(_)` | local decision? | `InSync` if this end decided, else `Lost` |
     ///
@@ -122,21 +145,34 @@ impl SessionEnd {
     /// undecodable frame, a lost position) is `Lost` whoever decided;
     /// only the ambiguous ends — a slot already gone, a dispatch that
     /// failed — are read in the light of who ended the session.
-    pub(crate) fn new(reason: EndReason, ended_locally: bool) -> Self {
+    ///
+    /// The two timeout reasons need `deadline_armed` because by the time
+    /// they reach here the two kinds of timeout have become one. A socket
+    /// read deadline arrives as `EAGAIN` and the kernel's `ETIMEDOUT` as
+    /// itself, but every backend folds both into `RpcError::Timeout` /
+    /// `RpcError::DeadlineMidFrame` (`transport::is_timeout`, which has to
+    /// stay that wide: the `Read` adapters carry this end's own deadline
+    /// with the `TimedOut` kind). So with a deadline armed a `TimedOut`
+    /// between frames reads as this end evicting an idle peer — clean,
+    /// local — and one inside a frame as this end's own cut; including a
+    /// kernel `ETIMEDOUT` that happens to arrive while one is armed. With
+    /// none armed either can only be the kernel's, a TCP/TLS peer whose
+    /// host stopped answering, which is not this end's decision. The
+    /// position is lost inside a frame whichever it was.
+    pub(crate) fn new(reason: EndReason, ended_locally: bool, deadline_armed: bool) -> Self {
         use EndReason::*;
         use StreamState::*;
-        let decided = ended_locally
-            || matches!(
-                reason,
-                Interrupted | DeadlineMidFrame | Frame(StatusCode::TimedOut)
-            );
+        let idle_eviction = deadline_armed && matches!(reason, Frame(StatusCode::TimedOut));
+        let our_cut = deadline_armed && matches!(reason, DeadlineMidFrame);
+        let decided = ended_locally || idle_eviction || our_cut || matches!(reason, Interrupted);
         let by = if decided {
             EndedBy::Local
         } else {
             EndedBy::NotLocal
         };
         let stream = match reason {
-            EndOfStream | Interrupted | Frame(StatusCode::TimedOut) => InSync,
+            EndOfStream | Interrupted => InSync,
+            Frame(StatusCode::TimedOut) if idle_eviction => InSync,
             UncleanEndOfStream | Unreadable | DeadlineMidFrame | Frame(_) => Lost,
             Retired | Dispatch(_) => {
                 if ended_locally {
@@ -211,43 +247,66 @@ pub(crate) enum ServeStep {
 mod tests {
     use super::*;
 
-    /// The projection table, cell by cell — every combination
-    /// [`SessionEnd::new`] can produce, and what it projects to.
+    /// The projection table, cell by cell — every `(by, stream)` pair
+    /// [`SessionEnd::new`] can produce for each reason, and what it
+    /// projects to. `deadline_armed` is varied only where `new` reads it.
     #[test]
     fn projection_reads_the_stream_axis_only() {
         use EndReason::*;
         use EndedBy::{Local, NotLocal};
         use StatusCode::{BadType, DeadObject, NotEnoughData, TimedOut};
         use StreamState::{InSync, Lost};
-        // (reason, this end had decided, expected by, expected stream, clean?)
-        let cases: &[(EndReason, bool, EndedBy, StreamState, bool)] = &[
-            (EndOfStream, false, NotLocal, InSync, true),
-            (EndOfStream, true, Local, InSync, true),
-            (UncleanEndOfStream, false, NotLocal, Lost, false),
-            (UncleanEndOfStream, true, Local, Lost, false),
-            (Unreadable, false, NotLocal, Lost, false),
-            (Unreadable, true, Local, Lost, false),
-            (Retired, false, NotLocal, Lost, false),
-            (Retired, true, Local, InSync, true),
-            (Interrupted, true, Local, InSync, true),
-            (DeadlineMidFrame, false, Local, Lost, false),
-            (Frame(TimedOut), false, Local, InSync, true),
-            (Frame(NotEnoughData), false, NotLocal, Lost, false),
-            (Frame(BadType), true, Local, Lost, false),
-            (Dispatch(DeadObject), false, NotLocal, Lost, false),
-            (Dispatch(DeadObject), true, Local, InSync, true),
+        // (reason, this end had decided, a deadline was armed,
+        //  expected by, expected stream, clean?)
+        let cases: &[(EndReason, bool, bool, EndedBy, StreamState, bool)] = &[
+            (EndOfStream, false, false, NotLocal, InSync, true),
+            (EndOfStream, true, false, Local, InSync, true),
+            (UncleanEndOfStream, false, false, NotLocal, Lost, false),
+            (UncleanEndOfStream, true, false, Local, Lost, false),
+            (Unreadable, false, false, NotLocal, Lost, false),
+            (Unreadable, true, false, Local, Lost, false),
+            (Retired, false, false, NotLocal, Lost, false),
+            (Retired, true, false, Local, InSync, true),
+            (Interrupted, true, false, Local, InSync, true),
+            // `Interrupted` is `Local` on its own: this end interrupted the
+            // loop whether or not it had already decided elsewhere. Only
+            // this row holds `new`'s `Interrupted` arm — the one above is
+            // already decided by `ended_locally`.
+            (Interrupted, false, false, Local, InSync, true),
+            // A deadline this end armed cut the frame: local, position lost.
+            (DeadlineMidFrame, false, true, Local, Lost, false),
+            // With none armed the same cut is the kernel's `ETIMEDOUT`,
+            // which this end did not decide.
+            (DeadlineMidFrame, false, false, NotLocal, Lost, false),
+            (DeadlineMidFrame, true, false, Local, Lost, false),
+            // A deadline this end armed elapsed between frames: idle
+            // eviction, clean and local.
+            (Frame(TimedOut), false, true, Local, InSync, true),
+            // The same code with no deadline armed is the kernel's
+            // `ETIMEDOUT` — the peer host went away; not this end's
+            // decision, and not a stream anything more can be read from.
+            (Frame(TimedOut), false, false, NotLocal, Lost, false),
+            (Frame(TimedOut), true, false, Local, Lost, false),
+            (Frame(NotEnoughData), false, false, NotLocal, Lost, false),
+            (Frame(BadType), true, false, Local, Lost, false),
+            (Dispatch(DeadObject), false, false, NotLocal, Lost, false),
+            (Dispatch(DeadObject), true, false, Local, InSync, true),
         ];
-        for &(reason, local, by, stream, ok) in cases {
-            let end = SessionEnd::new(reason, local);
-            assert_eq!(end.by, by, "{reason:?} local={local}");
-            assert_eq!(end.stream, stream, "{reason:?} local={local}");
-            assert_eq!(end.is_clean(), ok, "{reason:?} local={local}");
+        for &(reason, local, armed, by, stream, ok) in cases {
+            let end = SessionEnd::new(reason, local, armed);
+            assert_eq!(end.by, by, "{reason:?} local={local} armed={armed}");
+            assert_eq!(end.stream, stream, "{reason:?} local={local} armed={armed}");
+            assert_eq!(end.is_clean(), ok, "{reason:?} local={local} armed={armed}");
             let expected = if ok {
                 Ok(())
             } else {
                 Err(StatusCode::DeadObject)
             };
-            assert_eq!(end.into_result(), expected, "{reason:?} local={local}");
+            assert_eq!(
+                end.into_result(),
+                expected,
+                "{reason:?} local={local} armed={armed}"
+            );
         }
     }
 }

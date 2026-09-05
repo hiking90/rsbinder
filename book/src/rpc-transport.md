@@ -481,7 +481,7 @@ that client* — the nested call rides the connection the request came
 in on. Calling it from anywhere else (a timer, a worker thread, a
 oneway notification fired later) needs a connection the server can
 *send* on, and by default a session has none: the server fails such a
-call at once with `FailedTransaction` (AOSP `WOULD_BLOCK`) rather than
+call at once with `WouldBlock` (AOSP `WOULD_BLOCK`) rather than
 waiting for a slot that will never free up.
 
 The client provides that connection, exactly as libbinder's
@@ -545,10 +545,13 @@ Each call on the ending side means one thing:
 | `ServerGuard::stop_and_join()` | `terminate`, after joining the accept thread — the same as dropping the guard |
 | `RpcTransport::shutdown()` | the transport half-close itself (`shutdown(2)` in both directions): wakes a reader blocked on this end, fails this end's later sends |
 
-What the *peer* sees after this end's `shutdown` is platform-dependent —
-Linux delivers frames already queued ahead of the EOF, macOS discards
-them — so code must not assume a queued frame arrives, or that it does
-not.
+What **this end's own reader** sees after its `shutdown` is
+platform-dependent — Linux delivers frames already queued ahead of the
+end of stream, macOS discards them — so code must not assume a queued
+frame arrives, or that it does not. The peer reads the end of stream on
+either platform; what differs is the peer's *next send* (Linux
+`AF_UNIX`: `EPIPE` at once; macOS: accepted and discarded; TCP: a reset
+on a later write).
 
 ## Bridging RPC and the service manager: the Accessor pattern
 
@@ -649,9 +652,8 @@ works exactly like it does on the kernel path. See
 [Async Service](./async-service.md).
 
 There is intentionally **no** non-blocking `RpcTransport` /
-reactor-based async serve loop. Decision record:
-[`plans/2-10-async-rpc-io.md`](https://github.com/hiking90/rsbinder/blob/master/plans/2-10-async-rpc-io.md)
-in the repo.
+reactor-based async serve loop: async support is these adapters over
+the blocking stack, not a second I/O engine underneath it.
 
 ## Platform support
 

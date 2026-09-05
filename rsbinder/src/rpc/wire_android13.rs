@@ -776,7 +776,8 @@ fn map_io(e: std::io::Error) -> RpcError {
 /// [`read_exact_into`], the whole message for the FD reader): at zero a
 /// clean close or an elapsed deadline stands as itself; above zero the
 /// stream position is lost — [`RpcError::Truncated`] if the stream ended,
-/// [`RpcError::DeadlineMidFrame`] if our own deadline cut it.
+/// [`RpcError::DeadlineMidFrame`] if a read deadline cut it (whose it was
+/// is not knowable here; see `transport::is_timeout`).
 fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
     if progress > 0 && e.leaves_frame_boundary_intact() {
         if matches!(e, RpcError::Timeout) {
@@ -865,7 +866,8 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     if body_size > 0 {
         // The header is already consumed, so a deadline or a clean EOF at the
         // start of the body is mid-message, not frame-synchronized: pass the
-        // header as progress so both become `Truncated`, the same value the FD
+        // header as progress so a stream that ended becomes `Truncated` and
+        // a read deadline becomes `DeadlineMidFrame`, the same values the FD
         // reader's `total_read` yields there.
         read_exact_into(r, &mut out[WIRE_HEADER_LEN..])
             .map_err(|e| classify_short_read(e, WIRE_HEADER_LEN))?;

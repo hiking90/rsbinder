@@ -20,11 +20,10 @@
 //! `vsock` is not here: it needs a VM peer (its own tests are `#[ignore]`),
 //! and its behaviour is inferred from `vsock(7)`, not measured.
 //!
-//! This suite's first run found a deadlock: `UnixTransport::shutdown` took
-//! the fd-mode leftover lock before shutting the socket down, and a reader
-//! parked in `recvmsg` holds that lock until the socket wakes it. Every
-//! `shutdown` here runs under a deadline so the next such bug fails
-//! instead of hanging the runner.
+//! An fd-mode reader parked in `recvmsg` holds the leftover lock until the
+//! socket wakes it, so a `shutdown` that takes that lock first deadlocks
+//! against it. Every `shutdown` here runs under a deadline, so such a bug
+//! fails the test instead of hanging the runner.
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`.
 
@@ -70,16 +69,16 @@ enum PeerSend {
 }
 
 fn unix_peer_send() -> PeerSend {
-    if cfg!(target_os = "linux") {
-        PeerSend::FailsAtOnce
-    } else {
+    if cfg!(target_os = "macos") {
         PeerSend::Accepted
+    } else {
+        PeerSend::FailsAtOnce
     }
 }
 
 /// `shutdown` on its own thread under a deadline: a shutdown that blocks
-/// (this suite found one — a lock held by a parked reader) must fail the
-/// test, not hang the runner.
+/// — on a lock a parked reader holds, say — must fail the test, not hang
+/// the runner.
 fn shutdown_within(name: &str, t: &Shared) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), RpcError>>(1);
     let t = Arc::clone(t);
@@ -155,13 +154,23 @@ fn queued_then_shutdown(
 /// returns the end of stream — within a bound, on every backend.
 fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, RpcError>>(1);
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let reader = {
         let local = Arc::clone(local);
         std::thread::spawn(move || {
+            let _ = started_tx.send(());
             let _ = tx.send(recv(&*local, fd_mode));
         })
     };
+    started_rx.recv().expect("the reader thread started");
     std::thread::sleep(Duration::from_millis(50));
+    // The reader has to still be parked, or the end of stream asserted
+    // below is just a read of an already-shut connection and the wake-up
+    // this test exists for never runs.
+    assert!(
+        matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "{name}: the reader must still be parked when we shut down"
+    );
     shutdown_within(name, local);
     match rx.recv_timeout(Duration::from_secs(2)) {
         Ok(Err(RpcError::EndOfStream)) => {}
@@ -172,14 +181,28 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     reader.join().expect("reader thread");
 }
 
+/// The suite's own read deadline, armed on both ends of every pair. The
+/// reads here expect an end of stream that a regressed `shutdown` would
+/// never produce — the peer is still alive — and libtest has no per-test
+/// timeout, so without this such a regression hangs the runner instead of
+/// failing the assertion. Longer than every `recv_timeout` bound below, so
+/// the assertion is still what reports the failure.
+fn armed(pair: (Shared, Shared)) -> (Shared, Shared) {
+    for t in [&pair.0, &pair.1] {
+        t.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arm the suite's read deadline");
+    }
+    pair
+}
+
 fn unix_pair() -> (Shared, Shared) {
     let (a, b) = UnixTransport::pair().expect("socketpair");
-    (Arc::new(a), Arc::new(b))
+    armed((Arc::new(a), Arc::new(b)))
 }
 
 fn mem_pair() -> (Shared, Shared) {
     let (a, b) = MemTransport::pair();
-    (Arc::new(a), Arc::new(b))
+    armed((Arc::new(a), Arc::new(b)))
 }
 
 #[test]
@@ -246,7 +269,7 @@ mod tcp {
 
     fn tcp_pair() -> (Shared, Shared) {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
-        (Arc::new(client), Arc::new(server))
+        armed((Arc::new(client), Arc::new(server)))
     }
 
     #[test]
@@ -318,7 +341,7 @@ mod tls {
         let client = TlsTransport::connect_stream(Box::new(s_cli), "localhost", cli_cfg)
             .expect("client handshake");
         let server = server.join().expect("server thread");
-        (Arc::new(client), Arc::new(server))
+        armed((Arc::new(client), Arc::new(server)))
     }
 
     #[test]

@@ -218,7 +218,7 @@ fn explicit_shutdown_breaks_cycle_without_any_transaction() {
     // hang instead of failing.
     assert!(
         wait_gone(&probe),
-        "shutdown() must release the peer's local objects and break the cycle"
+        "close_session() must release the peer's local objects and break the cycle"
     );
     let _ = jh.join().expect("serve thread");
 }

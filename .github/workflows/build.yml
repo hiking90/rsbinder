@@ -115,6 +115,24 @@ jobs:
       - name: Build release
         run: cargo build --workspace --release
       - name: Check test builds
+        # The only workspace-wide enumeration this workflow has — but it
+        # compiles, it does not run, and a target gated on a feature the run
+        # does not enable compiles to *zero* tests. So every test target is
+        # either named on a `--test` line in `rpc-suite` / `macos-build`, or
+        # run whole-package (`-p rsbinder-aidl`, `-p rsbinder-macros`, whose
+        # targets are ungated), or excluded here on purpose:
+        #   * rsbinder/tests/rpc_vsock.rs — every test in it is `#[ignore]`d
+        #     (needs a peer VM or the `vsock_loopback` module), so running it
+        #     yields nothing; `rpc-suite` still builds it via the
+        #     `--features rpc-vsock` matrix step.
+        #   * rsbinder/tests/loom_cache_pin.rs — `cfg(loom)`, empty without
+        #     `RUSTFLAGS="--cfg loom"`; a loom run is a manual exercise.
+        #   * tests/tests/mesh_rpc.rs, tests/tests/mesh_kernel.rs — the
+        #     multi-process mesh: minutes-expensive, and `mesh_kernel` needs
+        #     /dev/binder plus a live rsb_hub, so integration-test.yml owns
+        #     both.
+        # Adding a test target means adding it to one of those lines, or to
+        # this list with the reason it cannot run here.
         run: |
           cargo test --workspace --no-run
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
@@ -151,10 +169,21 @@ jobs:
           cargo build -p rsbinder --features rpc-tls
           cargo build -p rsbinder --features rpc-vsock
       - name: RPC unit + e2e (rsbinder, hermetic — multi-conn now default per AC-12.6)
+        # `rpc_transport_conformance` is what makes the
+        # `RpcTransport::shutdown` contract measured rather than merely
+        # written, and the behaviour it pins differs by platform — so it
+        # runs here *and* in `macos-build`. The file is
+        # `#![cfg(feature = "rpc")]` with `#[cfg(feature =
+        # "rpc-tcp-debug")]` / `#[cfg(feature = "rpc-tls")]` submodules:
+        # the plain `rpc` run covers the unix/unix-fd/mem cases, and the
+        # TLS run adds `rpc-tcp-debug` so the tcp and tls cases run too.
+        # `source_invariants` is ungated (it scans `src/`); it runs here so
+        # the PR gate covers it, not only the manual integration-test
+        # workflow.
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
-          cargo test -p rsbinder --features rpc-tls --test rpc_tls
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_transport_conformance --test source_invariants
+          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
         # "android_16"))]`; without `android_16` the file compiles to
@@ -163,9 +192,20 @@ jobs:
         # interaction), so default-features cover it fully.
         run: |
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
-      - name: Generated-stub e2e (tests crate)
+      - name: Generated-stub + entry-API e2e (tests crate)
+        # The `tests` crate has no `default` feature and every file below is
+        # `#![cfg(feature = "rpc")]`, so a target left off this line compiles
+        # to zero tests everywhere else in the workflow — `cargo test
+        # --workspace --no-run` included. Every hermetic `rpc` target of the
+        # crate is therefore named here: `entry_rpc` (the
+        # `serve`/`connect`/`Client` gate), `codegen_shapes`, the async stub
+        # adapter, `get_calling_uid` over RPC, and the `@EnforcePermission`
+        # deny. `macro_cross` needs `macros` too and is on the next step; the
+        # two mesh targets are integration-test.yml's (see the ledger on
+        # `linux-build`'s "Check test builds").
         run: |
-          cargo test -p tests --features rpc --test rpc_generated_stub
+          cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test codegen_shapes \
+            --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
       - name: Interface macro (plan 2-19 — golden equivalence, UI, e2e, interop)
         # `rsbinder-macros` holds the contract this feature rests on: a trait
@@ -209,10 +249,15 @@ jobs:
       - name: rsb_device unit (mounts parser)
         run: cargo test -p rsbinder-tools --bin rsb_device
       - name: RPC hermetic (multi-conn now default per AC-12.6)
+        # The macOS half of the `shutdown` conformance gate: this is the
+        # platform that drops its receive queue on a local shutdown and
+        # accepts the peer's first send afterwards, so the suite has to
+        # run on both runners to pin the split. See the matching step in
+        # `rpc-suite` for the feature-gate reasoning.
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_server --test rpc_fd
-          cargo test -p rsbinder --features rpc-tls --test rpc_tls
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_transport_conformance --test source_invariants
+          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
         # See the matching step in `linux-build` — plan 3 AC-3.4

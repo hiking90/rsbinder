@@ -137,7 +137,9 @@ impl ServerGuard {
             // Flag first so the accept loop exits; join it so nothing is
             // accepted past this point; then end what is connected.
             server.stop_accepting();
-            let _ = jh.join();
+            if jh.join().is_err() {
+                log::warn!("RPC: accept loop thread panicked");
+            }
             server.terminate();
         }
     }

@@ -74,9 +74,21 @@ pub struct ClientOptions {
     pub timeout: Option<Duration>,
     /// RPC: deadline for the connection **handshake** — the phase
     /// [`timeout`](Self::timeout) cannot reach, because it runs before the
-    /// session exists. Covers the `tls://` `connect(2)` and the android-13+
-    /// session handshake, on the founding connection and on every fan-out
-    /// or incoming attach.
+    /// session exists. Covers `tls://`'s `connect(2)` and TLS handshake,
+    /// and the android-13+ session handshake, on the founding connection
+    /// and on every fan-out or incoming attach. The r34 wire (no
+    /// `?profile=`) has no such phase at all, so on a plain r34 endpoint
+    /// the option does not apply and `open` refuses it with
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) rather than
+    /// ignore it.
+    ///
+    /// It bounds each blocking step of that phase — one `connect(2)` per
+    /// address the host resolves to, then each handshake read and write —
+    /// and is not a budget for the phase as a whole, so `open` can take a
+    /// multiple of it before returning. What it guarantees is that no
+    /// single step waits on a silent peer forever. Resolving the host name
+    /// is the one step it cannot reach: that blocks in the platform's
+    /// resolver, which takes no deadline from here.
     ///
     /// `None` (default) blocks forever, so a peer that accepts the socket
     /// and then writes nothing hangs `open`. Set it whenever the peer is
@@ -176,8 +188,8 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
                 ));
             }
             #[cfg(feature = "rpc")]
-            if o.fd_mode.is_some() {
-                return Err(reject("fd_mode"));
+            if o.fd_mode.is_some() || o.handshake_timeout.is_some() {
+                return Err(reject("fd_mode/handshake_timeout"));
             }
             #[cfg(feature = "rpc-tls")]
             if o.tls.is_some() || o.tls_server_name.is_some() {
@@ -252,6 +264,23 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         log::error!(
             "rsbinder::Client::open: session_id/outgoing_connections/incoming_connections \
              need `?profile=android13plus` ({:?})",
+            uri.endpoint
+        );
+        return Err(StatusCode::BadValue);
+    }
+    // Same contract for the handshake deadline. The r34 wire has no
+    // connection handshake at all — the session exists as soon as the
+    // socket does, and what `open` does after that is bounded by
+    // `timeout` — so on a plain r34 endpoint there is nothing for this
+    // option to bound. `tls://` is the exception either way: its
+    // `connect(2)` and TLS handshake below are bounded by it.
+    if versioned.is_none()
+        && o.handshake_timeout.is_some()
+        && !matches!(uri.endpoint, Endpoint::Tls(..))
+    {
+        log::error!(
+            "rsbinder::Client::open: handshake_timeout needs `?profile=android13plus` \
+             (or a `tls://` endpoint) ({:?})",
             uri.endpoint
         );
         return Err(StatusCode::BadValue);
@@ -380,9 +409,26 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
                     }
                     None => std::net::TcpStream::connect((host.as_str(), *port))?,
                 };
-                Box::new(crate::rpc::transport::TlsTransport::connect(
-                    tcp, name, cfg,
-                )?)
+                // The TLS handshake is the rest of this phase, and it is
+                // blocking I/O on the socket: bound it too, or a peer that
+                // accepts the connection and never sends a ServerHello
+                // hangs `open` — the very failure this option promises to
+                // cut. The server side bounds its half the same way,
+                // before `wrap_accepted`.
+                if let Some(d) = o.handshake_timeout {
+                    tcp.set_read_timeout(Some(d))?;
+                    tcp.set_write_timeout(Some(d))?;
+                }
+                let t = crate::rpc::transport::TlsTransport::connect(tcp, name, cfg)?;
+                if o.handshake_timeout.is_some() {
+                    // Handshake over: what follows (the android-13+
+                    // handshake, then the session's own traffic) arms its
+                    // own deadlines, and a sticky one here would cut an
+                    // idle session short.
+                    t.set_read_timeout(None).map_err(StatusCode::from)?;
+                    t.set_write_timeout(None).map_err(StatusCode::from)?;
+                }
+                Box::new(t)
             }
             #[cfg(not(feature = "rpc-tls"))]
             {
