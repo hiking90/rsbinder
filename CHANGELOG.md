@@ -727,20 +727,49 @@ short form — and the first entry is the only one no compiler will catch.
   client's `RpcSession::session_id()` is a client-local value that is never
   the peer's id (only `get_session_id()` fetches that), which is the mistake
   this used to accept silently; its rustdoc now says so.
+- **rsbinder (RPC) — a zero handshake deadline was neither honored nor
+  reported.** `RpcUnixClientConfig::handshake_timeout(Duration::ZERO)` and
+  `ClientOptions::handshake_timeout = Some(Duration::ZERO)` travelled to
+  `set_read_timeout` (and, on `tls://`, `TcpStream::connect_timeout`), both of
+  which document an error for a zero duration, so setup failed with an
+  unexplained `StatusCode::Unknown`. A zero duration cannot be a deadline and
+  `None` already means "no deadline", so it is now refused: the setup and
+  attach entries return `BadValue` naming the option, before any connect, and
+  the one place every handshake deadline is armed refuses it as well — no
+  `RpcTransport` implementation can be handed a value its socket rejects, or
+  quietly turn the caller's bound into no bound at all.
+- **rsbinder (RPC) — a write-side disconnect on an android-13+ session
+  reported `Unknown` instead of `DeadObject`.** `RawTransportIo` bridges the
+  transport to `std::io`, and its write side stringified the `RpcError`
+  into `io::Error::other`, so a `PeerClosed` raised while *sending* came
+  back from the other side of that boundary as `Io(Other)` — a peer that had
+  gone away was reported as an unclassified error, on the send path of every
+  call on a non-fd session as well as the handshake. `From<RpcError> for io::Error` is now
+  kind-preserving for the two variants that have an `io::ErrorKind` meaning
+  the same thing (`PeerClosed` → `BrokenPipe`, `Timeout` → `TimedOut`), so a
+  peer close comes back from the bridge as `PeerClosed` and a timeout comes
+  back in the shape the framing reader's deadline arm keys on. The TLS
+  transport's R34 framing adapter (`transport::tls`'s `RawIo`) carried the
+  same stringifying projection on its write side and is fixed with it, so an
+  `rpc-tls` R34 session now reports a dead peer as `DeadObject` too.
 - **rsbinder (RPC) — a wire-profile mismatch never mentioned the profile.**
-  An r34 (default) client's first frame parses as a *valid-looking* v0
-  `RpcConnectionHeader` — its leading `CMD_TRANSACT` reads as protocol
-  version 0 — so an android-13+ server accepted it, answered, and failed at
-  the `"cci"` check with a reject that named nothing an operator could act
-  on; the server's handshake log also flattened every cause into the opaque
-  `RpcError` status name. In the other direction an r34 server closed the
-  connection mid-handshake and the client surfaced a bare `DeadObject` with
-  no log at all. Both rejects now name the r34 profile as the likely cause,
-  in the same shape as the existing `Client::open` diagnostics. An attach
-  whose `max_version` is below the session's negotiated version (which can
-  never work — an attach does not negotiate) now logs that
-  `wire_protocol_version()` is the value to pass instead of failing with a
-  bare `BadType`.
+  An android-13+ server clamps whatever version the connection header
+  decodes to (`min(client_version, server_max_version)`, as AOSP does), so an
+  r34 (default) client's leading bytes got past the header: the server
+  accepted the connection, answered, and failed at the `"cci"` check with a
+  reject that named nothing an operator could act on; the server's handshake
+  log also flattened every cause into the opaque `RpcError` status name. In
+  the other direction an r34 server hung up mid-handshake and the client got
+  a bare dead-peer status with no log at all. Both rejects now name the r34
+  profile as the likely cause, in the same shape as the existing
+  `Client::open` diagnostics. Which side of that exchange notices the
+  disconnect first is a host- and timing-dependent race (EOF on the client's
+  response read, or `EPIPE`/`ECONNRESET` on its `"cci"` write), so the client
+  hint covers both — and a stall or a mid-frame cut names the deadline or the
+  partial response instead of guessing. An attach whose `max_version` is
+  below the session's negotiated version (which can never work — an attach
+  does not negotiate) now logs that `wire_protocol_version()` is the value
+  to pass instead of failing with a bare `BadType`.
 - **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
   freed memory.** `write_transaction_data` stores raw pointers to the reply
   parcel (or the status word on the stack) in the thread's command buffer.

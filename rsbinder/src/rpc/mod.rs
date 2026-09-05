@@ -211,15 +211,33 @@ impl From<std::io::Error> for RpcError {
 
 impl From<RpcError> for std::io::Error {
     /// Boundary projection back to `std::io::Error` for callers that
-    /// hold an `io::Result<_>` accumulator (the accept-loop dispatch in
-    /// `RpcServer::run` is the motivating site — its `accept_transport`
-    /// helper must surface a `from_stream`-side `RpcError` through the
-    /// same `io::ErrorKind` matching as the underlying `accept()`).
-    /// `RpcError::Io` round-trips the original `io::Error` unchanged;
-    /// other variants are wrapped with [`std::io::ErrorKind::Other`].
+    /// hold an `io::Result<_>` accumulator. Its consumers are the
+    /// adapters that bridge an [`transport::RpcTransport`] to a
+    /// `std::io` `Read`/`Write` — `RawTransportIo`
+    /// (`rpc::wire_android13`, the android-13+ raw framing) and `RawIo`
+    /// (`rpc::transport::tls`, R34 framing over TLS).
+    ///
+    /// `RpcError::Io` hands its payload back as-is, but the reverse
+    /// direction folds the disconnect kinds, so an `Io` carrying one of
+    /// them returns as `PeerClosed`.
+    /// [`RpcError::PeerClosed`] projects onto a single representative
+    /// disconnect kind (`BrokenPipe`): the four kinds `From<io::Error>`
+    /// folds into `PeerClosed` are not distinguished, and a
+    /// `PeerClosed` raised from a 0-byte read never had one. That kind
+    /// folds back into `PeerClosed`, so a write-side disconnect on an
+    /// android-13+ session stays `StatusCode::DeadObject` rather than
+    /// degrading to an unclassified `Io(Other)` (`StatusCode::Unknown`)
+    /// — the status a caller's dead-peer check keys on.
+    /// [`RpcError::Timeout`] projects onto `TimedOut`
+    /// — kind-preserving rather than variant-preserving, since
+    /// `From<io::Error>` folds that kind into `Io(TimedOut)`. The
+    /// remaining variants have no `io::ErrorKind` that means what they
+    /// mean, so they stay `Other`.
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::Io(io) => io,
+            RpcError::PeerClosed => std::io::ErrorKind::BrokenPipe.into(),
+            RpcError::Timeout => std::io::ErrorKind::TimedOut.into(),
             other => std::io::Error::other(format!("{other}")),
         }
     }
@@ -341,6 +359,57 @@ mod tests {
         assert_eq!(
             StatusCode::from(RpcError::Protocol("bad")),
             StatusCode::RpcError
+        );
+    }
+
+    /// `RpcError -> io::Error` must preserve the `io::ErrorKind` for the
+    /// two variants that have one meaning the same thing.
+    /// `RawTransportIo` crosses that boundary on every android-13+
+    /// handshake and on every read and write of a non-fd session, so a
+    /// variant that degrades to `Other` there comes back
+    /// as `Io(Other)`: a peer that closes before our write has to report
+    /// `StatusCode::DeadObject`, not `Unknown`. Which side of an
+    /// exchange notices a disconnect first is a host- and timing-
+    /// dependent race, so both directions have to classify alike.
+    /// `PeerClosed` returns as the same variant; `Timeout` is only
+    /// kind-preserving — it comes back as `Io(TimedOut)`.
+    ///
+    /// **Mutant gate**: restoring `other => io::Error::other(...)` for
+    /// `PeerClosed` fails the round trip below (and the timeout arm
+    /// guards `read_exact_into`'s `is_timeout` path the same way).
+    #[test]
+    fn peer_closed_and_timeout_round_trip_through_io_error() {
+        let io = std::io::Error::from(RpcError::PeerClosed);
+        assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(RpcError::from(io), RpcError::PeerClosed));
+        assert_eq!(
+            StatusCode::from(RpcError::from(std::io::Error::from(RpcError::PeerClosed))),
+            StatusCode::DeadObject,
+            "a write-side disconnect must stay DeadObject, not Unknown"
+        );
+
+        let io = std::io::Error::from(RpcError::Timeout);
+        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            transport::is_timeout(&io),
+            "read_exact_into's deadline arm keys on this kind"
+        );
+        // Reverse: `From<io::Error>` folds only the disconnect kinds, so
+        // a timeout comes back as `Io(TimedOut)`, not `Timeout` itself.
+        assert!(
+            matches!(RpcError::from(io), RpcError::Io(ref e) if transport::is_timeout(e)),
+            "a timeout stays recognizable as one across the round trip"
+        );
+
+        // An `Io` payload still round-trips unchanged, and a variant
+        // with no matching kind still degrades to `Other`.
+        let io = std::io::Error::from(RpcError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::io::Error::from(RpcError::Protocol("bad")).kind(),
+            std::io::ErrorKind::Other
         );
     }
 

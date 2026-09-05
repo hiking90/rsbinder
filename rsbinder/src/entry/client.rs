@@ -82,6 +82,11 @@ pub struct ClientOptions {
     /// and then writes nothing hangs `open`. Set it whenever the peer is
     /// untrusted or merely unreliable. This is the client-side counterpart
     /// of [`ServeOptions::handshake_timeout`](super::ServeOptions::handshake_timeout).
+    ///
+    /// `Some(Duration::ZERO)` is not a deadline and `open` refuses it with
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) rather than
+    /// silently dropping the bound; use `None` to wait indefinitely on
+    /// purpose.
     #[cfg(feature = "rpc")]
     pub handshake_timeout: Option<Duration>,
     /// Kernel: `?driver=` equivalent.
@@ -228,6 +233,14 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     use crate::rpc::transport::RpcTransport;
     use crate::rpc::{AddressSpace, FileDescriptorTransportMode, RpcSession};
 
+    // Before any connect: this value reaches a read deadline on every
+    // RPC endpoint and `TcpStream::connect_timeout` on `tls://`, and
+    // both reject a zero duration — refuse it here, where the option
+    // that carries it can still be named.
+    crate::rpc::session::reject_zero_handshake_timeout(
+        o.handshake_timeout,
+        "ClientOptions::handshake_timeout",
+    )?;
     let versioned = uri.wire_max_version;
     let fan_out = o.outgoing_connections.unwrap_or(1).max(1);
     let incoming = o.incoming_connections.unwrap_or(0);

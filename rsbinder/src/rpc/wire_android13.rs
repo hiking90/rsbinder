@@ -483,12 +483,12 @@ impl Android13PlusCodec {
     /// Verify an `RpcOutgoingConnectionInit` (`strncmp(msg,"cci",4)`).
     ///
     /// The rejects name the r34 profile because that is what this check
-    /// catches in practice: an r34 client's first frame
-    /// (`[command|bodySize|reserved]`) parses as a *valid-looking*
-    /// v0 `RpcConnectionHeader` — `command == CMD_TRANSACT == 0` reads
-    /// as protocol version 0 — so a profile mismatch survives the header
-    /// and first fails here, where the `"cci"` magic cannot be faked by
-    /// an r34 transaction body.
+    /// catches in practice: [`server_accept_deferred_init`] clamps the
+    /// version the connection header decodes to
+    /// (`min(client_version, server_max_version)`, as AOSP does) instead
+    /// of rejecting it, so a profile mismatch survives the header and
+    /// first fails here, where the `"cci"` magic cannot be faked by an
+    /// r34 transaction body.
     pub fn decode_connection_init(&self, buf: &[u8]) -> RpcResult<()> {
         if buf.len() < A13_CONN_INIT_LEN {
             return Err(RpcError::Protocol(
@@ -771,9 +771,22 @@ fn map_io(e: std::io::Error) -> RpcError {
     RpcError::from(e)
 }
 
+/// Classify a failed read by `progress`, the amount the **caller**
+/// counts as already arrived (this call's bytes for
+/// [`read_exact_into`], the whole message for the FD reader): at zero a
+/// clean close or an elapsed deadline stands as itself; above zero
+/// either one leaves the stream desynchronized ⇒
+/// [`RpcError::Truncated`].
+fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
+    match e {
+        RpcError::PeerClosed | RpcError::Timeout if progress > 0 => RpcError::Truncated,
+        other => other,
+    }
+}
+
 /// Read exactly `n` bytes. Zero bytes before any progress ⇒ a clean
 /// [`RpcError::PeerClosed`]; a short read after partial progress ⇒
-/// [`RpcError::Truncated`] (mirrors `transport::read_frame`).
+/// [`RpcError::Truncated`].
 fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
     read_exact_into(r, &mut buf)?;
@@ -788,30 +801,19 @@ fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut got = 0;
     while got < n {
         match r.read(&mut buf[got..]) {
-            Ok(0) => {
-                return Err(if got == 0 {
-                    RpcError::PeerClosed
-                } else {
-                    RpcError::Truncated
-                })
-            }
+            Ok(0) => return Err(classify_short_read(RpcError::PeerClosed, got)),
             Ok(k) => got += k,
             // A signal interrupted the read; retry like every other reader.
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A read deadline elapsed (`RawTransportIo` surfaces
             // `recv_raw`'s `Timeout` as `ErrorKind::TimedOut`; a bare
-            // socket reader yields `WouldBlock`): a clean `Timeout` before
-            // any byte of this read, else mid-frame `Truncated` — honoring
-            // the `set_read_timeout` contract rather than collapsing to a
+            // socket reader yields `WouldBlock`): honor the
+            // `set_read_timeout` contract rather than collapsing to a
             // generic `Io` via `map_io`.
             Err(ref e) if super::transport::is_timeout(e) => {
-                return Err(if got == 0 {
-                    RpcError::Timeout
-                } else {
-                    RpcError::Truncated
-                });
+                return Err(classify_short_read(RpcError::Timeout, got))
             }
-            Err(e) => return Err(map_io(e)),
+            Err(e) => return Err(classify_short_read(map_io(e), got)),
         }
     }
     Ok(())
@@ -856,17 +858,12 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);
     if body_size > 0 {
-        // The header is already consumed, so either a deadline that elapses at
-        // the start of the body (`Timeout`) or a clean EOF before the body
-        // (`PeerClosed`, which `read_exact_into` reports for a 0-byte read) is
-        // mid-message, not frame-synchronized: report `Truncated` in both
-        // cases (matches `read_aosp_message_with_fds`, which carries
-        // `total_read` across header+body). Without the `PeerClosed` arm a peer
-        // that sends only a header and dies would be recorded as a clean close.
-        read_exact_into(r, &mut out[WIRE_HEADER_LEN..]).map_err(|e| match e {
-            RpcError::Timeout | RpcError::PeerClosed => RpcError::Truncated,
-            other => other,
-        })?;
+        // The header is already consumed, so a deadline or a clean EOF at the
+        // start of the body is mid-message, not frame-synchronized: pass the
+        // header as progress so both become `Truncated`, the same value the FD
+        // reader's `total_read` yields there.
+        read_exact_into(r, &mut out[WIRE_HEADER_LEN..])
+            .map_err(|e| classify_short_read(e, WIRE_HEADER_LEN))?;
     }
     Ok(out)
 }
@@ -910,28 +907,17 @@ pub fn read_aosp_message_with_fds(
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut total_read = 0usize;
-    // Read exactly `want` bytes via `recvmsg`, accumulating any fds
-    // into `fds`. `total_read` tracks progress across header+body so a
-    // 0-byte recv distinguishes a clean pre-message close (PeerClosed)
-    // from a mid-message truncation (Truncated) — same contract as
-    // `read_exact_raw`.
-    let mut fill = |want: usize| -> RpcResult<Vec<u8>> {
-        let mut buf = vec![0u8; want];
+    // Fill `dst` via `recvmsg`, accumulating any fds into `fds`.
+    // `total_read` tracks progress across header+body so a 0-byte recv
+    // distinguishes a clean pre-message close (PeerClosed) from a
+    // mid-message truncation (Truncated) — same contract as
+    // `read_exact_raw`, through the same `classify_short_read`.
+    let mut fill = |dst: &mut [u8]| -> RpcResult<()> {
         let mut got = 0;
-        while got < want {
-            let (n, mut more) = match t.recv_raw_with_fds(&mut buf[got..]) {
+        while got < dst.len() {
+            let (n, mut more) = match t.recv_raw_with_fds(&mut dst[got..]) {
                 Ok(v) => v,
-                // A read deadline elapsed: a clean `Timeout` only before any
-                // byte of the message was read; otherwise the message is
-                // mid-flight ⇒ `Truncated` (same split as the EOF case below).
-                Err(RpcError::Timeout) => {
-                    return Err(if total_read == 0 {
-                        RpcError::Timeout
-                    } else {
-                        RpcError::Truncated
-                    });
-                }
-                Err(e) => return Err(e),
+                Err(e) => return Err(classify_short_read(e, total_read)),
             };
             fds.append(&mut more);
             // Enforce the per-message `MAX_FDS_PER_FRAME` cap *across*
@@ -948,19 +934,16 @@ pub fn read_aosp_message_with_fds(
                 ));
             }
             if n == 0 {
-                return Err(if total_read == 0 {
-                    RpcError::PeerClosed
-                } else {
-                    RpcError::Truncated
-                });
+                return Err(classify_short_read(RpcError::PeerClosed, total_read));
             }
             got += n;
             total_read += n;
         }
-        Ok(buf)
+        Ok(())
     };
 
-    let header = fill(WIRE_HEADER_LEN)?;
+    let mut header = [0u8; WIRE_HEADER_LEN];
+    fill(&mut header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
@@ -968,10 +951,14 @@ pub fn read_aosp_message_with_fds(
             max: MAX_FRAME_LEN,
         });
     }
-    let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_size);
-    out.extend_from_slice(&header);
+    // One allocation for header + body, read into in place: `bodySize`
+    // is peer-chosen up to `MAX_FRAME_LEN`, so a temporary body buffer
+    // would let a 16-byte header commit twice that (as `read_aosp_message`
+    // notes).
+    let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
+    out[..WIRE_HEADER_LEN].copy_from_slice(&header);
     if body_size > 0 {
-        out.extend_from_slice(&fill(body_size)?);
+        fill(&mut out[WIRE_HEADER_LEN..])?;
     }
     Ok((out, fds))
 }
@@ -1214,13 +1201,11 @@ pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.recv_raw(buf).map_err(|e| match e {
-            // Preserve the timeout kind across the `Read` boundary so
-            // `read_exact_raw` can honor the `Timeout`/`Truncated`
-            // contract; other errors keep their string form.
-            RpcError::Timeout => std::io::Error::from(std::io::ErrorKind::TimedOut),
-            other => std::io::Error::other(other.to_string()),
-        })
+        // `From<RpcError>` is kind-preserving (`Timeout` -> `TimedOut`,
+        // `PeerClosed` -> `BrokenPipe`), so on the other side of this
+        // boundary `map_io` recovers `PeerClosed` and the `is_timeout`
+        // arm recovers `Timeout`, instead of a stringified `Io(Other)`.
+        self.0.recv_raw(buf).map_err(std::io::Error::from)
     }
 }
 
@@ -1230,9 +1215,10 @@ impl Write for RawTransportIo<'_> {
         Ok(buf.len())
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0
-            .send_raw(buf)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        // Kind-preserving, as on the read side: a peer that closed
+        // before our write must surface as `PeerClosed` (`DeadObject`),
+        // not as an unclassified `Io(Other)`.
+        self.0.send_raw(buf).map_err(std::io::Error::from)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(()) // `send_raw` already flushes the underlying stream.
@@ -1446,10 +1432,10 @@ mod tests {
         let init = c1.encode_connection_init();
         assert_eq!(&init[0..4], b"cci\0");
         c1.decode_connection_init(&init).expect("\"cci\"");
-        // A profile mismatch first fails here (an r34 client's leading
-        // `CMD_TRANSACT == 0` passes as protocol version 0), so both
-        // rejects have to name r34 — that string is the only thing the
-        // server's handshake log can show an operator.
+        // A profile mismatch first fails here (the header read clamps
+        // the peer's version instead of rejecting it), so both rejects
+        // have to name r34 — that string is the only thing the server's
+        // handshake log can show an operator.
         for bad in [&[0u8; 8][..], &[0u8; 2][..]] {
             let why = match c1.decode_connection_init(bad) {
                 Err(RpcError::Protocol(why)) => why,

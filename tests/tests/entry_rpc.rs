@@ -169,6 +169,39 @@ fn entry_options_apply_to_rpc_server() {
     drop(keep);
 }
 
+/// `ClientOptions::handshake_timeout` is a plain public field, so a zero
+/// duration can only be caught where the options are consumed. `open`
+/// refuses it there with `BadValue` — before any connect — instead of
+/// carrying it to a `set_read_timeout`/`connect_timeout` that rejects it
+/// as an opaque I/O error, or (worse) dropping the caller's bound.
+///
+/// **Mutant gate**: removing the check in `rpc_connect` turns this into
+/// a connect attempt whose failure names neither the option nor the
+/// reason.
+#[test]
+fn entry_zero_handshake_timeout_is_refused() {
+    let sock = SockPath::new("zerohs");
+    let _guard = rsbinder::serve(&sock.uri(""))
+        .expect("serve")
+        .add("svc", tagged("svc"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let err = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
+        o.handshake_timeout = Some(std::time::Duration::ZERO)
+    })
+    .expect_err("a zero handshake deadline must be refused");
+    assert_eq!(err, rsbinder::StatusCode::BadValue);
+
+    // Control: a positive deadline on the same endpoint connects.
+    let ok = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
+        o.handshake_timeout = Some(std::time::Duration::from_secs(5))
+    })
+    .and_then(|c| c.binder("svc"));
+    assert!(ok.is_ok(), "a positive deadline still connects");
+}
+
 /// `connect_async` (feature `tokio`) resolves through `spawn_blocking`
 /// and hands back a proxy the async stub can drive with `.await`.
 #[test]

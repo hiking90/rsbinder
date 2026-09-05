@@ -199,6 +199,11 @@ impl<'a> RpcUnixClientConfig<'a> {
     /// session, and the handshake runs before the session exists. This is
     /// the client-side counterpart of
     /// [`RpcServer::set_handshake_timeout`](super::RpcServer::set_handshake_timeout).
+    ///
+    /// `Duration::ZERO` is not a deadline: the setup call this config is
+    /// passed to refuses it with [`StatusCode::BadValue`] rather than
+    /// silently dropping the bound the caller asked for. Leave the option
+    /// unset to wait indefinitely on purpose.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = Some(timeout);
         self
@@ -490,12 +495,42 @@ struct HandshakeDeadline<'a> {
 
 impl<'a> HandshakeDeadline<'a> {
     fn arm(transport: &'a dyn RpcTransport, deadline: Option<Duration>) -> RpcResult<Self> {
+        // Every handshake deadline funnels through here, so this is the
+        // one place that can promise a zero duration never reaches a
+        // transport. `set_read_timeout` is documented to reject it, but
+        // that is the *socket*'s promise, not the `RpcTransport` trait's:
+        // an implementation free to accept `Some(ZERO)` would leave the
+        // phase unbounded, which is worse than the deadline the caller
+        // asked for. `None` is how "no deadline" is spelled.
+        if deadline.is_some_and(|d| d.is_zero()) {
+            log::error!(
+                "rsbinder RPC: a zero handshake deadline is not a deadline — pass a positive                  duration, or `None` to wait indefinitely on purpose"
+            );
+            return Err(RpcError::Io(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
         let armed = deadline.is_some();
         if armed {
             transport.set_read_timeout(deadline)?;
         }
         Ok(Self { transport, armed })
     }
+}
+
+/// A zero handshake deadline, rejected where the caller can still be
+/// named. `HandshakeDeadline::arm` refuses it too, but only once the
+/// connect has happened and only as a transport error; here it is the
+/// `BadValue` every other invalid field of these builders yields.
+pub(crate) fn reject_zero_handshake_timeout(timeout: Option<Duration>, setter: &str) -> Result<()> {
+    if timeout.is_some_and(|d| d.is_zero()) {
+        log::error!(
+            "rsbinder RPC: {setter} was given a zero duration, which is not a deadline; pass a \
+             positive duration, or leave it unset to wait indefinitely"
+        );
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
 }
 
 impl Drop for HandshakeDeadline<'_> {
@@ -573,9 +608,17 @@ fn confirm_attach(
     }
 }
 
-/// One line explaining what a refused attach looks like, shared by the
-/// two attach entries so the diagnosis does not drift between them.
+/// Explain a failed attach, shared by the two attach entries so the
+/// diagnosis does not drift between them.
 fn log_attach_refused(e: &RpcError) {
+    if matches!(e, RpcError::Timeout | RpcError::Truncated) {
+        log::error!(
+            "android-13+ RPC: the attach admission probe (GET_SESSION_ID) did not complete \
+             ({e}) — a read deadline armed by this caller ends it this way too, so this is \
+             not necessarily a refusal"
+        );
+        return;
+    }
     log::error!(
         "android-13+ RPC: the peer refused this attach ({e}) — the session id is unknown or \
          stale, the peer's outgoing-slot cap (`set_max_threads`) is spent, or it is shutting \
@@ -585,21 +628,43 @@ fn log_attach_refused(e: &RpcError) {
     );
 }
 
-/// Map an android-13+ **client** handshake failure to a [`StatusCode`],
-/// logging the profile-mismatch hint when the peer hung up where its
-/// `RpcNewSessionResponse` was due. That is what an r34 (default
-/// profile) server looks like from here: it reads our 16-byte
-/// `RpcConnectionHeader` as an r34 frame, fails to decode it and
-/// closes — leaving the client with a bare `DeadObject` and the server
-/// with no log at all.
+/// Map an android-13+ **client** handshake failure to a [`StatusCode`].
+/// A new-session handshake logs a hint first: an r34 (default profile)
+/// peer is the likeliest cause and the returned status cannot say so.
 fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
-    if requesting_new_session && matches!(e, RpcError::PeerClosed | RpcError::Truncated) {
-        log::error!(
-            "rsbinder RPC: the peer closed the connection during the android-13+ handshake, \
-             before its RpcNewSessionResponse — it may be speaking the r34 (default) profile. \
-             Connect without `?profile=android13plus`, or enable the android-13+ wire on the \
-             server (`RpcServer::set_android13plus`)"
-        );
+    if requesting_new_session {
+        match &e {
+            RpcError::PeerClosed => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
+                 the peer accepted the connection — it may be speaking the r34 (default) \
+                 profile. Connect without `?profile=android13plus`, or enable the android-13+ \
+                 wire on the server (`RpcServer::set_android13plus`)"
+            ),
+            RpcError::Truncated => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed part-way through a response \
+                 ({e}) — the peer may be speaking the r34 (default) profile, or a read \
+                 deadline armed on this connection landed mid-frame. Connect without \
+                 `?profile=android13plus`, or enable the android-13+ wire on the server \
+                 (`RpcServer::set_android13plus`)"
+            ),
+            RpcError::Timeout => log::error!(
+                "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
+                 this connection elapsed — that deadline is the caller's own \
+                 (`RpcUnixClientConfig::handshake_timeout`, the 10s \
+                 `RpcSession::from_preconnected_fd` arms, or one set on the transport \
+                 directly), so it may simply be shorter than this peer's legitimate response \
+                 time. A peer that should have answered well within it may be speaking the \
+                 r34 (default) profile instead"
+            ),
+            // The returned status drops the reason string, so this log
+            // is the only description of the violation a caller gets.
+            RpcError::Protocol(_) => log::error!(
+                "rsbinder RPC: the android-13+ handshake failed ({e}) — either the peer's \
+                 answer violated the wire or the caller offered a `max_version` this build \
+                 does not implement"
+            ),
+            _ => {}
+        }
     }
     StatusCode::from(e)
 }
@@ -4060,6 +4125,10 @@ impl RpcSession {
     pub fn setup_unix_client_android13plus_with_config(
         config: RpcUnixClientConfig,
     ) -> Result<RpcSession> {
+        reject_zero_handshake_timeout(
+            config.handshake_timeout,
+            "RpcUnixClientConfig::handshake_timeout",
+        )?;
         let local = config.outgoing_connections.max(1);
         let incoming = config.incoming_connections;
         // Fan-out and incoming connections are a session *owner*'s
@@ -4170,6 +4239,10 @@ impl RpcSession {
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
+        reject_zero_handshake_timeout(
+            config.handshake_timeout,
+            "RpcUnixClientConfig::handshake_timeout",
+        )?;
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
             || config.session_id.len() != 32
@@ -4281,6 +4354,10 @@ impl RpcSession {
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
+        reject_zero_handshake_timeout(
+            config.handshake_timeout,
+            "RpcUnixClientConfig::handshake_timeout",
+        )?;
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
             || config.session_id.len() != 32
@@ -4658,6 +4735,43 @@ mod tests {
             None,
         )
         .expect("socketpair")
+    }
+
+    /// A zero handshake deadline is refused at the one point every
+    /// arming site funnels through, so no transport can be handed a
+    /// deadline it is documented to reject — and no implementation that
+    /// accepts one can leave the phase unbounded instead.
+    ///
+    /// **Mutant gate**: dropping the guard in `HandshakeDeadline::arm`
+    /// makes this `Ok` for any transport whose `set_read_timeout`
+    /// tolerates zero, and turns the caller's bound into no bound.
+    #[test]
+    fn zero_handshake_deadline_is_refused_before_it_reaches_a_transport() {
+        let (a, _b) = super::super::transport::MemTransport::pair();
+        assert!(
+            HandshakeDeadline::arm(&a, Some(Duration::ZERO)).is_err(),
+            "a zero duration is not a deadline"
+        );
+        // The two shapes that are deadlines still arm.
+        assert!(HandshakeDeadline::arm(&a, None).is_ok());
+        assert!(HandshakeDeadline::arm(&a, Some(Duration::from_millis(50))).is_ok());
+    }
+
+    /// The same value refused where the caller can still be named: the
+    /// builder's setup and attach entries report it as the `BadValue`
+    /// every other invalid field of that builder yields, before any
+    /// connect happens.
+    #[test]
+    fn zero_handshake_timeout_is_bad_value_at_the_config_entries() {
+        let path = std::path::Path::new("/nonexistent/rsb-zero-handshake.sock");
+        assert_eq!(
+            RpcSession::setup_unix_client_android13plus_with_config(
+                RpcUnixClientConfig::path(path, 2).handshake_timeout(Duration::ZERO),
+            )
+            .err(),
+            Some(StatusCode::BadValue),
+            "rejected before the connect — the path is never touched"
+        );
     }
 
     /// `from_preconnected_fd` on an `AF_UNIX` socketpair half: family
