@@ -231,6 +231,68 @@ jobs:
             cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e || exit 1
           done
 
+  big-endian:
+    # The parcel wire is defined little-endian on every host, and this is
+    # the only job that can tell. Every other runner is little-endian, so
+    # the wire codec and a host-native one emit identical bytes there —
+    # the entire suite stays green either way.
+    #
+    # s390x through `cross`, which supplies the cross linker and a
+    # qemu-user runner in its Docker image; the runner has Docker, so
+    # nothing else is needed. The kernel-binder path is out of scope
+    # (there is no binderfs in the container, and no big-endian one
+    # anywhere) — this covers the wire, which is what portability means.
+    name: Big-endian wire (s390x)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          # `cross` mounts the host toolchain into the container, so the
+          # target has to be installed out here rather than in the image.
+          targets: s390x-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Control — the same filter on x86_64
+        # No other job runs the parcel unit tests on a hermetic runner
+        # (`test`/`linux-build` build them but do not run them; the
+        # kernel-binder matrix lives in integration-test.yml). Without
+        # this, a failure below cannot be read as "big-endian" rather
+        # than "broken everywhere".
+        run: cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Confirm the binary really is big-endian
+        # A silent fallback to a host-native build would pass every test
+        # below and prove nothing, and it looks exactly like success.
+        # `file` must say MSB / IBM S/390 before any result counts.
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib parcel --no-run
+          file target/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | tee /tmp/file.out
+          grep -q 'MSB.*IBM S/390' /tmp/file.out
+      - name: AC-7.3 cross-endian wire goldens + parcel codec
+        # The goldens assert literal little-endian bytes, so a big-endian
+        # build that reproduces them is cross-endian compatible by
+        # construction — no networking, no peer.
+        #
+        # `--skip shared_memory` drops two tests that create a memfd,
+        # which qemu-user does not implement. They are endianness-blind
+        # and covered by every other job.
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib parcel -- --skip shared_memory
+      - name: AC-7.2 RPC stack on a big-endian host
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --features rpc,rpc-tcp-debug --lib rpc::
+      - name: Layer gates
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --test source_invariants
+
   macos-build:
     # macOS is a first-class target per plan 2-9 (Phase A+B). The
     # kernel-binder path is Linux/Android-only, so the matrix here is
