@@ -72,6 +72,38 @@ jobs:
           # fails to `cargo doc` the baseline crate.
           features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,async
 
+  public_api:
+    # `semver_checks` above answers "did anything break?". This answers
+    # the question that has no owner otherwise: "what did we add?" — a
+    # surface that grows one `pub` at a time, each defensible on its own,
+    # is how a crate ends up with two paths to everything. The golden
+    # makes every addition a line in a reviewable diff.
+    #
+    # To update after an intentional change, run the same command and
+    # commit the result:
+    #
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > api/rsbinder.txt
+    #
+    # Both the toolchain and the tool version are pinned because the
+    # rendering is not stable across either; bumping one means
+    # regenerating the golden in the same commit.
+    name: Public API golden
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust nightly (pinned — rustdoc JSON needs nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-25
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked --version 0.52.0
+      - name: Diff the public surface against the golden
+        run: |
+          cargo public-api -p rsbinder --simplified > /tmp/public-api.txt
+          diff -u api/rsbinder.txt /tmp/public-api.txt
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
