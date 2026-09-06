@@ -1878,9 +1878,19 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
     // A two-way transact normally yields a reply, but a `break` path in
     // `wait_for_response` can surface `Ok(None)`; return a recoverable error
     // rather than panicking the calling thread.
-    let interface: String = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
+    //
+    // The descriptor is read as nullable and a null folded to empty, which
+    // is what AOSP does — `BpBinder::getInterfaceDescriptor` takes
+    // `String16 res(reply.readString16())` and `readString16` yields an
+    // empty string for a null, with no error path. A service registered
+    // without an AIDL interface answers `INTERFACE_TRANSACTION` with a null
+    // string, and reading it as non-null failed the *whole lookup*: on a
+    // stock Android 34 image that is 23 of 280 services (`battery`,
+    // `cpuinfo`, `dbinfo`, `DockObserver`, …) — every one of them
+    // unreachable, while `service check` finds them.
+    let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
 
-    Ok(interface)
+    Ok(interface.unwrap_or_default())
 }
 
 pub(crate) fn ping_binder(handle: u32) -> Result<()> {

@@ -135,9 +135,13 @@ fn main() {
             // `find` (checkService) must never have that side effect.
             // `try_get_service` is the `getService` wire call, which is
             // what carries that side effect.
-            "get" => match hub::try_get_service(arg).ok().flatten() {
-                Some(_) => "OK",
-                None => "NOTFOUND",
+            "get" => match hub::try_get_service(arg) {
+                Ok(Some(_)) => "OK",
+                Ok(None) => "NOTFOUND",
+                Err(err) => {
+                    println!("RESULT get {arg} ERR {err:?}");
+                    continue;
+                }
             },
             "declared" => {
                 if hub::is_declared(arg) {

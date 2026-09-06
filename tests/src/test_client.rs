@@ -2244,12 +2244,13 @@ fn test_issue_47_cached_interface_string() {
     // First pass: get services and record their descriptors
     println!("\n=== First Pass: Recording service descriptors ===");
     for service_name in all_services.iter().take(10) {
-        // Sweeping whatever the device happens to have registered, so a
-        // name that fails to resolve is skipped rather than fatal — on a
-        // stock Android 34 image at least one system service comes back
-        // as an error here. Every other lookup in this file names a
-        // service the harness registered, and expects it to be there.
-        if let Some(service) = hub::try_get_service(service_name).ok().flatten() {
+        // Strict on purpose. This sweep resolves whatever the *device* has
+        // registered, which is the only place a service registered without
+        // an AIDL interface turns up — and those were unresolvable until
+        // `query_interface` learned to read a null descriptor as empty the
+        // way AOSP does. Tolerating an error here is what hid that for as
+        // long as it was hidden.
+        if let Some(service) = hub::try_get_service(service_name).expect("service manager") {
             let descriptor = service.descriptor().to_string();
 
             println!("Service '{}' -> descriptor: '{}'", service_name, descriptor);
@@ -2266,12 +2267,13 @@ fn test_issue_47_cached_interface_string() {
     let mut bug_detected = false;
 
     for (service_name, expected_descriptor) in &service_descriptors {
-        // Sweeping whatever the device happens to have registered, so a
-        // name that fails to resolve is skipped rather than fatal — on a
-        // stock Android 34 image at least one system service comes back
-        // as an error here. Every other lookup in this file names a
-        // service the harness registered, and expects it to be there.
-        if let Some(service) = hub::try_get_service(service_name).ok().flatten() {
+        // Strict on purpose. This sweep resolves whatever the *device* has
+        // registered, which is the only place a service registered without
+        // an AIDL interface turns up — and those were unresolvable until
+        // `query_interface` learned to read a null descriptor as empty the
+        // way AOSP does. Tolerating an error here is what hid that for as
+        // long as it was hidden.
+        if let Some(service) = hub::try_get_service(service_name).expect("service manager") {
             let actual_descriptor = service.descriptor();
 
             println!(
