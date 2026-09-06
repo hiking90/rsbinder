@@ -235,7 +235,9 @@ fn native_byte_codecs_stay_in_their_islands() {
         for (suffix, want) in pin.files {
             let got = hits.iter().filter(|(p, _)| p.ends_with(suffix)).count();
             if got != *want {
-                failures.push(format!("`{needle}` in {suffix}: expected {want}, found {got}"));
+                failures.push(format!(
+                    "`{needle}` in {suffix}: expected {want}, found {got}"
+                ));
             }
         }
         if !pin.tree_wide {
@@ -246,7 +248,9 @@ fn native_byte_codecs_stay_in_their_islands() {
             .filter(|(p, _)| !pin.files.iter().any(|(suffix, _)| p.ends_with(suffix)))
             .collect();
         if !stray.is_empty() {
-            failures.push(format!("`{needle}` appeared in an unlisted file: {stray:#?}"));
+            failures.push(format!(
+                "`{needle}` appeared in an unlisted file: {stray:#?}"
+            ));
         }
     }
 

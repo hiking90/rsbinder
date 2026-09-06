@@ -13,7 +13,6 @@ use crate::parcel::*;
 use crate::parcelable::*;
 use std::fmt::{Debug, Display, Formatter};
 
-
 /// Result alias for **binder interface methods** — the type returned by the
 /// generated `Bp*` proxy / `Bn*` native stubs and by your `impl` of an AIDL
 /// trait.

@@ -1083,7 +1083,11 @@ fn execute_command(cmd: i32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
-                let other: StatusCode = thread_state.borrow_mut().in_parcel.read_native::<i32>()?.into();
+                let other: StatusCode = thread_state
+                    .borrow_mut()
+                    .in_parcel
+                    .read_native::<i32>()?
+                    .into();
                 log::error!("binder::BR_ERROR ({other})");
                 return Err(other);
             }
@@ -1317,8 +1321,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write_native::<u32>(&binder::BC_INCREFS_DONE)?;
-                state.out_parcel.write_native::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write_native::<u32>(&binder::BC_INCREFS_DONE)?;
+                state
+                    .out_parcel
+                    .write_native::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
                     .write_native::<binder::binder_uintptr_t>(&cookie_echo)?;
@@ -1339,8 +1347,12 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write_native::<u32>(&(binder::BC_ACQUIRE_DONE))?;
-                state.out_parcel.write_native::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write_native::<u32>(&(binder::BC_ACQUIRE_DONE))?;
+                state
+                    .out_parcel
+                    .write_native::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
                     .write_native::<binder::binder_uintptr_t>(&cookie_echo)?;
@@ -1382,7 +1394,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let success = ProcessState::as_self().ref_native_kernel(id).is_some();
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write_native::<u32>(&binder::BC_ACQUIRE_RESULT)?;
+                state
+                    .out_parcel
+                    .write_native::<u32>(&binder::BC_ACQUIRE_RESULT)?;
                 state.out_parcel.write_native::<i32>(&(success as _))?;
             }
             binder::BR_NOOP => {}
@@ -1601,7 +1615,9 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write_native::<u32>(&(binder::BC_ACQUIRE))?;
+            state
+                .out_parcel
+                .write_native::<u32>(&(binder::BC_ACQUIRE))?;
             state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
@@ -1617,7 +1633,9 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write_native::<u32>(&(binder::BC_RELEASE))?;
+            state
+                .out_parcel
+                .write_native::<u32>(&(binder::BC_RELEASE))?;
             state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
@@ -1633,7 +1651,9 @@ pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write_native::<u32>(&(binder::BC_INCREFS))?;
+            state
+                .out_parcel
+                .write_native::<u32>(&(binder::BC_INCREFS))?;
             state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
@@ -1649,7 +1669,9 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write_native::<u32>(&(binder::BC_DECREFS))?;
+            state
+                .out_parcel
+                .write_native::<u32>(&(binder::BC_DECREFS))?;
             state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
@@ -1834,7 +1856,9 @@ fn free_buffer(
         thread_state
             .out_parcel
             .write_native::<u32>(&binder::BC_FREE_BUFFER)?;
-        thread_state.out_parcel.write_native::<binder_uintptr_t>(&data)?;
+        thread_state
+            .out_parcel
+            .write_native::<binder_uintptr_t>(&data)?;
         Ok(())
     })?;
 

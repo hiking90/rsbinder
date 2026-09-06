@@ -61,11 +61,7 @@ impl IHello for HelloService {
 struct NoopClientCallback;
 impl Interface for NoopClientCallback {}
 impl IClientCallback for NoopClientCallback {
-    fn onClients(
-        &self,
-        _registered: &SIBinder,
-        _has_clients: bool,
-    ) -> rsbinder::BinderResult<()> {
+    fn onClients(&self, _registered: &SIBinder, _has_clients: bool) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

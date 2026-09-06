@@ -393,9 +393,8 @@ pub mod android_16 {
     pub use super::accessor_16::__fuzz_accessor_error_decode;
     #[cfg(feature = "rpc")]
     pub use super::accessor_16::{
-        accessor_error_name, resolve_accessor, BnAccessor,
-        BpAccessor, IAccessor, IAccessorDefault, IAccessorDefaultRef,
-        ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
+        accessor_error_name, resolve_accessor, BnAccessor, BpAccessor, IAccessor, IAccessorDefault,
+        IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
         ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
         ERROR_UNSUPPORTED_SOCKET_FAMILY,
     };

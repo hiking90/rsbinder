@@ -1515,9 +1515,8 @@ impl IServiceManager for ServiceManager {
     fn getConnectionInfo(
         &self,
         arg_name: &str,
-    ) -> rsbinder::BinderResult<
-        Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
-    > {
+    ) -> rsbinder::BinderResult<Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+    {
         self.require(Permission::Find, arg_name)?;
         Ok(self
             .enforcer
@@ -1739,9 +1738,8 @@ impl IServiceManager for ServiceManager {
 
     fn getServiceDebugInfo(
         &self,
-    ) -> rsbinder::BinderResult<
-        Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>,
-    > {
+    ) -> rsbinder::BinderResult<Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+    {
         self.require(Permission::List, "")?;
 
         // See `listServices`: snapshot under the lock, filter outside it.

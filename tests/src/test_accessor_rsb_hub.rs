@@ -12,7 +12,7 @@
 //!      rsb_hub's `addService` inspects
 //!      `service.descriptor() == "android.os.IAccessor"` and stamps
 //!      `is_accessor = true`.
-//!   2. This test process calls `crate::lookup::get_service(instance)`.
+//!   2. This test process calls `hub::try_get_service(instance)`.
 //!      rsb_hub's `getService2` sees the flag and returns
 //!      `Service::Accessor(Some(binder))` — distinct from the regular
 //!      `ServiceWithMetadata` wrap.
@@ -81,13 +81,15 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
     //                    → rsb_hub returns `Service::Accessor(Some(_))`
     //                    → consume-side `resolve_accessor_arm` bridges to RPC
     //                    → returns the RPC root binder.
-    let root = crate::lookup::get_service(INSTANCE).unwrap_or_else(|| {
-        panic!(
-            "crate::lookup::get_service({INSTANCE:?}) returned None — \
-             is the accessor server bin running and has it called \
-             `hub::add_service` yet? rsb_hub also needs to be up."
-        )
-    });
+    let root = hub::try_get_service(INSTANCE)
+        .expect("service manager")
+        .unwrap_or_else(|| {
+            panic!(
+                "hub::try_get_service({INSTANCE:?}) returned None — \
+                 is the accessor server bin running and has it called \
+                 `hub::add_service` yet? rsb_hub also needs to be up."
+            )
+        });
 
     // The accessor arm wraps the consumed RPC connection in an
     // `RpcProxy`; downcasting is the canonical way to use the

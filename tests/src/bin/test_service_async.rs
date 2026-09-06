@@ -472,8 +472,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn GetCallback(
         &self,
         return_null: bool,
-    ) -> rsbinder::BinderResult<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>
-    {
+    ) -> rsbinder::BinderResult<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>> {
         if return_null {
             Ok(None)
         } else {

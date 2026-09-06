@@ -1545,8 +1545,8 @@ impl Parcel {
         // width per monomorphization), so a little-endian build emits the
         // memcpy alone — this loop is not in it.
         if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
-            for chunk in self.data.as_mut_slice()[pos..pos + size]
-                .chunks_exact_mut(std::mem::size_of::<S>())
+            for chunk in
+                self.data.as_mut_slice()[pos..pos + size].chunks_exact_mut(std::mem::size_of::<S>())
             {
                 chunk.reverse();
             }
@@ -2855,7 +2855,10 @@ mod wire_golden {
         // IEEE-754 bit patterns, byte-reversed: 1.0f32 = 0x3F80_0000.
         assert_eq!(enc(&1.0f32), [0x00, 0x00, 0x80, 0x3F]);
         assert_eq!(enc(&-2.0f32), [0x00, 0x00, 0x00, 0xC0]);
-        assert_eq!(enc(&1.0f64), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]);
+        assert_eq!(
+            enc(&1.0f64),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
+        );
     }
 
     #[test]
@@ -2923,10 +2926,7 @@ mod wire_golden {
         // the one that catches a native-endian `u16` view; an ASCII-only
         // corpus cannot.
         assert_eq!(enc("한"), [0x01, 0x00, 0x00, 0x00, 0x5C, 0xD5, 0x00, 0x00]);
-        assert_eq!(
-            enc(""),
-            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        );
+        assert_eq!(enc(""), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         assert_eq!(enc(&None::<String>), [0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
@@ -3028,7 +3028,11 @@ mod data_serde {
     fn a_value_survives_the_round_trip_and_encodes_the_same_way_twice() {
         let value: Vec<i32> = vec![1, -2, 0x0102_0304];
         let bytes = to_bytes(&value).unwrap();
-        assert_eq!(bytes, to_bytes(&value).unwrap(), "encoding is deterministic");
+        assert_eq!(
+            bytes,
+            to_bytes(&value).unwrap(),
+            "encoding is deterministic"
+        );
         assert_eq!(from_bytes::<Vec<i32>>(&bytes).unwrap(), value);
 
         let text = String::from("한 quiet");
