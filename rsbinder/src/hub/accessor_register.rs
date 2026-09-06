@@ -457,7 +457,7 @@ use std::sync::{Arc, OnceLock, Weak};
 /// `name`, try the next provider in the registry".
 ///
 /// `Send + Sync` so the registry can be walked under a mutex by any
-/// thread issuing a `hub::get_service` lookup; the closure should be
+/// thread issuing a `hub::try_get_service` lookup; the closure should be
 /// idempotent across threads (lookup dispatches without re-locking
 /// the registry — see `IServiceManager.cpp:286-291` snapshot pattern).
 pub type AccessorProviderFn = Box<dyn Fn(&str) -> Option<crate::binder::SIBinder> + Send + Sync>;
@@ -514,7 +514,7 @@ fn is_instance_provided_locked(entries: &[AccessorProviderEntry], instance: &str
 /// `Err(StatusCode::BadValue)` (AOSP `ALOGE`+empty-weak).
 ///
 /// The provider closure must be `Send + Sync` — it is invoked from
-/// whatever thread services a `hub::get_service` fallback.
+/// whatever thread services a `hub::try_get_service` fallback.
 pub fn add_accessor_provider(
     instances: HashSet<String>,
     provider: AccessorProviderFn,
@@ -634,7 +634,7 @@ impl Drop for AccessorProviderHandle {
 /// trying to backfill).
 ///
 /// Consumed by [`resolve_via_process_local`] (the fallback the public
-/// `hub::get_service` arm uses) and by the hermetic tests.
+/// `hub::try_get_service` arm uses) and by the hermetic tests.
 /// `pub(crate)` keeps all callers inside the crate.
 pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBinder> {
     // Snapshot of `Arc<AccessorProviderFn>` for entries that include

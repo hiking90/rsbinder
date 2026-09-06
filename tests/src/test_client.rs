@@ -1,5 +1,6 @@
 #![allow(non_snake_case, dead_code, unused_imports, unused_macros, deprecated)]
 
+use crate::lookup;
 use env_logger::Env;
 
 pub use rsbinder::*;
@@ -60,7 +61,7 @@ fn init_test() {
 
 fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
     init_test();
-    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor()).unwrap_or_else(
+    lookup::get_interface(<BpTestService as ITestService::ITestService>::descriptor()).unwrap_or_else(
         |_| {
             panic!(
                 "did not get binder service: {}",
@@ -1325,7 +1326,7 @@ fn test_default_impl() {
 fn test_versioned_interface_version() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let version = service.getInterfaceVersion();
@@ -1340,7 +1341,7 @@ fn test_versioned_interface_version() {
 fn test_versioned_interface_hash() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let hash = service.getInterfaceHash();
@@ -1358,7 +1359,7 @@ fn test_versioned_interface_hash() {
 fn test_versioned_known_union_field_is_ok() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     assert_eq!(
@@ -1381,7 +1382,7 @@ fn test_calling_v2_api_triggers_error() {
     // Connect the V2 proxy (which has `newApi`) to the *V1* service. Calling
     // the V2-only `newApi()` hits an unknown transaction code on the V1 Bn.
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(FOO_V1_SERVICE_NAME).expect("did not get binder service");
+        lookup::get_interface(FOO_V1_SERVICE_NAME).expect("did not get binder service");
 
     let ret = service.newApi();
     assert_eq!(
@@ -1409,7 +1410,7 @@ use trunk_v2_gen::android::aidl::test::trunk::ITrunkStableTest::{
 
 fn get_trunk_service() -> rsbinder::Strong<dyn ITrunkStableTestV2> {
     init_test();
-    hub::get_interface(<BpTrunkStableTest as ITrunkStableTestV2>::descriptor())
+    lookup::get_interface(<BpTrunkStableTest as ITrunkStableTestV2>::descriptor())
         .expect("did not get trunk binder service")
 }
 
@@ -1586,7 +1587,7 @@ fn test_trunk_stable_callback() {
 // fn test_versioned_unknown_union_field_triggers_error() {
 //     init_test();
 //     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-//         hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+//         lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
 //             .expect("did not get binder service");
 
 //     let ret = service.acceptUnionAndReturnString(&BazUnion::LongNum(42));
@@ -1611,7 +1612,7 @@ fn test_trunk_stable_callback() {
 fn test_array_of_parcelable_with_new_field() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let foos = [Default::default(), Default::default(), Default::default()];
@@ -1627,7 +1628,7 @@ fn test_array_of_parcelable_with_new_field() {
 fn test_read_data_correctly_after_parcelable_with_new_field() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let in_foo = Default::default();
@@ -1745,7 +1746,7 @@ impl INestedService::ICallback::ICallback for Callback {
     ignore = "requires /dev/binder"
 )]
 fn test_nested_type() {
-    let service: rsbinder::Strong<dyn INestedService::INestedService> = hub::get_interface(
+    let service: rsbinder::Strong<dyn INestedService::INestedService> = lookup::get_interface(
         <INestedService::BpNestedService as INestedService::INestedService>::descriptor(),
     )
     .expect("did not get binder service");
@@ -1940,7 +1941,7 @@ macro_rules! test_repeat_fixed_size_array_2d_binder {
 fn test_fixed_size_array_over_binder() {
     let test_service = get_test_service();
     let service: rsbinder::Strong<dyn IRepeatFixedSizeArray> =
-        hub::get_interface(<BpRepeatFixedSizeArray as IRepeatFixedSizeArray>::descriptor())
+        lookup::get_interface(<BpRepeatFixedSizeArray as IRepeatFixedSizeArray>::descriptor())
             .expect("did not get binder service");
 
     test_repeat_fixed_size_array!(service, RepeatBytes, [1u8, 2u8, 3u8]);
@@ -2092,7 +2093,7 @@ fn test_death_recipient() {
     ignore = "requires /dev/binder"
 )]
 fn test_hub() {
-    hub::get_service(ITestService::BpTestService::descriptor()).unwrap();
+    lookup::get_service(ITestService::BpTestService::descriptor()).unwrap();
     let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
     assert!(list
         .iter()
@@ -2149,7 +2150,7 @@ fn test_concurrent_service_resolution_slow_path_no_deadlock() {
     for _ in 0..N {
         let tx = tx.clone();
         joins.push(std::thread::spawn(move || {
-            tx.send(hub::get_service(name))
+            tx.send(lookup::get_service(name))
                 .expect("result channel must not drop");
         }));
     }
@@ -2231,7 +2232,7 @@ fn test_issue_47_cached_interface_string() {
     // First pass: get services and record their descriptors
     println!("\n=== First Pass: Recording service descriptors ===");
     for service_name in all_services.iter().take(10) {
-        if let Some(service) = hub::get_service(service_name) {
+        if let Some(service) = lookup::get_service(service_name) {
             let descriptor = service.descriptor().to_string();
 
             println!("Service '{}' -> descriptor: '{}'", service_name, descriptor);
@@ -2248,7 +2249,7 @@ fn test_issue_47_cached_interface_string() {
     let mut bug_detected = false;
 
     for (service_name, expected_descriptor) in &service_descriptors {
-        if let Some(service) = hub::get_service(service_name) {
+        if let Some(service) = lookup::get_service(service_name) {
             let actual_descriptor = service.descriptor();
 
             println!(
@@ -2360,7 +2361,7 @@ fn test_binder_extension_none_from_remote() {
     init_test();
     // The versioned service does NOT set any extension
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
 
     let ext = service.as_binder().get_extension();
@@ -2402,7 +2403,7 @@ fn test_binder_extension_proxy_cache_with_ext() {
 fn test_binder_extension_proxy_cache_without_ext() {
     init_test();
     let service: rsbinder::Strong<dyn IFooInterface::IFooInterface> =
-        hub::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
+        lookup::get_interface(<BpFooInterface as IFooInterface::IFooInterface>::descriptor())
             .expect("did not get binder service");
     let binder = service.as_binder();
 
@@ -2587,8 +2588,8 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
         handles.push(std::thread::spawn(move || {
             for i in 0..K {
                 let svc: rsbinder::Strong<dyn ITestService::ITestService> =
-                    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-                        .expect("hub::get_interface must succeed");
+                    lookup::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
+                        .expect("lookup::get_interface must succeed");
                 let binder1 = svc.as_binder();
                 let actual = binder1.descriptor().to_string();
                 assert_eq!(
@@ -2603,8 +2604,8 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
                 // concurrent lookups yielding live Arcs share the
                 // same allocation.
                 let svc2: rsbinder::Strong<dyn ITestService::ITestService> =
-                    hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-                        .expect("hub::get_interface must succeed (second lookup)");
+                    lookup::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
+                        .expect("lookup::get_interface must succeed (second lookup)");
                 assert_eq!(
                     svc.as_binder(),
                     svc2.as_binder(),
@@ -2652,8 +2653,8 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
 
     for round in 0..50 {
         let svc: rsbinder::Strong<dyn ITestService::ITestService> =
-            hub::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
-                .expect("hub::get_interface must succeed");
+            lookup::get_interface(<BpTestService as ITestService::ITestService>::descriptor())
+                .expect("lookup::get_interface must succeed");
         let descriptor = svc.as_binder().descriptor().to_string();
         assert_eq!(
             descriptor, canonical,
@@ -2733,7 +2734,7 @@ fn test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works() {
     // `checkService`/`getService` delivers the handle anew and gives
     // the new proxy a transactable kernel strong ref.
     let resolved: rsbinder::Strong<dyn ITestService::ITestService> =
-        hub::get_interface(&canonical).expect("re-resolve by name must succeed");
+        lookup::get_interface(&canonical).expect("re-resolve by name must succeed");
     assert_eq!(
         resolved.as_binder().descriptor(),
         canonical,
@@ -3286,7 +3287,7 @@ fn test_shared_memory_window_over_kernel_binder() {
     use rsbinder::shared_memory::{BpMemory, IMemory, IMemoryHeap};
     init_test();
 
-    let binder = hub::get_service("rsbinder.test.shm").expect("rsbinder.test.shm registered");
+    let binder = lookup::get_service("rsbinder.test.shm").expect("rsbinder.test.shm registered");
     let bp = BpMemory::new(binder);
     let heap = bp
         .resolve()
@@ -3307,7 +3308,7 @@ fn test_shared_memory_window_over_kernel_binder() {
     // Our write is visible through a second, independent mapping obtained
     // via a fresh proxy (new HEAP_ID round-trip, new fd, new mmap).
     bp.write_at(64, b"client-wrote").unwrap();
-    let bp2 = BpMemory::new(hub::get_service("rsbinder.test.shm").unwrap());
+    let bp2 = BpMemory::new(lookup::get_service("rsbinder.test.shm").unwrap());
     let heap2 = bp2.resolve().unwrap();
     assert!(!Arc::ptr_eq(&heap, &heap2));
     assert_ne!(heap.heap_id(), heap2.heap_id());
@@ -3331,7 +3332,7 @@ fn test_shared_memory_window_over_kernel_binder() {
 fn stage3_cpp_imemory_client_marker_visible() {
     use rsbinder::shared_memory::BpMemory;
     init_test();
-    let bp = BpMemory::new(hub::get_service("rsbinder.test.shm").expect("rsbinder.test.shm"));
+    let bp = BpMemory::new(lookup::get_service("rsbinder.test.shm").expect("rsbinder.test.shm"));
     bp.resolve().unwrap();
     let marker = b"cpp-client-wrote";
     let mut buf = vec![0u8; marker.len()];
@@ -3348,7 +3349,7 @@ fn stage3_cpp_imemory_client_marker_visible() {
 fn stage3_cpp_memory_heap_server_readable() {
     use rsbinder::shared_memory::{BpMemory, IMemory, IMemoryHeap};
     init_test();
-    let bp = BpMemory::new(hub::get_service("rsbinder.test.cppshm").expect("rsbinder.test.cppshm"));
+    let bp = BpMemory::new(lookup::get_service("rsbinder.test.cppshm").expect("rsbinder.test.cppshm"));
     let heap = bp
         .resolve()
         .expect("GET_MEMORY + HEAP_ID against libbinder");
@@ -3362,7 +3363,7 @@ fn stage3_cpp_memory_heap_server_readable() {
     bp.read_at(0, &mut buf).unwrap();
     assert_eq!(&buf, pattern);
     bp.write_at(64, b"rust-client-wrote").unwrap();
-    let bp2 = BpMemory::new(hub::get_service("rsbinder.test.cppshm").unwrap());
+    let bp2 = BpMemory::new(lookup::get_service("rsbinder.test.cppshm").unwrap());
     bp2.resolve().unwrap();
     let mut back = [0u8; 17];
     bp2.read_at(64, &mut back).unwrap();

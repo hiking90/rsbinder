@@ -72,7 +72,7 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
     #[cfg(target_os = "android")]
     {
         let manager_name = "manager";
-        let binder = hub::get_service(manager_name);
+        let binder = crate::lookup::get_service(manager_name);
         assert!(binder.is_some());
 
         let binder = hub::check_service(manager_name);
@@ -80,7 +80,7 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
     }
 
     let unknown_name = "unknown_service";
-    let binder = hub::get_service(unknown_name);
+    let binder = crate::lookup::get_service(unknown_name);
     assert!(binder.is_none());
     let binder = hub::check_service(unknown_name);
     assert!(binder.is_none());

@@ -133,8 +133,9 @@ fn main() {
             },
             // `get` is the half that may start a declared service;
             // `find` (checkService) must never have that side effect.
-            #[allow(deprecated)]
-            "get" => match hub::get_service(arg) {
+            // `try_get_service` is the `getService` wire call, which is
+            // what carries that side effect.
+            "get" => match hub::try_get_service(arg).ok().flatten() {
                 Some(_) => "OK",
                 None => "NOTFOUND",
             },

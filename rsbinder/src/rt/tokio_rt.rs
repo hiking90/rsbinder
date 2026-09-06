@@ -42,25 +42,29 @@
 use crate::{hub, BinderAsyncPool, BinderAsyncRuntime, BoxFuture, FromIBinder, StatusCode, Strong};
 use std::future::Future;
 
-/// Retrieve an existing service for a particular interface — a single
-/// `getService` wire call on Android 11+ (see [`crate::hub::get_interface`]).
-/// For an event-driven wait use [`crate::hub::wait_for_interface`]; for a
-/// non-blocking lookup use [`crate::hub::check_interface`].
+/// Retrieve an existing service for a particular interface — one
+/// `getService` wire call, which does not block (see
+/// [`crate::hub::try_get_interface`]). For an event-driven wait use
+/// [`crate::hub::wait_for_interface`]; for a lookup that will not start an
+/// unregistered lazy service, [`crate::hub::check_interface`].
 ///
 /// The `_async` suffix is what tells the two apart at the crate root: the
 /// synchronous lookups live in [`crate::hub`], and only this one has to be
 /// awaited. It matches [`crate::connect_async`], the facade entry point.
-#[allow(deprecated)] // wraps the deprecated single-shot hub::get_interface
 pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {
+    fn lookup<T: FromIBinder + ?Sized + 'static>(name: &str) -> Result<Strong<T>, StatusCode> {
+        hub::try_get_interface::<T>(name)?.ok_or(StatusCode::NameNotFound)
+    }
+
     if crate::is_handling_transaction() {
         // See comment in the BinderAsyncPool impl.
-        return hub::get_interface::<T>(name);
+        return lookup::<T>(name);
     }
 
     let name = name.to_string();
-    let res = tokio::task::spawn_blocking(move || hub::get_interface::<T>(&name)).await;
+    let res = tokio::task::spawn_blocking(move || lookup::<T>(&name)).await;
 
     // The `is_panic` branch is not actually reachable in Android as we compile
     // with `panic = abort`.

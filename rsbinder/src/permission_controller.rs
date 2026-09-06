@@ -6,7 +6,7 @@
 //!
 //! rsbinder provides the **client side only** — the server lives in
 //! Android's `system_server`. Consumers acquire a proxy via
-//! [`crate::hub::get_service`]`("permission")` then cast through
+//! [`crate::hub::try_get_service`]`("permission")` then cast through
 //! [`crate::permission_controller::IPermissionController`].
 //!
 //! The wire descriptor is `"android.os.IPermissionController"`, generated
@@ -17,7 +17,7 @@
 //!
 //! On non-Android targets (Linux + binderfs without an Android
 //! userspace, or macOS), `system_server` does not exist — the helpers
-//! still compile but [`crate::hub::get_service`] returns `None` and the
+//! still compile but [`crate::hub::try_get_service`] returns `None` and the
 //! [`crate::permission_controller::check_permission`] convenience
 //! returns `false` (fail-closed).
 
@@ -39,7 +39,7 @@ use crate::error::Result;
 use crate::{hub, Caller, FromIBinder, Parcel, Strong};
 
 /// Service name registered by Android's `PermissionManagerService`. Used
-/// as the key for [`crate::hub::get_service`].
+/// as the key for [`crate::hub::try_get_service`].
 pub const SERVICE_NAME: &str = "permission";
 
 /// An injectable, **transport-aware** authorization policy (Plan 2-16
@@ -91,10 +91,14 @@ pub fn clear_permission_authority() {
 /// `FromIBinder` cast (descriptor mismatch).
 ///
 /// This is a thin wrapper; consumers needing custom error mapping or
-/// caching should call [`crate::hub::get_service`] directly.
-#[allow(deprecated)] // single-shot lookup of the permission service is intended
+/// caching should call [`crate::hub::try_get_service`] directly.
 pub fn default() -> Result<Strong<dyn IPermissionController>> {
-    let binder = hub::get_service(SERVICE_NAME).ok_or(crate::StatusCode::NameNotFound)?;
+    // Single-shot on purpose: a permission check must not block, and a
+    // service manager that cannot be reached is a different failure from
+    // a permission service that is not registered — `try_get_service`
+    // keeps the two apart where the old single-shot lookup flattened
+    // both to `None`.
+    let binder = hub::try_get_service(SERVICE_NAME)?.ok_or(crate::StatusCode::NameNotFound)?;
     <dyn IPermissionController>::try_from(binder)
 }
 

@@ -1109,8 +1109,6 @@ pub fn rsbinder::hub::ServiceManager::check_interface<T: rsbinder::FromIBinder +
 pub fn rsbinder::hub::ServiceManager::check_service(&self, &str) -> core::option::Option<rsbinder::SIBinder>
 pub fn rsbinder::hub::ServiceManager::get_connection_info(&self, &str) -> core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>
 pub fn rsbinder::hub::ServiceManager::get_declared_instances(&self, &str) -> alloc::vec::Vec<alloc::string::String>
-pub fn rsbinder::hub::ServiceManager::get_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::hub::ServiceManager::get_service(&self, &str) -> core::option::Option<rsbinder::SIBinder>
 pub fn rsbinder::hub::ServiceManager::get_service_debug_info(&self) -> rsbinder::Result<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
 pub fn rsbinder::hub::ServiceManager::is_declared(&self, &str) -> bool
 pub fn rsbinder::hub::ServiceManager::list_services(&self, i32) -> alloc::vec::Vec<alloc::string::String>
@@ -1290,8 +1288,6 @@ pub fn rsbinder::hub::check_service(&str) -> core::option::Option<rsbinder::SIBi
 pub fn rsbinder::hub::default() -> rsbinder::Result<alloc::sync::Arc<rsbinder::hub::ServiceManager>>
 pub fn rsbinder::hub::get_connection_info(&str) -> core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>
 pub fn rsbinder::hub::get_declared_instances(&str) -> alloc::vec::Vec<alloc::string::String>
-pub fn rsbinder::hub::get_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::hub::get_service(&str) -> core::option::Option<rsbinder::SIBinder>
 pub fn rsbinder::hub::get_service_debug_info() -> rsbinder::Result<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
 pub fn rsbinder::hub::is_declared(&str) -> bool
 pub fn rsbinder::hub::list_services(i32) -> alloc::vec::Vec<alloc::string::String>

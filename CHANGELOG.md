@@ -242,6 +242,23 @@ short form — and the first entry is the only one no compiler will catch.
 - **`rsbinder::get_interface` is now `rsbinder::get_interface_async`.** It is
   the tokio one, and nothing in the old name said so while `hub::get_interface`
   sat beside it, synchronous. Matches `connect_async`.
+- **`hub::get_service` / `get_interface` and the two `ServiceManager` methods
+  of the same names are removed** (deprecated since 0.10.0). The replacement
+  is **`try_get_service` / `try_get_interface`**, which issue the same
+  `getService` wire call and therefore behave identically on Android 11+ and
+  on Linux — including letting the service manager start an unregistered
+  lazy service, which `check_service` does *not* do. They differ only in
+  returning the failure instead of flattening it:
+
+  | Was | Now |
+  |---|---|
+  | `hub::get_service(n)` | `hub::try_get_service(n).ok().flatten()` |
+  | `hub::get_interface::<T>(n)` | `hub::try_get_interface::<T>(n)?.ok_or(StatusCode::NameNotFound)` |
+
+  What you lose is the Android 10 client-side ~5s poll, which is the reason
+  these were deprecated: the wait was inconsistent across versions and
+  invisible in the name. If you want it, ask for it — `wait_for_service` /
+  `wait_for_interface` block until the service appears, on every version.
 - **An fd written to an RPC parcel with no negotiated fd mode now fails with
   `FdsNotAllowed`, not `BadType`.** Observable to an RPC peer, and a fidelity
   fix: AOSP's `Parcel::writeFileDescriptor` answers `FDS_NOT_ALLOWED` for
