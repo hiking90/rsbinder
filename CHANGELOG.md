@@ -242,6 +242,17 @@ short form — and the first entry is the only one no compiler will catch.
 - **`rsbinder::get_interface` is now `rsbinder::get_interface_async`.** It is
   the tokio one, and nothing in the old name said so while `hub::get_interface`
   sat beside it, synchronous. Matches `connect_async`.
+- **An fd written to an RPC parcel with no negotiated fd mode now fails with
+  `FdsNotAllowed`, not `BadType`.** Observable to an RPC peer, and a fidelity
+  fix: AOSP's `Parcel::writeFileDescriptor` answers `FDS_NOT_ALLOWED` for
+  exactly this condition (`FileDescriptorTransportMode::NONE`;
+  android-15.0.0_r36 and android-16.0.0_r4 alike). The old code was faithful
+  to android-13.0.0_r84, which rejected every fd on an RPC parcel with a
+  blanket `if (isForRpc()) return BAD_TYPE;` — a shape from before
+  fd-over-RPC existed and one rsbinder no longer implements. A binder
+  written to a parcel with no session stays `BadType`; that condition has no
+  AOSP counterpart, and `InvalidOperation` is already spoken for by the
+  cross-stack refusal, where it matches AOSP.
 - **Test- and fuzz-only entry points need a feature.** The nine `__fuzz_*`
   decoders now need `fuzzing`, and `RpcSession::__slot_count`,
   `__incoming_thread_*` and `RpcServer::__set_attach_shutdown_probe` need

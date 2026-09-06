@@ -2039,10 +2039,11 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 /// # Errors
 ///
 /// A binder or a file descriptor cannot be encoded — neither means
-/// anything outside the process that produced it, and there is no
-/// session here to marshal a binder through — so a value containing one
-/// is `Err(BadType)` rather than bytes that would be a lie. Nothing else
-/// fails.
+/// anything outside the process that produced it — so a value containing
+/// one is refused rather than turned into bytes that would be a lie:
+/// `FdsNotAllowed` for a file descriptor, matching what AOSP returns for
+/// a session that permits none, and `BadType` for a binder, which has no
+/// session here to be marshalled through. Nothing else fails.
 ///
 /// # Byte order
 ///
@@ -2066,8 +2067,8 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 ///   as a different type, and returning the value anyway would hide
 ///   that.
 /// - `BadType` — the input claims to contain a binder or a file
-///   descriptor. Such bytes are never turned into an object; the
-///   decoder has no object table and refuses outright.
+///   descriptor. Such bytes are never turned into an object; the decoder
+///   has no object table and refuses outright.
 #[cfg(feature = "rpc")]
 pub fn from_bytes<T: Deserialize>(bytes: &[u8]) -> Result<T> {
     let mut parcel = Parcel::from_slice(bytes);
@@ -3088,7 +3089,7 @@ mod data_serde {
         let pfd = crate::ParcelFileDescriptor::new(file);
 
         let mut parcel = Parcel::new_data_only();
-        assert_eq!(parcel.write(&pfd), Err(StatusCode::BadType));
+        assert_eq!(parcel.write(&pfd), Err(StatusCode::FdsNotAllowed));
         assert!(
             pfd.as_raw_fd() >= 0,
             "the caller's fd is untouched by the refusal"

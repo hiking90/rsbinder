@@ -65,9 +65,12 @@ So a value containing one is refused at the point it is written — before any
 `dup` — rather than encoded:
 
 ```rust
-// Err(StatusCode::BadType); the file descriptor is never duplicated.
+// Err(StatusCode::FdsNotAllowed); the file descriptor is never duplicated.
 let bytes = rsbinder::to_bytes(&value_with_an_fd)?;
 ```
+
+A binder is `BadType` rather than `FdsNotAllowed` — the two conditions are
+distinct, and the codes match what Android's `libbinder` returns for each.
 
 The refusal runs in the other direction too. Bytes that merely *look* like a
 binder object are never turned into one: the decoder has no object table to

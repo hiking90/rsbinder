@@ -125,8 +125,21 @@ enum RpcFdProfile {
     V1Plus,
 }
 
-/// `None` ⇒ not an RPC parcel. `Err(BadType)` ⇒ RPC parcel whose
-/// negotiated fd mode forbids fds (the default, android-12/13 fidelity).
+/// `None` ⇒ not an RPC parcel. `Err(FdsNotAllowed)` ⇒ RPC parcel whose
+/// negotiated fd mode forbids fds — the default, and what AOSP returns
+/// for the same condition:
+///
+/// ```text
+/// case RpcSession::FileDescriptorTransportMode::NONE: {
+///     ALOGE("FDs are not allowed in this RpcSession. ...");
+///     return FDS_NOT_ALLOWED;
+/// }
+/// ```
+///
+/// (`Parcel::writeFileDescriptor`, android-16.0.0_r4; identical in
+/// android-15.0.0_r36.) android-13.0.0_r84 answered `BAD_TYPE` here, but
+/// that was a blanket `if (isForRpc())` rejection from before fd-over-RPC
+/// existed — a shape this code does not implement.
 #[cfg(feature = "rpc")]
 fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
     use crate::rpc::FileDescriptorTransportMode as M;
@@ -134,7 +147,7 @@ fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
         return Ok(None);
     }
     match parcel.rpc_fd_mode() {
-        M::None => Err(StatusCode::BadType),
+        M::None => Err(StatusCode::FdsNotAllowed),
         M::Unix if parcel.rpc_record_fd_positions() => Ok(Some(RpcFdProfile::V1Plus)),
         M::Unix => Ok(Some(RpcFdProfile::V0)),
     }
