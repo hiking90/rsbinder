@@ -130,7 +130,7 @@ enum RpcFdProfile {
 #[cfg(feature = "rpc")]
 fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
     use crate::rpc::FileDescriptorTransportMode as M;
-    if !parcel.is_for_rpc() {
+    if parcel.is_kernel_backed() {
         return Ok(None);
     }
     match parcel.rpc_fd_mode() {

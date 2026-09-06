@@ -2368,7 +2368,7 @@ impl RpcSessionInner {
                 // only at v2 (`>= INCLUDES_BINDER_POSITIONS`). null
                 // binders (`TYPE_BINDER_NULL`, the `None` arm) get no
                 // position. `rpc_record_object_position` is itself
-                // hard-gated on `is_for_rpc`, so the kernel wire can
+                // refused on a kernel-backed parcel, so the kernel wire can
                 // never grow a table.
                 let obj_pos = parcel.data_position();
                 parcel.write(&1i32)?;

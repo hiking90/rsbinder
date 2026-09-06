@@ -497,9 +497,9 @@ impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         // RPC mode: marshal as `RpcAddress` via the attached session
         // hooks, not `flat_binder_object`. Kernel path below is
-        // byte-identical when `is_for_rpc == false`.
+        // byte-identical on a driver-backed parcel.
         #[cfg(feature = "rpc")]
-        if parcel.is_for_rpc() {
+        if !parcel.is_kernel_backed() {
             let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
             return ops.write_binder(this, parcel);
         }
@@ -563,9 +563,9 @@ impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         // RPC mode: unmarshal from `RpcAddress` via the attached
         // session hooks. The kernel `flat_binder_object`
-        // path below is byte-identical when `is_for_rpc == false`.
+        // path below is byte-identical on a driver-backed parcel.
         #[cfg(feature = "rpc")]
-        if parcel.is_for_rpc() {
+        if !parcel.is_kernel_backed() {
             let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
             return ops.read_binder(parcel);
         }

@@ -393,7 +393,7 @@ fn rpc_mode_parcel_rejects_file_descriptor() {
     use std::fs::File;
 
     let mut p = Parcel::new();
-    p.set_for_rpc(true);
+    p.__set_for_rpc(true);
     let pfd = ParcelFileDescriptor::new(File::open("/dev/null").expect("/dev/null"));
     let err = p
         .write(&pfd)
@@ -402,7 +402,7 @@ fn rpc_mode_parcel_rejects_file_descriptor() {
 
     // Kernel-mode parcel still accepts an FD (no regression).
     let mut k = Parcel::new();
-    assert!(!k.is_for_rpc());
+    assert!(k.is_kernel_backed());
     let pfd2 = ParcelFileDescriptor::new(File::open("/dev/null").expect("/dev/null"));
     k.write(&pfd2).expect("kernel-mode FD write still works");
 }

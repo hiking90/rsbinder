@@ -221,7 +221,7 @@ pub mod {{mod}} {
     /// `P` selects the async pool that drives the underlying blocking transact;
     /// with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
     /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
-    /// directly via `rsbinder::get_interface::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// directly via `rsbinder::get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
     /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
     /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
     /// for `Tokio`, `tokio`) feature.

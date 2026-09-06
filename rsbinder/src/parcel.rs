@@ -354,7 +354,7 @@ pub(crate) type FnFreeBuffer =
 /// `rpc` module's session/state. When a `Parcel` is in RPC mode the
 /// `SIBinder` (de)serializers route through these hooks instead of the
 /// kernel `flat_binder_object` path — the kernel path is byte-identical
-/// when `is_for_rpc == false`.
+/// on a kernel-backed parcel.
 #[cfg(feature = "rpc")]
 pub(crate) trait RpcParcelOps: Send + Sync {
     /// Marshal a possibly-null binder leaving this process: append the
@@ -375,8 +375,8 @@ pub(crate) trait RpcParcelOps: Send + Sync {
 /// table in [`Parcel::objects`], a wholly separate field, so only the
 /// RPC arm has to be bundled.
 ///
-/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode
-/// (the former `is_for_rpc == true`), `None` ⇒ kernel path,
+/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode,
+/// `None` ⇒ kernel path ([`Parcel::is_kernel_backed`]),
 /// byte-identical to the kernel wire. Tying every RPC field's
 /// existence to the mode flag in the type makes "RPC mode ⇒ RPC state
 /// present" an invariant the compiler enforces, instead of seven
@@ -506,8 +506,8 @@ pub struct Parcel {
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
     /// RPC serialization state, or `None` for the kernel path
-    /// (byte-identical to the kernel wire). `Some` is the former
-    /// `is_for_rpc == true`. Only object marshalling and the
+    /// (byte-identical to the kernel wire, and what
+    /// [`Parcel::is_kernel_backed`] reports). Only object marshalling and the
     /// object/FD lifetime branch on this; scalar/string/POD paths are
     /// unaffected. See [`RpcFields`].
     #[cfg(feature = "rpc")]
@@ -620,7 +620,7 @@ impl Parcel {
     /// marshalling and the object/FD lifetime branch on this — scalar,
     /// string and POD bytes are identical in both modes.
     #[cfg(feature = "rpc")]
-    pub fn set_for_rpc(&mut self, yes: bool) {
+    pub(crate) fn set_for_rpc(&mut self, yes: bool) {
         if yes {
             // Idempotent: preserve any RpcFields already configured
             // (e.g. via a prior `attach_rpc_ops`).
@@ -630,22 +630,49 @@ impl Parcel {
         }
     }
 
-    /// `true` if this parcel serializes binders/FDs the RPC way
-    /// (`RpcAddress` instead of `flat_binder_object`; FD rejected).
-    #[cfg(feature = "rpc")]
-    pub fn is_for_rpc(&self) -> bool {
-        self.rpc.is_some()
+    /// Test-only door to [`Parcel::set_for_rpc`], for a test in another
+    /// crate that needs a session-less RPC-mode parcel. Production code
+    /// reaches this mode through [`Parcel::attach_rpc_session`].
+    #[cfg(all(feature = "rpc", feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn __set_for_rpc(&mut self, yes: bool) {
+        self.set_for_rpc(yes)
     }
 
-    /// `false` always — without the `rpc` feature there is no RPC
-    /// serialization mode. This `cfg`-off arm exists so callers that
-    /// branch on transport (notably
-    /// [`crate::permission_controller::check_permission`], which denies
-    /// `@EnforcePermission` over RPC — Plan 2-16 Phase A) compile in any
-    /// feature configuration without a `cfg` of their own.
+    /// `true` if the kernel driver's object table backs this parcel —
+    /// binders travel as `flat_binder_object`, FDs as `BINDER_TYPE_FD`,
+    /// and a transaction on it carries a caller identity the kernel
+    /// vouched for.
+    ///
+    /// `false` for an RPC-mode parcel, whose binders are `RpcAddress`
+    /// values marshalled through the attached session, and for any other
+    /// parcel that is not driver-backed. Anything that must not trust a
+    /// caller identity should require this rather than exclude a
+    /// particular transport, so that a mode added later is refused by
+    /// default — see [`crate::permission_controller::check_permission`].
+    #[cfg(feature = "rpc")]
+    pub fn is_kernel_backed(&self) -> bool {
+        self.rpc.is_none()
+    }
+
+    /// `true` always — without the `rpc` feature the kernel driver is
+    /// the only thing that can back a parcel. This `cfg`-off arm exists
+    /// so callers that branch on it compile in any feature
+    /// configuration without a `cfg` of their own.
     #[cfg(not(feature = "rpc"))]
+    pub fn is_kernel_backed(&self) -> bool {
+        true
+    }
+
+    /// `true` if this parcel serializes binders/FDs the RPC way.
+    #[deprecated(
+        since = "0.11.0",
+        note = "renamed and inverted: use `!parcel.is_kernel_backed()`. The old name \
+                described one consumer of the mode rather than what the flag controls, \
+                and read fail-open at the one security branch that uses it."
+    )]
     pub fn is_for_rpc(&self) -> bool {
-        false
+        !self.is_kernel_backed()
     }
 
     /// Attach the RPC object-marshalling hooks and enter RPC mode
@@ -691,7 +718,7 @@ impl Parcel {
 
     /// The sorted object-position table (AOSP `mObjectPositions`),
     /// consumed by the wire codec as a trailing `u32[]`. Always empty
-    /// on the kernel path (`!is_for_rpc`) and when no RPC object was
+    /// on a kernel-backed parcel and when no RPC object was
     /// flattened — i.e. byte-identical to a wire with no object table.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_positions(&self) -> &[u32] {
@@ -703,7 +730,7 @@ impl Parcel {
     /// Install the object table that arrived with an incoming RPC
     /// parcel (AOSP `rpcSetDataReference`'s `mObjectPositions` copy),
     /// so the binder/FD deserializers can validate object positions.
-    /// No-op kernel-side (`!is_for_rpc`).
+    /// No-op on a kernel-backed parcel.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -757,7 +784,7 @@ impl Parcel {
     /// `Parcel::flattenBinder`/`writeFileDescriptor`:
     /// `mObjectPositions.insert(upper_bound(...), dataPos)`).
     ///
-    /// **Hard-gated on `is_for_rpc`**: a stray call on a kernel parcel
+    /// **Refused on a kernel-backed parcel**: a stray call there
     /// is a no-op, so the kernel wire can never grow an object table.
     /// The producer only calls this from the RPC `write_binder` /
     /// FD-write paths, and the caller decides *whether* to record
@@ -814,7 +841,7 @@ impl Parcel {
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
         // Only ever reached from the RPC `Unix` fd-write path (guarded
-        // by `is_for_rpc()` upstream), so RPC mode is a hard
+        // by `is_kernel_backed()` upstream), so RPC mode is a hard
         // precondition — a stray kernel-parcel call is a programming
         // error, and returning a bogus index would be worse than a
         // clear panic.
@@ -1603,8 +1630,8 @@ impl Parcel {
         // marshalled as `RpcAddress` and FDs are rejected upstream.
         // Write the bytes verbatim but never load the kernel offset
         // table or take a kernel `acquire()` — RPC has its own
-        // refcount. The kernel path below is byte-identical when
-        // `is_for_rpc == false`.
+        // refcount. The kernel path below is byte-identical on a
+        // kernel-backed parcel.
         #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             self.write_aligned(obj)?;
@@ -2499,7 +2526,7 @@ mod tests {
     /// (AOSP `dataPos = mDataPos` *before* `writeInt32(TYPE_*)`), the
     /// table stays **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
     /// dataPos)`) even when objects are recorded out of order, it is
-    /// hard-gated on `is_for_rpc` (kernel diff 0), and it
+    /// refused on a kernel-backed parcel (kernel diff 0), and it
     /// survives a v2 codec encode→decode with the AOSP `bodySize =
     /// fixed + parcelDataSize + 4·N` framing. Single / multiple /
     /// mixed (binder-shaped + FD-shaped) objects.
@@ -2512,7 +2539,7 @@ mod tests {
         // ---- kernel parcel: recording is a hard no-op ----
         let mut kparcel = Parcel::new();
         kparcel.write(&7i32).unwrap();
-        kparcel.rpc_record_object_position(0); // !is_for_rpc ⇒ ignored
+        kparcel.rpc_record_object_position(0); // kernel-backed ⇒ ignored
         assert!(
             kparcel.rpc_object_positions().is_empty(),
             "kernel parcel must never grow an object table"

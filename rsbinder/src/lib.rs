@@ -319,7 +319,7 @@ pub use proxy::{Proxy, ProxyHandle};
 // Explicit (not glob) so a newly-added `pub` item in `rt` can't silently leak
 // to the crate root without semver review — the policy stated above.
 #[cfg(feature = "tokio")]
-pub use rt::{get_interface, Tokio, TokioRuntime};
+pub use rt::{get_interface_async, Tokio, TokioRuntime};
 pub use status::{BinderResult, ExceptionCode, Status};
 
 /// Default path to the binder control device

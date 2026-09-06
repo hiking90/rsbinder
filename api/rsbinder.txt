@@ -2694,6 +2694,7 @@ pub fn rsbinder::Parcel::data_size(&self) -> usize
 pub unsafe fn rsbinder::Parcel::from_ipc_parts(*mut u8, usize, *mut std::os::raw::c_ulonglong, usize, fn(core::option::Option<&rsbinder::Parcel>, std::os::raw::c_ulonglong, usize, std::os::raw::c_ulonglong, usize) -> rsbinder::Result<()>) -> Self
 pub fn rsbinder::Parcel::has_more_data(&self) -> bool
 pub fn rsbinder::Parcel::is_for_rpc(&self) -> bool
+pub fn rsbinder::Parcel::is_kernel_backed(&self) -> bool
 pub fn rsbinder::Parcel::new() -> Self
 pub fn rsbinder::Parcel::read<D: rsbinder::Deserialize>(&mut self) -> rsbinder::Result<D>
 pub fn rsbinder::Parcel::read_bool(&mut self) -> rsbinder::Result<bool>
@@ -3821,7 +3822,7 @@ pub fn rsbinder::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CS
 pub fn rsbinder::get_calling_uid() -> std::os::raw::c_uint
 pub fn rsbinder::get_current_scheduler_policy() -> rsbinder::Result<i32>
 pub fn rsbinder::get_extended_error() -> rsbinder::Result<rsbinder::thread_state::ExtendedError>
-pub async fn rsbinder::get_interface<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
+pub async fn rsbinder::get_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub fn rsbinder::get_strict_mode_policy() -> i32
 pub fn rsbinder::has_explicit_identity() -> bool
 pub fn rsbinder::is_handling_transaction() -> bool

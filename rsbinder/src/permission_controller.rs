@@ -118,12 +118,14 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// path [`crate::get_calling_uid`] is not populated, so it would read `0`
 /// (= root) — and `PermissionManagerService` *unconditionally grants
 /// root*. That would turn every guarded method into a **silent grant to
-/// any anonymous RPC peer**. To prevent this, when `reader` is an RPC
-/// parcel ([`Parcel::is_for_rpc`]) this returns `false` **before any uid
-/// read or PMS lookup**, regardless of process shape, and emits a
-/// one-time `warn`. The deny is therefore independent of whether uid is
-/// later wired over Unix RPC (Plan 2-16 Phase B): `is_for_rpc()` stays
-/// `true` no matter what uid is populated.
+/// any anonymous RPC peer**. To prevent this, unless the kernel driver
+/// backs `reader` ([`Parcel::is_kernel_backed`]) this returns `false`
+/// **before any uid read or PMS lookup**, regardless of process shape,
+/// and emits a one-time `warn`. Requiring kernel backing rather than
+/// excluding one transport is what makes it fail closed: a mode added
+/// later is denied until someone decides otherwise. The deny is
+/// therefore independent of whether uid is later wired over Unix RPC
+/// (Plan 2-16 Phase B) — no uid makes an RPC parcel kernel-backed.
 ///
 /// RPC services needing authorization must use transport-native means
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
@@ -165,11 +167,13 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
             .is_some_and(|caller| authority.check(permission_name, &caller));
     }
 
-    // Default (no authority). RPC fail-closed: deny before reading uid or
-    // reaching PMS — uid 0 on the RPC path would otherwise read as root and
-    // PMS grants root. The deny is transport-driven (the reader knows it is
-    // an RPC parcel), so it is independent of Plan 2-16 Phase B uid wiring.
-    if reader.is_for_rpc() {
+    // Default (no authority). Fail-closed: without the kernel driver
+    // behind the parcel there is no caller identity to trust, so deny
+    // before reading uid or reaching PMS — uid 0 on the RPC path would
+    // otherwise read as root and PMS grants root. Requiring kernel
+    // backing rather than excluding RPC means a transport added later is
+    // denied by default too. Independent of Plan 2-16 Phase B uid wiring.
+    if !reader.is_kernel_backed() {
         warn_enforce_permission_over_rpc();
         return false;
     }
@@ -253,7 +257,7 @@ mod tests {
         let mut rpc_parcel = Parcel::new();
         rpc_parcel.set_for_rpc(true);
         // Inside a (simulated) RPC transaction, so `is_handling_transaction()`
-        // is `true` and only the `is_for_rpc` gate can produce the denial.
+        // is `true` and only the kernel-backing gate can produce the denial.
         let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
         assert!(crate::is_handling_transaction());
         assert!(
@@ -262,9 +266,9 @@ mod tests {
         );
 
         // Sanity: a kernel parcel takes the non-RPC branch (it does not
-        // short-circuit on `is_for_rpc`).
+        // short-circuit on the kernel-backing gate).
         let kernel_parcel = Parcel::new();
-        assert!(!kernel_parcel.is_for_rpc());
+        assert!(kernel_parcel.is_kernel_backed());
     }
 
     /// Plan 2-16 Phase C: an installed [`PermissionAuthority`] owns the

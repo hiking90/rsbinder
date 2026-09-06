@@ -10,7 +10,7 @@
 //! `get_calling_uid()` reads `0` (= root), and Android's
 //! `PermissionManagerService` *unconditionally grants root* — turning a
 //! guarded method into a grant to any anonymous RPC peer. The deny is
-//! transport-driven (`reader.is_for_rpc()` in
+//! transport-driven (`!reader.is_kernel_backed()` in
 //! `permission_controller::check_permission`), so it fires **before** any
 //! uid read or PMS lookup, independent of process shape and of any future
 //! uid wiring (Phase B).
