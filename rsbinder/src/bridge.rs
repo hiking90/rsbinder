@@ -128,6 +128,39 @@ fn take_removed(entries: &mut HashMap<usize, Entry>, insert: Option<(usize, Entr
     removed
 }
 
+/// Unlink every entry that left the table, finishing the list even when one
+/// entry's proxy panics.
+///
+/// Abandoning the rest is the damage worth avoiding: nothing prunes a dead
+/// `Weak` from a proxy's recipient list, and `link_to_death` queues
+/// `BC_REQUEST_DEATH_NOTIFICATION` only while that list is empty — so one
+/// skipped unlink silently costs an unrelated later caller its death
+/// notification on that proxy. A panic here is reachable without a bug in
+/// this file: `ProxyHandle::link_to_death` holds its `recipients` write guard
+/// across `talk_with_driver`, which panics if the driver under-consumes, and
+/// that poisons the guard so every later unlink on that proxy panics too.
+///
+/// `resume` re-raises the first panic once the list is finished, so a
+/// non-`Drop` caller still fails; `Drop` passes `false`, since unwinding out
+/// of a drop during another unwind aborts.
+fn unlink_all(dead: &[Entry], resume: bool) {
+    let mut first: Option<Box<dyn std::any::Any + Send>> = None;
+    for e in dead {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.unlink()))
+        {
+            log::error!("Rewrap: unlink panicked; a death link is left registered on the remote");
+            if first.is_none() {
+                first = Some(payload);
+            }
+        }
+    }
+    if let Some(payload) = first {
+        if resume {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 /// Removes one entry when its remote dies. Holds a `Weak` to the table so a
 /// live death link cannot keep the gateway's table alive.
 struct Reaper {
@@ -223,12 +256,9 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
             )),
         );
         drop(entries);
-        // Unlink outside the lock: it takes the proxy's recipient lock and
-        // can reach the driver, and R1 forbids holding a lock across a
-        // binder entry point.
-        for e in &dead {
-            e.unlink();
-        }
+        // Unlink outside the lock: it takes the proxy's recipient lock and can
+        // reach the driver, and this `Mutex` is not reentrant.
+        unlink_all(&dead, true);
         local
     }
 
@@ -246,9 +276,7 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
             let mut entries = self.entries.lock().expect("rewrap table poisoned");
             take_removed(&mut entries, None)
         };
-        for e in &dead {
-            e.unlink();
-        }
+        unlink_all(&dead, true);
         dead.len()
     }
 
@@ -288,16 +316,9 @@ impl<I: FromIBinder + ?Sized> Drop for Rewrap<I> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             entries.drain().map(|(_, e)| e).collect()
         };
-        for e in &dead {
-            // A panic out of `unlink` (poisoned proxy lock, driver, thread-local
-            // teardown) would abort under an unwind and skip the rest. Catching
-            // it leaves that entry's link registered on the remote, so log it.
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.unlink())).is_err() {
-                log::error!(
-                    "Rewrap::drop: unlink panicked; a death link is left registered on the remote"
-                );
-            }
-        }
+        // `false`: a panic must not leave this `Drop`, or an unwind already in
+        // progress would abort the process.
+        unlink_all(&dead, false);
     }
 }
 
@@ -316,4 +337,127 @@ impl<I: FromIBinder + ?Sized> std::fmt::Debug for Rewrap<I> {
 // the allocation.
 fn key_of(binder: &SIBinder) -> usize {
     Arc::as_ptr(binder.as_arc()) as *const () as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binder::{IBinder, Stability};
+    use std::mem::ManuallyDrop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A binder whose `unlink_to_death` either counts the call or panics —
+    /// standing in for a proxy whose `recipients` lock has been poisoned by an
+    /// earlier driver panic, which is how this is reachable in production.
+    struct Unlinkable {
+        panics: bool,
+        unlinked: Arc<AtomicUsize>,
+    }
+
+    impl IBinder for Unlinkable {
+        fn link_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> crate::Result<()> {
+            Ok(())
+        }
+        fn unlink_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> crate::Result<()> {
+            assert!(!self.panics, "injected unlink panic");
+            self.unlinked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn ping_binder(&self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn crate::Transactable> {
+            None
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.IUnlinkable"
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+        fn stability(&self) -> Stability {
+            Stability::default()
+        }
+        fn inc_strong(&self, _: &SIBinder) -> crate::Result<()> {
+            Ok(())
+        }
+        fn attempt_inc_strong(&self) -> bool {
+            true
+        }
+        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> crate::Result<()> {
+            Ok(())
+        }
+        fn inc_weak(&self, _: &WIBinder) -> crate::Result<()> {
+            Ok(())
+        }
+        fn dec_weak(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn entry(panics: bool, unlinked: &Arc<AtomicUsize>) -> (SIBinder, Entry) {
+        let b = SIBinder::new(Arc::new(Unlinkable {
+            panics,
+            unlinked: unlinked.clone(),
+        }))
+        .expect("SIBinder::new");
+        let e = Entry {
+            remote: SIBinder::downgrade(&b),
+            local: SIBinder::downgrade(&b),
+            reaper: Arc::new(Reaper {
+                table: std::sync::Weak::new(),
+                key: 0,
+            }),
+        };
+        // The caller keeps the strong `SIBinder` alive so `unlink`'s
+        // `remote.upgrade()` succeeds.
+        (b, e)
+    }
+
+    /// One entry panicking must not cost the rest their unlink. Nothing prunes
+    /// a dead `Weak` from a proxy's recipient list, so a skipped unlink
+    /// silently blocks a later `link_to_death` from subscribing.
+    #[test]
+    fn unlink_all_finishes_the_list_after_a_panic() {
+        let unlinked = Arc::new(AtomicUsize::new(0));
+        let (_k0, e0) = entry(false, &unlinked);
+        let (_k1, e1) = entry(true, &unlinked); // panics
+        let (_k2, e2) = entry(false, &unlinked);
+        let dead = vec![e0, e1, e2];
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unlink_all(&dead, true)));
+        std::panic::set_hook(prev);
+
+        assert!(out.is_err(), "resume=true must re-raise the entry's panic");
+        assert_eq!(
+            unlinked.load(Ordering::SeqCst),
+            2,
+            "the entries either side of the panicking one must still be unlinked"
+        );
+    }
+
+    /// `Drop` swallows the panic instead: unwinding out of a drop that is
+    /// itself running during an unwind aborts the process.
+    #[test]
+    fn unlink_all_swallows_the_panic_for_drop() {
+        let unlinked = Arc::new(AtomicUsize::new(0));
+        let (_k0, e0) = entry(true, &unlinked); // panics first
+        let (_k1, e1) = entry(false, &unlinked);
+        let dead = vec![e0, e1];
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unlink_all(&dead, false)));
+        std::panic::set_hook(prev);
+
+        assert!(out.is_ok(), "resume=false must not propagate");
+        assert_eq!(unlinked.load(Ordering::SeqCst), 1);
+    }
 }
