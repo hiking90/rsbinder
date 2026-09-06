@@ -215,11 +215,30 @@ impl Server {
     /// Publish `svc` under `name`. Kernel: registered with the system
     /// service manager immediately. RPC: queued and registered in the
     /// server's directory when it starts.
+    ///
+    /// An RPC endpoint refuses a **remote** binder with
+    /// [`StatusCode::InvalidOperation`]: a proxy cannot be re-published on a
+    /// socket server, because the binder that would leave this process is the
+    /// proxy itself and no stack accepts one from the other (see the
+    /// [gateway section] of the book — wrap it in a `Bn*` instead:
+    /// `BnFoo::new_binder(proxy)`). The kernel arm still accepts a *kernel*
+    /// proxy — re-registering one with the system service manager is a
+    /// legitimate use — but an RPC proxy is refused there too, by the same
+    /// stack-boundary check, when the registration parcel is written.
+    ///
+    /// [gateway section]: https://hiking90.github.io/rsbinder/cross-transport-services.html
     pub fn add(mut self, name: &str, svc: impl Into<SIBinder>) -> Result<Self> {
         let binder = svc.into();
         if self.uri.endpoint.is_kernel() {
             crate::hub::add_service(name, binder).map_err(StatusCode::from)?;
         } else {
+            if (*binder).is_remote() {
+                log::error!(
+                    "serve(...).add({name}): refusing a remote binder on an RPC endpoint; \
+                     wrap it in a local Bn* (gateway) instead"
+                );
+                return Err(StatusCode::InvalidOperation);
+            }
             self.pending.push((name.to_string(), binder));
         }
         Ok(self)

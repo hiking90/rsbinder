@@ -277,7 +277,7 @@ fn make_root() -> SIBinder {
 /// server session so the caller can assert node accounting.
 fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
-    server.set_root(make_root());
+    server.set_root(make_root()).expect("set_root");
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
         let _ = server_for_thread.serve_blocking();
@@ -347,7 +347,7 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
 
     let (a, b) = MemTransport::pair();
     let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("RpcSession::new");
-    server.set_root(make_root());
+    server.set_root(make_root()).expect("set_root");
     let h = thread::spawn(move || {
         let _ = server.serve_blocking();
     });

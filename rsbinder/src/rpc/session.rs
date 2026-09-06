@@ -2340,6 +2340,13 @@ impl RpcSessionInner {
                     // Pinned in the parcel past the send, so its DEC_STRONG cannot precede the reply that names it.
                     parcel.rpc_pin_binder(b.clone());
                     rp.address()
+                } else if (**b).is_remote() {
+                    // AOSP `RpcState::onBinderLeaving`: "Cannot send binder proxy
+                    // over sockets" → `INVALID_OPERATION`. The `RpcProxy` arm above
+                    // has already consumed every RPC-backed remote, so a binder that
+                    // still reports `is_remote()` here is a kernel proxy.
+                    log::error!("RPC: cannot send a kernel binder proxy over sockets");
+                    return Err(StatusCode::InvalidOperation);
                 } else {
                     // A local object leaving this process: `on_binder_leaving`
                     // bumps its `timesSent`. Record the address so a send
@@ -3959,8 +3966,13 @@ impl RpcSession {
     }
 
     /// Publish the server's root object (returned by `get_root`).
-    pub fn set_root(&self, binder: SIBinder) {
+    ///
+    /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`] — see
+    /// [`RpcServer::add_service`](crate::rpc::RpcServer::add_service).
+    pub fn set_root(&self, binder: SIBinder) -> Result<()> {
+        super::refuse_remote(&binder, "RpcSession::set_root")?;
         *self.inner.shared.root.lock().expect("root poisoned") = Some(binder);
+        Ok(())
     }
 
     /// Client: fetch the peer's root object as an [`RpcProxy`]-backed

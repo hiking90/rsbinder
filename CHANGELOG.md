@@ -24,6 +24,11 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **`RpcServer::set_root` / `RpcSession::set_root` return `Result<()>`.** They
+  now refuse a *remote* binder (see *Changed*), so they have a value to
+  report. An unused `Result` is only a warning, so a build without
+  `-D warnings` still compiles and the refusal goes unnoticed: add `?` or
+  `.expect(...)` at every call. Nothing else about them changed.
 - **`rpc::transport::TlsStream` gained a required `shutdown_stream()`.**
   Custom stream implementations must add
   `fn shutdown_stream(&self) -> std::io::Result<()>` (shut the underlying
@@ -203,6 +208,28 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Added
 
+- **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
+  `Interface` (delegating to the binder it holds), and generated interfaces —
+  from `.aidl` and from `#[interface]` alike — implement themselves for
+  `Strong<dyn IFoo>`, so a proxy satisfies `BnFoo::new_binder`'s bound:
+  `serve(uri)?.add("foo", BnFoo::new_binder(upstream_proxy))?` re-publishes a
+  service reached over one transport onto another. `getInterfaceVersion` /
+  `getInterfaceHash` report the *upstream's* values, not the delegating
+  module's. Binder-typed arguments still have to be re-wrapped by hand — see
+  the book's [cross-transport chapter], which also covers what stops at a
+  gateway (caller identity, fd rights, uid, death, one worker per forwarded
+  call), and `example-hello`'s new `gateway_service` binary.
+
+  [cross-transport chapter]: https://hiking90.github.io/rsbinder/cross-transport-services.html
+- **`rsbinder::bridge::Rewrap`** — one local wrapper per remote binder, for
+  gateways that forward a binder *argument*. Re-wrapping inline
+  (`BnCallback::new_binder(cb.clone())`) is correct per call and wrong across
+  calls: it mints a new object each time, so an upstream that pairs
+  `register(cb)` with `unregister(cb)` by identity never matches the second.
+  `Rewrap::new(BnCallback::new_binder)` then `.wrap(cb)` returns the
+  same object for the same live remote. It holds only weak references, so it
+  never keeps a wrapper alive; entries go when the remote dies (death
+  notification), when the wrapper is dropped, or on `purge_dead()`.
 - **rsbinder (RPC):** client-side **incoming (callback) connections** —
   `RpcUnixClientConfig::incoming_connections(n)`,
   `RpcSession::add_incoming_connection_android13plus_with_config`, and
@@ -486,6 +513,26 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Changed
 
+- **rsbinder:** writing a binder that belongs to the *other* IPC stack — an
+  RPC proxy into a kernel parcel, or a kernel proxy into an RPC parcel — is
+  now refused at **write time** with `InvalidOperation`, matching libbinder
+  (`Parcel::flattenBinder`, `RpcState::onBinderLeaving`). It used to be
+  accepted and then fail on the receiver's *first call* with
+  `UnknownTransaction`, which pointed at the wrong process. rsbinder already
+  refused the third case libbinder does (a proxy from an unrelated RPC
+  session); that check is now pinned by a test. Registration refuses the same
+  mistake up front: `serve(rpc://…).add`, `RpcServer::add_service`,
+  `RpcServer::set_root` and `RpcSession::set_root` reject a remote binder. To
+  re-publish a service reached over one transport on another, wrap the proxy
+  in a local `Bn*` — `BnFoo::new_binder(proxy)`, the gateway pattern — rather
+  than forwarding the binder itself. Kernel `hub::add_service` still takes a
+  *kernel* proxy — re-registering one with the system service manager is
+  legitimate — but an RPC proxy is refused there too, by the write-time check
+  above.
+- **`RpcServer::set_root` and `RpcSession::set_root` return `Result<()>`**
+  (was `()`), so they can report the refusal above. Callers passing a local
+  binder are unaffected apart from handling the value — `?` in a function
+  that returns `Result`, `.expect("set_root")` in a test.
 - **rsbinder (RPC):** a non-nested call on a session with no connection to
   send on — a server calling a client callback outside any handler, the
   client having opened no incoming connection — now fails immediately with

@@ -166,6 +166,8 @@ pub mod binder_async;
 mod binder_object;
 /// BinderFS filesystem utilities
 pub mod binderfs;
+/// Helpers for a process bridging two transports (the gateway pattern)
+pub mod bridge;
 /// Error types and result handling
 pub mod error;
 /// File descriptor wrapper for IPC

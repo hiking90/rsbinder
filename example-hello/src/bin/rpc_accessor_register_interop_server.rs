@@ -159,7 +159,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(&sock_path);
     let server: Arc<RpcServer> = RpcServer::setup_unix_server(&sock_path)?;
     server.set_android13plus(max_version);
-    server.set_root(Interface::as_binder(&Binder::new(Interop)));
+    server.set_root(Interface::as_binder(&Binder::new(Interop)))?;
     let _bg = server.run_background();
 
     // 4) IAccessor binder via `LocalAccessor` (AOSP `createAccessor`

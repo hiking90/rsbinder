@@ -372,10 +372,12 @@ fn boot(tag: &str) -> Booted {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     let delay_entered = Arc::new(AtomicBool::new(false));
     let delay_done = Arc::new(AtomicI64::new(0));
-    server.set_root(make_service(
-        Arc::clone(&delay_entered),
-        Arc::clone(&delay_done),
-    ));
+    server
+        .set_root(make_service(
+            Arc::clone(&delay_entered),
+            Arc::clone(&delay_done),
+        ))
+        .expect("set_root");
     let bg = server.run_background();
     let cu = ServeCleanup {
         server: Arc::clone(&server),

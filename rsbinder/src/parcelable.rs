@@ -491,6 +491,19 @@ impl SerializeOption for SIBinder {
 
         match this {
             Some(binder) => {
+                // AOSP `Parcel::flattenBinder`: "Sending a socket binder over
+                // kernel binder is prohibited" → `INVALID_OPERATION`. Must stay
+                // *before* `binder.into()`, which calls `ProcessState::as_self()`
+                // and would panic in a pure-RPC process that never initialized it.
+                #[cfg(feature = "rpc")]
+                if (**binder)
+                    .as_any()
+                    .downcast_ref::<crate::rpc::RpcProxy>()
+                    .is_some()
+                {
+                    log::error!("Sending a socket (RPC) binder over kernel binder is prohibited");
+                    return Err(StatusCode::InvalidOperation);
+                }
                 parcel.write::<flat_binder_object>(&binder.into())?;
                 if crate::sdk_at_least(30) {
                     parcel.write::<i32>(&binder.stability().into())?;

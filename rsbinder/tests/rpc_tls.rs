@@ -146,9 +146,11 @@ fn tls_valid_cert_e2e_and_peer_identity() {
         let t = TlsTransport::accept(tcp, srv_cfg).expect("server handshake");
         let session =
             RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
-        session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-            PingSvc,
-        )))));
+        session
+            .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+                PingSvc,
+            )))))
+            .expect("set_root");
         let _ = session.serve_blocking();
     });
 
@@ -189,9 +191,11 @@ fn tls_over_unix_socket_e2e() {
             .expect("server TLS handshake over unix");
         let session =
             RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
-        session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-            PingSvc,
-        )))));
+        session
+            .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+                PingSvc,
+            )))))
+            .expect("set_root");
         let _ = session.serve_blocking();
     });
 
@@ -381,9 +385,11 @@ fn setup_tcp_client_tls_convenience_e2e() {
         let t = TlsTransport::accept(tcp, srv_cfg).expect("server handshake");
         let session =
             RpcSession::new(Box::new(t), AddressSpace::Acceptor).expect("RpcSession::new");
-        session.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-            PingSvc,
-        )))));
+        session
+            .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+                PingSvc,
+            )))))
+            .expect("set_root");
         let _ = session.serve_blocking();
     });
 
@@ -659,9 +665,11 @@ fn setup_tcp_server_tls_e2e() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
     let server =
         RpcServer::setup_tcp_server_tls("127.0.0.1:0", srv_cfg).expect("setup_tcp_server_tls");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     let addr = server.tcp_address().expect("tcp_address");
     // Accessor gates: tcp_address Some, path None.
     assert!(server.path().is_none(), "TCP server has no fs path");
@@ -716,9 +724,11 @@ fn vsock_tls_loopback_e2e() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
     let server = RpcServer::setup_vsock_server_tls(VMADDR_CID_LOCAL, TLS_TEST_PORT, srv_cfg)
         .expect("setup_vsock_server_tls");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     assert_eq!(
         server.vsock_address(),
         Some((VMADDR_CID_LOCAL, TLS_TEST_PORT))
@@ -794,9 +804,11 @@ fn setup_unix_server_tls_e2e() {
     };
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
     let server = RpcServer::setup_unix_server_tls(&path, srv_cfg).expect("setup_unix_server_tls");
-    server.set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
-        PingSvc,
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
     assert_eq!(
         server.path(),
         Some(path.as_path()),

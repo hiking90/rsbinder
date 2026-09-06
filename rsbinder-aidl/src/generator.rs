@@ -570,6 +570,32 @@ pub mod {{mod}} {
         }
         {%- endfor %}
     }
+    /// A typed handle implements the interface it points at, so a proxy can be
+    /// re-published as a local service on another transport in one line:
+    /// `{{ bn_name }}::new_binder(upstream)` (the **gateway** pattern —
+    /// `new_binder` takes any `T: {{ name }} + Send + Sync + 'static`).
+    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+    /// forwarded as-is is refused at the stack boundary.
+    impl {{ name }} for {{crate}}::Strong<dyn {{ name }}> {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+            (**self).r#{{ member.identifier }}({{ member.func_call_params }})
+        }
+        {%- endfor %}
+        {%- if version %}
+        // Report the *upstream* version, not this module's constant: a gateway
+        // speaks for the service it fronts. The trait's default body would
+        // silently answer with `VERSION` if this override were dropped.
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
+            (**self).r#getInterfaceVersion()
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
+            (**self).r#getInterfaceHash()
+        }
+        {%- endif %}
+    }
     fn on_transact(
         _service: &dyn {{ name }}, _code: {{crate}}::TransactionCode, _reader: &mut {{crate}}::Parcel, _reply: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
         match _code {

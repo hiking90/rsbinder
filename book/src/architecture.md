@@ -115,5 +115,10 @@ canonical example):
   even need the `rpc` Cargo feature). Mixing the two costs only what
   each side already costs in isolation — there is no shared singleton
   between them.
+- **Binder objects do not cross between the two.** Writing a proxy of one
+  stack into a parcel of the other is refused with `InvalidOperation`
+  (AOSP does the same). To let a client of one stack reach a service on
+  the other, use an Accessor or a gateway —
+  [Cross-Transport Services § Bridging](./cross-transport-services.md).
 
 See [RPC Transport](./rpc-transport.md) for the full story.

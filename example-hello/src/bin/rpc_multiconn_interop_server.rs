@@ -260,7 +260,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         oneway_log: Mutex::new(Vec::new()),
         in_flight: AtomicI32::new(0),
         sched: Arc::new(Mutex::new(None)),
-    })));
+    })))?;
 
     println!("[rsbinder-server] READY v2 max_threads={max_threads} on {sock}");
     // Block in the accept loop; the launcher drives every transact.

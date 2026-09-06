@@ -121,7 +121,7 @@ fn pair_with_root(root: SIBinder) -> (RpcSession, RpcSession, UnixStream) {
     let st = UnixTransport::from_stream(a).expect("transport");
     let ct = UnixTransport::from_stream(b).expect("transport");
     let server = RpcSession::new(Box::new(st), AddressSpace::Acceptor).expect("server");
-    server.set_root(root);
+    server.set_root(root).expect("set_root");
     let client = RpcSession::new(Box::new(ct), AddressSpace::Initiator).expect("client");
     (server, client, server_dup)
 }
@@ -291,7 +291,9 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
     ));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
-    server.set_root(Interface::as_binder(&Binder::new(Holder::default())));
+    server
+        .set_root(Interface::as_binder(&Binder::new(Holder::default())))
+        .expect("set_root");
     let bg = server.run_background();
     for _ in 0..400 {
         if path.exists() {

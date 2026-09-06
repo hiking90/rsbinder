@@ -1249,6 +1249,51 @@ impl<I: FromIBinder + ?Sized> Deref for Strong<I> {
     }
 }
 
+/// A typed handle is itself an [`Interface`], forwarding to the binder it
+/// holds.
+///
+/// This is what lets a **gateway** — a process that re-publishes a service it
+/// reached over one transport onto another — be one line. `Bn*::new_binder`
+/// accepts any `T: IFoo + Send + Sync + 'static`, and the AIDL generator emits
+/// `impl IFoo for Strong<dyn IFoo>` (every method forwarding through `Deref`),
+/// so `BnFoo::new_binder(proxy)` wraps a remote proxy in a *local* binder that
+/// this process owns and can publish anywhere:
+///
+/// ```ignore
+/// // B: reached C over the kernel; re-publishes it on a socket.
+/// let upstream: Strong<dyn IFoo> = rsbinder::connect("binder://my.foo")?;
+/// rsbinder::serve("unix:///tmp/gw.sock")?
+///     .add("foo", BnFoo::new_binder(upstream))?
+///     .run()?;
+/// ```
+///
+/// The `Interface` half has to live here rather than beside the generated
+/// `impl`: `Strong` is an rsbinder type, so a user crate writing
+/// `impl Interface for Strong<dyn IFoo>` violates the orphan rule (E0117 —
+/// `Strong` is not `#[fundamental]`). The generated interface `impl` is fine
+/// there because `IFoo` is local to the user's crate.
+///
+/// Note `as_binder` on a handle wrapping a **proxy** returns that *remote*
+/// binder. Serializing the handle directly therefore hands the proxy to the
+/// parcel, which the stack-boundary check refuses — wrapping it in a `Bn*` is
+/// exactly what makes it publishable. See the book's
+/// [cross-transport chapter](https://hiking90.github.io/rsbinder/cross-transport-services.html).
+///
+/// `dump` forwards to the handle's target, but a *proxy* target has no
+/// `Interface::dump` of its own (remote dump is
+/// [`ProxyHandle::dump`](crate::ProxyHandle::dump), a different signature — an
+/// fd, not a writer), so it takes the trait's no-op default: a dump sent to a
+/// gateway succeeds and returns nothing. Dump the upstream service directly.
+impl<I: FromIBinder + ?Sized> Interface for Strong<I> {
+    fn as_binder(&self) -> SIBinder {
+        (**self).as_binder()
+    }
+
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
+        (**self).dump(writer, args)
+    }
+}
+
 impl<I: FromIBinder + Debug + ?Sized> Debug for Strong<I> {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         Debug::fmt(&**self, f)

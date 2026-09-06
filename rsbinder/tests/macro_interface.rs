@@ -240,6 +240,40 @@ fn macro_interface_descriptor_is_the_attribute_value() {
     );
 }
 
+/// AC-22.9. `#[interface]` renders through the same generator as `.aidl`
+/// (plan 2-19 D1), so the delegating `impl IFoo for Strong<dyn IFoo>` is
+/// there too — a proxy satisfies `Bn*::new_binder`'s bound and the
+/// gateway spelling compiles and forwards on this path as well.
+#[test]
+fn macro_interface_gateway_republishes_a_proxy() {
+    let up = SockPath::new("gwup");
+    let down = SockPath::new("gwdown");
+
+    let _c = rsbinder::serve(&up.uri(""))
+        .expect("serve")
+        .add(
+            "echo",
+            BnMacroEcho::new_binder(Echo {
+                pinged: Arc::new(Mutex::new(0)),
+            }),
+        )
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    let upstream: Strong<dyn IMacroEcho> = rsbinder::connect(&up.uri("#echo")).expect("connect");
+    let _b = rsbinder::serve(&down.uri(""))
+        .expect("serve")
+        .add("echo", BnMacroEcho::new_binder(upstream))
+        .expect("the macro path yields the same one-line gateway")
+        .spawn()
+        .expect("spawn");
+
+    let via: Strong<dyn IMacroEcho> = rsbinder::connect(&down.uri("#echo")).expect("connect");
+    assert_eq!(via.echo("hi").unwrap(), "echo:hi");
+    assert_eq!(via.add(40, 2).unwrap(), 42);
+}
+
 #[test]
 fn macro_interface_can_reference_itself() {
     let sock = SockPath::new("chain");

@@ -112,9 +112,11 @@ let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |
 ```
 
 `ServeOptions`: `threads`, `max_connections`, `handshake_timeout`,
-`idle_timeout`, `authorizer`, `tls`, `fd_modes`, `call_restriction`.
+`idle_timeout`, `reply_timeout`, `authorizer`, `tls`, `fd_modes`,
+`call_restriction`.
 `ClientOptions`: `tls` / `tls_server_name`, `session_id`,
-`outgoing_connections`, `fd_mode`, `timeout`, `driver`.
+`outgoing_connections`, `incoming_connections`, `fd_mode`, `timeout`,
+`handshake_timeout`, `driver`.
 
 `Client::open_with`'s closure also receives the parsed `Endpoint`, so an
 option that applies to only some transports is set from the endpoint rather
@@ -133,6 +135,111 @@ An option that does not apply to the transport (a TLS config on
 `run`/`spawn`/`open` time**, with a log line naming the option — never
 silently ignored. Users who want that checked at compile time use the
 low-level types directly.
+
+## Bridging two transports in one process
+
+Everything above moves *one* service onto whichever transport you pick. A
+different problem is reaching a service that lives on the *other* transport
+— a socket client that needs a kernel service, or the reverse. rsbinder has
+three answers, and which one applies depends on the direction:
+
+| Direction | Mechanism | Where |
+|---|---|---|
+| kernel client → socket service | **Accessor** (`IAccessor`, Android 16 / `rsb_hub`) — the service manager hands the client a connection to the socket | [RPC Transport § Bridging](./rpc-transport.md) |
+| one service, both transports | **dual-hosting** — the same `Bn*` passed to two `serve(...).add(...)` calls | this chapter |
+| socket client → kernel service | **gateway** — a process that re-publishes an upstream proxy as a local service | below |
+
+None of the three moves raw bytes between the stacks. A binder that belongs
+to one stack **cannot be written into a parcel of the other**: rsbinder
+refuses it at write time with `InvalidOperation`, exactly as libbinder does
+(`Parcel::flattenBinder`, `RpcState::onBinderLeaving`). There is no
+transparent bridge, and building one is a non-goal — a generic byte
+forwarder would silently change the caller identity, fd rights, stability
+and oneway ordering that the two stacks define differently.
+
+### The gateway
+
+A gateway process B connects to the upstream service C and publishes it
+again on its own endpoint. Because `Bn*::new_binder` accepts anything
+implementing the interface, and a typed handle implements the interface it
+points at, that is one line:
+
+```rust
+// B: reach C over kernel binder, re-publish it on a Unix socket.
+let upstream: Strong<dyn IHello> = rsbinder::connect("binder://my.hello")?;
+
+rsbinder::serve("unix:///tmp/rsb_gw.sock")?
+    .add("hello", BnHello::new_binder(upstream))?   // <- the gateway
+    .run()?;
+```
+
+Passing the *proxy* instead — `.add("hello", upstream.as_binder())` — is the
+mistake this refuses (`InvalidOperation` at `add`). Wrapping is not
+ceremony: the `Bn*` is a **local** binder that B owns, and that is what
+makes it publishable.
+
+**The rule: every binder object crossing B is unwrapped by B and wrapped
+again. Plain data flows through untouched.** So a method with a binder
+argument — a callback registration, say — needs B to override just that
+method and re-wrap the argument before forwarding it:
+
+```rust
+fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+    self.upstream.register(&BnCallback::new_binder(cb.clone()))
+}
+```
+
+Forwarding `cb` as-is fails with `InvalidOperation`, reported back to the
+original caller.
+
+That inline `new_binder` is correct for one call and wrong across calls:
+each one mints a *new* object, so `register(cb)` and `unregister(cb)` reach C
+as two unrelated binders and the removal matches nothing.
+[`bridge::Rewrap`](https://docs.rs/rsbinder/latest/rsbinder/bridge/struct.Rewrap.html)
+is the table that fixes it — same remote in, same local out:
+
+```rust
+struct Gateway {
+    upstream: Strong<dyn IFoo>,
+    callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
+}
+
+fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+    self.upstream.register(&self.callbacks.wrap(cb))
+}
+fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+    self.upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+}
+```
+
+It holds only weak references, so it never keeps a wrapper alive: the
+wrapper lives as long as C holds it, and the entry goes when the remote dies
+or the wrapper is dropped.
+
+What a gateway costs, all of it visible in B:
+
+- **Identity.** C sees *B* as its caller, not A. C's `@EnforcePermission`
+  checks pass with B's credentials, so authenticating A is B's job —
+  `ServeOptions::authorizer` on B's endpoint.
+- **File descriptors.** They only cross a Unix-domain link, and only with
+  FD passing negotiated on that hop.
+- **Uid.** Over TCP or vsock, B cannot learn A's uid at all.
+- **Plaintext TCP** is bring-up only; a real deployment uses TLS or a
+  Unix socket.
+- **Death.** There are now two lifetimes. A's proxy dies when B goes away;
+  B's upstream dies when C does. B does not forward one as the other.
+- **Threads.** Each forwarded call occupies one of B's RPC workers for the
+  whole upstream round trip — size `ServeOptions::threads` accordingly.
+
+`example-hello` ships a runnable one:
+
+```text
+cargo run -p example-hello --bin hello_service                 # C, on kernel binder
+cargo run -p example-hello --features rpc --bin gateway_service \
+    binder://my.hello unix:///tmp/rsb_gw.sock                  # B
+cargo run -p example-hello --features rpc --bin unified_client \
+    unix:///tmp/rsb_gw.sock                                    # A
+```
 
 ## What the URI does *not* hide
 

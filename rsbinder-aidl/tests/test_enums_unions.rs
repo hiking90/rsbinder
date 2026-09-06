@@ -417,6 +417,17 @@ pub mod ITestService {
             self.0.r#RepeatByteEnum(_arg_token)
         }
     }
+    /// A typed handle implements the interface it points at, so a proxy can be
+    /// re-published as a local service on another transport in one line:
+    /// `BnTestService::new_binder(upstream)` (the **gateway** pattern —
+    /// `new_binder` takes any `T: ITestService + Send + Sync + 'static`).
+    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+    /// forwarded as-is is refused at the stack boundary.
+    impl ITestService for rsbinder::Strong<dyn ITestService> {
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
+            (**self).r#RepeatByteEnum(_arg_token)
+        }
+    }
     fn on_transact(
         _service: &dyn ITestService, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
         match _code {

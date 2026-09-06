@@ -381,7 +381,9 @@ fn real_process_e2e_and_negotiation() {
     if let Ok(path) = std::env::var("RSB_RPC_SERVER") {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_max_threads(2);
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         let _ = server.run(); // blocks until killed
         std::process::exit(0);
     }
@@ -430,7 +432,9 @@ fn real_process_abstract_unix_socket_e2e() {
         let server = RpcServer::setup_unix_server_abstract(name.as_bytes()).expect("bind abstract");
         server.set_android13plus(2);
         server.set_max_threads(3);
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         let _ = server.run();
         std::process::exit(0);
     }
@@ -510,7 +514,9 @@ fn real_process_abstract_unix_socket_e2e() {
 fn concurrent_calls_single_shared_session() {
     let path = tmp_sock("shared");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -556,7 +562,9 @@ fn concurrent_calls_single_shared_session() {
 fn concurrent_clients_isolated_sessions() {
     let path = tmp_sock("iso");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -597,7 +605,9 @@ fn concurrent_clients_isolated_sessions() {
 fn max_connections_admission_bound() {
     let path = tmp_sock("admit");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     server.set_max_connections(2);
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -667,7 +677,9 @@ fn max_connections_admission_bound() {
 fn silent_r34_peer_released_by_handshake_deadline() {
     let path = tmp_sock("silent_r34");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     // One slot so a pinned silent peer is directly observable, and a short
     // deadline to keep the test fast + deterministic.
     server.set_max_connections(1);
@@ -706,7 +718,9 @@ fn oneway_fifo_and_nonblocking() {
     let path = tmp_sock("ow");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -747,7 +761,9 @@ fn oneway_fifo_and_nonblocking() {
 fn nested_callback_no_deadlock() {
     let path = tmp_sock("nest");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -777,7 +793,9 @@ fn nested_callback_no_deadlock() {
 fn client_timeout_on_hung_server() {
     let path = tmp_sock("to");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -827,7 +845,9 @@ fn android13plus_profile_e2e() {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(smax); // opt in to the versioned wire
         server.set_max_threads(2);
-        server.set_root(make_service(counter.clone()));
+        server
+            .set_root(make_service(counter.clone()))
+            .expect("set_root");
         let bg = server.run_background();
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
@@ -898,7 +918,9 @@ fn abstract_unix_socket_e2e() {
     let r34_name = format!("rsb_rpc_abs_r34_{}", std::process::id()).into_bytes();
     let server = RpcServer::setup_unix_server_abstract(&r34_name).expect("bind abstract r34");
     assert!(server.path().is_none());
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu_r34 = ServeCleanup {
         server: Arc::clone(&server),
@@ -915,7 +937,9 @@ fn abstract_unix_socket_e2e() {
     assert!(server.path().is_none());
     server.set_android13plus(2);
     server.set_max_threads(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu_a13 = ServeCleanup {
         server: Arc::clone(&server),
@@ -946,7 +970,9 @@ fn abstract_unix_socket_e2e() {
     let fan_server = RpcServer::setup_unix_server_abstract(&fan_name).expect("bind fan-out");
     fan_server.set_android13plus(2);
     fan_server.set_max_threads(3);
-    fan_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    fan_server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let fan_bg = fan_server.run_background();
     let _cu_fan = ServeCleanup {
         server: Arc::clone(&fan_server),
@@ -1036,7 +1062,7 @@ fn tls_android13plus_nested_callback_e2e() {
             let t = TlsTransport::accept(tcp, srv_cfg).expect("server TLS handshake");
             let session = RpcSession::accept_android13plus(Box::new(t), smax)
                 .expect("server android-13+ accept");
-            session.set_root(make_service(counter));
+            session.set_root(make_service(counter)).expect("set_root");
             let _ = session.serve_blocking();
         });
 
@@ -1102,7 +1128,9 @@ fn tls_android13plus_nested_callback_e2e() {
 fn r34_profile_reports_no_wire_version() {
     let path = tmp_sock("r34_ver");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1167,7 +1195,9 @@ fn a0b_multi_connection_shared_session() {
                                  // a multi-conn scenario, so AOSP `setMaxIncomingThreads(2)` is its
                                  // natural setup step.
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1331,7 +1361,9 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     server.set_android13plus(1);
     // Opt into 2 incoming slots (default 1 ⇒ founding-only).
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1422,7 +1454,9 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1509,7 +1543,9 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
     // N = 3 (founding + 2 fan-out attaches). Cap is server-side; the
     // helper learns it via `negotiate` and mints exactly N - 1 extras.
     server.set_max_threads(3);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1589,7 +1625,9 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     // Server is multi-conn-capable but the client opts out — fan-out
     // must NOT run regardless.
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1626,7 +1664,9 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let server2 = RpcServer::setup_unix_server(&path2).expect("bind");
     server2.set_android13plus(1);
     server2.set_max_threads(2);
-    server2.set_root(make_service(counter.clone()));
+    server2
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg2 = server2.run_background();
     let _cu2 = ServeCleanup::new(Arc::clone(&server2), bg2, path2.clone());
     wait_for_sock(&path2);
@@ -1658,7 +1698,9 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(4);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1738,7 +1780,9 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
     server.set_android13plus(1);
     // Founding + exactly one attach.
     server.set_max_threads(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1786,7 +1830,9 @@ fn attach_max_version_below_the_session_version_is_bad_type() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
     server.set_max_threads(3);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1825,7 +1871,9 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     let path = tmp_sock("profmix");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     // No `set_android13plus`: the default r34 wire.
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1854,7 +1902,9 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(3);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -1907,7 +1957,9 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     // increment of `rejected_unknown_id` we want to observe is the
     // shutdown-arm one.
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2021,7 +2073,9 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     server.set_android13plus(1);
     // Opt into 2 incoming slots (founding + attached).
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2106,7 +2160,9 @@ fn f7_excess_receipt_no_leak_single_client() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2175,7 +2231,9 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     // ⇒ 2 incoming slots at the server. Default cap = 1 would reject
     // the attach, defeating the pool-distribution scenario.
     server.set_max_threads(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2239,7 +2297,9 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     // 2 incoming slots (founding + attached); 3 client
     // threads observe the cv-wait band.
     server.set_max_threads(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2330,10 +2390,12 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     server.set_android13plus(1);
     // 2 incoming slots (founding + forced slot-2 echo).
     server.set_max_threads(2);
-    server.set_root(make_service_with_slow_signal(
-        Arc::new(AtomicI64::new(0)),
-        Arc::clone(&slow_entered),
-    ));
+    server
+        .set_root(make_service_with_slow_signal(
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&slow_entered),
+        ))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2401,7 +2463,9 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2458,7 +2522,9 @@ fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(2);
-    server.set_root(make_service(counter.clone()));
+    server
+        .set_root(make_service(counter.clone()))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -2678,7 +2744,9 @@ impl rsbinder::DeathRecipient for DeathFlag {
 fn rpc_death_recipient_fires_on_session_drop() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_SERVER") {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         let _ = server.run(); // blocks until killed
         std::process::exit(0);
     }
@@ -2773,7 +2841,9 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
     {
         let path = tmp_sock("authz_no");
         let server = RpcServer::setup_unix_server(&path).expect("bind");
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         server.set_authorizer(|_peer| false);
         let bg = server.run_background();
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -2791,7 +2861,9 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
     {
         let path = tmp_sock("authz_yes");
         let server = RpcServer::setup_unix_server(&path).expect("bind");
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         server.set_authorizer(|peer| matches!(peer, PeerIdentity::Local { .. }));
         let bg = server.run_background();
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -2871,7 +2943,7 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
     }
     server.set_max_threads(cfg.max_threads);
     let root_local = make_service_with_hold(Arc::new(AtomicI64::new(0)), Arc::clone(&held));
-    server.set_root(root_local.clone());
+    server.set_root(root_local.clone()).expect("set_root");
     let bg = server.run_background();
     let cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
@@ -3117,7 +3189,9 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let path2 = tmp_sock("hs_ok");
     let server = RpcServer::setup_unix_server(&path2).expect("bind");
     server.set_android13plus(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path2.clone());
     wait_for_sock(&path2);
@@ -3556,7 +3630,9 @@ fn c_server_death_is_eager_with_incoming() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(2);
-        server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
         let _ = server.run(); // blocks until killed
         std::process::exit(0);
     }
@@ -3640,10 +3716,12 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
             RpcSession::new(Box::new(srv_t), AddressSpace::Acceptor).expect("server session"),
         );
         let slow_entered = Arc::new(AtomicBool::new(false));
-        server.set_root(make_service_with_slow_signal(
-            Arc::new(AtomicI64::new(0)),
-            slow_entered.clone(),
-        ));
+        server
+            .set_root(make_service_with_slow_signal(
+                Arc::new(AtomicI64::new(0)),
+                slow_entered.clone(),
+            ))
+            .expect("set_root");
         let serving = Arc::clone(&server);
         let serve = std::thread::spawn(move || serving.serve_blocking());
         let client =
@@ -3699,7 +3777,9 @@ fn preconnected_inet_fd_handshakes_over_tcp_debug() {
     let path = tmp_sock("pcfd");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
-    server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     server.serve_connection(Box::new(server_t));
 
     let client = RpcSession::from_preconnected_fd(OwnedFd::from(client_stream), 2)
@@ -3727,7 +3807,9 @@ fn terminate_ends_every_session_and_joins_workers() {
     // one profile, so the two paths need two servers.
     let r34_path = tmp_sock("term34");
     let r34_server = RpcServer::setup_unix_server(&r34_path).expect("bind r34");
-    r34_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    r34_server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let r34_bg = r34_server.run_background();
     wait_for_sock(&r34_path);
     let r34 = RpcSession::setup_unix_client(&r34_path).expect("r34 connect");
@@ -3740,7 +3822,9 @@ fn terminate_ends_every_session_and_joins_workers() {
     let a13_server = RpcServer::setup_unix_server(&a13_path).expect("bind a13");
     a13_server.set_android13plus(2);
     a13_server.set_max_threads(2);
-    a13_server.set_root(make_service(Arc::new(AtomicI64::new(0))));
+    a13_server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
     let a13_bg = a13_server.run_background();
     wait_for_sock(&a13_path);
     let a13 = RpcSession::setup_unix_client_android13plus_with_config(
@@ -3837,9 +3921,11 @@ fn terminate_from_a_handler_does_not_join_itself() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     // The service holds the server until the call takes it, so the strong
     // count below can reach 1 once the worker is gone.
-    server.set_root(Interface::as_binder(&Binder::new(Stopper(Mutex::new(
-        Some(Arc::clone(&server)),
-    )))));
+    server
+        .set_root(Interface::as_binder(&Binder::new(Stopper(Mutex::new(
+            Some(Arc::clone(&server)),
+        )))))
+        .expect("set_root");
     let bg = server.run_background();
     wait_for_sock(&path);
     let client = RpcSession::setup_unix_client(&path).expect("connect");
