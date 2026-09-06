@@ -6,9 +6,10 @@
 //! discovered later by the receiver.
 //!
 //! libbinder refuses the same three writes with `INVALID_OPERATION`
-//! (`Parcel.cpp` `flattenBinder`, `RpcState.cpp` `onBinderLeaving`).
-//! rsbinder used to accept two of them and fail on the receiver's first
-//! call with `UnknownTransaction`. See `plans/2-22-*`.
+//! (`Parcel.cpp` `flattenBinder`, `RpcState.cpp` `onBinderLeaving`), and
+//! rsbinder refuses all three at the same points — so no such binder ever
+//! reaches a receiver that could only answer it with `UnknownTransaction`.
+//! See `plans/2-22-*`.
 //!
 //! Hermetic: `mem`/`unix` transports only, and deliberately **never**
 //! initializes `ProcessState` — the kernel-parcel checks must fire
@@ -32,9 +33,6 @@ use rsbinder::{
 // ---- fixtures -------------------------------------------------------
 
 const DESC: &str = "rsbinder.test.ICrossStack";
-
-struct Svc;
-impl Interface for Svc {}
 
 struct BnSvc;
 impl Remotable for BnSvc {
@@ -146,7 +144,7 @@ fn kernelish() -> SIBinder {
     SIBinder::new(Arc::new(KernelishProxy)).expect("SIBinder::new")
 }
 
-// ---- A-4.1 / A-4.2: kernel parcel ← RPC proxy -----------------------
+// ---- AC-22.1: kernel parcel ← RPC proxy -----------------------------
 
 /// AC-22.1. A kernel-mode `Parcel` refuses an RPC proxy, in every shape
 /// the single `SerializeOption for SIBinder` funnel is reached through,
@@ -206,7 +204,7 @@ fn local_binder_still_writes_into_an_rpc_parcel() {
         .expect("AC-22.5: a local binder must still cross into an RPC parcel");
 }
 
-// ---- A-4.4: RPC parcel ← kernel proxy -------------------------------
+// ---- AC-22.2: RPC parcel ← kernel proxy -----------------------------
 
 /// AC-22.2. An RPC-mode `Parcel` refuses a remote binder that is not
 /// RPC-backed — i.e. a kernel proxy. Without the check the binder is
@@ -225,20 +223,21 @@ fn rpc_parcel_refuses_kernel_proxy() {
         "AC-22.2: a kernel proxy cannot be written into an RPC parcel"
     );
 
-    // And no local node was registered for it on the way out.
+    // And no local node was registered for it on the way out. The parcel
+    // belongs to the *client* session, so that is the side whose table the
+    // `else` arm would have grown.
     assert_eq!(
-        pair.server.as_ref().unwrap().local_node_count(),
-        1,
+        pair.client.local_node_count(),
+        0,
         "AC-22.2: the refused binder must not have been registered as a local node"
     );
 }
 
-// ---- A-4.5: RPC parcel ← another session's RPC proxy ----------------
+// ---- AC-22.3: RPC parcel ← another session's proxy ------------------
 
-/// AC-22.3. Pins the check rsbinder already had: an `RpcProxy` belonging
-/// to a *different* session is refused, because its address means
-/// nothing to this peer (AOSP `onBinderLeaving`). Removing the
-/// `ptr::eq` guard makes this `Ok`.
+/// AC-22.3. An `RpcProxy` belonging to a *different* session is refused,
+/// because its address means nothing to this peer (AOSP
+/// `onBinderLeaving`). Removing the `ptr::eq` guard makes this `Ok`.
 #[test]
 fn rpc_parcel_refuses_another_sessions_proxy() {
     let one = Pair::new();
@@ -262,7 +261,7 @@ fn rpc_parcel_refuses_another_sessions_proxy() {
         .expect("AC-22.3: this session's own proxy may travel back home");
 }
 
-// ---- A-4.8: registration-time refusal -------------------------------
+// ---- AC-22.4: registration-time refusal -----------------------------
 
 /// AC-22.4. `RpcServer::set_root` / `add_service` and
 /// `RpcSession::set_root` refuse a remote binder up front, rather than
@@ -274,8 +273,8 @@ fn registration_refuses_a_remote_binder() {
 
     // Bound but never run — this test only exercises the registration
     // guards, so no accept loop is needed.
-    let path = tmp_sock("reg");
-    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    let path = SockPath::new("reg");
+    let server = RpcServer::setup_unix_server(&path.0).expect("bind");
     assert_eq!(
         server.set_root(proxy.clone()).unwrap_err(),
         StatusCode::InvalidOperation,
@@ -308,33 +307,41 @@ fn registration_refuses_a_remote_binder() {
         "AC-22.4: RpcSession::set_root refuses a remote binder"
     );
     session.set_root(local_root()).expect("local root accepted");
-
-    let _ = std::fs::remove_file(&path);
 }
 
-fn tmp_sock(tag: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "rsb_xstack_{}_{}_{}.sock",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    p
+/// A socket path that unlinks itself, so a failing assertion above does
+/// not leave the file behind.
+struct SockPath(std::path::PathBuf);
+
+impl SockPath {
+    fn new(tag: &str) -> Self {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rsb_xstack_{}_{}_{}.sock",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        SockPath(p)
+    }
 }
 
-/// AC-22.5. `Svc` exists only to keep the fixture honest about the
-/// `Interface`/`Remotable` split; assert it is a *local* binder so the
-/// tests above are refusing something the same code path would
-/// otherwise have accepted.
+impl Drop for SockPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// AC-22.5. Assert the fixture root is a *local* binder, so the tests
+/// above are refusing something the same code path would otherwise have
+/// accepted.
 #[test]
 fn fixture_root_is_local() {
     assert!(
         !(*local_root()).is_remote(),
         "the fixture root must be local, or every rejection above is vacuous"
     );
-    let _ = Svc;
 }

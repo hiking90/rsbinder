@@ -38,24 +38,40 @@ use rpcsmoke::IRpcSmoke::{BnRpcSmoke, IRpcSmoke};
 
 /// The child blocks in the kernel thread pool forever; reap it however
 /// the test ends, including on a panic.
-struct KillOnDrop<'a>(&'a mut std::process::Child);
-impl Drop for KillOnDrop<'_> {
+struct KillOnDrop(std::process::Child);
+impl KillOnDrop {
+    /// `Some(status)` once the child has exited — it should not, until we
+    /// kill it, so a status here means it failed to come up.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().expect("try_wait")
+    }
+}
+impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-struct KernelSvc;
+struct KernelSvc {
+    pings: std::sync::atomic::AtomicU32,
+}
 impl Interface for KernelSvc {}
 impl IRpcSmoke for KernelSvc {
     fn r#echo(&self, s: &str) -> rsbinder::status::Result<String> {
+        // `"pings"` is the read-back channel for the oneway below: it has no
+        // reply of its own, so the count has to ride a twoway call.
+        if s == "pings" {
+            let n = self.pings.load(std::sync::atomic::Ordering::SeqCst);
+            return Ok(format!("kernel:{n}"));
+        }
         Ok(format!("kernel:{s}"))
     }
     fn r#add(&self, a: i32, b: i32) -> rsbinder::status::Result<i32> {
         Ok(a + b)
     }
     fn r#ping(&self) -> rsbinder::status::Result<()> {
+        self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
@@ -67,7 +83,12 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     if let Ok(name) = std::env::var("RSB_GW_KERNEL_SERVICE") {
         rsbinder::serve("binder://")
             .expect("serve kernel")
-            .add(&name, BnRpcSmoke::new_binder(KernelSvc))
+            .add(
+                &name,
+                BnRpcSmoke::new_binder(KernelSvc {
+                    pings: std::sync::atomic::AtomicU32::new(0),
+                }),
+            )
             .expect("addService (needs a permissive service manager)")
             .run()
             .expect("kernel thread pool");
@@ -81,7 +102,7 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     let uri = format!("unix://{}", sock.display());
 
     let exe = std::env::current_exe().expect("current_exe");
-    let mut c = std::process::Command::new(exe)
+    let child = std::process::Command::new(exe)
         .args([
             "--ignored",
             "--exact",
@@ -91,13 +112,28 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
         .env("RSB_GW_KERNEL_SERVICE", &name)
         .spawn()
         .expect("spawn kernel service child");
-    let _kill = KillOnDrop(&mut c);
+    let mut kill = KillOnDrop(child);
 
     // B — the gateway: a kernel proxy of C, re-published on a socket.
-    // `connect("binder://…")` waits for the registration (AOSP
-    // `waitForService`), so no sleep is needed here.
-    let upstream: Strong<dyn IRpcSmoke> =
-        rsbinder::connect(&format!("binder://{name}")).expect("kernel lookup");
+    // Polled rather than `connect("binder://…")`: `waitForService` waits
+    // forever on a name that is never registered, so a child that dies on
+    // `addService` (a service manager that is not permissive) would hang
+    // the job instead of failing the test.
+    let client = rsbinder::Client::open("binder://").expect("kernel client");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let upstream: Strong<dyn IRpcSmoke> = loop {
+        if let Some(s) = client.try_get::<dyn IRpcSmoke>(&name).expect("try_get") {
+            break s;
+        }
+        if let Some(st) = kill.exited() {
+            panic!("kernel service child exited before registering {name}: {st}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{name} was never registered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert!(
         (*upstream.as_binder()).is_remote(),
         "the gateway must be fronting a real kernel proxy, not a local node"
@@ -132,10 +168,18 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     );
     assert_eq!(a.r#add(40, 2).expect("add through the gateway"), 42);
 
-    // A oneway call has no reply to wait on; pair it with a twoway call
-    // so the assertion below cannot pass on an unflushed queue.
+    // A oneway call has no reply to wait on, and the kernel does not order
+    // it against a twoway that follows — so read the service's own counter
+    // back until it lands. A gateway that swallowed `ping` fails here.
     a.r#ping().expect("oneway through the gateway");
-    assert_eq!(a.r#echo("barrier").unwrap(), "kernel:barrier");
+    let ping_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while a.r#echo("pings").expect("read the ping count") != "kernel:1" {
+        assert!(
+            std::time::Instant::now() < ping_deadline,
+            "AC-22.12: the oneway ping never reached the kernel service"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
     let _ = std::fs::remove_file(&sock);
 }

@@ -112,9 +112,11 @@ let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |
 ```
 
 `ServeOptions`: `threads`, `max_connections`, `handshake_timeout`,
-`idle_timeout`, `authorizer`, `tls`, `fd_modes`, `call_restriction`.
+`idle_timeout`, `reply_timeout`, `authorizer`, `tls`, `fd_modes`,
+`call_restriction`.
 `ClientOptions`: `tls` / `tls_server_name`, `session_id`,
-`outgoing_connections`, `fd_mode`, `timeout`, `driver`.
+`outgoing_connections`, `incoming_connections`, `fd_mode`, `timeout`,
+`handshake_timeout`, `driver`.
 
 `Client::open_with`'s closure also receives the parsed `Endpoint`, so an
 option that applies to only some transports is set from the endpoint rather
@@ -235,8 +237,8 @@ What a gateway costs, all of it visible in B:
 cargo run -p example-hello --bin hello_service                 # C, on kernel binder
 cargo run -p example-hello --features rpc --bin gateway_service \
     binder://my.hello unix:///tmp/rsb_gw.sock                  # B
-cargo run -p example-hello --features rpc --bin hello_client \
-    unix:///tmp/rsb_gw.sock#hello                              # A
+cargo run -p example-hello --features rpc --bin unified_client \
+    unix:///tmp/rsb_gw.sock                                    # A
 ```
 
 ## What the URI does *not* hide

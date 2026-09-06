@@ -1278,6 +1278,12 @@ impl<I: FromIBinder + ?Sized> Deref for Strong<I> {
 /// parcel, which the stack-boundary check refuses — wrapping it in a `Bn*` is
 /// exactly what makes it publishable. See the book's
 /// [cross-transport chapter](https://hiking90.github.io/rsbinder/cross-transport-services.html).
+///
+/// `dump` forwards to the handle's target, but a *proxy* target has no
+/// `Interface::dump` of its own (remote dump is
+/// [`ProxyHandle::dump`](crate::ProxyHandle::dump), a different signature — an
+/// fd, not a writer), so it takes the trait's no-op default: a dump sent to a
+/// gateway succeeds and returns nothing. Dump the upstream service directly.
 impl<I: FromIBinder + ?Sized> Interface for Strong<I> {
     fn as_binder(&self) -> SIBinder {
         (**self).as_binder()

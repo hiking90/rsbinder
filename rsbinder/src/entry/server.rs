@@ -221,9 +221,10 @@ impl Server {
     /// socket server, because the binder that would leave this process is the
     /// proxy itself and no stack accepts one from the other (see the
     /// [gateway section] of the book — wrap it in a `Bn*` instead:
-    /// `BnFoo::new_binder(proxy)`). The kernel arm keeps allowing it:
-    /// re-registering a proxy with the system service manager is a legitimate
-    /// use.
+    /// `BnFoo::new_binder(proxy)`). The kernel arm still accepts a *kernel*
+    /// proxy — re-registering one with the system service manager is a
+    /// legitimate use — but an RPC proxy is refused there too, by the same
+    /// stack-boundary check, when the registration parcel is written.
     ///
     /// [gateway section]: https://hiking90.github.io/rsbinder/cross-transport-services.html
     pub fn add(mut self, name: &str, svc: impl Into<SIBinder>) -> Result<Self> {

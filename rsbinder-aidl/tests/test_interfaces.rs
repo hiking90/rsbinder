@@ -100,6 +100,14 @@ pub mod ArrayOfInterfaces {
         }
         impl IEmptyInterface for rsbinder::Binder<BnEmptyInterface> {
         }
+        /// A typed handle implements the interface it points at, so a proxy can be
+        /// re-published as a local service on another transport in one line:
+        /// `BnEmptyInterface::new_binder(upstream)` (the **gateway** pattern —
+        /// `new_binder` takes any `T: IEmptyInterface + Send + Sync + 'static`).
+        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+        /// forwarded as-is is refused at the stack boundary.
+        impl IEmptyInterface for rsbinder::Strong<dyn IEmptyInterface> {
+        }
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             match _code {
@@ -177,6 +185,17 @@ pub mod ArrayOfInterfaces {
         impl IMyInterface for rsbinder::Binder<BnMyInterface> {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
                 self.0.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
+            }
+        }
+        /// A typed handle implements the interface it points at, so a proxy can be
+        /// re-published as a local service on another transport in one line:
+        /// `BnMyInterface::new_binder(upstream)` (the **gateway** pattern —
+        /// `new_binder` takes any `T: IMyInterface + Send + Sync + 'static`).
+        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+        /// forwarded as-is is refused at the stack boundary.
+        impl IMyInterface for rsbinder::Strong<dyn IMyInterface> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+                (**self).r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
             }
         }
         fn on_transact(

@@ -123,14 +123,20 @@ jobs:
         # targets are ungated), or excluded here on purpose:
         #   * rsbinder/tests/rpc_vsock.rs — every test in it is `#[ignore]`d
         #     (needs a peer VM or the `vsock_loopback` module), so running it
-        #     yields nothing; `rpc-suite` still builds it via the
-        #     `--features rpc-vsock` matrix step.
+        #     yields nothing; the `test` job's
+        #     `cargo clippy --all-targets --all-features` is what type-checks
+        #     it (the `rpc-vsock` matrix step is a plain `cargo build`, which
+        #     compiles lib + bins only, never `tests/`).
         #   * rsbinder/tests/loom_cache_pin.rs — `cfg(loom)`, empty without
         #     `RUSTFLAGS="--cfg loom"`; a loom run is a manual exercise.
         #   * tests/tests/mesh_rpc.rs, tests/tests/mesh_kernel.rs — the
         #     multi-process mesh: minutes-expensive, and `mesh_kernel` needs
         #     /dev/binder plus a live rsb_hub, so integration-test.yml owns
         #     both.
+        #   * tests/tests/gateway_kernel.rs — every test in it is `#[ignore]`d
+        #     and needs /dev/binder plus a live rsb_hub to drive an RPC client
+        #     through a gateway to a kernel service, so integration-test.yml
+        #     owns it.
         # Adding a test target means adding it to one of those lines, or to
         # this list with the reason it cannot run here.
         run: |
@@ -182,7 +188,7 @@ jobs:
         # workflow.
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_transport_conformance --test source_invariants
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
@@ -199,12 +205,13 @@ jobs:
         # --workspace --no-run` included. Every hermetic `rpc` target of the
         # crate is therefore named here: `entry_rpc` (the
         # `serve`/`connect`/`Client` gate), `codegen_shapes`, the async stub
-        # adapter, `get_calling_uid` over RPC, and the `@EnforcePermission`
-        # deny. `macro_cross` needs `macros` too and is on the next step; the
-        # two mesh targets are integration-test.yml's (see the ledger on
+        # adapter, `get_calling_uid` over RPC, the `@EnforcePermission` deny,
+        # and `gateway_rpc` (the re-publish/`Rewrap` gate). `macro_cross`
+        # needs `macros` too and is on the next step; the two mesh targets and
+        # `gateway_kernel` are integration-test.yml's (see the ledger on
         # `linux-build`'s "Check test builds").
         run: |
-          cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test codegen_shapes \
+          cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
       - name: Interface macro (plan 2-19 — golden equivalence, UI, e2e, interop)
@@ -256,7 +263,7 @@ jobs:
         # `rpc-suite` for the feature-gate reasoning.
         run: |
           cargo test -p rsbinder --features rpc --lib rpc::
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_transport_conformance --test source_invariants
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)

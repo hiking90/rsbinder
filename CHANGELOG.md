@@ -525,8 +525,10 @@ short form — and the first entry is the only one no compiler will catch.
   `RpcServer::set_root` and `RpcSession::set_root` reject a remote binder. To
   re-publish a service reached over one transport on another, wrap the proxy
   in a local `Bn*` — `BnFoo::new_binder(proxy)`, the gateway pattern — rather
-  than forwarding the binder itself. Kernel `hub::add_service` is unchanged:
-  re-registering a proxy with the system service manager is legitimate.
+  than forwarding the binder itself. Kernel `hub::add_service` still takes a
+  *kernel* proxy — re-registering one with the system service manager is
+  legitimate — but an RPC proxy is refused there too, by the write-time check
+  above.
 - **`RpcServer::set_root` and `RpcSession::set_root` return `Result<()>`**
   (was `()`), so they can report the refusal above. Callers passing a local
   binder are unaffected apart from handling the value — `?` in a function

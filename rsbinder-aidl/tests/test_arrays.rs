@@ -162,6 +162,23 @@ pub mod ITestService {
             self.0.r#FillOutStructuredParcelable(_arg_parcel)
         }
     }
+    /// A typed handle implements the interface it points at, so a proxy can be
+    /// re-published as a local service on another transport in one line:
+    /// `BnTestService::new_binder(upstream)` (the **gateway** pattern —
+    /// `new_binder` takes any `T: ITestService + Send + Sync + 'static`).
+    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+    /// forwarded as-is is refused at the stack boundary.
+    impl ITestService for rsbinder::Strong<dyn ITestService> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
+            (**self).r#ReverseBoolean(_arg_input, _arg_repeated)
+        }
+        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+            (**self).r#RepeatNullableIntArray(_arg_input)
+        }
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
+            (**self).r#FillOutStructuredParcelable(_arg_parcel)
+        }
+    }
     fn on_transact(
         _service: &dyn ITestService, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
         match _code {
@@ -392,6 +409,17 @@ pub mod FixedSizeArrayExample {
                 self.0.r#Repeat2dParcelables(_arg_input, _arg_repeated)
             }
         }
+        /// A typed handle implements the interface it points at, so a proxy can be
+        /// re-published as a local service on another transport in one line:
+        /// `BnRepeatFixedSizeArray::new_binder(upstream)` (the **gateway** pattern —
+        /// `new_binder` takes any `T: IRepeatFixedSizeArray + Send + Sync + 'static`).
+        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+        /// forwarded as-is is refused at the stack boundary.
+        impl IRepeatFixedSizeArray for rsbinder::Strong<dyn IRepeatFixedSizeArray> {
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+                (**self).r#Repeat2dParcelables(_arg_input, _arg_repeated)
+            }
+        }
         fn on_transact(
             _service: &dyn IRepeatFixedSizeArray, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             match _code {
@@ -488,6 +516,14 @@ pub mod FixedSizeArrayExample {
         impl IEmptyInterface for BpEmptyInterface {
         }
         impl IEmptyInterface for rsbinder::Binder<BnEmptyInterface> {
+        }
+        /// A typed handle implements the interface it points at, so a proxy can be
+        /// re-published as a local service on another transport in one line:
+        /// `BnEmptyInterface::new_binder(upstream)` (the **gateway** pattern —
+        /// `new_binder` takes any `T: IEmptyInterface + Send + Sync + 'static`).
+        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
+        /// forwarded as-is is refused at the stack boundary.
+        impl IEmptyInterface for rsbinder::Strong<dyn IEmptyInterface> {
         }
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
