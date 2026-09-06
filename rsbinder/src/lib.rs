@@ -303,6 +303,12 @@ pub use thread_state::{
 };
 
 pub use parcel::Parcel;
+// Value ↔ bytes, for storing what an interface already knows how to
+// describe. Behind `rpc` because the encoder runs in the session-less
+// RPC parcel mode — that mode is what refuses binders and fds — and not
+// because anything here talks to a socket.
+#[cfg(feature = "rpc")]
+pub use parcel::{from_bytes, to_bytes};
 
 // From `parcelable` — (de)serialization trait stack.
 pub use parcelable::{

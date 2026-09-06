@@ -40,5 +40,10 @@ name = "macro_cross"
 path = "tests/macro_cross.rs"
 required-features = ["rpc", "macros"]
 
+[[test]]
+name = "data_serde"
+path = "tests/data_serde.rs"
+required-features = ["rpc", "macros"]
+
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

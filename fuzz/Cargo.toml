@@ -85,5 +85,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "data_parcel_decode"
+path = "fuzz_targets/data_parcel_decode.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

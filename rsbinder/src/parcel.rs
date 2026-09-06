@@ -594,6 +594,67 @@ impl Parcel {
         }
     }
 
+    /// A parcel that refuses binder objects and file descriptors, so the
+    /// bytes it produces carry no reference to anything in this process.
+    ///
+    /// It is the session-less RPC mode — the same mode the RPC transport
+    /// uses, without the session that would give a binder somewhere to
+    /// go. Nothing new refuses anything here: with no ops attached and
+    /// `fd_mode` left at `None`, the existing RPC write paths reject a
+    /// binder and an fd on their own, which is why there is no second
+    /// check to keep in step with them.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn new_data_only() -> Self {
+        let mut p = Parcel::new();
+        p.set_for_rpc(true);
+        p
+    }
+
+    /// A data-only parcel over a copy of `bytes`, positioned at the start.
+    ///
+    /// Data-only matters on the read side too: it makes `read_object` an
+    /// immediate `BadType`, so a forged `flat_binder_object` in the input
+    /// cannot become a binder.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
+        let mut p = Parcel::from_vec(bytes.to_vec());
+        p.set_for_rpc(true);
+        p
+    }
+
+    /// `true` when nothing in this parcel refers to something in this
+    /// process — no kernel object-table entry, no RPC object position, no
+    /// out-of-band fd. Only then do the bytes mean the same thing
+    /// anywhere else.
+    ///
+    /// All three have to be checked. The kernel object table is empty by
+    /// construction on an RPC parcel, so a check of that alone would hand
+    /// out the bytes of a parcel carrying binders — bytes that are
+    /// meaningless without the object table that travelled beside them.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn is_self_contained(&self) -> bool {
+        self.objects.len() == 0
+            && self.rpc_object_positions().is_empty()
+            && self.rpc_out_fds().is_empty()
+    }
+
+    /// The encoded bytes, or `Err(BadType)` if the parcel carries a
+    /// process-local reference ([`Parcel::is_self_contained`]). Cannot
+    /// fail on a parcel from [`Parcel::new_data_only`].
+    #[cfg(feature = "rpc")]
+    pub(crate) fn as_bytes(&self) -> Result<&[u8]> {
+        if !self.is_self_contained() {
+            return Err(StatusCode::BadType);
+        }
+        Ok(self.data.as_slice())
+    }
+
+    /// [`Parcel::as_bytes`], taking ownership.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn into_bytes(self) -> Result<Vec<u8>> {
+        self.as_bytes().map(<[u8]>::to_vec)
+    }
+
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
@@ -1935,6 +1996,68 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
     }
 }
 
+/// Encodes one value to bytes, using the same codec the IPC paths use.
+///
+/// Anything that is `Serialize` works, but a type you intend to store
+/// should be a parcelable — `#[derive(rsbinder::Parcelable)]` or a type
+/// generated from `.aidl`. That is where the forward-compatibility comes
+/// from: a parcelable writes a length header, so a reader built against
+/// an older definition stops at the boundary the writer wrote and a
+/// field appended later is simply not read. `to_bytes(&42i32)` is four
+/// bytes with no such header and no way to evolve.
+///
+/// ```no_run
+/// # #[derive(rsbinder::Parcelable, Default, Debug, Clone, PartialEq)]
+/// # struct Settings { volume: i32, name: String }
+/// # fn main() -> rsbinder::Result<()> {
+/// let settings = Settings { volume: 7, name: "quiet".into() };
+/// std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// A binder or a file descriptor cannot be encoded — neither means
+/// anything outside the process that produced it, and there is no
+/// session here to marshal a binder through — so a value containing one
+/// is `Err(BadType)` rather than bytes that would be a lie. Nothing else
+/// fails.
+///
+/// # Byte order
+///
+/// The wire is little-endian on every host, so these bytes are portable
+/// across architectures and identical to what an IPC peer would receive
+/// for the same value.
+#[cfg(feature = "rpc")]
+pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    let mut parcel = Parcel::new_data_only();
+    parcel.write(value)?;
+    parcel.into_bytes()
+}
+
+/// Decodes one value from bytes written by [`to_bytes`].
+///
+/// # Errors
+///
+/// - `NotEnoughData` — the input ends inside the value.
+/// - `BadValue` — the value decoded but bytes are left over. A partial
+///   read is not success here: it usually means the bytes were written
+///   as a different type, and returning the value anyway would hide
+///   that.
+/// - `BadType` — the input claims to contain a binder or a file
+///   descriptor. Such bytes are never turned into an object; the
+///   decoder has no object table and refuses outright.
+#[cfg(feature = "rpc")]
+pub fn from_bytes<T: Deserialize>(bytes: &[u8]) -> Result<T> {
+    let mut parcel = Parcel::from_slice(bytes);
+    let value = parcel.read::<T>()?;
+    if parcel.data_avail() != 0 {
+        return Err(StatusCode::BadValue);
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
@@ -2870,5 +2993,127 @@ mod wire_golden {
             bytes[4..obj_len].iter().all(|&b| b == 0),
             "a null binder carries no handle, cookie or flags"
         );
+    }
+}
+
+/// `to_bytes` / `from_bytes`: the promise is that the bytes are
+/// self-contained, so every test here is about something that would
+/// break that.
+#[cfg(all(test, feature = "rpc"))]
+mod data_serde {
+    use super::*;
+
+    #[test]
+    fn a_value_survives_the_round_trip_and_encodes_the_same_way_twice() {
+        let value: Vec<i32> = vec![1, -2, 0x0102_0304];
+        let bytes = to_bytes(&value).unwrap();
+        assert_eq!(bytes, to_bytes(&value).unwrap(), "encoding is deterministic");
+        assert_eq!(from_bytes::<Vec<i32>>(&bytes).unwrap(), value);
+
+        let text = String::from("한 quiet");
+        assert_eq!(
+            from_bytes::<String>(&to_bytes(&text).unwrap()).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn the_bytes_are_the_ipc_bytes() {
+        // The point of reusing the IPC codec rather than inventing a
+        // format: what gets stored is what a peer would have received.
+        let value = -2i64;
+        let mut kernel = Parcel::new();
+        kernel.write(&value).unwrap();
+        assert_eq!(to_bytes(&value).unwrap(), kernel.data.as_slice());
+    }
+
+    #[test]
+    fn trailing_bytes_are_an_error_rather_than_a_partial_read() {
+        let mut bytes = to_bytes(&7i32).unwrap();
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(from_bytes::<i32>(&bytes), Err(StatusCode::BadValue));
+    }
+
+    #[test]
+    fn a_truncated_input_is_not_enough_data() {
+        let bytes = to_bytes(&7i64).unwrap();
+        assert_eq!(
+            from_bytes::<i64>(&bytes[..4]),
+            Err(StatusCode::NotEnoughData)
+        );
+    }
+
+    #[test]
+    fn a_binder_field_is_refused_at_write_time() {
+        // Refused where the value is written, not audited afterwards:
+        // by the time bytes exist it is too late to tell a handle from a
+        // number. `ProcessState` is never initialized in this test
+        // process, and the kernel path would panic reaching for it —
+        // arriving at `BadType` instead is the whole point of the
+        // data-only mode.
+        let mut parcel = Parcel::new_data_only();
+        let binder: Option<&crate::SIBinder> = None;
+        assert_eq!(
+            crate::SerializeOption::serialize_option(binder, &mut parcel),
+            Err(StatusCode::BadType),
+            "even a null binder needs an object table it will not get"
+        );
+    }
+
+    #[test]
+    fn a_file_descriptor_field_is_refused_before_the_dup() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let before = count_open_fds();
+        let pfd = crate::ParcelFileDescriptor::new(file);
+
+        let mut parcel = Parcel::new_data_only();
+        assert_eq!(parcel.write(&pfd), Err(StatusCode::BadType));
+        assert!(
+            pfd.as_raw_fd() >= 0,
+            "the caller's fd is untouched by the refusal"
+        );
+        assert_eq!(
+            count_open_fds(),
+            before,
+            "refused before the dup — no second descriptor was created"
+        );
+    }
+
+    #[test]
+    fn a_forged_object_in_the_input_never_becomes_a_binder() {
+        // Bytes that look like a `flat_binder_object` are just bytes:
+        // the decoder has no object table to resolve them against and
+        // says so, rather than fabricating a reference.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&crate::sys::BINDER_TYPE_BINDER.to_ne_bytes());
+        forged.extend_from_slice(&[0u8; 20]);
+        assert_eq!(
+            from_bytes::<crate::SIBinder>(&forged),
+            Err(StatusCode::BadType)
+        );
+    }
+
+    #[test]
+    fn a_parcel_holding_a_reference_refuses_to_hand_out_its_bytes() {
+        // `objects` is always empty in RPC mode, so a guard that only
+        // looked there would hand out the bytes of a parcel whose
+        // meaning lives in a table that is not in them.
+        let mut parcel = Parcel::new_data_only();
+        parcel.write(&1i32).unwrap();
+        assert!(parcel.as_bytes().is_ok());
+
+        parcel.rpc_record_object_position(0);
+        assert_eq!(
+            parcel.as_bytes().err(),
+            Some(StatusCode::BadType),
+            "an object position makes the bytes incomplete"
+        );
+    }
+
+    fn count_open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
     }
 }

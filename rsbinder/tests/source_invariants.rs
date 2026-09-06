@@ -196,10 +196,11 @@ fn native_byte_codecs_stay_in_their_islands() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods, plus the two goldens
-                // that assert what stays native: the command stream and
-                // the null binder's object header.
-                ("parcel.rs", 4),
+                // `NativeScalar`'s two methods, plus three tests that
+                // assert what stays native: the command stream, the null
+                // binder's object header, and the forged object header a
+                // data decode must refuse.
+                ("parcel.rs", 5),
                 // fd/memfd bookkeeping, never parcel wire.
                 ("shared_memory/mod.rs", 4),
             ],

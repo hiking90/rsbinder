@@ -79,10 +79,15 @@ jobs:
     # is how a crate ends up with two paths to everything. The golden
     # makes every addition a line in a reviewable diff.
     #
-    # To update after an intentional change, run the same command and
+    # Two feature sets, because most of the crate is not in the default
+    # one: everything RPC — including `to_bytes`/`from_bytes`, which need
+    # the session-less parcel mode — would otherwise change unobserved.
+    #
+    # To update after an intentional change, run the same commands and
     # commit the result:
     #
     #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > api/rsbinder.txt
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > api/rsbinder-rpc.txt
     #
     # Both the toolchain and the tool version are pinned because the
     # rendering is not stable across either; bumping one means
@@ -99,10 +104,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-public-api
         run: cargo install cargo-public-api --locked --version 0.52.0
-      - name: Diff the public surface against the golden
+      - name: Diff the public surface against the goldens
         run: |
           cargo public-api -p rsbinder --simplified > /tmp/public-api.txt
           diff -u api/rsbinder.txt /tmp/public-api.txt
+          cargo public-api -p rsbinder --simplified --features rpc > /tmp/public-api-rpc.txt
+          diff -u api/rsbinder-rpc.txt /tmp/public-api-rpc.txt
 
   test:
     name: Test Suite
@@ -255,6 +262,11 @@ jobs:
           cargo test -p rsbinder-macros
           cargo test -p rsbinder --features macros,rpc --test macro_interface
           cargo test -p tests --features rpc,macros --test macro_cross
+          # `data_serde` needs a real parcelable to show the property
+          # `to_bytes` is sold on — a record read back by code built
+          # against a different version of its definition — so it lands
+          # here rather than beside the primitives.
+          cargo test -p tests --features rpc,macros --test data_serde
 
       - name: V5 parallel-safety soak (default test-threads, 5x)
         run: |
