@@ -226,7 +226,7 @@ short form — and the first entry is the only one no compiler will catch.
   (`BnCallback::new_binder(cb.clone())`) is correct per call and wrong across
   calls: it mints a new object each time, so an upstream that pairs
   `register(cb)` with `unregister(cb)` by identity never matches the second.
-  `Rewrap::new(|p| BnCallback::new_binder(p))` then `.wrap(cb)` returns the
+  `Rewrap::new(BnCallback::new_binder)` then `.wrap(cb)` returns the
   same object for the same live remote. It holds only weak references, so it
   never keeps a wrapper alive; entries go when the remote dies (death
   notification), when the wrapper is dropped, or on `purge_dead()`.

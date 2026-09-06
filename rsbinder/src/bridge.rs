@@ -43,7 +43,7 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 /// }
 ///
 /// // once, at construction:
-/// callbacks: Rewrap::new(|p| BnCallback::new_binder(p)),
+/// callbacks: Rewrap::new(BnCallback::new_binder),
 ///
 /// fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
 ///     self.upstream.register(&self.callbacks.wrap(cb))
@@ -74,10 +74,8 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 ///
 /// [`purge_dead`]: Self::purge_dead
 pub struct Rewrap<I: FromIBinder + ?Sized> {
-    // Boxed rather than a fn pointer: `BnFoo::new_binder` is a generic fn
-    // item, and coercing one to a pointer leans on inference at every call
-    // site. A closure — `Rewrap::new(|p| BnFoo::new_binder(p))` — always
-    // resolves.
+    // `Box<dyn Fn>` rather than a fn pointer so a capturing closure is also
+    // accepted; `new` takes `impl Fn`, so `BnFoo::new_binder` passes as-is.
     #[allow(clippy::type_complexity)]
     make_local: Box<dyn Fn(Strong<I>) -> Strong<I> + Send + Sync>,
     // `Arc`, not a plain field, so a `Reaper` can hold a `Weak` to just the
@@ -157,7 +155,7 @@ impl DeathRecipient for Reaper {
 impl<I: FromIBinder + ?Sized> Rewrap<I> {
     /// Build a table whose wrappers are made by `make_local`.
     ///
-    /// `make_local` is normally `|p| BnFoo::new_binder(p)` — the generated
+    /// `make_local` is normally `BnFoo::new_binder` itself — the generated
     /// delegating impl means the proxy satisfies `new_binder`'s bound.
     pub fn new(make_local: impl Fn(Strong<I>) -> Strong<I> + Send + Sync + 'static) -> Self {
         Self {

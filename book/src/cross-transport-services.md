@@ -201,7 +201,7 @@ is the table that fixes it — same remote in, same local out:
 ```rust
 struct Gateway {
     upstream: Strong<dyn IFoo>,
-    callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(|p| BnCallback::new_binder(p))
+    callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
 }
 
 fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {

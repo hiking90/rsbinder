@@ -138,7 +138,7 @@ impl Drop for SockPath {
 
 fn msg(seq: i32, origin: &str) -> MeshMessage {
     MeshMessage {
-        r#seq: seq,
+        seq,
         r#nonce: 0xfeed_face,
         r#origin: origin.to_string(),
         r#originKind: NodeKind::RPC,
@@ -303,7 +303,7 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
             "mesh",
             BnMeshNode::new_binder(RewrappingGateway {
                 upstream: c_proxy,
-                observers: Rewrap::new(|p| BnMeshObserver::new_binder(p)),
+                observers: Rewrap::new(BnMeshObserver::new_binder),
             }),
         )
         .expect("add B")
@@ -475,7 +475,7 @@ impl IMeshNode for Recorder {
 #[test]
 fn rewrap_returns_one_local_object_per_remote() {
     let sock = SockPath::new("rewrap");
-    let rewrap = Rewrap::new(|p| BnMeshObserver::new_binder(p));
+    let rewrap = Rewrap::new(BnMeshObserver::new_binder);
     // The table is inside the service, so probe it through the calls.
     let svc = Recorder {
         rewrap,
@@ -513,7 +513,7 @@ fn rewrap_returns_one_local_object_per_remote() {
 /// the "remote" here is a local binder, which `wrap` treats the same way.
 #[test]
 fn rewrap_holds_nothing_alive_and_collects_dead_entries() {
-    let rewrap: Rewrap<dyn IMeshObserver> = Rewrap::new(|p| BnMeshObserver::new_binder(p));
+    let rewrap: Rewrap<dyn IMeshObserver> = Rewrap::new(BnMeshObserver::new_binder);
     assert!(rewrap.is_empty());
 
     let remote = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));
