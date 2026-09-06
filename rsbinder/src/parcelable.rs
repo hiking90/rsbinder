@@ -310,9 +310,17 @@ impl SerializeOption for str {
 
                 parcel.write::<i32>(&(len as i32))?;
 
-                // A byte view of the `Vec<u16>` is the encoding only on a
-                // little-endian host, where it is also the free one.
-                #[cfg(target_endian = "little")]
+                // The byte view below is a host-order view of the code
+                // units, and the wire wants them little-endian. Swapping
+                // the units first keeps that view the whole encoding on
+                // every host; `cfg!` is a compile-time constant, so a
+                // little-endian build does not contain this loop.
+                if cfg!(target_endian = "big") {
+                    for unit in utf16.iter_mut() {
+                        *unit = unit.swap_bytes();
+                    }
+                }
+
                 // SAFETY: We're creating a byte view of the UTF-16 encoded string.
                 // - utf16 is a valid Vec<u16> with proper alignment
                 // - The byte count is exactly utf16.len() * size_of::<u16>()
@@ -324,15 +332,6 @@ impl SerializeOption for str {
                         utf16.len() * std::mem::size_of::<u16>(),
                     )
                 })?;
-
-                #[cfg(target_endian = "big")]
-                {
-                    let mut bytes = Vec::with_capacity(utf16.len() * 2);
-                    for unit in &utf16 {
-                        bytes.extend_from_slice(&unit.to_le_bytes());
-                    }
-                    parcel.write_aligned_data(&bytes)?;
-                }
 
                 Ok(())
             }

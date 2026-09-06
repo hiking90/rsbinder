@@ -1219,38 +1219,39 @@ impl Parcel {
             .get(pos..pos + size)
             .ok_or(StatusCode::NotEnoughData)?;
 
-        // The wire is little-endian, so on a little-endian host the bulk
-        // copy *is* the decode and nothing here changes. A big-endian
-        // host cannot memcpy and pays a per-element swap instead.
-        #[cfg(target_endian = "little")]
-        let result = {
-            // SAFETY: We have verified bounds through data_slice.get()
-            // - data_slice is a valid slice of exactly `size` bytes
-            // - result has capacity for `len` elements
-            // - copy_nonoverlapping copies exactly `size` bytes
-            // - setting length to `len` is valid as we just initialized those elements
-            // - `D: ParcelPod` means every bit pattern the peer sent is a valid
-            //   `D`, so the copied bytes need no per-element validation
-            let mut result = Vec::with_capacity(len as usize);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data_slice.as_ptr(),
-                    result.as_mut_ptr() as *mut u8,
-                    size,
-                );
-                result.set_len(len as usize);
-            }
-            result
-        };
+        // SAFETY: We have verified bounds through data_slice.get()
+        // - data_slice is a valid slice of exactly `size` bytes
+        // - result has capacity for `len` elements
+        // - copy_nonoverlapping copies exactly `size` bytes
+        // - setting length to `len` is valid as we just initialized those elements
+        // - `D: ParcelPod` means every bit pattern the peer sent is a valid
+        //   `D`, so the copied bytes need no per-element validation — and
+        //   for the same reason they may be permuted as `u8` and read back
+        //   as `D` (the byte-order fix-up below, over the `size` bytes just
+        //   written through this very pointer)
+        let mut result = Vec::with_capacity(len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_slice.as_ptr(),
+                result.as_mut_ptr() as *mut u8,
+                size,
+            );
+            result.set_len(len as usize);
 
-        // `size == len * size_of::<D>()` exactly (`checked_array_layout`),
-        // so `chunks_exact` yields `len` full elements and no remainder.
-        // One-byte elements decode to themselves here.
-        #[cfg(target_endian = "big")]
-        let result = data_slice
-            .chunks_exact(std::mem::size_of::<D>())
-            .map(D::from_wire)
-            .collect::<Result<Vec<D>>>()?;
+            // The wire is little-endian, so on a little-endian host the
+            // bulk copy *is* the decode: both conditions below are
+            // compile-time constants (the width per monomorphization), so
+            // that build emits the memcpy alone. A big-endian host reverses
+            // each element in place — which also covers `f32`/`f64`, which
+            // have no `swap_bytes`. `size == len * size_of::<D>()` exactly
+            // (`checked_array_layout`), so no remainder.
+            if cfg!(target_endian = "big") && std::mem::size_of::<D>() > 1 {
+                let bytes = std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, size);
+                for chunk in bytes.chunks_exact_mut(std::mem::size_of::<D>()) {
+                    chunk.reverse();
+                }
+            }
+        }
 
         self.set_data_position(pos + padded);
 
@@ -1385,73 +1386,67 @@ impl Parcel {
             return Ok(());
         }
 
-        // Mirror of `read_array`: a big-endian host cannot memcpy onto a
-        // little-endian wire, so it encodes element by element. One-byte
-        // elements come out the same either way; the swap is what makes
-        // the wider ones portable.
-        #[cfg(target_endian = "big")]
-        {
-            let mut bytes = Vec::with_capacity(std::mem::size_of_val(parcelable));
-            for element in parcelable {
-                bytes.extend_from_slice(element.to_wire().as_ref());
+        let size = std::mem::size_of_val(parcelable);
+        let padded = pad_size(size);
+        let pos = self.pos;
+
+        // See `write_aligned_data`: keep the end position within `i32::MAX`
+        // and reject rather than overflow the reserve/copy arithmetic.
+        let end = pos
+            .checked_add(padded)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+
+        self.data.reserve(end.saturating_sub(self.data.len()));
+        // SAFETY: the `reserve` above guarantees the destination has at least
+        // `end` bytes of capacity, so `add(pos)` and the `size`-byte copy
+        // (size <= padded) stay in-bounds and the ranges do not overlap
+        // (distinct allocations). The 0-3 trailing pad bytes are then zeroed
+        // so that `set_len` exposes only initialized memory: `reserve`
+        // allocates but does not initialize, and the pad is transmitted (it is
+        // counted in `data_size`), so without this we would both hit UB and
+        // leak uninitialized process memory to the peer. AOSP masks the pad to
+        // zero as well. `set_len` only grows up to the just-reserved capacity
+        // over now-initialized `u8` bytes.
+        unsafe {
+            // Zero any `[len..pos]` gap left by a forward `set_data_position`
+            // before `set_len`, so an uninitialized hole is never exposed via
+            // `as_slice()` / transmitted to the peer (UB + info-leak). See
+            // `write_aligned_data` for the full rationale.
+            let old_len = self.data.len();
+            if pos > old_len {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
             }
-            self.write_aligned_data(&bytes)
+            std::ptr::copy_nonoverlapping::<u8>(
+                parcelable.as_ptr() as _,
+                self.data.as_mut_ptr().add(pos),
+                size,
+            );
+            if padded > size {
+                std::ptr::write_bytes(self.data.as_mut_ptr().add(pos + size), 0, padded - size);
+            }
+            if self.data.len() < end {
+                self.data.set_len(end);
+            }
         }
 
-        #[cfg(target_endian = "little")]
-        {
-            let size = std::mem::size_of_val(parcelable);
-            let padded = pad_size(size);
-            let pos = self.pos;
-
-            // See `write_aligned_data`: keep the end position within `i32::MAX`
-            // and reject rather than overflow the reserve/copy arithmetic.
-            let end = pos
-                .checked_add(padded)
-                .filter(|&e| e <= i32::MAX as usize)
-                .ok_or(StatusCode::BadValue)?;
-
-            self.data.reserve(end.saturating_sub(self.data.len()));
-            // SAFETY: the `reserve` above guarantees the destination has at least
-            // `end` bytes of capacity, so `add(pos)` and the `size`-byte copy
-            // (size <= padded) stay in-bounds and the ranges do not overlap
-            // (distinct allocations). The 0-3 trailing pad bytes are then zeroed
-            // so that `set_len` exposes only initialized memory: `reserve`
-            // allocates but does not initialize, and the pad is transmitted (it is
-            // counted in `data_size`), so without this we would both hit UB and
-            // leak uninitialized process memory to the peer. AOSP masks the pad to
-            // zero as well. `set_len` only grows up to the just-reserved capacity
-            // over now-initialized `u8` bytes.
-            unsafe {
-                // Zero any `[len..pos]` gap left by a forward `set_data_position`
-                // before `set_len`, so an uninitialized hole is never exposed via
-                // `as_slice()` / transmitted to the peer (UB + info-leak). See
-                // `write_aligned_data` for the full rationale.
-                let old_len = self.data.len();
-                if pos > old_len {
-                    std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
-                }
-                std::ptr::copy_nonoverlapping::<u8>(
-                    parcelable.as_ptr() as _,
-                    self.data.as_mut_ptr().add(pos),
-                    size,
-                );
-                if padded > size {
-                    std::ptr::write_bytes(
-                        self.data.as_mut_ptr().add(pos + size),
-                        0,
-                        padded - size,
-                    );
-                }
-                if self.data.len() < end {
-                    self.data.set_len(end);
-                }
+        // The copy above put host words on a little-endian wire, so a
+        // big-endian host owes each element a byte reversal. Doing it in
+        // place keeps one code path and covers `f32`/`f64`, which have no
+        // `swap_bytes`. Both conditions are compile-time constants (the
+        // width per monomorphization), so a little-endian build emits the
+        // memcpy alone — this loop is not in it.
+        if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
+            for chunk in self.data.as_mut_slice()[pos..pos + size]
+                .chunks_exact_mut(std::mem::size_of::<S>())
+            {
+                chunk.reverse();
             }
-
-            self.set_data_position(end);
-
-            Ok(())
         }
+
+        self.set_data_position(end);
+
+        Ok(())
     }
 
     pub(crate) fn write_array_char<S: CharType>(&mut self, parcelable: &[S]) -> Result<()> {
@@ -2810,8 +2805,9 @@ mod wire_golden {
         // The two agree on a little-endian host, which is precisely why
         // a little-endian test run cannot tell the layers apart and this
         // assertion has to reach a big-endian one to mean anything.
-        #[cfg(target_endian = "big")]
-        assert_ne!(native.data.as_slice(), wire.data.as_slice());
+        if cfg!(target_endian = "big") {
+            assert_ne!(native.data.as_slice(), wire.data.as_slice());
+        }
 
         native.set_data_position(0);
         assert_eq!(native.read_native::<u32>().unwrap(), cmd);
