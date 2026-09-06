@@ -696,7 +696,7 @@ impl ThreadState {
         };
 
         let start = self.out_parcel.data_size();
-        self.out_parcel.write::<u32>(&cmd)?;
+        self.out_parcel.write_native::<u32>(&cmd)?;
         if let Err(e) = self.out_parcel.write_aligned(&tr) {
             // Roll back the orphan cmd word: flushing a bare BC_* opcode with
             // no binder_transaction_data behind it would desync the driver
@@ -794,7 +794,7 @@ pub(crate) fn _setup_polling() -> Result<()> {
         thread_state
             .borrow_mut()
             .out_parcel
-            .write::<u32>(&binder::BC_ENTER_LOOPER)
+            .write_native::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
     flush_commands()?;
     Ok(())
@@ -822,7 +822,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
             if thread_state.borrow().in_parcel.is_empty() {
                 continue;
             }
-            let cmd: u32 = thread_state.borrow_mut().in_parcel.read::<i32>()? as _;
+            let cmd: u32 = thread_state.borrow_mut().in_parcel.read_native::<i32>()? as _;
 
             log::trace!("{:?}", return_to_str(cmd));
 
@@ -868,7 +868,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     return Err(StatusCode::FailedTransaction);
                 }
                 binder::BR_ACQUIRE_RESULT => {
-                    let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
+                    let result = thread_state.borrow_mut().in_parcel.read_native::<i32>()?;
                     if let UntilResponse::AcquireResult = until {
                         let res = if result != 0 {
                             Ok(None)
@@ -1083,7 +1083,7 @@ fn execute_command(cmd: i32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
-                let other: StatusCode = thread_state.borrow_mut().in_parcel.read::<i32>()?.into();
+                let other: StatusCode = thread_state.borrow_mut().in_parcel.read_native::<i32>()?.into();
                 log::error!("binder::BR_ERROR ({other})");
                 return Err(other);
             }
@@ -1294,12 +1294,12 @@ fn execute_command(cmd: i32) -> Result<()> {
 
             binder::BR_INCREFS => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
                 // The cookie half is unused under the new id encoding
                 // but the kernel still emits the original `cookie`
                 // (always 0 for our published natives). Echo it back
                 // verbatim in BC_INCREFS_DONE.
-                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let cookie_echo = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // BR_INCREFS reflects the kernel acquiring a weak ref
@@ -1317,16 +1317,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
+                state.out_parcel.write_native::<u32>(&binder::BC_INCREFS_DONE)?;
+                state.out_parcel.write_native::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
-                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
+                    .write_native::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
+                let cookie_echo = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // Same shape as BR_INCREFS — bookkeeping only.
@@ -1339,17 +1339,17 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
+                state.out_parcel.write_native::<u32>(&(binder::BC_ACQUIRE_DONE))?;
+                state.out_parcel.write_native::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
-                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
+                    .write_native::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_RELEASE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
                 // cookie echo unused on the deferred-deref path.
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
@@ -1358,8 +1358,8 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
@@ -1368,8 +1368,8 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_ATTEMPT_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // Probe the table's binary alive-signal: entry exists
@@ -1382,8 +1382,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let success = ProcessState::as_self().ref_native_kernel(id).is_some();
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&binder::BC_ACQUIRE_RESULT)?;
-                state.out_parcel.write::<i32>(&(success as _))?;
+                state.out_parcel.write_native::<u32>(&binder::BC_ACQUIRE_RESULT)?;
+                state.out_parcel.write_native::<i32>(&(success as _))?;
             }
             binder::BR_NOOP => {}
             binder::BR_SPAWN_LOOPER => {
@@ -1395,7 +1395,7 @@ fn execute_command(cmd: i32) -> Result<()> {
             binder::BR_DEAD_BINDER => {
                 let handle = {
                     let mut state = thread_state.borrow_mut();
-                    state.in_parcel.read::<binder::binder_uintptr_t>()?
+                    state.in_parcel.read_native::<binder::binder_uintptr_t>()?
                 };
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
@@ -1407,10 +1407,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                         let mut state = thread_state.borrow_mut();
                         state
                             .out_parcel
-                            .write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
+                            .write_native::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
                         state
                             .out_parcel
-                            .write::<binder::binder_uintptr_t>(&handle)?;
+                            .write_native::<binder::binder_uintptr_t>(&handle)?;
                         Ok(())
                     },
                     || ProcessState::as_self().release_obituary_pin(handle as _),
@@ -1418,7 +1418,7 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
                 let mut state = thread_state.borrow_mut();
-                state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                state.in_parcel.read_native::<binder::binder_uintptr_t>()?;
             }
             _ => {
                 log::error!("*** BAD COMMAND {cmd} received from Binder driver\n");
@@ -1572,7 +1572,7 @@ fn get_and_execute_command() -> Result<()> {
     talk_with_driver(true)?;
 
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
-        thread_state.borrow_mut().in_parcel.read::<i32>()
+        thread_state.borrow_mut().in_parcel.read_native::<i32>()
     })?;
     execute_command(cmd)?;
 
@@ -1601,8 +1601,8 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_native::<u32>(&(binder::BC_ACQUIRE))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1617,8 +1617,8 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_RELEASE))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_native::<u32>(&(binder::BC_RELEASE))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1633,8 +1633,8 @@ pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_INCREFS))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_native::<u32>(&(binder::BC_INCREFS))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1649,8 +1649,8 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_DECREFS))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_native::<u32>(&(binder::BC_DECREFS))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1833,8 +1833,8 @@ fn free_buffer(
         let mut thread_state = thread_state.borrow_mut();
         thread_state
             .out_parcel
-            .write::<u32>(&binder::BC_FREE_BUFFER)?;
-        thread_state.out_parcel.write::<binder_uintptr_t>(&data)?;
+            .write_native::<u32>(&binder::BC_FREE_BUFFER)?;
+        thread_state.out_parcel.write_native::<binder_uintptr_t>(&data)?;
         Ok(())
     })?;
 
@@ -1898,7 +1898,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
 
         {
             let mut thread_state = thread_state.borrow_mut();
-            thread_state.out_parcel.write::<u32>(&looper)?;
+            thread_state.out_parcel.write_native::<u32>(&looper)?;
             thread_state.is_looper = true;
         }
 
@@ -1950,7 +1950,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
             thread_state.is_looper = false;
             thread_state
                 .out_parcel
-                .write::<u32>(&binder::BC_EXIT_LOOPER)?;
+                .write_native::<u32>(&binder::BC_EXIT_LOOPER)?;
         }
 
         talk_with_driver(false)?;
@@ -1967,12 +1967,12 @@ pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
 
             state
                 .out_parcel
-                .write::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+                .write_native::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
             state
                 .out_parcel
-                .write::<binder::binder_uintptr_t>(&(handle as _))?;
+                .write_native::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
@@ -1987,12 +1987,12 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
 
             state
                 .out_parcel
-                .write::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+                .write_native::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
+            state.out_parcel.write_native::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
             state
                 .out_parcel
-                .write::<binder::binder_uintptr_t>(&(handle as _))?;
+                .write_native::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
