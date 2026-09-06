@@ -2489,3 +2489,195 @@ mod tests {
         }
     }
 }
+
+/// Absolute little-endian byte goldens for the data-parcel wire.
+///
+/// Every assertion here is a **literal byte sequence**, never a round
+/// trip. A round trip re-reads with the same codec, so it passes on a
+/// big-endian host even when the bytes are wrong — which is exactly why
+/// the rest of the suite cannot see the wire layout at all (measured on
+/// qemu-user s390x: 36/36 green with a native-endian codec).
+///
+/// These goldens are therefore the *definition* of what a little-endian
+/// peer puts on the wire, and the `cross`/qemu s390x job runs them
+/// unchanged: a big-endian build that produces these bytes is
+/// cross-endian compatible by construction, no networking required.
+///
+/// Two things are deliberately absent. `flat_binder_object` and the
+/// kernel command stream are **not** wire — they are the kernel's own
+/// ABI and stay host-native; the one exception below pins that as a
+/// decision rather than an omission. Anything needing a live
+/// `ProcessState` (a non-null binder, a real fd) belongs in the
+/// kernel-host suite, not here — this module must stay hermetic so it
+/// can run under qemu.
+#[cfg(test)]
+mod wire_golden {
+    use super::*;
+
+    /// The bytes a fresh kernel-mode parcel holds after writing `value`.
+    fn enc<S: Serialize + ?Sized>(value: &S) -> Vec<u8> {
+        let mut parcel = Parcel::new();
+        parcel.write(value).unwrap();
+        parcel.data.as_slice().to_vec()
+    }
+
+    #[test]
+    fn scalar_wire_is_absolute_little_endian() {
+        assert_eq!(enc(&true), [0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&false), [0x00, 0x00, 0x00, 0x00]);
+
+        assert_eq!(enc(&0x0102_0304i32), [0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(enc(&0xDEAD_BEEFu32), [0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_eq!(
+            enc(&0x0102_0304_0506_0708i64),
+            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(
+            enc(&0xDEAD_BEEF_CAFE_BABEu64),
+            [0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE]
+        );
+        assert_eq!(
+            enc(&0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10u128),
+            [
+                0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+                0x02, 0x01
+            ]
+        );
+
+        // IEEE-754 bit patterns, byte-reversed: 1.0f32 = 0x3F80_0000.
+        assert_eq!(enc(&1.0f32), [0x00, 0x00, 0x80, 0x3F]);
+        assert_eq!(enc(&-2.0f32), [0x00, 0x00, 0x00, 0xC0]);
+        assert_eq!(enc(&1.0f64), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]);
+    }
+
+    #[test]
+    fn scalar_widening_matches_the_aidl_wire() {
+        // A lone `i8`/`u8`/`i16` widens to `i32` and `u16` to `u32`
+        // *before* the byte order applies. Reversing the un-widened
+        // value would emit one or two bytes and desync everything
+        // after it, so this is the trap a naive codec swap falls into.
+        assert_eq!(enc(&-2i8), [0xFE, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(enc(&0xABu8), [0xAB, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&-2i16), [0xFE, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(enc(&0xBEEFu16), [0xEF, 0xBE, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn array_wire_is_absolute_little_endian() {
+        // Arrays invert the widening above: `i8`/`u8` are one byte per
+        // element, zero-padded to the 4-byte slot.
+        assert_eq!(
+            enc(&[0xABu8, 0xCD, 0xEF][..]),
+            [0x03, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x00]
+        );
+        assert_eq!(
+            enc(&[-2i8, 1][..]),
+            [0x02, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x00, 0x00]
+        );
+
+        // ...while `i16`/`u16` are four bytes per element.
+        assert_eq!(
+            enc(&[-2i16, 3][..]),
+            [0x02, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            enc(&[0xBEEFu16][..]),
+            [0x01, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            enc(&[0x0102_0304i32, -1][..]),
+            [0x02, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            enc(&[1i64][..]),
+            [0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            enc(&[1.0f64][..]),
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
+        );
+
+        // The length word is itself a wire `i32` — the byte range the
+        // pre-existing suite never asserted.
+        assert_eq!(enc(&[0i32; 0][..]), [0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&None::<Vec<i32>>), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn string16_wire_is_absolute_little_endian() {
+        // [i32 code-unit count][UTF-16 units][NUL unit][pad to 4].
+        assert_eq!(
+            enc("AB"),
+            [0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // U+D55C is the only case here whose two bytes differ, so it is
+        // the one that catches a native-endian `u16` view; an ASCII-only
+        // corpus cannot.
+        assert_eq!(enc("한"), [0x01, 0x00, 0x00, 0x00, 0x5C, 0xD5, 0x00, 0x00]);
+        assert_eq!(
+            enc(""),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(enc(&None::<String>), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn stability_word_is_little_endian() {
+        // The category encoding itself is platform-dependent (android-12
+        // ships a different repr), so only the byte order is pinned.
+        let level = i32::from(crate::Stability::Vintf);
+        assert_eq!(enc(&level), level.to_le_bytes());
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(enc(&level), [0x3F, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn a_parcel_of_mixed_fields_keeps_every_slot_aligned() {
+        // Each field's padding decides where the next one starts, so a
+        // per-type golden alone cannot catch a slot that moved.
+        let mut parcel = Parcel::new();
+        parcel.write(&-2i8).unwrap();
+        parcel.write("한").unwrap();
+        parcel.write(&[0x0102_0304i32][..]).unwrap();
+
+        assert_eq!(
+            parcel.data.as_slice().to_vec(),
+            [
+                0xFE, 0xFF, 0xFF, 0xFF, // i8 -2, widened to i32
+                0x01, 0x00, 0x00, 0x00, // String16: 1 code unit
+                0x5C, 0xD5, 0x00, 0x00, //   U+D55C then the NUL unit
+                0x01, 0x00, 0x00, 0x00, // i32[]: 1 element
+                0x04, 0x03, 0x02, 0x01, //   element 0
+            ]
+        );
+    }
+
+    #[test]
+    fn null_binder_stays_a_native_island() {
+        // `flat_binder_object` is the kernel's UAPI struct, not wire: it
+        // is handed to the driver, which parses it with host-native
+        // loads. It must stay native even after the wire is fixed to
+        // little-endian, and this asserts that as a decision with a
+        // name — it goes red if someone "finishes the job" by swapping
+        // the object header too, which would break the kernel path on a
+        // big-endian host.
+        //
+        // The null object is the one that can be tested hermetically:
+        // `pointer() == 0` skips `acquire()`, so no `ProcessState`.
+        let mut parcel = Parcel::new();
+        SerializeOption::serialize_option(None::<&crate::SIBinder>, &mut parcel).unwrap();
+        let bytes = parcel.data.as_slice();
+
+        let obj_len = std::mem::size_of::<flat_binder_object>();
+        assert_eq!(
+            bytes[..4],
+            crate::sys::BINDER_TYPE_BINDER.to_ne_bytes()[..],
+            "object header is native, not little-endian"
+        );
+        assert!(
+            bytes[4..obj_len].iter().all(|&b| b == 0),
+            "a null binder carries no handle, cookie or flags"
+        );
+    }
+}
