@@ -986,6 +986,19 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (kernel binder) — a service registered without an AIDL
+  interface could not be resolved at all.** Such a service answers
+  `INTERFACE_TRANSACTION` with a null string; `query_interface` read it as a
+  non-nullable `String` and returned `UnexpectedNull`, and because every
+  proxy construction goes through it, the whole lookup failed. On a stock
+  Android 34 image that is 23 of 280 services — `battery`, `cpuinfo`,
+  `dbinfo`, `DockObserver`, `app_binding` and the rest of the native
+  diagnostic services — unreachable from rsbinder while `service check`
+  finds them. AOSP folds the null to empty
+  (`String16 res(reply.readString16())` in
+  `BpBinder::getInterfaceDescriptor`, android-16.0.0_r4) and this now does
+  the same. The bug survived because the deprecated `hub::get_service`
+  flattened the error to `None`, so callers read it as "not registered".
 - **rsbinder (RPC, TLS) — a session's own shutdown read as a truncation on
   its own side.** With `UncleanEndOfStream` in place, the end of stream
   rsbinder's own `shutdown()` produced for its own reader — no
