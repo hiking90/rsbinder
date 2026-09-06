@@ -58,7 +58,7 @@ struct KernelSvc {
 }
 impl Interface for KernelSvc {}
 impl IRpcSmoke for KernelSvc {
-    fn r#echo(&self, s: &str) -> rsbinder::status::Result<String> {
+    fn r#echo(&self, s: &str) -> rsbinder::BinderResult<String> {
         // `"pings"` is the read-back channel for the oneway below: it has no
         // reply of its own, so the count has to ride a twoway call.
         if s == "pings" {
@@ -67,10 +67,10 @@ impl IRpcSmoke for KernelSvc {
         }
         Ok(format!("kernel:{s}"))
     }
-    fn r#add(&self, a: i32, b: i32) -> rsbinder::status::Result<i32> {
+    fn r#add(&self, a: i32, b: i32) -> rsbinder::BinderResult<i32> {
         Ok(a + b)
     }
-    fn r#ping(&self) -> rsbinder::status::Result<()> {
+    fn r#ping(&self) -> rsbinder::BinderResult<()> {
         self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }

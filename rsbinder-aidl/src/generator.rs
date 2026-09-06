@@ -323,9 +323,9 @@ pub mod {{mod}} {
             }
             let wrapped = Wrapper { _inner: inner, _rt: rt };
             {%- if is_vintf %}
-            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
             {%- else %}
-            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
             {%- endif %}
             {{crate}}::Strong::new(Box::new(binder))
         }

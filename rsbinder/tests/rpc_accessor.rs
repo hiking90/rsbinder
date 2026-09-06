@@ -123,7 +123,7 @@ struct MockAccessor {
 
 impl Interface for MockAccessor {}
 impl IAccessor for MockAccessor {
-    fn r#addConnection(&self) -> rsbinder::status::Result<ParcelFileDescriptor> {
+    fn r#addConnection(&self) -> rsbinder::BinderResult<ParcelFileDescriptor> {
         self.addconnection_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(code) = self.add_connection_error {
             return Err(Status::new_service_specific_error(
@@ -148,7 +148,7 @@ impl IAccessor for MockAccessor {
         Ok(ParcelFileDescriptor::new(stream))
     }
 
-    fn r#getInstanceName(&self) -> rsbinder::status::Result<String> {
+    fn r#getInstanceName(&self) -> rsbinder::BinderResult<String> {
         Ok(self.name.clone())
     }
 }

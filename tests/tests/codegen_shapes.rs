@@ -31,14 +31,14 @@ impl ICodegenShapes for ShapesSvc {
         src: &SIBinder,
         fill: bool,
         dst: &mut Option<SIBinder>,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         if fill {
             *dst = Some(src.clone());
         }
         Ok(())
     }
 
-    fn r#roundNullableVec(&self, v: &mut Option<Vec<i32>>) -> rsbinder::status::Result<()> {
+    fn r#roundNullableVec(&self, v: &mut Option<Vec<i32>>) -> rsbinder::BinderResult<()> {
         if let Some(v) = v.as_mut() {
             v.push(99);
         }
@@ -49,12 +49,12 @@ impl ICodegenShapes for ShapesSvc {
         &self,
         v: Option<&[i32; 3]>,
         r: &mut Option<[i32; 3]>,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         *r = v.map(|v| [v[2], v[1], v[0]]);
         Ok(())
     }
 
-    fn r#roundInoutBinders(&self, v: &mut Vec<SIBinder>) -> rsbinder::status::Result<()> {
+    fn r#roundInoutBinders(&self, v: &mut Vec<SIBinder>) -> rsbinder::BinderResult<()> {
         v.reverse();
         Ok(())
     }

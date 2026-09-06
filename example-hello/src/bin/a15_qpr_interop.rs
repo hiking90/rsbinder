@@ -49,7 +49,7 @@ const LAZY_NAME: &str = "rsbinder.test.a15.lazy";
 struct HelloService;
 impl Interface for HelloService {}
 impl IHello for HelloService {
-    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         Ok(echo.to_owned())
     }
 }
@@ -65,7 +65,7 @@ impl IClientCallback for NoopClientCallback {
         &self,
         _registered: &SIBinder,
         _has_clients: bool,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

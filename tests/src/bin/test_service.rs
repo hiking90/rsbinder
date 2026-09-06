@@ -603,7 +603,7 @@ impl ITestService::ITestService for TestService {
         Ok(input.iter().rev().cloned().collect())
     }
 
-    fn r#killService(&self) -> rsbinder::status::Result<()> {
+    fn r#killService(&self) -> rsbinder::BinderResult<()> {
         std::process::exit(0);
     }
 }
@@ -634,7 +634,7 @@ impl IFooInterface::IFooInterface for FooInterface {
     ) -> std::result::Result<i32, Status> {
         Ok(value)
     }
-    fn newApi(&self) -> rsbinder::status::Result<()> {
+    fn newApi(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

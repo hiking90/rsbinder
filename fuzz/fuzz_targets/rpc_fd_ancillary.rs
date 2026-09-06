@@ -10,5 +10,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    rsbinder::file_descriptor::__fuzz_rpc_fd_index(data);
+    rsbinder::__fuzz_rpc_fd_index(data);
 });

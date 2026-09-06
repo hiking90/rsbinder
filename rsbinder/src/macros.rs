@@ -80,7 +80,7 @@ macro_rules! __declare_binder_interface {
                         }
                         fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
                     }
-                    let binder = $crate::native::Binder::new_with_stability_and_features(
+                    let binder = $crate::Binder::new_with_stability_and_features(
                         $native(::std::boxed::Box::new(Wrapper {_inner: inner})),
                         $stability,
                         features,
@@ -111,7 +111,7 @@ macro_rules! __declare_binder_interface {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
                         ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
                         ::core::option::Option::None => {
-                            match $crate::native::Binder::<$native>::try_from(ibinder) {
+                            match $crate::Binder::<$native>::try_from(ibinder) {
                                 ::core::result::Result::Ok(native) => {
                                     // A local binder can back the async view only if it
                                     // was published as an async service. A sync-only
@@ -206,7 +206,7 @@ macro_rules! __declare_binder_interface {
                 inner: T,
                 features: $crate::BinderFeatures,
             ) -> $crate::Strong<dyn $interface> {
-                let binder = $crate::native::Binder::new_with_stability_and_features(
+                let binder = $crate::Binder::new_with_stability_and_features(
                     $native(::std::boxed::Box::new(inner)),
                     $stability,
                     features,
@@ -439,7 +439,7 @@ macro_rules! declare_binder_interface {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
                     ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
                     ::core::option::Option::None => {
-                        match $crate::native::Binder::<$native>::try_from(binder) {
+                        match $crate::Binder::<$native>::try_from(binder) {
                             ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
                             ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
                         }
@@ -448,7 +448,7 @@ macro_rules! declare_binder_interface {
             }
         }
 
-        impl $crate::parcelable::Serialize for dyn $interface + '_
+        impl $crate::Serialize for dyn $interface + '_
         where
             dyn $interface: $crate::Interface
         {
@@ -459,7 +459,7 @@ macro_rules! declare_binder_interface {
             }
         }
 
-        impl $crate::parcelable::SerializeOption for dyn $interface + '_ {
+        impl $crate::SerializeOption for dyn $interface + '_ {
             fn serialize_option(this: ::core::option::Option<&Self>, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 parcel.write(&this.map($crate::Interface::as_binder))
             }

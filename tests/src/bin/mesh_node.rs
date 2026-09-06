@@ -87,7 +87,7 @@ impl MeshNodeImpl {
 impl Interface for MeshNodeImpl {}
 
 impl IMeshNode for MeshNodeImpl {
-    fn r#exchange(&self, req: &MeshMessage) -> status::Result<MeshMessage> {
+    fn r#exchange(&self, req: &MeshMessage) -> BinderResult<MeshMessage> {
         self.received.fetch_add(1, Ordering::Relaxed);
         // Deterministic transform: seq+1, origin/kind rewritten to this
         // node; nonce + blob echoed unchanged so the caller can verify
@@ -101,7 +101,7 @@ impl IMeshNode for MeshNodeImpl {
         })
     }
 
-    fn r#accumulate(&self, v: &MeshValue) -> status::Result<i64> {
+    fn r#accumulate(&self, v: &MeshValue) -> BinderResult<i64> {
         let delta = match v {
             MeshValue::I(i) => *i as i64,
             MeshValue::L(l) => *l,
@@ -110,16 +110,16 @@ impl IMeshNode for MeshNodeImpl {
         Ok(self.accumulator.fetch_add(delta, Ordering::Relaxed) + delta)
     }
 
-    fn r#notify(&self, _msg: &MeshMessage) -> status::Result<()> {
+    fn r#notify(&self, _msg: &MeshMessage) -> BinderResult<()> {
         self.received.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn r#registerObserver(&self, _obs: &Strong<dyn IMeshObserver>) -> status::Result<()> {
+    fn r#registerObserver(&self, _obs: &Strong<dyn IMeshObserver>) -> BinderResult<()> {
         Ok(())
     }
 
-    fn r#receivedCount(&self) -> status::Result<i32> {
+    fn r#receivedCount(&self) -> BinderResult<i32> {
         Ok(self.received.load(Ordering::Relaxed))
     }
 }

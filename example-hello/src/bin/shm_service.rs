@@ -57,12 +57,12 @@ impl ShmService {
 impl Interface for ShmService {}
 
 impl IShm for ShmService {
-    fn getRegion(&self) -> rsbinder::status::Result<ParcelFileDescriptor> {
+    fn getRegion(&self) -> rsbinder::BinderResult<ParcelFileDescriptor> {
         // `to_parcel_fd` dups the fd; the service keeps its own mapping.
         Ok(self.region.to_parcel_fd()?)
     }
 
-    fn regionWritten(&self, offset: i32, len: i32) -> rsbinder::status::Result<()> {
+    fn regionWritten(&self, offset: i32, len: i32) -> rsbinder::BinderResult<()> {
         let (offset, len) = (offset as usize, len as usize);
         let mut buf = vec![0u8; len];
         self.region.read_at(offset, &mut buf)?;
@@ -73,7 +73,7 @@ impl IShm for ShmService {
         Ok(())
     }
 
-    fn nextFrame(&self, seq: i32) -> rsbinder::status::Result<SIBinder> {
+    fn nextFrame(&self, seq: i32) -> rsbinder::BinderResult<SIBinder> {
         // 4 KiB per frame, page-aligned as a real pixel buffer would be.
         let frame = self.dealer.allocate_page_aligned(4096)?;
         let payload = format!("frame #{seq} @ offset {}", frame.offset());

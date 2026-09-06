@@ -24,7 +24,7 @@ struct Recorder {
 impl Interface for Recorder {}
 
 impl IUpdateTxnDedup for Recorder {
-    fn onRecord(&self, v: i32, delay_ms: i32) -> rsbinder::status::Result<()> {
+    fn onRecord(&self, v: i32, delay_ms: i32) -> rsbinder::BinderResult<()> {
         if delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
         }
@@ -32,11 +32,11 @@ impl IUpdateTxnDedup for Recorder {
         Ok(())
     }
 
-    fn drain(&self) -> rsbinder::status::Result<Vec<i32>> {
+    fn drain(&self) -> rsbinder::BinderResult<Vec<i32>> {
         Ok(self.recorded.lock().unwrap().clone())
     }
 
-    fn reset(&self) -> rsbinder::status::Result<()> {
+    fn reset(&self) -> rsbinder::BinderResult<()> {
         self.recorded.lock().unwrap().clear();
         Ok(())
     }

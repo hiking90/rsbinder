@@ -29,7 +29,7 @@ struct CallingIdentitySmoke;
 impl Interface for CallingIdentitySmoke {}
 
 impl ICallingIdentity for CallingIdentitySmoke {
-    fn describeCaller(&self) -> rsbinder::status::Result<String> {
+    fn describeCaller(&self) -> rsbinder::BinderResult<String> {
         let uid = rsbinder::get_calling_uid();
         let pid = rsbinder::get_calling_pid();
         let sid_pre = rsbinder::get_calling_sid();

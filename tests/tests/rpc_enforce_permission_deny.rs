@@ -51,16 +51,16 @@ use rpcperm::IRpcPermGuard::{BnRpcPermGuard, IRpcPermGuard};
 struct GuardSvc;
 impl Interface for GuardSvc {}
 impl IRpcPermGuard for GuardSvc {
-    fn r#doSingle(&self) -> rsbinder::status::Result<bool> {
+    fn r#doSingle(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#doAllOf(&self) -> rsbinder::status::Result<bool> {
+    fn r#doAllOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#doAnyOf(&self) -> rsbinder::status::Result<bool> {
+    fn r#doAnyOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#echo(&self, message: &str) -> rsbinder::status::Result<String> {
+    fn r#echo(&self, message: &str) -> rsbinder::BinderResult<String> {
         Ok(message.to_string())
     }
 }

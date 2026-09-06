@@ -59,7 +59,7 @@ impl Remotable for ProbeBinder {
 struct Callback;
 impl Interface for Callback {}
 impl hub::IServiceCallback for Callback {
-    fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> status::Result<()> {
+    fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> BinderResult<()> {
         Ok(())
     }
 }

@@ -41,7 +41,7 @@ struct AuthzService;
 impl Interface for AuthzService {}
 
 impl IAuthz for AuthzService {
-    fn whoami(&self) -> rsbinder::status::Result<String> {
+    fn whoami(&self) -> rsbinder::BinderResult<String> {
         // Authorize: only an *identifiable local* caller is allowed. A
         // uid-less RPC transport (vsock / TLS cert / anonymous) or no
         // in-flight transaction falls through to a fail-closed deny.
@@ -61,7 +61,7 @@ impl IAuthz for AuthzService {
         }
     }
 
-    fn adminOnly(&self) -> rsbinder::status::Result<String> {
+    fn adminOnly(&self) -> rsbinder::BinderResult<String> {
         // `get_calling_uid()` is the kernel sender uid or the Unix-RPC peer
         // uid; a uid-less transport returns the `u32::MAX` sentinel (never
         // 0), so this comparison fail-closes there too — no root bypass.

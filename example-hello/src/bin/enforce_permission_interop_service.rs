@@ -22,23 +22,23 @@ struct PermCheckImpl;
 impl Interface for PermCheckImpl {}
 
 impl IPermCheck for PermCheckImpl {
-    fn doSingle(&self) -> rsbinder::status::Result<bool> {
+    fn doSingle(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn doAllOf(&self) -> rsbinder::status::Result<bool> {
+    fn doAllOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn doAnyOf(&self) -> rsbinder::status::Result<bool> {
+    fn doAnyOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn doDenied(&self) -> rsbinder::status::Result<bool> {
+    fn doDenied(&self) -> rsbinder::BinderResult<bool> {
         // This must NEVER run — the generated `on_transact` arm should
         // reject before reaching here. We return a sentinel that the
         // client compares against to detect a leak.
         eprintln!("STAGE3_4_2_LEAK: doDenied() body ran — generated check did not fire!");
         Ok(false)
     }
-    fn echo(&self, message: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, message: &str) -> rsbinder::BinderResult<String> {
         Ok(message.to_owned())
     }
 }

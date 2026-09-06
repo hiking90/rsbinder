@@ -1529,22 +1529,22 @@ struct MyCallback {
 impl rsbinder::Interface for MyCallback {}
 
 impl IMyCallback::IMyCallback for MyCallback {
-    fn repeatParcelable(&self, input: &TMyParcelable) -> rsbinder::status::Result<TMyParcelable> {
+    fn repeatParcelable(&self, input: &TMyParcelable) -> rsbinder::BinderResult<TMyParcelable> {
         *self.repeat_parcelable_called.lock().unwrap() = true;
         Ok(input.clone())
     }
-    fn repeatEnum(&self, input: TMyEnum) -> rsbinder::status::Result<TMyEnum> {
+    fn repeatEnum(&self, input: TMyEnum) -> rsbinder::BinderResult<TMyEnum> {
         *self.repeat_enum_called.lock().unwrap() = true;
         Ok(input)
     }
-    fn repeatUnion(&self, input: &TMyUnion) -> rsbinder::status::Result<TMyUnion> {
+    fn repeatUnion(&self, input: &TMyUnion) -> rsbinder::BinderResult<TMyUnion> {
         *self.repeat_union_called.lock().unwrap() = true;
         Ok(input.clone())
     }
     fn repeatOtherParcelable(
         &self,
         input: &TMyOtherParcelable,
-    ) -> rsbinder::status::Result<TMyOtherParcelable> {
+    ) -> rsbinder::BinderResult<TMyOtherParcelable> {
         *self.repeat_other_parcelable_called.lock().unwrap() = true;
         Ok(input.clone())
     }
@@ -2472,7 +2472,7 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     // SIBinder Derefs to dyn IBinder, which has as_proxy() returning
     // Option<&ProxyHandle>. The borrow is valid for as long as
     // `binder` (which holds the underlying Arc) is alive.
-    let proxy_ref: &rsbinder::proxy::ProxyHandle = binder
+    let proxy_ref: &rsbinder::ProxyHandle = binder
         .as_proxy()
         .expect("test_service binder must be a proxy");
 

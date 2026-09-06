@@ -24,7 +24,7 @@ const RPC_SOCKET: &str = "/tmp/rsb_unified.sock";
 struct IHelloService;
 impl Interface for IHelloService {}
 impl IHello for IHelloService {
-    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         println!("unified_service: echo({echo:?})");
         Ok(echo.to_owned())
     }

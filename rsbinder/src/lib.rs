@@ -160,32 +160,36 @@
 
 // Core binder functionality
 mod binder;
-/// Async binder runtime support
+// Async binder runtime support. Private: `BoxFuture`, `BinderAsyncPool`
+// and `BinderAsyncRuntime` are re-exported at the crate root, which is
+// the only path — see the re-export policy below.
 #[cfg(feature = "async")]
-pub mod binder_async;
+mod binder_async;
 mod binder_object;
 /// BinderFS filesystem utilities
 pub mod binderfs;
 /// Helpers for a process bridging two transports (the gateway pattern)
 pub mod bridge;
-/// Error types and result handling
-pub mod error;
-/// File descriptor wrapper for IPC
-pub mod file_descriptor;
+// Error types. Private: `Result` and `StatusCode` are re-exported at the
+// crate root.
+mod error;
+// `ParcelFileDescriptor`, re-exported at the crate root.
+mod file_descriptor;
 // `LazyServiceRegistrar`; documented inside (an outer doc would re-resolve its links at the crate root, as at `entry`).
 pub mod lazy_service;
 mod macros;
-/// Native service implementation helpers
-pub mod native;
-/// Data serialization for IPC
-pub mod parcel;
-/// Parcelable trait for serializable types
-pub mod parcelable;
-/// Holder for parcelable objects
-pub mod parcelable_holder;
+// Server-side binder construction: `Binder`, `BinderFeatures` and
+// `is_handling_transaction`, re-exported at the crate root.
+mod native;
+// `Parcel`, re-exported at the crate root.
+mod parcel;
+// The (de)serialization trait stack, re-exported at the crate root.
+mod parcelable;
+// `ParcelableHolder`, re-exported at the crate root.
+mod parcelable_holder;
 mod process_state;
-/// Client proxy for remote services
-pub mod proxy;
+// `Proxy` and `ProxyHandle`, re-exported at the crate root.
+mod proxy;
 /// Process-global proxy count + watermark callbacks
 /// with opt-in per-uid tracking. AOSP `BpBinder` proxy-count surface
 /// (`getBinderProxyCount` / `setBinderProxyCountWatermarks` /
@@ -198,8 +202,9 @@ mod ref_counter;
 /// stubs so a heap fd can travel over the kernel binder or
 /// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
-/// Status and exception handling
-pub mod status;
+// Status and exception handling: `BinderResult`, `ExceptionCode` and
+// `Status`, re-exported at the crate root.
+mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
@@ -248,8 +253,14 @@ pub use rsbinder_macros::{interface, BinderEnum, Parcelable};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
-// Items kept out of the crate root must be reached via
-// `rsbinder::<module>::<item>`.
+//
+// Nine of the modules below are private, and this block is the only way
+// in. They exported exactly what is re-exported here, so the module path
+// was a second name for each item and nothing else — including one that
+// was actively harmful: `status::Result` is `BinderResult`, but shares a
+// name with the root `Result`, which is a different type. A domain module
+// that carries items of its own (`hub`, `rpc`, `thread_state`, …) stays
+// public; those must still be reached via `rsbinder::<module>::<item>`.
 
 // From `binder` — core binder identity, transaction codes, traits.
 pub use binder::{
@@ -271,6 +282,12 @@ pub use binder::__rpc_stamp_descriptor;
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
+// Fuzz entry points for the `fuzz/` crate, which is outside the
+// workspace and so can only reach them through the crate root now that
+// `file_descriptor` is private.
+#[cfg(feature = "rpc")]
+#[doc(hidden)]
+pub use file_descriptor::{__fuzz_rpc_fd_index, __fuzz_rpc_fd_index_v1, __fuzz_rpc_raw_fd};
 
 // From `native` — server-side binder construction.
 pub use native::{is_handling_transaction, Binder, BinderFeatures};

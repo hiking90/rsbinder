@@ -14,7 +14,7 @@ impl rsbinder::Interface for IFooService {}
 
 impl IFoo for IFooService {
     // Implement the echo method.
-    fn hello(&self) -> rsbinder::status::Result<()> {
+    fn hello(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }
@@ -106,7 +106,7 @@ fn test_notifications() -> rsbinder::Result<()> {
             &self,
             name: &str,
             service: &rsbinder::SIBinder,
-        ) -> rsbinder::status::Result<()> {
+        ) -> rsbinder::BinderResult<()> {
             println!("onRegistration: {name} {service:?}");
             Ok(())
         }

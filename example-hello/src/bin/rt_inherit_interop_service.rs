@@ -19,7 +19,7 @@ struct RtCheck;
 impl Interface for RtCheck {}
 
 impl IRtCheck for RtCheck {
-    fn reportSchedPolicy(&self) -> rsbinder::status::Result<i32> {
+    fn reportSchedPolicy(&self) -> rsbinder::BinderResult<i32> {
         let policy = rsbinder::get_current_scheduler_policy()
             .map_err(|_| Status::from(ExceptionCode::IllegalState))?;
         Ok(policy)
