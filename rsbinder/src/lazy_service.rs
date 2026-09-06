@@ -210,7 +210,7 @@ struct ClientCounterCallback {
 impl Interface for ClientCounterCallback {}
 
 impl IClientCallback for ClientCounterCallback {
-    fn onClients(&self, registered: &SIBinder, has_clients: bool) -> crate::status::Result<()> {
+    fn onClients(&self, registered: &SIBinder, has_clients: bool) -> crate::BinderResult<()> {
         // Not an error: the service manager may still hold the proxy
         // after the last `LazyServiceRegistrar` handle is dropped.
         if let Some(shared) = self.shared.upgrade() {

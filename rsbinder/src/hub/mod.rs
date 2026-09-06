@@ -785,7 +785,7 @@ macro_rules! forward_service_callback_impl {
                 &self,
                 _name: &str,
                 _binder: &crate::SIBinder,
-            ) -> crate::status::Result<()> {
+            ) -> crate::BinderResult<()> {
                 // Unreachable on the serialize-only path; see the
                 // ForwardServiceCallback doc. Return an error rather than
                 // panic in library code if it is ever reached.
@@ -869,7 +869,7 @@ macro_rules! forward_client_callback_impl {
                 &self,
                 _registered: &crate::SIBinder,
                 _has_clients: bool,
-            ) -> crate::status::Result<()> {
+            ) -> crate::BinderResult<()> {
                 // Unreachable on the serialize-only path; see the
                 // ForwardClientCallback doc. Return an error rather than
                 // panic in library code if it is ever reached.

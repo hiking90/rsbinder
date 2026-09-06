@@ -20,6 +20,7 @@
     - [Shared Memory](./shared-memory.md)
     - [Error Handling](./error-handling.md)
     - [Service Manager (HUB)](./service-manager.md)
+- [Storing Values (Data Serialization)](./data-serialization.md)
 - [RPC Transport (binder-over-socket)](./rpc-transport.md)
 - [Cross-Transport Services](./cross-transport-services.md)
 - [Security & Authorization](./security.md)

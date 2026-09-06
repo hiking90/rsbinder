@@ -483,6 +483,22 @@ const MAX_NESTED_READ_DEPTH: usize = 1000;
 /// A `Parcel` is the fundamental data container for binder IPC, handling serialization
 /// and deserialization of primitive types, strings, objects, and file descriptors.
 /// It maintains proper alignment and object reference tracking required by the binder protocol.
+///
+/// # Byte order
+///
+/// The data a parcel carries is **little-endian on every host**, so its
+/// bytes mean the same thing on the machine that reads them as on the one
+/// that wrote them — see the crate docs' *Wire byte order*. What a parcel
+/// holds is not all wire, though: an object written into a kernel parcel
+/// is a `flat_binder_object`, a UAPI struct the driver parses with native
+/// loads, and it stays host-native. On a big-endian host a kernel parcel
+/// carrying a binder is therefore a mixture — little-endian scalars
+/// around a native object header — and correctly so, because only the
+/// scalars are going to a peer.
+///
+/// Bytes that leave the process as *data* never contain that mixture:
+/// `rsbinder::to_bytes` encodes through a parcel that refuses binders and
+/// file descriptors outright, so what it hands back is pure wire.
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
@@ -2007,12 +2023,16 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 /// bytes with no such header and no way to evolve.
 ///
 /// ```no_run
+/// # fn main() {}
+/// # #[cfg(feature = "macros")]
+/// # mod example {
 /// # #[derive(rsbinder::Parcelable, Default, Debug, Clone, PartialEq)]
 /// # struct Settings { volume: i32, name: String }
-/// # fn main() -> rsbinder::Result<()> {
+/// # fn run() -> rsbinder::Result<()> {
 /// let settings = Settings { volume: 7, name: "quiet".into() };
 /// std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
 /// # Ok(())
+/// # }
 /// # }
 /// ```
 ///

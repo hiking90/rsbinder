@@ -53,6 +53,17 @@ $ mdbook serve
 
 The RPC transport requires no kernel module, no root, and no special device file — making rsbinder usable as a general cross-platform Rust IPC layer in addition to its Android role.
 
+### Byte order
+
+Parcel data is **little-endian on every host**, so a parcel written on one machine reads on another and the bytes match what Android's `libbinder` sends for the same value. On a little-endian host — every Android target and nearly every Linux one — this costs nothing; a big-endian host pays a byte swap.
+
+| Path | Little-endian | Big-endian |
+|------|:-------------:|:----------:|
+| RPC transport | ✅ supported, CI-verified | ✅ supported, verified under qemu-user (s390x) |
+| Kernel binder | ✅ supported, CI-verified | ⚠️ structurally correct, **unverified** |
+
+The kernel-binder caveat is honest rather than cautious: no big-endian system ships binderfs, so there is nowhere to run that path. The RPC half is verified by encoding to fixed little-endian bytes on a big-endian build and reading them back — no network needed.
+
 ## RPC Transport (binder-over-socket)
 
 A separate stack from the kernel binder path. Lets you run binder-style IPC **without `/dev/binder`** — on Linux, macOS, or Android, and across host/VM or network boundaries. Wire-compatible with Android `libbinder` RPC v1 and v2, verified end-to-end against real Android 15 / 16 emulators.

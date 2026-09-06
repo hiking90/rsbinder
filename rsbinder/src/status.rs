@@ -13,8 +13,6 @@ use crate::parcel::*;
 use crate::parcelable::*;
 use std::fmt::{Debug, Display, Formatter};
 
-/// Result type for operations that can return a `Status` error.
-pub type Result<T> = std::result::Result<T, Status>;
 
 /// Result alias for **binder interface methods** — the type returned by the
 /// generated `Bp*` proxy / `Bn*` native stubs and by your `impl` of an AIDL
@@ -25,10 +23,10 @@ pub type Result<T> = std::result::Result<T, Status>;
 /// and what a service returns to raise an application-level error (see
 /// [`Status::new_service_specific_error`]).
 ///
-/// This is the *same type* as [`Result`] in this module; it exists under a
-/// distinct, intention-revealing name so it does not read as a collision
-/// with the crate-root [`crate::Result`], whose error is the flat
-/// transport-level [`StatusCode`]. The two interoperate through `?` in both
+/// The name is deliberately not `Result`: the crate root already has one,
+/// whose error is the flat transport-level [`StatusCode`], and two aliases
+/// spelled `Result` meaning different types is how a single `use` line
+/// silently changes what a file's `Result` is. The two interoperate through `?` in both
 /// directions (`From<Status> for StatusCode` and `From<StatusCode> for
 /// Status`), and `?` on `std::io::Error` works in either context.
 pub type BinderResult<T> = std::result::Result<T, Status>;

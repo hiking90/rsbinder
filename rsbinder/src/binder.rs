@@ -638,8 +638,11 @@ const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 /// android-12 `Stability::Category::repr()` for a raw `Level`.
 ///
 /// AOSP-12 `Category { uint8_t version; uint8_t reserved[2]; Level level; }`
-/// with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, so on
-/// little-endian `repr() == (level << 24) | version`
+/// with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, which
+/// AOSP reinterprets as an `int32_t`. The stability word is an ordinary
+/// wire `i32`, and the wire is little-endian on every host, so
+/// `repr() == (level << 24) | version` everywhere — this arithmetic needs
+/// no `target_endian` of its own
 /// (`frameworks/native/libs/binder/{include/binder/Stability.h,Stability.cpp}`,
 /// android-12.0.0_r34).
 // Only reachable in the `target_os = "android"` encode branch (and unit tests).

@@ -205,8 +205,98 @@ short form — and the first entry is the only one no compiler will catch.
   cannot soundly describe. The view is read-only (`load` / `copy_to` / `slice`
   / `to_vec`); writes go through `write_at` on the concrete heap types, which
   also refuses a `FLAG_READ_ONLY` mapping.
+- **Nine module paths are gone; the crate root is the only way in.** Each of
+  them re-exported exactly what the root already did, so the fix is to drop
+  the module segment — every replacement below is the same type:
+
+  | Was | Now |
+  |---|---|
+  | `rsbinder::parcel::Parcel` | `rsbinder::Parcel` |
+  | `rsbinder::parcelable::{Serialize, Deserialize, Parcelable, …}` | `rsbinder::{Serialize, Deserialize, Parcelable, …}` |
+  | `rsbinder::parcelable_holder::ParcelableHolder` | `rsbinder::ParcelableHolder` |
+  | `rsbinder::proxy::{Proxy, ProxyHandle}` | `rsbinder::{Proxy, ProxyHandle}` |
+  | `rsbinder::native::{Binder, BinderFeatures, is_handling_transaction}` | `rsbinder::{Binder, BinderFeatures, is_handling_transaction}` |
+  | `rsbinder::error::{Result, StatusCode}` | `rsbinder::{Result, StatusCode}` |
+  | `rsbinder::status::{BinderResult, ExceptionCode, Status}` | `rsbinder::{BinderResult, ExceptionCode, Status}` |
+  | **`rsbinder::status::Result`** | **`rsbinder::BinderResult`** — see below |
+  | `rsbinder::binder_async::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` | `rsbinder::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` |
+  | `rsbinder::file_descriptor::ParcelFileDescriptor` | `rsbinder::ParcelFileDescriptor` |
+
+  `rsbinder::status::Result` is the one that was worth removing rather than
+  merely deduplicating: it is `Result<T, Status>`, while `rsbinder::Result`
+  is `Result<T, StatusCode>` — a different type with the same name, so
+  `use rsbinder::status::Result;` silently changed what `Result` meant in a
+  file. Use `BinderResult`, which is the same type under a name that does
+  not collide. A type's methods are unaffected by any of this; only the path
+  to name the type changes. Domain modules (`hub`, `rpc`, `thread_state`,
+  `shared_memory`, `entry`, `bridge`, and the rest) are untouched.
+- **`Parcel::is_for_rpc` is deprecated in favour of `Parcel::is_kernel_backed`,
+  with the polarity inverted.** `!p.is_kernel_backed()` is the literal
+  replacement. The old name described one consumer of the mode rather than
+  what the flag controls — whether the kernel driver's object table backs the
+  parcel — and it read fail-open at the one place it guards: "deny if this is
+  RPC" lets through a parcel that is neither kernel nor RPC, while "deny
+  unless the kernel backs this" does not. `Parcel::set_for_rpc` is now
+  internal; production code reaches the mode through the RPC session, and
+  `rsbinder::to_bytes` covers the data case.
+- **`rsbinder::get_interface` is now `rsbinder::get_interface_async`.** It is
+  the tokio one, and nothing in the old name said so while `hub::get_interface`
+  sat beside it, synchronous. Matches `connect_async`.
+- **Test- and fuzz-only entry points need a feature.** The nine `__fuzz_*`
+  decoders now need `fuzzing`, and `RpcSession::__slot_count`,
+  `__incoming_thread_*` and `RpcServer::__set_attach_shutdown_probe` need
+  `test-util`. They were `#[doc(hidden)]`, which hides an item from the
+  documentation and from nothing else — they were in the ABI and in what
+  `cargo-semver-checks` compares. If you were calling one, enable the
+  feature; if you were not, sixteen exported symbols left your build.
+
+### Platform support
+
+- **The parcel wire is little-endian on every host.** It used to be whatever
+  the CPU was: nothing said so, nothing checked it, and a big-endian target
+  built clean and then produced parcels no other machine could read. RPC was
+  the worst of it — the framing was already explicit little-endian, so the
+  handshake succeeded and only the body was wrong.
+
+  **No little-endian build produces a different byte than before.**
+  `to_le_bytes` is the identity there, so the encoding is still the memory
+  layout; a big-endian host pays a swap and gains parcels its peers can read.
+  Verified by capturing the emitted bytes as goldens before the change and
+  running them unchanged afterwards, on x86_64 and on s390x under qemu-user.
+
+  Not everything moved: the `BC_*`/`BR_*` command stream and the UAPI structs
+  (`flat_binder_object`, `binder_transaction_data`) go to the kernel driver,
+  which parses them with native loads, and stay host-native. On a big-endian
+  host a kernel parcel carrying a binder is therefore a mixture — correctly,
+  since only the scalars cross to a peer.
+
+  Support tiers, stated honestly: the RPC path is supported and verified on
+  big-endian; the kernel-binder path is structurally correct but unverified,
+  because no big-endian system ships binderfs to test it on.
 
 ### Added
+
+- **rsbinder:** `to_bytes` / `from_bytes` — store a value the way an
+  interface already describes it. An AIDL definition is a schema and the
+  generated code is a complete serializer; these give it somewhere to write
+  other than a transaction, so a project need not maintain a second
+  description of the same data in protobuf or serde:
+
+  ```rust
+  std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+  let settings: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
+  ```
+
+  The bytes are the IPC bytes — same codec, same layout, and portable across
+  architectures now that the wire is fixed little-endian. Binders and file
+  descriptors are refused at the point they are written, before any `dup`,
+  since neither means anything outside the process that made it; and bytes
+  that merely look like a binder object are never turned into one on the way
+  back. Reading is strict: leftover bytes are an error, not a partial read.
+  Forward compatibility comes from the parcelable's length header, so wrap
+  what you store in a parcelable rather than storing a bare scalar. Behind
+  the `rpc` feature, which is where the parcel mode it uses lives. See the
+  book's *Storing Values*.
 
 - **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
   `Interface` (delegating to the binder it holds), and generated interfaces —

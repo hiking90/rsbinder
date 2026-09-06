@@ -353,7 +353,7 @@ impl LocalAccessor {
 impl Interface for LocalAccessor {}
 
 impl IAccessor for LocalAccessor {
-    fn addConnection(&self) -> crate::status::Result<ParcelFileDescriptor> {
+    fn addConnection(&self) -> crate::BinderResult<ParcelFileDescriptor> {
         // Step 1: ask the user-supplied closure for a socket address.
         // A `Result::Err` here is AOSP `ERROR_CONNECTION_INFO_NOT_FOUND`
         // (the provider could not derive an address for this name —
@@ -390,7 +390,7 @@ impl IAccessor for LocalAccessor {
         }
     }
 
-    fn getInstanceName(&self) -> crate::status::Result<String> {
+    fn getInstanceName(&self) -> crate::BinderResult<String> {
         Ok(self.instance.clone())
     }
 }

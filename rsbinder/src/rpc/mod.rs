@@ -10,6 +10,15 @@
 //! never touches `ProcessState`, `ThreadState`, `/dev/binder`, ioctl or
 //! mmap.
 //!
+//! # Endianness
+//!
+//! The wire is little-endian, header and body alike, on whatever host
+//! either end runs — so an rsbinder peer and an AOSP libbinder peer
+//! exchange byte-identical parcels, and a big-endian host is a peer like
+//! any other rather than a silent corruption. It was already true of the
+//! framing; it is now true of the parcel body too. See the crate docs'
+//! *Wire byte order*.
+//!
 //! # Security
 //!
 //! **RPC is _not_ a drop-in for kernel binder's security model.** The

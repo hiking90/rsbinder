@@ -20,6 +20,67 @@
 //! - **Entry API**: [`serve`] / [`connect`] — publish and look up services
 //!   with one URI-selected transport (kernel binder or RPC)
 //!
+//! # Wire byte order
+//!
+//! **The data-parcel wire is little-endian on every host.** A parcel
+//! written on one machine can be read on another, whatever either CPU's
+//! byte order is, and the bytes are identical to what a peer running
+//! Android's libbinder would send for the same value.
+//!
+//! On a little-endian host — every Android target and almost every Linux
+//! one — this costs nothing: the encoding is the memory layout, as it
+//! always was. A big-endian host pays a byte swap and gets a parcel its
+//! peers can actually read.
+//!
+//! Not every byte in a parcel is wire, and the distinction matters if you
+//! are reading the source:
+//!
+//! | Layer | What | Byte order |
+//! |---|---|---|
+//! | Data parcel | scalars, arrays, `String`, the object-free payload | **little-endian** |
+//! | Kernel command stream | the `BC_*`/`BR_*` ioctl buffer | host-native |
+//! | UAPI structs | `flat_binder_object`, `binder_transaction_data` | host-native |
+//!
+//! The lower two go to the kernel driver, which parses them with native
+//! loads; byte-swapping those would break the driver interface. So on a
+//! big-endian host a *kernel* parcel carrying a binder is a mixture —
+//! little-endian scalars around a native object header. That is correct:
+//! the scalars cross to a peer, the object header does not.
+//!
+//! ## Support tiers
+//!
+//! | Path | Little-endian | Big-endian |
+//! |---|---|---|
+//! | RPC (binder-over-socket) | supported, CI-verified | supported, verified under qemu-user s390x |
+//! | Kernel binder | supported, CI-verified | structurally correct but **unverified** — no big-endian binderfs exists to test on |
+//!
+//! # Data serialization
+//!
+//! An AIDL interface is already a schema, and the code generated from it
+//! is already a complete serializer. `to_bytes` and `from_bytes` (with
+//! the `rpc` feature) let you use it for storage rather than only for a
+//! transaction:
+//!
+//! ```no_run
+//! # fn main() {}
+//! # #[cfg(all(feature = "rpc", feature = "macros"))]
+//! # mod example {
+//! # #[derive(rsbinder::Parcelable, Default, Debug, Clone)]
+//! # struct Settings { volume: i32, name: String }
+//! # fn run() -> rsbinder::Result<()> {
+//! let settings = Settings { volume: 7, name: "quiet".into() };
+//! std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+//!
+//! let restored: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! Binders and file descriptors are refused rather than encoded — neither
+//! means anything outside the process that made it. `to_bytes`'s own docs
+//! cover what makes a stored type survive its schema changing.
+//!
 //! # Feature flags
 //!
 //! - `tokio` *(default)* — full async/await support on the Tokio runtime
@@ -46,11 +107,23 @@
 //!   its initial release and `android_15` serves `r6` and later; enable both
 //!   to cover every Android 15 device. The choice is measured at runtime,
 //!   not derived from the SDK version.
+//! - `fuzzing`, `test-util` — expose entry points that exist for a fuzz
+//!   target or a test to reach past the API. Not part of the supported
+//!   surface, and absent from a normal build; a consumer has no reason to
+//!   enable either.
 //!
 //! # Basic Usage
 //!
 //! This library works with AIDL (Android Interface Definition Language) files to generate
 //! type-safe Rust bindings for IPC services.
+//!
+//! **[`serve`] and [`connect`] are the way in.** One URI picks the
+//! transport — `binder:///dev/binderfs/binder` for kernel binder,
+//! `unix:///run/svc.sock` or `tcp://…` for RPC — and the service and
+//! client code either side of it is identical. The lower-level route
+//! ([`ProcessState`] plus the [`hub`] service-manager calls) stays
+//! available and is what the entry API is built on; reach for it when you
+//! need control the URI does not express, not as the default way to start.
 //!
 //! ## Setting up an AIDL-based Service
 //!

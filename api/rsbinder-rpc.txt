@@ -1028,10 +1028,10 @@ impl rsbinder::Interface for rsbinder::hub::android_16::LocalAccessor
 pub fn rsbinder::hub::android_16::LocalAccessor::as_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::hub::android_16::LocalAccessor::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 impl rsbinder::hub::android_16::IAccessor for rsbinder::hub::android_16::LocalAccessor
-pub fn rsbinder::hub::android_16::LocalAccessor::addConnection(&self) -> core::result::Result<rsbinder::ParcelFileDescriptor, rsbinder::Status>
+pub fn rsbinder::hub::android_16::LocalAccessor::addConnection(&self) -> rsbinder::BinderResult<rsbinder::ParcelFileDescriptor>
 pub fn rsbinder::hub::android_16::LocalAccessor::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::LocalAccessor::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::IAccessorDefaultRef> where Self: core::marker::Sized
-pub fn rsbinder::hub::android_16::LocalAccessor::getInstanceName(&self) -> core::result::Result<alloc::string::String, rsbinder::Status>
+pub fn rsbinder::hub::android_16::LocalAccessor::getInstanceName(&self) -> rsbinder::BinderResult<alloc::string::String>
 pub fn rsbinder::hub::android_16::LocalAccessor::setDefaultImpl(rsbinder::hub::android_16::IAccessorDefaultRef) -> rsbinder::hub::android_16::IAccessorDefaultRef where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::LocalAccessor
 impl core::marker::Send for rsbinder::hub::android_16::LocalAccessor
@@ -1111,10 +1111,10 @@ pub fn rsbinder::hub::android_16::BpAccessor::getDefaultImpl() -> core::option::
 pub fn rsbinder::hub::android_16::BpAccessor::getInstanceName(&self) -> rsbinder::BinderResult<alloc::string::String>
 pub fn rsbinder::hub::android_16::BpAccessor::setDefaultImpl(rsbinder::hub::android_16::IAccessorDefaultRef) -> rsbinder::hub::android_16::IAccessorDefaultRef where Self: core::marker::Sized
 impl rsbinder::hub::android_16::IAccessor for rsbinder::hub::android_16::LocalAccessor
-pub fn rsbinder::hub::android_16::LocalAccessor::addConnection(&self) -> core::result::Result<rsbinder::ParcelFileDescriptor, rsbinder::Status>
+pub fn rsbinder::hub::android_16::LocalAccessor::addConnection(&self) -> rsbinder::BinderResult<rsbinder::ParcelFileDescriptor>
 pub fn rsbinder::hub::android_16::LocalAccessor::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::LocalAccessor::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::IAccessorDefaultRef> where Self: core::marker::Sized
-pub fn rsbinder::hub::android_16::LocalAccessor::getInstanceName(&self) -> core::result::Result<alloc::string::String, rsbinder::Status>
+pub fn rsbinder::hub::android_16::LocalAccessor::getInstanceName(&self) -> rsbinder::BinderResult<alloc::string::String>
 pub fn rsbinder::hub::android_16::LocalAccessor::setDefaultImpl(rsbinder::hub::android_16::IAccessorDefaultRef) -> rsbinder::hub::android_16::IAccessorDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::android_16::IAccessorAsyncService: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::IAccessorAsyncService::addConnection<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = rsbinder::BinderResult<rsbinder::ParcelFileDescriptor>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
