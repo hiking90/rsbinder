@@ -159,3 +159,146 @@ fn remove_slot_has_exactly_six_callers() {
         hits,
     );
 }
+
+/// The parcel has three byte layers and only one of them is the wire.
+///
+/// L1 (data-parcel scalars, arrays, String16) is defined little-endian on
+/// every host. L2 (the `BC_*`/`BR_*` ioctl stream) and L3 (the UAPI
+/// structs the driver parses) are host-native. All three share the same
+/// `Parcel`, so nothing but the primitive a call reaches for says which
+/// layer it is in — and getting it wrong is invisible on a little-endian
+/// host, where the two codecs emit identical bytes.
+///
+/// So pin where the native primitives live. A new `_ne_bytes` in
+/// `parcelable.rs` means a wire value stopped being portable; a new one
+/// in `parcel.rs` outside `NativeScalar` means the same. Raise a count
+/// only after deciding which layer the new code belongs to.
+#[test]
+fn native_byte_codecs_stay_in_their_islands() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    if !src_root.is_dir() {
+        eprintln!("skipping: sources not reachable at {}", src_root.display());
+        return;
+    }
+
+    struct Pin {
+        needle: &'static str,
+        /// Whether a hit outside `files` is itself a failure. True for a
+        /// primitive that has no business anywhere else in the crate;
+        /// false for `as *const u8`, which is ordinary Rust (pointer
+        /// identity, FFI) away from the parcel.
+        tree_wide: bool,
+        files: &'static [(&'static str, usize)],
+    }
+
+    let pins = [
+        Pin {
+            needle: "_ne_bytes",
+            tree_wide: true,
+            files: &[
+                // `NativeScalar`'s two methods, plus the two goldens
+                // that assert what stays native: the command stream and
+                // the null binder's object header.
+                ("parcel.rs", 4),
+                // fd/memfd bookkeeping, never parcel wire.
+                ("shared_memory/mod.rs", 4),
+            ],
+        },
+        Pin {
+            // The `parcelable_struct!` arm: L3 structs in, L3 structs out.
+            needle: "transmute::<[u8",
+            tree_wide: true,
+            files: &[("parcelable.rs", 1)],
+        },
+        Pin {
+            // Raw byte views of parcel data. `parcel.rs`: `write_aligned`
+            // and the object table. `parcelable.rs`: the String16
+            // `Vec<u16>` view, which stays behind a `target_endian` gate
+            // rather than disappearing.
+            needle: "as *const u8",
+            tree_wide: false,
+            files: &[("parcel.rs", 2), ("parcelable.rs", 1)],
+        },
+        Pin {
+            // L3's membership list — the types whose bytes cross verbatim.
+            needle: "unsafe impl ParcelPod for",
+            tree_wide: true,
+            files: &[("parcel.rs", 4)],
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for pin in &pins {
+        let needle = pin.needle;
+        let hits = count_call_sites(&src_root, needle);
+        for (suffix, want) in pin.files {
+            let got = hits.iter().filter(|(p, _)| p.ends_with(suffix)).count();
+            if got != *want {
+                failures.push(format!("`{needle}` in {suffix}: expected {want}, found {got}"));
+            }
+        }
+        if !pin.tree_wide {
+            continue;
+        }
+        let stray: Vec<_> = hits
+            .iter()
+            .filter(|(p, _)| !pin.files.iter().any(|(suffix, _)| p.ends_with(suffix)))
+            .collect();
+        if !stray.is_empty() {
+            failures.push(format!("`{needle}` appeared in an unlisted file: {stray:#?}"));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the three parcel byte layers moved — see this test's doc:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// `thread_state.rs` writes the kernel command stream, which is an ioctl
+/// buffer the driver parses with native loads — not wire. It must reach
+/// the parcel through `write_native` / `read_native` only.
+///
+/// This is the gate for the one mistake the naming cannot prevent: a new
+/// `BC_*` command written as `out_parcel.write::<u32>(&cmd)` compiles,
+/// passes every little-endian test, and sends byte-swapped commands to a
+/// big-endian driver. Matching on the method rather than the receiver
+/// catches the wrapped call chains too, where the receiver is a line up.
+#[test]
+fn the_kernel_command_stream_never_reaches_the_wire_codec() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/thread_state.rs");
+    let Ok(content) = fs::read_to_string(&path) else {
+        eprintln!("skipping: sources not reachable at {}", path.display());
+        return;
+    };
+
+    let mut offenders = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if !line.contains(".write::<") && !line.contains(".read::<") {
+            continue;
+        }
+        // L3: the UAPI transaction structs are read whole and native, by
+        // the `parcelable_struct!` path the driver's layout requires.
+        if line.contains("binder_transaction_data") {
+            continue;
+        }
+        // A *reply* is a data parcel, not the command stream, so the two
+        // test writes below are wire — correctly.
+        if line.contains("reply.write::<") {
+            continue;
+        }
+        offenders.push(format!("thread_state.rs:{}: {}", i + 1, line.trim()));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the kernel command stream must use write_native / read_native — \
+         see this test's doc:\n{}",
+        offenders.join("\n")
+    );
+}
