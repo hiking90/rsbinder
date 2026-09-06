@@ -774,7 +774,11 @@ impl Parcel {
 
     /// Set the negotiated FD-over-RPC mode for this parcel (default
     /// `None` ⇒ FD write is rejected, bit-identical).
-    #[cfg(feature = "rpc")]
+    ///
+    /// Production builds a parcel through `attach_rpc_session` instead,
+    /// which sets mode and position-recording together; the two setters
+    /// exist for a test or fuzz target that wants one without a session.
+    #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.fd_mode = mode;
@@ -791,7 +795,7 @@ impl Parcel {
     /// mode): record FD object positions only on the android-13+ v1+
     /// profile. R34 stays `false` ⇒ the FD-over-RPC wire is
     /// byte-unchanged.
-    #[cfg(feature = "rpc")]
+    #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.record_fd_positions = yes;

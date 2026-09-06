@@ -390,9 +390,11 @@ pub mod android_16 {
     /// Expose the deterministic error-name decoder
     /// (and its `__fuzz_*` hook) so the libFuzzer target can drive it
     /// without re-implementing the i32→symbol map.
+    #[cfg(all(feature = "rpc", feature = "fuzzing"))]
+    pub use super::accessor_16::__fuzz_accessor_error_decode;
     #[cfg(feature = "rpc")]
     pub use super::accessor_16::{
-        __fuzz_accessor_error_decode, accessor_error_name, resolve_accessor, BnAccessor,
+        accessor_error_name, resolve_accessor, BnAccessor,
         BpAccessor, IAccessor, IAccessorDefault, IAccessorDefaultRef,
         ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
         ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,

@@ -18,6 +18,11 @@ rpc = ["rsbinder/rpc"]
 # (`hub::android_16::resolve_accessor`); only used by the STAGE3
 # interop client.
 android_16 = ["rsbinder/android_16"]
+# `rpc_incoming_interop_client` asserts on connection-slot and
+# incoming-thread counters, which live behind `rsbinder/test-util`. It is
+# a STAGE3 harness rather than an example, so it carries the feature
+# rather than the counters being on for everyone.
+test-util = ["rsbinder/test-util"]
 
 [[bin]]
 name = "rpc_hello_service"
@@ -105,7 +110,7 @@ required-features = ["rpc"]
 # plain thread. Run via cpp/run_rpc_incoming_interop.sh.
 [[bin]]
 name = "rpc_incoming_interop_client"
-required-features = ["rpc"]
+required-features = ["rpc", "test-util"]
 
 # Plan 2-11 AC-11.3 STAGE3 — rsbinder side of the FD-over-RPC
 # real-libbinder gate. Pairs with cpp/rpc_fd_interop_launcher (a real

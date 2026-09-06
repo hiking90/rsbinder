@@ -312,6 +312,7 @@ pub fn accessor_error_name(code: i32) -> &'static str {
 /// panics, allocates indefinitely, or returns a non-`'static str`. The
 /// returned string is intentionally consumed via `std::hint::black_box`
 /// so the optimiser cannot DCE the lookup on builds that inline it.
+#[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_accessor_error_decode(input: &[u8]) {
     // Pad / truncate to exactly 4 bytes — any extra is ignored, any

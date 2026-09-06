@@ -321,6 +321,7 @@ impl WireCodec for R34Codec {
 
 /// Decode-only entrypoint for the `rpc_wire_decode` fuzz target.
 /// Not part of the supported API surface.
+#[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_decode_wire(input: &[u8]) {
     let _ = R34Codec.decode_message(input);
@@ -332,6 +333,7 @@ pub fn __fuzz_decode_wire(input: &[u8]) {
 /// any input; bad negotiation values are rejected, not trusted. (The
 /// android-13+ connection header has its own path — `server_accept` /
 /// `decode_connection_header` — and is not covered here.)
+#[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_session_handshake(input: &[u8]) {
     let c = R34Codec;
@@ -345,6 +347,7 @@ pub fn __fuzz_session_handshake(input: &[u8]) {
 /// form — are called *directly* on the input (a DEC_STRONG wrapper alone
 /// would stop at the body-length check for every input that is not
 /// exactly 32 bytes and never reach them), plus the framed path.
+#[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_decode_address(input: &[u8]) {
     let _ = rd_addr(input, 0);

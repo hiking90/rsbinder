@@ -285,7 +285,7 @@ pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points for the `fuzz/` crate, which is outside the
 // workspace and so can only reach them through the crate root now that
 // `file_descriptor` is private.
-#[cfg(feature = "rpc")]
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub use file_descriptor::{__fuzz_rpc_fd_index, __fuzz_rpc_fd_index_v1, __fuzz_rpc_raw_fd};
 

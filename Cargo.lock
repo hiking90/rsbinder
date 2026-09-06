@@ -889,6 +889,7 @@ dependencies = [
  "log",
  "loom",
  "pretty-hex",
+ "rsbinder",
  "rsbinder-aidl",
  "rsbinder-macros",
  "rsproperties",

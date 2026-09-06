@@ -45,7 +45,7 @@ echo "==> cross-compiling rsbinder client"
 ( cd "$REPO_ROOT" && \
     ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}" \
     cargo ndk -t arm64-v8a -p 35 build --release -p example-hello \
-        --features rpc \
+        --features rpc,test-util \
         --bin rpc_incoming_interop_client )
 
 echo "==> pushing binaries"

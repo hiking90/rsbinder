@@ -552,6 +552,7 @@ pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
 /// arbitrary bytes through the same deframing path
 /// `recv_frame` uses. `#[doc(hidden)]`: not part of the supported API
 /// surface (and absent entirely without the `rpc` feature).
+#[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_decode_frame(input: &[u8]) -> RpcResult<Vec<u8>> {
     read_frame(&mut std::io::Cursor::new(input))

@@ -20,7 +20,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rsbinder = { path = "../rsbinder", features = ["rpc", "android_16"] }
+rsbinder = { path = "../rsbinder", features = ["rpc", "android_16", "fuzzing"] }
 
 [[bin]]
 name = "rpc_frame_decode"

@@ -4913,6 +4913,7 @@ impl RpcSession {
     /// Test/diagnostic: number of connection slots in this session's pool
     /// (founding + fan-out + incoming, or founding + attaches + callback
     /// slots on a server session). Not a stable API.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn __slot_count(&self) -> usize {
         self.inner.slot_count()
@@ -4923,6 +4924,7 @@ impl RpcSession {
     /// joining any of it, so this drops to zero the moment `close_session`
     /// starts — use [`__incoming_thread_live_count`](Self::__incoming_thread_live_count)
     /// to observe the join itself.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn __incoming_thread_count(&self) -> usize {
         self.inner
@@ -4933,6 +4935,7 @@ impl RpcSession {
     }
 
     /// Test/diagnostic: incoming-connection threads still running.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn __incoming_thread_live_count(&self) -> usize {
         self.inner.incoming_live.load(Ordering::SeqCst)
@@ -4940,6 +4943,7 @@ impl RpcSession {
 
     /// Test/diagnostic: incoming-connection threads `close_session` has
     /// joined. Stays 0 if they are detached instead.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn __incoming_thread_joined_count(&self) -> usize {
         self.inner.incoming_joined.load(Ordering::SeqCst)

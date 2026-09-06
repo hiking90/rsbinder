@@ -361,7 +361,7 @@ impl DeserializeArray for ParcelFileDescriptor {}
 /// fds**. Property: no panic / UB / fd leak — an out-of-bounds or
 /// dangling fd-table index is a clean `Err`, never a crash. Not part of
 /// the supported API surface.
-#[cfg(feature = "rpc")]
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_rpc_fd_index(input: &[u8]) {
     let mut p = Parcel::from_vec(input.to_vec());
@@ -380,7 +380,7 @@ pub fn __fuzz_rpc_fd_index(input: &[u8]) {
 /// non-zero `hasComm`, or a dangling index is a clean `Err`, never a
 /// crash. Complements [`__fuzz_rpc_fd_index`] (which only covers the
 /// R34 legacy `[present|idx]` path). Not part of the supported API.
-#[cfg(feature = "rpc")]
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_rpc_fd_index_v1(input: &[u8]) {
     let mut p = fuzz_v1_parcel(input);
@@ -394,7 +394,7 @@ pub fn __fuzz_rpc_fd_index_v1(input: &[u8]) {
 /// the rest is the parcel body — so the fuzzer reaches both
 /// `binary_search` hit and miss, unsorted tables, and positions past
 /// the body.
-#[cfg(feature = "rpc")]
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
 fn fuzz_v1_parcel(input: &[u8]) -> Parcel {
     let (n_pos, rest) = match input.split_first() {
         Some((&n, rest)) => ((n % 16) as usize, rest),
@@ -420,7 +420,7 @@ fn fuzz_v1_parcel(input: &[u8]) -> Parcel {
 /// object-position table (as in [`__fuzz_rpc_fd_index_v1`]). Property:
 /// no panic / UB / fd leak — every forged position, type, or index is
 /// a clean `Err`. Not part of the supported API.
-#[cfg(feature = "rpc")]
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_rpc_raw_fd(input: &[u8]) {
     let Some((&profile, rest)) = input.split_first() else {
