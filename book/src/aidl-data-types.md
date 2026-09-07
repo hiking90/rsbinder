@@ -41,20 +41,20 @@ The generated Rust trait expects the following signatures. A service implementat
 
 ```rust
 impl IDataService for MyService {
-    fn RepeatBoolean(&self, token: bool) -> rsbinder::status::Result<bool> {
+    fn RepeatBoolean(&self, token: bool) -> rsbinder::BinderResult<bool> {
         Ok(token)
     }
-    fn RepeatByte(&self, token: i8) -> rsbinder::status::Result<i8> {
+    fn RepeatByte(&self, token: i8) -> rsbinder::BinderResult<i8> {
         Ok(token)
     }
-    fn RepeatInt(&self, token: i32) -> rsbinder::status::Result<i32> {
+    fn RepeatInt(&self, token: i32) -> rsbinder::BinderResult<i32> {
         Ok(token)
     }
     // ... similar for other types
 }
 ```
 
-Each method returns `rsbinder::status::Result<T>`, which allows the service to return either a value or a `Status` error to the client.
+Each method returns `rsbinder::BinderResult<T>`, which allows the service to return either a value or a `Status` error to the client.
 
 ## String Types
 
@@ -65,7 +65,7 @@ The `@utf8InCpp` annotation exists in Android AIDL to distinguish between UTF-16
 A simple service method that echoes a string back to the caller looks like this:
 
 ```rust
-fn RepeatString(&self, input: &str) -> rsbinder::status::Result<String> {
+fn RepeatString(&self, input: &str) -> rsbinder::BinderResult<String> {
     Ok(input.into())
 }
 ```
@@ -86,7 +86,7 @@ In the generated Rust trait, the `in` parameter becomes a slice reference (`&[i3
 
 ```rust
 fn ReverseInt(&self, input: &[i32], repeated: &mut Vec<i32>)
-    -> rsbinder::status::Result<Vec<i32>>
+    -> rsbinder::BinderResult<Vec<i32>>
 {
     repeated.clear();
     repeated.extend_from_slice(input);
@@ -122,7 +122,7 @@ Rust service implementation:
 
 ```rust
 fn RepeatNullableIntArray(&self, input: Option<&[i32]>)
-    -> rsbinder::status::Result<Option<Vec<i32>>>
+    -> rsbinder::BinderResult<Option<Vec<i32>>>
 {
     Ok(input.map(<[i32]>::to_vec))
 }
@@ -193,7 +193,7 @@ Here are a few practical details to keep in mind when working with AIDL data typ
 
 - **Direction tags affect performance.** An `inout` parameter requires serialization in both directions. If you only need data to flow one way, use `in` or `out` to reduce the amount of data copied over the Binder transaction.
 
-- **Return values are always `Result`.** Every AIDL method in rsbinder returns `rsbinder::status::Result<T>`, allowing services to report errors using `Status` codes. Even void methods return `rsbinder::status::Result<()>`.
+- **Return values are always `Result`.** Every AIDL method in rsbinder returns `rsbinder::BinderResult<T>`, allowing services to report errors using `Status` codes. Even void methods return `rsbinder::BinderResult<()>`.
 
 - **`char` is UTF-16, not UTF-8.** The AIDL `char` type maps to Rust's `u16`, representing a single UTF-16 code unit. This is not the same as Rust's native `char` type, which is a Unicode scalar value. Be mindful of this difference when working with character data.
 

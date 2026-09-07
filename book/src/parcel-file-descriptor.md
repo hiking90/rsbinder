@@ -83,7 +83,7 @@ use rsbinder::ParcelFileDescriptor;
 fn RepeatParcelFileDescriptor(
     &self,
     read: &ParcelFileDescriptor,
-) -> rsbinder::status::Result<ParcelFileDescriptor> {
+) -> rsbinder::BinderResult<ParcelFileDescriptor> {
     Ok(read.try_clone()?)
 }
 ```
@@ -99,7 +99,7 @@ fn ReverseParcelFileDescriptorArray(
     &self,
     input: &[ParcelFileDescriptor],
     repeated: &mut Vec<Option<ParcelFileDescriptor>>,
-) -> rsbinder::status::Result<Vec<ParcelFileDescriptor>> {
+) -> rsbinder::BinderResult<Vec<ParcelFileDescriptor>> {
     repeated.clear();
     for fd in input {
         repeated.push(Some(fd.try_clone()?));

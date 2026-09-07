@@ -243,6 +243,9 @@ mod binder_object;
 pub mod binderfs;
 /// Helpers for a process bridging two transports (the gateway pattern)
 pub mod bridge;
+// `CommandStream`, the L2 ioctl buffer. Private, and its field is private
+// to the module: `thread_state` cannot reach the L1 codec through it.
+mod command_stream;
 // Error types. Private: `Result` and `StatusCode` are re-exported at the
 // crate root.
 mod error;

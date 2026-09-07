@@ -3,7 +3,8 @@
 
 //! Opt-in FD-over-RPC (`FileDescriptorTransportMode`).
 //!
-//! * default (no opt-in) is the `BadType` reject, unchanged.
+//! * default (no opt-in) is the `FdsNotAllowed` reject (`BadType` before
+//!   0.11.0).
 //! * both peers opt in over UDS ⇒ fd travels via
 //!   `SCM_RIGHTS`, valid + `O_CLOEXEC` at the receiver; works in
 //!   *both* directions (arg and reply).

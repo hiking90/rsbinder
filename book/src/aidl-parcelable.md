@@ -82,7 +82,7 @@ Service implementation:
 fn FillOutStructuredParcelable(
     &self,
     parcelable: &mut StructuredParcelable::StructuredParcelable,
-) -> rsbinder::status::Result<()> {
+) -> rsbinder::BinderResult<()> {
     parcelable.shouldBeJerry = "Jerry".into();
     parcelable.shouldContainThreeFs = vec![parcelable.f, parcelable.f, parcelable.f];
     parcelable.shouldSetBit0AndBit2 =
@@ -128,7 +128,7 @@ Service implementation:
 fn RepeatNullableParcelable(
     &self,
     input: Option<&Empty>,
-) -> rsbinder::status::Result<Option<Empty>> {
+) -> rsbinder::BinderResult<Option<Empty>> {
     Ok(input.cloned())
 }
 ```

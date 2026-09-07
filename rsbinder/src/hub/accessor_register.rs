@@ -544,9 +544,11 @@ pub fn add_accessor_provider(
 /// Explicit removal of a provider previously
 /// registered via [`add_accessor_provider`]. AOSP
 /// `removeAccessorProvider` (`IServiceManager.cpp:391-411`). Returns
-/// `Err(StatusCode::BadValue)` if the handle is already dead (the
-/// Arc has been dropped — typically because
-/// [`AccessorProviderHandle`] already ran its Drop), and
+/// `Err(StatusCode::BadValue)` if the handle is already dead (the Arc
+/// has been dropped). That is a defensive branch, not a case normal use
+/// reaches: the handle is consumed here and [`AccessorProviderHandle`]
+/// is not `Clone`, so a handle whose Drop already ran cannot be passed
+/// in. Returns
 /// `Err(StatusCode::NameNotFound)` if no entry with this provider
 /// exists in the registry (shouldn't happen in practice — the handle
 /// holds a `Weak` and the entry holds the `Arc`, so a live handle
@@ -578,10 +580,10 @@ pub fn remove_accessor_provider(
 ///
 /// The handle carries a `Weak` reference to the provider entry's
 /// `Arc<AccessorProviderFn>` so its lifetime tracks the registry
-/// entry — a successful `add_accessor_provider` returns a live
-/// handle, `Drop` removes it, and a subsequent
-/// [`remove_accessor_provider`] surfaces `BadValue` for the
-/// already-removed case.
+/// entry — a successful `add_accessor_provider` returns a live handle
+/// and `Drop` removes the entry. Removing twice is not expressible:
+/// `Drop` and [`remove_accessor_provider`] both consume the handle, and
+/// the type is not `Clone`.
 ///
 /// `Debug` is implemented so callers can `.expect()`/`.expect_err()`
 /// against `Result<AccessorProviderHandle, _>`; the body deliberately
@@ -1203,10 +1205,9 @@ mod tests {
 
     /// RAII unregister — dropping the handle removes the entry from
     /// the registry; subsequent lookups return `None`.
-    /// `remove_accessor_provider` on the already-dropped handle would
-    /// be `BadValue` (we can't test that directly because handle drop
-    /// consumes the handle; instead we test the explicit-removal path
-    /// in [`explicit_remove_succeeds`] / [`explicit_remove_on_dead_returns_bad_value`]).
+    /// `remove_accessor_provider` on the already-dropped handle cannot
+    /// be tested — it consumes the handle — so the explicit-removal
+    /// path is covered by [`explicit_remove_succeeds`].
     #[test]
     fn handle_drop_unregisters() {
         let instance = unique_instance("raii");

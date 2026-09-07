@@ -1233,8 +1233,8 @@ fn render_enforce_permission_check(
         );
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
-    // `_reader` lets the runtime fail closed over RPC, where uid 0 reads as
-    // root and PMS would grant unconditionally (plan/2-16 Phase A).
+    // `_reader` lets the runtime deny over RPC before it reads a uid: an RPC
+    // peer's uid is not a PMS uid (plan/2-16 Phase A).
     let call = |p: &str| {
         format!(
             "{crate_name}::permission_controller::check_permission(_reader, \"{}\")",

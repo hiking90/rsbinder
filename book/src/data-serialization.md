@@ -18,6 +18,10 @@ let settings: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
 Both need the `rpc` feature — not because anything here talks to a socket,
 but because the encoder runs in the same session-less parcel mode the RPC
 transport uses, and that mode is what refuses binders and file descriptors.
+The `#[derive(rsbinder::Parcelable)]` below additionally needs `macros`
+(`rpc` does not imply it, and neither is on by default); a type generated
+from `.aidl` does not, since the generator emits the `Parcelable` impl
+directly.
 
 ## What you can store
 
@@ -70,7 +74,9 @@ let bytes = rsbinder::to_bytes(&value_with_an_fd)?;
 ```
 
 A binder is `BadType` rather than `FdsNotAllowed` — the two conditions are
-distinct, and the codes match what Android's `libbinder` returns for each.
+distinct. `FdsNotAllowed` is what Android's `libbinder` returns for a
+session that permits no fds; the binder case has no AOSP counterpart, since
+there is no session-less parcel there to write one into.
 
 The refusal runs in the other direction too. Bytes that merely *look* like a
 binder object are never turned into one: the decoder has no object table to
@@ -95,9 +101,18 @@ plausible-looking wrong answer.
 
 There is no separate storage format. `to_bytes` produces exactly what a peer
 would receive for the same value over kernel binder or RPC — same codec,
-same layout — and since the wire is fixed little-endian, the same bytes on
-any architecture. A file written on an aarch64 phone reads on an x86_64
-server.
+same layout — and since the wire is fixed little-endian, a value that
+carries no object is the same bytes on any architecture. A file written on
+an aarch64 phone reads on an x86_64 server.
+
+The exception is a *null* binder. It is written as a 24-byte object header
+whose type word stays host-native, and it is recorded in no object table,
+so the refusals above do not catch it. It can only get in via a
+`ParcelableHolder` whose bytes were copied from a kernel parcel — but such
+a file is not portable between hosts of different endianness, and the value
+it came from does not read back even on the host that wrote it: decoding the
+payload returns `BadType`, because the decoder has no session to marshal a
+binder through.
 
 What this buys you: a value can move between a file, a socket and a
 transaction without being re-encoded, and one schema describes all three.

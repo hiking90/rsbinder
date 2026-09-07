@@ -101,7 +101,14 @@ fn every_field_shape_survives_the_round_trip() {
     let value = sample_v1();
     let bytes = to_bytes(&value).expect("encode");
     assert_eq!(from_bytes::<RecordV1>(&bytes).expect("decode"), value);
-    assert_eq!(bytes, to_bytes(&value).expect("encode"), "deterministic");
+    // `code` is on these bytes as 04 03 02 01. This suite runs on
+    // little-endian hosts only, so it rules out a byte-swapping encoder,
+    // not a host-native one; the cross-endian proof is `parcel`'s absolute
+    // goldens, which the s390x job runs.
+    assert!(
+        bytes.windows(4).any(|w| w == [0x04, 0x03, 0x02, 0x01]),
+        "0x01020304 must be encoded little-endian"
+    );
 
     // A `None` option is a field too, and its absence has to round-trip
     // as such rather than as an empty string.
@@ -115,18 +122,32 @@ fn every_field_shape_survives_the_round_trip() {
 
 #[test]
 fn a_reader_built_against_the_older_definition_still_reads_the_new_bytes() {
+    let base = sample_v1();
     let v2 = RecordV2 {
+        flag: base.flag,
+        small: base.small,
+        code: base.code,
+        big: base.big,
+        ratio: base.ratio,
+        name: base.name.clone(),
+        blob: base.blob.clone(),
+        codes: base.codes.clone(),
+        names: base.names.clone(),
+        maybe: base.maybe.clone(),
+        mode: base.mode,
+        inner: base.inner.clone(),
+        inners: base.inners.clone(),
         added_count: 42,
         added_note: "appended".into(),
-        ..Default::default()
     };
     let v1: RecordV1 = from_bytes(&to_bytes(&v2).expect("encode")).expect("decode");
 
-    // The fields it knows about are intact, and the two it does not are
-    // simply not read — the parcelable's length header is what stops it
-    // at the boundary the writer wrote.
-    assert_eq!(v1.name, v2.name);
-    assert_eq!(v1.inner, v2.inner);
+    // Every field the old definition knows about is intact — not one of
+    // them is a default, so a decode that returned defaults would fail
+    // here. The two it does not know are simply not read: the
+    // parcelable's length header stops it at the boundary the writer
+    // wrote.
+    assert_eq!(v1, base);
 }
 
 #[test]

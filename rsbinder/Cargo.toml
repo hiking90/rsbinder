@@ -140,7 +140,10 @@ serial_test = { workspace = true }
 # may depend on itself as a dev-dependency, which turns the feature on
 # for its own test builds without turning it on for anyone consuming the
 # library — so `cargo test -p rsbinder` needs no extra flag.
-rsbinder = { path = ".", features = ["test-util"] }
+# `default-features = false` because this edge is unified with the package
+# itself: with the defaults left on it re-enables `default`/`tokio`/`async`
+# under `--no-default-features`, and no run in CI builds that combination.
+rsbinder = { path = ".", default-features = false, features = ["test-util"] }
 
 # Declared so a missing feature is an error rather than a file that `#![cfg]`
 # compiles away to zero tests and a green run.

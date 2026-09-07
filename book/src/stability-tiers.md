@@ -6,7 +6,7 @@ what callers can rely on.
 
 | Tier | Versioning | Wire compatibility | When it can change |
 |------|-----------|--------------------|--------------------|
-| **Stable** | Semver-strict | AOSP-faithful, byte-tested against real `libbinder` | Only on a major bump. Breaking changes are last-resort. |
+| **Stable** | Semver-strict | AOSP-faithful, byte-tested against real `libbinder` | Only on a major bump — and pre-1.0 the `0.x` minor slot *is* the major slot (see the [changelog](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md) preamble). Breaking changes are last-resort. |
 | **Provisional** | Stabilizing toward 1.0 | AOSP-faithful in the validated cases (hermetic + real-`libbinder` STAGE3) | May break in a minor bump if 1.0 review surfaces an issue. Will be re-classified as Stable or Experimental at 1.0. |
 | **Experimental** | Opt-in via Cargo feature | **No guarantee** until the corresponding real-`libbinder` interop gate passes | Anytime, including the wire format. Default builds do not reach this code. |
 
@@ -24,11 +24,10 @@ binder and is not expected to break.
   `INTERFACE_TRANSACTION`, `DUMP_TRANSACTION`, `FLAG_ONEWAY`,
   `FLAG_CLEAR_BUF`.
 - **Service manager (Android binder)** — `hub::add_service`,
-  `hub::get_service`, `hub::check_service`, `hub::get_interface`.
-  (`hub::get_service` / `hub::get_interface` are deprecated as of 0.10.0 in
-  favor of `wait_for_*` / `check_interface` / `try_*` — deprecated-but-kept
-  still satisfies the no-breakage promise; the replacements start in
-  Provisional. See [Service Manager](service-manager.md).)
+  `hub::check_service`.
+  (`hub::get_service` / `hub::get_interface` were deprecated in 0.10.0 and
+  removed in 0.11.0, in favor of `wait_for_*` / `check_interface` / `try_*` —
+  which are Provisional (below). See [Service Manager](service-manager.md).)
 - **AIDL compiler entry points** — `rsbinder_aidl::Builder::{new, source,
   output, version, generate}`.
 - **rsb_device** binary CLI (binderfs setup).
@@ -92,9 +91,19 @@ these types reads as intentional rather than as a gap.
 ## What this means in practice
 
 - A **0.x → 0.(x+1)** minor bump can change **Provisional** signatures.
-  rsbinder runs `cargo-semver-checks` on every PR for both
-  `rsbinder` and `rsbinder-aidl` (default features and RPC features),
-  so any such change is visible on the PR before merge.
+  Pre-1.0 the minor slot *is* the major slot, so a **Stable** item can
+  change there too — what the tier buys you is that it is last-resort and
+  always lands in that release's *Migrating from …* section of the
+  [CHANGELOG](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md),
+  named with its replacement. That section carries the changes that have a
+  replacement to name; one that only alters a value or a behavior may be
+  recorded under *Fixed* instead. *Changed* / *Removed* carry the rationale
+  for the entries that have one, but not every entry appears there.
+  rsbinder runs `cargo-semver-checks` for both `rsbinder` and `rsbinder-aidl`
+  (default features and RPC features) on pull requests targeting `master`; it
+  reports signature changes, and cannot see a change that alters only a value
+  or a behavior. Neither can your build — for those, read *Migrating* and
+  *Fixed* both.
 - **Experimental** features never break the default build's wire
   format. Enabling one is an explicit acknowledgement that the
   corresponding interop gate has not passed.

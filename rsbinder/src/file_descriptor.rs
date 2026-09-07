@@ -125,21 +125,9 @@ enum RpcFdProfile {
     V1Plus,
 }
 
-/// `None` ⇒ not an RPC parcel. `Err(FdsNotAllowed)` ⇒ RPC parcel whose
-/// negotiated fd mode forbids fds — the default, and what AOSP returns
-/// for the same condition:
-///
-/// ```text
-/// case RpcSession::FileDescriptorTransportMode::NONE: {
-///     ALOGE("FDs are not allowed in this RpcSession. ...");
-///     return FDS_NOT_ALLOWED;
-/// }
-/// ```
-///
-/// (`Parcel::writeFileDescriptor`, android-16.0.0_r4; identical in
-/// android-15.0.0_r36.) android-13.0.0_r84 answered `BAD_TYPE` here, but
-/// that was a blanket `if (isForRpc())` rejection from before fd-over-RPC
-/// existed — a shape this code does not implement.
+/// `Ok(None)` ⇒ kernel-marshalled (fd crosses as `BINDER_TYPE_FD`);
+/// `Err(FdsNotAllowed)` ⇒ RPC parcel whose fd mode forbids fds
+/// (AOSP `Parcel::writeFileDescriptor`, android-16.0.0_r4).
 #[cfg(feature = "rpc")]
 fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
     use crate::rpc::FileDescriptorTransportMode as M;
@@ -332,6 +320,7 @@ impl DeserializeOption for ParcelFileDescriptor {
             if comm.header_type() != crate::sys::BINDER_TYPE_FD {
                 return Err(StatusCode::BadType);
             }
+            // Java PFD comm channel, not parcel wire: AOSP peeks this int BIG_ENDIAN.
             const DETACHED: i32 = 2;
             let notice = DETACHED.to_be_bytes();
             // A sender that already closed its end (oneway + `close()`) must not fail the fd: AOSP only logs.

@@ -5,6 +5,14 @@
 //! comments depend on. A new caller of an invariant-protected function
 //! flips the test red until the audit named in the invariant is
 //! performed.
+//!
+//! Four remain: refuted prose, `remove_slot`'s callers, the files a
+//! byte-order primitive may appear in plus the `ParcelPod` membership
+//! list, and the method surface of `CommandStream` — each a closed set,
+//! not an enumeration of ways to get it wrong. The call sites of the layer split are not
+//! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
+//! private field leaves the L1 wire codec unreachable from the command
+//! stream's callers.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +26,10 @@ fn count_call_sites(src_root: &Path, needle: &str) -> Vec<(PathBuf, usize)> {
             {
                 continue;
             }
-            if line.contains(needle) {
+            // Match code only: a pin budgeted at exactly 0 would otherwise
+            // go red for someone naming the needle in a trailing comment.
+            let code = line.split("//").next().unwrap_or(line);
+            if code.contains(needle) {
                 hits.push((path.to_path_buf(), i + 1));
             }
         }
@@ -160,21 +171,13 @@ fn remove_slot_has_exactly_six_callers() {
     );
 }
 
-/// The parcel has three byte layers and only one of them is the wire.
-///
-/// L1 (data-parcel scalars, arrays, String16) is defined little-endian on
-/// every host. L2 (the `BC_*`/`BR_*` ioctl stream) and L3 (the UAPI
-/// structs the driver parses) are host-native. All three share the same
-/// `Parcel`, so nothing but the primitive a call reaches for says which
-/// layer it is in — and getting it wrong is invisible on a little-endian
-/// host, where the two codecs emit identical bytes.
-///
-/// So pin where the native primitives live. A new `_ne_bytes` in
-/// `parcelable.rs` means a wire value stopped being portable; a new one
-/// in `parcel.rs` outside `NativeScalar` means the same. Raise a count
-/// only after deciding which layer the new code belongs to.
+/// L1 (the parcel wire) is little-endian on every host while L2 (the
+/// `BC_*`/`BR_*` command stream) and L3 (the UAPI structs) are native, so
+/// pin which files may spell a byte-order primitive — native, big-endian
+/// or little-endian — and which types `ParcelPod` admits to the raw-bytes
+/// view the three layers share.
 #[test]
-fn native_byte_codecs_stay_in_their_islands() {
+fn byte_order_primitives_and_pod_membership_stay_pinned() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     if !src_root.is_dir() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
@@ -184,9 +187,7 @@ fn native_byte_codecs_stay_in_their_islands() {
     struct Pin {
         needle: &'static str,
         /// Whether a hit outside `files` is itself a failure. True for a
-        /// primitive that has no business anywhere else in the crate;
-        /// false for `as *const u8`, which is ordinary Rust (pointer
-        /// identity, FFI) away from the parcel.
+        /// primitive that has no business anywhere else in the crate.
         tree_wide: bool,
         files: &'static [(&'static str, usize)],
     }
@@ -206,22 +207,48 @@ fn native_byte_codecs_stay_in_their_islands() {
             ],
         },
         Pin {
+            // The one big-endian value in the tree: the Java reliable-PFD
+            // comm-socket status, which AOSP peeks BIG_ENDIAN. Not parcel
+            // wire — "correcting" it to LE would garble the status.
+            needle: "_be_bytes",
+            tree_wide: true,
+            files: &[("file_descriptor.rs", 1)],
+        },
+        Pin {
             // The `parcelable_struct!` arm: L3 structs in, L3 structs out.
             needle: "transmute::<[u8",
             tree_wide: true,
             files: &[("parcelable.rs", 1)],
         },
         Pin {
-            // Raw byte views of parcel data. `parcel.rs`: `write_aligned`
-            // and the object table. `parcelable.rs`: the String16
-            // `Vec<u16>` view, which stays behind a `target_endian` gate
-            // rather than disappearing.
-            needle: "as *const u8",
+            // L2 has no wire scalar. `CommandStream` exposes no L1 method,
+            // but it does hand out `as_mut_ptr`, and a value re-encoded with
+            // `from_le_bytes` reaches the driver byte-swapped even through
+            // `write_cmd`. Both spell `_le_bytes` in one of these two files.
+            needle: "_le_bytes",
             tree_wide: false,
-            files: &[("parcel.rs", 2), ("parcelable.rs", 1)],
+            files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
         },
         Pin {
-            // L3's membership list — the types whose bytes cross verbatim.
+            // The same re-encoding without a byte array: `cmd.to_le()`,
+            // `u32::from_le(..)`. `_le(` covers both, and an L1 `write_le(..)`
+            // called here would be the same mistake.
+            needle: "_le(",
+            tree_wide: false,
+            files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
+        },
+        Pin {
+            // And the spelling that names no endianness at all.
+            needle: "swap_bytes",
+            tree_wide: false,
+            files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
+        },
+        Pin {
+            // L3's membership list: the types `write_aligned` / `write_array`
+            // / `read_array` reinterpret as raw bytes. Adding one means
+            // re-auditing padding and bit-validity (see `ParcelPod`'s
+            // `# Safety`), so the macro definition plus the three explicit
+            // impls are budgeted; the argument list is pinned below.
             needle: "unsafe impl ParcelPod for",
             tree_wide: true,
             files: &[("parcel.rs", 4)],
@@ -233,6 +260,14 @@ fn native_byte_codecs_stay_in_their_islands() {
         let needle = pin.needle;
         let hits = count_call_sites(&src_root, needle);
         for (suffix, want) in pin.files {
+            // A pin budgeted at 0 goes silently green if its file moves —
+            // `ends_with` stops matching and `got == want == 0`. Pin the
+            // file's existence too.
+            if !src_root.join(suffix).is_file() {
+                failures.push(format!(
+                    "`{needle}`: pinned file {suffix} no longer exists under src/"
+                ));
+            }
             let got = hits.iter().filter(|(p, _)| p.ends_with(suffix)).count();
             if got != *want {
                 failures.push(format!(
@@ -254,56 +289,59 @@ fn native_byte_codecs_stay_in_their_islands() {
         }
     }
 
+    // The pin above counts the `unsafe impl` sites; membership is decided by
+    // this argument list, which the macro definition hides from that count.
+    let parcel_rs = fs::read_to_string(src_root.join("parcel.rs")).unwrap();
+    if !parcel_rs
+        .contains("impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);")
+    {
+        failures.push(
+            "the `impl_parcel_pod!` argument list changed — re-audit padding and \
+             bit-validity before raising it (`usize`/`isize` are pointer-width, \
+             so their bytes are not the same width on every host)"
+                .to_string(),
+        );
+    }
+
     assert!(
         failures.is_empty(),
-        "the three parcel byte layers moved — see this test's doc:\n{}",
+        "a pinned byte-order primitive or the `ParcelPod` membership list \
+         moved — see this test's doc:\n{}",
         failures.join("\n")
     );
 }
 
-/// `thread_state.rs` writes the kernel command stream, which is an ioctl
-/// buffer the driver parses with native loads — not wire. It must reach
-/// the parcel through `write_native` / `read_native` only.
-///
-/// This is the gate for the one mistake the naming cannot prevent: a new
-/// `BC_*` command written as `out_parcel.write::<u32>(&cmd)` compiles,
-/// passes every little-endian test, and sends byte-swapped commands to a
-/// big-endian driver. Matching on the method rather than the receiver
-/// catches the wrapped call chains too, where the receiver is a line up.
+/// `CommandStream` (in `src/command_stream.rs`) is what keeps the L1 wire
+/// codec out of the L2 command stream, and it does that by exposing no L1
+/// method.
+/// Nothing in the language stops a 16th `fn` here from forwarding one, from
+/// handing `&mut self.0` back out, or from declaring a child module that
+/// reaches the private field from its own file — so pin all three counts:
+/// they move only for a deliberate edit.
 #[test]
-fn the_kernel_command_stream_never_reaches_the_wire_codec() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/thread_state.rs");
-    let Ok(content) = fs::read_to_string(&path) else {
-        eprintln!("skipping: sources not reachable at {}", path.display());
+fn command_stream_exposes_no_new_forward() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    if !src_root.is_dir() {
+        eprintln!("skipping: sources not reachable at {}", src_root.display());
         return;
-    };
-
-    let mut offenders = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        if !line.contains(".write::<") && !line.contains(".read::<") {
-            continue;
-        }
-        // L3: the UAPI transaction structs are read whole and native, by
-        // the `parcelable_struct!` path the driver's layout requires.
-        if line.contains("binder_transaction_data") {
-            continue;
-        }
-        // A *reply* is a data parcel, not the command stream, so the two
-        // test writes below are wire — correctly.
-        if line.contains("reply.write::<") {
-            continue;
-        }
-        offenders.push(format!("thread_state.rs:{}: {}", i + 1, line.trim()));
     }
-
+    let path = src_root.join("command_stream.rs");
     assert!(
-        offenders.is_empty(),
-        "the kernel command stream must use write_native / read_native — \
-         see this test's doc:\n{}",
-        offenders.join("\n")
+        path.is_file(),
+        "command_stream.rs is gone — point this gate at the L2 type's new home"
     );
+    for (needle, want) in [("self.0", 14), ("fn ", 15), ("mod ", 0)] {
+        let got = count_call_sites(&src_root, needle)
+            .iter()
+            .filter(|(p, _)| p == &path)
+            .count();
+        assert_eq!(
+            got, want,
+            "`{needle}` in command_stream.rs: expected {want}, found {got}. \
+             A method — or a child module, which is a descendant and so reaches \
+             the private field — that gets at the inner `Parcel` re-opens the L1 \
+             codec to every one of the command stream's call sites — argue for it \
+             here."
+        );
+    }
 }
