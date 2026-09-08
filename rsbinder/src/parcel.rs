@@ -2260,15 +2260,22 @@ mod tests {
     }
 
     #[test]
-    fn checked_array_layout_64bit_no_op_for_i32_max() {
-        // The whole point: on a 64-bit `usize`, no realistic
-        // `(i32::MAX, size_of::<D>())` can overflow. Regression
-        // guard so the helper never starts gating valid 64-bit
-        // inputs (which would silently break every kernel/RPC array
-        // path).
-        let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
-        assert_eq!(size, (i32::MAX as usize) * 4);
-        assert_eq!(padded, super::pad_size(size));
+    fn checked_array_layout_passes_i32_max_on_64_bit_and_rejects_it_on_32() {
+        // The helper is 32-bit hardening only, so `(i32::MAX, 4)` is the input
+        // that separates the two targets: on 64-bit it must stay a no-op —
+        // gating a valid length there would silently break every kernel/RPC
+        // array path — and on 32-bit it is exactly the overflow to refuse.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
+            assert_eq!(size, (i32::MAX as usize) * 4);
+            assert_eq!(padded, super::pad_size(size));
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        assert_eq!(
+            super::checked_array_layout(i32::MAX, 4),
+            Err(StatusCode::BadValue)
+        );
     }
 
     #[test]
