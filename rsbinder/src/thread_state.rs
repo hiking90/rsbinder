@@ -1447,6 +1447,30 @@ fn execute_command(cmd: i32) -> Result<()> {
     })
 }
 
+/// Name the queued command the driver refused, for a `BINDER_WRITE_READ` that
+/// failed or stopped short.
+///
+/// `stopped_at` is the driver's `write_consumed`: the offset it gave up at, so
+/// the command starting there is the one it rejected. That is the datum worth
+/// having, because the usual causes are caller bugs the errno alone cannot
+/// distinguish — a refcount underflow from an over-released proxy
+/// (`BC_RELEASE`/`BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer already
+/// returned.
+fn describe_refused_command(out: &mut CommandStream, stopped_at: usize) -> String {
+    let total = out.data_size();
+    if stopped_at >= total {
+        return format!("consumed {stopped_at} of {total}");
+    }
+    let saved = out.data_position();
+    out.set_data_position(stopped_at);
+    let named = match out.read_cmd::<u32>() {
+        Ok(cmd) => format!("{} ({cmd:#x})", command_to_str(cmd)),
+        Err(e) => format!("<unreadable: {e}>"),
+    };
+    out.set_data_position(saved);
+    format!("consumed {stopped_at} of {total}; driver stopped at {named}")
+}
+
 /// Drive one round-trip with the binder kernel driver.
 ///
 /// # Borrow discipline (H1, hygiene only)
@@ -1530,7 +1554,14 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             match res {
                 Ok(_) => break,
                 Err(errno) if errno != rustix::io::Errno::INTR => {
-                    log::error!("binder::write_read() error : {errno}");
+                    // The driver rejects a command by failing the whole ioctl,
+                    // so this — not the partial-consume abort below — is where a
+                    // caller's refcount or buffer bug actually surfaces.
+                    let detail = describe_refused_command(
+                        &mut thread_state.borrow_mut().out_parcel,
+                        bwr.write_consumed as _,
+                    );
+                    log::error!("binder::write_read() error : {errno}; {detail}");
                     return Err(StatusCode::from(errno));
                 }
                 _ => {}
@@ -1551,11 +1582,23 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
             if bwr.write_consumed > 0 {
                 if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
-                    panic!(
-                        "Driver did not consume write buffer. consumed: {} of {}",
-                        bwr.write_consumed,
-                        thread_state.out_parcel.data_size()
+                    let detail = describe_refused_command(
+                        &mut thread_state.out_parcel,
+                        bwr.write_consumed as _,
                     );
+                    // Written straight to stderr, not through `log`: a consumer
+                    // that installed no logger would otherwise die mute.
+                    eprintln!(
+                        "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
+                         The remainder was never seen by the kernel, so the reference\n\
+                         counts and buffer ownership this process believes in are no\n\
+                         longer the kernel's. Queued commands:\n{:?}",
+                        thread_state.out_parcel
+                    );
+                    // AOSP `LOG_ALWAYS_FATAL`s here. Abort rather than panic:
+                    // the reply path's `catch_unwind` would otherwise resume on
+                    // that desynchronized stream.
+                    std::process::abort();
                 }
                 thread_state.out_parcel.set_data_size(0)?;
                 thread_state.out_flush_epoch += 1;
@@ -3364,5 +3407,37 @@ mod tests {
         assert_eq!(get_strict_mode_policy(), 0x1234_5678);
         set_strict_mode_policy(saved);
         assert_eq!(get_strict_mode_policy(), saved);
+    }
+
+    /// The driver reports how far it got, not which command it disliked; the
+    /// offset is what turns one into the other.
+    #[test]
+    fn a_refused_command_is_named_from_the_offset_the_driver_stopped_at() {
+        let mut out = CommandStream::new();
+        out.write_cmd::<u32>(&binder::BC_INCREFS).unwrap();
+        out.write_cmd::<u32>(&7u32).unwrap();
+        let second = out.data_size();
+        out.write_cmd::<u32>(&binder::BC_FREE_BUFFER).unwrap();
+        out.write_cmd::<u32>(&0u32).unwrap();
+        let total = out.data_size();
+
+        out.set_data_position(4);
+        let msg = describe_refused_command(&mut out, second);
+        assert!(msg.contains("BC_FREE_BUFFER"), "{msg}");
+        assert!(
+            msg.contains(&format!("consumed {second} of {total}")),
+            "{msg}"
+        );
+        assert_eq!(
+            out.data_position(),
+            4,
+            "the probe must leave the read position where it found it"
+        );
+
+        assert_eq!(
+            describe_refused_command(&mut out, total),
+            format!("consumed {total} of {total}"),
+            "a fully consumed buffer has no command to blame"
+        );
     }
 }
