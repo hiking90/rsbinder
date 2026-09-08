@@ -22,7 +22,12 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const MESH_NODE: &str = env!("CARGO_BIN_EXE_mesh_node");
+// The `mesh_node` binary. Defaults to the cargo-provided path, but can
+// be overridden via `MESH_NODE_BIN` so the test can run on a device
+// (e.g. the Android emulator) where the build-time path does not exist.
+fn mesh_node_bin() -> String {
+    std::env::var("MESH_NODE_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_mesh_node").to_string())
+}
 
 /// One parsed `MESH_SUMMARY` line.
 #[derive(Debug, Default)]
@@ -95,7 +100,7 @@ fn rpc_mesh_ten_nodes_exchange_without_error() {
     }
 
     let spawn = |role: &str, name: &str, listen: Option<&str>, peers: &[String]| -> Child {
-        let mut cmd = Command::new(MESH_NODE);
+        let mut cmd = Command::new(mesh_node_bin());
         cmd.arg("--role").arg(role).arg("--name").arg(name);
         cmd.arg("--duration-ms").arg(DURATION_MS.to_string());
         cmd.arg("--blob").arg("48");
