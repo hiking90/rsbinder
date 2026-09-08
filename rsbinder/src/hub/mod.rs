@@ -570,6 +570,22 @@ fn android_15_feature_missing(numbering: Android15Numbering) -> StatusCode {
 /// Returns an error instead of panicking when the context object cannot be
 /// obtained, the proxy cannot be created, or the SDK version is unsupported.
 /// A failed initialization is not cached, so a later call may retry.
+///
+/// # Panics
+///
+/// Panics if the kernel-binder [`ProcessState`] has not been initialized with
+/// [`ProcessState::init`] or [`ProcessState::init_default`]. Reaching the
+/// service manager without kernel binder is a programming error, not a
+/// runtime condition, so it fails fast at the first call rather than
+/// degrading into a plausible-looking "no such service" answer.
+///
+/// Every convenience wrapper in this module inherits that, including the ones
+/// whose signature cannot report failure — [`is_declared`], [`check_service`],
+/// [`wait_for_service`], [`list_services`] and [`get_declared_instances`]. Their
+/// `unwrap_or`/`ok()?` covers the *other* failures listed above, not this one.
+///
+/// [`ProcessState::init`]: crate::ProcessState::init
+/// [`ProcessState::init_default`]: crate::ProcessState::init_default
 pub fn default() -> Result<Arc<ServiceManager>> {
     static GLOBAL_SM: OnceLock<Arc<ServiceManager>> = OnceLock::new();
 
@@ -1863,10 +1879,11 @@ impl Drop for UnregisterOnDrop<'_> {
 /// Convenience function to list services from the default ServiceManager.
 ///
 /// This is equivalent to `default().list_services(dump_priority)`.
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
 #[inline]
 pub fn list_services(dump_priority: i32) -> Vec<String> {
-    // Consistent with this wrapper's existing error-swallowing contract:
-    // an unavailable ServiceManager yields an empty list rather than a panic.
+    // An unavailable ServiceManager yields an empty list.
     default()
         .map(|sm| sm.list_services(dump_priority))
         .unwrap_or_default()
@@ -1965,6 +1982,8 @@ pub(crate) fn try_unregister_service_status(
 /// hand-rolled client retry loops — see
 /// [`ServiceManager::wait_for_service`] for the blocking and thread-pool
 /// contract.
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
 #[inline]
 pub fn wait_for_service(name: &str) -> Option<SIBinder> {
     default().ok()?.wait_for_service(name)
@@ -1984,6 +2003,8 @@ pub fn wait_for_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<
 /// Convenience function to check if a service is available from the default ServiceManager.
 ///
 /// This is equivalent to `default().check_service(name)`.
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
 #[inline]
 pub fn check_service(name: &str) -> Option<SIBinder> {
     default().ok()?.check_service(name)
@@ -2027,6 +2048,9 @@ pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<S
 /// Convenience function to check if a service is declared from the default ServiceManager.
 ///
 /// This is equivalent to `default().is_declared(name)`.
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
+/// A `false` here means "not declared", never "no service manager".
 #[inline]
 pub fn is_declared(name: &str) -> bool {
     default().map(|sm| sm.is_declared(name)).unwrap_or(false)
@@ -2040,6 +2064,8 @@ pub fn try_is_declared(name: &str) -> std::result::Result<bool, Status> {
 }
 
 /// Convenience function for [`ServiceManager::get_declared_instances`].
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
 #[inline]
 pub fn get_declared_instances(iface: &str) -> Vec<String> {
     default()

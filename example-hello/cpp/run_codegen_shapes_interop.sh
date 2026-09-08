@@ -11,20 +11,23 @@
 # against the device's libbinder_ndk at run time.
 #
 # Prereqs:
-#   * A booted Android device/emulator (arm64), API >= 29.
+#   * A booted Android device/emulator, API >= 29.
 #   * NDK at $ANDROID_NDK_HOME (default /opt/homebrew/share/android-ndk).
-#   * cargo-ndk + the aarch64-linux-android rustup target.
+#   * cargo-ndk + the rustup target for the device's ABI.
 #
-# Usage: ./run_codegen_shapes_interop.sh [-s <device>]
+# Usage: ./run_codegen_shapes_interop.sh [-s <device>] [-t <abi>]
+# The ABI defaults to the device's own; -t overrides it.
 # Exit 0 on PASS.
 
 set -euo pipefail
 
 DEVICE=""
-while getopts "s:" opt; do
+ABI=""
+while getopts "s:t:" opt; do
     case "$opt" in
         s) DEVICE="$OPTARG" ;;
-        *) echo "usage: $0 [-s <device>]" >&2; exit 2 ;;
+        t) ABI="$OPTARG" ;;
+        *) echo "usage: $0 [-s <device>] [-t <abi>]" >&2; exit 2 ;;
     esac
 done
 adb_() { if [ -n "$DEVICE" ]; then adb -s "$DEVICE" "$@"; else adb "$@"; fi; }
@@ -33,10 +36,28 @@ CPP_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOP_DIR="$(cd "$CPP_DIR/../.." && pwd)"
 NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
 REMOTE=/data/local/tmp/rsb_shapes
-API=35
 
-CXX=$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android${API}-clang++ | head -1)
-[ -x "$CXX" ] || { echo "NDK clang++ not found under $NDK" >&2; exit 2; }
+# For the two 64-bit ABIs the NDK clang prefix and the cargo target
+# directory are both the Rust triple; the 32-bit ones differ and are not
+# covered.
+case "${ABI:-$(adb_ shell getprop ro.product.cpu.abi | tr -d '\r')}" in
+    arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
+    x86_64)            TRIPLE=x86_64-linux-android ;;
+    *) echo "unsupported ABI; pass -t arm64-v8a or -t x86_64" >&2; exit 2 ;;
+esac
+
+# The binary's minSdk must not exceed the device's API level, so walk
+# down to the newest clang the NDK actually ships at or below it.
+DEV_API=$(adb_ shell getprop ro.build.version.sdk | tr -d '\r')
+CXX=""
+API=""
+for a in $(seq "$DEV_API" -1 29); do
+    for c in "$NDK"/toolchains/llvm/prebuilt/*/bin/"${TRIPLE}${a}"-clang++; do
+        [ -x "$c" ] && { CXX="$c"; API="$a"; break 2; }
+    done
+done
+[ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $DEV_API under $NDK" >&2; exit 2; }
+echo "==> target $TRIPLE, API $API (device SDK $DEV_API)"
 
 echo "==> [1/5] building the C++ client (NDK only)"
 "$CXX" -O2 -Wall -Wextra -std=c++17 -static-libstdc++ \
@@ -45,13 +66,13 @@ echo "==> [1/5] building the C++ client (NDK only)"
     -o "$CPP_DIR/codegen_shapes_interop"
 
 echo "==> [2/5] cross-building the rsbinder service"
-(cd "$TOP_DIR" && cargo ndk -t arm64-v8a -p "$API" build \
+(cd "$TOP_DIR" && cargo ndk -t "$TRIPLE" -p "$API" build \
     --bin codegen_shapes_interop_service >/dev/null)
 
 echo "==> [3/5] pushing to $REMOTE"
 adb_ shell "mkdir -p $REMOTE"
 adb_ push "$CPP_DIR/codegen_shapes_interop" "$REMOTE/" >/dev/null
-adb_ push "$TOP_DIR/target/aarch64-linux-android/debug/codegen_shapes_interop_service" \
+adb_ push "$TOP_DIR/target/$TRIPLE/debug/codegen_shapes_interop_service" \
     "$REMOTE/" >/dev/null
 adb_ shell "chmod 755 $REMOTE/codegen_shapes_interop $REMOTE/codegen_shapes_interop_service"
 

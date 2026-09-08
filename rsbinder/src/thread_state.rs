@@ -1233,6 +1233,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                 // nested dispatch; OOM aborts and is not catchable — rather than
                 // unwinding the worker loop (mirrors `dispatch_transact_caught`;
                 // a dropped reply reaches a sync caller as BR_DEAD_REPLY).
+                // Taken outside `catch_unwind` so the panic arm below can rewind to
+                // it too; inside, only the `Ok` path could see it.
+                let queued_at = thread_state.borrow().unflushed_mark();
                 let reply_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                         if (flags & transaction_flags_TF_ONE_WAY) == 0 {
@@ -1242,7 +1245,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 Err(err) => err.into(),
                             };
                             // The queued BC_REPLY points at `reply`/`status`; a failed flush must rewind it, not leave it.
-                            let queued_at = thread_state.borrow().unflushed_mark();
                             thread_state.borrow_mut().write_transaction_data(
                                 binder::BC_REPLY,
                                 flags,
@@ -1279,9 +1281,15 @@ fn execute_command(cmd: i32) -> Result<()> {
                     Ok(inner) => inner?,
                     Err(_payload) => {
                         // A caught panic may leave `out_parcel` holding an
-                        // unflushed/partial BC_REPLY; drop it so the next IPC
-                        // does not flush a malformed command.
-                        let _ = thread_state.borrow_mut().out_parcel.set_data_size(0);
+                        // unflushed/partial BC_REPLY; rewind just this
+                        // transaction's bytes. Truncating the whole parcel would
+                        // also drop a `BC_FREE_BUFFER` queued earlier by a nested
+                        // call — on a looper thread `flush_if_needed` never
+                        // flushes it — and the kernel would never reclaim that
+                        // transaction buffer. No `retry_flush`: the panic may have
+                        // come from `talk_with_driver`, and a re-entry would
+                        // unwind outside this `catch_unwind`.
+                        discard_unflushed_commands(thread_state, queued_at, false);
                         log::error!(
                             "reply path panicked for code {}; reply dropped",
                             tr_secctx.transaction_data.code

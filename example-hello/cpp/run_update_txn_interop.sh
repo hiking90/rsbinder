@@ -22,37 +22,67 @@
 #      older drivers, which counts as the documented fallback (also
 #      PASS).
 #
-# Usage: ./run_update_txn_interop.sh [-s emulator-5556]
+# Prereqs: NDK at $ANDROID_NDK_HOME (default
+# /opt/homebrew/share/android-ndk), cargo-ndk + the rustup target for the
+# device's ABI.
+#
+# Usage: ./run_update_txn_interop.sh [-s emulator-5556] [-t <abi>]
+# The ABI defaults to the device's own; -t overrides it.
 # Exit 0 on PASS.
 
 set -euo pipefail
 
 DEVICE=emulator-5556
+ABI=""
 SERVICE_BIN=/data/local/tmp/update_txn_interop_service
 CLIENT_BIN=/data/local/tmp/update_txn_interop_client
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
 
-if [[ ${1:-} == "-s" ]]; then
-    DEVICE="$2"
-    shift 2
-fi
+while [[ ${1:-} == -* ]]; do
+    case "$1" in
+        -s) DEVICE="$2"; shift 2 ;;
+        -t) ABI="$2"; shift 2 ;;
+        *) echo "usage: $0 [-s <device>] [-t <abi>]" >&2; exit 2 ;;
+    esac
+done
+
+sdk=$(adb -s "$DEVICE" shell getprop ro.build.version.sdk | tr -d '\r')
+
+# For the two 64-bit ABIs the NDK clang prefix and the cargo target
+# directory are both the Rust triple; the 32-bit ones differ and are not
+# covered.
+case "${ABI:-$(adb -s "$DEVICE" shell getprop ro.product.cpu.abi | tr -d '\r')}" in
+    arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
+    x86_64)            TRIPLE=x86_64-linux-android ;;
+    *) echo "unsupported ABI; pass -t arm64-v8a or -t x86_64" >&2; exit 2 ;;
+esac
+
+# The binary's minSdk must not exceed the device's API level, so walk
+# down to the newest clang the NDK actually ships at or below it.
+API=""
+for a in $(seq "$sdk" -1 29); do
+    for c in "$NDK"/toolchains/llvm/prebuilt/*/bin/"${TRIPLE}${a}"-clang++; do
+        [ -x "$c" ] && { API="$a"; break 2; }
+    done
+done
+[ -n "$API" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
+echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
 echo "==> verifying device $DEVICE is Android 12+ (needs BINDER_GET_EXTENDED_ERROR / TF_UPDATE_TXN)"
-sdk=$(adb -s "$DEVICE" shell getprop ro.build.version.sdk | tr -d '\r')
 [[ "$sdk" -ge 31 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 31 (Android 12)"; exit 1; }
 
 echo "==> cross-compiling rsbinder STAGE3 binaries"
-( cd "$REPO_ROOT" && \
-    ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}" \
-    cargo ndk -t arm64-v8a -p 35 build --release -p example-hello \
+( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
+    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
         --bin update_txn_interop_service --bin update_txn_interop_client )
 
 echo "==> pushing binaries"
 adb -s "$DEVICE" push \
-    "$REPO_ROOT/target/aarch64-linux-android/release/update_txn_interop_service" \
+    "$REPO_ROOT/target/$TRIPLE/release/update_txn_interop_service" \
     "$SERVICE_BIN" >/dev/null
 adb -s "$DEVICE" push \
-    "$REPO_ROOT/target/aarch64-linux-android/release/update_txn_interop_client" \
+    "$REPO_ROOT/target/$TRIPLE/release/update_txn_interop_client" \
     "$CLIENT_BIN" >/dev/null
 
 echo "==> killing any old server + cleaning state"
