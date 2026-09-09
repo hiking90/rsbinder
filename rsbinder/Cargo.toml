@@ -62,6 +62,19 @@ rpc-tls = ["rpc", "dep:rustls", "dep:sha2"]
 # every build, with the AOSP-faithful `setMaxIncomingThreads` semantic.
 # See `plan/2-12-multi-connection-per-session.md` §8 (Phase D wire
 # fix) + §9 (Phase C asyncTodo).
+# Entry points the `fuzz/` crate calls to reach a decoder directly. They
+# are `#[doc(hidden)]`, but `doc(hidden)` hides an item from the docs, not
+# from the ABI — the surface golden and `cargo-semver-checks` both still
+# saw them. Behind a feature they are absent from a default build, which
+# is the honest shape for a target that only a fuzzer has any business
+# calling. `fuzz/Cargo.toml` enables it.
+fuzzing = []
+# Counters and probes that let a test observe internal RPC state
+# (connection slots, incoming-thread lifecycle, an attach-shutdown hook).
+# Same reasoning as `fuzzing`. Enabled by `rsbinder`'s own integration
+# tests and by `example-hello`'s interop client, which is a test harness
+# wearing a binary's clothes.
+test-util = []
 android_10 = []
 android_11 = []
 android_12 = []
@@ -122,6 +135,15 @@ rsbinder-aidl = { workspace = true, features = ["async"] }
 [dev-dependencies]
 env_logger = { workspace = true }
 serial_test = { workspace = true }
+# `tests/rpc_server.rs` observes internal RPC state (slot counts,
+# incoming-thread lifecycle) through the `test-util` counters. A crate
+# may depend on itself as a dev-dependency, which turns the feature on
+# for its own test builds without turning it on for anyone consuming the
+# library — so `cargo test -p rsbinder` needs no extra flag.
+# `default-features = false` because this edge is unified with the package
+# itself: with the defaults left on it re-enables `default`/`tokio`/`async`
+# under `--no-default-features`, and no run in CI builds that combination.
+rsbinder = { path = ".", default-features = false, features = ["test-util"] }
 
 # Declared so a missing feature is an error rather than a file that `#![cfg]`
 # compiles away to zero tests and a green run.

@@ -30,8 +30,9 @@ A shared region is a file descriptor, so it travels wherever an fd can:
 * **Kernel binder** (Linux with binderfs, Android) — always.
 * **Unix-socket RPC** — when both sides opt into fd passing
   (`FileDescriptorTransportMode::Unix`, see below).
-* **TCP / vsock / TLS RPC** — never; writing a region into such a parcel
-  fails with `StatusCode::BadType`, exactly like a plain
+* **TCP / vsock / TLS RPC** — never through the entry API, which refuses
+  the `Unix` fd mode on these transports; writing a region into such a
+  parcel fails with `StatusCode::FdsNotAllowed`, exactly like a plain
   `ParcelFileDescriptor`.
 
 ## 1. One region: `SharedMemory` + `ParcelFileDescriptor`
@@ -68,12 +69,12 @@ impl ShmService {
 }
 
 impl IShm for ShmService {
-    fn getRegion(&self) -> rsbinder::status::Result<ParcelFileDescriptor> {
+    fn getRegion(&self) -> rsbinder::BinderResult<ParcelFileDescriptor> {
         // dup the fd for the parcel; the service keeps its mapping
         Ok(self.region.to_parcel_fd()?)
     }
 
-    fn regionWritten(&self, offset: i32, len: i32) -> rsbinder::status::Result<()> {
+    fn regionWritten(&self, offset: i32, len: i32) -> rsbinder::BinderResult<()> {
         let mut buf = vec![0u8; len as usize];
         self.region.read_at(offset as usize, &mut buf)?;   // the client's bytes
         Ok(())
@@ -87,7 +88,7 @@ impl IShm for ShmService {
 ```rust
 use rsbinder::shared_memory::SharedMemory;
 
-let shm: Strong<dyn IShm> = broker.get_interface(SERVICE_NAME)?;
+let shm: Strong<dyn IShm> = client.get::<dyn IShm>(SERVICE_NAME)?;
 
 let pfd = shm.getRegion()?;
 let region = SharedMemory::from_fd(pfd.into())?;   // size recovered from the fd
@@ -130,7 +131,7 @@ struct ShmService {
     frames: Mutex<VecDeque<Allocation>>,   // bounded; dropping returns the block
 }
 
-fn nextFrame(&self, seq: i32) -> rsbinder::status::Result<SIBinder> {
+fn nextFrame(&self, seq: i32) -> rsbinder::BinderResult<SIBinder> {
     let frame = self.dealer.allocate_page_aligned(4096)?;   // NoMemory when full
     frame.write_at(0, format!("frame #{seq}").as_bytes())?;
     let binder = frame.export();                             // the IMemory binder
@@ -191,12 +192,27 @@ cargo run -p example-hello --features rpc --bin shm_service rpc &
 cargo run -p example-hello --features rpc --bin shm_client rpc
 ```
 
-Over RPC both ends must opt into fd passing — the service with
-`host.server().set_supported_fd_modes(&[FileDescriptorTransportMode::Unix])`
-and the client with
-`broker.session().negotiate_fd_transport(FileDescriptorTransportMode::Unix)`
-before its first lookup. Without that, `getRegion()` fails with
-`BadType`.
+Over RPC both ends must opt into fd passing, before any fd-bearing call.
+Through the entry API it is an option on the connect; on a session you
+built yourself it is `RpcSession::negotiate_fd_transport`:
+
+```rust
+// service
+rsbinder::serve(&uri)?
+    .with(|o| o.fd_modes = Some(vec![FileDescriptorTransportMode::Unix]))
+    .add(SERVICE_NAME, BnShm::new_binder(ShmService::new()?))?
+    .run()?;
+
+// client
+let client = rsbinder::Client::open_with(&uri, |o, _endpoint| {
+    o.fd_mode = Some(FileDescriptorTransportMode::Unix);
+})?;
+```
+
+Both options are rejected on an endpoint that cannot carry fds, so ask
+`endpoint.supports_fd_passing()` first when the URI is not fixed (as
+[`shm_client.rs`](https://github.com/hiking90/rsbinder/blob/master/example-hello/src/bin/shm_client.rs)
+does). Without the opt-in, `getRegion()` fails with `FdsNotAllowed`.
 
 Expected client output:
 

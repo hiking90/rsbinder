@@ -18,11 +18,13 @@
 #   * `adb root` works (userdebug image).
 #   * `adb remount` was run once after boot to enable the
 #     `/system_ext` overlay (this script's `bootstrap_overlay` step).
-#   * NDK r29+ at $ANDROID_NDK_HOME, cargo-ndk + aarch64-linux-android
-#     rustup target installed.
+#   * NDK r29+ at $ANDROID_NDK_HOME, cargo-ndk + the rustup target for
+#     the device's ABI installed.
 #
 # Usage:
-#   example-hello/cpp/run_phasec_vintf.sh [-s emulator-5556]
+#   example-hello/cpp/run_phasec_vintf.sh [-s emulator-5556] [-t <abi>]
+#
+# The ABI defaults to the device's own; -t overrides it.
 #
 # Exits 0 on PASS, non-zero on FAIL. The expected sequence on a
 # successful run is:
@@ -41,21 +43,46 @@
 set -euo pipefail
 
 DEVICE=emulator-5556
+ABI=""
 INSTANCE="android.os.IAccessor/IInterop/default"
 SERVICE_NAME="rsbinder.test.accessor.IInterop/default"
 SOCK=/data/local/tmp/rsacc-phasec.sock
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
-NDK_BIN="$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 
-if [[ ${1:-} == "-s" ]]; then
-    DEVICE="$2"
-    shift 2
-fi
+while [[ ${1:-} == -* ]]; do
+    case "$1" in
+        -s) DEVICE="$2"; shift 2 ;;
+        -t) ABI="$2"; shift 2 ;;
+        *) echo "usage: $0 [-s <device>] [-t <abi>]" >&2; exit 2 ;;
+    esac
+done
 
 echo "==> [1/8] verifying device $DEVICE is userdebug + booted"
 sdk=$(adb -s "$DEVICE" shell getprop ro.build.version.sdk | tr -d '\r')
+
+# For the two 64-bit ABIs the NDK clang prefix and the cargo target
+# directory are both the Rust triple; the 32-bit ones differ and are not
+# covered.
+case "${ABI:-$(adb -s "$DEVICE" shell getprop ro.product.cpu.abi | tr -d '\r')}" in
+    arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
+    x86_64)            TRIPLE=x86_64-linux-android ;;
+    *) echo "unsupported ABI; pass -t arm64-v8a or -t x86_64" >&2; exit 2 ;;
+esac
+
+# The binary's minSdk must not exceed the device's API level, so walk
+# down to the newest clang the NDK actually ships at or below it.
+CXX=""
+API=""
+for a in $(seq "$sdk" -1 29); do
+    for c in "$NDK_HOME"/toolchains/llvm/prebuilt/*/bin/"${TRIPLE}${a}"-clang++; do
+        [ -x "$c" ] && { CXX="$c"; API="$a"; break 2; }
+    done
+done
+[ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK_HOME" >&2; exit 2; }
+echo "==> target $TRIPLE, API $API (device SDK $sdk)"
+
 [[ "$sdk" == "36" ]] || { echo "device $DEVICE is SDK $sdk, expected 36"; exit 1; }
 build_type=$(adb -s "$DEVICE" shell getprop ro.build.type | tr -d '\r')
 [[ "$build_type" == "userdebug" ]] || {
@@ -106,7 +133,7 @@ echo "==> [3/8] pulling libbinder_ndk.so for host-side linking"
 adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so /tmp/libbinder_ndk.so >/dev/null
 
 echo "==> [4/8] building phasec_vintf_client (NDK)"
-"$NDK_BIN/aarch64-linux-android35-clang++" \
+"$CXX" \
     -O2 -Wall -std=c++17 -static-libstdc++ \
     -L /tmp -lbinder_ndk -llog \
     "$SCRIPT_DIR/phasec_vintf_client.cpp" \
@@ -114,14 +141,14 @@ echo "==> [4/8] building phasec_vintf_client (NDK)"
 
 echo "==> [5/8] cross-compiling rsbinder accessor server"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK_HOME" \
-    cargo ndk -t arm64-v8a -p 35 build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
         --features rpc,android_16 \
         --bin rpc_accessor_register_interop_server )
 
 echo "==> [6/8] pushing artifacts (VINTF XML, server, client)"
 adb -s "$DEVICE" push "$REPO_ROOT/example-hello/android/rsbinder_phasec_accessor.xml" \
     /system_ext/etc/vintf/manifest/ >/dev/null
-adb -s "$DEVICE" push "$REPO_ROOT/target/aarch64-linux-android/release/rpc_accessor_register_interop_server" \
+adb -s "$DEVICE" push "$REPO_ROOT/target/$TRIPLE/release/rpc_accessor_register_interop_server" \
     /data/local/tmp/ >/dev/null
 adb -s "$DEVICE" push "$SCRIPT_DIR/phasec_vintf_client" /data/local/tmp/ >/dev/null
 
@@ -131,8 +158,11 @@ adb -s "$DEVICE" push "$SCRIPT_DIR/phasec_vintf_client" /data/local/tmp/ >/dev/n
 # take effect.
 echo "==> [7/8] checking if VINTF entry is already loaded by servicemanager"
 sc=$(adb -s "$DEVICE" shell "service check '$SERVICE_NAME'" 2>&1 | tr -d '\r')
+# `service check` answers "…: found" or "…: not found", so the loaded
+# case has to be anchored — a bare *found* glob matches both and skips
+# the reboot the not-loaded case needs.
 case "$sc" in
-    *found*)
+    *": found")
         echo "  VINTF entry already loaded: $sc"
         ;;
     *)

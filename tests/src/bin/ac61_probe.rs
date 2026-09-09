@@ -59,7 +59,7 @@ impl Remotable for ProbeBinder {
 struct Callback;
 impl Interface for Callback {}
 impl hub::IServiceCallback for Callback {
-    fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> status::Result<()> {
+    fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> BinderResult<()> {
         Ok(())
     }
 }
@@ -133,10 +133,15 @@ fn main() {
             },
             // `get` is the half that may start a declared service;
             // `find` (checkService) must never have that side effect.
-            #[allow(deprecated)]
-            "get" => match hub::get_service(arg) {
-                Some(_) => "OK",
-                None => "NOTFOUND",
+            // `try_get_service` is the `getService` wire call, which is
+            // what carries that side effect.
+            "get" => match hub::try_get_service(arg) {
+                Ok(Some(_)) => "OK",
+                Ok(None) => "NOTFOUND",
+                Err(err) => {
+                    println!("RESULT get {arg} ERR {err:?}");
+                    continue;
+                }
             },
             "declared" => {
                 if hub::is_declared(arg) {

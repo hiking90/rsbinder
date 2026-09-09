@@ -72,6 +72,44 @@ jobs:
           # fails to `cargo doc` the baseline crate.
           features: rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,async
 
+  public_api:
+    # `semver_checks` above answers "did anything break?". This answers
+    # the question that has no owner otherwise: "what did we add?" — a
+    # surface that grows one `pub` at a time, each defensible on its own,
+    # is how a crate ends up with two paths to everything. The golden
+    # makes every addition a line in a reviewable diff.
+    #
+    # Two feature sets, because most of the crate is not in the default
+    # one: everything RPC — including `to_bytes`/`from_bytes`, which need
+    # the session-less parcel mode — would otherwise change unobserved.
+    #
+    # To update after an intentional change, run the same commands and
+    # commit the result:
+    #
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > api/rsbinder.txt
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > api/rsbinder-rpc.txt
+    #
+    # Both the toolchain and the tool version are pinned because the
+    # rendering is not stable across either; bumping one means
+    # regenerating the golden in the same commit.
+    name: Public API golden
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust nightly (pinned — rustdoc JSON needs nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-25
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked --version 0.52.0
+      - name: Diff the public surface against the goldens
+        run: |
+          cargo public-api -p rsbinder --simplified > /tmp/public-api.txt
+          diff -u api/rsbinder.txt /tmp/public-api.txt
+          cargo public-api -p rsbinder --simplified --features rpc > /tmp/public-api-rpc.txt
+          diff -u api/rsbinder-rpc.txt /tmp/public-api-rpc.txt
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -186,8 +224,28 @@ jobs:
         # `source_invariants` is ungated (it scans `src/`); it runs here so
         # the PR gate covers it, not only the manual integration-test
         # workflow.
+        #
+        # `rpc`-gated *lib unit* tests live outside `rpc::` too, so every
+        # module holding one needs its own filter line below: `rpc` is not
+        # a default feature, so the `--no-default-features` runs elsewhere
+        # cannot see them at all. The filters are per module rather than a
+        # bare `--lib` because `thread_state::tests` and
+        # `tests::process_state` open `/dev/binderfs/binder`, which a
+        # hermetic runner has not got.
         run: |
-          cargo test -p rsbinder --features rpc --lib rpc::
+          # libtest exits 0 when a filter matches nothing, so a renamed,
+          # moved or newly `cfg`-gated module would empty a filter line
+          # silently. Every line below is a filter, so every line goes
+          # through this: it fails the step unless the run reported at
+          # least one passing test.
+          t() { "$@" 2>&1 | tee /tmp/rpc_filter.out; grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/rpc_filter.out; }
+          t cargo test -p rsbinder --features rpc --lib rpc::
+          t cargo test -p rsbinder --features rpc --lib parcel::
+          t cargo test -p rsbinder --features rpc --lib file_descriptor::
+          t cargo test -p rsbinder --features rpc --lib hub::
+          t cargo test -p rsbinder --features rpc --lib parcelable_holder::
+          t cargo test -p rsbinder --features rpc --lib permission_controller::
+          t cargo test -p rsbinder --features rpc --lib thread_state::tests::rpc_
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
@@ -207,9 +265,9 @@ jobs:
         # `serve`/`connect`/`Client` gate), `codegen_shapes`, the async stub
         # adapter, `get_calling_uid` over RPC, the `@EnforcePermission` deny,
         # and `gateway_rpc` (the re-publish/`Rewrap` gate). `macro_cross`
-        # needs `macros` too and is on the next step; the two mesh targets and
-        # `gateway_kernel` are integration-test.yml's (see the ledger on
-        # `linux-build`'s "Check test builds").
+        # and `data_serde` need `macros` too and are on the next step; the
+        # two mesh targets and `gateway_kernel` are integration-test.yml's
+        # (see the ledger on `linux-build`'s "Check test builds").
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny
@@ -223,6 +281,11 @@ jobs:
           cargo test -p rsbinder-macros
           cargo test -p rsbinder --features macros,rpc --test macro_interface
           cargo test -p tests --features rpc,macros --test macro_cross
+          # `data_serde` needs a real parcelable to show the property
+          # `to_bytes` is sold on — a record read back by code built
+          # against a different version of its definition — so it lands
+          # here rather than beside the primitives.
+          cargo test -p tests --features rpc,macros --test data_serde
 
       - name: V5 parallel-safety soak (default test-threads, 5x)
         run: |
@@ -230,6 +293,91 @@ jobs:
             echo "soak iteration $i"
             cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e || exit 1
           done
+
+  big-endian:
+    # The parcel wire is defined little-endian on every host, and this is
+    # the only job that can tell. Every other runner is little-endian, so
+    # the wire codec and a host-native one emit identical bytes there —
+    # the entire suite stays green either way.
+    #
+    # s390x through `cross`, which supplies the cross linker and a
+    # qemu-user runner in its Docker image; the runner has Docker, so
+    # nothing else is needed. The kernel-binder path is out of scope
+    # (there is no binderfs in the container, and no big-endian one
+    # anywhere) — this covers the wire, which is what portability means.
+    name: Big-endian wire (s390x)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          # `cross` mounts the host toolchain into the container, so the
+          # target has to be installed out here rather than in the image.
+          targets: s390x-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Control — the same filter on x86_64
+        # The only x86_64 run of the *same* `--no-default-features` filter
+        # (`rpc-suite` runs `--features rpc --lib parcel::`, a different
+        # feature set; `test`/`linux-build` build the parcel unit tests but
+        # do not run them; the kernel-binder matrix lives in
+        # integration-test.yml). Without this, a failure below cannot be
+        # read as "big-endian" rather than "broken everywhere".
+        #
+        # Every run in this job is guarded the way `rpc-suite` guards its
+        # `thread_state::tests::rpc_` line: libtest exits 0 when a filter
+        # matches nothing, so a renamed or newly `cfg`-gated `mod tests`
+        # would empty these lines silently and the job would stay green
+        # with no big-endian signal at all.
+        run: |
+          cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/control_parcel.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_parcel.out
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Confirm the binary really is big-endian
+        # A silent fallback to a host-native build would pass every test
+        # below and prove nothing, and it looks exactly like success.
+        # `file` must say MSB / IBM S/390 before any result counts.
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib parcel --no-run
+          file target/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | tee /tmp/file.out
+          grep -q 'MSB.*IBM S/390' /tmp/file.out
+      - name: AC-7.3 cross-endian wire goldens + parcel codec
+        # The goldens assert literal little-endian bytes, so a big-endian
+        # build that reproduces them is cross-endian compatible by
+        # construction — no networking, no peer.
+        #
+        # `--skip shared_memory` drops two tests that create a memfd,
+        # which qemu-user does not implement. They are endianness-blind
+        # and covered by every other job.
+        #
+        # The fd-over-RPC body goldens and `parcel::data_serde` are
+        # `#[cfg(feature = "rpc")]`, so the `--no-default-features` run
+        # cannot see them even though they too assert literal LE bytes.
+        # The feature set matches the AC-7.2 step below so the build is
+        # shared rather than a third cross compile.
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/be_parcel.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel.out
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --features rpc,rpc-tcp-debug --lib file_descriptor:: 2>&1 | tee /tmp/be_fd.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_fd.out
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --features rpc,rpc-tcp-debug --lib parcel:: -- --skip shared_memory 2>&1 | tee /tmp/be_parcel_rpc.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel_rpc.out
+      - name: AC-7.2 RPC stack on a big-endian host
+        run: |
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --features rpc,rpc-tcp-debug --lib rpc:: 2>&1 | tee /tmp/be_rpc.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_rpc.out
+      # `source_invariants` is not run here: it is a static scan of `src/`
+      # with no endianness-dependent code, and `rpc-suite` and `macos-build`
+      # already run it on the same tree — a third, cross-compiled run adds
+      # no big-endian signal.
 
   macos-build:
     # macOS is a first-class target per plan 2-9 (Phase A+B). The

@@ -45,7 +45,7 @@ use rsbinder::*;
 struct IHelloService;
 impl Interface for IHelloService {}
 impl IHello for IHelloService {
-    fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         Ok(echo.to_owned())
     }
 }

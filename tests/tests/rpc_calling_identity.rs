@@ -36,16 +36,16 @@ use rpccaller::IRpcCaller::{BnRpcCaller, IRpcCaller};
 struct CallerSvc;
 impl Interface for CallerSvc {}
 impl IRpcCaller for CallerSvc {
-    fn r#callingUid(&self) -> rsbinder::status::Result<i64> {
+    fn r#callingUid(&self) -> rsbinder::BinderResult<i64> {
         Ok(rsbinder::get_calling_uid() as i64)
     }
-    fn r#callingPid(&self) -> rsbinder::status::Result<i64> {
+    fn r#callingPid(&self) -> rsbinder::BinderResult<i64> {
         Ok(rsbinder::get_calling_pid() as i64)
     }
-    fn r#handlingTransaction(&self) -> rsbinder::status::Result<bool> {
+    fn r#handlingTransaction(&self) -> rsbinder::BinderResult<bool> {
         Ok(rsbinder::is_handling_transaction())
     }
-    fn r#callerKind(&self) -> rsbinder::status::Result<String> {
+    fn r#callerKind(&self) -> rsbinder::BinderResult<String> {
         use rsbinder::rpc::PeerIdentity;
         use rsbinder::Caller;
         Ok(match rsbinder::calling_caller() {

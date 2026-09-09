@@ -37,7 +37,7 @@ impl Interface for MyService {
 
 // 3. Implement your AIDL-generated interface trait.
 impl IMyService::IMyService for MyService {
-    fn echo(&self, input: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, input: &str) -> rsbinder::BinderResult<String> {
         Ok(input.to_owned())
     }
 }
@@ -281,7 +281,7 @@ struct MyServiceCallback;
 impl Interface for MyServiceCallback {}
 
 impl hub::IServiceCallback for MyServiceCallback {
-    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::status::Result<()> {
+    fn onRegistration(&self, name: &str, _service: &SIBinder) -> rsbinder::BinderResult<()> {
         println!("Service registered: {name}");
         Ok(())
     }

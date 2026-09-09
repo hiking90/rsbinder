@@ -195,11 +195,15 @@ wait* and *how they encode "not registered"* — pick by what your client needs:
 | `try_get_interface::<T>` | no | `Result<Option<Strong<T>>>` | `Ok(None)` |
 | `try_get_service` | no | `Result<Option<SIBinder>>` | `Ok(None)` |
 
-> **Deprecated**: `hub::get_service` and `hub::get_interface` are
-> `#[deprecated]` as of 0.10.0 because their wait behavior was inconsistent
-> across Android versions. Use `wait_for_service` / `wait_for_interface` to
-> block until the service appears, or `check_service` / `check_interface`
-> for a non-blocking lookup.
+> **Removed in 0.11.0**: `hub::get_service` and `hub::get_interface` are
+> gone (deprecated in 0.10.0) because their wait behavior was inconsistent
+> across Android versions. `try_get_service` / `try_get_interface` issue the
+> same `getService` wire call; use `wait_for_service` / `wait_for_interface`
+> to block until the service appears, or `check_service` / `check_interface`
+> for a non-blocking lookup that does not start a lazy service — except on
+> Android 15 `r6`+ (the `android_15` protocol), where `checkService` returns
+> a union rsbinder does not parse, so `check_service` routes through
+> `getService` and does start one.
 
 ### Blocking, Type-Safe Lookup with `wait_for_interface`
 
@@ -319,7 +323,7 @@ impl hub::IServiceCallback for MyServiceCallback {
         &self,
         name: &str,
         service: &rsbinder::SIBinder,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         println!("Service registered: {name}");
         Ok(())
     }
@@ -429,7 +433,7 @@ are usable because resolving uid → groups through NSS is race-free.
 | Permission | Gates |
 |---|---|
 | `add` | `add_service`, `register_client_callback`, `try_unregister_service` |
-| `find` | `check_service`, `wait_for_service`, `get_service`, `register_for_notifications`, `is_declared`, `get_connection_info`, and the per-name filtering of the two `list` calls |
+| `find` | `check_service`, `wait_for_service`, `try_get_service`, `register_for_notifications`, `is_declared`, `get_connection_info`, and the per-name filtering of the two `list` calls |
 | `list` | `list_services`, `get_service_debug_info` — a single global gate, since there is no name to scope it to |
 
 A denied **lookup** is reported as "not registered" rather than as an error.
@@ -539,7 +543,7 @@ instances it could look up.
 
 ### Starting a service on demand
 
-With a `start` entry, a `get_service` (or `wait_for_interface`) that misses
+With a `start` entry, a `try_get_service` (or `wait_for_interface`) that misses
 the service asks for it to be started — AOSP's `tryStartService`, with the
 declaration standing in for the init property:
 
@@ -550,7 +554,8 @@ start = { exec = ["/usr/bin/exampled", "--instance", "default"] }
 ```
 
 `check_service` never does this: it is documented as non-blocking and free
-of side effects. Only the `get`/`wait` family starts anything.
+of side effects. Only the `try_get_*` / `wait_*` families start anything (on
+Linux; see the Android 15 `r6`+ note above).
 
 The start runs on its own thread and `rsb_hub` does not wait for it — what
 tells the client the service is up is the registration notification it is
@@ -648,7 +653,7 @@ service manager as a parameter or store it in a struct.
   observe every (re-)registration over time, and remember that the
   notification callback only fires if the process runs a thread pool.
 
-- **Avoid the deprecated `get_service` / `get_interface`.** Their wait
+- **`get_service` / `get_interface` are gone as of 0.11.0.** Their wait
   behavior differed across Android versions; the `wait_*`, `check_*`, and
   `try_get_*` families make the blocking and error semantics explicit.
 

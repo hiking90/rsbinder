@@ -221,7 +221,7 @@ pub mod {{mod}} {
     /// `P` selects the async pool that drives the underlying blocking transact;
     /// with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
     /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
-    /// directly via `rsbinder::get_interface::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// directly via `rsbinder::get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
     /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
     /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
     /// for `Tokio`, `tokio`) feature.
@@ -323,9 +323,9 @@ pub mod {{mod}} {
             }
             let wrapped = Wrapper { _inner: inner, _rt: rt };
             {%- if is_vintf %}
-            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
             {%- else %}
-            let binder = {{crate}}::native::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
             {%- endif %}
             {{crate}}::Strong::new(Box::new(binder))
         }
@@ -1233,8 +1233,8 @@ fn render_enforce_permission_check(
         );
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
-    // `_reader` lets the runtime fail closed over RPC, where uid 0 reads as
-    // root and PMS would grant unconditionally (plan/2-16 Phase A).
+    // `_reader` lets the runtime deny over RPC before it reads a uid: an RPC
+    // peer's uid is not a PMS uid (plan/2-16 Phase A).
     let call = |p: &str| {
         format!(
             "{crate_name}::permission_controller::check_permission(_reader, \"{}\")",

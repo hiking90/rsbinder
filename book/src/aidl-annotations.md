@@ -127,8 +127,8 @@ interface IUserService {
 The generated Rust signatures use `Option`:
 
 ```rust
-fn getName(&self) -> rsbinder::status::Result<Option<String>>;
-fn setValues(&self, values: Option<&[i32]>) -> rsbinder::status::Result<()>;
+fn getName(&self) -> rsbinder::BinderResult<Option<String>>;
+fn setValues(&self, values: Option<&[i32]>) -> rsbinder::BinderResult<()>;
 ```
 
 When `None` is passed over a Binder transaction, a null marker is written to the parcel. The receiving side deserializes it as `None` without allocating any data.

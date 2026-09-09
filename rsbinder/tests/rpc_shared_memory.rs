@@ -280,7 +280,10 @@ fn heap_fd_rejected_without_fd_mode() {
     let bp = BpMemory::new(client.get_root().unwrap());
     let err = bp.resolve().unwrap_err();
     assert!(
-        matches!(err, StatusCode::BadType | StatusCode::FailedTransaction),
+        matches!(
+            err,
+            StatusCode::FdsNotAllowed | StatusCode::FailedTransaction
+        ),
         "unexpected error {err:?}"
     );
     assert_eq!(bp.size(), 0);

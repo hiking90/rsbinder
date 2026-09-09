@@ -9,22 +9,22 @@ include exception codes and optional messages.
 
 ## Core Types
 
-### `rsbinder::status::Result<T>`
+### `rsbinder::BinderResult<T>`
 
 Every AIDL-generated method returns this type:
 
 ```rust
-pub type Result<T> = std::result::Result<T, Status>;
+pub type BinderResult<T> = std::result::Result<T, Status>;
 ```
 
-This is a standard `Result` whose error variant is a `Status`. In generated code the alias is spelled `rsbinder::BinderResult<T>` — it is identical to `rsbinder::status::Result<T>`, so that is the name you will see in your generated files.
+This is a standard `Result` whose error variant is a `Status`, and `BinderResult` is the name you will see in your generated files.
 
 > **Note — two `Result` aliases coexist in `rsbinder`.** AIDL methods use
-> `rsbinder::status::Result<T> = Result<T, Status>` (rich error with exception
+> `rsbinder::BinderResult<T> = Result<T, Status>` (rich error with exception
 > code + optional message), but several library-level APIs (`Interface::dump`,
 > `hub::default`, `hub::register_for_notifications`, `hub::get_service_debug_info`)
-> use the plain `rsbinder::Result<T> = Result<T, StatusCode>` re-exported from
-> [`rsbinder::error`](https://docs.rs/rsbinder/latest/rsbinder/error/index.html).
+> use the plain [`rsbinder::Result<T>`](https://docs.rs/rsbinder/latest/rsbinder/type.Result.html)
+> `= Result<T, StatusCode>`.
 > Because `StatusCode` implements `From<StatusCode> for Status`, propagating
 > with `?` from a `Result<_, StatusCode>` into an AIDL method body (which
 > returns `Result<_, Status>`) works transparently.
@@ -32,8 +32,7 @@ This is a standard `Result` whose error variant is a `Status`. In generated code
 ### `StatusCode`
 
 `StatusCode` represents low-level transport errors that occur before or during
-a Binder transaction. These are defined in `rsbinder::StatusCode` (re-exported
-from `rsbinder::error::StatusCode`).
+a Binder transaction. It is named `rsbinder::StatusCode`.
 
 Commonly encountered values:
 
@@ -115,7 +114,7 @@ by the service:
 fn ThrowServiceException(
     &self,
     code: i32,
-) -> rsbinder::status::Result<()> {
+) -> rsbinder::BinderResult<()> {
     Err(rsbinder::Status::new_service_specific_error(code, None))
 }
 ```
@@ -138,7 +137,7 @@ added in a newer version of the AIDL interface), return `UnknownTransaction`:
 fn UnimplementedMethod(
     &self,
     _arg: i32,
-) -> rsbinder::status::Result<i32> {
+) -> rsbinder::BinderResult<i32> {
     // Indicate that this method is not implemented
     Err(rsbinder::StatusCode::UnknownTransaction.into())
 }
@@ -152,7 +151,7 @@ The `.into()` conversion automatically creates a `Status` with the
 If your service enforces access control, return `PermissionDenied`:
 
 ```rust
-fn restricted_operation(&self) -> rsbinder::status::Result<()> {
+fn restricted_operation(&self) -> rsbinder::BinderResult<()> {
     let caller = rsbinder::thread_state::CallingContext::default();
     if caller.uid != ALLOWED_UID {
         return Err(rsbinder::StatusCode::PermissionDenied.into());

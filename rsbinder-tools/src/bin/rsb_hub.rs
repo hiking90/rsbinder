@@ -56,7 +56,7 @@ enum PendingCallback {
 }
 
 impl PendingCallback {
-    fn fire(self) -> rsbinder::status::Result<()> {
+    fn fire(self) -> rsbinder::BinderResult<()> {
         match self {
             PendingCallback::Registration {
                 callback,
@@ -84,7 +84,7 @@ fn fire_pending(pending: Vec<PendingCallback>) {
 
 /// Like [`fire_pending`] but propagates the first callback error, preserving
 /// `addService`'s original error-propagating semantics for `onRegistration`.
-fn fire_pending_propagate(pending: Vec<PendingCallback>) -> rsbinder::status::Result<()> {
+fn fire_pending_propagate(pending: Vec<PendingCallback>) -> rsbinder::BinderResult<()> {
     for cb in pending {
         cb.fire()?;
     }
@@ -223,7 +223,7 @@ impl Inner {
         }
     }
 
-    fn add_service(&mut self, name: &str, service: Service) -> rsbinder::status::Result<()> {
+    fn add_service(&mut self, name: &str, service: Service) -> rsbinder::BinderResult<()> {
         self.name_to_service.insert(name.to_owned(), service);
         Ok(())
     }
@@ -235,7 +235,7 @@ impl Inner {
     /// do not need to test for it. Every successful call must be paired
     /// with exactly one [`Inner::release_death_link`] or, once the binder
     /// has died, one [`Inner::retire_dead_binder`].
-    fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::status::Result<()> {
+    fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::BinderResult<()> {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return Ok(());
         };
@@ -263,8 +263,8 @@ impl Inner {
         &mut self,
         handle: u32,
         weak: &rsbinder::WIBinder,
-        link: impl FnOnce() -> rsbinder::status::Result<()>,
-    ) -> rsbinder::status::Result<()> {
+        link: impl FnOnce() -> rsbinder::BinderResult<()>,
+    ) -> rsbinder::BinderResult<()> {
         if let Some(existing) = self.death_links.get_mut(&handle) {
             existing.count += 1;
             return Ok(());
@@ -492,7 +492,7 @@ impl Inner {
         &mut self,
         name: &str,
         pending: &mut Vec<PendingCallback>,
-    ) -> rsbinder::status::Result<Option<Lookup>> {
+    ) -> rsbinder::BinderResult<Option<Lookup>> {
         let service = if let Some(service) = self.name_to_service.get_mut(name) {
             service
         } else {
@@ -801,7 +801,7 @@ impl ServiceManager {
     /// return ok regardless. Reporting a denied lookup as "not registered"
     /// also keeps a denied caller from using the error to probe which names
     /// exist.
-    fn require(&self, permission: Permission, name: &str) -> rsbinder::status::Result<()> {
+    fn require(&self, permission: Permission, name: &str) -> rsbinder::BinderResult<()> {
         if self.allows(permission, name) {
             return Ok(());
         }
@@ -1126,7 +1126,7 @@ impl IServiceManager for ServiceManager {
     /// `getService` is the "start it if you have to" half of the pair, and
     /// [`checkService`](Self::checkService) is the non-blocking half that
     /// must not. See [`try_start_service`](Self::try_start_service).
-    fn getService(&self, name: &str) -> rsbinder::status::Result<Option<rsbinder::SIBinder>> {
+    fn getService(&self, name: &str) -> rsbinder::BinderResult<Option<rsbinder::SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
         }
@@ -1164,7 +1164,7 @@ impl IServiceManager for ServiceManager {
         service: &SIBinder,
         allowIsolated: bool,
         dumpPriority: i32,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Add, name)?;
 
         if !Self::is_valid_service_name(name) {
@@ -1202,7 +1202,7 @@ impl IServiceManager for ServiceManager {
         // `reg_pending` errors are propagated (prior `onRegistration` used `?`).
         let mut client_pending = Vec::new();
         let mut reg_pending = Vec::new();
-        let result: rsbinder::status::Result<()> = (|| {
+        let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
 
             // distinct-name DoS cap: refuse a *new* service name once the
@@ -1340,7 +1340,7 @@ impl IServiceManager for ServiceManager {
 
     /// Non-blocking, and free of side effects: unlike
     /// [`getService`](Self::getService) this never starts anything.
-    fn checkService(&self, name: &str) -> rsbinder::status::Result<Option<SIBinder>> {
+    fn checkService(&self, name: &str) -> rsbinder::BinderResult<Option<SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
         }
@@ -1361,7 +1361,7 @@ impl IServiceManager for ServiceManager {
     /// mirrors what AOSP already does in `getUpdatableNames`
     /// (`ServiceManager.cpp:789-793`) — a name the caller could not look
     /// up is a name it has no business learning the existence of.
-    fn listServices(&self, dump_priority: i32) -> rsbinder::status::Result<Vec<String>> {
+    fn listServices(&self, dump_priority: i32) -> rsbinder::BinderResult<Vec<String>> {
         self.require(Permission::List, "")?;
 
         // Collect under the lock, filter outside it: `allows` resolves
@@ -1388,7 +1388,7 @@ impl IServiceManager for ServiceManager {
         arg_callback: &rsbinder::Strong<
             dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Find, name)?;
 
         if !Self::is_valid_service_name(name) {
@@ -1455,7 +1455,7 @@ impl IServiceManager for ServiceManager {
         callback: &rsbinder::Strong<
             dyn hub::android_16::android::os::IServiceCallback::IServiceCallback,
         >,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Find, name)?;
 
         let mut inner = lock_recover(&self.inner);
@@ -1480,7 +1480,7 @@ impl IServiceManager for ServiceManager {
     /// are expected to exist before anyone registers them, which is what
     /// lets a client tell "not installed" from "not started yet". A host
     /// that declares nothing gets `false` for everything, as before.
-    fn isDeclared(&self, arg_name: &str) -> rsbinder::status::Result<bool> {
+    fn isDeclared(&self, arg_name: &str) -> rsbinder::BinderResult<bool> {
         self.require(Permission::Find, arg_name)?;
         Ok(self.enforcer.config().declarations.is_declared(arg_name))
     }
@@ -1488,7 +1488,7 @@ impl IServiceManager for ServiceManager {
     /// See [`isDeclared`](Self::isDeclared). Instances are filtered by
     /// `find`, as AOSP filters `getUpdatableNames`: an instance the caller
     /// could not look up is one it has no business learning about.
-    fn getDeclaredInstances(&self, arg_iface: &str) -> rsbinder::status::Result<Vec<String>> {
+    fn getDeclaredInstances(&self, arg_iface: &str) -> rsbinder::BinderResult<Vec<String>> {
         let declarations = &self.enforcer.config().declarations;
         Ok(declarations
             .instances_of(arg_iface)
@@ -1502,7 +1502,7 @@ impl IServiceManager for ServiceManager {
     /// `None` truthfully reports "no APEX governs this service". Demoted
     /// to `debug` because under steady-state load every `getService`
     /// caller that asks may hit this — `warn` would flood the log.
-    fn updatableViaApex(&self, arg_name: &str) -> rsbinder::status::Result<Option<String>> {
+    fn updatableViaApex(&self, arg_name: &str) -> rsbinder::BinderResult<Option<String>> {
         self.require(Permission::Find, arg_name)?;
         log::debug!("updatableViaApex is not implemented on Linux (APEX is Android-only)");
         Ok(None)
@@ -1515,9 +1515,8 @@ impl IServiceManager for ServiceManager {
     fn getConnectionInfo(
         &self,
         arg_name: &str,
-    ) -> rsbinder::status::Result<
-        Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>,
-    > {
+    ) -> rsbinder::BinderResult<Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+    {
         self.require(Permission::Find, arg_name)?;
         Ok(self
             .enforcer
@@ -1539,11 +1538,11 @@ impl IServiceManager for ServiceManager {
         arg_callback: &rsbinder::Strong<
             dyn hub::android_16::android::os::IClientCallback::IClientCallback,
         >,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Add, name)?;
 
         let mut pending = Vec::new();
-        let result: rsbinder::status::Result<()> = (|| {
+        let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
 
             let service = if let Some(service) = inner.name_to_service.get(name) {
@@ -1647,13 +1646,13 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
         arg_service: &rsbinder::SIBinder,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Add, name)?;
 
         let context = rsbinder::thread_state::CallingContext::default();
 
         let mut pending = Vec::new();
-        let result: rsbinder::status::Result<()> = (|| {
+        let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
             let service = if let Some(service) = inner.name_to_service.get(name) {
                 service
@@ -1739,9 +1738,8 @@ impl IServiceManager for ServiceManager {
 
     fn getServiceDebugInfo(
         &self,
-    ) -> rsbinder::status::Result<
-        Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>,
-    > {
+    ) -> rsbinder::BinderResult<Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+    {
         self.require(Permission::List, "")?;
 
         // See `listServices`: snapshot under the lock, filter outside it.
@@ -1766,7 +1764,7 @@ impl IServiceManager for ServiceManager {
     fn getService2(
         &self,
         name: &str,
-    ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
+    ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
         // Routing logic lives in `classify_for_service_union` so
         // `checkService2` stays byte-identical without re-stating the
         // match arms.
@@ -1788,7 +1786,7 @@ impl IServiceManager for ServiceManager {
     fn checkService2(
         &self,
         name: &str,
-    ) -> rsbinder::status::Result<hub::android_16::android::os::Service::Service> {
+    ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
         // See `getService2` — both route through
         // `classify_for_service_union`.
         if !self.allows(Permission::Find, name) {
@@ -1806,7 +1804,7 @@ impl IServiceManager for ServiceManager {
     /// See [`updatableViaApex`](Self::updatableViaApex) — same
     /// APEX-on-Linux rationale, same demoted log level. An empty `Vec`
     /// is the truthful "no APEX-updatable services" answer.
-    fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::status::Result<Vec<String>> {
+    fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::BinderResult<Vec<String>> {
         log::debug!("getUpdatableNames is not implemented on Linux (APEX is Android-only)");
         Ok(vec![])
     }
@@ -2225,7 +2223,7 @@ mod tests {
     }
 
     impl LinkLedger {
-        fn link(&self) -> rsbinder::status::Result<()> {
+        fn link(&self) -> rsbinder::BinderResult<()> {
             self.links.set(self.links.get() + 1);
             Ok(())
         }

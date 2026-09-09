@@ -24,13 +24,13 @@ struct TaggedSvc {
 }
 impl Interface for TaggedSvc {}
 impl IRpcSmoke for TaggedSvc {
-    fn r#echo(&self, s: &str) -> rsbinder::status::Result<String> {
+    fn r#echo(&self, s: &str) -> rsbinder::BinderResult<String> {
         Ok(format!("{}:{}", self.tag, s))
     }
-    fn r#add(&self, a: i32, b: i32) -> rsbinder::status::Result<i32> {
+    fn r#add(&self, a: i32, b: i32) -> rsbinder::BinderResult<i32> {
         Ok(a + b)
     }
-    fn r#ping(&self) -> rsbinder::status::Result<()> {
+    fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

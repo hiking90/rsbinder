@@ -72,7 +72,9 @@ use std::fmt::Debug;
 use std::fs::File;
 use std::sync::{atomic::Ordering, Arc};
 
-use crate::{binder::*, error::*, parcel::*, process_state::*, sys::*};
+use crate::{
+    binder::*, command_stream::CommandStream, error::*, parcel::*, process_state::*, sys::*,
+};
 
 // See module doc — R1: borrows of these `RefCell`s must not be held across
 // calls that may re-borrow either cell (user callbacks, other binder entry
@@ -547,8 +549,8 @@ fn process_pending_derefs() -> Result<()> {
 }
 
 pub(crate) struct ThreadState {
-    in_parcel: Parcel,
-    out_parcel: Parcel,
+    in_parcel: CommandStream,
+    out_parcel: CommandStream,
     transaction: Option<TransactionState>,
     strict_mode_policy: i32,
     is_looper: bool,
@@ -564,8 +566,8 @@ pub(crate) struct ThreadState {
 impl ThreadState {
     fn new() -> Self {
         ThreadState {
-            in_parcel: Parcel::new(),
-            out_parcel: Parcel::new(),
+            in_parcel: CommandStream::new(),
+            out_parcel: CommandStream::new(),
             transaction: None,
             strict_mode_policy: 0,
             is_looper: false,
@@ -696,8 +698,8 @@ impl ThreadState {
         };
 
         let start = self.out_parcel.data_size();
-        self.out_parcel.write::<u32>(&cmd)?;
-        if let Err(e) = self.out_parcel.write_aligned(&tr) {
+        self.out_parcel.write_cmd::<u32>(&cmd)?;
+        if let Err(e) = self.out_parcel.write_transaction(&tr) {
             // Roll back the orphan cmd word: flushing a bare BC_* opcode with
             // no binder_transaction_data behind it would desync the driver
             // protocol.
@@ -794,7 +796,7 @@ pub(crate) fn _setup_polling() -> Result<()> {
         thread_state
             .borrow_mut()
             .out_parcel
-            .write::<u32>(&binder::BC_ENTER_LOOPER)
+            .write_cmd::<u32>(&binder::BC_ENTER_LOOPER)
     })?;
     flush_commands()?;
     Ok(())
@@ -822,7 +824,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
             if thread_state.borrow().in_parcel.is_empty() {
                 continue;
             }
-            let cmd: u32 = thread_state.borrow_mut().in_parcel.read::<i32>()? as _;
+            let cmd: u32 = thread_state.borrow_mut().in_parcel.read_cmd::<i32>()? as _;
 
             log::trace!("{:?}", return_to_str(cmd));
 
@@ -868,7 +870,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     return Err(StatusCode::FailedTransaction);
                 }
                 binder::BR_ACQUIRE_RESULT => {
-                    let result = thread_state.borrow_mut().in_parcel.read::<i32>()?;
+                    let result = thread_state.borrow_mut().in_parcel.read_cmd::<i32>()?;
                     if let UntilResponse::AcquireResult = until {
                         let res = if result != 0 {
                             Ok(None)
@@ -881,10 +883,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     }
                 }
                 binder::BR_REPLY => {
-                    let tr = thread_state
-                        .borrow_mut()
-                        .in_parcel
-                        .read::<binder::binder_transaction_data>()?;
+                    let tr = thread_state.borrow_mut().in_parcel.read_transaction()?;
                     // SAFETY: for a kernel-delivered BR_REPLY the driver populates
                     // the `data.ptr` arm of the union (buffer/offsets pointers into
                     // the mmap region), so reading that arm is valid.
@@ -1083,7 +1082,11 @@ fn execute_command(cmd: i32) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         match cmd {
             binder::BR_ERROR => {
-                let other: StatusCode = thread_state.borrow_mut().in_parcel.read::<i32>()?.into();
+                let other: StatusCode = thread_state
+                    .borrow_mut()
+                    .in_parcel
+                    .read_cmd::<i32>()?
+                    .into();
                 log::error!("binder::BR_ERROR ({other})");
                 return Err(other);
             }
@@ -1093,14 +1096,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let tr_secctx = {
                     let mut thread_state = thread_state.borrow_mut();
                     if cmd == binder::BR_TRANSACTION_SEC_CTX {
-                        thread_state
-                            .in_parcel
-                            .read::<binder::binder_transaction_data_secctx>()?
+                        thread_state.in_parcel.read_transaction_secctx()?
                     } else {
                         binder::binder_transaction_data_secctx {
-                            transaction_data: thread_state
-                                .in_parcel
-                                .read::<binder::binder_transaction_data>()?,
+                            transaction_data: thread_state.in_parcel.read_transaction()?,
                             secctx: 0,
                         }
                     }
@@ -1234,6 +1233,9 @@ fn execute_command(cmd: i32) -> Result<()> {
                 // nested dispatch; OOM aborts and is not catchable — rather than
                 // unwinding the worker loop (mirrors `dispatch_transact_caught`;
                 // a dropped reply reaches a sync caller as BR_DEAD_REPLY).
+                // Taken outside `catch_unwind` so the panic arm below can rewind to
+                // it too; inside, only the `Ok` path could see it.
+                let queued_at = thread_state.borrow().unflushed_mark();
                 let reply_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                         if (flags & transaction_flags_TF_ONE_WAY) == 0 {
@@ -1243,7 +1245,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 Err(err) => err.into(),
                             };
                             // The queued BC_REPLY points at `reply`/`status`; a failed flush must rewind it, not leave it.
-                            let queued_at = thread_state.borrow().unflushed_mark();
                             thread_state.borrow_mut().write_transaction_data(
                                 binder::BC_REPLY,
                                 flags,
@@ -1280,9 +1281,15 @@ fn execute_command(cmd: i32) -> Result<()> {
                     Ok(inner) => inner?,
                     Err(_payload) => {
                         // A caught panic may leave `out_parcel` holding an
-                        // unflushed/partial BC_REPLY; drop it so the next IPC
-                        // does not flush a malformed command.
-                        let _ = thread_state.borrow_mut().out_parcel.set_data_size(0);
+                        // unflushed/partial BC_REPLY; rewind just this
+                        // transaction's bytes. Truncating the whole parcel would
+                        // also drop a `BC_FREE_BUFFER` queued earlier by a nested
+                        // call — on a looper thread `flush_if_needed` never
+                        // flushes it — and the kernel would never reclaim that
+                        // transaction buffer. No `retry_flush`: the panic may have
+                        // come from `talk_with_driver`, and a re-entry would
+                        // unwind outside this `catch_unwind`.
+                        discard_unflushed_commands(thread_state, queued_at, false);
                         log::error!(
                             "reply path panicked for code {}; reply dropped",
                             tr_secctx.transaction_data.code
@@ -1294,12 +1301,12 @@ fn execute_command(cmd: i32) -> Result<()> {
 
             binder::BR_INCREFS => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 // The cookie half is unused under the new id encoding
                 // but the kernel still emits the original `cookie`
                 // (always 0 for our published natives). Echo it back
                 // verbatim in BC_INCREFS_DONE.
-                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // BR_INCREFS reflects the kernel acquiring a weak ref
@@ -1317,16 +1324,20 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&binder::BC_INCREFS_DONE)?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
-                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
+                    .write_cmd::<u32>(&binder::BC_INCREFS_DONE)?;
+                state
+                    .out_parcel
+                    .write_cmd::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write_cmd::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+                let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // Same shape as BR_INCREFS — bookkeeping only.
@@ -1339,17 +1350,21 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE_DONE))?;
-                state.out_parcel.write::<binder::binder_uintptr_t>(&id)?;
                 state
                     .out_parcel
-                    .write::<binder::binder_uintptr_t>(&cookie_echo)?;
+                    .write_cmd::<u32>(&(binder::BC_ACQUIRE_DONE))?;
+                state
+                    .out_parcel
+                    .write_cmd::<binder::binder_uintptr_t>(&id)?;
+                state
+                    .out_parcel
+                    .write_cmd::<binder::binder_uintptr_t>(&cookie_echo)?;
             }
             binder::BR_RELEASE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 // cookie echo unused on the deferred-deref path.
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
@@ -1358,8 +1373,8 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_DECREFS => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
 
                 BINDER_DEREFS.with(|binder_derefs| {
                     let mut binder_derefs = binder_derefs.borrow_mut();
@@ -1368,8 +1383,8 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_ATTEMPT_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read::<binder::binder_uintptr_t>()?;
-                let _cookie_echo = state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+                let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
                 // Probe the table's binary alive-signal: entry exists
@@ -1382,8 +1397,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let success = ProcessState::as_self().ref_native_kernel(id).is_some();
 
                 let mut state = thread_state.borrow_mut();
-                state.out_parcel.write::<u32>(&binder::BC_ACQUIRE_RESULT)?;
-                state.out_parcel.write::<i32>(&(success as _))?;
+                state
+                    .out_parcel
+                    .write_cmd::<u32>(&binder::BC_ACQUIRE_RESULT)?;
+                state.out_parcel.write_cmd::<i32>(&(success as _))?;
             }
             binder::BR_NOOP => {}
             binder::BR_SPAWN_LOOPER => {
@@ -1395,7 +1412,7 @@ fn execute_command(cmd: i32) -> Result<()> {
             binder::BR_DEAD_BINDER => {
                 let handle = {
                     let mut state = thread_state.borrow_mut();
-                    state.in_parcel.read::<binder::binder_uintptr_t>()?
+                    state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?
                 };
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
@@ -1407,10 +1424,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                         let mut state = thread_state.borrow_mut();
                         state
                             .out_parcel
-                            .write::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
+                            .write_cmd::<u32>(&(binder::BC_DEAD_BINDER_DONE))?;
                         state
                             .out_parcel
-                            .write::<binder::binder_uintptr_t>(&handle)?;
+                            .write_cmd::<binder::binder_uintptr_t>(&handle)?;
                         Ok(())
                     },
                     || ProcessState::as_self().release_obituary_pin(handle as _),
@@ -1418,7 +1435,7 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
                 let mut state = thread_state.borrow_mut();
-                state.in_parcel.read::<binder::binder_uintptr_t>()?;
+                state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
             }
             _ => {
                 log::error!("*** BAD COMMAND {cmd} received from Binder driver\n");
@@ -1428,6 +1445,30 @@ fn execute_command(cmd: i32) -> Result<()> {
 
         Ok(())
     })
+}
+
+/// Name the queued command the driver refused, for a `BINDER_WRITE_READ` that
+/// failed or stopped short.
+///
+/// `stopped_at` is the driver's `write_consumed`: the offset it gave up at, so
+/// the command starting there is the one it rejected. That is the datum worth
+/// having, because the usual causes are caller bugs the errno alone cannot
+/// distinguish — a refcount underflow from an over-released proxy
+/// (`BC_RELEASE`/`BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer already
+/// returned.
+fn describe_refused_command(out: &mut CommandStream, stopped_at: usize) -> String {
+    let total = out.data_size();
+    if stopped_at >= total {
+        return format!("consumed {stopped_at} of {total}");
+    }
+    let saved = out.data_position();
+    out.set_data_position(stopped_at);
+    let named = match out.read_cmd::<u32>() {
+        Ok(cmd) => format!("{} ({cmd:#x})", command_to_str(cmd)),
+        Err(e) => format!("<unreadable: {e}>"),
+    };
+    out.set_data_position(saved);
+    format!("consumed {stopped_at} of {total}; driver stopped at {named}")
 }
 
 /// Drive one round-trip with the binder kernel driver.
@@ -1513,7 +1554,14 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             match res {
                 Ok(_) => break,
                 Err(errno) if errno != rustix::io::Errno::INTR => {
-                    log::error!("binder::write_read() error : {errno}");
+                    // The driver rejects a command by failing the whole ioctl,
+                    // so this — not the partial-consume abort below — is where a
+                    // caller's refcount or buffer bug actually surfaces.
+                    let detail = describe_refused_command(
+                        &mut thread_state.borrow_mut().out_parcel,
+                        bwr.write_consumed as _,
+                    );
+                    log::error!("binder::write_read() error : {errno}; {detail}");
                     return Err(StatusCode::from(errno));
                 }
                 _ => {}
@@ -1534,11 +1582,23 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
             if bwr.write_consumed > 0 {
                 if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
-                    panic!(
-                        "Driver did not consume write buffer. consumed: {} of {}",
-                        bwr.write_consumed,
-                        thread_state.out_parcel.data_size()
+                    let detail = describe_refused_command(
+                        &mut thread_state.out_parcel,
+                        bwr.write_consumed as _,
                     );
+                    // Written straight to stderr, not through `log`: a consumer
+                    // that installed no logger would otherwise die mute.
+                    eprintln!(
+                        "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
+                         The remainder was never seen by the kernel, so the reference\n\
+                         counts and buffer ownership this process believes in are no\n\
+                         longer the kernel's. Queued commands:\n{:?}",
+                        thread_state.out_parcel
+                    );
+                    // AOSP `LOG_ALWAYS_FATAL`s here. Abort rather than panic:
+                    // the reply path's `catch_unwind` would otherwise resume on
+                    // that desynchronized stream.
+                    std::process::abort();
                 }
                 thread_state.out_parcel.set_data_size(0)?;
                 thread_state.out_flush_epoch += 1;
@@ -1572,7 +1632,7 @@ fn get_and_execute_command() -> Result<()> {
     talk_with_driver(true)?;
 
     let cmd = THREAD_STATE.with(|thread_state| -> Result<i32> {
-        thread_state.borrow_mut().in_parcel.read::<i32>()
+        thread_state.borrow_mut().in_parcel.read_cmd::<i32>()
     })?;
     execute_command(cmd)?;
 
@@ -1601,8 +1661,8 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_ACQUIRE))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_cmd::<u32>(&(binder::BC_ACQUIRE))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1617,8 +1677,8 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_RELEASE))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_cmd::<u32>(&(binder::BC_RELEASE))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1633,8 +1693,8 @@ pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_INCREFS))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_cmd::<u32>(&(binder::BC_INCREFS))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1649,8 +1709,8 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
-            state.out_parcel.write::<u32>(&(binder::BC_DECREFS))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+            state.out_parcel.write_cmd::<u32>(&(binder::BC_DECREFS))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
         }
 
         flush_if_needed()?;
@@ -1833,8 +1893,10 @@ fn free_buffer(
         let mut thread_state = thread_state.borrow_mut();
         thread_state
             .out_parcel
-            .write::<u32>(&binder::BC_FREE_BUFFER)?;
-        thread_state.out_parcel.write::<binder_uintptr_t>(&data)?;
+            .write_cmd::<u32>(&binder::BC_FREE_BUFFER)?;
+        thread_state
+            .out_parcel
+            .write_cmd::<binder_uintptr_t>(&data)?;
         Ok(())
     })?;
 
@@ -1851,12 +1913,12 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
 
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    // A two-way transact normally yields a reply, but a `break` path in
-    // `wait_for_response` can surface `Ok(None)`; return a recoverable error
-    // rather than panicking the calling thread.
-    let interface: String = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
+    // `wait_for_response` can surface `Ok(None)` — a recoverable error, not a
+    // panic; a null descriptor folds to empty (AOSP `readString16` has no
+    // error path).
+    let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
 
-    Ok(interface)
+    Ok(interface.unwrap_or_default())
 }
 
 pub(crate) fn ping_binder(handle: u32) -> Result<()> {
@@ -1898,7 +1960,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
 
         {
             let mut thread_state = thread_state.borrow_mut();
-            thread_state.out_parcel.write::<u32>(&looper)?;
+            thread_state.out_parcel.write_cmd::<u32>(&looper)?;
             thread_state.is_looper = true;
         }
 
@@ -1950,7 +2012,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
             thread_state.is_looper = false;
             thread_state
                 .out_parcel
-                .write::<u32>(&binder::BC_EXIT_LOOPER)?;
+                .write_cmd::<u32>(&binder::BC_EXIT_LOOPER)?;
         }
 
         talk_with_driver(false)?;
@@ -1967,12 +2029,12 @@ pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
 
             state
                 .out_parcel
-                .write::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+                .write_cmd::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
             state
                 .out_parcel
-                .write::<binder::binder_uintptr_t>(&(handle as _))?;
+                .write_cmd::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
@@ -1987,12 +2049,12 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
 
             state
                 .out_parcel
-                .write::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
-            state.out_parcel.write::<u32>(&(handle))?;
+                .write_cmd::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
+            state.out_parcel.write_cmd::<u32>(&(handle))?;
             // Android binder calls writePointer(proxy) here, but we just write handle.
             state
                 .out_parcel
-                .write::<binder::binder_uintptr_t>(&(handle as _))?;
+                .write_cmd::<binder::binder_uintptr_t>(&(handle as _))?;
         }
 
         Ok(())
@@ -2630,35 +2692,15 @@ mod tests {
     }
 
     /// `binder_frozen_state_info` layout: cookie (u64), is_frozen (u32),
-    /// reserved (u32) = 16 bytes, aligned 8. The `BR_FROZEN_BINDER`
-    /// dispatch reads this via `parcel.read::<binder_frozen_state_info>()`.
+    /// reserved (u32) = 16 bytes, aligned 8. Nothing reads it yet — the
+    /// `BR_FROZEN_BINDER` arm is unimplemented and the command falls to
+    /// `execute_command`'s "BAD COMMAND" default — so pinning the layout
+    /// here is what keeps the payload right for whenever that arm lands.
     #[test]
     fn binder_frozen_state_info_layout() {
         use crate::sys::binder_frozen_state_info;
         assert_eq!(std::mem::size_of::<binder_frozen_state_info>(), 16);
         assert_eq!(std::mem::align_of::<binder_frozen_state_info>(), 8);
-        let s = binder_frozen_state_info::default();
-        assert_eq!(s.cookie, 0);
-        assert_eq!(s.is_frozen, 0);
-        assert_eq!(s.reserved, 0);
-    }
-
-    /// The default arm in `wait_for_response` is untouched: the new
-    /// constants are declared so the strings table can label them, but
-    /// no dispatch path consumes them yet. This is a smoke test — if a
-    /// future change accidentally dispatched the freeze-observer BRs
-    /// before its own arm is in place, the kernel wire would diverge.
-    /// Here we just confirm the constants are visible to user code.
-    #[test]
-    fn freeze_observer_constants_are_pub_for_phase_b() {
-        // If these uses compile, the constants are exposed for a future
-        // dispatch path to consume.
-        let _b1 = binder::BR_TRANSACTION_PENDING_FROZEN;
-        let _b2 = binder::BR_FROZEN_BINDER;
-        let _b3 = binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE;
-        let _c1 = binder::BC_REQUEST_FREEZE_NOTIFICATION;
-        let _c2 = binder::BC_CLEAR_FREEZE_NOTIFICATION;
-        let _c3 = binder::BC_FREEZE_NOTIFICATION_DONE;
     }
 
     #[test]
@@ -3345,5 +3387,37 @@ mod tests {
         assert_eq!(get_strict_mode_policy(), 0x1234_5678);
         set_strict_mode_policy(saved);
         assert_eq!(get_strict_mode_policy(), saved);
+    }
+
+    /// The driver reports how far it got, not which command it disliked; the
+    /// offset is what turns one into the other.
+    #[test]
+    fn a_refused_command_is_named_from_the_offset_the_driver_stopped_at() {
+        let mut out = CommandStream::new();
+        out.write_cmd::<u32>(&binder::BC_INCREFS).unwrap();
+        out.write_cmd::<u32>(&7u32).unwrap();
+        let second = out.data_size();
+        out.write_cmd::<u32>(&binder::BC_FREE_BUFFER).unwrap();
+        out.write_cmd::<u32>(&0u32).unwrap();
+        let total = out.data_size();
+
+        out.set_data_position(4);
+        let msg = describe_refused_command(&mut out, second);
+        assert!(msg.contains("BC_FREE_BUFFER"), "{msg}");
+        assert!(
+            msg.contains(&format!("consumed {second} of {total}")),
+            "{msg}"
+        );
+        assert_eq!(
+            out.data_position(),
+            4,
+            "the probe must leave the read position where it found it"
+        );
+
+        assert_eq!(
+            describe_refused_command(&mut out, total),
+            format!("consumed {total} of {total}"),
+            "a fully consumed buffer has no command to blame"
+        );
     }
 }

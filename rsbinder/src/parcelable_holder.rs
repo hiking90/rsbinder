@@ -64,6 +64,18 @@ enum ParcelableHolderData {
 /// `ParcelableHolder` is `Send + Sync`: its state sits behind a `Mutex` and
 /// rsbinder's `Parcel` is plain owned data (unlike AOSP's, which wraps a raw
 /// `AParcel` pointer).
+///
+/// # Relaying undecoded bytes
+///
+/// A holder that still carries undecoded bytes taken from an RPC or
+/// data-only parcel — one read from an RPC transaction, or decoded with
+/// `from_bytes` (the `rpc` feature) — cannot be written into a kernel parcel:
+/// the write returns `BadType` rather than handing a kernel reader bytes no
+/// session vouched for. Calling
+/// [`get_parcelable::<T>`](Self::get_parcelable) for the payload's own type
+/// first resolves the bytes into a typed value, and that value re-encodes
+/// into any parcel. So whether a relay succeeds depends on whether the
+/// holder has been resolved, not only on where its bytes came from.
 #[derive(Debug)]
 pub struct ParcelableHolder {
     // This is a `Mutex` because of `get_parcelable`
@@ -328,7 +340,20 @@ impl Parcelable for ParcelableHolder {
             .checked_add(data_size as usize)
             .ok_or(StatusCode::BadValue)?;
 
+        // The payload keeps the marshalling mode of the parcel it came from.
+        // Handing RPC / data-only bytes to a kernel-mode reader would let a
+        // forged `flat_binder_object` resolve through the kernel object path:
+        // `read_object`'s null-meta shortcut returns a null-pointer,
+        // null-cookie object without consulting the offset table, so
+        // `BINDER_TYPE_HANDLE` with handle 0 would become a live proxy.
         let mut new_parcel = Parcel::new();
+        #[cfg(feature = "rpc")]
+        if !parcel.is_kernel_backed() {
+            new_parcel.set_for_rpc(true);
+            if let Some(ops) = parcel.rpc_ops() {
+                new_parcel.attach_rpc_ops(ops);
+            }
+        }
         new_parcel.append_from(parcel, data_start, data_size as usize)?;
         *self
             .data
@@ -417,5 +442,108 @@ mod tests {
                 "status {status} must be rejected as UnexpectedNull",
             );
         }
+    }
+
+    /// A holder carries its payload in a sub-parcel built by
+    /// `read_from_parcel`. That sub-parcel must inherit the marshalling
+    /// mode of the parcel it was cut from, or the data-only decoder
+    /// behind [`crate::from_bytes`] hands its bytes to a kernel-mode
+    /// reader — and `read_object`'s null-meta shortcut waves a
+    /// null-pointer, null-cookie object through without an offset-table
+    /// entry, so a forged `BINDER_TYPE_HANDLE` with handle 0 would
+    /// become a proxy to the context manager (or panic on
+    /// `ProcessState::as_self()` in a process that never initialized the
+    /// driver). Both outcomes contradict what `from_bytes` promises
+    /// about bytes you did not write.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn a_forged_object_inside_a_holder_never_becomes_a_binder() {
+        #[derive(Debug, Default)]
+        struct BinderCarrier {
+            binder: Option<crate::SIBinder>,
+        }
+        impl ParcelableMetadata for BinderCarrier {
+            fn descriptor() -> &'static str {
+                "rsbinder.test.BinderCarrier"
+            }
+        }
+        impl Parcelable for BinderCarrier {
+            fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
+                parcel.write(&self.binder)
+            }
+            fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
+                self.binder = parcel.read()?;
+                Ok(())
+            }
+        }
+
+        // Descriptor, then the 24 bytes of a `flat_binder_object` naming
+        // handle 0 with a null pointer and cookie, then the trailing
+        // stability `int32` the kernel binder path reads after it.
+        let mut payload = Parcel::new_data_only();
+        payload
+            .write(&BinderCarrier::descriptor().to_string())
+            .unwrap();
+        payload
+            .write(&crate::binder_object::flat_binder_object::new_handle(0, 0))
+            .unwrap();
+        payload.write(&0i32).unwrap();
+        let payload = payload.into_bytes().unwrap();
+
+        let mut encoded = Parcel::new_data_only();
+        encoded.write(&NON_NULL_PARCELABLE_FLAG).unwrap();
+        encoded.write(&0i32).unwrap(); // STABILITY_LOCAL
+        encoded.write(&(payload.len() as i32)).unwrap();
+        encoded.write_aligned_data(&payload).unwrap();
+        let encoded = encoded.into_bytes().unwrap();
+
+        let holder: ParcelableHolder = crate::from_bytes(&encoded).expect("the holder decodes");
+        assert_eq!(
+            holder.get_parcelable::<BinderCarrier>().err(),
+            Some(StatusCode::BadType),
+            "the payload of a data-only holder must stay data-only"
+        );
+    }
+
+    /// Keeping the payload data-only is not enough on its own: serializing
+    /// the holder into a *kernel* parcel would copy those bytes back into a
+    /// buffer whose reader trusts them. `read_object`'s null-meta shortcut
+    /// waves a null-pointer, null-cookie `flat_binder_object` through with
+    /// no offset-table entry, so one kernel round trip would turn file
+    /// bytes into a proxy for the context manager. `append_from` refuses
+    /// the copy instead; a same-mode sink still accepts the holder.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn a_data_only_holder_is_refused_by_a_kernel_parcel() {
+        let mut payload = Parcel::new_data_only();
+        payload
+            .write(&"rsbinder.test.BinderCarrier".to_string())
+            .unwrap();
+        payload
+            .write(&crate::binder_object::flat_binder_object::new_handle(0, 0))
+            .unwrap();
+        payload.write(&0i32).unwrap();
+        let payload = payload.into_bytes().unwrap();
+
+        let mut encoded = Parcel::new_data_only();
+        encoded.write(&NON_NULL_PARCELABLE_FLAG).unwrap();
+        encoded.write(&0i32).unwrap(); // STABILITY_LOCAL
+        encoded.write(&(payload.len() as i32)).unwrap();
+        encoded.write_aligned_data(&payload).unwrap();
+        let encoded = encoded.into_bytes().unwrap();
+
+        let holder: ParcelableHolder = crate::from_bytes(&encoded).expect("the holder decodes");
+
+        let mut kernel = Parcel::new();
+        assert_eq!(
+            kernel.write(&holder).err(),
+            Some(StatusCode::BadType),
+            "a data-only payload must not be relayed into a kernel parcel"
+        );
+
+        let mut data_only = Parcel::new_data_only();
+        data_only
+            .write(&holder)
+            .expect("a same-mode sink still accepts the holder");
     }
 }

@@ -954,6 +954,7 @@ impl RpcServer {
     /// attach path without the probe. Same `__`-prefix unstable-API discipline
     /// as `__fuzz_decode_rpc_parcel`; not part of the supported API
     /// surface.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn __set_attach_shutdown_probe<F>(&self, f: F)
     where

@@ -14,7 +14,7 @@ impl rsbinder::Interface for IFooService {}
 
 impl IFoo for IFooService {
     // Implement the echo method.
-    fn hello(&self) -> rsbinder::status::Result<()> {
+    fn hello(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }
@@ -72,7 +72,7 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
     #[cfg(target_os = "android")]
     {
         let manager_name = "manager";
-        let binder = hub::get_service(manager_name);
+        let binder = hub::try_get_service(manager_name).expect("service manager");
         assert!(binder.is_some());
 
         let binder = hub::check_service(manager_name);
@@ -80,7 +80,7 @@ fn test_get_check_list_service() -> rsbinder::Result<()> {
     }
 
     let unknown_name = "unknown_service";
-    let binder = hub::get_service(unknown_name);
+    let binder = hub::try_get_service(unknown_name).expect("service manager");
     assert!(binder.is_none());
     let binder = hub::check_service(unknown_name);
     assert!(binder.is_none());
@@ -106,7 +106,7 @@ fn test_notifications() -> rsbinder::Result<()> {
             &self,
             name: &str,
             service: &rsbinder::SIBinder,
-        ) -> rsbinder::status::Result<()> {
+        ) -> rsbinder::BinderResult<()> {
             println!("onRegistration: {name} {service:?}");
             Ok(())
         }

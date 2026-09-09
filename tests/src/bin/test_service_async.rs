@@ -79,7 +79,7 @@ impl Interface for NamedCallback {}
 
 #[async_trait]
 impl INamedCallback::INamedCallbackAsyncService for NamedCallback {
-    async fn GetName(&self) -> rsbinder::status::Result<String> {
+    async fn GetName(&self) -> rsbinder::BinderResult<String> {
         Ok(self.0.clone())
     }
 }
@@ -88,7 +88,7 @@ impl INamedCallback::INamedCallbackAsyncService for NamedCallback {
 // be wrapped with the non-async `new_binder` (set_extension is a non-async
 // IBinder trait method).
 impl INamedCallback::INamedCallback for NamedCallback {
-    fn GetName(&self) -> rsbinder::status::Result<String> {
+    fn GetName(&self) -> rsbinder::BinderResult<String> {
         Ok(self.0.clone())
     }
 }
@@ -99,7 +99,7 @@ impl Interface for OldName {}
 
 #[async_trait]
 impl IOldName::IOldNameAsyncService for OldName {
-    async fn RealName(&self) -> rsbinder::status::Result<String> {
+    async fn RealName(&self) -> rsbinder::BinderResult<String> {
         Ok("OldName".into())
     }
 }
@@ -111,7 +111,7 @@ impl Interface for NewName {}
 
 #[async_trait]
 impl INewName::INewNameAsyncService for NewName {
-    async fn RealName(&self) -> rsbinder::status::Result<String> {
+    async fn RealName(&self) -> rsbinder::BinderResult<String> {
         Ok("NewName".into())
     }
 }
@@ -125,7 +125,7 @@ impl Interface for Circular {}
 impl ICircular::ICircularAsyncService for Circular {
     async fn GetTestService(
         &self,
-    ) -> rsbinder::status::Result<Option<rsbinder::Strong<dyn ITestService::ITestService>>> {
+    ) -> rsbinder::BinderResult<Option<rsbinder::Strong<dyn ITestService::ITestService>>> {
         Ok(None)
     }
 }
@@ -154,7 +154,7 @@ macro_rules! impl_repeat {
         fn $repeat_name<'a, 'b>(
             &'a self,
             token: $type,
-        ) -> BoxFuture<'b, rsbinder::status::Result<$type>>
+        ) -> BoxFuture<'b, rsbinder::BinderResult<$type>>
         where
             'a: 'b,
             Self: 'b,
@@ -170,7 +170,7 @@ macro_rules! impl_reverse {
             &'a self,
             input: &'b [$type],
             repeated: &'c mut Vec<$type>,
-        ) -> BoxFuture<'d, rsbinder::status::Result<Vec<$type>>>
+        ) -> BoxFuture<'d, rsbinder::BinderResult<Vec<$type>>>
         where
             'a: 'd,
             'b: 'd,
@@ -198,7 +198,7 @@ macro_rules! impl_repeat_nullable {
         fn $repeat_nullable_name<'a, 'b, 'c>(
             &'a self,
             input: Option<&'b [$type]>,
-        ) -> BoxFuture<'c, rsbinder::status::Result<Option<Vec<$type>>>>
+        ) -> BoxFuture<'c, rsbinder::BinderResult<Option<Vec<$type>>>>
         where
             'a: 'c,
             'b: 'c,
@@ -214,16 +214,16 @@ impl ITestService::ITestServiceAsyncService for TestService {
     impl_repeat! {RepeatByte, i8}
     impl_reverse! {ReverseByte, u8}
 
-    async fn UnimplementedMethod(&self, _: i32) -> rsbinder::status::Result<i32> {
+    async fn UnimplementedMethod(&self, _: i32) -> rsbinder::BinderResult<i32> {
         // Pretend this method hasn't been implemented
         Err(rsbinder::StatusCode::UnknownTransaction.into())
     }
 
-    async fn TestOneway(&self) -> rsbinder::status::Result<()> {
+    async fn TestOneway(&self) -> rsbinder::BinderResult<()> {
         Err(rsbinder::StatusCode::Unknown.into())
     }
 
-    async fn Deprecated(&self) -> rsbinder::status::Result<()> {
+    async fn Deprecated(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 
@@ -240,18 +240,18 @@ impl ITestService::ITestServiceAsyncService for TestService {
     impl_reverse! {ReverseStringList, String}
     impl_reverse! {ReverseUtf8CppString, String}
 
-    async fn RepeatString(&self, input: &str) -> rsbinder::status::Result<String> {
+    async fn RepeatString(&self, input: &str) -> rsbinder::BinderResult<String> {
         Ok(input.into())
     }
 
-    async fn RepeatUtf8CppString(&self, input: &str) -> rsbinder::status::Result<String> {
+    async fn RepeatUtf8CppString(&self, input: &str) -> rsbinder::BinderResult<String> {
         Ok(input.into())
     }
 
     async fn GetOtherTestService(
         &self,
         name: &str,
-    ) -> rsbinder::status::Result<rsbinder::Strong<dyn INamedCallback::INamedCallback>> {
+    ) -> rsbinder::BinderResult<rsbinder::Strong<dyn INamedCallback::INamedCallback>> {
         let mut service_map = self.service_map.lock().unwrap();
         let other_service = service_map.entry(name.into()).or_insert_with(|| {
             let named_callback = NamedCallback(name.into());
@@ -264,7 +264,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         name: &str,
         service: &rsbinder::Strong<dyn INamedCallback::INamedCallback>,
-    ) -> rsbinder::status::Result<bool> {
+    ) -> rsbinder::BinderResult<bool> {
         let mut service_map = self.service_map.lock().unwrap();
         if let Some(existing_service) = service_map.get(name) {
             if existing_service == service {
@@ -279,7 +279,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         service: &rsbinder::Strong<dyn INamedCallback::INamedCallback>,
         name: &str,
-    ) -> rsbinder::status::Result<bool> {
+    ) -> rsbinder::BinderResult<bool> {
         service
             .clone()
             .into_async::<Tokio>()
@@ -291,7 +291,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn GetInterfaceArray(
         &self,
         names: &[String],
-    ) -> rsbinder::status::Result<Vec<rsbinder::Strong<dyn INamedCallback::INamedCallback>>> {
+    ) -> rsbinder::BinderResult<Vec<rsbinder::Strong<dyn INamedCallback::INamedCallback>>> {
         let mut res = Vec::new();
         for name in names {
             res.push(self.GetOtherTestService(name).await?);
@@ -303,7 +303,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         services: &[rsbinder::Strong<dyn INamedCallback::INamedCallback>],
         names: &[String],
-    ) -> rsbinder::status::Result<bool> {
+    ) -> rsbinder::BinderResult<bool> {
         if services.len() == names.len() {
             for (s, n) in services.iter().zip(names) {
                 if !self.VerifyName(s, n).await? {
@@ -319,7 +319,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn GetNullableInterfaceArray(
         &self,
         names: Option<&[Option<String>]>,
-    ) -> rsbinder::status::Result<
+    ) -> rsbinder::BinderResult<
         Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>,
     > {
         if let Some(names) = names {
@@ -341,7 +341,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         services: Option<&[Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>]>,
         names: Option<&[Option<String>]>,
-    ) -> rsbinder::status::Result<bool> {
+    ) -> rsbinder::BinderResult<bool> {
         if let (Some(services), Some(names)) = (services, names) {
             for (s, n) in services.iter().zip(names) {
                 if let (Some(s), Some(n)) = (s, n) {
@@ -361,7 +361,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn GetInterfaceList(
         &self,
         names: Option<&[Option<String>]>,
-    ) -> rsbinder::status::Result<
+    ) -> rsbinder::BinderResult<
         Option<Vec<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>>,
     > {
         self.GetNullableInterfaceArray(names).await
@@ -371,7 +371,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         services: Option<&[Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>]>,
         names: Option<&[Option<String>]>,
-    ) -> rsbinder::status::Result<bool> {
+    ) -> rsbinder::BinderResult<bool> {
         self.VerifyNamesWithNullableInterfaceArray(services, names)
             .await
     }
@@ -379,7 +379,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn RepeatParcelFileDescriptor(
         &self,
         read: &ParcelFileDescriptor,
-    ) -> rsbinder::status::Result<ParcelFileDescriptor> {
+    ) -> rsbinder::BinderResult<ParcelFileDescriptor> {
         Ok(dup_fd(read))
     }
 
@@ -387,13 +387,13 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: &[ParcelFileDescriptor],
         repeated: &mut Vec<Option<ParcelFileDescriptor>>,
-    ) -> rsbinder::status::Result<Vec<ParcelFileDescriptor>> {
+    ) -> rsbinder::BinderResult<Vec<ParcelFileDescriptor>> {
         repeated.clear();
         repeated.extend(input.iter().map(dup_fd).map(Some));
         Ok(input.iter().rev().map(dup_fd).collect())
     }
 
-    async fn ThrowServiceException(&self, code: i32) -> rsbinder::status::Result<()> {
+    async fn ThrowServiceException(&self, code: i32) -> rsbinder::BinderResult<()> {
         Err(rsbinder::Status::new_service_specific_error(code, None))
     }
 
@@ -406,43 +406,43 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn RepeatNullableString(
         &self,
         input: Option<&str>,
-    ) -> rsbinder::status::Result<Option<String>> {
+    ) -> rsbinder::BinderResult<Option<String>> {
         Ok(input.map(String::from))
     }
 
     async fn RepeatNullableUtf8CppString(
         &self,
         input: Option<&str>,
-    ) -> rsbinder::status::Result<Option<String>> {
+    ) -> rsbinder::BinderResult<Option<String>> {
         Ok(input.map(String::from))
     }
 
     async fn RepeatNullableParcelable(
         &self,
         input: Option<&Empty>,
-    ) -> rsbinder::status::Result<Option<Empty>> {
+    ) -> rsbinder::BinderResult<Option<Empty>> {
         Ok(input.cloned())
     }
 
     impl_repeat_nullable! {RepeatNullableParcelableArray, Option<Empty>}
     impl_repeat_nullable! {RepeatNullableParcelableList, Option<Empty>}
 
-    async fn TakesAnIBinder(&self, _: &SIBinder) -> rsbinder::status::Result<()> {
+    async fn TakesAnIBinder(&self, _: &SIBinder) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 
-    async fn TakesANullableIBinder(&self, _: Option<&SIBinder>) -> rsbinder::status::Result<()> {
+    async fn TakesANullableIBinder(&self, _: Option<&SIBinder>) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 
-    async fn TakesAnIBinderList(&self, _: &[SIBinder]) -> rsbinder::status::Result<()> {
+    async fn TakesAnIBinderList(&self, _: &[SIBinder]) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 
     async fn TakesANullableIBinderList(
         &self,
         _: Option<&[Option<SIBinder>]>,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 
@@ -450,7 +450,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: Option<&[Option<String>]>,
         repeated: &mut Option<Vec<Option<String>>>,
-    ) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
+    ) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
         if let Some(input) = input {
             *repeated = Some(input.to_vec());
             Ok(Some(input.iter().rev().cloned().collect()))
@@ -465,15 +465,14 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: Option<&[Option<String>]>,
         repeated: &mut Option<Vec<Option<String>>>,
-    ) -> rsbinder::status::Result<Option<Vec<Option<String>>>> {
+    ) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
         self.ReverseNullableUtf8CppString(input, repeated).await
     }
 
     async fn GetCallback(
         &self,
         return_null: bool,
-    ) -> rsbinder::status::Result<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>>
-    {
+    ) -> rsbinder::BinderResult<Option<rsbinder::Strong<dyn INamedCallback::INamedCallback>>> {
         if return_null {
             Ok(None)
         } else {
@@ -486,7 +485,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     async fn FillOutStructuredParcelable(
         &self,
         parcelable: &mut StructuredParcelable::StructuredParcelable,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         parcelable.shouldBeJerry = "Jerry".into();
         parcelable.shouldContainThreeFs = vec![parcelable.f, parcelable.f, parcelable.f];
         parcelable.shouldBeByteBar = ByteEnum::BAR;
@@ -518,7 +517,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         ep: &ExtendableParcelable,
         ep2: &mut ExtendableParcelable,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         ep2.a = ep.a;
         ep2.b = ep.b.clone();
 
@@ -536,7 +535,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         ep: &ExtendableParcelable,
         ep2: &mut ExtendableParcelable,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         ep2.a = ep.a;
         ep2.b.clone_from(&ep.b);
 
@@ -550,7 +549,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         Ok(())
     }
 
-    async fn ReverseList(&self, list: &RecursiveList) -> rsbinder::status::Result<RecursiveList> {
+    async fn ReverseList(&self, list: &RecursiveList) -> rsbinder::BinderResult<RecursiveList> {
         let mut reversed: Option<RecursiveList> = None;
         let mut cur: Option<&RecursiveList> = Some(list);
         while let Some(node) = cur {
@@ -568,7 +567,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: &[SIBinder],
         repeated: &mut Vec<Option<SIBinder>>,
-    ) -> rsbinder::status::Result<Vec<SIBinder>> {
+    ) -> rsbinder::BinderResult<Vec<SIBinder>> {
         *repeated = input.iter().cloned().map(Some).collect();
         Ok(input.iter().rev().cloned().collect())
     }
@@ -577,7 +576,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: Option<&[Option<SIBinder>]>,
         repeated: &mut Option<Vec<Option<SIBinder>>>,
-    ) -> rsbinder::status::Result<Option<Vec<Option<SIBinder>>>> {
+    ) -> rsbinder::BinderResult<Option<Vec<Option<SIBinder>>>> {
         let input = input.expect("input is null");
         *repeated = Some(input.to_vec());
         Ok(Some(input.iter().rev().cloned().collect()))
@@ -585,20 +584,20 @@ impl ITestService::ITestServiceAsyncService for TestService {
 
     async fn GetOldNameInterface(
         &self,
-    ) -> rsbinder::status::Result<rsbinder::Strong<dyn IOldName::IOldName>> {
+    ) -> rsbinder::BinderResult<rsbinder::Strong<dyn IOldName::IOldName>> {
         Ok(IOldName::BnOldName::new_async_binder(OldName, rt()))
     }
 
     async fn GetNewNameInterface(
         &self,
-    ) -> rsbinder::status::Result<rsbinder::Strong<dyn INewName::INewName>> {
+    ) -> rsbinder::BinderResult<rsbinder::Strong<dyn INewName::INewName>> {
         Ok(INewName::BnNewName::new_async_binder(NewName, rt()))
     }
 
     async fn GetUnionTags(
         &self,
         input: &[Union::Union],
-    ) -> rsbinder::status::Result<Vec<Union::Tag>> {
+    ) -> rsbinder::BinderResult<Vec<Union::Tag>> {
         Ok(input
             .iter()
             .map(|u| match u {
@@ -613,18 +612,18 @@ impl ITestService::ITestServiceAsyncService for TestService {
             .collect::<Vec<_>>())
     }
 
-    async fn GetCppJavaTests(&self) -> rsbinder::status::Result<Option<SIBinder>> {
+    async fn GetCppJavaTests(&self) -> rsbinder::BinderResult<Option<SIBinder>> {
         Ok(None)
     }
 
-    async fn getBackendType(&self) -> rsbinder::status::Result<BackendType> {
+    async fn getBackendType(&self) -> rsbinder::BinderResult<BackendType> {
         Ok(BackendType::RUST)
     }
 
     async fn GetCircular(
         &self,
         _: &mut CircularParcelable,
-    ) -> rsbinder::status::Result<rsbinder::Strong<dyn ICircular::ICircular>> {
+    ) -> rsbinder::BinderResult<rsbinder::Strong<dyn ICircular::ICircular>> {
         Ok(ICircular::BnCircular::new_async_binder(Circular, rt()))
     }
 
@@ -632,7 +631,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: &SimpleParcelable,
         repeat: &mut SimpleParcelable,
-    ) -> rsbinder::status::Result<SimpleParcelable> {
+    ) -> rsbinder::BinderResult<SimpleParcelable> {
         *repeat = input.clone();
         Ok(input.clone())
     }
@@ -641,12 +640,12 @@ impl ITestService::ITestServiceAsyncService for TestService {
         &self,
         input: &[SimpleParcelable],
         repeated: &mut Vec<SimpleParcelable>,
-    ) -> rsbinder::status::Result<Vec<SimpleParcelable>> {
+    ) -> rsbinder::BinderResult<Vec<SimpleParcelable>> {
         *repeated = input.to_vec();
         Ok(input.iter().rev().cloned().collect())
     }
 
-    async fn r#killService(&self) -> rsbinder::status::Result<()> {
+    async fn r#killService(&self) -> rsbinder::BinderResult<()> {
         std::process::exit(0);
     }
 }
@@ -657,16 +656,16 @@ impl Interface for FooInterface {}
 
 #[async_trait]
 impl IFooInterface::IFooInterfaceAsyncService for FooInterface {
-    async fn originalApi(&self) -> rsbinder::status::Result<()> {
+    async fn originalApi(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
-    async fn acceptUnionAndReturnString(&self, u: &BazUnion) -> rsbinder::status::Result<String> {
+    async fn acceptUnionAndReturnString(&self, u: &BazUnion) -> rsbinder::BinderResult<String> {
         match u {
             BazUnion::IntNum(n) => Ok(n.to_string()),
             BazUnion::LongNum(n) => Ok(n.to_string()),
         }
     }
-    async fn returnsLengthOfFooArray(&self, foos: &[Foo]) -> rsbinder::status::Result<i32> {
+    async fn returnsLengthOfFooArray(&self, foos: &[Foo]) -> rsbinder::BinderResult<i32> {
         Ok(foos.len() as i32)
     }
     async fn ignoreParcelablesAndRepeatInt(
@@ -675,10 +674,10 @@ impl IFooInterface::IFooInterfaceAsyncService for FooInterface {
         _inout_foo: &mut Foo,
         _out_foo: &mut Foo,
         value: i32,
-    ) -> rsbinder::status::Result<i32> {
+    ) -> rsbinder::BinderResult<i32> {
         Ok(value)
     }
-    async fn newApi(&self) -> rsbinder::status::Result<()> {
+    async fn newApi(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }
@@ -690,16 +689,16 @@ impl Interface for FooInterfaceV1 {}
 
 #[async_trait]
 impl IFooInterfaceV1Async for FooInterfaceV1 {
-    async fn originalApi(&self) -> rsbinder::status::Result<()> {
+    async fn originalApi(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
-    async fn acceptUnionAndReturnString(&self, u: &BazUnionV1) -> rsbinder::status::Result<String> {
+    async fn acceptUnionAndReturnString(&self, u: &BazUnionV1) -> rsbinder::BinderResult<String> {
         match u {
             BazUnionV1::IntNum(n) => Ok(n.to_string()),
             BazUnionV1::LongNum(n) => Ok(n.to_string()),
         }
     }
-    async fn returnsLengthOfFooArray(&self, foos: &[FooV1]) -> rsbinder::status::Result<i32> {
+    async fn returnsLengthOfFooArray(&self, foos: &[FooV1]) -> rsbinder::BinderResult<i32> {
         Ok(foos.len() as i32)
     }
     async fn ignoreParcelablesAndRepeatInt(
@@ -708,7 +707,7 @@ impl IFooInterfaceV1Async for FooInterfaceV1 {
         _inout_foo: &mut FooV1,
         _out_foo: &mut FooV1,
         value: i32,
-    ) -> rsbinder::status::Result<i32> {
+    ) -> rsbinder::BinderResult<i32> {
         Ok(value)
     }
 }
@@ -723,19 +722,19 @@ impl ITrunkStableTestV1Async for TrunkStableTest {
     async fn repeatParcelable(
         &self,
         input: &TMyParcelable,
-    ) -> rsbinder::status::Result<TMyParcelable> {
+    ) -> rsbinder::BinderResult<TMyParcelable> {
         Ok(input.clone())
     }
-    async fn repeatEnum(&self, input: TMyEnum) -> rsbinder::status::Result<TMyEnum> {
+    async fn repeatEnum(&self, input: TMyEnum) -> rsbinder::BinderResult<TMyEnum> {
         Ok(input)
     }
-    async fn repeatUnion(&self, input: &TMyUnion) -> rsbinder::status::Result<TMyUnion> {
+    async fn repeatUnion(&self, input: &TMyUnion) -> rsbinder::BinderResult<TMyUnion> {
         Ok(input.clone())
     }
     async fn callMyCallback(
         &self,
         cb: &rsbinder::Strong<dyn TrunkCb::IMyCallback>,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         // Echoed return values are unused, but propagate transaction failures
         // (e.g. a dead callback proxy) rather than swallowing them.
         cb.repeatParcelable(&TMyParcelable::default())?;
@@ -754,7 +753,7 @@ impl INestedService::INestedServiceAsyncService for NestedService {
     async fn flipStatus(
         &self,
         p: &ParcelableWithNested::ParcelableWithNested,
-    ) -> rsbinder::status::Result<INestedService::Result::Result> {
+    ) -> rsbinder::BinderResult<INestedService::Result::Result> {
         if p.status == ParcelableWithNested::Status::Status::OK {
             Ok(INestedService::Result::Result {
                 status: ParcelableWithNested::Status::Status::NOT_OK,
@@ -769,7 +768,7 @@ impl INestedService::INestedServiceAsyncService for NestedService {
         &self,
         st: ParcelableWithNested::Status::Status,
         cb: &rsbinder::Strong<dyn INestedService::ICallback::ICallback>,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         if st == ParcelableWithNested::Status::Status::OK {
             cb.done(ParcelableWithNested::Status::Status::NOT_OK)
         } else {
@@ -788,7 +787,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[u8; 3],
         repeated: &mut [u8; 3],
-    ) -> rsbinder::status::Result<[u8; 3]> {
+    ) -> rsbinder::BinderResult<[u8; 3]> {
         *repeated = *input;
         Ok(*input)
     }
@@ -796,7 +795,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[i32; 3],
         repeated: &mut [i32; 3],
-    ) -> rsbinder::status::Result<[i32; 3]> {
+    ) -> rsbinder::BinderResult<[i32; 3]> {
         *repeated = *input;
         Ok(*input)
     }
@@ -804,7 +803,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[SIBinder; 3],
         repeated: &mut [Option<SIBinder>; 3],
-    ) -> rsbinder::status::Result<[SIBinder; 3]> {
+    ) -> rsbinder::BinderResult<[SIBinder; 3]> {
         *repeated = input.clone().map(Some);
         Ok(input.clone())
     }
@@ -812,7 +811,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[IntParcelable; 3],
         repeated: &mut [IntParcelable; 3],
-    ) -> rsbinder::status::Result<[IntParcelable; 3]> {
+    ) -> rsbinder::BinderResult<[IntParcelable; 3]> {
         *repeated = *input;
         Ok(*input)
     }
@@ -820,7 +819,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[[u8; 3]; 2],
         repeated: &mut [[u8; 3]; 2],
-    ) -> rsbinder::status::Result<[[u8; 3]; 2]> {
+    ) -> rsbinder::BinderResult<[[u8; 3]; 2]> {
         *repeated = *input;
         Ok(*input)
     }
@@ -828,7 +827,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[[i32; 3]; 2],
         repeated: &mut [[i32; 3]; 2],
-    ) -> rsbinder::status::Result<[[i32; 3]; 2]> {
+    ) -> rsbinder::BinderResult<[[i32; 3]; 2]> {
         *repeated = *input;
         Ok(*input)
     }
@@ -836,7 +835,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[[SIBinder; 3]; 2],
         repeated: &mut [[Option<SIBinder>; 3]; 2],
-    ) -> rsbinder::status::Result<[[SIBinder; 3]; 2]> {
+    ) -> rsbinder::BinderResult<[[SIBinder; 3]; 2]> {
         *repeated = input.clone().map(|nested| nested.map(Some));
         Ok(input.clone())
     }
@@ -844,7 +843,7 @@ impl IRepeatFixedSizeArray::IRepeatFixedSizeArrayAsyncService for FixedSizeArray
         &self,
         input: &[[IntParcelable; 3]; 2],
         repeated: &mut [[IntParcelable; 3]; 2],
-    ) -> rsbinder::status::Result<[[IntParcelable; 3]; 2]> {
+    ) -> rsbinder::BinderResult<[[IntParcelable; 3]; 2]> {
         *repeated = *input;
         Ok(*input)
     }

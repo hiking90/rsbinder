@@ -24,7 +24,7 @@ it with no parameter threading:
 use rsbinder::{Caller, ExceptionCode, Status};
 
 impl IExample for MyService {
-    fn do_thing(&self, arg: i32) -> rsbinder::status::Result<()> {
+    fn do_thing(&self, arg: i32) -> rsbinder::BinderResult<()> {
         let uid = rsbinder::get_calling_uid();   // who is calling, right now
         // ... authorize, then act ...
         Ok(())
@@ -80,7 +80,7 @@ tags the identity by transport so you authorize **explicitly**:
 use rsbinder::{Caller, ExceptionCode, Status};
 use rsbinder::rpc::PeerIdentity;
 
-fn authorize() -> rsbinder::status::Result<()> {
+fn authorize() -> rsbinder::BinderResult<()> {
     match rsbinder::calling_caller() {
         // Kernel binder: Android permission, uid, or SELinux `sid`.
         Some(Caller::Kernel { uid, .. }) if uid == 1000 => Ok(()),

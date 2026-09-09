@@ -65,7 +65,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     // Shared memory travels as an fd. A Unix-socket RPC session must opt
     // into fd passing (SCM_RIGHTS) before the first lookup — without it the
-    // service's `getRegion()` reply is rejected with BadType. Every other
+    // service's `getRegion()` reply is rejected with FdsNotAllowed. Every other
     // endpoint rejects the option, so ask the parsed endpoint rather than
     // the URI string.
     let client = rsbinder::Client::open_with(&uri, |_o, _endpoint| {

@@ -10,6 +10,14 @@
 //! never touches `ProcessState`, `ThreadState`, `/dev/binder`, ioctl or
 //! mmap.
 //!
+//! # Endianness
+//!
+//! The wire is little-endian, header and body alike, on whatever host
+//! either end runs — so an rsbinder peer and an AOSP libbinder peer
+//! exchange byte-identical parcels, and a big-endian host is a peer like
+//! any other rather than a silent corruption. See the crate docs'
+//! *Wire byte order* for the three-layer split.
+//!
 //! # Security
 //!
 //! **RPC is _not_ a drop-in for kernel binder's security model.** The
@@ -104,6 +112,7 @@ pub mod transport;
 pub(crate) mod wire;
 /// Fuzz entrypoints (`fuzz/fuzz_targets/rpc_{wire,address}_decode.rs`,
 /// `rpc_session_handshake.rs`); not part of the supported API.
+#[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use wire::{__fuzz_decode_address, __fuzz_decode_wire, __fuzz_session_handshake};
 #[allow(dead_code)]
@@ -382,6 +391,7 @@ impl From<RpcError> for crate::StatusCode {
 /// Property: no panic / OOM / UB / unbounded pre-allocation on *any*
 /// input — every length is bounded by the bytes actually present.
 /// Not part of the supported API surface.
+#[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     use crate::binder::SIBinder;

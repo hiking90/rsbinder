@@ -10,7 +10,7 @@
 //! `get_calling_uid()` reads `0` (= root), and Android's
 //! `PermissionManagerService` *unconditionally grants root* — turning a
 //! guarded method into a grant to any anonymous RPC peer. The deny is
-//! transport-driven (`reader.is_for_rpc()` in
+//! transport-driven (`!reader.is_kernel_backed()` in
 //! `permission_controller::check_permission`), so it fires **before** any
 //! uid read or PMS lookup, independent of process shape and of any future
 //! uid wiring (Phase B).
@@ -51,16 +51,16 @@ use rpcperm::IRpcPermGuard::{BnRpcPermGuard, IRpcPermGuard};
 struct GuardSvc;
 impl Interface for GuardSvc {}
 impl IRpcPermGuard for GuardSvc {
-    fn r#doSingle(&self) -> rsbinder::status::Result<bool> {
+    fn r#doSingle(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#doAllOf(&self) -> rsbinder::status::Result<bool> {
+    fn r#doAllOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#doAnyOf(&self) -> rsbinder::status::Result<bool> {
+    fn r#doAnyOf(&self) -> rsbinder::BinderResult<bool> {
         Ok(true)
     }
-    fn r#echo(&self, message: &str) -> rsbinder::status::Result<String> {
+    fn r#echo(&self, message: &str) -> rsbinder::BinderResult<String> {
         Ok(message.to_string())
     }
 }

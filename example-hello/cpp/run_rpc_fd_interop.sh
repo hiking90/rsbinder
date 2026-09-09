@@ -9,39 +9,68 @@
 # is v1) and Android 16 (v2) emulators.
 #
 # Prereqs (as run_rpc_multiconn_interop.sh):
-#   * an Android 15/16 AVD booted; NDK at $ANDROID_NDK_HOME (default
-#     /opt/homebrew/share/android-ndk); `cargo ndk`; the
-#     aarch64-linux-android rustup target.
+#   * a booted AVD, SDK >= 34; NDK at $ANDROID_NDK_HOME (default
+#     /opt/homebrew/share/android-ndk); `cargo ndk`; the rustup target
+#     for the device's ABI.
 #
 # Usage:
-#   ./run_rpc_fd_interop.sh [-s emulator-5554] [max-wire-version]
+#   ./run_rpc_fd_interop.sh [-s emulator-5554] [-t <abi>] [max-wire-version]
 #
+# The ABI defaults to the device's own; -t overrides it.
 # Exits 0 on FD_PASS; non-zero otherwise.
 
 set -euo pipefail
 
 DEVICE=emulator-5554
+ABI=""
 SOCK=/data/local/tmp/rsfd.sock
 CPP_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$CPP_DIR/../.." && pwd)"
-NDK_BIN="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
 
-if [[ ${1:-} == "-s" ]]; then
-    DEVICE="$2"
-    shift 2
-fi
+while [[ ${1:-} == -* ]]; do
+    case "$1" in
+        -s) DEVICE="$2"; shift 2 ;;
+        -t) ABI="$2"; shift 2 ;;
+        *) echo "usage: $0 [-s <device>] [-t <abi>] [max-wire-version]" >&2; exit 2 ;;
+    esac
+done
 MAX_VERSION="${1:-2}"
 
-echo "==> verifying device $DEVICE is Android 15 or 16"
+# libbinder's own RPC max is v1 on Android 15 and v2 on 16; the version
+# is negotiated, so an older libbinder just settles lower. SDK 34 is the
+# oldest measured to carry libbinder_rpc_unstable with fd transport.
+echo "==> checking device $DEVICE"
 sdk=$(adb -s "$DEVICE" shell getprop ro.build.version.sdk | tr -d '\r')
-[[ "$sdk" == "35" || "$sdk" == "36" ]] || { echo "device $DEVICE is SDK $sdk, expected 35/36"; exit 1; }
+[[ "$sdk" -ge 34 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 34"; exit 1; }
+
+# For the two 64-bit ABIs the NDK clang prefix and the cargo target
+# directory are both the Rust triple; the 32-bit ones differ and are not
+# covered.
+case "${ABI:-$(adb -s "$DEVICE" shell getprop ro.product.cpu.abi | tr -d '\r')}" in
+    arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
+    x86_64)            TRIPLE=x86_64-linux-android ;;
+    *) echo "unsupported ABI; pass -t arm64-v8a or -t x86_64" >&2; exit 2 ;;
+esac
+
+# The binary's minSdk must not exceed the device's API level, so walk
+# down to the newest clang the NDK actually ships at or below it.
+CXX=""
+API=""
+for a in $(seq "$sdk" -1 29); do
+    for c in "$NDK"/toolchains/llvm/prebuilt/*/bin/"${TRIPLE}${a}"-clang++; do
+        [ -x "$c" ] && { CXX="$c"; API="$a"; break 2; }
+    done
+done
+[ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
+echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
 echo "==> pulling libbinder_*.so so we can link against them"
 adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so /tmp/libbinder_ndk.so >/dev/null
 adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so /tmp/libbinder_rpc_unstable.so >/dev/null
 
 echo "==> building C++ launcher (NDK)"
-"$NDK_BIN/aarch64-linux-android35-clang++" \
+"$CXX" \
     -O2 -Wall -std=c++17 -static-libstdc++ \
     -L /tmp \
     -lbinder_ndk -lbinder_rpc_unstable -llog \
@@ -49,15 +78,14 @@ echo "==> building C++ launcher (NDK)"
     -o "$CPP_DIR/rpc_fd_interop_launcher"
 
 echo "==> cross-compiling rsbinder server"
-( cd "$REPO_ROOT" && \
-    ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}" \
-    cargo ndk -t arm64-v8a -p 35 build --release -p example-hello \
+( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
+    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
         --features rpc \
         --bin rpc_fd_interop_server )
 
 echo "==> pushing binaries"
 adb -s "$DEVICE" push "$CPP_DIR/rpc_fd_interop_launcher" /data/local/tmp/ >/dev/null
-adb -s "$DEVICE" push "$REPO_ROOT/target/aarch64-linux-android/release/rpc_fd_interop_server" \
+adb -s "$DEVICE" push "$REPO_ROOT/target/$TRIPLE/release/rpc_fd_interop_server" \
     /data/local/tmp/ >/dev/null
 
 cleanup() {

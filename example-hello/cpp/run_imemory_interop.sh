@@ -20,27 +20,54 @@
 #     `adb root` + `setenforce 0` are applied (test_service's addService
 #     needs it, like the rest of the tests/ package).
 #   * NDK at $ANDROID_NDK_HOME (default /opt/homebrew/share/android-ndk),
-#     cargo-ndk, aarch64-linux-android rustup target.
+#     cargo-ndk, the rustup target for the device's ABI.
 #   * AOSP checkout at $AOSP (default /Users/king/Workspace/android) for
 #     the libbinder / libutils / libbase / liblog / libcutils headers.
 #
-# Usage: ./run_imemory_interop.sh [-s emulator-5554]
+# Usage: ./run_imemory_interop.sh [-s emulator-5554] [-t <abi>]
+# The ABI defaults to the device's own; -t overrides it.
 # Exit 0 on PASS (both directions).
 
 set -euo pipefail
 
 DEVICE=emulator-5554
+ABI=""
 AOSP="${AOSP:-/Users/king/Workspace/android}"
 NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="${TMPDIR:-/tmp}/rsbinder-imemory-interop"
 DEV_DIR=/data/local/tmp
 
-if [[ ${1:-} == "-s" ]]; then
-    DEVICE="$2"
-    shift 2
-fi
+while [[ ${1:-} == -* ]]; do
+    case "$1" in
+        -s) DEVICE="$2"; shift 2 ;;
+        -t) ABI="$2"; shift 2 ;;
+        *) echo "usage: $0 [-s <device>] [-t <abi>]" >&2; exit 2 ;;
+    esac
+done
 ADB=(adb -s "$DEVICE")
+
+# For the two 64-bit ABIs the NDK clang prefix and the cargo target
+# directory are both the Rust triple; the 32-bit ones differ and are not
+# covered.
+sdk=$("${ADB[@]}" shell getprop ro.build.version.sdk | tr -d '\r')
+case "${ABI:-$("${ADB[@]}" shell getprop ro.product.cpu.abi | tr -d '\r')}" in
+    arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
+    x86_64)            TRIPLE=x86_64-linux-android ;;
+    *) echo "unsupported ABI; pass -t arm64-v8a or -t x86_64" >&2; exit 2 ;;
+esac
+
+# The binary's minSdk must not exceed the device's API level, so walk
+# down to the newest clang the NDK actually ships at or below it.
+CXX=""
+API=""
+for a in $(seq "$sdk" -1 29); do
+    for c in "$NDK"/toolchains/llvm/prebuilt/*/bin/"${TRIPLE}${a}"-clang++; do
+        [ -x "$c" ] && { CXX="$c"; API="$a"; break 2; }
+    done
+done
+[ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
+echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
 mkdir -p "$WORK/sys"
 
@@ -50,8 +77,7 @@ for l in libbinder.so libutils.so libcutils.so libbase.so liblog.so libc++.so; d
 done
 
 echo "==> [2/7] compiling imemory_interop.cpp against AOSP headers + device libbinder"
-CXX=$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android35-clang++ | head -1)
-"$CXX" -O2 -Wall -std=c++20 -DANDROID -D__ANDROID_API__=35 \
+"$CXX" -O2 -Wall -std=c++20 -DANDROID -D__ANDROID_API__="$API" \
     -I "$AOSP/frameworks/native/libs/binder/include" \
     -I "$AOSP/system/core/libutils/include" \
     -I "$AOSP/system/libbase/include" \
@@ -64,14 +90,14 @@ CXX=$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android35-clang++ |
 
 echo "==> [3/7] cross-compiling rsbinder test_service + tests binary"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t aarch64-linux-android build -p tests --bin test_service >/dev/null 2>&1 )
+    cargo ndk -t "$TRIPLE" build -p tests --bin test_service >/dev/null 2>&1 )
 TESTBIN=$( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t aarch64-linux-android test --no-run -p tests 2>&1 \
+    cargo ndk -t "$TRIPLE" test --no-run -p tests 2>&1 \
     | grep -E "Executable unittests src/lib.rs" | sed -E 's/.*\((.*)\)/\1/' )
 
 echo "==> [4/7] pushing"
 "${ADB[@]}" push "$WORK/imemory_interop" "$DEV_DIR/imemory_interop" >/dev/null
-"${ADB[@]}" push "$REPO_ROOT/target/aarch64-linux-android/debug/test_service" "$DEV_DIR/test_service" >/dev/null
+"${ADB[@]}" push "$REPO_ROOT/target/$TRIPLE/debug/test_service" "$DEV_DIR/test_service" >/dev/null
 "${ADB[@]}" push "$REPO_ROOT/$TESTBIN" "$DEV_DIR/tests_testbin" >/dev/null
 "${ADB[@]}" shell "chmod 755 $DEV_DIR/imemory_interop $DEV_DIR/test_service $DEV_DIR/tests_testbin"
 

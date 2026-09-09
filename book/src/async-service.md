@@ -138,7 +138,7 @@ impl Interface for IHelloService {}
 
 #[async_trait]
 impl IHelloAsyncService for IHelloService {
-    async fn echo(&self, echo: &str) -> rsbinder::status::Result<String> {
+    async fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
         Ok(echo.to_owned())
     }
 }
@@ -229,11 +229,11 @@ struct MyService;
 impl Interface for MyService {}
 
 impl IMyService::IMyService for MyService {
-    fn echo(&self, input: &str) -> rsbinder::status::Result<String> {
+    fn echo(&self, input: &str) -> rsbinder::BinderResult<String> {
         Ok(input.to_owned())
     }
 
-    fn RepeatInt(&self, token: i32) -> rsbinder::status::Result<i32> {
+    fn RepeatInt(&self, token: i32) -> rsbinder::BinderResult<i32> {
         Ok(token)
     }
 }
@@ -252,12 +252,12 @@ impl Interface for MyAsyncService {}
 
 #[async_trait]
 impl IMyService::IMyServiceAsyncService for MyAsyncService {
-    async fn echo(&self, input: &str) -> rsbinder::status::Result<String> {
+    async fn echo(&self, input: &str) -> rsbinder::BinderResult<String> {
         // You can use .await on async operations here.
         Ok(input.to_owned())
     }
 
-    async fn RepeatInt(&self, token: i32) -> rsbinder::status::Result<i32> {
+    async fn RepeatInt(&self, token: i32) -> rsbinder::BinderResult<i32> {
         Ok(token)
     }
 }
@@ -289,7 +289,7 @@ async fn VerifyName(
     &self,
     service: &rsbinder::Strong<dyn INamedCallback::INamedCallback>,
     name: &str,
-) -> rsbinder::status::Result<bool> {
+) -> rsbinder::BinderResult<bool> {
     service
         .clone()
         .into_async::<Tokio>()
@@ -331,7 +331,7 @@ factory-style method. Pass the same `rt()` helper:
 async fn GetOtherTestService(
     &self,
     name: &str,
-) -> rsbinder::status::Result<rsbinder::Strong<dyn INamedCallback::INamedCallback>> {
+) -> rsbinder::BinderResult<rsbinder::Strong<dyn INamedCallback::INamedCallback>> {
     let mut service_map = self.service_map.lock().unwrap();
     let other_service = service_map.entry(name.into()).or_insert_with(|| {
         let named_callback = NamedCallback(name.into());
@@ -395,7 +395,7 @@ macro_rules! impl_repeat {
         fn $repeat_name<'a, 'b>(
             &'a self,
             token: $type,
-        ) -> BoxFuture<'b, rsbinder::status::Result<$type>>
+        ) -> BoxFuture<'b, rsbinder::BinderResult<$type>>
         where
             'a: 'b,
             Self: 'b,
@@ -411,7 +411,7 @@ macro_rules! impl_reverse {
             &'a self,
             input: &'b [$type],
             repeated: &'c mut Vec<$type>,
-        ) -> BoxFuture<'d, rsbinder::status::Result<Vec<$type>>>
+        ) -> BoxFuture<'d, rsbinder::BinderResult<Vec<$type>>>
         where
             'a: 'd,
             'b: 'd,
@@ -437,7 +437,7 @@ impl ITestService::ITestServiceAsyncService for TestService {
     impl_repeat! {RepeatInt, i32}
     impl_reverse! {ReverseInt, i32}
 
-    async fn RepeatString(&self, input: &str) -> rsbinder::status::Result<String> {
+    async fn RepeatString(&self, input: &str) -> rsbinder::BinderResult<String> {
         Ok(input.into())
     }
 

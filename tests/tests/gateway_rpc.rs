@@ -52,7 +52,7 @@ struct MeshNodeImpl {
 impl Interface for MeshNodeImpl {}
 
 impl IMeshNode for MeshNodeImpl {
-    fn r#exchange(&self, req: &MeshMessage) -> rsbinder::status::Result<MeshMessage> {
+    fn r#exchange(&self, req: &MeshMessage) -> rsbinder::BinderResult<MeshMessage> {
         self.received.fetch_add(1, Ordering::Relaxed);
         Ok(MeshMessage {
             r#seq: req.r#seq + 1,
@@ -63,7 +63,7 @@ impl IMeshNode for MeshNodeImpl {
         })
     }
 
-    fn r#accumulate(&self, v: &MeshValue) -> rsbinder::status::Result<i64> {
+    fn r#accumulate(&self, v: &MeshValue) -> rsbinder::BinderResult<i64> {
         let delta = match v {
             MeshValue::I(i) => *i as i64,
             MeshValue::L(l) => *l,
@@ -72,7 +72,7 @@ impl IMeshNode for MeshNodeImpl {
         Ok(self.total.fetch_add(delta, Ordering::Relaxed) + delta)
     }
 
-    fn r#notify(&self, msg: &MeshMessage) -> rsbinder::status::Result<()> {
+    fn r#notify(&self, msg: &MeshMessage) -> rsbinder::BinderResult<()> {
         self.received.fetch_add(1, Ordering::Relaxed);
         let obs = self.observers.lock().expect("observers").clone();
         for o in obs {
@@ -81,12 +81,12 @@ impl IMeshNode for MeshNodeImpl {
         Ok(())
     }
 
-    fn r#registerObserver(&self, obs: &Strong<dyn IMeshObserver>) -> rsbinder::status::Result<()> {
+    fn r#registerObserver(&self, obs: &Strong<dyn IMeshObserver>) -> rsbinder::BinderResult<()> {
         self.observers.lock().expect("observers").push(obs.clone());
         Ok(())
     }
 
-    fn r#receivedCount(&self) -> rsbinder::status::Result<i32> {
+    fn r#receivedCount(&self) -> rsbinder::BinderResult<i32> {
         Ok(self.received.load(Ordering::Relaxed))
     }
 }
@@ -103,7 +103,7 @@ fn upstream(name: &str) -> Strong<dyn IMeshNode> {
 struct CountingObserver(Arc<AtomicI32>);
 impl Interface for CountingObserver {}
 impl IMeshObserver for CountingObserver {
-    fn r#onEvent(&self, _msg: &MeshMessage) -> rsbinder::status::Result<()> {
+    fn r#onEvent(&self, _msg: &MeshMessage) -> rsbinder::BinderResult<()> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -271,25 +271,25 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
     }
     impl Interface for RewrappingGateway {}
     impl IMeshNode for RewrappingGateway {
-        fn r#exchange(&self, req: &MeshMessage) -> rsbinder::status::Result<MeshMessage> {
+        fn r#exchange(&self, req: &MeshMessage) -> rsbinder::BinderResult<MeshMessage> {
             self.upstream.r#exchange(req)
         }
-        fn r#accumulate(&self, v: &MeshValue) -> rsbinder::status::Result<i64> {
+        fn r#accumulate(&self, v: &MeshValue) -> rsbinder::BinderResult<i64> {
             self.upstream.r#accumulate(v)
         }
-        fn r#notify(&self, msg: &MeshMessage) -> rsbinder::status::Result<()> {
+        fn r#notify(&self, msg: &MeshMessage) -> rsbinder::BinderResult<()> {
             self.upstream.r#notify(msg)
         }
         fn r#registerObserver(
             &self,
             obs: &Strong<dyn IMeshObserver>,
-        ) -> rsbinder::status::Result<()> {
+        ) -> rsbinder::BinderResult<()> {
             // The re-wrap: a *local* binder of B's, delegating to A's
             // observer. `Rewrap` mints it once and hands the same object
             // back on every later call for the same observer.
             self.upstream.r#registerObserver(&self.observers.wrap(obs))
         }
-        fn r#receivedCount(&self) -> rsbinder::status::Result<i32> {
+        fn r#receivedCount(&self) -> rsbinder::BinderResult<i32> {
             self.upstream.r#receivedCount()
         }
     }
@@ -355,13 +355,13 @@ use trunk_v2_gen::android::aidl::test::trunk::ITrunkStableTest::{
 struct TrunkV1Svc;
 impl Interface for TrunkV1Svc {}
 impl ITrunkV1 for TrunkV1Svc {
-    fn r#repeatParcelable(&self, input: &V1Parcelable) -> rsbinder::status::Result<V1Parcelable> {
+    fn r#repeatParcelable(&self, input: &V1Parcelable) -> rsbinder::BinderResult<V1Parcelable> {
         Ok(input.clone())
     }
     fn r#repeatEnum(
         &self,
         input: trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::MyEnum::MyEnum,
-    ) -> rsbinder::status::Result<
+    ) -> rsbinder::BinderResult<
         trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::MyEnum::MyEnum,
     > {
         Ok(input)
@@ -369,7 +369,7 @@ impl ITrunkV1 for TrunkV1Svc {
     fn r#repeatUnion(
         &self,
         input: &trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::MyUnion::MyUnion,
-    ) -> rsbinder::status::Result<
+    ) -> rsbinder::BinderResult<
         trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::MyUnion::MyUnion,
     > {
         Ok(input.clone())
@@ -379,7 +379,7 @@ impl ITrunkV1 for TrunkV1Svc {
         _cb: &Strong<
             dyn trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::IMyCallback::IMyCallback,
         >,
-    ) -> rsbinder::status::Result<()> {
+    ) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }
@@ -439,23 +439,23 @@ struct Recorder {
 }
 impl Interface for Recorder {}
 impl IMeshNode for Recorder {
-    fn r#exchange(&self, req: &MeshMessage) -> rsbinder::status::Result<MeshMessage> {
+    fn r#exchange(&self, req: &MeshMessage) -> rsbinder::BinderResult<MeshMessage> {
         Ok(req.clone())
     }
-    fn r#accumulate(&self, _v: &MeshValue) -> rsbinder::status::Result<i64> {
+    fn r#accumulate(&self, _v: &MeshValue) -> rsbinder::BinderResult<i64> {
         Ok(0)
     }
-    fn r#notify(&self, _msg: &MeshMessage) -> rsbinder::status::Result<()> {
+    fn r#notify(&self, _msg: &MeshMessage) -> rsbinder::BinderResult<()> {
         Ok(())
     }
-    fn r#registerObserver(&self, obs: &Strong<dyn IMeshObserver>) -> rsbinder::status::Result<()> {
+    fn r#registerObserver(&self, obs: &Strong<dyn IMeshObserver>) -> rsbinder::BinderResult<()> {
         self.seen.lock().expect("seen").push(self.rewrap.wrap(obs));
         Ok(())
     }
     /// Reports how many **distinct** local objects `Rewrap` handed out —
     /// the number the test cares about. Without the table this equals the
     /// number of `registerObserver` calls.
-    fn r#receivedCount(&self) -> rsbinder::status::Result<i32> {
+    fn r#receivedCount(&self) -> rsbinder::BinderResult<i32> {
         let seen = self.seen.lock().expect("seen");
         let mut distinct: Vec<rsbinder::SIBinder> = Vec::new();
         for s in seen.iter() {

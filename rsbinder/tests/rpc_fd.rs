@@ -3,7 +3,8 @@
 
 //! Opt-in FD-over-RPC (`FileDescriptorTransportMode`).
 //!
-//! * default (no opt-in) is the `BadType` reject, unchanged.
+//! * default (no opt-in) is the `FdsNotAllowed` reject (`BadType` before
+//!   0.11.0).
 //! * both peers opt in over UDS ⇒ fd travels via
 //!   `SCM_RIGHTS`, valid + `O_CLOEXEC` at the receiver; works in
 //!   *both* directions (arg and reply).
@@ -222,7 +223,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
 }
 
 /// No opt-in (or one-sided) ⇒ fd write is the
-/// `BadType` reject, never a silent corruption or an error-less hang.
+/// `FdsNotAllowed` reject, never a silent corruption or an error-less hang.
 #[test]
 fn fd_rejected_without_mutual_opt_in() {
     // (a) server does NOT support Unix; client requests it.
@@ -247,7 +248,7 @@ fn fd_rejected_without_mutual_opt_in() {
     let pfd = ParcelFileDescriptor::new(tf);
     assert_eq!(
         call_len_of(&root, &pfd).unwrap_err(),
-        StatusCode::BadType,
+        StatusCode::FdsNotAllowed,
         "AC-7.1/7.3: FD in None mode is the 2-2 reject"
     );
 

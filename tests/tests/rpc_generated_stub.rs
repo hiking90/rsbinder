@@ -39,13 +39,13 @@ use rpcsmoke::IRpcSmoke::{BnRpcSmoke, IRpcSmoke};
 struct SmokeSvc;
 impl Interface for SmokeSvc {}
 impl IRpcSmoke for SmokeSvc {
-    fn r#echo(&self, s: &str) -> rsbinder::status::Result<String> {
+    fn r#echo(&self, s: &str) -> rsbinder::BinderResult<String> {
         Ok(s.to_string())
     }
-    fn r#add(&self, a: i32, b: i32) -> rsbinder::status::Result<i32> {
+    fn r#add(&self, a: i32, b: i32) -> rsbinder::BinderResult<i32> {
         Ok(a + b)
     }
-    fn r#ping(&self) -> rsbinder::status::Result<()> {
+    fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

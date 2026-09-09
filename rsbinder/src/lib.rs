@@ -20,6 +20,67 @@
 //! - **Entry API**: [`serve`] / [`connect`] — publish and look up services
 //!   with one URI-selected transport (kernel binder or RPC)
 //!
+//! # Wire byte order
+//!
+//! **The data-parcel wire is little-endian on every host.** A parcel
+//! written on one machine can be read on another, whatever either CPU's
+//! byte order is, and the bytes are identical to what a peer running
+//! Android's libbinder would send for the same value.
+//!
+//! On a little-endian host — every Android target and almost every Linux
+//! one — this costs nothing: the encoding is the memory layout, as it
+//! always was. A big-endian host pays a byte swap and gets a parcel its
+//! peers can actually read.
+//!
+//! Not every byte in a parcel is wire, and the distinction matters if you
+//! are reading the source:
+//!
+//! | Layer | What | Byte order |
+//! |---|---|---|
+//! | Data parcel | scalars, arrays, `String`, the object-free payload | **little-endian** |
+//! | Kernel command stream | the `BC_*`/`BR_*` ioctl buffer | host-native |
+//! | UAPI structs | `flat_binder_object`, `binder_transaction_data` | host-native |
+//!
+//! The lower two go to the kernel driver, which parses them with native
+//! loads; byte-swapping those would break the driver interface. So on a
+//! big-endian host a *kernel* parcel carrying a binder is a mixture —
+//! little-endian scalars around a native object header. That is correct:
+//! the scalars cross to a peer, the object header does not.
+//!
+//! ## Support tiers
+//!
+//! | Path | Little-endian | Big-endian |
+//! |---|---|---|
+//! | RPC (binder-over-socket) | supported, CI-verified | supported, verified under qemu-user s390x |
+//! | Kernel binder | supported, CI-verified | structurally correct but **unverified** — no big-endian binderfs exists to test on |
+//!
+//! # Data serialization
+//!
+//! An AIDL interface is already a schema, and the code generated from it
+//! is already a complete serializer. `to_bytes` and `from_bytes` (with
+//! the `rpc` feature) let you use it for storage rather than only for a
+//! transaction:
+//!
+//! ```no_run
+//! # fn main() {}
+//! # #[cfg(all(feature = "rpc", feature = "macros"))]
+//! # mod example {
+//! # #[derive(rsbinder::Parcelable, Default, Debug, Clone)]
+//! # struct Settings { volume: i32, name: String }
+//! # fn run() -> rsbinder::Result<()> {
+//! let settings = Settings { volume: 7, name: "quiet".into() };
+//! std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+//!
+//! let restored: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! Binders and file descriptors are refused rather than encoded — neither
+//! means anything outside the process that made it. `to_bytes`'s own docs
+//! cover what makes a stored type survive its schema changing.
+//!
 //! # Feature flags
 //!
 //! - `tokio` *(default)* — full async/await support on the Tokio runtime
@@ -46,11 +107,23 @@
 //!   its initial release and `android_15` serves `r6` and later; enable both
 //!   to cover every Android 15 device. The choice is measured at runtime,
 //!   not derived from the SDK version.
+//! - `fuzzing`, `test-util` — expose entry points that exist for a fuzz
+//!   target or a test to reach past the API. Not part of the supported
+//!   surface, and absent from a normal build; a consumer has no reason to
+//!   enable either.
 //!
 //! # Basic Usage
 //!
 //! This library works with AIDL (Android Interface Definition Language) files to generate
 //! type-safe Rust bindings for IPC services.
+//!
+//! **[`serve`] and [`connect`] are the way in.** One URI picks the
+//! transport — `binder:///dev/binderfs/binder` for kernel binder,
+//! `unix:///run/svc.sock` or `tcp://…` for RPC — and the service and
+//! client code either side of it is identical. The lower-level route
+//! ([`ProcessState`] plus the [`hub`] service-manager calls) stays
+//! available and is what the entry API is built on; reach for it when you
+//! need control the URI does not express, not as the default way to start.
 //!
 //! ## Setting up an AIDL-based Service
 //!
@@ -160,32 +233,39 @@
 
 // Core binder functionality
 mod binder;
-/// Async binder runtime support
+// Async binder runtime support. Private: `BoxFuture`, `BinderAsyncPool`
+// and `BinderAsyncRuntime` are re-exported at the crate root, which is
+// the only path — see the re-export policy below.
 #[cfg(feature = "async")]
-pub mod binder_async;
+mod binder_async;
 mod binder_object;
 /// BinderFS filesystem utilities
 pub mod binderfs;
 /// Helpers for a process bridging two transports (the gateway pattern)
 pub mod bridge;
-/// Error types and result handling
-pub mod error;
-/// File descriptor wrapper for IPC
-pub mod file_descriptor;
+// `CommandStream`, the L2 ioctl buffer. Private, and its field is private
+// to the module: `thread_state` cannot reach the L1 codec through it.
+mod command_stream;
+// Error types. Private: `Result` and `StatusCode` are re-exported at the
+// crate root.
+mod error;
+// `ParcelFileDescriptor`, re-exported at the crate root.
+mod file_descriptor;
 // `LazyServiceRegistrar`; documented inside (an outer doc would re-resolve its links at the crate root, as at `entry`).
 pub mod lazy_service;
 mod macros;
-/// Native service implementation helpers
-pub mod native;
-/// Data serialization for IPC
-pub mod parcel;
-/// Parcelable trait for serializable types
-pub mod parcelable;
-/// Holder for parcelable objects
-pub mod parcelable_holder;
+// Server-side binder construction: `Binder`, `BinderFeatures` and
+// `is_handling_transaction`, re-exported at the crate root.
+mod native;
+// `Parcel`, re-exported at the crate root.
+mod parcel;
+// The (de)serialization trait stack, re-exported at the crate root.
+mod parcelable;
+// `ParcelableHolder`, re-exported at the crate root.
+mod parcelable_holder;
 mod process_state;
-/// Client proxy for remote services
-pub mod proxy;
+// `Proxy` and `ProxyHandle`, re-exported at the crate root.
+mod proxy;
 /// Process-global proxy count + watermark callbacks
 /// with opt-in per-uid tracking. AOSP `BpBinder` proxy-count surface
 /// (`getBinderProxyCount` / `setBinderProxyCountWatermarks` /
@@ -198,8 +278,9 @@ mod ref_counter;
 /// stubs so a heap fd can travel over the kernel binder or
 /// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
-/// Status and exception handling
-pub mod status;
+// Status and exception handling: `BinderResult`, `ExceptionCode` and
+// `Status`, re-exported at the crate root.
+mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
@@ -248,8 +329,14 @@ pub use rsbinder_macros::{interface, BinderEnum, Parcelable};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
-// Items kept out of the crate root must be reached via
-// `rsbinder::<module>::<item>`.
+//
+// Nine of the modules below are private, and this block is the only way
+// in. They exported exactly what is re-exported here, so the module path
+// was a second name for each item and nothing else — including one that
+// was actively harmful: `status::Result` is `BinderResult`, but shares a
+// name with the root `Result`, which is a different type. A domain module
+// that carries items of its own (`hub`, `rpc`, `thread_state`, …) stays
+// public; those must still be reached via `rsbinder::<module>::<item>`.
 
 // From `binder` — core binder identity, transaction codes, traits.
 pub use binder::{
@@ -271,6 +358,12 @@ pub use binder::__rpc_stamp_descriptor;
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
+// Fuzz entry points for the `fuzz/` crate, which is outside the
+// workspace and so can only reach them through the crate root now that
+// `file_descriptor` is private.
+#[cfg(all(feature = "rpc", feature = "fuzzing"))]
+#[doc(hidden)]
+pub use file_descriptor::{__fuzz_rpc_fd_index, __fuzz_rpc_fd_index_v1, __fuzz_rpc_raw_fd};
 
 // From `native` — server-side binder construction.
 pub use native::{is_handling_transaction, Binder, BinderFeatures};
@@ -286,6 +379,12 @@ pub use thread_state::{
 };
 
 pub use parcel::Parcel;
+// Value ↔ bytes, for storing what an interface already knows how to
+// describe. Behind `rpc` because the encoder runs in the session-less
+// RPC parcel mode — that mode is what refuses binders and fds — and not
+// because anything here talks to a socket.
+#[cfg(feature = "rpc")]
+pub use parcel::{from_bytes, to_bytes};
 
 // From `parcelable` — (de)serialization trait stack.
 pub use parcelable::{
@@ -302,7 +401,7 @@ pub use proxy::{Proxy, ProxyHandle};
 // Explicit (not glob) so a newly-added `pub` item in `rt` can't silently leak
 // to the crate root without semver review — the policy stated above.
 #[cfg(feature = "tokio")]
-pub use rt::{get_interface, Tokio, TokioRuntime};
+pub use rt::{get_interface_async, Tokio, TokioRuntime};
 pub use status::{BinderResult, ExceptionCode, Status};
 
 /// Default path to the binder control device

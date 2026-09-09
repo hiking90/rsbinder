@@ -15,8 +15,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Migrating from 0.10.0
 
-The breaking changes are listed in *Changed* and *Removed* below. This is the
-short form — and the first entry is the only one no compiler will catch.
+The short form of this release's breaking changes; *Changed* and *Removed*
+below carry the rationale for the ones that have it. Some entries change only
+behavior or a value, so nothing in your build will warn. The little-endian
+wire fix under *Platform support* belongs here too — it changes bytes only on
+a big-endian host.
 
 - **`ProcessState::init(path, 0)` no longer means "the default".** The count
   now reaches the kernel as written, so `0` asks for zero binder threads. The
@@ -24,6 +27,11 @@ short form — and the first entry is the only one no compiler will catch.
   it and neither can your build. If you meant the default, pass the newly
   public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
   without `?threads=` are unchanged.
+- **`FLAG_PRIVATE_VENDOR` is now `0x10000000`, not `0`.** It was defined as
+  `FLAG_PRIVATE_LOCAL`, so passing it to `transact` set no bit; it now sets
+  bit 28 on the wire, matching AOSP `IBinder.h`. Only the value changed, so
+  nothing warns and a peer sees the difference. `FLAG_PRIVATE_LOCAL` is
+  unchanged (`0`).
 - **`RpcServer::set_root` / `RpcSession::set_root` return `Result<()>`.** They
   now refuse a *remote* binder (see *Changed*), so they have a value to
   report. An unused `Result` is only a warning, so a build without
@@ -37,12 +45,15 @@ short form — and the first entry is the only one no compiler will catch.
   blocked in `recv` with nothing to wake them, so `RpcSession::close_session`
   would hang on the join. The bundled `TcpStream`/`UnixStream`/`VsockStream`
   impls are unaffected.
-- **`shutdown` now names one operation; four methods are renamed.** Five
-  public methods shared the name with five meanings — two of them, on the
+- **`shutdown` now names one operation; four methods are renamed.** The name
+  had spread to five public methods with five meanings — two of them, on the
   adjacent `RpcServer` and `ServerGuard`, with opposite join semantics. Only
   the transport half-close keeps it (`rpc::transport::RpcTransport::shutdown`,
   the same operation as `TcpStream::shutdown`). The rest are renamed, with no
-  deprecated aliases:
+  deprecated aliases. Of the four, only `RpcServer::shutdown` was public in
+  0.10.0 — `ServerGuard::shutdown`, `RpcSession::shutdown` and
+  `TlsStream::shutdown` arrived after it, so a 0.10.0 build can only be
+  calling the first:
   - `RpcServer::shutdown` → `RpcServer::stop_accepting`: raise the accept
     flag; connected sessions drain as their peers leave; nothing is joined.
     To end connected sessions too, `RpcServer::terminate`.
@@ -90,7 +101,8 @@ short form — and the first entry is the only one no compiler will catch.
   used to come back as `Ok(())` or `Err(DeadObject)` depending on whether the
   worker was parked in `recv` or inside a handler at the time.
 - **`rpc::transport::RpcTransport::shutdown` is a required method.** The
-  default did nothing and returned `Ok(())`, so a transport that inherited it
+  method itself arrived after 0.10.0, and the default it first carried did
+  nothing and returned `Ok(())`, so a transport that inherited it
   left every serve loop and incoming-connection thread parked in `recv` with
   nothing to wake them, and `RpcSession::close_session` hung on the join — the
   reason `TlsStream::shutdown_stream` was already required. Every in-tree backend
@@ -102,8 +114,9 @@ short form — and the first entry is the only one no compiler will catch.
   diagnostic; it is not `close`.
 - **`rpc::transport::MemTransport::shutdown` models a Linux socket.** Frames
   already queued on either side are still delivered, then the end of
-  stream, and sends on either side fail — where it used to drop what was
-  queued on its own side and leave the peer untouched. Linux is the
+  stream, and sends on either side fail — where the form this method first
+  took, after 0.10.0, dropped what was queued on its own side and left the
+  peer untouched. Linux is the
   deployment target and the platform where a caller that assumes a
   shutdown discards the queue is wrong; the hermetic backend now exercises
   that case instead of certifying the assumption. A test that relied on a
@@ -132,7 +145,8 @@ short form — and the first entry is the only one no compiler will catch.
   send-failure entry below). `FailedTransaction` keeps its other meanings (an
   oneway backlog flushed, an attach past the incoming-slot cap).
 - **Dropping a `ServerGuard` now ends the server, connected clients
-  included.** It used to flip the accept flag and join the workers, which
+  included.** `ServerGuard` arrived after 0.10.0; the form it first took
+  flipped the accept flag and joined the workers, which
   blocked for as long as any client stayed connected — a `?` or a panic that
   dropped the guard before the client hung there. `RpcServer::terminate` is
   new: it stops accepting, ends every session the server minted (their
@@ -161,6 +175,10 @@ short form — and the first entry is the only one no compiler will catch.
   qualified constant names a *direct* member of its owner: `Outer.X` no
   longer reaches `Outer.Inner.X`. A build that leaned on either shadowing
   fails with an unresolved-name diagnostic rather than changing value.
+- **`AidlError::Template` gained a `source` field** carrying the underlying
+  `tera::Error`, whose cause chain holds the detail its `Display` omits.
+  `AidlError` is not `#[non_exhaustive]`, so a `match` arm written as
+  `AidlError::Template { message }` needs `..` added.
 - **`out` arguments of `IBinder` / `ParcelFileDescriptor` / an interface are
   now `&mut Option<T>`** in generated traits (matching AOSP). The wire is
   unchanged; implementations need the parameter type updated. `inout` is
@@ -182,8 +200,8 @@ short form — and the first entry is the only one no compiler will catch.
 - **Low-level `Parcel` accessors are `pub(crate)`** (`as_ptr`, `as_mut_ptr`,
   `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
   `from_vec`), along with the RPC-ops plumbing and three `thread_state`
-  helpers. `Parcel::from_ipc_parts` and `Parcel::set_for_rpc` remain the
-  supported raw-buffer entry points.
+  helpers. `Parcel::from_ipc_parts` remains the supported raw-buffer entry
+  point; `Parcel::set_for_rpc` is now internal (see below).
 - **The RPC wire codec is private** (`WireMessage`, `WireCodec`, `R34Codec`,
   `Android13PlusCodec`, `WireReply`, `WireTransaction`, `RpcState`). The
   supported RPC surface is `RpcServer` / `RpcSession` / `RpcProxy`, the
@@ -205,8 +223,155 @@ short form — and the first entry is the only one no compiler will catch.
   cannot soundly describe. The view is read-only (`load` / `copy_to` / `slice`
   / `to_vec`); writes go through `write_at` on the concrete heap types, which
   also refuses a `FLAG_READ_ONLY` mapping.
+- **Nine module paths are gone; the crate root is the only way in.** Each of
+  them re-exported exactly what the root already did, so the fix is to drop
+  the module segment — every replacement below is the same type:
+
+  | Was | Now |
+  |---|---|
+  | `rsbinder::parcel::Parcel` | `rsbinder::Parcel` |
+  | `rsbinder::parcelable::{Serialize, Deserialize, Parcelable, …}` | `rsbinder::{Serialize, Deserialize, Parcelable, …}` |
+  | `rsbinder::parcelable_holder::ParcelableHolder` | `rsbinder::ParcelableHolder` |
+  | `rsbinder::proxy::{Proxy, ProxyHandle}` | `rsbinder::{Proxy, ProxyHandle}` |
+  | `rsbinder::native::{Binder, BinderFeatures, is_handling_transaction}` | `rsbinder::{Binder, BinderFeatures, is_handling_transaction}` |
+  | `rsbinder::error::{Result, StatusCode}` | `rsbinder::{Result, StatusCode}` |
+  | `rsbinder::status::{BinderResult, ExceptionCode, Status}` | `rsbinder::{BinderResult, ExceptionCode, Status}` |
+  | **`rsbinder::status::Result`** | **`rsbinder::BinderResult`** — see below |
+  | `rsbinder::binder_async::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` | `rsbinder::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` |
+  | `rsbinder::file_descriptor::ParcelFileDescriptor` | `rsbinder::ParcelFileDescriptor` |
+
+  `rsbinder::status::Result` is the one that was worth removing rather than
+  merely deduplicating: it is `Result<T, Status>`, while `rsbinder::Result`
+  is `Result<T, StatusCode>` — a different type with the same name, so
+  `use rsbinder::status::Result;` silently changed what `Result` meant in a
+  file. Use `BinderResult`, which is the same type under a name that does
+  not collide. A type's methods are unaffected by any of this; only the path
+  to name the type changes. Domain modules (`hub`, `rpc`, `thread_state`,
+  `shared_memory`, `entry`, `bridge`, and the rest) are untouched.
+- **`Parcel::is_for_rpc` is deprecated in favour of `Parcel::is_kernel_backed`,
+  with the polarity inverted.** `!p.is_kernel_backed()` is the literal
+  replacement. The old name described one consumer of the mode rather than
+  what the flag controls — whether the kernel driver's object table backs the
+  parcel — and it read fail-open at the one place it guards: "deny if this is
+  RPC" lets through a parcel that is neither kernel nor RPC, while "deny
+  unless the kernel backs this" does not. `Parcel::set_for_rpc` is now
+  internal; production code reaches the mode through the RPC session, and
+  `rsbinder::to_bytes` covers the data case.
+- **`rsbinder::get_interface` is now `rsbinder::get_interface_async`.** It is
+  the tokio one, and nothing in the old name said so while `hub::get_interface`
+  sat beside it, synchronous. Matches `connect_async`. It now looks up through
+  `hub::try_get_interface`, so on Android 10 it also drops the ~5s client-side
+  poll `hub::get_interface` did; if you need to wait, use
+  `hub::wait_for_interface`.
+- **`hub::get_service` / `get_interface` and the two `ServiceManager` methods
+  of the same names are removed** (deprecated since 0.10.0). The replacement
+  is **`try_get_service` / `try_get_interface`**, which issue the same wire
+  call `get_service` did (`getService`, or `getService2` on Android 16 and
+  17) and therefore behave identically on Android 11+ and
+  on Linux — including letting the service manager start an unregistered
+  lazy service, which `check_service` does *not* do. (Android 15 `r6`+ is the
+  exception: its `checkService` returns a union rsbinder does not parse, so
+  `check_service` is sent as `getService` there and starts a lazy service
+  too.) They differ only in returning the failure instead of flattening it:
+
+  | Was | Now |
+  |---|---|
+  | `hub::get_service(n)` | `hub::try_get_service(n).ok().flatten()` |
+  | `hub::get_interface::<T>(n)` | `hub::try_get_interface::<T>(n)?.ok_or(StatusCode::NameNotFound)` |
+
+  What you lose is the Android 10 client-side ~5s poll, which is the reason
+  these were deprecated: the wait was inconsistent across versions and
+  invisible in the name. If you want it, ask for it — `wait_for_service` /
+  `wait_for_interface` block until the service appears, on every version.
+- **A `ParcelableHolder` no longer moves freely between kernel and RPC
+  parcels.** Four behavior changes, none of which your build can see; all
+  four are under *Fixed* with the reasoning:
+  - A holder received over RPC (or decoded with `from_bytes`) forwarded into
+    a kernel binder transaction is `BadType` as soon as it carries a payload
+    — the refusal does not look at what is in it. Those bytes were never
+    checked against a kernel object table, and a kernel reader accepts a
+    null-pointer, null-cookie `flat_binder_object` without one.
+  - A holder received over kernel binder forwarded onto an RPC transaction,
+    or into `to_bytes`, is `BadType` when its payload carries an object
+    (`FdsNotAllowed` when every object in it is a file descriptor). The
+    object table used to be dropped and the bytes copied as payload.
+  - A holder read out of an RPC parcel now yields an RPC-mode sub-parcel, so
+    24 bytes that merely look like a `flat_binder_object` no longer decode as
+    a binder on the way back out — reading one that way is now `BadType`.
+  - A holder read out of an RPC *session*'s parcel passed to `to_bytes` is
+    `BadType`, whatever its payload holds. `get_parcelable::<T>` for the
+    payload's own type still resolves it into a value that encodes anywhere.
+- **An fd written to an RPC parcel with no negotiated fd mode now fails with
+  `FdsNotAllowed`, not `BadType`.** Observable to an RPC peer, and a fidelity
+  fix: AOSP's `Parcel::writeFileDescriptor` answers `FDS_NOT_ALLOWED` for
+  exactly this condition (`FileDescriptorTransportMode::NONE`;
+  android-15.0.0_r36 and android-16.0.0_r4 alike). The old code was faithful
+  to android-13.0.0_r84, which rejected every fd on an RPC parcel with a
+  blanket `if (isForRpc()) return BAD_TYPE;` — a shape from before
+  fd-over-RPC existed and one rsbinder no longer implements. A binder
+  written to a parcel with no session stays `BadType`; that condition has no
+  AOSP counterpart, and `InvalidOperation` is already spoken for by the
+  cross-stack refusal, where it matches AOSP.
+- **Test- and fuzz-only entry points need a feature.** The nine `__fuzz_*`
+  decoders now need `fuzzing`, and `RpcSession::__slot_count`,
+  `__incoming_thread_*`, `RpcServer::__set_attach_shutdown_probe` and
+  `Parcel::__set_for_rpc` need `test-util`. They are `#[doc(hidden)]`, which
+  hides an item from the documentation and from nothing else — so the nine
+  0.10.0 already shipped (its eight `__fuzz_*` decoders and
+  `__set_attach_shutdown_probe`) were in the ABI and in what
+  `cargo-semver-checks` compares. If you were calling one, enable the
+  feature; if you were not, those nine left your build. The rest are new
+  here.
+
+### Platform support
+
+- **The parcel wire is little-endian on every host.** It used to be whatever
+  the CPU was: nothing said so, nothing checked it, and a big-endian target
+  built clean and then produced parcels no other machine could read. RPC was
+  the worst of it — the framing was already explicit little-endian, so the
+  handshake succeeded and only the body was wrong.
+
+  **No little-endian build produces a different byte than before.**
+  `to_le_bytes` is the identity there, so the encoding is still the memory
+  layout; a big-endian host pays a swap and gains parcels its peers can read.
+  Verified by capturing the emitted bytes as goldens before the change and
+  running them unchanged afterwards, on x86_64 and on s390x under qemu-user.
+
+  Not everything moved: the `BC_*`/`BR_*` command stream and the UAPI structs
+  (`flat_binder_object`, `binder_transaction_data`) go to the kernel driver,
+  which parses them with native loads, and stay host-native. On a big-endian
+  host a kernel parcel carrying a binder is therefore a mixture — correctly,
+  since only the scalars cross to a peer.
+
+  Support tiers, stated honestly: the RPC path is supported and verified on
+  big-endian; the kernel-binder path is structurally correct but unverified,
+  because no big-endian system ships binderfs to test it on.
 
 ### Added
+
+- **rsbinder:** `to_bytes` / `from_bytes` — store a value the way an
+  interface already describes it. An AIDL definition is a schema and the
+  generated code is a complete serializer; these give it somewhere to write
+  other than a transaction, so a project need not maintain a second
+  description of the same data in protobuf or serde:
+
+  ```rust
+  std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+  let settings: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
+  ```
+
+  The bytes are the IPC bytes — same codec, same layout, and, for a value that
+  carries no object and no `ParcelableHolder` filled from a kernel parcel,
+  portable across architectures now that the wire is fixed
+  little-endian. Binders and file
+  descriptors are refused at the point they are written, before any `dup`,
+  since neither means anything outside the process that made it; and bytes
+  that merely look like a binder object are never turned into one on the way
+  back. Reading is strict: leftover bytes are an error, not a partial read.
+  Forward compatibility comes from the parcelable's length header, so wrap
+  what you store in a parcelable rather than storing a bare scalar. Behind
+  the `rpc` feature, which is where the parcel mode it uses lives. See the
+  book's *Storing Values*.
 
 - **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
   `Interface` (delegating to the binder it holds), and generated interfaces —
@@ -850,8 +1015,10 @@ short form — and the first entry is the only one no compiler will catch.
 - **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
   `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
   and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
-  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive) and
-  `Parcel::set_for_rpc` remain public.
+  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive)
+  remains public. `Parcel::set_for_rpc` is `pub(crate)` as well: production
+  code reaches the RPC mode through the session, and `rsbinder::to_bytes`
+  covers the data case.
 
 ### Removed
 
@@ -868,6 +1035,19 @@ short form — and the first entry is the only one no compiler will catch.
 
 ### Fixed
 
+- **rsbinder (kernel binder) — a service registered without an AIDL
+  interface could not be resolved at all.** Such a service answers
+  `INTERFACE_TRANSACTION` with a null string; `query_interface` read it as a
+  non-nullable `String` and returned `UnexpectedNull`, and because every
+  proxy construction goes through it, the whole lookup failed. On a stock
+  Android 34 image that is 23 of 280 services — `battery`, `cpuinfo`,
+  `dbinfo`, `DockObserver`, `app_binding` and the rest of the native
+  diagnostic services — unreachable from rsbinder while `service check`
+  finds them. AOSP folds the null to empty
+  (`String16 res(reply.readString16())` in
+  `BpBinder::getInterfaceDescriptor`, android-16.0.0_r4) and this now does
+  the same. The bug survived because the deprecated `hub::get_service`
+  flattened the error to `None`, so callers read it as "not registered".
 - **rsbinder (RPC, TLS) — a session's own shutdown read as a truncation on
   its own side.** With `UncleanEndOfStream` in place, the end of stream
   rsbinder's own `shutdown()` produced for its own reader — no
@@ -1515,6 +1695,34 @@ short form — and the first entry is the only one no compiler will catch.
 - **rsbinder (`rpc`):** `StatusCode::RpcError` no longer shares AOSP
   `FROZEN_OBJECT`'s `status_t` value, so an incoming frozen-object status is not
   mis-decoded.
+- **rsbinder (`rpc`):** a `ParcelableHolder`'s sub-parcel now inherits the
+  marshalling mode of the parcel it was cut from. A holder read out of an RPC
+  parcel became a kernel-mode sub-parcel, so 24 bytes that merely look like a
+  `flat_binder_object` — payload there, with no object-table entry — could be
+  decoded as a binder on the way back out.
+- **rsbinder (`rpc`):** `Parcel::append_from` refuses to copy RPC or data-only
+  bytes into a kernel-mode parcel (`BadType`). They were never checked against
+  a kernel object table, and a kernel reader accepts a null-pointer,
+  null-cookie `flat_binder_object` without one, so payload could come back out
+  as a binder. Copying the other way is newly refused too: a kernel range
+  carrying objects into an RPC or data-only parcel is `BadType`
+  (`FdsNotAllowed` when every object in the range is a file descriptor),
+  where the object table used to be dropped and the bytes copied as payload.
+  User-visible: forwarding a `ParcelableHolder` decoded with `from_bytes` or
+  received over RPC into a kernel binder transaction now returns `BadType`,
+  and forwarding one received over kernel binder whose payload carries a
+  binder or a file descriptor onto an RPC transaction, or into `to_bytes`,
+  now returns `BadType` / `FdsNotAllowed` where the object used to be
+  silently dropped.
+- **rsbinder (`rpc`):** `Parcel::append_from` refuses to copy the bytes of a
+  parcel bound to an RPC session into one that has no session (`BadType`). A
+  binder in an RPC parcel is flattened into the body as a session address,
+  and only the android-16 v2 wire records where — so neither parcel's object
+  table can tell such a range from data, and the copy landed the address in a
+  parcel that `to_bytes` then handed out as file bytes. User-visible:
+  `to_bytes` on a `ParcelableHolder` read out of an RPC transaction now
+  returns `BadType` instead of bytes; resolving it first with
+  `get_parcelable::<T>` gives a value that encodes as usual.
 
 ## [0.10.0] - 2026-07-11
 

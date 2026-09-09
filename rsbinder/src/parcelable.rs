@@ -100,7 +100,7 @@ macro_rules! impl_parcelable {
     {Serialize, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                parcel.write_aligned(self)
+                parcel.write_le(self)
             }
         }
     };
@@ -108,7 +108,7 @@ macro_rules! impl_parcelable {
     {Deserialize, $ty:ty} => {
         impl Deserialize for $ty {
             fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-                Ok(<$ty>::from_ne_bytes(parcel.try_into()?))
+                parcel.read_le::<$ty>()
             }
         }
     };
@@ -154,8 +154,11 @@ macro_rules! impl_parcelable_ex {
     {Serialize, $to_ty:ty, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+                // The widening happens first: the wire slot is the
+                // 4-byte `$to_ty`, so the byte order applies to that and
+                // not to the one or two bytes of `$ty`.
                 let val: $to_ty = *self as _;
-                parcel.write_aligned(&val)
+                parcel.write_le(&val)
             }
         }
     };
@@ -163,7 +166,7 @@ macro_rules! impl_parcelable_ex {
     {Deserialize, $to_ty:ty, $ty:ty} => {
         impl Deserialize for $ty {
             fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-                Ok(<$to_ty>::from_ne_bytes(parcel.try_into()?) as _)
+                Ok(parcel.read_le::<$to_ty>()? as _)
             }
         }
     };
@@ -276,7 +279,7 @@ impl DeserializeArray for u16 {
 
 impl Deserialize for bool {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        Ok(<i32>::from_ne_bytes(parcel.try_into()?) != 0)
+        Ok(parcel.read_le::<i32>()? != 0)
     }
 }
 
@@ -285,7 +288,7 @@ impl DeserializeArray for bool {}
 impl Serialize for bool {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = *self as _;
-        parcel.write_aligned(&val)
+        parcel.write_le(&val)
     }
 }
 
@@ -306,6 +309,18 @@ impl SerializeOption for str {
                 utf16.push(0);
 
                 parcel.write::<i32>(&(len as i32))?;
+
+                // The byte view below is a host-order view of the code
+                // units, and the wire wants them little-endian. Swapping
+                // the units first keeps that view the whole encoding on
+                // every host; `cfg!` is a compile-time constant, so a
+                // little-endian build does not contain this loop.
+                if cfg!(target_endian = "big") {
+                    for unit in utf16.iter_mut() {
+                        *unit = unit.swap_bytes();
+                    }
+                }
+
                 // SAFETY: We're creating a byte view of the UTF-16 encoded string.
                 // - utf16 is a valid Vec<u16> with proper alignment
                 // - The byte count is exactly utf16.len() * size_of::<u16>()
@@ -326,14 +341,14 @@ impl SerializeOption for str {
 
 impl Deserialize for StatusCode {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-        Ok(<i32>::from_ne_bytes(parcel.try_into()?).into())
+        Ok(parcel.read_le::<i32>()?.into())
     }
 }
 
 impl Serialize for StatusCode {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         let val: i32 = i32::from(*self);
-        parcel.write_aligned(&val)
+        parcel.write_le(&val)
     }
 }
 
@@ -432,7 +447,7 @@ impl DeserializeOption for String {
             // `chunks_exact` copy used by `read_array_char`.
             let u16_data: Vec<u16> = data[..len as usize * std::mem::size_of::<u16>()]
                 .chunks_exact(std::mem::size_of::<u16>())
-                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let res = String::from_utf16(&u16_data).map_err(|e| {
                 log::error!("Deserialize for Option<String16>: {e}");
@@ -482,9 +497,9 @@ impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         // RPC mode: marshal as `RpcAddress` via the attached session
         // hooks, not `flat_binder_object`. Kernel path below is
-        // byte-identical when `is_for_rpc == false`.
+        // byte-identical on a driver-backed parcel.
         #[cfg(feature = "rpc")]
-        if parcel.is_for_rpc() {
+        if !parcel.is_kernel_backed() {
             let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
             return ops.write_binder(this, parcel);
         }
@@ -548,9 +563,9 @@ impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         // RPC mode: unmarshal from `RpcAddress` via the attached
         // session hooks. The kernel `flat_binder_object`
-        // path below is byte-identical when `is_for_rpc == false`.
+        // path below is byte-identical on a driver-backed parcel.
         #[cfg(feature = "rpc")]
-        if parcel.is_for_rpc() {
+        if !parcel.is_kernel_backed() {
             let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
             return ops.read_binder(parcel);
         }

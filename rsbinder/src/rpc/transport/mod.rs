@@ -121,7 +121,8 @@ pub trait RpcTransport: Send + Sync {
     /// purpose: a transport that silently did nothing here would leave a
     /// serve loop or an incoming-connection thread parked in `recv`
     /// forever, and `RpcSession::close_session` would hang on the join. The
-    /// same reasoning already made [`TlsStream::shutdown_stream`] required.
+    /// same reasoning already made `TlsStream::shutdown_stream` required
+    /// (the `rpc-tls` backend).
     ///
     /// The contract is narrower than the name suggests, and every caller
     /// in rsbinder is written to it (plan 2-21 §3.4):
@@ -552,6 +553,7 @@ pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
 /// arbitrary bytes through the same deframing path
 /// `recv_frame` uses. `#[doc(hidden)]`: not part of the supported API
 /// surface (and absent entirely without the `rpc` feature).
+#[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_decode_frame(input: &[u8]) -> RpcResult<Vec<u8>> {
     read_frame(&mut std::io::Cursor::new(input))

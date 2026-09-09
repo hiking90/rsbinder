@@ -19,7 +19,7 @@ use rsbinder::*;
 
 use example_hello::permcheck::{IPermCheck, SERVICE_NAME};
 
-fn expect_ok_true(label: &str, r: rsbinder::status::Result<bool>) -> bool {
+fn expect_ok_true(label: &str, r: rsbinder::BinderResult<bool>) -> bool {
     match r {
         Ok(true) => {
             println!("STAGE3_4_2_PASS {label}=true");
@@ -36,7 +36,7 @@ fn expect_ok_true(label: &str, r: rsbinder::status::Result<bool>) -> bool {
     }
 }
 
-fn expect_security_denial(r: rsbinder::status::Result<bool>) -> bool {
+fn expect_security_denial(r: rsbinder::BinderResult<bool>) -> bool {
     match r {
         Err(status) if status.exception_code() == ExceptionCode::Security => {
             println!(

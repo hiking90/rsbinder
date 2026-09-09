@@ -71,6 +71,70 @@ macro_rules! impl_parcel_pod {
 }
 impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
 
+/// A scalar whose *wire* representation is little-endian.
+///
+/// The data-parcel wire is defined little-endian on every host, so an
+/// L1 scalar is encoded with `to_le_bytes` rather than copied out of
+/// memory. On a little-endian host that is the identity, so the emitted
+/// bytes and the generated code are unchanged; a big-endian host pays a
+/// swap and gains a parcel its peers can read.
+///
+/// This is the *wire* layer only. The kernel command stream
+/// ([`Parcel::write_native`]) and the UAPI structs ([`ParcelPod`]) stay
+/// host-native — the driver parses those with native loads.
+pub(crate) trait WireScalar: Copy {
+    /// `[u8; size_of::<Self>()]`, as a type: stable Rust cannot use an
+    /// associated const as an array length in a trait signature.
+    type Bytes: AsRef<[u8]>;
+
+    fn to_wire(self) -> Self::Bytes;
+    fn from_wire(bytes: &[u8]) -> Result<Self>;
+}
+
+/// A scalar of the *kernel command stream* — the `BC_*`/`BR_*` ioctl
+/// buffer, which the driver parses with native loads.
+///
+/// The mirror image of [`WireScalar`], and the reason both exist: the
+/// two layers use the same `Parcel` and the same 4-byte slots, so only
+/// the name at the call site says which contract is in force. A value
+/// crossing to the driver must not be byte-swapped; a value crossing to
+/// a peer must.
+pub(crate) trait NativeScalar: Copy {
+    type Bytes: AsRef<[u8]>;
+
+    fn to_native(self) -> Self::Bytes;
+    fn from_native(bytes: &[u8]) -> Result<Self>;
+}
+
+macro_rules! impl_scalar_codecs {
+    ($($t:ty),* $(,)?) => { $(
+        impl WireScalar for $t {
+            type Bytes = [u8; std::mem::size_of::<$t>()];
+
+            fn to_wire(self) -> Self::Bytes {
+                self.to_le_bytes()
+            }
+
+            fn from_wire(bytes: &[u8]) -> Result<Self> {
+                Ok(<$t>::from_le_bytes(bytes.try_into()?))
+            }
+        }
+
+        impl NativeScalar for $t {
+            type Bytes = [u8; std::mem::size_of::<$t>()];
+
+            fn to_native(self) -> Self::Bytes {
+                self.to_ne_bytes()
+            }
+
+            fn from_native(bytes: &[u8]) -> Result<Self> {
+                Ok(<$t>::from_ne_bytes(bytes.try_into()?))
+            }
+        }
+    )* };
+}
+impl_scalar_codecs!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
+
 // SAFETY: bindgen `#[repr(C)]` binder-ABI structs whose fields are
 // integers / pointers-as-integers / unions of those, laid out with no
 // padding (8-byte-multiple field groups); every bit pattern is a valid
@@ -290,7 +354,7 @@ pub(crate) type FnFreeBuffer =
 /// `rpc` module's session/state. When a `Parcel` is in RPC mode the
 /// `SIBinder` (de)serializers route through these hooks instead of the
 /// kernel `flat_binder_object` path — the kernel path is byte-identical
-/// when `is_for_rpc == false`.
+/// on a kernel-backed parcel.
 #[cfg(feature = "rpc")]
 pub(crate) trait RpcParcelOps: Send + Sync {
     /// Marshal a possibly-null binder leaving this process: append the
@@ -311,8 +375,8 @@ pub(crate) trait RpcParcelOps: Send + Sync {
 /// table in [`Parcel::objects`], a wholly separate field, so only the
 /// RPC arm has to be bundled.
 ///
-/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode
-/// (the former `is_for_rpc == true`), `None` ⇒ kernel path,
+/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode,
+/// `None` ⇒ kernel path ([`Parcel::is_kernel_backed`]),
 /// byte-identical to the kernel wire. Tying every RPC field's
 /// existence to the mode flag in the type makes "RPC mode ⇒ RPC state
 /// present" an invariant the compiler enforces, instead of seven
@@ -419,6 +483,24 @@ const MAX_NESTED_READ_DEPTH: usize = 1000;
 /// A `Parcel` is the fundamental data container for binder IPC, handling serialization
 /// and deserialization of primitive types, strings, objects, and file descriptors.
 /// It maintains proper alignment and object reference tracking required by the binder protocol.
+///
+/// # Byte order
+///
+/// The data a parcel carries is **little-endian on every host**, so its
+/// bytes mean the same thing on the machine that reads them as on the one
+/// that wrote them — see the crate docs' *Wire byte order*. What a parcel
+/// holds is not all wire, though: an object written into a kernel parcel
+/// is a `flat_binder_object`, a UAPI struct the driver parses with native
+/// loads, and it stays host-native. On a big-endian host a kernel parcel
+/// carrying a binder is therefore a mixture — little-endian scalars
+/// around a native object header — and correctly so, because only the
+/// scalars are going to a peer.
+///
+/// Bytes that leave the process as *data* do not contain that mixture for
+/// a value carrying no object: `rsbinder::to_bytes` encodes through a
+/// parcel that refuses binders and file descriptors outright, so what it
+/// hands back is pure wire. One shape still slips past those refusals —
+/// see `to_bytes`'s *Byte order*.
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
@@ -442,8 +524,8 @@ pub struct Parcel {
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
     /// RPC serialization state, or `None` for the kernel path
-    /// (byte-identical to the kernel wire). `Some` is the former
-    /// `is_for_rpc == true`. Only object marshalling and the
+    /// (byte-identical to the kernel wire, and what
+    /// [`Parcel::is_kernel_backed`] reports). Only object marshalling and the
     /// object/FD lifetime branch on this; scalar/string/POD paths are
     /// unaffected. See [`RpcFields`].
     #[cfg(feature = "rpc")]
@@ -530,6 +612,69 @@ impl Parcel {
         }
     }
 
+    /// A parcel that refuses binder objects and file descriptors, so the
+    /// bytes it produces carry no reference to anything in this process.
+    ///
+    /// It is the session-less RPC mode — the same mode the RPC transport
+    /// uses, without the session that would give a binder somewhere to
+    /// go. With no ops attached and `fd_mode` left at `None`, the RPC
+    /// write paths reject a binder and an fd on their own, and
+    /// `append_from` — the one path that copies another parcel's bytes
+    /// wholesale — carries its own write-time refusal for them. All of
+    /// them refuse before anything is written, which is why there is no
+    /// second check on the finished bytes to keep in step with them.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn new_data_only() -> Self {
+        let mut p = Parcel::new();
+        p.set_for_rpc(true);
+        p
+    }
+
+    /// A data-only parcel over a copy of `bytes`, positioned at the start.
+    ///
+    /// Data-only matters on the read side too: it makes `read_object` an
+    /// immediate `BadType`, so a forged `flat_binder_object` in the input
+    /// cannot become a binder.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
+        let mut p = Parcel::from_vec(bytes.to_vec());
+        p.set_for_rpc(true);
+        p
+    }
+
+    /// `true` when nothing in this parcel refers to something in this
+    /// process — no kernel object-table entry, no RPC object position, no
+    /// out-of-band fd. Only then do the bytes mean the same thing
+    /// anywhere else.
+    ///
+    /// All three have to be checked. The kernel object table is empty by
+    /// construction on an RPC parcel, so a check of that alone would hand
+    /// out the bytes of a parcel carrying binders — bytes that are
+    /// meaningless without the object table that travelled beside them.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn is_self_contained(&self) -> bool {
+        self.objects.len() == 0
+            && self.rpc_object_positions().is_empty()
+            && self.rpc_out_fds().is_empty()
+    }
+
+    /// The encoded bytes, or `Err(BadType)` if the parcel carries a
+    /// process-local reference ([`Parcel::is_self_contained`]). Cannot
+    /// fail on a parcel from [`Parcel::new_data_only`].
+    #[cfg(feature = "rpc")]
+    pub(crate) fn as_bytes(&self) -> Result<&[u8]> {
+        if !self.is_self_contained() {
+            return Err(StatusCode::BadType);
+        }
+        Ok(self.data.as_slice())
+    }
+
+    /// [`Parcel::as_bytes`], taking ownership.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn into_bytes(self) -> Result<Vec<u8>> {
+        self.as_bytes().map(<[u8]>::to_vec)
+    }
+
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_mut_ptr()
     }
@@ -556,7 +701,7 @@ impl Parcel {
     /// marshalling and the object/FD lifetime branch on this — scalar,
     /// string and POD bytes are identical in both modes.
     #[cfg(feature = "rpc")]
-    pub fn set_for_rpc(&mut self, yes: bool) {
+    pub(crate) fn set_for_rpc(&mut self, yes: bool) {
         if yes {
             // Idempotent: preserve any RpcFields already configured
             // (e.g. via a prior `attach_rpc_ops`).
@@ -566,22 +711,54 @@ impl Parcel {
         }
     }
 
-    /// `true` if this parcel serializes binders/FDs the RPC way
-    /// (`RpcAddress` instead of `flat_binder_object`; FD rejected).
-    #[cfg(feature = "rpc")]
-    pub fn is_for_rpc(&self) -> bool {
-        self.rpc.is_some()
+    /// Test-only door to [`Parcel::set_for_rpc`], for a test in another
+    /// crate that needs a session-less RPC-mode parcel. Production code
+    /// reaches this mode through `Parcel::configure_rpc`.
+    #[cfg(all(feature = "rpc", feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn __set_for_rpc(&mut self, yes: bool) {
+        self.set_for_rpc(yes)
     }
 
-    /// `false` always — without the `rpc` feature there is no RPC
-    /// serialization mode. This `cfg`-off arm exists so callers that
-    /// branch on transport (notably
-    /// [`crate::permission_controller::check_permission`], which denies
-    /// `@EnforcePermission` over RPC — Plan 2-16 Phase A) compile in any
-    /// feature configuration without a `cfg` of their own.
+    /// `true` if the kernel driver's object table backs this parcel —
+    /// binders travel as `flat_binder_object`, FDs as `BINDER_TYPE_FD`,
+    /// and a transaction on it carries a caller identity the kernel
+    /// vouched for.
+    ///
+    /// `false` exactly for an RPC-mode parcel, whose binders are
+    /// `RpcAddress` values marshalled through the attached session — or
+    /// refused outright where there is no session, as in the data-only
+    /// mode behind `to_bytes`.
+    /// Kernel marshalling is the default, so a parcel that has not
+    /// travelled yet — a freshly constructed [`Parcel::new`], say —
+    /// reports `true` as well: this answers *which marshalling the
+    /// parcel uses*, not whether a live transaction vouched for its
+    /// contents. A security branch needs the second question too, and
+    /// must ask it separately with [`crate::is_handling_transaction`] —
+    /// see [`crate::permission_controller::check_permission`].
+    #[cfg(feature = "rpc")]
+    pub fn is_kernel_backed(&self) -> bool {
+        self.rpc.is_none()
+    }
+
+    /// `true` always — without the `rpc` feature the kernel driver is
+    /// the only thing that can back a parcel. This `cfg`-off arm exists
+    /// so callers that branch on it compile in any feature
+    /// configuration without a `cfg` of their own.
     #[cfg(not(feature = "rpc"))]
+    pub fn is_kernel_backed(&self) -> bool {
+        true
+    }
+
+    /// `true` if this parcel serializes binders/FDs the RPC way.
+    #[deprecated(
+        since = "0.11.0",
+        note = "renamed and inverted: use `!parcel.is_kernel_backed()`. The old name \
+                described one consumer of the mode rather than what the flag controls, \
+                and read fail-open at the one security branch that uses it."
+    )]
     pub fn is_for_rpc(&self) -> bool {
-        false
+        !self.is_kernel_backed()
     }
 
     /// Attach the RPC object-marshalling hooks and enter RPC mode
@@ -627,7 +804,7 @@ impl Parcel {
 
     /// The sorted object-position table (AOSP `mObjectPositions`),
     /// consumed by the wire codec as a trailing `u32[]`. Always empty
-    /// on the kernel path (`!is_for_rpc`) and when no RPC object was
+    /// on a kernel-backed parcel and when no RPC object was
     /// flattened — i.e. byte-identical to a wire with no object table.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_positions(&self) -> &[u32] {
@@ -639,7 +816,7 @@ impl Parcel {
     /// Install the object table that arrived with an incoming RPC
     /// parcel (AOSP `rpcSetDataReference`'s `mObjectPositions` copy),
     /// so the binder/FD deserializers can validate object positions.
-    /// No-op kernel-side (`!is_for_rpc`).
+    /// No-op on a kernel-backed parcel.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -693,7 +870,7 @@ impl Parcel {
     /// `Parcel::flattenBinder`/`writeFileDescriptor`:
     /// `mObjectPositions.insert(upper_bound(...), dataPos)`).
     ///
-    /// **Hard-gated on `is_for_rpc`**: a stray call on a kernel parcel
+    /// **Refused on a kernel-backed parcel**: a stray call there
     /// is a no-op, so the kernel wire can never grow an object table.
     /// The producer only calls this from the RPC `write_binder` /
     /// FD-write paths, and the caller decides *whether* to record
@@ -710,7 +887,11 @@ impl Parcel {
 
     /// Set the negotiated FD-over-RPC mode for this parcel (default
     /// `None` ⇒ FD write is rejected, bit-identical).
-    #[cfg(feature = "rpc")]
+    ///
+    /// Production builds a parcel through `configure_rpc` instead,
+    /// which sets mode and position-recording together; the two setters
+    /// exist for a test or fuzz target that wants one without a session.
+    #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.fd_mode = mode;
@@ -727,7 +908,7 @@ impl Parcel {
     /// mode): record FD object positions only on the android-13+ v1+
     /// profile. R34 stays `false` ⇒ the FD-over-RPC wire is
     /// byte-unchanged.
-    #[cfg(feature = "rpc")]
+    #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
         if let Some(rpc) = self.rpc.as_mut() {
             rpc.record_fd_positions = yes;
@@ -746,7 +927,7 @@ impl Parcel {
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
         // Only ever reached from the RPC `Unix` fd-write path (guarded
-        // by `is_for_rpc()` upstream), so RPC mode is a hard
+        // by `is_kernel_backed()` upstream), so RPC mode is a hard
         // precondition — a stray kernel-parcel call is a programming
         // error, and returning a bogus index would be worse than a
         // clear panic.
@@ -1112,7 +1293,9 @@ impl Parcel {
         self.pos < end
     }
 
-    pub(crate) fn read_array<D: Deserialize + ParcelPod>(&mut self) -> Result<Option<Vec<D>>> {
+    pub(crate) fn read_array<D: Deserialize + ParcelPod + WireScalar>(
+        &mut self,
+    ) -> Result<Option<Vec<D>>> {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
@@ -1159,7 +1342,10 @@ impl Parcel {
         // - copy_nonoverlapping copies exactly `size` bytes
         // - setting length to `len` is valid as we just initialized those elements
         // - `D: ParcelPod` means every bit pattern the peer sent is a valid
-        //   `D`, so the copied bytes need no per-element validation
+        //   `D`, so the copied bytes need no per-element validation — and
+        //   for the same reason they may be permuted as `u8` and read back
+        //   as `D` (the byte-order fix-up below, over the `size` bytes just
+        //   written through this very pointer)
         let mut result = Vec::with_capacity(len as usize);
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1168,6 +1354,20 @@ impl Parcel {
                 size,
             );
             result.set_len(len as usize);
+
+            // The wire is little-endian, so on a little-endian host the
+            // bulk copy *is* the decode: both conditions below are
+            // compile-time constants (the width per monomorphization), so
+            // that build emits the memcpy alone. A big-endian host reverses
+            // each element in place — which also covers `f32`/`f64`, which
+            // have no `swap_bytes`. `size == len * size_of::<D>()` exactly
+            // (`checked_array_layout`), so no remainder.
+            if cfg!(target_endian = "big") && std::mem::size_of::<D>() > 1 {
+                let bytes = std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, size);
+                for chunk in bytes.chunks_exact_mut(std::mem::size_of::<D>()) {
+                    chunk.reverse();
+                }
+            }
         }
 
         self.set_data_position(pos + padded);
@@ -1215,7 +1415,7 @@ impl Parcel {
         // `chunks_exact` yields exactly `len` elements with no remainder.
         let result = self.data.as_slice()[pos..pos + size]
             .chunks_exact(std::mem::size_of::<i32>())
-            .map(|c| D::from(&i32::from_ne_bytes([c[0], c[1], c[2], c[3]])))
+            .map(|c| D::from(&i32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
 
         self.set_data_position(pos + padded);
@@ -1289,7 +1489,10 @@ impl Parcel {
         parcelable.serialize(self)
     }
 
-    pub(crate) fn write_array<S: Serialize + ParcelPod>(&mut self, parcelable: &[S]) -> Result<()> {
+    pub(crate) fn write_array<S: Serialize + ParcelPod + WireScalar>(
+        &mut self,
+        parcelable: &[S],
+    ) -> Result<()> {
         let len = parcelable.len();
         // The wire length word is an `i32`; a slice too large to fit is a
         // `BadValue`, not a silently truncated (possibly negative) count.
@@ -1344,6 +1547,20 @@ impl Parcel {
             }
         }
 
+        // The copy above put host words on a little-endian wire, so a
+        // big-endian host owes each element a byte reversal. Doing it in
+        // place keeps one code path and covers `f32`/`f64`, which have no
+        // `swap_bytes`. Both conditions are compile-time constants (the
+        // width per monomorphization), so a little-endian build emits the
+        // memcpy alone — this loop is not in it.
+        if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
+            for chunk in
+                self.data.as_mut_slice()[pos..pos + size].chunks_exact_mut(std::mem::size_of::<S>())
+            {
+                chunk.reverse();
+            }
+        }
+
         self.set_data_position(end);
 
         Ok(())
@@ -1390,6 +1607,41 @@ impl Parcel {
         } else {
             self.write(&-1i32)
         }
+    }
+
+    /// Writes an L1 wire scalar: little-endian on every host.
+    ///
+    /// Callers must pass the value *already widened* to its wire type
+    /// (`i8`/`u8`/`i16` → `i32`, `u16` → `u32`). Reversing the narrow
+    /// value would emit one or two bytes and desync everything after
+    /// it — the `parcel::wire_golden` widening test pins that.
+    pub(crate) fn write_le<T: WireScalar>(&mut self, val: &T) -> Result<()> {
+        self.write_aligned_data(val.to_wire().as_ref())
+    }
+
+    /// Reads an L1 wire scalar written by [`Parcel::write_le`].
+    pub(crate) fn read_le<T: WireScalar>(&mut self) -> Result<T> {
+        let data = self.read_aligned_data(std::mem::size_of::<T>())?;
+        T::from_wire(data)
+    }
+
+    /// Writes an L2 scalar: the *kernel command stream* (`BC_*` codes,
+    /// handles, cookies), which is an ioctl buffer the driver parses
+    /// with native loads — not wire. Host-native, deliberately.
+    ///
+    /// The command stream reaches this through
+    /// [`CommandStream`](crate::command_stream::CommandStream), whose
+    /// private field exposes no L1 method at all — the layer is enforced
+    /// by the type, not by a list of spellings.
+    pub(crate) fn write_native<T: NativeScalar>(&mut self, val: &T) -> Result<()> {
+        self.write_aligned_data(val.to_native().as_ref())
+    }
+
+    /// Reads an L2 scalar written by the kernel driver. See
+    /// [`Parcel::write_native`].
+    pub(crate) fn read_native<T: NativeScalar>(&mut self) -> Result<T> {
+        let data = self.read_aligned_data(std::mem::size_of::<T>())?;
+        T::from_native(data)
     }
 
     pub(crate) fn write_aligned<T: ParcelPod>(&mut self, val: &T) -> Result<()> {
@@ -1466,8 +1718,8 @@ impl Parcel {
         // marshalled as `RpcAddress` and FDs are rejected upstream.
         // Write the bytes verbatim but never load the kernel offset
         // table or take a kernel `acquire()` — RPC has its own
-        // refcount. The kernel path below is byte-identical when
-        // `is_for_rpc == false`.
+        // refcount. The kernel path below is byte-identical on a
+        // kernel-backed parcel.
         #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             self.write_aligned(obj)?;
@@ -1574,6 +1826,34 @@ impl Parcel {
             return Err(StatusCode::BadValue);
         }
 
+        // Refuse before the copy, mirror direction: `other`'s bytes were
+        // validated under `other`'s marshalling mode, and the table that made
+        // them safe is not copied with them. Into a kernel destination that is
+        // exploitable, because `read_object`'s null-meta shortcut waves a
+        // null-pointer, null-cookie `flat_binder_object` through with no
+        // offset-table entry — so 24 bytes of RPC or data-only payload become
+        // `BINDER_TYPE_HANDLE` handle 0, a live proxy to the context manager.
+        // The opposite direction needs no gate: `read_object` is an immediate
+        // `BadType` on an RPC-mode parcel, so nothing there can be laundered
+        // into an object.
+        #[cfg(feature = "rpc")]
+        if self.rpc.is_none() && other.rpc.is_some() {
+            log::error!("Parcel::append_from: refusing RPC/data-only bytes into a kernel parcel");
+            return Err(StatusCode::BadType);
+        }
+
+        // Refuse before the copy: a source with session hooks can carry an
+        // `RpcAddress` flattened into its *body*, and only the v2 wire profile
+        // records where, so no table can prove a range clean. A hook-less sink
+        // is the one whose bytes get exported (`Parcel::as_bytes`).
+        #[cfg(feature = "rpc")]
+        if other.rpc.as_ref().is_some_and(|r| r.ops.is_some())
+            && self.rpc.as_ref().is_none_or(|r| r.ops.is_none())
+        {
+            log::error!("Parcel::append_from: refusing session bytes into a session-less parcel");
+            return Err(StatusCode::BadType);
+        }
+
         let start_pos = self.pos;
         let mut first_idx: i32 = -1;
         let mut last_idx: i32 = -2;
@@ -1598,6 +1878,29 @@ impl Parcel {
         }
 
         let num_objects = last_idx - first_idx + 1;
+
+        // Refuse before the copy: an RPC-mode destination has no object table,
+        // so a `flat_binder_object` appended into it would survive as 24 bytes
+        // of payload carrying a process-local handle or fd number, with
+        // nothing left to mark it as an object. After the copy that is
+        // indistinguishable from data, which is why this is a write-time
+        // refusal and not a check on the finished bytes.
+        #[cfg(feature = "rpc")]
+        if self.rpc.is_some() && num_objects > 0 {
+            let src_data = other.data.as_slice();
+            let src_objects = other.objects.as_slice();
+            let only_fds = (first_idx..=last_idx).all(|i| {
+                matches!(
+                    read_flat_binder(src_data, src_objects[i as usize] as usize),
+                    Ok(flat) if flat.header_type() == BINDER_TYPE_FD
+                )
+            });
+            return Err(if only_fds {
+                StatusCode::FdsNotAllowed
+            } else {
+                StatusCode::BadType
+            });
+        }
 
         // See `write_aligned_data`: bound the end position to `i32::MAX` and
         // reject rather than overflow the reserve/copy arithmetic when the
@@ -1634,10 +1937,8 @@ impl Parcel {
         }
         self.set_data_position(end);
 
-        // An RPC-mode parcel carries no `flat_binder_object`s, so the
-        // offset recompute / re-acquire / FD-dup below is kernel-only.
-        // `self.objects` is already empty in RPC mode so this is also
-        // defence-in-depth.
+        // Kernel-only: in RPC mode `num_objects > 0` already returned above,
+        // so this arm is only reached with nothing to relocate.
         #[cfg(feature = "rpc")]
         let skip_objects = self.rpc.is_some();
         #[cfg(not(feature = "rpc"))]
@@ -1771,6 +2072,93 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
     }
 }
 
+/// Encodes one value to bytes, using the same codec the IPC paths use.
+///
+/// Anything that is `Serialize` works, but a type you intend to store
+/// should be a parcelable — `#[derive(rsbinder::Parcelable)]` or a type
+/// generated from `.aidl`. That is where the forward-compatibility comes
+/// from: a parcelable writes a length header, so a reader built against
+/// an older definition stops at the boundary the writer wrote and a
+/// field appended later is simply not read. `to_bytes(&42i32)` is four
+/// bytes with no such header and no way to evolve.
+///
+/// ```no_run
+/// # fn main() {}
+/// # #[cfg(feature = "macros")]
+/// # mod example {
+/// # #[derive(rsbinder::Parcelable, Default, Debug, Clone, PartialEq)]
+/// # struct Settings { volume: i32, name: String }
+/// # fn run() -> rsbinder::Result<()> {
+/// let settings = Settings { volume: 7, name: "quiet".into() };
+/// std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
+/// # Ok(())
+/// # }
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// A binder or a file descriptor cannot be encoded — neither means
+/// anything outside the process that produced it — so a value containing
+/// one is refused rather than turned into bytes that would be a lie:
+/// `FdsNotAllowed` for a file descriptor, matching what AOSP returns for
+/// a session that permits none, and `BadType` for a binder, which has no
+/// session here to be marshalled through. Beyond that, only what the
+/// value's own `Serialize` reports — plus `BadValue` for a value too
+/// large to address with an `i32` offset.
+///
+/// # Byte order
+///
+/// The wire is little-endian on every host, so for a value that carries
+/// no object these bytes are portable across architectures and identical
+/// to what an IPC peer would receive for the same value.
+///
+/// One shape escapes that. A *null* binder is 24 bytes of
+/// `flat_binder_object` whose type word is written host-native, and it
+/// gets no object-table entry — so the refusals above, which key on that
+/// table, do not see it. It can only reach here inside a
+/// [`crate::ParcelableHolder`] that copied its bytes in from a kernel
+/// parcel. Bytes carrying one are not portable across endianness, and the
+/// value they came from does not read back on any host: decoding the
+/// payload returns `BadType`, since the decoder has no session to marshal
+/// a binder through.
+#[cfg(feature = "rpc")]
+pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    let mut parcel = Parcel::new_data_only();
+    parcel.write(value)?;
+    parcel.into_bytes()
+}
+
+/// Decodes one value from bytes written by [`to_bytes`].
+///
+/// # Errors
+///
+/// - `NotEnoughData` — the input ends inside the value.
+/// - `BadValue` — the value decoded but bytes are left over. A partial
+///   read is not success here: it usually means the bytes were written
+///   as a different type, and returning the value anyway would hide
+///   that. Also returned for an input of `i32::MAX` bytes or more, which
+///   no parcel can address.
+/// - `BadType` — the input claims to contain a binder. Such bytes are
+///   never turned into an object; the decoder has no object table and
+///   refuses outright.
+/// - `FdsNotAllowed` — the input claims to contain a file descriptor.
+///   The decoder has no session and therefore no negotiated fd mode,
+///   which is the condition AOSP answers this way.
+#[cfg(feature = "rpc")]
+pub fn from_bytes<T: Deserialize>(bytes: &[u8]) -> Result<T> {
+    // Parcel offsets are `i32`; past that the read path asserts.
+    if bytes.len() >= i32::MAX as usize {
+        return Err(StatusCode::BadValue);
+    }
+    let mut parcel = Parcel::from_slice(bytes);
+    let value = parcel.read::<T>()?;
+    if parcel.data_avail() != 0 {
+        return Err(StatusCode::BadValue);
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
@@ -1872,15 +2260,22 @@ mod tests {
     }
 
     #[test]
-    fn checked_array_layout_64bit_no_op_for_i32_max() {
-        // The whole point: on a 64-bit `usize`, no realistic
-        // `(i32::MAX, size_of::<D>())` can overflow. Regression
-        // guard so the helper never starts gating valid 64-bit
-        // inputs (which would silently break every kernel/RPC array
-        // path).
-        let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
-        assert_eq!(size, (i32::MAX as usize) * 4);
-        assert_eq!(padded, super::pad_size(size));
+    fn checked_array_layout_passes_i32_max_on_64_bit_and_rejects_it_on_32() {
+        // The helper is 32-bit hardening only, so `(i32::MAX, 4)` is the input
+        // that separates the two targets: on 64-bit it must stay a no-op —
+        // gating a valid length there would silently break every kernel/RPC
+        // array path — and on 32-bit it is exactly the overflow to refuse.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
+            assert_eq!(size, (i32::MAX as usize) * 4);
+            assert_eq!(padded, super::pad_size(size));
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        assert_eq!(
+            super::checked_array_layout(i32::MAX, 4),
+            Err(StatusCode::BadValue)
+        );
     }
 
     #[test]
@@ -2362,7 +2757,7 @@ mod tests {
     /// (AOSP `dataPos = mDataPos` *before* `writeInt32(TYPE_*)`), the
     /// table stays **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
     /// dataPos)`) even when objects are recorded out of order, it is
-    /// hard-gated on `is_for_rpc` (kernel diff 0), and it
+    /// refused on a kernel-backed parcel (kernel diff 0), and it
     /// survives a v2 codec encode→decode with the AOSP `bodySize =
     /// fixed + parcelDataSize + 4·N` framing. Single / multiple /
     /// mixed (binder-shaped + FD-shaped) objects.
@@ -2375,7 +2770,7 @@ mod tests {
         // ---- kernel parcel: recording is a hard no-op ----
         let mut kparcel = Parcel::new();
         kparcel.write(&7i32).unwrap();
-        kparcel.rpc_record_object_position(0); // !is_for_rpc ⇒ ignored
+        kparcel.rpc_record_object_position(0); // kernel-backed ⇒ ignored
         assert!(
             kparcel.rpc_object_positions().is_empty(),
             "kernel parcel must never grow an object table"
@@ -2487,5 +2882,448 @@ mod tests {
             }
             o => panic!("expected Transact, got {o:?}"),
         }
+    }
+}
+
+/// Absolute little-endian byte goldens for the data-parcel wire.
+///
+/// Every assertion here is a **literal byte sequence**, never a round
+/// trip. A round trip re-reads with the same codec, so it passes on a
+/// big-endian host even when the bytes are wrong — which is exactly why
+/// the rest of the suite cannot see the wire layout at all (measured on
+/// qemu-user s390x: 36/36 green with a native-endian codec).
+///
+/// These goldens are therefore the *definition* of what a little-endian
+/// peer puts on the wire, and the `cross`/qemu s390x job runs them
+/// unchanged: a big-endian build that produces these bytes is
+/// cross-endian compatible by construction, no networking required.
+///
+/// Two things are deliberately absent. `flat_binder_object` and the
+/// kernel command stream are **not** wire — they are the kernel's own
+/// ABI and stay host-native; the one exception below pins that as a
+/// decision rather than an omission. Anything needing a live
+/// `ProcessState` (a non-null binder, a real fd) belongs in the
+/// kernel-host suite, not here — this module must stay hermetic so it
+/// can run under qemu.
+#[cfg(test)]
+mod wire_golden {
+    use super::*;
+
+    /// The bytes a fresh kernel-mode parcel holds after writing `value`.
+    fn enc<S: Serialize + ?Sized>(value: &S) -> Vec<u8> {
+        let mut parcel = Parcel::new();
+        parcel.write(value).unwrap();
+        parcel.data.as_slice().to_vec()
+    }
+
+    #[test]
+    fn scalar_wire_is_absolute_little_endian() {
+        assert_eq!(enc(&true), [0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&false), [0x00, 0x00, 0x00, 0x00]);
+
+        assert_eq!(enc(&0x0102_0304i32), [0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(enc(&0xDEAD_BEEFu32), [0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_eq!(
+            enc(&0x0102_0304_0506_0708i64),
+            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(
+            enc(&0xDEAD_BEEF_CAFE_BABEu64),
+            [0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE]
+        );
+        assert_eq!(
+            enc(&0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10u128),
+            [
+                0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+                0x02, 0x01
+            ]
+        );
+
+        // IEEE-754 bit patterns, byte-reversed: 1.0f32 = 0x3F80_0000.
+        assert_eq!(enc(&1.0f32), [0x00, 0x00, 0x80, 0x3F]);
+        assert_eq!(enc(&-2.0f32), [0x00, 0x00, 0x00, 0xC0]);
+        assert_eq!(
+            enc(&1.0f64),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
+        );
+    }
+
+    #[test]
+    fn scalar_widening_matches_the_aidl_wire() {
+        // A lone `i8`/`u8`/`i16` widens to `i32` and `u16` to `u32`
+        // *before* the byte order applies. Reversing the un-widened
+        // value would emit one or two bytes and desync everything
+        // after it, so this is the trap a naive codec swap falls into.
+        assert_eq!(enc(&-2i8), [0xFE, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(enc(&0xABu8), [0xAB, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&-2i16), [0xFE, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(enc(&0xBEEFu16), [0xEF, 0xBE, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn array_wire_is_absolute_little_endian() {
+        // Arrays invert the widening above: `i8`/`u8` are one byte per
+        // element, zero-padded to the 4-byte slot.
+        assert_eq!(
+            enc(&[0xABu8, 0xCD, 0xEF][..]),
+            [0x03, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x00]
+        );
+        assert_eq!(
+            enc(&[-2i8, 1][..]),
+            [0x02, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x00, 0x00]
+        );
+
+        // ...while `i16`/`u16` are four bytes per element.
+        assert_eq!(
+            enc(&[-2i16, 3][..]),
+            [0x02, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            enc(&[0xBEEFu16][..]),
+            [0x01, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            enc(&[0x0102_0304i32, -1][..]),
+            [0x02, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            enc(&[1i64][..]),
+            [0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            enc(&[1.0f64][..]),
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
+        );
+
+        // The length word is itself a wire `i32` — the byte range the
+        // pre-existing suite never asserted.
+        assert_eq!(enc(&[0i32; 0][..]), [0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&None::<Vec<i32>>), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn string16_wire_is_absolute_little_endian() {
+        // [i32 code-unit count][UTF-16 units][NUL unit][pad to 4].
+        assert_eq!(
+            enc("AB"),
+            [0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // U+D55C is the only case here whose two bytes differ, so it is
+        // the one that catches a native-endian `u16` view; an ASCII-only
+        // corpus cannot.
+        assert_eq!(enc("한"), [0x01, 0x00, 0x00, 0x00, 0x5C, 0xD5, 0x00, 0x00]);
+        assert_eq!(enc(""), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&None::<String>), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn stability_word_is_little_endian() {
+        // The category encoding itself is platform-dependent (android-12
+        // ships a different repr), so only the byte order is pinned —
+        // spelled out by shift so the expected order is readable. That is
+        // equal to `to_le_bytes` on every host and detects exactly as much.
+        let level = i32::from(crate::Stability::Vintf);
+        assert_eq!(
+            enc(&level),
+            [
+                (level & 0xFF) as u8,
+                ((level >> 8) & 0xFF) as u8,
+                ((level >> 16) & 0xFF) as u8,
+                ((level >> 24) & 0xFF) as u8,
+            ]
+        );
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(enc(&level), [0x3F, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn a_parcel_of_mixed_fields_keeps_every_slot_aligned() {
+        // Each field's padding decides where the next one starts, so a
+        // per-type golden alone cannot catch a slot that moved.
+        let mut parcel = Parcel::new();
+        parcel.write(&-2i8).unwrap();
+        parcel.write("한").unwrap();
+        parcel.write(&[0x0102_0304i32][..]).unwrap();
+
+        assert_eq!(
+            parcel.data.as_slice().to_vec(),
+            [
+                0xFE, 0xFF, 0xFF, 0xFF, // i8 -2, widened to i32
+                0x01, 0x00, 0x00, 0x00, // String16: 1 code unit
+                0x5C, 0xD5, 0x00, 0x00, //   U+D55C then the NUL unit
+                0x01, 0x00, 0x00, 0x00, // i32[]: 1 element
+                0x04, 0x03, 0x02, 0x01, //   element 0
+            ]
+        );
+    }
+
+    #[test]
+    fn the_command_stream_is_native_not_wire() {
+        // `BC_*` opcodes and handles go to the driver, which reads them
+        // with native loads. They share this `Parcel` and these 4-byte
+        // slots with the wire, so the accessor name is the only thing
+        // separating the two contracts — this is what it separates.
+        let cmd: u32 = crate::sys::binder::BC_ACQUIRE;
+
+        let mut native = Parcel::new();
+        native.write_native::<u32>(&cmd).unwrap();
+        assert_eq!(native.data.as_slice().to_vec(), cmd.to_ne_bytes());
+
+        let mut wire = Parcel::new();
+        wire.write_le::<u32>(&cmd).unwrap();
+        assert_eq!(wire.data.as_slice().to_vec(), cmd.to_le_bytes());
+
+        // The two agree on a little-endian host, which is precisely why
+        // a little-endian test run cannot tell the layers apart and this
+        // assertion has to reach a big-endian one to mean anything.
+        if cfg!(target_endian = "big") {
+            assert_ne!(native.data.as_slice(), wire.data.as_slice());
+        }
+
+        native.set_data_position(0);
+        assert_eq!(native.read_native::<u32>().unwrap(), cmd);
+    }
+
+    #[test]
+    fn null_binder_stays_a_native_island() {
+        // `flat_binder_object` is the kernel's UAPI struct, not wire: it
+        // is handed to the driver, which parses it with host-native
+        // loads. It must stay native even after the wire is fixed to
+        // little-endian, and this asserts that as a decision with a
+        // name — it goes red if someone "finishes the job" by swapping
+        // the object header too, which would break the kernel path on a
+        // big-endian host.
+        //
+        // The null object is the one that can be tested hermetically:
+        // `pointer() == 0` skips `acquire()`, so no `ProcessState`.
+        let mut parcel = Parcel::new();
+        SerializeOption::serialize_option(None::<&crate::SIBinder>, &mut parcel).unwrap();
+        let bytes = parcel.data.as_slice();
+
+        let obj_len = std::mem::size_of::<flat_binder_object>();
+        assert_eq!(
+            bytes[..4],
+            crate::sys::BINDER_TYPE_BINDER.to_ne_bytes()[..],
+            "object header is native, not little-endian"
+        );
+        assert!(
+            bytes[4..obj_len].iter().all(|&b| b == 0),
+            "a null binder carries no handle, cookie or flags"
+        );
+    }
+}
+
+/// `to_bytes` / `from_bytes`: the promise is that the bytes are
+/// self-contained, so every test here is about something that would
+/// break that.
+#[cfg(all(test, feature = "rpc"))]
+mod data_serde {
+    use super::*;
+
+    #[test]
+    fn a_value_survives_the_round_trip_and_encodes_the_same_way_twice() {
+        let value: Vec<i32> = vec![1, -2, 0x0102_0304];
+        let bytes = to_bytes(&value).unwrap();
+        assert_eq!(
+            bytes,
+            to_bytes(&value).unwrap(),
+            "encoding is deterministic"
+        );
+        assert_eq!(from_bytes::<Vec<i32>>(&bytes).unwrap(), value);
+
+        let text = String::from("한 quiet");
+        assert_eq!(
+            from_bytes::<String>(&to_bytes(&text).unwrap()).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn the_bytes_are_the_ipc_bytes() {
+        // The point of reusing the IPC codec rather than inventing a
+        // format: what gets stored is what a peer would have received.
+        let value = -2i64;
+        let mut kernel = Parcel::new();
+        kernel.write(&value).unwrap();
+        assert_eq!(to_bytes(&value).unwrap(), kernel.data.as_slice());
+    }
+
+    #[test]
+    fn trailing_bytes_are_an_error_rather_than_a_partial_read() {
+        let mut bytes = to_bytes(&7i32).unwrap();
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(from_bytes::<i32>(&bytes), Err(StatusCode::BadValue));
+    }
+
+    #[test]
+    fn a_truncated_input_is_not_enough_data() {
+        let bytes = to_bytes(&7i64).unwrap();
+        assert_eq!(
+            from_bytes::<i64>(&bytes[..4]),
+            Err(StatusCode::NotEnoughData)
+        );
+    }
+
+    #[test]
+    fn a_binder_field_is_refused_at_write_time() {
+        // Refused where the value is written, not audited afterwards:
+        // by the time bytes exist it is too late to tell a handle from a
+        // number. `ProcessState` is never initialized in this test
+        // process, and the kernel path would panic reaching for it —
+        // arriving at `BadType` instead is the whole point of the
+        // data-only mode.
+        let mut parcel = Parcel::new_data_only();
+        let binder: Option<&crate::SIBinder> = None;
+        assert_eq!(
+            crate::SerializeOption::serialize_option(binder, &mut parcel),
+            Err(StatusCode::BadType),
+            "even a null binder needs an object table it will not get"
+        );
+    }
+
+    #[test]
+    fn a_file_descriptor_field_is_refused_before_the_dup() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let pfd = crate::ParcelFileDescriptor::new(file);
+
+        let mut parcel = Parcel::new_data_only();
+        assert_eq!(parcel.write(&pfd), Err(StatusCode::FdsNotAllowed));
+        assert!(
+            pfd.as_raw_fd() >= 0,
+            "the caller's fd is untouched by the refusal"
+        );
+        // The "before the dup" half is not asserted: an open-descriptor count is
+        // process-global, and sibling tests in this binary open and dup
+        // `/dev/null` in parallel, so it reports another test's fd as this one's
+        // leak. It was also vacuous where `/proc` is absent.
+    }
+
+    #[test]
+    fn a_forged_object_in_the_input_never_becomes_a_binder() {
+        // Bytes that look like a `flat_binder_object` are just bytes:
+        // the decoder has no object table to resolve them against and
+        // says so, rather than fabricating a reference.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&crate::sys::BINDER_TYPE_BINDER.to_ne_bytes());
+        forged.extend_from_slice(&[0u8; 20]);
+        // RPC mode short-circuits `read_object` before it reads a byte, so
+        // only a kernel parcel reaches the decoder. What it rejects there is
+        // the missing offset-table entry rather than the header bytes — the
+        // companion assertion pins a *different* failure for an input too
+        // short to be an object, so `BadType` is not simply constant.
+        assert_eq!(
+            Parcel::from_vec(forged.clone()).read_object(true).err(),
+            Some(StatusCode::BadType),
+            "the object decoder refuses an object with no offset-table entry"
+        );
+        assert_eq!(
+            Parcel::from_vec(vec![0u8; 8]).read_object(true).err(),
+            Some(StatusCode::NotEnoughData),
+            "too few bytes to be an object fails before the table lookup"
+        );
+        // Data-only mode has no session to marshal a binder through, so the
+        // public decoder refuses regardless of what the bytes claim.
+        assert_eq!(
+            from_bytes::<crate::SIBinder>(&forged),
+            Err(StatusCode::BadType)
+        );
+    }
+
+    #[test]
+    fn a_parcel_holding_a_reference_refuses_to_hand_out_its_bytes() {
+        // `objects` is always empty in RPC mode, so a guard that only
+        // looked there would hand out the bytes of a parcel whose
+        // meaning lives in a table that is not in them.
+        let mut parcel = Parcel::new_data_only();
+        parcel.write(&1i32).unwrap();
+        assert!(parcel.as_bytes().is_ok());
+
+        parcel.rpc_record_object_position(0);
+        assert_eq!(
+            parcel.as_bytes().err(),
+            Some(StatusCode::BadType),
+            "an object position makes the bytes incomplete"
+        );
+    }
+
+    #[test]
+    fn an_appended_object_table_is_refused_before_the_bytes_are_copied() {
+        // Nothing is opened or acquired: the refusal reads the object header
+        // only, and neither source object owns a reference (null pointer /
+        // `take_ownership: false`), so the source's drop has nothing to do.
+        for (object, expected) in [
+            (
+                flat_binder_object::new_binder_with_flags(0),
+                StatusCode::BadType,
+            ),
+            (
+                flat_binder_object::new_with_fd(0, false),
+                StatusCode::FdsNotAllowed,
+            ),
+        ] {
+            let mut source = Parcel::new();
+            source.write_object(&object, true).unwrap();
+
+            let mut sink = Parcel::new_data_only();
+            assert_eq!(sink.append_all_from(&mut source), Err(expected));
+            assert!(
+                sink.as_bytes().unwrap().is_empty(),
+                "refused before the copy — no object bytes reached the sink"
+            );
+        }
+    }
+
+    #[test]
+    fn a_holder_cut_from_a_session_parcel_cannot_be_exported() {
+        // The RPC binder encoding lives in the *body* (`[1i32][address]`),
+        // not in an object table, and `append_from` copies neither table
+        // with it — so all three `is_self_contained` checks are empty on
+        // the sink and the peer's session address would reach the file.
+        // Which body bytes are an object is knowable only on the v2 wire,
+        // so the refusal keys on the session rather than on a table.
+        use crate::Parcelable;
+
+        struct SessionOps;
+        impl RpcParcelOps for SessionOps {
+            fn write_binder(&self, _b: Option<&crate::SIBinder>, _p: &mut Parcel) -> Result<()> {
+                Err(StatusCode::DeadObject)
+            }
+            fn read_binder(&self, _p: &mut Parcel) -> Result<Option<crate::SIBinder>> {
+                Err(StatusCode::DeadObject)
+            }
+        }
+
+        const ADDR: [u8; 8] = *b"\xde\xad\xbe\xef\xfe\xed\xfa\xce";
+
+        // A holder as it arrives inside an RPC transaction: stability,
+        // payload length, then a flattened binder in the payload.
+        let mut txn = Parcel::new();
+        txn.set_for_rpc(true);
+        txn.attach_rpc_ops(std::sync::Arc::new(SessionOps));
+        txn.write(&0i32).unwrap(); // STABILITY_LOCAL
+        txn.write(&12i32).unwrap(); // payload length
+        let obj_pos = txn.data_position();
+        txn.write(&1i32).unwrap(); // binder present
+        txn.write_aligned_data(&ADDR).unwrap();
+        txn.rpc_record_object_position(obj_pos);
+        txn.set_data_position(0);
+
+        let mut holder = crate::ParcelableHolder::new(crate::Stability::Local);
+        holder.read_from_parcel(&mut txn).unwrap();
+        assert!(
+            txn.rpc_object_positions().len() == 1,
+            "the source records the position; the sub-parcel does not get it"
+        );
+
+        let exported = to_bytes(&holder);
+        assert!(
+            !exported
+                .as_deref()
+                .is_ok_and(|b| b.windows(ADDR.len()).any(|w| w == ADDR)),
+            "the session address reached the exported bytes"
+        );
+        assert_eq!(exported.err(), Some(StatusCode::BadType));
     }
 }

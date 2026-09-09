@@ -54,17 +54,17 @@ impl Interface for SmokeAsyncSvc {}
 
 #[async_trait]
 impl IRpcSmokeAsyncService for SmokeAsyncSvc {
-    async fn r#echo(&self, s: &str) -> rsbinder::status::Result<String> {
+    async fn r#echo(&self, s: &str) -> rsbinder::BinderResult<String> {
         // A real `.await` point on the server side: proves the
         // `rt.block_on` adapter drives a genuinely async handler over
         // the blocking RPC serve loop.
         tokio::task::yield_now().await;
         Ok(s.to_string())
     }
-    async fn r#add(&self, a: i32, b: i32) -> rsbinder::status::Result<i32> {
+    async fn r#add(&self, a: i32, b: i32) -> rsbinder::BinderResult<i32> {
         Ok(a + b)
     }
-    async fn r#ping(&self) -> rsbinder::status::Result<()> {
+    async fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
 }

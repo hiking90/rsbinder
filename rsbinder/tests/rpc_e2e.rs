@@ -384,25 +384,31 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
     h.join().unwrap();
 }
 
-/// An FD written into an RPC-mode parcel is a hard
-/// `BadType` reject (android-12 r34 fidelity), never a silent
-/// corruption or partial write.
+/// An FD written into an RPC-mode parcel with no negotiated fd mode is a
+/// hard `FdsNotAllowed` reject, never a silent corruption or partial
+/// write. That is AOSP's answer for the same condition
+/// (`Parcel::writeFileDescriptor`, `FileDescriptorTransportMode::NONE`,
+/// android-15.0.0_r36 / android-16.0.0_r4).
 #[test]
 fn rpc_mode_parcel_rejects_file_descriptor() {
     use rsbinder::ParcelFileDescriptor;
     use std::fs::File;
 
     let mut p = Parcel::new();
-    p.set_for_rpc(true);
+    p.__set_for_rpc(true);
     let pfd = ParcelFileDescriptor::new(File::open("/dev/null").expect("/dev/null"));
     let err = p
         .write(&pfd)
         .expect_err("FD in RPC parcel must be rejected");
-    assert_eq!(err, StatusCode::BadType, "android-12 r34 BAD_TYPE fidelity");
+    assert_eq!(
+        err,
+        StatusCode::FdsNotAllowed,
+        "AOSP FDS_NOT_ALLOWED for a session that negotiated no fd mode"
+    );
 
     // Kernel-mode parcel still accepts an FD (no regression).
     let mut k = Parcel::new();
-    assert!(!k.is_for_rpc());
+    assert!(k.is_kernel_backed());
     let pfd2 = ParcelFileDescriptor::new(File::open("/dev/null").expect("/dev/null"));
     k.write(&pfd2).expect("kernel-mode FD write still works");
 }
