@@ -1848,7 +1848,7 @@ impl Parcel {
         // is the one whose bytes get exported (`Parcel::as_bytes`).
         #[cfg(feature = "rpc")]
         if other.rpc.as_ref().is_some_and(|r| r.ops.is_some())
-            && !self.rpc.as_ref().is_some_and(|r| r.ops.is_some())
+            && self.rpc.as_ref().is_none_or(|r| r.ops.is_none())
         {
             log::error!("Parcel::append_from: refusing session bytes into a session-less parcel");
             return Err(StatusCode::BadType);
