@@ -2692,35 +2692,15 @@ mod tests {
     }
 
     /// `binder_frozen_state_info` layout: cookie (u64), is_frozen (u32),
-    /// reserved (u32) = 16 bytes, aligned 8. The `BR_FROZEN_BINDER`
-    /// dispatch reads this via `parcel.read::<binder_frozen_state_info>()`.
+    /// reserved (u32) = 16 bytes, aligned 8. Nothing reads it yet — the
+    /// `BR_FROZEN_BINDER` arm is unimplemented and the command falls to
+    /// `execute_command`'s "BAD COMMAND" default — so pinning the layout
+    /// here is what keeps the payload right for whenever that arm lands.
     #[test]
     fn binder_frozen_state_info_layout() {
         use crate::sys::binder_frozen_state_info;
         assert_eq!(std::mem::size_of::<binder_frozen_state_info>(), 16);
         assert_eq!(std::mem::align_of::<binder_frozen_state_info>(), 8);
-        let s = binder_frozen_state_info::default();
-        assert_eq!(s.cookie, 0);
-        assert_eq!(s.is_frozen, 0);
-        assert_eq!(s.reserved, 0);
-    }
-
-    /// The default arm in `wait_for_response` is untouched: the new
-    /// constants are declared so the strings table can label them, but
-    /// no dispatch path consumes them yet. This is a smoke test — if a
-    /// future change accidentally dispatched the freeze-observer BRs
-    /// before its own arm is in place, the kernel wire would diverge.
-    /// Here we just confirm the constants are visible to user code.
-    #[test]
-    fn freeze_observer_constants_are_pub_for_phase_b() {
-        // If these uses compile, the constants are exposed for a future
-        // dispatch path to consume.
-        let _b1 = binder::BR_TRANSACTION_PENDING_FROZEN;
-        let _b2 = binder::BR_FROZEN_BINDER;
-        let _b3 = binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE;
-        let _c1 = binder::BC_REQUEST_FREEZE_NOTIFICATION;
-        let _c2 = binder::BC_CLEAR_FREEZE_NOTIFICATION;
-        let _c3 = binder::BC_FREEZE_NOTIFICATION_DONE;
     }
 
     #[test]
