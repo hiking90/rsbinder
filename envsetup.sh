@@ -228,7 +228,12 @@ function run_coverage() {
     rustup override unset
 }
 
-declare -a publish_dirs=("rsbinder-aidl" "rsbinder" "rsbinder-tools")
+# Publish order is the dependency order, and every step must already be on
+# crates.io before the next one can resolve it. `rsbinder-macros` sits between
+# the two it bridges: it depends on `rsbinder-aidl`, and `rsbinder` declares it
+# (optionally, behind the `macros` feature) with a version requirement, which a
+# published manifest carries whether the dependency is optional or not.
+declare -a publish_dirs=("rsbinder-aidl" "rsbinder-macros" "rsbinder" "rsbinder-tools")
 
 function publish() {
     local cargo_options=()

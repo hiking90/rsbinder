@@ -13,7 +13,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-09-09
+## [0.11.0] - 2026-09-10
 
 ### Migrating from 0.10.0
 
