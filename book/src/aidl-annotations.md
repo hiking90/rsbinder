@@ -1,8 +1,8 @@
 # AIDL Annotations
 
-AIDL annotations modify how the code generator produces Rust code from `.aidl` files. They control everything from trait derivation and backing types to nullability and interface stability. This chapter covers the annotations relevant to the Rust backend in rsbinder, with examples showing how each annotation affects the generated code.
+Annotations modify what the code generator emits from an `.aidl` file — trait derivation, backing types, nullability, interface stability. Some that AOSP enforces are recognized here but not checked; each section below says which.
 
-If you are new to AIDL data types, read the [AIDL Data Types](./aidl-data-types.md) chapter first. Annotations build on those type mappings by adding metadata that changes how types are generated, serialized, or constrained.
+If you have not read [AIDL Data Types](./aidl-data-types.md) yet, start there: annotations adjust those mappings rather than replacing them.
 
 ## @RustDerive
 
@@ -157,12 +157,12 @@ pub struct RecursiveList {
 
 The `Box` indirection is necessary because without it, `RecursiveList` would contain itself directly, making the type infinitely large.
 
-In rsbinder, the `Box<T>` wrapping is driven by **self-reference detection in
-the code generator**, not by the `heap=true` parameter — the parameter is
-accepted for AOSP-faithful AIDL syntax compatibility but does not itself
-control the wrapping. Whenever a parcelable field references the enclosing
-parcelable's own type, the generator emits `Box<...>` around it to give the
-struct a known size. Keep the `heap=true` form when writing AIDL that must
+In rsbinder the `Box<T>` comes from the generator's own **cycle analysis**, not
+from `heap=true`, which is accepted for AOSP syntax compatibility and then
+ignored. A field is boxed whenever it can reach its own enclosing type by
+value — a cycle of any length, not just a direct self-reference — and is left
+alone when the path runs through an interface handle or a `Vec` element, which
+already keep the type finite. Keep writing `heap=true` if the same AIDL must
 also compile under the AOSP toolchain.
 
 For non-recursive optional fields, plain `@nullable` is sufficient and avoids the extra heap allocation.
@@ -312,14 +312,12 @@ exist so every method can declare its permission posture).
 
 ## Summary
 
-The following table provides a quick reference for all annotations covered in this chapter.
-
 | Annotation | Applies To | Rust Effect |
 |------------|------------|-------------|
 | `@RustDerive` | parcelable, union | Adds `derive` attributes (`Clone`, `Copy`, `PartialEq`) |
 | `@Backing` | enum | Sets the backing integer type (`i8`, `i32`, `i64`) |
 | `@nullable` | field, param, return | Maps to `Option<T>` |
-| `@nullable(heap=true)` | field | AOSP-faithful syntax for recursive fields; rsbinder boxes self-referential fields automatically (parameter accepted but not required) |
+| `@nullable(heap=true)` | field | `heap=true` is ignored; rsbinder boxes a field its own cycle analysis finds recursive |
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
 | `@VintfStability` | parcelable, interface | Stamps `Stability::Vintf`; structural constraints not enforced |

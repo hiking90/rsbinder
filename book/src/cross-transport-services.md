@@ -105,7 +105,7 @@ rsbinder::serve("tls://0.0.0.0:9000")?
     .add("hello", BnHello::new_binder(MyService))?
     .run()?;
 
-let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |o| {
+let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |o, _endpoint| {
     o.tls = Some(client_tls_config);
 })?
 .get("hello")?;

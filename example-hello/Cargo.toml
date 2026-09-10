@@ -131,6 +131,15 @@ name = "shm_service"
 [[bin]]
 name = "shm_client"
 
+# Data serialization: AIDL parcelables stored in a file with
+# `rsbinder::to_bytes` instead of sent in a transaction. Talks to nothing —
+# no binder device, no socket. `rpc` carries the session-less parcel mode
+# `to_bytes` encodes in.
+#   cargo run -p example-hello --features rpc --bin serde_demo
+[[bin]]
+name = "serde_demo"
+required-features = ["rpc"]
+
 # STAGE3 gate for the Android 15 service-manager split: drives the whole
 # `hub` surface against a real AOSP `servicemanager` and checks that every
 # method `android-15.0.0_r6` renumbered still lands where it should. Needs

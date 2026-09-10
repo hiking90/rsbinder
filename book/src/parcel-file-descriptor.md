@@ -114,26 +114,19 @@ descriptor is duplicated so that each `Vec` owns its own set of file handles.
 
 ## Helper Functions
 
-The test suite defines two small helpers that are useful in application code as
-well.
+Two small helpers cover most of what application code needs.
 
 ### build_pipe
 
-Creates a Unix pipe and returns both ends as `std::fs::File` values:
+Creates a Unix pipe and returns both ends as `std::fs::File` values. `pipe()`
+hands back `OwnedFd`s and `File` converts from one, so no `unsafe` is involved:
 
 ```rust
 use std::fs::File;
-use std::os::unix::io::FromRawFd;
-use rustix::fd::IntoRawFd;
 
 fn build_pipe() -> (File, File) {
-    let fds = rustix::pipe::pipe().expect("error creating pipe");
-    unsafe {
-        (
-            File::from_raw_fd(fds.0.into_raw_fd()),
-            File::from_raw_fd(fds.1.into_raw_fd()),
-        )
-    }
+    let (reader, writer) = rustix::pipe::pipe().expect("error creating pipe");
+    (File::from(reader), File::from(writer))
 }
 ```
 
@@ -169,31 +162,16 @@ wire version. Service and client code using `ParcelFileDescriptor` is
 otherwise unchanged. See
 [RPC Transport](./rpc-transport.md#capabilities) for details.
 
-## Tips and Best Practices
+## Tips
 
-- **Descriptors are duplicated during IPC.** When a `ParcelFileDescriptor` is
-  serialized into a `Parcel`, the kernel duplicates the file descriptor for the
-  receiving process. The sender and receiver each hold independent handles.
+- **Each side owns its own descriptor.** Serializing a `ParcelFileDescriptor`
+  makes the kernel duplicate the fd for the receiver, so the two handles are
+  independent and close order does not matter.
 
-- **Close order does not matter.** Because each side owns an independent
-  duplicate, closing the sender's copy does not affect the receiver, and vice
-  versa.
+- **`ParcelFileDescriptor` is not `Clone`** — it wraps an `OwnedFd`, which owns
+  the descriptor. Use `try_clone()`, and use it before storing or re-returning
+  a descriptor you received.
 
-- **Use `file_from_pfd` for reading and writing.** `ParcelFileDescriptor` does
-  not implement `std::io::Read` or `std::io::Write` directly. Convert it to a
-  `File` (via `try_clone().into()`) to use those traits.
-
-- **Always duplicate before storing.** If your service needs to keep a
-  reference to a received descriptor, clone it with `try_clone()`. Returning
-  or forwarding the original reference without duplication can lead to
-  use-after-close errors.
-
-- **`ParcelFileDescriptor` is not `Clone`.** Because it wraps an `OwnedFd`,
-  which owns the underlying file descriptor, the type cannot derive `Clone`.
-  Use the built-in `try_clone()` (a `fcntl(F_DUPFD_CLOEXEC)` duplication,
-  added in 0.10.0) for explicit duplication, and the `From<OwnedFd>` /
-  `From<std::fs::File>` impls for construction.
-
-- **Error handling.** `try_clone()` can fail if the process has exhausted its
-  file descriptor limit. Propagate the error with `?` (a `StatusCode`
-  converts into `Status` automatically) rather than calling `unwrap()`.
+- **`try_clone()` can fail** when the process is out of file descriptors.
+  Propagate it with `?` rather than `unwrap()`; a `StatusCode` converts into
+  `Status` automatically.

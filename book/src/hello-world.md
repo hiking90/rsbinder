@@ -18,14 +18,13 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.10"
+rsbinder = "0.11"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.10"
+rsbinder-aidl = "0.11"
 ```
-Add rsbinder and async-trait to [dependencies], and add rsbinder-aidl to [build-dependencies].
 
 ## Create an AIDL File
 Create an aidl folder in the project's top directory to manage AIDL files:
@@ -33,8 +32,6 @@ Create an aidl folder in the project's top directory to manage AIDL files:
 $ mkdir -p aidl/hello
 $ touch aidl/hello/IHello.aidl
 ```
-The reason for creating an additional **hello** folder is to create a namespace for the **hello** package.
-
 > **Directory ↔ package mapping.** The folder name under `aidl/` **must
 > match** the `package` declaration at the top of the `.aidl` file. So
 > `aidl/hello/IHello.aidl` requires `package hello;` (below), and the
@@ -69,8 +66,6 @@ fn main() {
         .unwrap();
 }
 ```
-This uses **rsbinder-aidl** to specify the AIDL source file (`IHello.aidl`) and the generated Rust file name (`hello.rs`), and then generates the code during the build process.
-
 > **Important**: The `build.rs` file must be placed in the project root directory, **not** inside `src/`. If placed in the wrong location, you will get a compile error: `environment variable OUT_DIR not defined at compile time`. Cargo only recognizes `build.rs` at the project root.
 
 ## Create a common library for Client and Service
@@ -98,7 +93,7 @@ pub use crate::hello::IHello::*;
 ## Create a service
 Create the `src/bin/` directory and add the service file. Cargo automatically recognizes `.rs` files under `src/bin/` as binary targets, so no `[[bin]]` section is needed in `Cargo.toml`.
 
-Let's configure the src/bin/hello_service.rs file as follows.
+Create `src/bin/hello_service.rs`:
 ```rust
 use env_logger::Env;
 use rsbinder::*;
@@ -228,11 +223,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 ## Run Hello Service and Client
 
-Before running the service and client, make sure you have the service manager running:
+Before running the service and client, start the service manager. It refuses
+to start without an access-control policy, so a local try-out passes
+`--insecure-allow-all` — see [Access control](./service-manager.md#access-control)
+for the real thing:
 
 ```bash
 # In terminal 1: Start the service manager
-$ rsb_hub
+$ rsb_hub --insecure-allow-all
 ```
 
 Now you can run the service and client:
@@ -264,101 +262,39 @@ MyServiceCallback: my.hello
 Result: Hello World!
 ```
 
-The client demonstrates several advanced features:
-- **Service Discovery**: Lists all available services
-- **Service Callbacks**: Registers for service availability notifications
-- **Death Recipients**: Monitors service lifecycle for cleanup
-- **Type-safe Proxies**: Uses strongly-typed interface for service calls
+Along the way the client also listed the registered services, registered for
+availability notifications, and linked a death recipient.
 
 ### Troubleshooting
 
-If you encounter issues:
-
-1. **"ProcessState is not initialized!"** - `rsbinder::serve("binder://")` / `rsbinder::connect("binder://…")` (or the low-level `ProcessState::init_default()`) must run before any other rsbinder API that touches the binder device
-2. **"environment variable OUT_DIR not defined"** - `build.rs` must be placed in the project root directory (next to `Cargo.toml`), not inside `src/`
-3. **Client blocks without output** - `rsbinder::connect("binder://…")` waits until the service is registered; ensure the service is running
-4. **Permission errors** - Check that binder device has correct permissions (0666)
-5. **Service manager not found** - Verify `rsb_hub` is running
-6. **Build errors** - Ensure all dependencies are correctly specified in Cargo.toml
+1. **"ProcessState is not initialized!"** — `rsbinder::serve("binder://")` / `rsbinder::connect("binder://…")` (or the low-level `ProcessState::init_default()`) must run before any other rsbinder API that touches the binder device.
+2. **"environment variable OUT_DIR not defined"** — `build.rs` must be in the project root, next to `Cargo.toml`, not inside `src/`.
+3. **Client blocks without output** — `rsbinder::connect("binder://…")` waits until the service is registered; make sure the service is running.
+4. **Permission errors** — the binder device node defaults to `0600`, root only. Give it a group with `rsb_device binder --group <group> --mode 0660` and make sure you are in that group.
+5. **Service manager not found** — check that `rsb_hub` is running, and that it did not exit at startup for want of a policy.
 
 ## Next Steps
 
-Congratulations! You've successfully created your first Binder service and client. Here are some next steps to explore:
-
-### Caller Identity and Access Control
-
-Inside a service method, you can identify the calling process using `CallingContext`:
-
-```rust
-use rsbinder::thread_state::CallingContext;
-
-fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
-    let caller = CallingContext::default();
-    let caller_uid = caller.uid;
-    let caller_pid = caller.pid;
-    let caller_sid = caller.sid;  // Optional SELinux context
-
-    // Enforce your own access control policy
-    if caller_uid != expected_uid {
-        return Err(rsbinder::Status::from(rsbinder::StatusCode::PermissionDenied));
-    }
-
-    Ok(echo.to_owned())
-}
-```
-
-This is especially useful since **rsbinder** does not enforce any access control policy by itself — it is up to each service to validate callers.
-
-### Error Handling
-
-Services can return service-specific errors to clients using `Status::new_service_specific_error`:
-
-```rust
-fn echo(&self, echo: &str) -> rsbinder::BinderResult<String> {
-    if echo.is_empty() {
-        return Err(rsbinder::Status::new_service_specific_error(-1, None));
-    }
-    Ok(echo.to_owned())
-}
-```
-
-On the client side, these errors can be inspected through the `Status` type to distinguish between transport errors and application-level errors.
-
-### AIDL Annotations
-
-Generated types from AIDL do not derive `Clone` by default, because some AIDL types contain non-cloneable fields such as `ParcelFileDescriptor` (which wraps `OwnedFd`) or `ParcelableHolder` (which contains a `Mutex`).
-
-You can opt-in to `Clone` (and other traits) for specific types using the `@RustDerive` annotation in your AIDL file:
-
-```aidl
-@RustDerive(Clone=true, PartialEq=true)
-parcelable MyData {
-    int id;
-    String name;
-}
-```
-
-`@RustDerive` is supported for **parcelable** and **union** types. This follows the same convention as [Android's AIDL Rust backend](https://source.android.com/docs/core/architecture/aidl/aidl-annotations). The annotation will only compile successfully if all fields in the type actually implement the requested traits.
-
-### Explore More Features
-- **[AIDL Data Types](./aidl-data-types.md)**: Learn how AIDL types map to Rust, including primitives, arrays, strings, and nullable types
-- **[Parcelable](./aidl-parcelable.md)**: Define custom data structures that can be sent across Binder IPC
-- **[Enum and Union](./aidl-enum-union.md)**: Use enum and union types in your AIDL interfaces
-- **[Annotations](./aidl-annotations.md)**: Control code generation with `@RustDerive`, `@Backing`, `@nullable`, and more
-- **[Service Patterns](./service-patterns.md)**: Advanced service patterns including `dump()`, default implementations, and multi-service processes
-- **[Async Service](./async-service.md)**: Use async/await with tokio runtime for non-blocking services
-- **[Callbacks and Interfaces](./callbacks-and-interfaces.md)**: Implement bidirectional communication and death recipients
-- **[ParcelFileDescriptor](./parcel-file-descriptor.md)**: Pass file descriptors across process boundaries
-- **[Error Handling](./error-handling.md)**: Service-specific errors, status codes, and exception handling
-- **[Service Manager (HUB)](./service-manager.md)**: Registration, lookup, notifications, and debug info
-- **API Reference**: See the full API documentation at [docs.rs/rsbinder](https://docs.rs/rsbinder)
+- **[AIDL Data Types](./aidl-data-types.md)** — how AIDL types map to Rust: primitives, arrays, strings, nullable types
+- **[Parcelable](./aidl-parcelable.md)** — custom data structures that cross the Binder boundary
+- **[Enum and Union](./aidl-enum-union.md)** — enum and union types in your interfaces
+- **[Annotations](./aidl-annotations.md)** — `@RustDerive`, `@Backing`, `@nullable`, and the rest
+- **[Interface Macros](./interface-macros.md)** — the same interface as a Rust trait, with no `.aidl` file
+- **[Service Patterns](./service-patterns.md)** — `dump()`, default implementations, multi-service processes
+- **[Async Service](./async-service.md)** — async/await on the tokio runtime
+- **[Callbacks and Interfaces](./callbacks-and-interfaces.md)** — bidirectional communication and death recipients
+- **[ParcelFileDescriptor](./parcel-file-descriptor.md)** — passing file descriptors across processes
+- **[Error Handling](./error-handling.md)** — service-specific errors, status codes, exceptions
+- **[Security & Authorization](./security.md)** — identifying the caller and deciding what it may do
+- **[Service Manager (HUB)](./service-manager.md)** — registration, lookup, notifications, debug info
+- **[docs.rs/rsbinder](https://docs.rs/rsbinder)** — the full API reference
 
 ### Run the Test Suite
 The **rsbinder** project includes a comprehensive test suite ported from Android:
 
 ```bash
 # Terminal 1: Start service manager
-$ cargo run --bin rsb_hub
+$ cargo run --bin rsb_hub -- --insecure-allow-all
 
 # Terminal 2: Start test service
 $ cargo run --bin test_service

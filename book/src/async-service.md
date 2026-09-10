@@ -2,9 +2,7 @@
 
 rsbinder supports async/await with the [Tokio](https://tokio.rs/) runtime, making it
 straightforward to build non-blocking Binder services. The `tokio` feature is enabled by
-default in rsbinder, so no extra feature flags are required for most projects. This chapter
-explains how to implement async Binder services, how they differ from their synchronous
-counterparts, and the patterns you will encounter when working with them.
+default in rsbinder, so no extra feature flags are required for most projects.
 
 If you have not yet read the [Hello, World!](./hello-world.md) chapter, it is recommended to
 do so first -- the async concepts here build on the synchronous service and client covered
@@ -354,19 +352,19 @@ runtime.block_on(async {
     let service = BnTestService::new_async_binder(
         TestService::default(), rt(),
     );
-    hub::add_service(service_name, service.as_binder())
+    hub::add_service(service_name, &service)
         .expect("Could not register service");
 
     let versioned_service = BnFooInterface::new_async_binder(
         FooInterface, rt(),
     );
-    hub::add_service(versioned_service_name, versioned_service.as_binder())
+    hub::add_service(versioned_service_name, &versioned_service)
         .expect("Could not register service");
 
     let nested_service = INestedService::BnNestedService::new_async_binder(
         NestedService, rt(),
     );
-    hub::add_service(nested_service_name, nested_service.as_binder())
+    hub::add_service(nested_service_name, &nested_service)
         .expect("Could not register service");
 
     // All services are now registered. Yield to the runtime.
@@ -463,35 +461,20 @@ macro_rules! impl_repeat {
 }
 ```
 
-## Tips and Best Practices
+## Tips
 
-- **Use `#[async_trait]`** from the `async-trait` crate for all async trait implementations.
-  This is required because Rust does not yet have native async trait support in all contexts
-  that rsbinder needs.
-
-- **`into_async::<Tokio>()`** converts a synchronous proxy into an async proxy. Always use
-  this when calling another Binder service from an async context, rather than making blocking
-  calls that could stall the Tokio runtime.
-
-- **`std::future::pending().await`** is the idiomatic way to keep an async service process
-  alive. Unlike the sync approach where `ProcessState::join_thread_pool()` blocks the main
-  thread, the async approach yields to Tokio so the runtime can drive spawned tasks.
-
-- **The `rt()` helper should capture the current runtime handle.** Define it as a function
-  that returns `TokioRuntime(tokio::runtime::Handle::current())` and call it from within the
-  Tokio runtime context.
-
-- **Both sync and async services can coexist in the same process.** You can register some
-  services with `new_binder` and others with `new_async_binder`. They share the same Binder
+- **The runtime flavor is decided by the transport, not by taste.** Kernel
+  binder can use `new_current_thread()`, because the binder thread pool already
+  supplies the worker threads. An **RPC** server must use
+  `new_multi_thread()` — its serve worker calls `rt.block_on(handler)` from a
+  thread outside the runtime, which a `current_thread` runtime cannot serve.
+- **Never block inside an async method.** A CPU-bound or blocking call belongs
+  in `tokio::task::spawn_blocking`, and a call to another binder service
+  belongs behind `into_async::<Tokio>()` — a blocking proxy call from an async
+  method stalls the executor thread.
+- **Sync and async services coexist in one process.** Register some with
+  `new_binder` and others with `new_async_binder`; they share the same binder
   thread pool.
-
-- **Prefer `new_current_thread()`** for the Tokio runtime builder. The Binder thread pool
-  handles multi-threaded transaction dispatching already, so a multi-threaded Tokio runtime
-  is typically unnecessary.
-
-- **Avoid blocking the Tokio runtime.** If your async service method must perform a
-  CPU-intensive or blocking operation, use `tokio::task::spawn_blocking` to move that work
-  off the async executor thread.
 
 ## Summary
 

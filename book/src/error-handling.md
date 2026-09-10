@@ -244,26 +244,21 @@ These conversions are used most often in the `Err(...)` return position of
 service methods, where `.into()` converts a `StatusCode` into the expected
 `Status` type automatically.
 
-## Tips and Best Practices
+## Tips
 
-- **Prefer service-specific errors for application logic.** Use
-  `Status::new_service_specific_error` when the error is meaningful to the
-  caller (e.g., "item not found", "quota exceeded"). Define your error codes
-  as constants so both the service and client can reference them.
+- **Split the two kinds of failure.** `Status::new_service_specific_error` is
+  for what the caller's own logic cares about — "item not found", "quota
+  exceeded" — with the codes declared as constants both sides share. A raw
+  `StatusCode` like `PermissionDenied` or `BadValue` is for the IPC mechanism
+  failing.
 
-- **Use `StatusCode` for infrastructure problems.** Return raw `StatusCode`
-  values like `PermissionDenied` or `BadValue` for errors that relate to the
-  IPC mechanism rather than your application's business logic.
+- **Check `exception_code()` before anything else.** `service_specific_error()`
+  and `transaction_error()` are only meaningful for their own exception code;
+  called on any other, they return zero rather than an error.
 
-- **Always check `exception_code()` first.** The meaning of
-  `service_specific_error()` and `transaction_error()` depends on the
-  exception code. Calling them without checking the exception may return
-  default (zero) values.
+- **Expect `DeadObject` in a long-running client.** A service can restart.
+  `link_to_death` tells you when, so you can reconnect instead of failing
+  every subsequent call.
 
-- **Handle `DeadObject` gracefully.** In long-running clients, the remote
-  service may restart. Consider using death notifications
-  (`link_to_death`) to detect service restarts and re-establish connections.
-
-- **`Status` implements `Display` and `std::error::Error`.** You can use it
-  with `?` in functions that return `Box<dyn std::error::Error>` or with
-  logging macros for human-readable diagnostics.
+- **`Status` implements `Display` and `std::error::Error`,** so it works with
+  `?` in a function returning `Box<dyn Error>` and prints usefully in a log.

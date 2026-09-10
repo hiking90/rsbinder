@@ -19,6 +19,10 @@
 //!   feature) — a separate stack from the kernel binder path
 //! - **Entry API**: [`serve`] / [`connect`] — publish and look up services
 //!   with one URI-selected transport (kernel binder or RPC)
+//! - **Shared memory**: [`shared_memory`] — payloads too big to copy through
+//!   a transaction (AOSP `IMemory` wire)
+//! - **Interface macros**: `#[rsbinder::interface]` (behind the `macros`
+//!   feature) — an interface as a Rust trait instead of an `.aidl` file
 //!
 //! # Wire byte order
 //!
@@ -97,6 +101,11 @@
 //!   Linux and Android targets only).
 //! - `rpc-tls` — TLS backend over rustls (implies `rpc`). rsbinder never
 //!   invents crypto; the caller supplies the `rustls` configuration.
+//! - `macros` — `#[rsbinder::interface]`, `#[derive(Parcelable)]` and
+//!   `#[derive(BinderEnum)]`: declare an interface as a Rust trait, with no
+//!   `.aidl` file and no `build.rs`. The emitted code is byte-for-byte what
+//!   `.aidl` produces. Off by default: it pulls the AIDL compiler in as a
+//!   proc-macro dependency.
 //! - `android_10` … `android_16`, plus the `android_*_plus` ranges (e.g.
 //!   `android_11_plus`) — select which Android service-manager protocol
 //!   versions to support. Android 10 uses the legacy C service-manager

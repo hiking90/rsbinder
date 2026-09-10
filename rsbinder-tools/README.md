@@ -60,7 +60,7 @@ For detailed technical information, refer to the [Linux kernel binderfs document
 
 ## rsb_hub
 
-A comprehensive service manager for Linux that replaces Android's service_manager functionality.
+The service manager for Linux — the counterpart of Android's `servicemanager`.
 
 ### Usage
 ```bash
@@ -102,17 +102,14 @@ on the same device exits 1 and says so; give it its own device
 (`rsb_device other && rsb_hub --device other`) to run an independent one.
 
 ### Features
-**rsb_hub** provides a full-featured service management system with:
 
-- **Service Registration**: Allows services to register themselves with unique names
-- **Service Discovery**: Enables clients to find and connect to registered services
-- **Lifecycle Management**: Monitors service health and handles cleanup
-- **Access Control**: Per-name `add` / `find` / `list` policy keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
+- **Service Registration / Discovery**: services register under a unique name; clients look them up by it
+- **Lifecycle Management**: dead services are reaped, and death notifications delivered
+- **Access Control**: per-name `add` / `find` / `list` policy keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
 - **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests
 - **On-Demand Start**: a lookup that misses a declared service starts it, via systemd or a configured command
-- **Priority Support**: Implements priority-based service access control
-- **Notification System**: Provides callbacks for service availability changes
-- **Debug Information**: Offers service introspection and debugging capabilities
+- **Notification System**: callbacks for service availability changes
+- **Dump Priorities**: `listServices` filters by the AOSP `DUMP_FLAG_PRIORITY_*` flags — a listing filter, not an access-control mechanism
 
 ### API Compatibility
 **rsb_hub** implements the same interface as Android's service manager, ensuring compatibility with existing binder applications. It supports:
@@ -124,15 +121,12 @@ on the same device exits 1 and says so; give it its own device
 - `registerForNotifications()`: Register for service lifecycle notifications
 
 ### Implementation Details
-Built on top of **rsbinder**'s service management APIs, **rsb_hub** provides:
-- Thread-safe service registration and lookup
-- Automatic cleanup of dead services
-- Support for service priorities and access control
-- Access control keyed on the credentials the kernel vouches for (uid), with
-  groups resolved through NSS -- portable to any Linux, and to macOS for the
-  RPC transport, without requiring SELinux
 
-The hub acts as a central registry that bridges the gap between service providers and consumers, making Binder IPC on Linux as seamless as on Android.
+Access control is keyed on the credential the kernel vouches for — the caller
+uid the binder driver fills in itself — with groups resolved through NSS. That
+is what makes the policy portable to any Linux without requiring SELinux.
+Deliberately unused: **pid**, because pid reuse makes every pid-derived
+attribute unsound as an authorization key.
 
 ## rsb_service
 

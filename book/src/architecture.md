@@ -122,3 +122,28 @@ canonical example):
   [Cross-Transport Services § Bridging](./cross-transport-services.md).
 
 See [RPC Transport](./rpc-transport.md) for the full story.
+
+## Parcel byte order
+
+**The data-parcel wire is little-endian on every host**, so a parcel written on
+one machine reads on another and the bytes match what Android's `libbinder`
+sends for the same value. On a little-endian host — every Android target and
+almost every Linux one — this costs nothing; a big-endian host pays a byte
+swap.
+
+Not every byte in a parcel is wire:
+
+| Layer | What | Byte order |
+|---|---|---|
+| Data parcel | scalars, arrays, `String`, the object-free payload | **little-endian** |
+| Kernel command stream | the `BC_*` / `BR_*` ioctl buffer | host-native |
+| UAPI structs | `flat_binder_object`, `binder_transaction_data` | host-native |
+
+The lower two go to the kernel driver, which parses them with native loads. So
+on a big-endian host a *kernel* parcel carrying a binder is a mixture —
+little-endian scalars around a native object header — which is correct: the
+scalars cross to a peer, the object header does not.
+
+The RPC path is verified on big-endian under qemu-user (s390x). The kernel path
+is structurally correct there but unverified, because no big-endian system
+ships binderfs to run it on.

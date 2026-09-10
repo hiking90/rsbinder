@@ -1,93 +1,40 @@
 # Getting Started
 
-Welcome to **rsbinder**! This guide will help you get started with Binder IPC development using Rust.
+## Pick a stack
 
-## Learning Path
+**rsbinder** ships two, and which one you can use depends on the platform:
 
-If you are new to Binder IPC, we recommend following this learning path:
+- **Kernel binder** — Linux 5.0+ with binderfs enabled, or Android. Talks to
+  the kernel driver through `/dev/binderfs/binder` (Linux) or `/dev/binder`
+  (Android). This is what most of this guide covers.
+- **RPC transport** (binder-over-socket, opt-in via the `rpc` feature) — pure
+  user-space, no kernel driver, no root. Runs on Linux, Android, and
+  **macOS**, over Unix-domain sockets, vsock, or TLS. See
+  [RPC Transport](./rpc-transport.md).
 
-1. **[Overview](./overview.md)** and **[Architecture](./architecture.md)** - Start here to understand Binder IPC fundamentals
-   - Learn about the core concepts and components
-   - Understand the relationship between services and clients
-   - See how AIDL generates Rust code
+macOS has no binder driver, so only the RPC stack works there — enough to
+develop and test RPC services on a workstation without a Linux VM. Windows is
+not supported on either stack.
 
-2. **[Installation](./installation.md)** - Set up your development environment
-   - Install required dependencies
-   - Set up binder devices and service manager
-   - Configure your Rust project
+## Before you start
 
-3. **[Hello World](./hello-world.md)** - Build your first Binder service
-   - Create a simple echo service
-   - Learn AIDL basics
-   - Understand service registration and client communication
+- [ ] Rust 1.85 or later
+- [ ] For kernel binder: a kernel with binder support, or an Android
+      device/emulator
+- [ ] For kernel binder on Linux: a device node created with `rsb_device`, and
+      `rsb_hub` running as the service manager
 
-4. **AIDL Guide** - Dive deeper into AIDL language features:
-   - **[Data Types](./aidl-data-types.md)** - How AIDL types map to Rust types
-   - **[Parcelable](./aidl-parcelable.md)** - Custom data structures for IPC
-   - **[Enum and Union](./aidl-enum-union.md)** - Enum and union type support
-   - **[Annotations](./aidl-annotations.md)** - Code generation annotations
+[Installation](./installation.md) walks through all of these.
 
-5. **Service Development** - Build production-quality services:
-   - **[Service Patterns](./service-patterns.md)** - Advanced service patterns and best practices
-   - **[Async Service](./async-service.md)** - Non-blocking services with tokio
-   - **[Callbacks and Interfaces](./callbacks-and-interfaces.md)** - Bidirectional communication
-   - **[ParcelFileDescriptor](./parcel-file-descriptor.md)** - File descriptor passing
-   - **[Error Handling](./error-handling.md)** - Error types and handling strategies
-   - **[Service Manager (HUB)](./service-manager.md)** - Service registration and discovery
+## The workflow
 
-6. **[RPC Transport](./rpc-transport.md)** - Binder-over-socket:
-   - The opt-in second stack that runs on Linux, Android, and macOS
-   - Unix-domain sockets, vsock, or TLS instead of `/dev/binder`
-   - Same generated AIDL stubs as the kernel-binder path
+1. Define the interface — an `.aidl` file, or a Rust trait with
+   [`#[rsbinder::interface]`](./interface-macros.md).
+2. Generate the Rust from it (`rsbinder-aidl` in a `build.rs`; the macro needs
+   no build step).
+3. Implement the service.
+4. Register it and connect to it — `rsbinder::serve(uri)` and
+   `rsbinder::connect(uri)`.
 
-7. **Platform-specific Setup** - Choose your target platform:
-   - **[Linux Setup](./enable-binder-for-linux.md)** - For Linux development
-   - **[Android Development](./android.md)** - For Android integration
-
-## Platform Requirements
-
-**rsbinder** ships two parallel stacks — pick by platform and use case:
-
-- **Kernel binder** (the default in this guide): Linux 5.0+ with
-  binderfs enabled (the `binderfs` filesystem landed in 5.0), or
-  Android. Talks to the kernel binder driver through
-  `/dev/binderfs/binder` (Linux) or `/dev/binder` (Android).
-- **RPC transport** (binder-over-socket, opt-in via the `rpc`
-  feature): pure user-space, no kernel binder driver. Runs on
-  **Linux, Android, and macOS** over Unix-domain sockets, vsock, or
-  TLS. See the [RPC Transport](./rpc-transport.md) chapter.
-
-> **Windows**: not supported on either stack.
->
-> **macOS**: kernel binder is not supported (no kernel driver), but
-> the RPC transport works natively — useful for developing and
-> testing RPC services on a macOS workstation without a Linux VM.
-
-## Quick Start Checklist
-
-Before diving into development, ensure you have:
-
-- [ ] Rust 1.85+ installed
-- [ ] Linux kernel with binder support enabled (or an Android device/emulator)
-- [ ] Created binder device using `rsb_device` (Linux only)
-- [ ] Service manager (`rsb_hub`) running (Linux only)
-- [ ] Basic understanding of AIDL syntax (covered in the [Hello World](./hello-world.md) tutorial)
-
-## Key Concepts to Understand
-
-- **Services**: Server-side implementations that provide functionality
-- **Clients**: Applications that consume services through proxies
-- **AIDL**: Interface definition language for describing service contracts
-- **Service Manager**: Central registry for service discovery
-- **Parcels**: Serialization format for data exchange
-- **Binder Objects**: References that enable cross-process communication
-
-## Common Development Workflow
-
-1. Define your service interface in an `.aidl` file
-2. Use `rsbinder-aidl` to generate Rust code
-3. Implement your service logic
-4. Register the service with the service manager
-5. Create clients that discover and use your service
-
-Ready to start? Head to the [Overview](./overview.md) section to learn the fundamentals!
+[Hello, World!](./hello-world.md) does all four end to end, and is the fastest
+way to see where each piece fits.

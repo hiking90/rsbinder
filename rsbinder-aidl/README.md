@@ -5,10 +5,10 @@ This is an AIDL compiler for **rsbinder**.
 Add dependencies to Cargo.toml (check crates.io for the latest version):
 ```toml
 [dependencies]
-rsbinder = "0.10"
+rsbinder = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.10", features = ["async"] }
+rsbinder-aidl = { version = "0.11", features = ["async"] }
 ```
 
 Create a build.rs file:
@@ -40,6 +40,10 @@ rsbinder::include_aidl!("my_service", crate::IMyService::*);
   equivalent). All directories are scanned deterministically; an import
   found under more than one directory is an error, matching AOSP.
 - `.output(name)` — the generated file name, written under `OUT_DIR`.
+- `.dest_dir(path)` — the directory `.output(name)` is resolved against,
+  overriding `OUT_DIR`. Use it outside a `build.rs` — a test generating into
+  a temporary directory, a tool driving several builders — where mutating the
+  process-wide `OUT_DIR` would not be thread-safe.
 - `.version(n)` / `.hash("…")` — stamp the **most recently added file
   source** with stable-AIDL version metadata (AOSP `aidl --version N
   --hash <s>` equivalent); the generated interfaces gain
@@ -51,10 +55,10 @@ rsbinder::include_aidl!("my_service", crate::IMyService::*);
 For environments without async runtime:
 ```toml
 [dependencies]
-rsbinder = { version = "0.10", default-features = false }
+rsbinder = { version = "0.11", default-features = false }
 
 [build-dependencies]
-rsbinder-aidl = "0.10"
+rsbinder-aidl = "0.11"
 ```
 
 ## Error Reporting

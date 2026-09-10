@@ -66,6 +66,17 @@ pub mod shm {
     pub const DEALER_SIZE: usize = 1024 * 1024;
 }
 
+/// Data-serialization example (`bin/serde_demo`): AIDL parcelables written to
+/// a file with [`rsbinder::to_bytes`] instead of into a transaction. Carries
+/// two versions of one record so the example can show what a reader built
+/// against the other version sees.
+#[cfg(feature = "rpc")]
+pub mod settings {
+    rsbinder::include_aidl!("settings", self::settings::*);
+    /// File `serde_demo` writes and reads back.
+    pub const STORE_PATH: &str = "/tmp/rsb_settings.bin";
+}
+
 /// Argument shapes the AOSP fixture corpus never uses (`out` scalars with no
 /// `Default`, `@nullable` primitive arrays, non-nullable `inout` binder
 /// arrays). The `.aidl` is shared with the tests crate;

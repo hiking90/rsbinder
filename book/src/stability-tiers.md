@@ -30,7 +30,8 @@ binder and is not expected to break.
   which are Provisional (below). See [Service Manager](service-manager.md).)
 - **AIDL compiler entry points** — `rsbinder_aidl::Builder::{new, source,
   output, version, generate}`.
-- **rsb_device** binary CLI (binderfs setup).
+- **rsb_device** binary CLI (binderfs setup); `--group` / `--mode` and the
+  `0600` default node are new in 0.11.0.
 
 ## Provisional
 
@@ -56,8 +57,39 @@ tweaks; wire formats are already locked.
 - **IAccessor client / server** (plans 2-13 D.8 + 2-14 D.9 STAGE3
   passed against real `libbinder`).
 - **`rsb_hub`** — `addService` descriptor auto-detect, `getService2`,
-  `checkService2`, `Service::Accessor` routing. Linux-native bringup.
+  `checkService2`, `Service::Accessor` routing. Linux-native bringup. New in
+  0.11.0: per-name access control, service declarations, on-demand start,
+  `dump`, supervisor integration, and the `rsb_service` CLI — the
+  configuration file format is settling with them.
 - **macOS first-class support** (plan 2-9 Phase A+B).
+- **Entry API (new in 0.11.0)** — `serve`, `connect`, `connect_async`,
+  `Client`, `Server`, `ServerGuard`, `ServeOptions`, `ClientOptions`,
+  `Endpoint`. Replaced the `rsbinder::service` facade. The URI grammar and the
+  two option structs are what may still change.
+- **Interface macros (new in 0.11.0, `macros` feature)** —
+  `#[rsbinder::interface]`, `#[derive(Parcelable)]`, `#[derive(BinderEnum)]`.
+  Feature-gated but **not** Experimental: the emitted code is byte-for-byte
+  the `.aidl` code, so the wire is whatever `.aidl` already guarantees. Only
+  the Rust-facing spelling is provisional. See
+  [Interface Macros](./interface-macros.md).
+- **Shared memory (new in 0.11.0)** — `SharedMemory`, `MemoryHeapBase`,
+  `MappedHeap`, `MemoryDealer`, `HeapCache`, and the `IMemory` / `IMemoryHeap`
+  wire (handwritten AOSP wire, not AIDL). STAGE3-gated against real
+  `libbinder` in both directions.
+- **Data serialization (new in 0.11.0)** — `to_bytes` / `from_bytes` (`rpc`
+  feature). The bytes are the IPC bytes, so only the two signatures may still
+  change. See [Storing Values](./data-serialization.md).
+- **Cross-stack bridging (new in 0.11.0)** — `impl Interface for Strong<I>`
+  (a proxy publishes as a local service, so a gateway is one line) and
+  `bridge::Rewrap`. See
+  [Cross-Transport Services](./cross-transport-services.md).
+- **`lazy_service` (new in 0.11.0)** — `LazyServiceRegistrar` and the AOSP
+  `registerService` / client-callback lifecycle, gated against Android's own
+  `servicemanager`.
+- **AIDL compiler, beyond the Stable entry points** —
+  `Builder::{dest_dir, hash}` and the public `render` module, the seam
+  `rsbinder-macros` plugs into. Its input structs are `#[non_exhaustive]`, so
+  a template gaining a field stays a minor release.
 
 ## Experimental (opt-in)
 

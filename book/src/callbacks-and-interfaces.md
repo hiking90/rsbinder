@@ -2,8 +2,6 @@
 
 Binder IPC is not limited to one-way requests from client to service. Through callback interfaces, a client can pass a Binder object to a service, and the service can call methods on that object. This enables bidirectional communication across process boundaries without requiring the client to register itself as a separate service.
 
-This chapter covers how to define callback interfaces in AIDL, implement them in Rust, manage collections of callbacks, pass raw `IBinder` objects, work with nested interface types, and monitor remote service lifecycle with death recipients.
-
 ## Defining a Callback Interface
 
 A callback interface is a regular AIDL interface. The only difference is in how it is used: instead of being registered with the service manager, it is created by one process and passed to another through a method call.
@@ -259,7 +257,7 @@ assert_eq!(*received, Some(ParcelableWithNested::Status::Status::OK));
 
 The key detail is the fully-qualified path for the nested callback's Binder node: `INestedService::ICallback::BnCallback`. This follows the Rust module hierarchy generated from the AIDL nesting structure.
 
-Note that a client passing a callback object to a service must run a binder thread pool — call `ProcessState::start_thread_pool()` (or park a thread in `join_thread_pool()`) — because the service's `done(..)` invocation arrives as an *inbound* transaction into the client process.
+`done(..)` arrives as an inbound transaction into the client, so a client that passes a callback needs its binder thread pool running.
 
 ### Service-Side Nested Callback Handling
 
@@ -311,50 +309,44 @@ The `binder_died` method is called when the remote process hosting the Binder ob
 
 ### Registering and Unregistering
 
-Death recipients are registered using `link_to_death` and unregistered using `unlink_to_death`. Both methods take a `Weak<dyn DeathRecipient>` reference:
+`link_to_death_arc` takes your `Arc` directly and is what you normally want:
 
 ```rust
 let recipient = Arc::new(MyDeathRecipient {
     write_file: Mutex::new(write_file),
 });
 
-// Register for death notification
-service
-    .as_binder()
-    .link_to_death(Arc::downgrade(
-        &(recipient.clone() as Arc<dyn DeathRecipient>),
-    ))
-    .unwrap();
-
-// Unregister when no longer needed
-service
-    .as_binder()
-    .unlink_to_death(Arc::downgrade(
-        &(recipient.clone() as Arc<dyn DeathRecipient>),
-    ))
-    .unwrap();
+service.link_to_death_arc(&recipient)?;
+// ... later
+service.unlink_to_death_arc(&recipient)?;
 ```
 
-The cast `recipient.clone() as Arc<dyn DeathRecipient>` is necessary to convert from the concrete type to the trait object before calling `Arc::downgrade`. The weak reference ensures that the death recipient does not keep the Binder object alive -- if all strong references are dropped, the Binder object can be cleaned up normally.
+The link holds only a **weak** reference, so it never keeps the recipient alive:
+drop your last `Arc` and the notification silently stops. Keep `recipient` alive
+for as long as you want to hear about the death.
 
-Note that death notifications only work for **remote** Binder objects. Calling `link_to_death` on a local Binder object (one in the same process) will return an error because there is no remote process to monitor.
+`link_to_death` / `unlink_to_death` are the lower-level pair, taking a
+`Weak<dyn DeathRecipient>` you build yourself
+(`Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))`) — use them
+when the recipient is already type-erased.
 
-Also note that `binder_died` is delivered as an inbound binder command: the process that links a death recipient must call `ProcessState::start_thread_pool()` (or park a thread in `join_thread_pool()`), or the notification never fires — even a client that otherwise only makes outbound calls.
+Two conditions are easy to miss:
+
+- Death notification works only for a **remote** binder. Linking to a local one
+  returns an error; there is no other process to outlive.
+- `binder_died` arrives as an inbound transaction, so the linking process needs
+  its thread pool running, even if it otherwise only makes outbound calls.
 
 ## Tips
 
-Here are key points to keep in mind when working with callbacks and interfaces in rsbinder:
+- **Equality is binder identity.** Two `Strong<dyn T>` compare equal when they
+  name the same binder object, so a service can tell whether two callbacks
+  arriving by different routes are in fact the same one — which is how you
+  de-duplicate a registration list.
 
-- **Callbacks are full Binder objects.** They cross process boundaries transparently. A callback created in the client process can be invoked by the service process through a standard Binder transaction.
+- **A callback is an inbound path into your process.** Whichever side *hands
+  out* the callback is the side that then serves transactions on it, and needs
+  a thread pool and `Mutex`-protected state to do so.
 
-- **Use `BnXxx::new_binder()` to create callback objects.** The `Bn` (Binder native) wrapper converts your Rust struct into a Binder node that can be sent through Binder transactions. The corresponding `Bp` (Binder proxy) is used automatically on the receiving side.
-
-- **Use `Mutex` to protect shared state.** Binder method calls can arrive on any thread in the thread pool. Any mutable state in your callback or service struct must be protected by `Mutex`, `RwLock`, or another synchronization primitive.
-
-- **Nested types use fully-qualified Rust paths.** A callback `ICallback` nested inside `INestedService` is accessed as `INestedService::ICallback::ICallback` for the trait and `INestedService::ICallback::BnCallback` for the Binder node constructor.
-
-- **Death recipients use `Weak` references.** The `link_to_death` API takes `Weak<dyn DeathRecipient>` to avoid preventing cleanup of the death recipient itself. Keep a strong `Arc` reference alive for as long as you want to receive notifications.
-
-- **`as_binder()` converts typed interfaces to raw `SIBinder`.** This is useful when you need to pass a Binder reference to a method that accepts `IBinder`, or when you need to call Binder-level methods like `link_to_death` or `ping_binder`.
-
-- **Callback equality works through Binder identity.** Two `Strong<dyn T>` references are equal if they point to the same Binder object. This allows you to compare callbacks received from different sources to determine if they refer to the same underlying implementation.
+- **`as_binder()` drops down to `SIBinder`** when you need `IBinder`-typed
+  parameters or binder-level calls like `ping_binder`.

@@ -23,19 +23,18 @@ However, since it is rarely used outside of Android, it is disabled by default i
 
 * **`rsbinder`**: Core library crate for implementing binder service/client functionality.
 * **`rsbinder-aidl`**: AIDL-to-Rust code generator for rsbinder.
-* **`rsbinder-tools`**: CLI tools, including a Binder Service Manager (`rsb_hub`) for Linux.
+* **`rsbinder-macros`**: The same generator, reached from a Rust trait instead of an `.aidl` file. Not a direct dependency — enable `rsbinder`'s `macros` feature. See [Interface Macros](./interface-macros.md).
+* **`rsbinder-tools`**: CLI tools — the Binder Service Manager for Linux (`rsb_hub`), the device setup helper (`rsb_device`), and the registry inspector (`rsb_service`).
 * **`tests`**: Port of Android's binder test cases for client/server testing.
 * **`example-hello`**: Example service/client implementation using rsbinder.
 
-## Key Features of Binder IPC
+## Key Features
 
-- **Object-oriented**: Binder IPC provides a clean and intuitive object-oriented API for inter-process communication.
-- **Efficient**: Binder IPC is designed for high performance and low overhead with efficient data serialization.
-- **Secure**: Binder IPC provides strong security features to prevent unauthorized access and tampering.
-- **Versatile**: Binder IPC can be used for a variety of purposes, including remote procedure calls, data sharing, and event notification.
-- **Cross-platform**: Works on Linux and Android (kernel binder), plus macOS (RPC transport only).
-- **Async/Sync Support**: Supports both synchronous and asynchronous programming models with optional tokio runtime integration.
-- **Two transport stacks**: Kernel binder for on-device IPC, and an opt-in RPC transport (Unix sockets, vsock, or TLS) for cross-process, cross-VM, or cross-host binder calls — both stacks share the same AIDL-generated code.
+- **Object-oriented**: a call is a method call on a remote object, with strong and weak references that work across processes — not a message you frame yourself.
+- **Wire-compatible with Android**: the same protocol as `libbinder`, so an rsbinder client can call a service written in C++ or Java, and the other way round.
+- **Two transport stacks**: kernel binder for on-device IPC, and an opt-in RPC transport (Unix sockets, vsock, or TLS) for cross-process, cross-VM, or cross-host calls — both driven by the same AIDL-generated code.
+- **Cross-platform**: Linux and Android (kernel binder), plus macOS (RPC transport only).
+- **Async/Sync**: both programming models, with optional tokio integration.
 
 ## Core Components
 
@@ -45,6 +44,7 @@ However, since it is rarely used outside of Android, it is disabled by default i
 - **Service Manager**: Centralized service discovery and registration (rsb_hub for Linux)
 - **Thread Pool**: Efficient handling of concurrent IPC transactions
 - **Death Notification**: Service lifecycle management and cleanup
+- **Shared Memory**: Payloads too big to copy through a transaction ([Shared Memory](./shared-memory.md))
 
 ## Resources
 

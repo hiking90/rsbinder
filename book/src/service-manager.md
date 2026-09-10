@@ -347,11 +347,8 @@ hub::unregister_for_notifications("com.example.myservice", &callback)?;
 The callback will be invoked each time a service matching the given name is
 registered, including if it is re-registered after a restart.
 
-> **Thread pool required.** `onRegistration` arrives as an *inbound* binder
-> transaction, so the client process must call
-> `ProcessState::start_thread_pool()` (or park a thread in
-> `join_thread_pool()`) — otherwise the callback never fires. This applies
-> to any client that receives inbound calls, not just services.
+> **Thread pool required.** `onRegistration` arrives as an inbound binder
+> transaction, so it never fires unless the client is running one.
 
 ## Checking if a Service is Declared
 
@@ -623,9 +620,11 @@ you can obtain the `ServiceManager` instance directly:
 ```rust
 use rsbinder::hub;
 
-// `hub::default()` returns `Result<Arc<ServiceManager>, StatusCode>` because
-// initialization can fail (e.g., binder device unavailable, unsupported SDK).
-// Propagate the error with `?` or handle it with `match`.
+// `hub::default()` returns `Result<Arc<ServiceManager>, StatusCode>` — the
+// error covers things like an unsupported service-manager protocol.
+// Reaching it before `ProcessState::init_default()` is a programming error
+// rather than a runtime condition, so that case panics instead, and every
+// convenience wrapper in `hub` inherits both behaviors.
 let sm = hub::default()?;
 
 // Use methods on the ServiceManager instance
@@ -636,39 +635,18 @@ let services = sm.list_services(hub::DUMP_FLAG_PRIORITY_ALL);
 This is equivalent to using the free functions but allows you to pass the
 service manager as a parameter or store it in a struct.
 
-## Tips and Best Practices
+## Tips
 
-- **Initialize ProcessState first.** Before calling any `hub::` function, you
-  must call `ProcessState::init_default()` (or `ProcessState::init()` with a
-  custom binder path). Failing to do so will panic at runtime.
+- **`ProcessState::init_default()` comes first.** Every `hub::` function
+  panics without it, including the ones whose signature cannot report failure.
 
-- **Use descriptive service names.** Follow a reverse-domain naming convention
-  (e.g., `com.example.myservice`) to avoid name collisions with other
-  services.
+- **Wait, do not poll.** A client that starts before its service should call
+  `wait_for_interface` / `wait_for_service`, which is event-driven when a
+  binder thread pool is running, rather than looping on `check_service`. Use
+  `register_for_notifications` when you need every (re-)registration over
+  time — it, too, needs the thread pool.
 
-- **Wait, don't poll.** If your client starts before the service it depends
-  on, call `wait_for_interface` / `wait_for_service` rather than repeatedly
-  calling `check_service` in a loop — the wait is event-driven when a binder
-  thread pool is running. Use `register_for_notifications` when you need to
-  observe every (re-)registration over time, and remember that the
-  notification callback only fires if the process runs a thread pool.
-
-- **`get_service` / `get_interface` are gone as of 0.11.0.** Their wait
-  behavior differed across Android versions; the `wait_*`, `check_*`, and
-  `try_get_*` families make the blocking and error semantics explicit.
-
-- **Handle registration failures.** `add_service` can fail if the name is
-  invalid or if the caller lacks permission (on Android with SELinux). Always
-  check the result.
-
-- **Prefer the typed `*_interface` variants.** `wait_for_interface`,
-  `check_interface`, and `try_get_interface` return a strongly-typed proxy
-  that provides compile-time guarantees; the `*_service` variants return the
-  raw `SIBinder`.
-
-- **Debug with `list_services` and `get_service_debug_info`.** When
-  troubleshooting, list all registered services and inspect their debug
-  information to verify that services are registered from the expected
-  processes. From a shell, `rsb_service list` / `info` / `dump manager` ask
-  the same questions without writing a program — see
+- **Reach for the shell before writing a program.** `rsb_service list` /
+  `info` / `check` / `dump manager` answer most "is it registered, and who
+  owns it" questions directly — see
   [Inspecting a running HUB](#inspecting-a-running-hub).

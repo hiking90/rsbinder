@@ -4,6 +4,8 @@ AIDL (Android Interface Definition Language) is the contract between a Binder se
 
 If you have not yet seen rsbinder running end-to-end, read [Hello, World!](./hello-world.md) first — it shows where AIDL fits into a complete project.
 
+> With rsbinder on both ends, [Interface Macros](./interface-macros.md) declares the same interface as a Rust trait instead — same compiler, same generated code. Read this guide either way: it describes the type system both paths share.
+
 ## Chapters
 
 - **[Data Types](./aidl-data-types.md)** — Primitive, string, array, list, map, and interface types, and how each one maps to Rust on the `in` / `out` / `inout` side. Start here.
@@ -11,13 +13,4 @@ If you have not yet seen rsbinder running end-to-end, read [Hello, World!](./hel
 - **[Enum and Union](./aidl-enum-union.md)** — Backed enums (newtype structs in Rust, for wire-stable forward compatibility) and unions (tagged variants).
 - **[Annotations](./aidl-annotations.md)** — `@RustDerive`, `@nullable`, `@Backing`, `@JavaDerive`-equivalents, and the other annotations the Rust backend honors.
 
-## How to use this guide
-
-The chapters are roughly ordered by how often you need each topic when building a new service:
-
-1. Skim **Data Types** so you know what AIDL primitives translate to in Rust.
-2. Read **Parcelable** when you need to pass structured data.
-3. Reach for **Enum and Union** when designing variant payloads or constant sets.
-4. Consult **Annotations** as a reference whenever the generated Rust does not look the way you expect.
-
-Once you are comfortable with the AIDL surface, move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.
+Read them in that order the first time; *Annotations* is a reference to come back to when the generated Rust does not look the way you expected. Then move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.
