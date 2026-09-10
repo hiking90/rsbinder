@@ -287,6 +287,21 @@ jobs:
           # here rather than beside the primitives.
           cargo test -p tests --features rpc,macros --test data_serde
 
+      - name: Data-serialization example (`.aidl` path — runs, not just builds)
+        # `serde_demo` is the one example that needs no binder device, no
+        # service manager and no peer, so CI can actually *run* it instead of
+        # only compiling it. Its asserts are the book's *Storing Values*
+        # claims — the round trip, both directions of version skew across an
+        # appended `.aidl` field, the strict read, and the write-time fd
+        # refusal — so a regression in any of them fails here rather than in a
+        # reader's terminal.
+        #
+        # `--features rpc` only, deliberately: `data_serde` above covers the
+        # `macros` declaration and this covers the `.aidl` one, which is the
+        # path the chapter is written around and the one every non-Rust
+        # consumer would use.
+        run: cargo run -p example-hello --features rpc --bin serde_demo
+
       - name: V5 parallel-safety soak (default test-threads, 5x)
         run: |
           for i in 1 2 3 4 5; do

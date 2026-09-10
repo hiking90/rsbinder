@@ -1,6 +1,6 @@
 # Android Build Environment Setup
 
-This guide will help you set up a complete Android development environment for building and testing **rsbinder** applications.
+What you need to build and test **rsbinder** on Android: the SDK for `adb` and the emulator, the NDK for the native toolchain, and `cargo-ndk` to drive them from cargo.
 
 ## Prerequisites
 
@@ -49,6 +49,11 @@ $ sdkmanager "ndk;26.1.10909125"
 # Check for the latest available version:
 $ sdkmanager --list | grep ndk
 ```
+
+> Use **r27 or later** if you target a device or emulator image with 16 KB
+> memory pages (Android 15 and up). Earlier NDKs link binaries such an image
+> refuses to load. CI builds with r26c, which is fine for the 4 KB images it
+> runs.
 
 #### Method 3: Direct Download
 Download from the [NDK Downloads page](https://developer.android.com/ndk/downloads) and extract manually.

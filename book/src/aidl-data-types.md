@@ -2,8 +2,6 @@
 
 AIDL (Android Interface Definition Language) defines the interface contract between a Binder service and its clients. When you write an `.aidl` file, `rsbinder-aidl` generates Rust code that maps each AIDL type to the corresponding Rust type. Understanding these mappings is essential for implementing services and calling them correctly from client code.
 
-This chapter covers the supported AIDL data types, how they map to Rust, and common patterns you will encounter when working with rsbinder.
-
 ## Primitive Types
 
 The following table shows how AIDL primitive types map to Rust types. Input parameters (`in`) are passed by value or by reference. Only *non-scalar* types — arrays, parcelables, and nullable references — may be `out`/`inout`; the generator rejects a primitive or a `String` marked `out`/`inout` at compile time (it has no fixed slot to write back into).
@@ -21,8 +19,10 @@ The following table shows how AIDL primitive types map to Rust types. Input para
 | @utf8InCpp String | &str | — (not allowed) | Same mapping in rsbinder |
 | T[] | &[T] | &mut Vec\<T\> | |
 | @nullable T | Option\<&T\> | &mut Option\<T\> | A nullable `String` input is `Option<&str>` |
-| IBinder | &SIBinder | | |
-| ParcelFileDescriptor | &ParcelFileDescriptor | | |
+| @nullable T[] | Option\<&[T]\> | &mut Option\<Vec\<T\>\> | For a primitive or enum element. A non-primitive element keeps its own `Option`: `&mut Option<Vec<Option<T>>>` |
+| IBinder | &SIBinder | &mut Option\<SIBinder\> | |
+| ParcelFileDescriptor | &ParcelFileDescriptor | &mut Option\<ParcelFileDescriptor\> | |
+| An interface | &Strong\<dyn I\> | &mut Option\<Strong\<dyn I\>\> | |
 
 Here is an AIDL interface that exercises the primitive types:
 
@@ -181,20 +181,8 @@ Use `inout` when the service needs to read the existing value and modify it in p
 
 ## Tips
 
-Here are a few practical details to keep in mind when working with AIDL data types in rsbinder:
-
-- **The `byte` type has a subtle difference between single values and arrays.** A single `byte` parameter maps to `i8` (signed), but when used in the `ReverseByte` pattern, array elements use `u8` (unsigned). This matches Android's Binder behavior where byte arrays are treated as unsigned.
-
-- **Rust strings are always UTF-8, so `@utf8InCpp` has no special behavior.** In Android's C++ backend, this annotation switches between `String16` (UTF-16) and `std::string` (UTF-8). Since Rust's `String` type is inherently UTF-8, both `String` and `@utf8InCpp String` produce identical code.
-
-- **Arrays in AIDL map to slices for input and `Vec` for output.** Input arrays use `&[T]`, which is efficient because no allocation is needed on the caller side. Output arrays and return values use `Vec<T>`, giving the service ownership of the returned data.
-
-- **Nullable types use `Option`.** This is idiomatic Rust and avoids the null pointer pitfalls found in C++ and Java Binder implementations. Always check for `None` on the client side when calling methods that return nullable types.
-
-- **Direction tags affect performance.** An `inout` parameter requires serialization in both directions. If you only need data to flow one way, use `in` or `out` to reduce the amount of data copied over the Binder transaction.
-
-- **Return values are always `Result`.** Every AIDL method in rsbinder returns `rsbinder::BinderResult<T>`, allowing services to report errors using `Status` codes. Even void methods return `rsbinder::BinderResult<()>`.
-
-- **`char` is UTF-16, not UTF-8.** The AIDL `char` type maps to Rust's `u16`, representing a single UTF-16 code unit. This is not the same as Rust's native `char` type, which is a Unicode scalar value. Be mindful of this difference when working with character data.
+- **`char` is not Rust's `char`.** AIDL `char` is one UTF-16 code unit and maps to `u16`; Rust's `char` is a Unicode scalar value. They are not interchangeable.
+- **`byte` is signed alone and unsigned in an array.** A `byte` parameter is `i8`, but `byte[]` elements are `u8` — matching how Android treats byte arrays.
+- **Every method returns `BinderResult<T>`,** a void one included (`BinderResult<()>`), because any call can fail in transport.
 
 For more information on AIDL syntax and features, refer to the [Android AIDL documentation](https://source.android.com/docs/core/architecture/aidl).

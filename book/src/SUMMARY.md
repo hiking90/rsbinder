@@ -12,6 +12,7 @@
     - [Parcelable](./aidl-parcelable.md)
     - [Enum and Union](./aidl-enum-union.md)
     - [Annotations](./aidl-annotations.md)
+- [Interface Macros (no `.aidl`)](./interface-macros.md)
 - [Service Development](./service-development.md)
     - [Service Patterns](./service-patterns.md)
     - [Async Service](./async-service.md)

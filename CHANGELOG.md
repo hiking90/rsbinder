@@ -13,6 +13,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-09
+
 ### Migrating from 0.10.0
 
 The short form of this release's breaking changes; *Changed* and *Removed*
@@ -371,7 +373,8 @@ a big-endian host.
   Forward compatibility comes from the parcelable's length header, so wrap
   what you store in a parcelable rather than storing a bare scalar. Behind
   the `rpc` feature, which is where the parcel mode it uses lives. See the
-  book's *Storing Values*.
+  book's *Storing Values*, and `example-hello`'s `serde_demo` for the whole
+  thing running against real `.aidl` definitions.
 
 - **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
   `Interface` (delegating to the binder it holds), and generated interfaces —
@@ -1019,6 +1022,20 @@ a big-endian host.
   remains public. `Parcel::set_for_rpc` is `pub(crate)` as well: production
   code reaches the RPC mode through the session, and `rsbinder::to_bytes`
   covers the data case.
+- **rsbinder (kernel binder):** a driver that consumed only part of the queued
+  command buffer used to `panic!`; it now writes the diagnosis to stderr and
+  **aborts the process**, as AOSP `LOG_ALWAYS_FATAL`s there. The remainder was
+  never seen by the kernel, so the reference counts and buffer ownership this
+  process believes in are no longer the kernel's — and a panic was not a way
+  out, because the reply path's `catch_unwind` would catch it and resume
+  transacting on that desynchronized stream. stderr rather than `log`, so a
+  consumer that installed no logger does not die mute.
+- **rsbinder (kernel binder):** a failed `BINDER_WRITE_READ` now names the
+  command the driver refused. The errno alone cannot tell a caller's bug from
+  a driver one, and `write_consumed` is the offset the driver gave up at — so
+  the command starting there is decoded into the log line, and an
+  over-released proxy's `BC_RELEASE` or a `BC_FREE_BUFFER` for a buffer
+  already returned now says which it was.
 
 ### Removed
 
@@ -1723,6 +1740,14 @@ a big-endian host.
   `to_bytes` on a `ParcelableHolder` read out of an RPC transaction now
   returns `BadType` instead of bytes; resolving it first with
   `get_parcelable::<T>` gives a value that encodes as usual.
+- **rsbinder (kernel binder):** a caught panic on the reply path leaked a
+  kernel transaction buffer. The recovery truncated the whole outgoing command
+  parcel to drop the half-written `BC_REPLY` — but on a looper thread
+  `flush_if_needed` never flushes, so a nested call's `BC_FREE_BUFFER` could
+  still be queued in the same parcel, and dropping it left the kernel holding
+  a buffer nothing would ever reclaim. The recovery now rewinds to the mark
+  taken before the reply was written, as the normal failure path and
+  `transact` already did.
 
 ## [0.10.0] - 2026-07-11
 
@@ -2020,6 +2045,7 @@ A large body of correctness work from multiple review and audit rounds
 - Addressed RUSTSEC-2025-0134 by replacing `rustls-pemfile` with
   `rustls-pki-types`.
 
-[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/hiking90/rsbinder/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hiking90/rsbinder/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hiking90/rsbinder/compare/v0.8.0...v0.9.0

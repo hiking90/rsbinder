@@ -1,6 +1,6 @@
 # Android Development
 
-**rsbinder** provides comprehensive support for Android development alongside Linux. Since Android already has a complete Binder IPC environment, you can use **rsbinder**, **rsbinder-aidl**, and the existing Android service manager directly. There's no need to create binder devices or run a separate service manager like on Linux.
+Android already has a complete Binder IPC environment, so **rsbinder** and **rsbinder-aidl** use the existing device nodes and service manager directly. Nothing here needs `rsb_device` or `rsb_hub`, which exist for Linux.
 
 For building in the Android environment, you need to install the Android NDK and set up a Rust build environment that utilizes the NDK.
 
@@ -33,7 +33,7 @@ In your `Cargo.toml`, specify the Android versions you want to support:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.10", features = ["android_14_plus"] }
+rsbinder = { version = "0.11", features = ["android_14_plus"] }
 ```
 
 Available feature combinations:
@@ -84,7 +84,7 @@ println!("Running on Android {}", version);
 Add `rsproperties` to your dependencies:
 ```toml
 [dependencies]
-rsproperties = "0.5"
+rsproperties = "0.6"
 ```
 
 ### Using Android's Existing Binder Devices
@@ -116,11 +116,14 @@ You do not need to run `rsb_hub` on Android — the system already provides serv
 
 ### Android-Specific Considerations
 
-- **Service Manager**: Uses Android's existing service manager automatically
-- **Permissions**: Respects Android's security model and SELinux policies
-- **Threading**: Integrates with Android's Binder thread pool management
-- **Memory**: Uses Android's shared memory mechanisms (ashmem/memfd)
-- **Stability**: Supports Android's interface stability annotations (@VintfStability)
+- **SELinux** applies as it does to any other process: a denial surfaces as a
+  failed `open` of the device or a refused transaction, not as an rsbinder
+  error.
+- **Shared memory** is allocated with `memfd_create`; a peer's legacy
+  `/dev/ashmem` fd is accepted on the way in. See
+  [Shared Memory](./shared-memory.md).
+- **`@VintfStability`** is honored, including the stability check a
+  `ParcelableHolder` carries on the wire.
 
 ### JNI Integration
 

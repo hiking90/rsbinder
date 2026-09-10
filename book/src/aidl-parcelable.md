@@ -1,8 +1,6 @@
 # Parcelable
 
-Parcelable types are user-defined data structures that can be serialized and sent across Binder IPC boundaries. They are defined in AIDL `.aidl` files, and the `rsbinder-aidl` code generator automatically produces Rust structs from them. Parcelable types are the primary way to pass structured data between a Binder service and its clients.
-
-Unlike primitive types (such as `int`, `String`, or `boolean`), which AIDL handles natively, parcelable types let you group related fields into a single, coherent structure. This is essential for any non-trivial service interface.
+A parcelable is a user-defined struct that can cross the Binder boundary. You declare it in an `.aidl` file and `rsbinder-aidl` generates the Rust struct and its codec — it is how any non-trivial interface passes structured data.
 
 ## Basic Parcelable Definition
 
@@ -137,7 +135,7 @@ When the client passes `None`, the service receives `None` and can return `None`
 
 ## Recursive Structures
 
-AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility, but the actual `Box<T>` wrapping is emitted by the code generator whenever a field references the enclosing parcelable's own type — the `heap=true` parameter is not what triggers it.
+AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility but ignores `heap=true`: it boxes a field whenever that field can reach its own enclosing type by value, which covers a cycle of any length, not only a direct self-reference. A type reached through an interface handle or a `Vec` element keeps the enclosing type finite and is not boxed.
 
 AIDL definition (from `RecursiveList.aidl` in the test suite):
 
@@ -148,7 +146,7 @@ parcelable RecursiveList {
 }
 ```
 
-This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`. The `@nullable` part makes it `Option`, and the self-reference detection adds the `Box` wrapper that gives the type a known size. Together they enable a linked-list pattern.
+This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`: `@nullable` makes it `Option`, and the cycle analysis adds the `Box`.
 
 Rust usage (based on the `test_reverse_recursive_list` test):
 
@@ -247,13 +245,11 @@ Key points about `ParcelableHolder`:
 
 ## Tips
 
-Here are some practical guidelines when working with parcelable types in rsbinder:
-
 - **Always use `@RustDerive(Clone=true)`** if you need to clone parcelable values. This is required for patterns like `input.cloned()` with nullable parameters. Only add it when all fields in the parcelable actually implement `Clone`.
 
 - **Use `@RustDerive(PartialEq=true)`** when you need to compare parcelable instances in assertions or business logic. As with `Clone`, all fields must implement `PartialEq`.
 
-- **`@nullable(heap=true)` is required for recursive types.** Without it, the compiler will reject the type due to infinite size. Use this annotation on any self-referential field.
+- **`@nullable` is what you need on a recursive field, not `heap=true`.** Write `heap=true` for source compatibility with AOSP if you like, but rsbinder-aidl ignores it: the `Box` comes from the generator's own cycle analysis, and the `Option` comes from `@nullable`.
 
 - **Default values in AIDL translate to Rust's `Default` trait.** When you write `int count = 5;` in AIDL, calling `MyParcelable::default()` in Rust will produce a struct with `count` set to `5`.
 
@@ -270,4 +266,4 @@ Here are some practical guidelines when working with parcelable types in rsbinde
 
 - **Place each parcelable in its own `.aidl` file.** Following the AIDL convention, each parcelable type should be defined in a separate file whose name matches the type name (e.g., `UserProfile.aidl` for `parcelable UserProfile`).
 
-- **Constants are scoped to the parcelable's module.** When you define `const int MAX_VALUE = 100;` inside a parcelable, access it in Rust as `MyParcelable::MAX_VALUE`, where `MyParcelable` is the generated *module* (import the module, not the struct — the struct itself is `MyParcelable::MyParcelable`). This keeps related constants close to the data they describe.
+- **Constants live on the generated module, not the struct.** Import the module: `MyParcelable::MAX_VALUE` is the constant and `MyParcelable::MyParcelable` is the struct. Importing the struct directly hides the constants.

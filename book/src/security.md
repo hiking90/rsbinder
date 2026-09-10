@@ -21,8 +21,6 @@ mirrors AOSP's `IPCThreadState`). So inside a `transact` handler you read
 it with no parameter threading:
 
 ```rust
-use rsbinder::{Caller, ExceptionCode, Status};
-
 impl IExample for MyService {
     fn do_thing(&self, arg: i32) -> rsbinder::BinderResult<()> {
         let uid = rsbinder::get_calling_uid();   // who is calling, right now

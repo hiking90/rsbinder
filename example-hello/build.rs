@@ -28,6 +28,17 @@ fn main() {
     aidl("aidl/authz/IAuthz.aidl", "authz.rs");
     // Shared-memory example interface (`bin/shm_{service,client}`).
     aidl("aidl/shm/IShm.aidl", "shm.rs");
+    // Data-serialization example (`bin/serde_demo`): parcelables stored with
+    // `rsbinder::to_bytes` rather than sent through a transaction. Several
+    // declarations in one package, so they go into one generated file.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/settings/Mode.aidl"))
+        .source(PathBuf::from("aidl/settings/Endpoint.aidl"))
+        .source(PathBuf::from("aidl/settings/SettingsV1.aidl"))
+        .source(PathBuf::from("aidl/settings/SettingsV2.aidl"))
+        .output(PathBuf::from("settings.rs"))
+        .generate()
+        .unwrap();
     // Shared with `tests/aidl/shapes/`; `cpp/codegen_shapes_interop.cpp` cross-checks the wire against libbinder.
     aidl(
         "../tests/aidl/shapes/ICodegenShapes.aidl",

@@ -1,8 +1,13 @@
 # Service Patterns
 
-This chapter covers the common patterns for implementing Binder services in rsbinder.
-Whether you are building a simple single-method service or a complex multi-service process,
-the patterns described here will help you structure your code effectively.
+How to structure a service, from a single method to a process hosting several.
+
+> This chapter uses the low-level lifecycle — `ProcessState`, the thread pool,
+> `hub::add_service` — because that is what the pieces actually are.
+> `rsbinder::serve("binder://")?.add(name, binder)?.run()?` performs exactly
+> these steps and is the shorter way to write them; reach past it when you need
+> control a URI does not express. See
+> [Cross-Transport Services](./cross-transport-services.md).
 
 ## Basic Service Structure
 
@@ -117,20 +122,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Register the primary test service.
     let service = BnTestService::new_binder(TestService::default());
-    hub::add_service(test_service_name, service.as_binder())?;
+    hub::add_service(test_service_name, &service)?;
 
     // Register a versioned interface service.
     let versioned_service = BnFooInterface::new_binder(FooInterface);
-    hub::add_service(versioned_service_name, versioned_service.as_binder())?;
+    hub::add_service(versioned_service_name, versioned_service)?;
 
     // Register a nested service.
     let nested_service = INestedService::BnNestedService::new_binder(NestedService);
-    hub::add_service(nested_service_name, nested_service.as_binder())?;
+    hub::add_service(nested_service_name, nested_service)?;
 
     // Register a fixed-size array service.
     let fixed_size_array_service =
         IRepeatFixedSizeArray::BnRepeatFixedSizeArray::new_binder(FixedSizeArrayService);
-    hub::add_service(fixed_size_array_service_name, fixed_size_array_service.as_binder())?;
+    hub::add_service(fixed_size_array_service_name, fixed_size_array_service)?;
 
     // All services share the same thread pool and process state.
     Ok(ProcessState::join_thread_pool()?)
@@ -181,8 +186,8 @@ The `ping_binder()` method tests whether a service is reachable and responsive.
 It sends a lightweight ping transaction and returns `Ok(())` on success:
 
 ```rust
-let service = get_service();
-assert_eq!(service.as_binder().ping_binder(), Ok(()));
+let hello: Strong<dyn IHello> = rsbinder::connect("binder://my.hello")?;
+assert_eq!(hello.as_binder().ping_binder(), Ok(()));
 ```
 
 This is useful for health checks and for verifying that a service is still alive
@@ -291,9 +296,8 @@ let callback = hub::BnServiceCallback::new_binder(MyServiceCallback);
 hub::register_for_notifications(SERVICE_NAME, &callback)?;
 ```
 
-Note: `onRegistration` is an *inbound* transaction into the client process,
-so the client must call `ProcessState::start_thread_pool()` (or park a thread
-in `join_thread_pool()`) — otherwise the notification never fires.
+`onRegistration` is an inbound transaction, so it needs the thread pool
+running in the client.
 
 ### Death Recipients
 
@@ -318,32 +322,19 @@ service.as_binder().link_to_death(
 
 To stop receiving notifications, call `unlink_to_death` with the same weak reference.
 
-Note: `binder_died` is delivered as an inbound binder command, so a client
-that links a death recipient must call `ProcessState::start_thread_pool()`
-(or park a thread in `join_thread_pool()`) — otherwise `binder_died` never
-fires.
+`binder_died` arrives as an inbound binder command, so it too needs the thread
+pool running in the client.
 
-## Tips and Best Practices
+## Tips
 
-- **`ProcessState::init_default()` must be called before any Binder operations.**
-  Failing to do so will result in a panic.
-- **`start_thread_pool()` is required by any process that receives inbound
-  transactions.** That includes not just services, but also *clients* holding a
-  service-notification callback, a callback object passed to a service, or a death
-  recipient — without a thread pool (or a thread parked in `join_thread_pool()`),
-  those callbacks and `binder_died` never fire. Only a purely-outbound client that
-  makes synchronous calls and receives nothing back can skip it.
-- **Each process needs only one `ProcessState::init_default()` call.** Multiple calls
-  are safe but unnecessary.
-- **`join_thread_pool()` blocks the calling thread.** Place it at the end of `main()`
-  after all setup is complete.
-- **`dump()` is optional but highly useful for debugging.** It provides a standardized
-  way to inspect service state from outside the process.
-- **Use `Mutex` or `RwLock` for mutable service state.** All AIDL methods receive
-  `&self`, so interior mutability is required for state changes.
-- **Service names should follow reverse-domain naming.** For example,
-  `com.example.myservice` or `my.hello`. This prevents name collisions when multiple
-  services are registered.
-- **Error handling**: Return `rsbinder::Status` errors from service methods to
-  communicate failures to clients. Use `Status::new_service_specific_error()` for
-  application-level errors that clients can inspect programmatically.
+- **Anything that *receives* a call needs `start_thread_pool()`** — not only
+  services. A client holding a service-notification callback, a callback object
+  it passed to a service, or a death recipient is receiving inbound
+  transactions, and without a thread pool (or a thread parked in
+  `join_thread_pool()`) those callbacks and `binder_died` simply never fire.
+  Only a purely outbound client can skip it.
+- **`ProcessState::init_default()` comes before any binder call** and panics if
+  it does not — but only once per process; further calls are harmless no-ops.
+- **Name services reverse-domain**, `com.example.myservice`, so two crates in
+  one process cannot collide.
+- **Mutable state needs `Mutex` or `RwLock`.** Every AIDL method takes `&self`.

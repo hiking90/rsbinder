@@ -1,8 +1,6 @@
 # Enum and Union
 
-AIDL supports two powerful type constructs beyond simple interfaces and parcelables: **enums** and **unions**. Enums provide named integer constants with type safety, while unions represent a value that can be one of several different types. Both are fully supported by rsbinder's AIDL compiler and map naturally to Rust constructs.
-
-This chapter covers how to define enums and unions in AIDL, how they translate to Rust code, and how to use them in practice.
+Beyond interfaces and parcelables, AIDL has **enums** — named integer constants — and **unions** — a value that is one of several types at a time. Both map onto Rust, though the enum mapping is not the one you would guess.
 
 ## Enum Types
 
@@ -220,15 +218,11 @@ union UnionInUnion {
 
 This allows building complex tagged-value hierarchies that are fully type-safe on the Rust side.
 
-## Tips and Best Practices
+## Tips
 
-- **Specify `@Backing` explicitly** for enums. It is optional (the default is `byte`), but stating it makes the wire format and the Rust integer type unambiguous to readers.
-- **The union default is always the first field.** Order your fields accordingly, placing the most common or natural default first.
-- **Use `@RustDerive(Clone=true, PartialEq=true)`** on unions so they can be compared and cloned in Rust. Without this, you cannot use `==` or `.clone()` on union values.
-- **Union constants are module-level**, not variants. Access them as `Union::S1`, not through any variant.
-- **Enum `enum_values()`** returns all defined constants, which is useful for exhaustive testing or validation loops.
-- **Forward compatibility**: Because AIDL enums are backed by integers, a service may receive values not defined in the current enum. Design your code to handle unknown values gracefully.
-- **Tag enums** use lowercase field names (e.g., `Union::Tag::ns`, not `Union::Tag::Ns`), matching the original AIDL field names.
+- **Specify `@Backing` explicitly.** It is optional — the default is `byte` — but stating it makes the wire format unambiguous to a reader.
+- **Handle values you never declared.** An AIDL enum is an integer on the wire, so a peer built against a newer definition can send one the current enum does not name. That is the point of the newtype mapping; do not assume the set is closed.
+- **Tags keep the AIDL field names**, so they are lowercase: `Union::Tag::ns`, not `Union::Tag::Ns`.
 
 ## Further Reading
 

@@ -95,6 +95,27 @@ Write service registration and lookup **once** and pick kernel binder or RPC by 
 
 See [Cross-Transport Services](book/src/cross-transport-services.md), [Security & Authorization](book/src/security.md), and [Async Service](book/src/async-service.md) in the book.
 
+## Interfaces without `.aidl`
+
+For an rsbinder ↔ rsbinder interface, `#[rsbinder::interface]` declares it as a plain Rust trait — no `.aidl` file, no `build.rs`, no generated-code directory. `&mut T` is an out parameter, `Option<T>` is nullable, `#[oneway]` drops the reply. `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` do the same for the data types.
+
+```rust
+#[rsbinder::interface(descriptor = "com.example.IHello")]
+pub trait IHello {
+    fn echo(&self, msg: &str) -> rsbinder::BinderResult<String>;
+}
+```
+
+Not a second code generator: the macros run the same templates as the AIDL front-end, so a trait here and the equivalent `.aidl` produce **byte-for-byte identical** code. `.aidl` stays canonical for anything an Android tool or another language reads. Opt in with the `macros` feature; see [Interface Macros](book/src/interface-macros.md).
+
+## Storing values
+
+`rsbinder::to_bytes` / `from_bytes` write a value the way its interface already describes it, so an AIDL schema can be a file format too and a project need not maintain a second description in protobuf or serde. The bytes are the IPC bytes, and the wire is fixed little-endian, so a file written on an aarch64 phone reads on an x86_64 server. Binders and file descriptors are refused at write time rather than stored as something that refers to nothing. Needs the `rpc` feature; see [Storing Values](book/src/data-serialization.md).
+
+```
+$ cargo run -p example-hello --features rpc --bin serde_demo   # no device, no socket
+```
+
 ## Prerequisites to build and test
 
 There are two transport paths. Pick whichever fits your environment.
@@ -168,6 +189,9 @@ Complete API parity is not a goal — rsbinder's architecture differs from `libb
 - [x] Tokio async support.
 - [x] Removed all `todo!()` / `unimplemented!()` macros.
 - [x] Compatibility testing with Binder on Android.
+- [x] Shared memory (`IMemory` / `MemoryHeapBase` / `MemoryDealer`).
+- [x] Interface macros — `#[rsbinder::interface]` without `.aidl`.
+- [x] Parcel data serialization (`to_bytes` / `from_bytes`).
 
 **RPC transport**
 - [x] RPC transport (binder-over-socket).

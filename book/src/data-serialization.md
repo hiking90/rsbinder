@@ -23,23 +23,71 @@ The `#[derive(rsbinder::Parcelable)]` below additionally needs `macros`
 from `.aidl` does not, since the generator emits the `Parcelable` impl
 directly.
 
+Everything on this page is demonstrated end to end, against real `.aidl`
+definitions, by
+[`example-hello/src/bin/serde_demo.rs`](https://github.com/hiking90/rsbinder/blob/master/example-hello/src/bin/serde_demo.rs)
+— it needs no binder device, no service manager and no socket:
+
+```bash
+$ cargo run -p example-hello --features rpc --bin serde_demo
+```
+
 ## What you can store
 
 Anything that implements `Serialize` works, but a type you intend to keep
-should be a parcelable — either generated from `.aidl` or declared with the
-derive:
+should be a **parcelable**. Nothing about the declaration is
+storage-specific — it is an ordinary `.aidl` file, compiled by an ordinary
+`build.rs`:
 
-```rust
-#[derive(rsbinder::Parcelable, Default, Debug, Clone, PartialEq)]
-#[parcelable(descriptor = "myapp.Settings")]
-pub struct Settings {
-    pub volume: i32,
-    pub name: String,
-    pub tags: Vec<String>,
+```aidl
+// aidl/settings/Settings.aidl
+package settings;
+
+@RustDerive(Clone=true, PartialEq=true)
+parcelable Settings {
+    String name = "unnamed";
+    int volume = 50;
+    String[] tags;
+    @nullable String note;
 }
 ```
 
-The derive matters for a reason worth being explicit about. A parcelable
+```rust
+// build.rs — the same call any interface gets.
+rsbinder_aidl::Builder::new()
+    .source(PathBuf::from("aidl/settings/Settings.aidl"))
+    .output(PathBuf::from("settings.rs"))
+    .generate()?;
+```
+
+```rust
+use settings::Settings::Settings;
+
+let value = Settings { name: "studio".into(), volume: 72, ..Default::default() };
+std::fs::write("settings.bin", rsbinder::to_bytes(&value)?)?;
+
+let restored: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
+```
+
+The same type can still be sent through a transaction; storing it is just a
+second destination for the codec the generator already emitted.
+
+If the type has no non-Rust consumer, the [interface
+macros](./interface-macros.md) declare the same thing without a file or a
+build step — the emitted codec is byte-for-byte identical:
+
+```rust
+#[derive(rsbinder::Parcelable, Default, Debug, Clone, PartialEq)]
+#[parcelable(descriptor = "settings.Settings")]
+pub struct Settings {
+    pub name: String,
+    pub volume: i32,
+    pub tags: Vec<String>,
+    pub note: Option<String>,
+}
+```
+
+Being a parcelable matters for a reason worth being explicit about. A parcelable
 writes a length header before its fields, and that header is the entire
 forward-compatibility story: a reader built against an older definition
 stops at the boundary the writer wrote, and a reader built against a newer

@@ -2,11 +2,9 @@
 
 > **Note**: This guide is community-contributed and may require adjustments for your specific system configuration. Please test in a safe environment first.
 
-RedHat-based distributions (RHEL, CentOS, Fedora) do not include Binder IPC support by default. Here are methods to enable it:
+RedHat-based distributions (RHEL, CentOS, Fedora) do not include Binder IPC support by default, so enabling it means building a kernel.
 
 ## Fedora
-
-### Method 1: Custom Kernel Build (Recommended for Fedora)
 
 Fedora provides kernel source packages that can be modified to include binder support:
 
@@ -44,21 +42,9 @@ $ sudo grub2-mkconfig -o /boot/grub2/grub.cfg
 $ sudo reboot
 ```
 
-### Method 2: Third-party Kernel Modules
-
-Some third-party repositories may provide binder modules:
-
-```bash
-# Enable RPM Fusion repositories
-$ sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
-
-# Look for available binder-related packages
-$ dnf search binder android-tools
-```
-
 ## RHEL/CentOS
 
-### Method 1: Build Custom Kernel
+### Build a Custom Kernel
 
 For enterprise distributions, building a custom kernel is often the most reliable approach:
 
@@ -103,19 +89,6 @@ $ sudo grub2-mkconfig -o /boot/grub2/grub.cfg
 $ sudo reboot
 ```
 
-### Method 2: Using ELRepo (CentOS/RHEL)
-
-ELRepo sometimes provides additional kernel modules:
-
-```bash
-# Install ELRepo
-$ sudo rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
-$ sudo dnf install https://www.elrepo.org/elrepo-release-8.el8.elrepo.noarch.rpm
-
-# Search for kernel modules
-$ dnf --enablerepo=elrepo search kernel-ml
-```
-
 ## CentOS Stream
 
 CentOS Stream may have more recent kernels that could include binder support:
@@ -150,18 +123,20 @@ $ grep -E "(ANDROID|BINDER)" /boot/config-$(uname -r)
 
 ## SELinux Considerations
 
-RedHat systems use SELinux which may interfere with binder operations:
+RedHat systems run SELinux, which can deny access to the binder device even
+once the node exists and its mode is right. A denial looks like a failed
+`open` rather than an rsbinder error, so check the audit log before suspecting
+anything else:
 
 ```bash
-# Check SELinux status
 $ sestatus
-
-# Temporarily disable SELinux for testing
-$ sudo setenforce 0
-
-# Create SELinux policy for binder (advanced)
-# This requires creating custom SELinux policies for binder devices
+$ sudo ausearch -m avc -ts recent | grep -i binder
 ```
+
+The fix is a policy module allowing your domain to use the device. Putting the
+whole system in permissive mode (`setenforce 0`) will also make the denial go
+away, but it disables SELinux for everything else on the machine — reach for it
+only to confirm a diagnosis, never as the resting state.
 
 ## Verification
 
