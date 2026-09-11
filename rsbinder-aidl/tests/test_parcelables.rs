@@ -113,7 +113,7 @@ parcelable VintfExtendableParcelable {
         "##,
         r#"
 pub mod VintfExtendableParcelable {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct VintfExtendableParcelable {
         pub r#ext: rsbinder::ParcelableHolder,
@@ -161,7 +161,7 @@ parcelable VintfParcelable {
         "##,
         r#"
 pub mod VintfParcelable {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct VintfParcelable {
         pub r#a: i32,
@@ -217,7 +217,7 @@ parcelable IServiceManager {
         "##,
         r#"
 pub mod IServiceManager {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     pub const r#DUMP_FLAG_PRIORITY_CRITICAL: i32 = 1;
     pub const r#DUMP_FLAG_PRIORITY_HIGH: i32 = 2;
     pub const r#DUMP_FLAG_PRIORITY_NORMAL: i32 = 4;
@@ -279,7 +279,7 @@ fn test_parcelable() -> Result<(), Box<dyn Error>> {
         "##,
         r#"
 pub mod ConnectionInfo {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct ConnectionInfo {
         pub r#ipAddress: String,
@@ -507,7 +507,7 @@ parcelable StructuredParcelable {
             + UNION),
         r#"
 pub mod StructuredParcelable {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     pub const r#BIT0: i32 = 1;
     pub const r#BIT1: i32 = 2;
     pub const r#BIT2: i32 = 4;
@@ -813,7 +813,7 @@ pub mod StructuredParcelable {
         fn descriptor() -> &'static str { "android.aidl.tests.StructuredParcelable" }
     }
     pub mod Empty {
-        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
         #[derive(Debug)]
         #[derive(Clone,PartialEq)]
         pub struct Empty {
@@ -844,7 +844,7 @@ pub mod StructuredParcelable {
     }
 }
 pub mod ConstantExpressionEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#ConstantExpressionEnum : [i32; 10] {
             r#decInt32_1 = 1,
@@ -861,7 +861,7 @@ pub mod ConstantExpressionEnum {
     }
 }
 pub mod ByteEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#ByteEnum : [i8; 3] {
             r#FOO = 1,
@@ -871,18 +871,19 @@ pub mod ByteEnum {
     }
 }
 pub mod IntEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#IntEnum : [i32; 4] {
             r#FOO = 1000,
             r#BAR = 2000,
             r#BAZ = 2001,
+            #[deprecated = "do not use this"]
             r#QUX = 2002,
         }
     }
 }
 pub mod LongEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#LongEnum : [i64; 3] {
             r#FOO = 100000000000,
@@ -892,7 +893,7 @@ pub mod LongEnum {
     }
 }
 pub mod Union {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
@@ -1017,7 +1018,7 @@ fn test_unstructured_parcelable() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod PersistableBundle {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     pub type PersistableBundle = crate::persistable_bundle::PersistableBundle;
 }
         "#,

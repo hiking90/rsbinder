@@ -163,7 +163,7 @@ fn test_simple_enum_reference_in_same_enum() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Status {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#Status : [i8; 5] {
             r#OK = 0,
@@ -202,7 +202,7 @@ fn test_enum_reference_across_enums() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod BaseEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#BaseEnum : [i8; 2] {
             r#BASE_VALUE = 10,
@@ -211,7 +211,7 @@ pub mod BaseEnum {
     }
 }
 pub mod DerivedEnum {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#DerivedEnum : [i8; 4] {
             r#FROM_BASE = 10,
@@ -249,7 +249,7 @@ fn test_enum_reference_with_bitwise_operations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Flags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#Flags : [i8; 5] {
             r#NONE = 0,
@@ -261,7 +261,7 @@ pub mod Flags {
     }
 }
 pub mod ExtendedFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#ExtendedFlags : [i8; 3] {
             r#BASE_FLAGS = 7,
@@ -327,7 +327,7 @@ fn test_enum_reference_in_parcelable_default() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod Priority {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#Priority : [i8; 3] {
             r#LOW = 0,
@@ -337,7 +337,7 @@ pub mod Priority {
     }
 }
 pub mod Task {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct Task {
         pub r#name: String,
@@ -404,7 +404,7 @@ fn test_keymint_style_simple_reference() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod TagType {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#TagType : [i32; 3] {
             r#INVALID = 0,
@@ -414,7 +414,7 @@ pub mod TagType {
     }
 }
 pub mod Tag {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#Tag : [i32; 3] {
             r#INVALID = 0,
@@ -459,7 +459,7 @@ fn test_backing_type_annotations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod ByteFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#ByteFlags : [i8; 3] {
             r#NONE = 0,
@@ -469,7 +469,7 @@ pub mod ByteFlags {
     }
 }
 pub mod IntFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#IntFlags : [i32; 4] {
             r#NONE = 0,
@@ -480,7 +480,7 @@ pub mod IntFlags {
     }
 }
 pub mod LongFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#LongFlags : [i64; 3] {
             r#NONE = 0,
@@ -515,7 +515,7 @@ fn test_simple_bitwise_operations() -> Result<(), Box<dyn Error>> {
         "##,
         r##"
 pub mod BaseFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#BaseFlags : [i8; 3] {
             r#NONE = 0,
@@ -525,7 +525,7 @@ pub mod BaseFlags {
     }
 }
 pub mod CombinedFlags {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     rsbinder::declare_binder_enum! {
         r#CombinedFlags : [i8; 3] {
             r#NONE = 0,

@@ -13,7 +13,121 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-09-10
+### Migrating
+
+- **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects.** The
+  new checks are listed under *Added*. Each one fires on a contract the AOSP
+  compiler already refuses, so an `.aidl` that builds against both compilers is
+  unaffected — but an rsbinder-only contract that leaned on the missing
+  validation now fails to build. The diagnostic names the rule and the AOSP
+  behavior it mirrors.
+- **`render::ConstMember` and `render::EnumMember` gained a field.**
+  `ConstMember` is now `(identifier, type, initializer, deprecation attribute)`
+  and `EnumMember` is `(identifier, discriminant, deprecation attribute)`. Both
+  are positional tuples that a second front-end fills directly, so this is a
+  compile error at those call sites, not a silent change; pass `String::new()`
+  for the new element to keep the previous output. The `#[non_exhaustive]`
+  render structs (`InterfaceRender`, `ParcelableRender`, `EnumRender`,
+  `FnMembers`, `ParcelableMember`) also gained a `deprecated` field, but they
+  are built through `new()`/`Default`, so those keep compiling.
+- **`error::SemanticError` is now `#[non_exhaustive]`** and gained two variants,
+  `FixedSizeNonFixedField` and `VintfStabilityLeak` (appended, so no existing
+  variant's discriminant moved). An exhaustive `match` over it needs a `_ => …`
+  arm added — once: from here on a new diagnostic is a minor release.
+- **A declaration nested in a `@VintfStability` type is now VINTF-stable** (see
+  *Fixed*), which changes both the wire and a runtime check for it: a
+  `ParcelableHolder` field of such a nested type records VINTF stability
+  instead of the default, and `ParcelableHolder::set_parcelable` now returns
+  `StatusCode::BadValue` for a payload whose own stability does not include
+  VINTF, where it previously succeeded. Nothing in the build warns.
+- **`#[deprecated]` codegen can break a downstream `-D warnings` build.** An
+  existing `.aidl` whose `/** @deprecated … */` javadoc was previously ignored
+  now generates `#[deprecated]`, and by design that warns outside the generated
+  module. Drop the javadoc tag, or allow the lint at the call site.
+
+### Added
+
+- **`rsbinder-aidl`: AIDL type-placement validation matching AOSP.** The
+  `@FixedSize` and `@VintfStability` rules are contract-level — rsbinder
+  generated compiling code either way, so without them an `.aidl` authored here
+  could be refused by AOSP's `aidl`. The `void` and `ParcelableHolder`
+  placements marked below are not contract-level: the code rsbinder generated
+  for them never compiled, and the check turns a rustc error in the generated
+  crate into an AIDL diagnostic.
+  - `@FixedSize` parcelables and unions now require every field to be fixed
+    size, porting AOSP `AidlTypenames::CanBeFixedSize` (primitives, enums,
+    fixed-size arrays of those, and other `@FixedSize` types qualify; `String`,
+    `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`, `List<T>`,
+    variable-length arrays, and `@nullable` types do not). `@FixedSize` is not
+    inherited by nested declarations, matching AOSP.
+  - `@VintfStability` declarations may only reference `@VintfStability` types.
+    AOSP enforces this compilation-wide through `aidl_interface { stability:
+    "vintf" }`; rsbinder has no such mode and enforces the reference closure
+    that rule implies, which fires on exactly the contracts AOSP refuses. A
+    non-VINTF type may still use a VINTF one.
+  - `ParcelableHolder` is rejected as an array element, as a `List` element, as
+    `@nullable`, as a method argument, as a method return type, and as a union
+    member. The array, `List` and `@nullable` forms are the ones that did not
+    compile (`Vec<ParcelableHolder>` has no `SerializeArray`,
+    `Option<ParcelableHolder>` no `SerializeOption`); the argument, return-type
+    and union-member forms compiled, so those three are contract-level.
+  - `void` is rejected as a parameter type, a field or constant type, and an
+    array or `List` element — none of which compiled. It remains valid as a
+    bare method return type.
+  - A `union` with no fields is rejected, porting AOSP `AidlUnionDecl::
+    CheckValid`. `const` members do not count as fields: the enum rendered for
+    such a union is uninhabited, so its `Default` impl and its `write_to_parcel`
+    match never compiled.
+  - A duplicate argument name in a method is rejected, porting AOSP
+    `AidlMethod::CheckValid`. Both arguments rendered as the same `_arg_<name>`
+    binding, so the defect used to surface as rustc E0415 in the consumer's
+    crate.
+  - A type argument on a type that takes none (`String<int>`, `IBinder<T>`) is
+    rejected, porting AOSP `AidlTypeSpecifier::CheckValid`. The generic was
+    being dropped silently, so `String<int>` compiled as a plain `String`.
+    `List`, `Map` and parameterizable user-defined parcelables are unaffected.
+  - A `const` must have a primitive or `String` type, or an array of those. A
+    handle (`IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) has no
+    constant form, and a user-defined type is refused by AOSP outright
+    (`AidlConstantDeclaration::CheckValid`). AOSP's set is narrower still —
+    `boolean`, `char` and constant arrays are deliberate rsbinder extensions,
+    pinned by its test suite, and are kept.
+  - A `@VintfStability` declaration may reference a `@RustOnlyStableParcelable`
+    (one declared with `rust_type`) without it being `@VintfStability` itself,
+    matching AOSP's stable-API-parcelable exemption (`IsStableApiParcelable`):
+    there is no generated declaration to carry the annotation.
+- **`rsbinder-aidl`: `@deprecated` javadoc is now emitted as `#[deprecated]`.**
+  A `/** @deprecated note */` block above an interface, parcelable, union,
+  enum, method, field, constant, or enumerator becomes `#[deprecated = "note"]`
+  on the generated item (`#[deprecated]` with no note), following AOSP's
+  `FindDeprecated` rules: only the last comment of the preceding run counts,
+  and only when it is a block comment. Generated modules carry a module-scoped
+  `#![allow(deprecated)]` so the generated proxy and dispatch plumbing does not
+  warn about the items it must name; callers outside the module still do.
+
+### Fixed
+
+- **`rsbinder-aidl`: a nested declaration inside a `@VintfStability` type now
+  inherits that stability.** AOSP resolves `@VintfStability` with a scoped
+  lookup that walks to the enclosing type, so a parcelable nested in a
+  `@VintfStability` parcelable is VINTF-stable. rsbinder read only the
+  declaration's own annotations, so such a nested type reported default
+  stability — which is what a `ParcelableHolder` records for it, making this
+  visible on the wire.
+- **`rsbinder-aidl`: a `@VintfStability` interface published through the sync
+  path registered with the default `System` stability.** The generated
+  `declare_binder_interface!` never emitted a `stability:` field, so the macro
+  fell back to `Stability::default()`. Because `System` does not include
+  `Vintf`, a peer requiring VINTF refused the binder — the annotation had no
+  effect at all on a sync service. AOSP emits the field
+  (`generate_rust.cpp`); rsbinder now does too. Parcelables, unions and the
+  async path were already correct.
+- **`rsbinder-aidl`: a type nested three or more levels deep could not name a
+  type from a grandparent scope.** The enclosing-scope walk in
+  `lookup_decl_from_name` stopped after two levels, so a reference AOSP
+  resolves — `AidlDefinedType::ResolveName` recurses with no depth limit — was
+  rejected as an unknown type, and with a misleading message at that. The walk
+  now runs to the package boundary.
 
 ### Migrating from 0.10.0
 

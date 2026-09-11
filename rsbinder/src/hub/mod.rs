@@ -130,6 +130,14 @@ macro_rules! impl_sm_module_body {
         /// (one attempt; not blocking). Use `wait_for_service` to block until
         /// the service appears, or `check_service` for an explicit
         /// non-blocking lookup.
+        // `getService` carries an `@deprecated` javadoc from Android 15 on
+        // ("use getService2"), which the AIDL backend renders as
+        // `#[deprecated]`. This module keeps calling it deliberately: the
+        // `Service` union `getService2` returns has a payload that varies by
+        // release train, so `servicemanager_15` never parses it (see that
+        // module's docs). Scoped to the call, not the crate, so a future
+        // deprecation elsewhere still warns.
+        #[allow(deprecated)]
         pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
             match sm.getService(name) {
                 Ok(result) => result,
@@ -144,6 +152,9 @@ macro_rules! impl_sm_module_body {
         /// collapsing it to `None`, so a waiter can tell "not yet registered"
         /// (`Ok(None)`) from "service manager unreachable" (`Err`) — the
         /// distinction AOSP `realGetService` carries in its `Status`.
+        // See `get_service` for why the deprecated `getService` is the one
+        // this module calls.
+        #[allow(deprecated)]
         pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
             sm.getService(name).map_err(|e| e.into())
         }
@@ -219,6 +230,9 @@ macro_rules! impl_sm_module_body {
             }
         }
 
+        // See `get_service` for why the deprecated `getService` is the one
+        // this module calls.
+        #[allow(deprecated)]
         pub fn get_interface<T: FromIBinder + ?Sized>(
             sm: &BpServiceManager,
             name: &str,

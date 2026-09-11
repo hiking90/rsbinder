@@ -104,6 +104,7 @@ impl SourceGuard {
     pub fn new(filename: &str, source: &str) -> Self {
         CURRENT_SOURCE_NAME.with(|name| *name.borrow_mut() = filename.to_string());
         CURRENT_SOURCE_TEXT.with(|text| *text.borrow_mut() = source.to_string());
+        CURRENT_COMMENTS.with(|spans| *spans.borrow_mut() = scan_comments(source));
         SourceGuard
     }
 }
@@ -112,6 +113,7 @@ impl Drop for SourceGuard {
     fn drop(&mut self) {
         CURRENT_SOURCE_NAME.with(|name| name.borrow_mut().clear());
         CURRENT_SOURCE_TEXT.with(|text| text.borrow_mut().clear());
+        CURRENT_COMMENTS.with(|spans| spans.borrow_mut().clear());
     }
 }
 
@@ -123,6 +125,156 @@ pub fn current_source_name() -> String {
 /// Returns the source text of the currently active source context.
 pub fn current_source_text() -> String {
     CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone())
+}
+
+/// One comment in the source, as [`scan_comments`] found it.
+#[derive(Debug, Clone, Copy)]
+struct CommentSpan {
+    start: usize,
+    end: usize,
+    /// `/* … */` (including `/** … */`). AOSP only reads block comments for
+    /// javadoc tags; a trailing `//` comment detaches the run entirely.
+    is_block: bool,
+}
+
+thread_local! {
+    // Comment index of the source currently being parsed, ascending by start
+    // offset. Built once per `SourceGuard` so `deprecated_at` is a lookup
+    // rather than a rescan per declaration.
+    static CURRENT_COMMENTS: RefCell<Vec<CommentSpan>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Finds every comment in `source`, skipping string and char literals so a
+/// `//` or `/*` inside one is not mistaken for a comment (the AIDL grammar's
+/// `C_STR` and `CHARVALUE` both admit backslash escapes).
+fn scan_comments(source: &str) -> Vec<CommentSpan> {
+    let bytes = source.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                let start = i;
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                spans.push(CommentSpan {
+                    start,
+                    end: i,
+                    is_block: false,
+                });
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                // An unterminated block comment runs to end of input; the
+                // parser rejects the file either way.
+                i = (i + 2).min(bytes.len());
+                spans.push(CommentSpan {
+                    start,
+                    end: i,
+                    is_block: true,
+                });
+            }
+            quote @ (b'"' | b'\'') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    // A backslash escapes the next byte, `\"` included.
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(bytes.len());
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
+/// The `@deprecated` note attached to the item starting at byte offset
+/// `start`, or `None` when it is not deprecated. `Some("")` is a bare
+/// `@deprecated` with no note.
+///
+/// Mirrors AOSP `comments.cpp`: only the **last** comment of the run
+/// immediately preceding the item counts, and only when it is a block
+/// comment — so a trailing `//` line detaches the javadoc above it, exactly
+/// as in AOSP. `start` must be the item's first character *including* its
+/// annotations, since the comment precedes those.
+pub fn deprecated_at(start: usize) -> Option<String> {
+    let span = CURRENT_COMMENTS.with(|spans| {
+        let spans = spans.borrow();
+        let idx = spans.partition_point(|c| c.end <= start);
+        idx.checked_sub(1).map(|i| spans[i])
+    })?;
+    if !span.is_block {
+        return None;
+    }
+    CURRENT_SOURCE_TEXT.with(|text| {
+        let text = text.borrow();
+        // Only whitespace may sit between the comment and the item; anything
+        // else means the comment belongs to something before it.
+        let gap = text.get(span.end..start)?;
+        if !gap.chars().all(char::is_whitespace) {
+            return None;
+        }
+        find_deprecated(text.get(span.start..span.end)?)
+    })
+}
+
+/// AOSP `TrimmedLines` for a block comment: drop the `/*` and `*/` markers,
+/// then per line drop leading whitespace, one optional `*`, and one optional
+/// space, and trim the trailing whitespace.
+fn trimmed_block_lines(body: &str) -> Vec<&str> {
+    let stripped = body.strip_prefix("/*").unwrap_or(body);
+    let stripped = stripped.strip_suffix("*/").unwrap_or(stripped);
+    stripped
+        .split('\n')
+        .map(|line| {
+            let rest = line.trim_start();
+            let rest = rest.strip_prefix('*').unwrap_or(rest);
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            rest.trim_end()
+        })
+        .collect()
+}
+
+/// AOSP `BlockTags` + `FindDeprecated`: a line whose first non-space
+/// character is `@` opens a block tag whose name runs to the first
+/// non-alphabetic character; following non-tag lines extend its description.
+/// The first `@deprecated` wins.
+fn find_deprecated(body: &str) -> Option<String> {
+    let mut tag: Option<&str> = None;
+    let mut paragraph: Vec<&str> = Vec::new();
+
+    for line in trimmed_block_lines(body) {
+        let line = line.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('@') {
+            if tag == Some("deprecated") {
+                return Some(paragraph.join(" "));
+            }
+            let name_len = rest
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_alphabetic())
+                .map_or(rest.len(), |(i, _)| i);
+            let (name, after) = rest.split_at(name_len);
+            tag = Some(name);
+            paragraph.clear();
+            let after = after.strip_prefix(' ').unwrap_or(after);
+            if !after.is_empty() {
+                paragraph.push(after);
+            }
+        } else if tag.is_some() {
+            paragraph.push(line);
+        }
+    }
+
+    (tag == Some("deprecated")).then(|| paragraph.join(" "))
 }
 
 pub struct NamespaceGuard();
@@ -234,9 +386,13 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
             .map(|package| Namespace::new(package, Namespace::AIDL))
     });
 
-    // 1. the current declaration and its enclosing one (a package-less document's empty scope stays).
+    // 1. the current declaration and every enclosing one, outward. AOSP
+    //    `AidlDefinedType::ResolveName` recurses through `GetEnclosingScope()`
+    //    with no depth limit, so a type three levels deep still sees its
+    //    grandparent's siblings. The package guard and `pop()` terminate the
+    //    walk (a package-less document's empty scope stays a candidate).
     let mut curr_ns = current_namespace();
-    for _ in 0..2 {
+    loop {
         if package_ns.as_ref() == Some(&curr_ns) {
             break;
         }
@@ -339,6 +495,46 @@ fn value_members(ns: &Namespace) -> Option<Vec<Declaration>> {
         Some(Declaration::Union(u)) => Some(u.members.clone()),
         _ => None,
     })
+}
+
+/// Is the declaration at `ns` `@VintfStability`, directly or by inheritance
+/// from an enclosing declaration?
+///
+/// `@VintfStability` is a **scoped** annotation in AOSP: `GetScopedAnnotation`
+/// (`aidl_language.cpp`) walks from the type up through its enclosing types,
+/// so a nested declaration inside a `@VintfStability` parcelable is itself
+/// VINTF-stable without repeating the annotation. That matters on the wire —
+/// the stability a parcelable reports is what a `ParcelableHolder` records for
+/// it — so the lookup has to walk, not just read the type's own annotations.
+///
+/// Only declarations nest, so the walk stops at the package boundary of the
+/// document that declares `ns` — `DECLARATION_MAP` is keyed by
+/// `<package>.<name>`, so without that floor a type whose name matches a
+/// package segment (`package a; parcelable b;` beside `package a.b;`) would
+/// hand its annotation to every declaration in that package.
+pub fn is_vintf_scoped(ns: &Namespace) -> bool {
+    let floor = declaration_document_context(ns)
+        .and_then(|ctx| ctx.package)
+        .map_or(0, |package| {
+            Namespace::new(&package, Namespace::AIDL).ns.len()
+        });
+    let mut ns = ns.clone();
+    loop {
+        let found = DECLARATION_MAP.with(|map| {
+            map.borrow()
+                .get(&ns)
+                .map(|decl| has_annotation(decl.annotation_list(), AnnotationType::VintfStability))
+        });
+        match found {
+            Some(true) => return true,
+            Some(false) => {
+                if ns.ns.len() <= floor + 1 || ns.pop().is_none() {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
 }
 
 /// Whether a declaration stores its members by value, without cloning the
@@ -853,6 +1049,9 @@ pub struct VariableDecl {
     pub r#type: Type,
     pub identifier: String,
     pub const_expr: Option<ConstExpr>,
+    /// `@deprecated` note from the preceding javadoc block, if any. `Some("")`
+    /// is a bare tag. See [`deprecated_at`].
+    pub deprecated: Option<String>,
 }
 
 impl VariableDecl {
@@ -885,6 +1084,7 @@ pub struct InterfaceDecl {
     pub method_list: Vec<MethodDecl>,
     pub constant_list: Vec<VariableDecl>,
     pub members: Vec<Declaration>,
+    pub deprecated: Option<String>,
 }
 
 impl InterfaceDecl {
@@ -909,6 +1109,7 @@ pub struct ParcelableDecl {
     pub ndk_header: String,
     pub rust_type: String,
     pub members: Vec<Declaration>,
+    pub deprecated: Option<String>,
     // pub name_dict: Option<HashMap<String, ConstExpr>>,
 }
 
@@ -966,6 +1167,7 @@ pub struct MethodDecl {
     pub arg_list: Vec<Arg>,
     pub intvalue: Option<i64>,
     pub intvalue_span: Option<(usize, usize)>,
+    pub deprecated: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,6 +1215,29 @@ impl Declaration {
             Declaration::Enum(decl) => &decl.name,
             Declaration::Union(decl) => &decl.name,
             _ => unreachable!(),
+        }
+    }
+
+    /// Records the `@deprecated` note resolved from the declaration's leading
+    /// javadoc. Set by the parse sites, which are the only place the
+    /// declaration's own start offset is still in hand.
+    pub fn set_deprecated(&mut self, deprecated: Option<String>) {
+        match self {
+            Declaration::Parcelable(decl) => decl.deprecated = deprecated,
+            Declaration::Interface(decl) => decl.deprecated = deprecated,
+            Declaration::Enum(decl) => decl.deprecated = deprecated,
+            Declaration::Union(decl) => decl.deprecated = deprecated,
+            Declaration::Variable(decl) => decl.deprecated = deprecated,
+        }
+    }
+
+    pub fn annotation_list(&self) -> &[Annotation] {
+        match self {
+            Declaration::Parcelable(decl) => &decl.annotation_list,
+            Declaration::Interface(decl) => &decl.annotation_list,
+            Declaration::Enum(decl) => &decl.annotation_list,
+            Declaration::Union(decl) => &decl.annotation_list,
+            Declaration::Variable(decl) => &decl.annotation_list,
         }
     }
 
@@ -1112,6 +1337,10 @@ pub enum AnnotationType {
     /// Rust backend generates normally.
     JavaOnlyStableParcelable,
     VintfStability,
+    /// `@FixedSize` — every field must itself be fixed size. Unlike
+    /// `@VintfStability` this is **not** scoped: AOSP reads it with the plain
+    /// `GetAnnotation`, so a nested declaration does not inherit it.
+    FixedSize,
 }
 
 /// Returns whether the annotation list contains the queried annotation.
@@ -1122,6 +1351,7 @@ pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType
         AnnotationType::JavaOnlyStableParcelable => {
             annotation.annotation == "@JavaOnlyStableParcelable"
         }
+        AnnotationType::FixedSize => annotation.annotation == "@FixedSize",
     })
 }
 
@@ -2074,21 +2304,26 @@ fn parse_interface_members(
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {
-                interface
-                    .method_list
-                    .push(parse_method_decl(pair.into_inner())?);
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut method = parse_method_decl(pair.into_inner())?;
+                method.deprecated = deprecated;
+                interface.method_list.push(method);
             }
 
             Rule::constant_decl => {
-                interface
-                    .constant_list
-                    .push(parse_variable_decl(pair.into_inner(), true)?);
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut constant = parse_variable_decl(pair.into_inner(), true)?;
+                constant.deprecated = deprecated;
+                interface.constant_list.push(constant);
             }
 
             Rule::decl => {
-                interface
-                    .members
-                    .append(&mut parse_decl(pair.into_inner())?);
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut members = parse_decl(pair.into_inner())?;
+                for member in &mut members {
+                    member.set_deprecated(deprecated.clone());
+                }
+                interface.members.append(&mut members);
             }
 
             _ => unreachable!("Unexpected rule in parse_interface_members(): {}", pair),
@@ -2139,19 +2374,21 @@ fn parse_parcelable_members(
 
     for pair in pairs {
         match pair.as_rule() {
-            Rule::variable_decl => {
-                res.push(Declaration::Variable(parse_variable_decl(
-                    pair.into_inner(),
-                    false,
-                )?));
+            Rule::variable_decl | Rule::constant_decl => {
+                let constant = pair.as_rule() == Rule::constant_decl;
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut var = parse_variable_decl(pair.into_inner(), constant)?;
+                var.deprecated = deprecated;
+                res.push(Declaration::Variable(var));
             }
-            Rule::constant_decl => {
-                res.push(Declaration::Variable(parse_variable_decl(
-                    pair.into_inner(),
-                    true,
-                )?));
+            Rule::decl => {
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut members = parse_decl(pair.into_inner())?;
+                for member in &mut members {
+                    member.set_deprecated(deprecated.clone());
+                }
+                res.append(&mut members);
             }
-            Rule::decl => res.append(&mut parse_decl(pair.into_inner())?),
             _ => unreachable!("Unexpected rule in parse_parcelable_members(): {}", pair),
         }
     }
@@ -2259,6 +2496,7 @@ fn parse_parcelable_decl(
 pub struct Enumerator {
     pub identifier: String,
     pub const_expr: Option<ConstExpr>,
+    pub deprecated: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2282,6 +2520,7 @@ pub struct EnumDecl {
     /// runtime `Tag` struct itself is emitted by the union template in
     /// [`crate::generator`], not from this stub.
     pub tag_of_union: Option<Namespace>,
+    pub deprecated: Option<String>,
 }
 
 fn parse_enumerator(pairs: pest::iterators::Pairs<Rule>) -> Result<Enumerator, AidlError> {
@@ -2331,9 +2570,12 @@ fn parse_enum_decl(
                 enum_decl.name = pair.as_str().into();
                 enum_decl.name_span = Some((span.start(), span.end()));
             }
-            Rule::enumerator => enum_decl
-                .enumerator_list
-                .push(parse_enumerator(pair.into_inner())?),
+            Rule::enumerator => {
+                let deprecated = deprecated_at(pair.as_span().start());
+                let mut enumerator = parse_enumerator(pair.into_inner())?;
+                enumerator.deprecated = deprecated;
+                enum_decl.enumerator_list.push(enumerator);
+            }
             _ => unreachable!("Unexpected rule in parse_enum_decl(): {}", pair),
         }
     }
@@ -2349,6 +2591,7 @@ pub struct UnionDecl {
     pub name_span: Option<(usize, usize)>,
     pub type_params: Vec<String>,
     pub members: Vec<Declaration>,
+    pub deprecated: Option<String>,
 }
 
 fn parse_union_decl(
@@ -2689,7 +2932,12 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                     }
 
                     Rule::decl => {
-                        document.decls.append(&mut parse_decl(pair.into_inner())?);
+                        let deprecated = deprecated_at(pair.as_span().start());
+                        let mut decls = parse_decl(pair.into_inner())?;
+                        for decl in &mut decls {
+                            decl.set_deprecated(deprecated.clone());
+                        }
+                        document.decls.append(&mut decls);
                     }
 
                     Rule::EOI => {}

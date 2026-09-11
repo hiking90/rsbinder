@@ -11,12 +11,20 @@ use crate::error::{AidlError, DuplicateCodeRelated, SemanticError};
 use crate::parser::Direction;
 use crate::{add_indent, parser, Namespace};
 
+// `deprecated`: generated plumbing must name the item it deprecates; the allow
+// is module-scoped, so consumers outside the module still warn.
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
     {{crate}}::declare_binder_enum! {
+        {%- if deprecated %}
+        {{ deprecated }}
+        {%- endif %}
         r#{{enum_name}} : [{{enum_type}}; {{enum_len}}] {
     {%- for member in members %}
+        {%- if member.2 %}
+            {{ member.2 }}
+        {%- endif %}
             r#{{ member.0 }} = {{ member.1 }},
     {%- endfor %}
         }
@@ -26,17 +34,26 @@ pub mod {{mod}} {
 
 const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
     {%- endif %}
+    {%- if deprecated %}
+    {{ deprecated }}
+    {%- endif %}
     pub enum r#{{union_name}} {
     {%- for member in members %}
+        {%- if member.5 %}
+        {{ member.5 }}
+        {%- endif %}
         r#{{ member.0 }}({{ member.1 }}),
     {%- endfor %}
     }
     {%- for member in const_members %}
+    {%- if member.3 %}
+    {{ member.3 }}
+    {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     impl Default for r#{{union_name}} {
@@ -107,16 +124,25 @@ pub mod {{mod}} {
 
 const PARCELABLE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     {%- for member in const_members %}
+    {%- if member.3 %}
+    {{ member.3 }}
+    {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
     {%- endif %}
+    {%- if deprecated %}
+    {{ deprecated }}
+    {%- endif %}
     pub struct {{name}} {
     {%- for member in members %}
+        {%- if member.deprecated %}
+        {{ member.deprecated }}
+        {%- endif %}
         pub r#{{ member.identifier }}: {{ member.type_decl }},
     {%- endfor %}
     }
@@ -175,8 +201,11 @@ pub mod {{mod}} {
 
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     {%- for member in const_members %}
+    {%- if member.3 %}
+    {{ member.3 }}
+    {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
     {%- if version %}
@@ -191,9 +220,15 @@ pub mod {{mod}} {
     /// responsibility).
     pub const HASH: &str = "{{ hash }}";
     {%- endif %}
+    {%- if deprecated %}
+    {{ deprecated }}
+    {%- endif %}
     pub trait {{name}}: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
+        {%- if member.deprecated %}
+        {{ member.deprecated }}
+        {%- endif %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
         {%- if version %}
@@ -225,9 +260,15 @@ pub mod {{mod}} {
     /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
     /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
     /// for `Tokio`, `tokio`) feature.
+    {%- if deprecated %}
+    {{ deprecated }}
+    {%- endif %}
     pub trait {{name}}Async<P>: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
+        {%- if member.deprecated %}
+        {{ member.deprecated }}
+        {%- endif %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
         {%- if version %}
@@ -247,10 +288,16 @@ pub mod {{mod}} {
     /// Asynchronous **server** view of `{{name}}`: implement this (with
     /// `#[async_trait]`) on your service, then wrap it with
     /// [`{{bn_name}}::new_async_binder`] to publish it as a binder.
+    {%- if deprecated %}
+    {{ deprecated }}
+    {%- endif %}
     #[{{crate}}::__async_trait]
     pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
+        {%- if member.deprecated %}
+        {{ member.deprecated }}
+        {%- endif %}
         async fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
     }
@@ -383,6 +430,9 @@ pub mod {{mod}} {
             {%- endif %}
             {%- if enabled_async %}
             r#async: {{ name }}Async,
+            {%- endif %}
+            {%- if is_vintf %}
+            stability: {{crate}}::Stability::Vintf,
             {%- endif %}
         }
     }
@@ -691,12 +741,14 @@ fn template() -> &'static tera::Tera {
 
 // Union has no render entry point — `decl_union` renders directly.
 
-/// One generated constant: `(identifier, type declaration, initializer)`.
+/// One generated constant: `(identifier, type declaration, initializer,
+/// deprecation attribute)`. The last element is the rendered
+/// `#[deprecated…]` line, or empty.
 ///
 /// A positional tuple, not a struct: the templates index it by position, so
 /// unlike [`InterfaceRender`] and friends its shape is fixed — growing it is a
 /// breaking change for any front-end that fills it.
-pub type ConstMember = (String, String, String);
+pub type ConstMember = (String, String, String, String);
 
 /// One parcelable field.
 ///
@@ -717,6 +769,8 @@ pub struct ParcelableMember {
     /// `Default`, which must unwrap to `UNEXPECTED_NULL` on write rather than
     /// emit a null marker.
     pub needs_unexpected_null: bool,
+    /// Rendered `#[deprecated…]` attribute for the field, or empty.
+    pub deprecated: String,
 }
 
 impl ParcelableMember {
@@ -732,14 +786,49 @@ impl ParcelableMember {
             init: init.into(),
             is_holder: false,
             needs_unexpected_null: false,
+            deprecated: String::new(),
         }
     }
 }
 
-/// One enum variant: `(identifier, discriminant)`.
+/// One enum variant: `(identifier, discriminant, deprecation attribute)`. The
+/// last element is the rendered `#[deprecated…]` line, or empty.
 ///
 /// Positional and therefore fixed in shape, as [`ConstMember`] is.
-pub type EnumMember = (String, i64);
+pub type EnumMember = (String, i64, String);
+
+/// Renders an AIDL `@deprecated` javadoc tag into the Rust attribute AOSP's
+/// Rust backend emits (`generate_rust.cpp` `GenerateDeprecated`): a bare
+/// `#[deprecated]` when the tag carries no note, `#[deprecated = "note"]`
+/// otherwise. `None` renders to the empty string.
+pub fn deprecated_attr(note: Option<&String>) -> String {
+    match note {
+        None => String::new(),
+        Some(note) if note.is_empty() => "#[deprecated]".to_string(),
+        Some(note) => format!("#[deprecated = {}]", quote_rust_string(note)),
+    }
+}
+
+/// Quotes `s` as a Rust string literal. The note comes from a comment, which
+/// the AIDL grammar does not constrain at all, so every character that cannot
+/// sit in a literal is escaped.
+fn quote_rust_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// AOSP `ClassName` (`aidl_to_cpp_common.cpp`): the `Bn`/`Bp` stem strips a
 /// leading `I` only when an uppercase letter follows, so `interface Foo3`
@@ -786,6 +875,8 @@ pub struct InterfaceRender {
     pub version: Option<i32>,
     /// Stable-AIDL `--hash <s>`, echoed verbatim. Independent of `version`.
     pub hash: Option<String>,
+    /// Rendered `#[deprecated…]` attribute for the interface, or empty.
+    pub deprecated: String,
 }
 
 /// `crate_name` defaults to `"rsbinder"`, not the empty string a derived
@@ -808,6 +899,7 @@ impl Default for InterfaceRender {
             is_vintf: false,
             version: None,
             hash: None,
+            deprecated: String::new(),
         }
     }
 }
@@ -824,6 +916,7 @@ impl Default for ParcelableRender {
             const_members: Vec::new(),
             nested: String::new(),
             is_vintf: false,
+            deprecated: String::new(),
         }
     }
 }
@@ -836,6 +929,7 @@ impl Default for EnumRender {
             name: String::new(),
             backing_type: String::new(),
             members: Vec::new(),
+            deprecated: String::new(),
         }
     }
 }
@@ -919,6 +1013,7 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     // its key is set, matching AOSP's per-flag conditional.
     context.insert("version", &r.version);
     context.insert("hash", &r.hash);
+    context.insert("deprecated", &r.deprecated);
 
     template()
         .render("interface", &context)
@@ -945,6 +1040,8 @@ pub struct ParcelableRender {
     pub const_members: Vec<ConstMember>,
     pub nested: String,
     pub is_vintf: bool,
+    /// Rendered `#[deprecated…]` attribute for the parcelable, or empty.
+    pub deprecated: String,
 }
 
 /// Render one parcelable module (`pub mod {module} { pub struct {name} … }`).
@@ -959,6 +1056,7 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
     context.insert("const_members", &r.const_members);
     context.insert("nested", &r.nested);
     context.insert("is_vintf", &r.is_vintf);
+    context.insert("deprecated", &r.deprecated);
 
     template()
         .render("parcelable", &context)
@@ -981,6 +1079,8 @@ pub struct EnumRender {
     /// Backing Rust type (`i8` / `i32` / `i64`).
     pub backing_type: String,
     pub members: Vec<EnumMember>,
+    /// Rendered `#[deprecated…]` attribute for the enum, or empty.
+    pub deprecated: String,
 }
 
 /// Render one backed-enum module.
@@ -992,6 +1092,7 @@ pub fn render_enum(r: &EnumRender) -> Result<String, AidlError> {
     context.insert("enum_type", &r.backing_type);
     context.insert("enum_len", &r.members.len());
     context.insert("members", &r.members);
+    context.insert("deprecated", &r.deprecated);
 
     template()
         .render("enum", &context)
@@ -1073,6 +1174,8 @@ pub struct FnMembers {
     /// (AOSP `EX_SECURITY`) on permission denial. `None` when the
     /// method carries no `@EnforcePermission`.
     pub enforce_permission_check: Option<String>,
+    /// Rendered `#[deprecated…]` attribute for the method, or empty.
+    pub deprecated: String,
 }
 
 impl FnMembers {
@@ -1087,7 +1190,14 @@ impl FnMembers {
     }
 }
 
-fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMembers, AidlError> {
+/// `vintf_owner` is `Some(interface name)` when the enclosing interface is
+/// `@VintfStability`, which makes every type in the method signature part of
+/// the VINTF reference closure.
+fn make_fn_member(
+    method: &parser::MethodDecl,
+    crate_name: &str,
+    vintf_owner: Option<&str>,
+) -> Result<FnMembers, AidlError> {
     let mut func_call_params = String::new();
     let mut args = "&self".to_string();
     let mut args_async = "&'a self".to_string();
@@ -1097,9 +1207,50 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
     let mut transaction_params = String::new();
     let mut read_onto_params = Vec::new();
 
+    let mut arg_names = std::collections::HashSet::new();
+
     for arg in &method.arg_list {
         let generator = arg.to_generator()?;
         generator.ensure_resolvable()?;
+
+        // AOSP `AidlMethod::CheckValid`: duplicate argument names. Both would
+        // render as the same `_arg_<name>` binding, so without this the defect
+        // surfaces as rustc E0415 in the consumer's crate.
+        if !arg_names.insert(arg.identifier.as_str()) {
+            return Err(Generator::decl_error(
+                format!(
+                    "method '{}' has a duplicate argument name '{}'",
+                    method.identifier, arg.identifier
+                ),
+                generator.type_span(),
+            ));
+        }
+        // AOSP `AidlMethod::CheckValid`: `void` is a return type only.
+        if generator.is_void() {
+            return Err(Generator::decl_error(
+                format!(
+                    "'void' is an invalid type for the parameter '{}'",
+                    arg.identifier
+                ),
+                generator.type_span(),
+            ));
+        }
+        // AOSP `AidlArgument::CheckValid` (`aidl_language.cpp`):
+        // `AidlTypenames::GetArgumentAspect` hands `ParcelableHolder` an empty
+        // direction set, so `in`/`out`/`inout` are all refused — a holder is a
+        // field type only (b/156872582).
+        if generator.is_parcelable_holder() {
+            return Err(Generator::decl_error(
+                format!(
+                    "ParcelableHolder cannot be an argument type ('{}')",
+                    arg.identifier
+                ),
+                generator.type_span(),
+            ));
+        }
+        if let Some(owner) = vintf_owner {
+            Generator::ensure_vintf_closure(&generator, "interface", owner)?;
+        }
 
         let type_decl_for_func = generator.type_decl_for_func()?;
 
@@ -1188,6 +1339,22 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
         };
     generator.ensure_resolvable()?;
 
+    // AOSP `AidlMethod::CheckValid`: a `ParcelableHolder` return value has no
+    // representation in the C++/NDK backends, so the contract is rejected
+    // rather than made unimplementable for a peer.
+    if generator.is_parcelable_holder() {
+        return Err(Generator::decl_error(
+            format!(
+                "method '{}': ParcelableHolder cannot be a return type",
+                method.identifier
+            ),
+            generator.type_span(),
+        ));
+    }
+    if let Some(owner) = vintf_owner {
+        Generator::ensure_vintf_closure(&generator, "interface", owner)?;
+    }
+
     let return_type = generator.type_declaration(false);
     let transaction_has_return = return_type != "()";
 
@@ -1213,6 +1380,7 @@ fn make_fn_member(method: &parser::MethodDecl, crate_name: &str) -> Result<FnMem
         transaction_code: method.intvalue.unwrap_or(0) as u32,
         has_explicit_code: method.intvalue.is_some(),
         enforce_permission_check,
+        deprecated: deprecated_attr(method.deprecated.as_ref()),
     })
 }
 
@@ -1519,6 +1687,124 @@ impl Generator {
         .into()
     }
 
+    /// AOSP `AidlVariableDeclaration::CheckValid` (`aidl_language.cpp`): no
+    /// declaration — parcelable field, union member, or interface constant —
+    /// may have type `void`. The array and nullable forms are already
+    /// rejected in `TypeGenerator::new_with_type`.
+    fn ensure_declarable(
+        generator: &crate::type_generator::TypeGenerator,
+        owner: &str,
+        identifier: &str,
+    ) -> Result<(), AidlError> {
+        if generator.is_void() {
+            return Err(Self::decl_error(
+                format!(
+                    "'{owner}': declaration '{identifier}' is void, but declarations \
+                     cannot be of void type"
+                ),
+                generator.type_span(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the `(NamedSource, SourceSpan)` pair a declaration-level
+    /// diagnostic needs from a span in the current source.
+    fn diagnostic_at(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
+        let (start, end) = span.unwrap_or((0, 0));
+        let source = parser::current_source_text();
+        let (start, end) = if source.is_empty() {
+            (start, end)
+        } else {
+            let start = start.min(source.len());
+            (start, end.clamp(start, source.len()))
+        };
+        (
+            NamedSource::new(parser::current_source_name(), source),
+            SourceSpan::new(start.into(), end - start),
+        )
+    }
+
+    /// AOSP `AidlParcelable::CheckValid`: every field of a `@FixedSize`
+    /// parcelable or union must itself be fixed size.
+    fn ensure_fixed_size_field(
+        generator: &crate::type_generator::TypeGenerator,
+        kind: &'static str,
+        owner: &str,
+        field: &str,
+    ) -> Result<(), AidlError> {
+        if generator.can_be_fixed_size() {
+            return Ok(());
+        }
+        let (src, span) = Self::diagnostic_at(generator.type_span());
+        Err(SemanticError::FixedSizeNonFixedField {
+            kind,
+            owner: owner.to_owned(),
+            field: field.to_owned(),
+            src,
+            span,
+        }
+        .into())
+    }
+
+    /// A constant's type must be one that has a constant form. See
+    /// [`TypeGenerator::is_supported_constant_type`] for how this relates to
+    /// AOSP's stricter set.
+    fn ensure_constant_type(
+        generator: &crate::type_generator::TypeGenerator,
+        owner: &str,
+        identifier: &str,
+    ) -> Result<(), AidlError> {
+        if generator.is_supported_constant_type() {
+            return Ok(());
+        }
+        Err(Self::decl_error(
+            format!(
+                "'{owner}': constant '{identifier}' has an unsupported type — a constant \
+                 must be a primitive or String (or an array of those)"
+            ),
+            generator.type_span(),
+        ))
+    }
+
+    /// A `@VintfStability` declaration may only name `@VintfStability` types —
+    /// the reference closure AOSP's compilation-wide `stability: "vintf"`
+    /// (`aidl.cpp`) implies, rsbinder having no such mode.
+    fn ensure_vintf_closure(
+        generator: &crate::type_generator::TypeGenerator,
+        kind: &'static str,
+        owner: &str,
+    ) -> Result<(), AidlError> {
+        for name in generator.referenced_user_types() {
+            let Some(lookup) = parser::lookup_decl_from_name(name, Namespace::AIDL) else {
+                continue;
+            };
+            if parser::is_vintf_scoped(&lookup.ns) {
+                continue;
+            }
+            // AOSP exempts a stable-API parcelable from the stability sweep
+            // (`aidl.cpp`, `IsStableApiParcelable`). For the Rust backend that
+            // is `@RustOnlyStableParcelable`, whose Rust type is supplied by
+            // `rust_type` rather than generated — there is no declaration to
+            // annotate `@VintfStability`.
+            if matches!(&lookup.decl, parser::Declaration::Parcelable(decl)
+                if !decl.rust_type.is_empty())
+            {
+                continue;
+            }
+            let (src, span) = Self::diagnostic_at(generator.type_span());
+            return Err(SemanticError::VintfStabilityLeak {
+                kind,
+                owner: owner.to_owned(),
+                referenced: lookup.ns.to_string(Namespace::AIDL),
+                src,
+                span,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn decl_interface(
         &self,
         arg_decl: &parser::InterfaceDecl,
@@ -1539,10 +1825,14 @@ impl Generator {
                 decl.name_span,
             ));
         }
+        // Scoped, not local: a nested declaration inherits `@VintfStability`
+        // from its enclosing type (AOSP `GetScopedAnnotation`). The
+        // declaration's own annotation is read directly so the answer never
+        // depends on the declaration map being populated.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        );
+        ) || parser::is_vintf_scoped(&decl.namespace);
 
         decl.pre_process();
 
@@ -1564,6 +1854,8 @@ impl Generator {
         for constant in decl.constant_list.iter() {
             let generator = constant.r#type.to_generator()?;
             generator.ensure_resolvable()?;
+            Self::ensure_declarable(&generator, &decl.name, &constant.identifier)?;
+            Self::ensure_constant_type(&generator, &decl.name, &constant.identifier)?;
             const_members.push((
                 constant.const_identifier(),
                 generator.const_type_decl()?,
@@ -1571,13 +1863,15 @@ impl Generator {
                     constant.const_expr.as_ref(),
                     InitParam::builder().with_const(true),
                 )?,
+                deprecated_attr(constant.deprecated.as_ref()),
             ));
         }
 
         validate_transaction_codes(&decl)?;
 
+        let vintf_owner = is_vintf.then_some(decl.name.as_str());
         for method in decl.method_list.iter() {
-            fn_members.push(make_fn_member(method, self.get_crate_name())?);
+            fn_members.push(make_fn_member(method, self.get_crate_name(), vintf_owner)?);
         }
 
         let nested = &self.declarations(&decl.members, indent + 1)?;
@@ -1609,6 +1903,7 @@ impl Generator {
             // generator.
             version: self.version,
             hash: self.hash.clone(),
+            deprecated: deprecated_attr(decl.deprecated.as_ref()),
         })?;
 
         Ok(add_indent(indent, rendered.trim()))
@@ -1621,10 +1916,14 @@ impl Generator {
     ) -> Result<String, AidlError> {
         let mut decl = arg_decl.clone();
 
+        // Scoped, not local: a nested declaration inherits `@VintfStability`
+        // from its enclosing type (AOSP `GetScopedAnnotation`). The
+        // declaration's own annotation is read directly so the answer never
+        // depends on the declaration map being populated.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        );
+        ) || parser::is_vintf_scoped(&decl.namespace);
 
         // An unstructured parcelable that names its `rust_type` is
         // representable: emit the alias and ignore the Java/NDK/C++ markers
@@ -1633,7 +1932,7 @@ impl Generator {
             let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     pub type {name} = {rust_type};
 }}
 "#, mod = escaped, name = escaped, rust_type = decl.rust_type);
@@ -1676,12 +1975,34 @@ pub mod {mod} {{
         let mut members = Vec::new();
         let mut declarations = Vec::new();
 
+        let owner_name = decl.name.clone();
+        // Not scoped: a nested parcelable does not inherit `@FixedSize`.
+        let is_fixed_size =
+            parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
+
         // Parse struct variables only.
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
                 let generator = var.r#type.to_generator()?;
                 generator.ensure_resolvable()?;
                 generator.ensure_sized()?;
+                Self::ensure_declarable(&generator, &owner_name, &var.identifier)?;
+                if var.constant {
+                    Self::ensure_constant_type(&generator, &owner_name, &var.identifier)?;
+                }
+                if !var.constant {
+                    if is_fixed_size {
+                        Self::ensure_fixed_size_field(
+                            &generator,
+                            "parcelable",
+                            &owner_name,
+                            &var.identifier,
+                        )?;
+                    }
+                    if is_vintf {
+                        Self::ensure_vintf_closure(&generator, "parcelable", &owner_name)?;
+                    }
+                }
 
                 if var.constant {
                     constant_members.push((
@@ -1691,6 +2012,7 @@ pub mod {mod} {{
                             var.const_expr.as_ref(),
                             InitParam::builder().with_const(true),
                         )?,
+                        deprecated_attr(var.deprecated.as_ref()),
                     ));
                 } else {
                     let init_value = match generator.value_type {
@@ -1710,6 +2032,7 @@ pub mod {mod} {{
                         )?,
                         is_holder: matches!(generator.value_type, ValueType::Holder),
                         needs_unexpected_null: generator.is_option_but_not_nullable(),
+                        deprecated: deprecated_attr(var.deprecated.as_ref()),
                     })
                 }
             } else {
@@ -1735,6 +2058,7 @@ pub mod {mod} {{
             const_members: constant_members,
             nested: nested.trim().to_string(),
             is_vintf,
+            deprecated: deprecated_attr(decl.deprecated.as_ref()),
         })?;
 
         Ok(add_indent(indent, rendered.trim()))
@@ -1829,7 +2153,11 @@ pub mod {mod} {{
                         "{value} does not fit the '{backing}' backing type ({min}..={max})"
                     )));
                 }
-                members.push((enumerator.identifier.to_owned(), value));
+                members.push((
+                    enumerator.identifier.to_owned(),
+                    value,
+                    deprecated_attr(enumerator.deprecated.as_ref()),
+                ));
             }
         }
 
@@ -1844,6 +2172,7 @@ pub mod {mod} {{
                 .direction(&Direction::None)?
                 .type_declaration(true),
             members,
+            deprecated: deprecated_attr(decl.deprecated.as_ref()),
         })?;
 
         Ok(add_indent(indent, rendered.trim()))
@@ -1864,10 +2193,18 @@ pub mod {mod} {{
             ));
         }
 
+        // Scoped, not local: a nested declaration inherits `@VintfStability`
+        // from its enclosing type (AOSP `GetScopedAnnotation`). The
+        // declaration's own annotation is read directly so the answer never
+        // depends on the declaration map being populated.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
-        );
+        ) || parser::is_vintf_scoped(&decl.namespace);
+
+        // Not scoped: a nested union does not inherit `@FixedSize`.
+        let is_fixed_size =
+            parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
 
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
@@ -1878,6 +2215,35 @@ pub mod {mod} {{
                 let generator = var.r#type.to_generator()?;
                 generator.ensure_resolvable()?;
                 generator.ensure_sized()?;
+                Self::ensure_declarable(&generator, &decl.name, &var.identifier)?;
+                if var.constant {
+                    Self::ensure_constant_type(&generator, &decl.name, &var.identifier)?;
+                }
+                if !var.constant {
+                    // AOSP `AidlUnionDecl::CheckValid`: a union member cannot be
+                    // a `ParcelableHolder` (b/170807936). Only fields are
+                    // restricted; a `const` never has a holder type anyway.
+                    if generator.is_parcelable_holder() {
+                        return Err(Self::decl_error(
+                            format!(
+                                "union '{}' cannot have a member of ParcelableHolder '{}'",
+                                decl.name, var.identifier
+                            ),
+                            generator.type_span(),
+                        ));
+                    }
+                    if is_fixed_size {
+                        Self::ensure_fixed_size_field(
+                            &generator,
+                            "union",
+                            &decl.name,
+                            &var.identifier,
+                        )?;
+                    }
+                    if is_vintf {
+                        Self::ensure_vintf_closure(&generator, "union", &decl.name)?;
+                    }
+                }
                 if var.constant {
                     constant_members.push((
                         var.const_identifier(),
@@ -1886,6 +2252,7 @@ pub mod {mod} {{
                             var.const_expr.as_ref(),
                             InitParam::builder().with_const(true),
                         )?,
+                        deprecated_attr(var.deprecated.as_ref()),
                     ));
                 } else {
                     // Honor an explicit `= EnumType.VARIANT` default; the union's
@@ -1912,6 +2279,7 @@ pub mod {mod} {{
                         // needs_unexpected_null: see
                         // `TypeGenerator::is_option_but_not_nullable` rustdoc.
                         generator.is_option_but_not_nullable(),
+                        deprecated_attr(var.deprecated.as_ref()),
                     ));
                 }
             } else {
@@ -1919,9 +2287,20 @@ pub mod {mod} {{
             }
         }
 
+        // AOSP `AidlUnionDecl::CheckValid` (`aidl_language.cpp`): a union needs
+        // at least one field. `const`-only members do not count — the rendered
+        // enum would be uninhabited, so its `Default` impl has nothing to
+        // return and the `write_to_parcel` match has no arm behind `&Self`.
+        if members.is_empty() {
+            return Err(Self::decl_error(
+                format!("the union '{}' has no fields", decl.name),
+                decl.name_span,
+            ));
+        }
+
         let mut seen_variants: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
-        for (variant, _, field, _, _) in &members {
+        for (variant, _, field, _, _, _) in &members {
             if let Some(previous) = seen_variants.insert(variant, field) {
                 return Err(Self::decl_error(
                     format!(
@@ -1950,6 +2329,7 @@ pub mod {mod} {{
         context.insert("const_members", &constant_members);
         context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);
+        context.insert("deprecated", &deprecated_attr(decl.deprecated.as_ref()));
 
         let rendered = template()
             .render("union", &context)
