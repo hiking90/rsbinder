@@ -1,0 +1,41 @@
+error: `u32` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i32`
+ --> tests/ui/unrenderable_scalar.rs:5:20
+  |
+5 |     fn f(&self, n: u32) -> rsbinder::BinderResult<()>;
+  |                    ^^^
+
+error: `u128` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i64`, the widest scalar AIDL has
+  --> tests/ui/unrenderable_scalar.rs:10:20
+   |
+10 |     fn f(&self, n: u128) -> rsbinder::BinderResult<()>;
+   |                    ^^^^
+
+error: `u64` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i64`, the widest scalar AIDL has
+  --> tests/ui/unrenderable_scalar.rs:15:43
+   |
+15 |     fn f(&self) -> rsbinder::BinderResult<u64>;
+   |                                           ^^^
+
+error: `u32` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i32`
+  --> tests/ui/unrenderable_scalar.rs:20:22
+   |
+20 |     fn f(&self, v: &[u32]) -> rsbinder::BinderResult<()>;
+   |                      ^^^
+
+error: `u8` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i8` (`.aidl`'s `byte`; `u8` is the element spelling, as in `&[u8]`)
+  --> tests/ui/unrenderable_scalar.rs:25:20
+   |
+25 |     fn f(&self, n: u8) -> rsbinder::BinderResult<()>;
+   |                    ^^
+
+error: `i8` is not the element spelling `.aidl` renders — a `byte[]` element is `u8` (`i8` is the scalar spelling, as in a bare `byte`), so the equivalent `.aidl` would render `u8` here and a call site written against one does not take the other; use `u8`
+  --> tests/ui/unrenderable_scalar.rs:30:22
+   |
+30 |     fn f(&self, v: &[i8]) -> rsbinder::BinderResult<()>;
+   |                      ^^
+
+error: `u128` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a different Rust type here; use `i64`, the widest scalar AIDL has
+  --> tests/ui/unrenderable_scalar.rs:35:12
+   |
+35 |     pub n: u128,
+   |            ^^^^

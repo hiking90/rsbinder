@@ -19,26 +19,34 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             format!("generated code did not parse ({e}); generated source follows:\n{rendered}"),
         )
     })?;
-    let Some(syn::Item::Mod(module)) = file.items.into_iter().next() else {
+    let mut top = file.items.into_iter();
+    let (Some(syn::Item::Mod(module)), None) = (top.next(), top.next()) else {
         return Err(syn::Error::new_spanned(
             &input.ident,
             "generated code was not a single module (generator contract changed)",
         ));
     };
+    // Only what the codec can raise: the template's blanket allow would clash with a `forbid`.
+    let deprecated = input.attrs.iter().any(|a| a.path().is_ident("deprecated"))
+        || matches!(&input.data, Data::Struct(s)
+            if s.fields.iter().any(|f| f.attrs.iter().any(|a| a.path().is_ident("deprecated"))));
+    let allow = deprecated.then(|| quote!(#[allow(deprecated)]));
     let items = module.content.map(|(_, items)| items).unwrap_or_default();
 
-    // A derive adds to a type, it cannot redeclare it: keep the codec, drop
-    // the struct and `Default` that the user writes.
+    // A derive cannot redeclare the struct or its `Default`; keep only the codec.
     let kept: Vec<_> = items.into_iter().filter(is_codec_item).collect();
 
     // The retained `impl_deserialize_for_parcelable!` calls `Self::default`.
     let name = &input.ident;
     Ok(quote! {
-        const _: fn() = || {
-            fn __rsbinder_assert_default<T: ::core::default::Default>() {}
-            __rsbinder_assert_default::<#name>();
+        #allow
+        const _: () = {
+            const _: fn() = || {
+                fn __rsbinder_assert_default<T: ::core::default::Default>() {}
+                __rsbinder_assert_default::<#name>();
+            };
+            #(#kept)*
         };
-        #(#kept)*
     })
 }
 
@@ -53,8 +61,7 @@ fn is_codec_item(item: &syn::Item) -> bool {
     }
 }
 
-/// The parcelable module source, before the non-codec items are dropped —
-/// split out so the golden test can hold it against the `.aidl` output.
+/// The module source before the non-codec items are dropped, split out for the golden test.
 pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -81,62 +88,33 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
         // `Ident`'s `Display` keeps the `r#`, and the template adds its own.
         let raw = field.ident.as_ref().expect("named field").to_string();
         let ident = crate::strip_raw(&raw).to_string();
-        if matches!(type_str::unwrap_group(&field.ty), syn::Type::Reference(_)) {
+        // rustc accepts the helper on a field too, but only the struct's is read.
+        if let Some(attr) = field.attrs.iter().find(|a| a.path().is_ident("parcelable")) {
             return Err(syn::Error::new_spanned(
-                &field.ty,
-                "a parcelable field cannot be a reference — it owns what it carries",
+                attr,
+                "#[parcelable(..)] belongs on the struct, not on a field",
             ));
         }
-        reject_parcelable_holder(&field.ty)?;
+        // The one gate every position shares, answered for a field.
+        type_str::check_type_at(&field.ty, type_str::Place::Field)?;
         let decl = type_str::as_written_in(&field.ty, type_str::Ctx::Parcelable)?;
         // Read only by the `impl Default` that is dropped below.
-        members.push(ParcelableMember::new(ident, decl, "Default::default()"));
+        let mut member = ParcelableMember::new(ident, decl, "Default::default()");
+        member.deprecated = crate::deprecated_of(&field.attrs)?;
+        members.push(member);
     }
 
-    // The descriptor goes on the wire — `ParcelableHolder` records it as the
-    // holder's name and compares it on read — so a raw identifier must shed
-    // its `r#` exactly as the `.aidl` path does, which spells `parcelable
-    // type` as `"type"`.
+    // A wire name (`ParcelableHolder` compares it), so `r#` is shed as `.aidl` does.
     let descriptor = crate::attr_descriptor(&input.attrs, "parcelable")?
         .unwrap_or_else(|| crate::strip_raw(&input.ident.to_string()).to_string());
 
     let mut render = ParcelableRender::new(input.ident.to_string(), descriptor);
     render.members = members;
+    render.deprecated = crate::deprecated_of(&input.attrs)?;
 
     render_parcelable(&render)
         .map(|s| s.trim().to_string())
         .map_err(|e| syn::Error::new_spanned(&input.ident, format!("codegen failed: {e}")))
-}
-
-/// A holder's stability is set before the read, and the derived codec replaces
-/// the whole field — a peer's `@VintfStability` holder could never be decoded.
-/// Matched structurally so `Option<rsbinder::ParcelableHolder>` is caught too.
-fn reject_parcelable_holder(ty: &syn::Type) -> syn::Result<()> {
-    if !mentions_parcelable_holder(ty) {
-        return Ok(());
-    }
-    Err(syn::Error::new_spanned(
-        ty,
-        "a `ParcelableHolder` field needs the `.aidl` path: its stability is set before \
-         the read and the derived codec would replace the whole field, so a peer's \
-         `@VintfStability` holder can never be decoded",
-    ))
-}
-
-fn mentions_parcelable_holder(ty: &syn::Type) -> bool {
-    match type_str::unwrap_group(ty) {
-        syn::Type::Path(p) => p.path.segments.iter().any(|seg| {
-            seg.ident == "ParcelableHolder" || match &seg.arguments {
-                syn::PathArguments::AngleBracketed(args) => args.args.iter().any(
-                    |a| matches!(a, syn::GenericArgument::Type(t) if mentions_parcelable_holder(t)),
-                ),
-                _ => false,
-            }
-        }),
-        syn::Type::Slice(s) => mentions_parcelable_holder(&s.elem),
-        syn::Type::Array(a) => mentions_parcelable_holder(&a.elem),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -178,6 +156,161 @@ mod tests {
         assert!(err.to_string().contains("reference"), "{err}");
     }
 
+    /// Owned all the way down: a nested borrow has nothing to decode into.
+    #[test]
+    fn rejects_a_nested_reference_field() {
+        for tokens in [
+            quote! { struct Bad { s: Option<&'static str> } },
+            quote! { struct Bad { s: Vec<&'static str> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains("borrowed type nested"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_nullable_primitive_field() {
+        for tokens in [
+            quote! { struct Bad { x: Option<i32> } },
+            quote! { struct Bad { x: Vec<Option<i32>> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains("cannot be nullable"), "{err}");
+        }
+    }
+
+    /// The field axis reaches the scalar gate the signature reaches.
+    #[test]
+    fn rejects_scalars_aidl_never_renders_in_a_field() {
+        for (tokens, needle) in [
+            (quote! { struct Bad { n: u128 } }, "`u128`"),
+            (quote! { struct Bad { n: u32 } }, "`u32`"),
+            (quote! { struct Bad { n: u8 } }, "`u8`"),
+            (quote! { struct Bad { v: Vec<i8> } }, "element spelling"),
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // Every scalar `.aidl` renders for a field, plus `u8` as a `byte[]` element.
+        source(quote! {
+            struct Fine {
+                a: bool,
+                b: i8,
+                c: i32,
+                d: i64,
+                e: f32,
+                f: f64,
+                g: u16,
+                h: Vec<u8>,
+            }
+        });
+    }
+
+    /// `.aidl` refuses `void` as a field, and rustc would blame generated tokens.
+    #[test]
+    fn rejects_a_unit_field() {
+        let input: DeriveInput = syn::parse2(quote! { struct Bad { a: () } }).unwrap();
+        let err = render_source(&input).unwrap_err();
+        assert!(err.to_string().contains("`()` has no wire form"), "{err}");
+    }
+
+    /// `.aidl` renders a binder or fd field as `Option<_>`, `@nullable` or not.
+    #[test]
+    fn rejects_a_bare_binder_or_fd_field() {
+        for tokens in [
+            quote! { struct Bad { fd: rsbinder::ParcelFileDescriptor } },
+            quote! { struct Bad { b: rsbinder::SIBinder } },
+            quote! { struct Bad { cb: rsbinder::Strong<dyn IFoo> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(
+                err.to_string().contains("renders this as `Option<"),
+                "{err}"
+            );
+        }
+        // The spelling `.aidl` renders, and the variable array it leaves bare.
+        source(quote! {
+            struct Fine {
+                fd: Option<rsbinder::ParcelFileDescriptor>,
+                b: Option<rsbinder::SIBinder>,
+                cb: Option<rsbinder::Strong<dyn IFoo>>,
+                fds: Vec<rsbinder::ParcelFileDescriptor>,
+            }
+        });
+    }
+
+    /// A field array answers the element rules on its own axis, not the `in` one.
+    #[test]
+    fn rejects_array_elements_aidl_spells_the_other_way_in_a_field() {
+        for (tokens, needle) in [
+            (
+                quote! { struct Bad { tags: Option<Vec<String>> } },
+                "a nullable parcelable field array",
+            ),
+            // A fixed-size `in` array keeps them bare; a field's does not.
+            (
+                quote! { struct Bad { slots: Option<[String; 3]> } },
+                "a nullable parcelable field array",
+            ),
+            (
+                quote! { struct Bad { tags: Vec<Option<String>> } },
+                "a parcelable field array cannot have",
+            ),
+            (
+                quote! { struct Bad { fds: [rsbinder::ParcelFileDescriptor; 3] } },
+                "a fixed-size parcelable field array",
+            ),
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // The spellings `.aidl` renders for those same shapes.
+        source(quote! {
+            struct Fine {
+                tags: Option<Vec<Option<String>>>,
+                slots: Option<[Option<String>; 3]>,
+                names: Vec<String>,
+                bare: [String; 3],
+                fds: [Option<rsbinder::ParcelFileDescriptor>; 3],
+                blob: Option<Vec<u8>>,
+            }
+        });
+    }
+
+    /// Any allow beyond a declared `#[deprecated]` would meet a user's `#![forbid(..)]`.
+    #[test]
+    fn the_allow_is_emitted_only_for_a_deprecated_item() {
+        let quiet: DeriveInput = syn::parse2(quote! { struct Config { name: String } }).unwrap();
+        let out = expand(&quiet).expect("expand").to_string();
+        assert!(!out.contains("allow"), "{out}");
+
+        let field: DeriveInput =
+            syn::parse2(quote! { struct Config { #[deprecated] name: String } }).unwrap();
+        let out = expand(&field).expect("expand").to_string();
+        assert!(out.contains("allow (deprecated)"), "{out}");
+    }
+
+    /// One allowed const holds every item, so a `#[deprecated]` struct's codec stays quiet.
+    #[test]
+    fn the_allow_covers_every_generated_item() {
+        let input: DeriveInput = syn::parse2(quote! {
+            #[deprecated]
+            struct Old { a: i32 }
+        })
+        .unwrap();
+        let file: syn::File = syn::parse2(expand(&input).expect("expand")).expect("parses");
+        let [syn::Item::Const(c)] = file.items.as_slice() else {
+            panic!("expected one const, got {} items", file.items.len());
+        };
+        let attrs: String = c.attrs.iter().map(|a| quote!(#a).to_string()).collect();
+        assert!(attrs.contains("deprecated"), "{attrs}");
+    }
+
     #[test]
     fn rejects_parcelable_holder_field() {
         let input: DeriveInput = syn::parse2(quote! {
@@ -188,8 +321,7 @@ mod tests {
         assert!(err.to_string().contains("`.aidl` path"), "{err}");
     }
 
-    /// The guard is structural, so a holder wrapped in `Option`/`Vec` — where
-    /// a string comparison saw `"ParcelableHolder>"` — is caught too.
+    /// Matched structurally, so a holder inside `Option`/`Vec` is caught too.
     #[test]
     fn rejects_a_wrapped_parcelable_holder_field() {
         for tokens in [
@@ -200,6 +332,26 @@ mod tests {
             let err = render_source(&input).unwrap_err();
             assert!(err.to_string().contains("`.aidl` path"), "{err}");
         }
+    }
+
+    /// Only the struct's `#[parcelable]` is read, so a field's would vanish.
+    #[test]
+    fn rejects_a_parcelable_attribute_on_a_field() {
+        let input: DeriveInput = syn::parse2(quote! {
+            struct Bad { #[parcelable(descriptor = "com.example.X")] a: i32 }
+        })
+        .unwrap();
+        let err = render_source(&input).unwrap_err();
+        assert!(err.to_string().contains("belongs on the struct"), "{err}");
+    }
+
+    /// The codec lands in the user's own scope, so `self::` there is the user's.
+    #[test]
+    fn a_self_path_field_is_accepted() {
+        let s = source(quote! {
+            struct Outer { cfg: self::Config }
+        });
+        assert!(s.contains("self.r#cfg"), "{s}");
     }
 
     #[test]

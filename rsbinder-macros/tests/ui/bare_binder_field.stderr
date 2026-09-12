@@ -1,0 +1,11 @@
+error: `.aidl` renders this as `Option<rsbinder::ParcelFileDescriptor>` here, and a call site written against one does not take the other; use `Option<rsbinder::ParcelFileDescriptor>`
+ --> tests/ui/bare_binder_field.rs:5:13
+  |
+5 |     pub fd: rsbinder::ParcelFileDescriptor,
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `.aidl` renders this as `Option<rsbinder::SIBinder>` here, and a call site written against one does not take the other; use `Option<rsbinder::SIBinder>`
+  --> tests/ui/bare_binder_field.rs:10:12
+   |
+10 |     pub b: rsbinder::SIBinder,
+   |            ^^^^^^^^^^^^^^^^^^

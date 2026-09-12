@@ -1870,7 +1870,19 @@ impl Generator {
         validate_transaction_codes(&decl)?;
 
         let vintf_owner = is_vintf.then_some(decl.name.as_str());
+        let mut method_names = std::collections::HashSet::new();
         for method in decl.method_list.iter() {
+            // AOSP `AidlInterface::CheckValid`: a duplicate would otherwise
+            // collapse into one method, taking its transaction code with it.
+            if !method_names.insert(method.identifier.as_str()) {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}' has a duplicate method name '{}'",
+                        decl.name, method.identifier
+                    ),
+                    method.identifier_span,
+                ));
+            }
             fn_members.push(make_fn_member(method, self.get_crate_name(), vintf_owner)?);
         }
 

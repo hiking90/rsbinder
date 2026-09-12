@@ -1,0 +1,5 @@
+error: a descriptor cannot be empty — it is what distinguishes this interface's binder from another's, and `.aidl` always has a name to put there
+ --> tests/ui/empty_descriptor.rs:3:26
+  |
+3 | #[interface(descriptor = "")]
+  |                          ^^

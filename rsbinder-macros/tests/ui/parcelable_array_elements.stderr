@@ -1,0 +1,17 @@
+error: a nullable parcelable field array of this type needs `Option<_>` elements — `.aidl` gives every element of a `@nullable` array its own `Option` unless the element is a primitive
+ --> tests/ui/parcelable_array_elements.rs:5:15
+  |
+5 |     pub tags: Option<Vec<String>>,
+  |               ^^^^^^^^^^^^^^^^^^^
+
+error: a parcelable field array cannot have `Option<_>` elements — `.aidl` gives an element its own `Option` in a `@nullable` array (except a fixed-size `in` or returned one, which keeps them bare) and where the slot has no value to start from (an `out` binder or fd array, a fixed-size `#[inout]` one, or a fixed-size parcelable field array of a binder or fd); this array is neither, so drop the element `Option`
+  --> tests/ui/parcelable_array_elements.rs:10:15
+   |
+10 |     pub tags: Vec<Option<String>>,
+   |               ^^^^^^^^^^^^^^^^^^^
+
+error: a fixed-size parcelable field array of this type needs `Option<_>` elements — the field has no value to start each slot from, so that is what `.aidl` renders
+  --> tests/ui/parcelable_array_elements.rs:15:14
+   |
+15 |     pub fds: [rsbinder::ParcelFileDescriptor; 3],
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

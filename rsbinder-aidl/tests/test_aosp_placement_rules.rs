@@ -898,6 +898,22 @@ parcelable A {
 }
 
 #[test]
+fn duplicate_method_name_is_rejected() {
+    // The second declaration would otherwise collapse into the first and take
+    // its transaction code with it, silently renumbering everything after it.
+    assert_error_contains(
+        r#"
+package test;
+interface IFoo {
+    void m();
+    void m(int a);
+}
+        "#,
+        "interface 'IFoo' has a duplicate method name 'm'",
+    );
+}
+
+#[test]
 fn duplicate_argument_name_is_rejected() {
     // Both arguments render as the same `_arg_a` binding, so leaving this to
     // the consumer's build surfaces it as rustc E0415 instead of an AIDL
