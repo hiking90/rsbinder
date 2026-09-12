@@ -42,7 +42,7 @@ parcelable ArrayOfInterfaces {
         "##,
         r##"
 pub mod ArrayOfInterfaces {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct ArrayOfInterfaces {
     }
@@ -70,7 +70,7 @@ pub mod ArrayOfInterfaces {
         fn descriptor() -> &'static str { "ArrayOfInterfaces" }
     }
     pub mod IEmptyInterface {
-        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
         pub trait IEmptyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
             fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {
@@ -116,7 +116,7 @@ pub mod ArrayOfInterfaces {
         }
     }
     pub mod IMyInterface {
-        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
         pub trait IMyInterface: rsbinder::Interface + Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>>;

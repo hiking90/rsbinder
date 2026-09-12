@@ -191,6 +191,24 @@ impl TypeGenerator {
                             aidl_type.name_span,
                         ));
                     }
+                    // `void` and `ParcelableHolder` have no element
+                    // representation: `Vec<()>` and
+                    // `Vec<ParcelableHolder>` have no `SerializeArray`
+                    // counterpart, so they would fail in rustc rather than
+                    // here. AOSP rejects both as `List` elements
+                    // (`aidl_language.cpp`, the `kListUsage` whitelist).
+                    if matches!(elem, ValueType::Void) {
+                        return Err(make_type_error(
+                            "List element type cannot be void",
+                            aidl_type.name_span,
+                        ));
+                    }
+                    if matches!(elem, ValueType::Holder) {
+                        return Err(make_type_error(
+                            "List element type cannot be ParcelableHolder",
+                            aidl_type.name_span,
+                        ));
+                    }
                     array_types.push(ArrayInfo::new_list(
                         &elem,
                         &Vec::new(),
@@ -219,6 +237,21 @@ impl TypeGenerator {
             _ => ValueType::UserDefined(aidl_type.name.to_owned()),
         };
 
+        // AOSP `AidlTypeSpecifier::CheckValid`: only `List`, `Map`, and a
+        // parameterizable user-defined type may carry type arguments. The
+        // arms above drop the generic on everything else, so `String<int>`
+        // would silently become a plain `String`. `ValueType::Array` here is
+        // the `List` arm; `UserDefined` covers both a generic parcelable and
+        // `Map` — which stays an unknown type, keeping its own diagnostic.
+        if aidl_type.generic.is_some()
+            && !matches!(value_type, ValueType::Array(_) | ValueType::UserDefined(_))
+        {
+            return Err(make_type_error(
+                format!("'{}' is not a generic type", aidl_type.name),
+                aidl_type.name_span,
+            ));
+        }
+
         Ok(Self {
             is_nullable: false,
             value_type,
@@ -231,6 +264,34 @@ impl TypeGenerator {
 
     pub fn new_with_type(_type: &Type) -> Result<Self, AidlError> {
         let mut this = Self::new(&_type.non_array_type)?;
+
+        let is_nullable = has_annotation(&_type.annotation_list, AnnotationType::IsNullable);
+        let is_array = !_type.array_types.is_empty();
+
+        // AOSP `AidlTypeSpecifier::CheckValid` (`aidl_language.cpp`): `void`
+        // is legal only as a bare method return type, and `ParcelableHolder`
+        // has no array or nullable form. Both would otherwise generate code
+        // that compiles here but has no counterpart in any AOSP backend.
+        if matches!(this.value_type, ValueType::Void) && (is_array || is_nullable) {
+            return Err(make_type_error(
+                "void type cannot be an array or nullable",
+                _type.non_array_type.name_span,
+            ));
+        }
+        if matches!(this.value_type, ValueType::Holder) {
+            if is_array {
+                return Err(make_type_error(
+                    "arrays of ParcelableHolder are not supported",
+                    _type.non_array_type.name_span,
+                ));
+            }
+            if is_nullable {
+                return Err(make_type_error(
+                    "ParcelableHolder cannot be nullable",
+                    _type.non_array_type.name_span,
+                ));
+            }
+        }
 
         if !_type.array_types.is_empty() {
             // An array of `List<T>` (`List<T>[]`): the non-array type is
@@ -465,6 +526,145 @@ impl TypeGenerator {
         } else {
             format!("Option<{type_name}>")
         }
+    }
+
+    /// Can a field of this type appear in a `@FixedSize` parcelable or union?
+    ///
+    /// Ports AOSP `AidlTypenames::CanBeFixedSize` (`aidl_typenames.cpp`): a
+    /// generic (`List<T>`), a `@nullable` type, and a variable-length array
+    /// are all variable size; primitives and enums are fixed; a parcelable or
+    /// union is fixed only if it is itself `@FixedSize`; every other builtin
+    /// (`String`, `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) and
+    /// every interface handle is not. Must be invoked while the owning
+    /// declaration's `NamespaceGuard` is active: a `UserDefined` name that
+    /// fails to resolve is reported as non-fixed, which would reject valid
+    /// input.
+    pub fn can_be_fixed_size(&self) -> bool {
+        if self.is_nullable {
+            return false;
+        }
+        let element = match self.array_types.first() {
+            Some(info) => {
+                if info.is_list || !info.is_fixed() {
+                    return false;
+                }
+                &info.value_type
+            }
+            None => &self.value_type,
+        };
+        Self::value_type_can_be_fixed_size(element)
+    }
+
+    fn value_type_can_be_fixed_size(value_type: &ValueType) -> bool {
+        match value_type {
+            ValueType::Bool(_)
+            | ValueType::Byte(_)
+            | ValueType::Char(_)
+            | ValueType::Int32(_)
+            | ValueType::Int64(_)
+            | ValueType::Float(_)
+            | ValueType::Double(_) => true,
+            ValueType::UserDefined(name) => {
+                match lookup_decl_from_name(name, crate::Namespace::AIDL) {
+                    Some(lookup_decl) => match &lookup_decl.decl {
+                        Declaration::Enum(_) => true,
+                        // `@FixedSize` is not scoped: a nested declaration does
+                        // not inherit it from its enclosing type.
+                        Declaration::Parcelable(decl) => {
+                            has_annotation(&decl.annotation_list, AnnotationType::FixedSize)
+                        }
+                        Declaration::Union(decl) => {
+                            has_annotation(&decl.annotation_list, AnnotationType::FixedSize)
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Every user-defined type this generator names: the type itself, or the
+    /// element type when it is an array or a `List<T>`. Used to walk a
+    /// `@VintfStability` declaration's reference closure.
+    pub fn referenced_user_types(&self) -> Vec<&str> {
+        std::iter::once(&self.value_type)
+            .chain(self.array_types.iter().map(|info| &info.value_type))
+            .filter_map(|value_type| match value_type {
+                ValueType::UserDefined(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Can a `const` have this type?
+    ///
+    /// AOSP `AidlConstantDeclaration::CheckValid` admits exactly `{String,
+    /// byte, int, long, float, double}`. rsbinder deliberately allows more —
+    /// `boolean`, `char`, and constant arrays of those — and its test suite
+    /// pins that, so this enforces the part of AOSP's rule that is not an
+    /// extension: a constant's type must be one with a constant *form*.
+    ///
+    /// A handle (`IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) has no
+    /// literal to be initialized from, and a user-defined type is refused by
+    /// AOSP outright — which is also why the `@VintfStability` reference
+    /// closure need not walk constants: a constant can never name a type that
+    /// would have to be VINTF-stable.
+    pub fn is_supported_constant_type(&self) -> bool {
+        let element = match self.array_types.first() {
+            Some(info) => &info.value_type,
+            None => &self.value_type,
+        };
+        matches!(
+            element,
+            ValueType::Bool(_)
+                | ValueType::Byte(_)
+                | ValueType::Char(_)
+                | ValueType::Int32(_)
+                | ValueType::Int64(_)
+                | ValueType::Float(_)
+                | ValueType::Double(_)
+                | ValueType::String(_)
+        )
+    }
+
+    /// A bare `void`, or a `List<void>` whose element is one. Legal only as a
+    /// method return type — AOSP rejects it for parameters (`aidl_language.cpp`
+    /// `AidlMethod::CheckValid`), for field/constant declarations
+    /// (`AidlVariableDeclaration::CheckValid`), and as a `List` element
+    /// (`AidlTypeSpecifier::CheckValid`); `void[]` is rejected earlier, in
+    /// [`Self::new_with_type`], and `List<void>` in [`Self::new`].
+    pub fn is_void(&self) -> bool {
+        matches!(self.value_type, ValueType::Void)
+            || self
+                .array_types
+                .first()
+                .is_some_and(|info| matches!(info.value_type, ValueType::Void))
+    }
+
+    /// A bare `ParcelableHolder`. AOSP rejects it as a method argument, as a
+    /// method return type, and as a union member (`aidl_typenames.cpp`
+    /// `AidlTypenames::GetArgumentAspect`, which gives it an empty direction
+    /// set; `aidl_language.cpp` `AidlArgument::CheckValid`,
+    /// `AidlMethod::CheckValid`, `AidlUnionDecl::CheckValid`). The array form
+    /// is rejected earlier, in [`Self::new_with_type`], and the
+    /// `List<ParcelableHolder>` form in [`Self::new`].
+    ///
+    /// The predicate answers only "is the value type a holder", so it stays
+    /// true for a nullable one. That combination is reachable: the field-level
+    /// `@nullable ParcelableHolder` form is rejected in
+    /// [`Self::new_with_type`], but a method-level `@nullable` is applied
+    /// after construction (`generator.rs` calls [`Self::nullable_at`] on the
+    /// finished generator), and `nullable_at` rejects primitives only.
+    pub fn is_parcelable_holder(&self) -> bool {
+        matches!(self.value_type, ValueType::Holder)
+    }
+
+    /// Span of the type as written, for diagnostics raised by callers that
+    /// only hold the generator.
+    pub fn type_span(&self) -> Option<(usize, usize)> {
+        self.type_span
     }
 
     pub fn is_variable_array(&self) -> bool {

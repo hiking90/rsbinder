@@ -8,8 +8,10 @@
 // specific. rsbinder-aidl matches the Rust backend's silent-ignore
 // behavior. These tests lock that in:
 //
-//   * `@FixedSize` (parcelable / union / type-param) — AOSP linter
-//     constraint; the wire format is the same as without.
+//   * `@FixedSize` (parcelable / union) — the wire format is the same as
+//     without. Note this is *recognition-only for codegen*, not for
+//     validation: `tests/test_aosp_placement_rules.rs` covers the AOSP
+//     `CanBeFixedSize` field check, which does reject contracts.
 //   * `@SensitiveData` (interface) — AOSP `generate_cpp.cpp:246` /
 //     `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method on
 //     the interface. rsbinder unconditionally emits `FLAG_CLEAR_BUF`
@@ -35,8 +37,11 @@ fn warnings_for(input: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------
-// @FixedSize — AOSP `aidl_language.cpp:189-192` — applies to
-// structured parcelable / union / type parameter; no codegen effect.
+// @FixedSize — AOSP `aidl_language.cpp` — applies to a structured
+// parcelable or union; no codegen effect. Its *field* constraint is
+// enforced separately (see `test_aosp_placement_rules.rs`); these
+// cases all satisfy it, so only the no-codegen-effect half is at
+// stake here.
 // ---------------------------------------------------------------
 
 #[test]

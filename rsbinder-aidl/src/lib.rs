@@ -55,6 +55,37 @@
 //! errors rather than being silently wrapped or truncated. See the project
 //! CHANGELOG for migration notes if upgrading from an earlier release.
 //!
+//! # Validation
+//!
+//! The generator enforces AOSP `aidl`'s type-placement rules, not just the
+//! ones it needs to emit code: a `@FixedSize` type's fields must all be fixed
+//! size, a `@VintfStability` type may only reference `@VintfStability` types,
+//! `ParcelableHolder` is not an
+//! array/`List`/`@nullable`/argument/return/union-member type, and `void` is a
+//! bare return type only. The `@FixedSize` and `@VintfStability` checks are
+//! contract-level — rsbinder would generate compiling code either way — so
+//! that an `.aidl` authored here is one AOSP's compiler also accepts; so are
+//! the argument, return-type and union-member forms of `ParcelableHolder`. The
+//! `void` placements and the array/`List`/`@nullable` forms of
+//! `ParcelableHolder` have no compiling Rust representation at all, so the
+//! check reports them as an AIDL diagnostic instead of a rustc error in the
+//! generated crate — as do a `union` with no fields, a duplicate argument
+//! name, and a type argument on a type that takes none (`String<int>`).
+//!
+//! A `@VintfStability` interface also declares that stability to the runtime,
+//! so the binder it publishes is accepted by a peer that requires VINTF.
+//!
+//! A `const` must have a primitive or `String` type, or an array of those.
+//! AOSP's set is narrower still (`{String, byte, int, long, float, double}`);
+//! `boolean`, `char` and constant arrays are deliberate rsbinder extensions,
+//! as `List<int>` is.
+//!
+//! # Deprecation
+//!
+//! A `/** @deprecated note */` javadoc block above a declaration, method,
+//! field, constant, or enumerator becomes `#[deprecated = "note"]` on the
+//! generated item, as in AOSP's Rust backend.
+//!
 //! Compatibility notes, supported AIDL constructs, and diagnostics examples
 //! live in the repository README and <https://hiking90.github.io/rsbinder/>.
 

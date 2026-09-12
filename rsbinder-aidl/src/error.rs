@@ -130,7 +130,11 @@ impl ParseError {
 }
 
 /// Semantic errors (type validation, transaction codes, etc.)
+///
+/// `#[non_exhaustive]`: new AIDL rules keep arriving, and each one a
+/// diagnostic. Match with a `_` arm so gaining one stays a minor release.
 #[derive(Error, Debug, Diagnostic)]
+#[non_exhaustive]
 pub enum SemanticError {
     #[error("Interface '{interface}': transaction code {code} conflict between '{method1}' and '{method2}'")]
     #[diagnostic(
@@ -292,6 +296,56 @@ pub enum SemanticError {
         #[source_code]
         src: NamedSource<String>,
         #[label("malformed @EnforcePermission argument")]
+        span: SourceSpan,
+    },
+
+    /// AOSP `AidlParcelable::CheckValid` (`aidl_language.cpp`) rejects a
+    /// `@FixedSize` parcelable or union that holds a field whose size is not
+    /// fixed. rsbinder generates the same wire format with or without the
+    /// annotation, so accepting this would leave a contract that only builds
+    /// here and is refused by AOSP's `aidl`.
+    #[error("the @FixedSize {kind} '{owner}' has a non-fixed size field named '{field}'")]
+    #[diagnostic(
+        code(aidl::fixed_size_non_fixed_field),
+        help(
+            "a @FixedSize member must be a primitive, an enum, a fixed-size array of \
+             those, or another @FixedSize parcelable/union — never String, IBinder, \
+             ParcelFileDescriptor, ParcelableHolder, List<T>, a variable-length array, \
+             or a @nullable type"
+        )
+    )]
+    FixedSizeNonFixedField {
+        kind: &'static str,
+        owner: String,
+        field: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this field is not fixed size")]
+        span: SourceSpan,
+    },
+
+    /// AOSP enforces VINTF stability across a whole compilation: with
+    /// `aidl_interface { stability: "vintf" }` (`--stability vintf`) every
+    /// type loaded must be `@VintfStability` (`aidl.cpp`). rsbinder has no
+    /// compilation-wide stability mode, so it enforces the implication of
+    /// that rule — a VINTF type's reference closure is also VINTF.
+    #[error(
+        "@VintfStability {kind} '{owner}' references '{referenced}', which is not @VintfStability"
+    )]
+    #[diagnostic(
+        code(aidl::vintf_stability_leak),
+        help(
+            "annotate '{referenced}' with @VintfStability, or drop @VintfStability from \
+             '{owner}' — a VINTF interface may only carry VINTF-stable types"
+        )
+    )]
+    VintfStabilityLeak {
+        kind: &'static str,
+        owner: String,
+        referenced: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("'{referenced}' does not have VINTF level stability")]
         span: SourceSpan,
     },
 }
