@@ -95,16 +95,8 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
                 "#[parcelable(..)] belongs on the struct, not on a field",
             ));
         }
-        if matches!(type_str::unwrap_group(&field.ty), syn::Type::Reference(_)) {
-            return Err(syn::Error::new_spanned(
-                &field.ty,
-                "a parcelable field cannot be a reference — it owns what it carries",
-            ));
-        }
-        // The signature's guards: neither shape has an `.aidl` field form.
-        type_str::reject_inner_references(&field.ty)?;
-        type_str::reject_nullable_primitive(&field.ty)?;
-        reject_parcelable_holder(&field.ty)?;
+        // The one gate every position shares, answered for a field.
+        type_str::check_type_at(&field.ty, type_str::Place::Field)?;
         let decl = type_str::as_written_in(&field.ty, type_str::Ctx::Parcelable)?;
         // Read only by the `impl Default` that is dropped below.
         let mut member = ParcelableMember::new(ident, decl, "Default::default()");
@@ -123,19 +115,6 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
     render_parcelable(&render)
         .map(|s| s.trim().to_string())
         .map_err(|e| syn::Error::new_spanned(&input.ident, format!("codegen failed: {e}")))
-}
-
-/// Matched structurally, so a holder inside `Option<_>` is caught too.
-fn reject_parcelable_holder(ty: &syn::Type) -> syn::Result<()> {
-    if !type_str::mentions_parcelable_holder(ty) {
-        return Ok(());
-    }
-    Err(syn::Error::new_spanned(
-        ty,
-        "a `ParcelableHolder` field needs the `.aidl` path: its stability is set before \
-         the read and the derived codec would replace the whole field, so a peer's \
-         `@VintfStability` holder can never be decoded",
-    ))
 }
 
 #[cfg(test)]
@@ -200,6 +179,107 @@ mod tests {
             let err = render_source(&input).unwrap_err();
             assert!(err.to_string().contains("cannot be nullable"), "{err}");
         }
+    }
+
+    /// The field axis reaches the scalar gate the signature reaches.
+    #[test]
+    fn rejects_scalars_aidl_never_renders_in_a_field() {
+        for (tokens, needle) in [
+            (quote! { struct Bad { n: u128 } }, "`u128`"),
+            (quote! { struct Bad { n: u32 } }, "`u32`"),
+            (quote! { struct Bad { n: u8 } }, "`u8`"),
+            (quote! { struct Bad { v: Vec<i8> } }, "element spelling"),
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // Every scalar `.aidl` renders for a field, plus `u8` as a `byte[]` element.
+        source(quote! {
+            struct Fine {
+                a: bool,
+                b: i8,
+                c: i32,
+                d: i64,
+                e: f32,
+                f: f64,
+                g: u16,
+                h: Vec<u8>,
+            }
+        });
+    }
+
+    /// `.aidl` refuses `void` as a field, and rustc would blame generated tokens.
+    #[test]
+    fn rejects_a_unit_field() {
+        let input: DeriveInput = syn::parse2(quote! { struct Bad { a: () } }).unwrap();
+        let err = render_source(&input).unwrap_err();
+        assert!(err.to_string().contains("`()` has no wire form"), "{err}");
+    }
+
+    /// `.aidl` renders a binder or fd field as `Option<_>`, `@nullable` or not.
+    #[test]
+    fn rejects_a_bare_binder_or_fd_field() {
+        for tokens in [
+            quote! { struct Bad { fd: rsbinder::ParcelFileDescriptor } },
+            quote! { struct Bad { b: rsbinder::SIBinder } },
+            quote! { struct Bad { cb: rsbinder::Strong<dyn IFoo> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(
+                err.to_string().contains("renders this as `Option<"),
+                "{err}"
+            );
+        }
+        // The spelling `.aidl` renders, and the variable array it leaves bare.
+        source(quote! {
+            struct Fine {
+                fd: Option<rsbinder::ParcelFileDescriptor>,
+                b: Option<rsbinder::SIBinder>,
+                cb: Option<rsbinder::Strong<dyn IFoo>>,
+                fds: Vec<rsbinder::ParcelFileDescriptor>,
+            }
+        });
+    }
+
+    /// A field array answers the element rules on its own axis, not the `in` one.
+    #[test]
+    fn rejects_array_elements_aidl_spells_the_other_way_in_a_field() {
+        for (tokens, needle) in [
+            (
+                quote! { struct Bad { tags: Option<Vec<String>> } },
+                "a nullable parcelable field array",
+            ),
+            // A fixed-size `in` array keeps them bare; a field's does not.
+            (
+                quote! { struct Bad { slots: Option<[String; 3]> } },
+                "a nullable parcelable field array",
+            ),
+            (
+                quote! { struct Bad { tags: Vec<Option<String>> } },
+                "a parcelable field array cannot have",
+            ),
+            (
+                quote! { struct Bad { fds: [rsbinder::ParcelFileDescriptor; 3] } },
+                "a fixed-size parcelable field array",
+            ),
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // The spellings `.aidl` renders for those same shapes.
+        source(quote! {
+            struct Fine {
+                tags: Option<Vec<Option<String>>>,
+                slots: Option<[Option<String>; 3]>,
+                names: Vec<String>,
+                bare: [String; 3],
+                fds: [Option<rsbinder::ParcelFileDescriptor>; 3],
+                blob: Option<Vec<u8>>,
+            }
+        });
     }
 
     /// Any allow beyond a declared `#[deprecated]` would meet a user's `#![forbid(..)]`.

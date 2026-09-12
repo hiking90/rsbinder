@@ -1,0 +1,5 @@
+error: `.aidl` renders this as `&str` here, and a call site written against one does not take the other; use `&str`
+ --> tests/ui/by_value_in_argument.rs:5:20
+  |
+5 |     fn f(&self, s: String) -> rsbinder::BinderResult<()>;
+  |                    ^^^^^^

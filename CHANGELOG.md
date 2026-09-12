@@ -60,8 +60,45 @@ This changelog starts at 0.9.0. For earlier releases, see the
   argument; a duplicate method or argument name; `BinderResult<T, E>`; an
   argument to `#[oneway(..)]` / `#[inout(..)]`; an attribute or an explicit
   lifetime on the receiver (`#[oneway] &self`, `&'static self`); a second
-  `descriptor = …`; and, on `#[derive(Parcelable)]`, a `#[parcelable(..)]` on a
-  field or a field borrowing below the top level (`Option<&str>`, `Vec<&str>`).
+  `descriptor = …`; an empty `descriptor = ""`, which would let two interfaces
+  cast to each other's proxy; an `in` argument spelled `&String`, `&Vec<T>`,
+  `&Option<T>` or `&i32`, including inside an `Option<&_>`, where `.aidl`
+  renders `&str`, `&[T]`, `Option<&T>` and the bare primitive; an `in` argument
+  taken by value where `.aidl` borrows it (`String`, `Vec<T>`, `[T; N]`,
+  `ParcelFileDescriptor`, `SIBinder`, `Strong<dyn IFoo>` and their `Option<_>`
+  forms), since `.aidl` renders every `in` type but a scalar behind a reference —
+  the bytes match and the call site does not, which is the one thing moving a
+  trait to `.aidl` must not change; a by-value bare name stays accepted, because
+  it may be a `#[derive(BinderEnum)]` enum, which `.aidl` does pass by value, and
+  the generated `Copy` assertion is what refuses the parcelable half; a `@nullable`
+  array with bare elements (`Option<&[String]>` — `.aidl` gives every
+  non-primitive element of a `@nullable` array its own `Option`, except in a
+  fixed-size `in` one, which is the one that keeps them bare); a fixed-size
+  `#[inout]` binder or fd array with bare elements
+  (`&mut [ParcelFileDescriptor; N]`, which `.aidl` renders
+  `&mut [Option<_>; N]`); a return type whose array elements are spelled the
+  other way (`BinderResult<Option<Vec<String>>>`, which `.aidl` renders
+  `Option<Vec<Option<String>>>`); `()` or a trait object nested in a container
+  (`Vec<()>`, `&[dyn IFoo]`) and a trait object or a qualified path as a return
+  type; a scalar `.aidl` never renders, in an argument, a return type or a
+  parcelable field (`u32`, `u64`, `i16`, `usize`, `u128`, Rust's `char`, or a
+  `u8` outside an array element), where AIDL has only `bool`, `i8`, `i32`,
+  `i64`, `f32`, `f64` and `u16` — the nearest `.aidl` renders a different Rust
+  type, and `u128` also put sixteen bytes on the wire no conforming AIDL peer
+  can decode; an `i8` *inside* an array element (`&[i8]`, `Vec<i8>`), which
+  `.aidl` always spells `u8` there, so `byte`'s spelling moves with the place
+  and neither half is accepted in the other's; and, on
+  `#[derive(Parcelable)]`, a `#[parcelable(..)]` on a
+  field or a field borrowing below the top level (`Option<&str>`, `Vec<&str>`),
+  a `()` field, and an array field whose elements are spelled the other way
+  (`Option<Vec<String>>` and `Vec<Option<String>>`, which `.aidl` renders
+  `Option<Vec<Option<String>>>` and `Vec<String>`; a fixed-size binder or fd
+  field array needs `Option<_>` elements, since the field has no value to start
+  each slot from), and a bare binder or fd field (`Strong<dyn IFoo>`,
+  `SIBinder`, `ParcelFileDescriptor`), which `.aidl` renders `Option<_>`
+  whether or not the field is `@nullable` — the field has no value to start
+  from, so the wrapping applies to the whole field and not only to an array
+  slot, and here that `Option<_>` is AIDL's `@nullable` field.
 - **`rsbinder-aidl` now rejects a duplicate method name in an interface.** The
   second declaration used to collapse into the first, so the method vanished
   and every transaction code after it shifted — silently, on both ends.

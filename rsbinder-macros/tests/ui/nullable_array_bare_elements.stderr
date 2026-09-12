@@ -1,0 +1,23 @@
+error: a nullable `in` array of this type needs `Option<_>` elements — `.aidl` gives every element of a `@nullable` array its own `Option` unless the element is a primitive
+ --> tests/ui/nullable_array_bare_elements.rs:5:20
+  |
+5 |     fn f(&self, v: Option<&[String]>) -> rsbinder::BinderResult<()>;
+  |                    ^^^^^^^^^^^^^^^^^
+
+error: a `@nullable` fixed-size `in` array keeps its elements bare — it is the one `@nullable` array `.aidl` leaves alone, rendering `@nullable T[N]` as `Option<&[T; N]>` (`Option<[T; N]>` for a return); drop the element `Option`
+  --> tests/ui/nullable_array_bare_elements.rs:10:20
+   |
+10 |     fn f(&self, v: Option<&[Option<rsbinder::ParcelFileDescriptor>; 3]>)
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a nullable returned array of this type needs `Option<_>` elements — `.aidl` gives every element of a `@nullable` array its own `Option` unless the element is a primitive
+  --> tests/ui/nullable_array_bare_elements.rs:16:43
+   |
+16 |     fn f(&self) -> rsbinder::BinderResult<Option<Vec<String>>>;
+   |                                           ^^^^^^^^^^^^^^^^^^^
+
+error: a returned array cannot have `Option<_>` elements — `.aidl` gives an element its own `Option` in a `@nullable` array (except a fixed-size `in` or returned one, which keeps them bare) and where the slot has no value to start from (an `out` binder or fd array, a fixed-size `#[inout]` one, or a fixed-size parcelable field array of a binder or fd); this array is neither, so drop the element `Option`
+  --> tests/ui/nullable_array_bare_elements.rs:21:43
+   |
+21 |     fn f(&self) -> rsbinder::BinderResult<Vec<Option<String>>>;
+   |                                           ^^^^^^^^^^^^^^^^^^^

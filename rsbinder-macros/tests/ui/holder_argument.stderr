@@ -1,4 +1,4 @@
-error: a `ParcelableHolder` cannot appear in a binder signature — `.aidl` refuses it as an argument or return type; carry it as a field of a parcelable instead
+error: a `ParcelableHolder` cannot appear in a binder signature — `.aidl` refuses it as an argument or return type; carry it as a field of an `.aidl` parcelable instead, since `#[derive(Parcelable)]` cannot hold one either (its stability is set before the read)
  --> tests/ui/holder_argument.rs:5:20
   |
 5 |     fn f(&self, h: &rsbinder::ParcelableHolder) -> rsbinder::BinderResult<()>;

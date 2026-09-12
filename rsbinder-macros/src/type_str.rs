@@ -21,6 +21,30 @@ impl Ctx {
     }
 }
 
+/// Where a type sits. A field has no direction of its own, so it answers the
+/// direction-dependent rules for itself (`type_declaration(is_struct = true)`).
+#[derive(Clone, Copy)]
+pub enum Place {
+    In,
+    Out,
+    Inout,
+    Return,
+    Field,
+}
+
+impl Place {
+    /// The word the diagnostics use; also `check_array_elements`'s axis.
+    fn word(self) -> &'static str {
+        match self {
+            Place::In => "in",
+            Place::Out => "out",
+            Place::Inout => "inout",
+            Place::Return => "return",
+            Place::Field => "field",
+        }
+    }
+}
+
 /// Strip the invisible group a `macro_rules!` `$t:ty` arrives in, and any parentheses.
 pub fn unwrap_group(ty: &Type) -> &Type {
     match ty {
@@ -142,6 +166,12 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
             inner => owned(inner)?,
         },
         Type::Path(p) => {
+            if p.qself.is_some() {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "qualified paths are not supported",
+                ));
+            }
             reject_self_path(p)?;
             let mut out = String::new();
             for (i, seg) in p.path.segments.iter().enumerate() {
@@ -176,10 +206,83 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
     })
 }
 
+/// Every gate a type must pass, keyed by where it sits. The argument, return
+/// and parcelable-field paths call only this, so a rule added here is reached
+/// from all of them rather than from the one position that prompted it.
+pub fn check_type_at(ty: &Type, place: Place) -> syn::Result<()> {
+    match place {
+        // `check_supported` is the argument-shape gate: it opens with
+        // `reject_non_argument` and `check_scalar_names` itself.
+        Place::In | Place::Out | Place::Inout => check_supported(ty)?,
+        Place::Return => {
+            // Not `check_supported`: its `Option<&str>` would silently become `Option<String>` here.
+            reject_any_reference(ty)?;
+            // `()` is `void`, which only the whole return type may be.
+            if !matches!(unwrap_group(ty), Type::Tuple(t) if t.elems.is_empty()) {
+                reject_non_argument(ty)?;
+            }
+            check_scalar_names(ty)?;
+        }
+        Place::Field => {
+            reject_field_references(ty)?;
+            // A field has no `void` exception: `.aidl` refuses `void` as a field outright.
+            reject_non_argument(ty)?;
+            check_scalar_names(ty)?;
+        }
+    }
+    reject_nullable_primitive(ty)?;
+    reject_parcelable_holder(ty, place)?;
+    if matches!(place, Place::Out | Place::Inout) {
+        check_out_capable(ty, place.word())?;
+    }
+    check_array_elements(ty, place.word())?;
+    // Last, so a shape that cannot go on the wire at all keeps its own
+    // diagnostic: the rules above each describe one way to be wrong, and this
+    // asks the only question that actually matters — whether `.aidl` would
+    // have written what you wrote.
+    crate::aidl_shape::check_canonical(ty, place)
+}
+
+/// A field owns what it carries, so it borrows at no depth.
+fn reject_field_references(ty: &Type) -> syn::Result<()> {
+    if matches!(unwrap_group(ty), Type::Reference(_)) {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "a parcelable field cannot be a reference — it owns what it carries",
+        ));
+    }
+    reject_inner_references(ty)
+}
+
+/// Matched structurally, so a holder inside `Option<_>` is caught too. Both
+/// messages live here so neither can start recommending what the other refuses.
+fn reject_parcelable_holder(ty: &Type, place: Place) -> syn::Result<()> {
+    if !mentions_parcelable_holder(ty) {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        ty,
+        match place {
+            Place::Field => {
+                "a `ParcelableHolder` field needs the `.aidl` path: its stability is set before \
+                 the read and the derived codec would replace the whole field, so a peer's \
+                 `@VintfStability` holder can never be decoded"
+            }
+            _ => {
+                "a `ParcelableHolder` cannot appear in a binder signature — `.aidl` refuses it \
+                 as an argument or return type; carry it as a field of an `.aidl` parcelable \
+                 instead, since `#[derive(Parcelable)]` cannot hold one either (its stability \
+                 is set before the read)"
+            }
+        },
+    ))
+}
+
 /// Reject what [`owned`] cannot lend back (`&[&str]`); `Option<&str>` is AIDL's nullable `in`.
 pub fn check_supported(ty: &Type) -> syn::Result<()> {
     let ty = unwrap_group(ty);
     reject_non_argument(ty)?;
+    check_scalar_names(ty)?;
     match ty {
         Type::Reference(r) => {
             if r.lifetime.is_some() {
@@ -196,7 +299,9 @@ pub fn check_supported(ty: &Type) -> syn::Result<()> {
                      `&mut Vec<T>`, or `&mut [T; N]` for a fixed-size array",
                 ));
             }
-            reject_non_argument(&r.elem)?;
+            if r.mutability.is_none() {
+                reject_borrowed_container(&r.elem, false)?;
+            }
             reject_inner_references(&r.elem)
         }
         Type::Path(p) => {
@@ -210,10 +315,12 @@ pub fn check_supported(ty: &Type) -> syn::Result<()> {
                                 return Err(syn::Error::new_spanned(
                                     ty,
                                     "a nullable argument borrows immutably and without a named \
-                                     lifetime — use `Option<&str>` or `Option<&[T]>`",
+                                     lifetime — use `Option<&str>`, or `Option<&[T]>` for an \
+                                     array (whose non-primitive elements each carry an \
+                                     `Option` of their own: `Option<&[Option<String>]>`)",
                                 ));
                             }
-                            reject_non_argument(&inner.elem)?;
+                            reject_borrowed_container(&inner.elem, true)?;
                             return reject_inner_references(&inner.elem);
                         }
                     }
@@ -226,18 +333,162 @@ pub fn check_supported(ty: &Type) -> syn::Result<()> {
 }
 
 /// `()` and a trait object have no wire form; rustc would blame generated tokens.
-fn reject_non_argument(ty: &Type) -> syn::Result<()> {
+pub fn reject_non_argument(ty: &Type) -> syn::Result<()> {
     match unwrap_group(ty) {
         Type::Tuple(t) if t.elems.is_empty() => Err(syn::Error::new_spanned(
             ty,
-            "`()` is not an argument type — `.aidl` accepts `void` only as a return type",
+            "`()` has no wire form inside a type — `.aidl` accepts `void` only as the whole \
+             return type",
         )),
         Type::TraitObject(_) => Err(syn::Error::new_spanned(
             ty,
-            "a trait object has no wire form — pass a binder as `&rsbinder::Strong<dyn IFoo>`",
+            "a trait object has no wire form — pass a binder as `rsbinder::Strong<dyn IFoo>` \
+             (`&` it in an argument)",
         )),
+        Type::Reference(r) => reject_non_argument(&r.elem),
+        Type::Slice(s) => reject_non_argument(&s.elem),
+        Type::Array(a) => reject_non_argument(&a.elem),
+        // Never below `Strong<dyn IFoo>`: that `dyn` is the one legal trait object.
+        Type::Path(p) if named_generic(ty, "Strong").is_none() => {
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(t) = arg {
+                            reject_non_argument(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Reject a scalar name `.aidl` never renders: the `.aidl` port would spell it
+/// another type, and `u128` puts a width no AIDL peer can decode on the wire.
+pub fn check_scalar_names(ty: &Type) -> syn::Result<()> {
+    check_scalar_names_at(ty, false)
+}
+
+fn check_scalar_names_at(ty: &Type, element: bool) -> syn::Result<()> {
+    let ty = unwrap_group(ty);
+    match ty {
+        Type::Reference(r) => check_scalar_names_at(&r.elem, element),
+        Type::Slice(s) => check_scalar_names_at(&s.elem, true),
+        Type::Array(a) => check_scalar_names_at(&a.elem, true),
+        Type::Path(_) => {
+            if let Some(inner) = named_generic(ty, "Vec").and_then(first_type_arg) {
+                return check_scalar_names_at(inner, true);
+            }
+            // An `Option` wraps, so its argument sits in the same place it does.
+            if let Some(inner) = named_generic(ty, "Option").and_then(first_type_arg) {
+                return check_scalar_names_at(inner, element);
+            }
+            let Some(name) = plain_name(ty) else {
+                return Ok(());
+            };
+            // `byte` swaps spelling by place — `i8` as a scalar, `u8` as an
+            // array element (`array_type_name`) — and neither the other way.
+            if element && name == "i8" {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "`i8` is not the element spelling `.aidl` renders — a `byte[]` element is \
+                     `u8` (`i8` is the scalar spelling, as in a bare `byte`), so the equivalent \
+                     `.aidl` would render `u8` here and a call site written against one does not \
+                     take the other; use `u8`",
+                ));
+            }
+            if RENDERABLE_SCALARS.contains(&name.as_str())
+                || (element && name == "u8")
+                || !RUST_SCALARS.contains(&name.as_str())
+            {
+                return Ok(());
+            }
+            Err(syn::Error::new_spanned(
+                ty,
+                format!(
+                    "`{name}` is not a spelling `.aidl` renders — AIDL's scalars are `bool`, \
+                     `i8` (`byte`), `i32` (`int`), `i64` (`long`), `f32` (`float`), `f64` \
+                     (`double`) and `u16` (`char`), so the equivalent `.aidl` would render a \
+                     different Rust type here; use {}",
+                    scalar_advice(&name)
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The AIDL scalar to write instead, which every place taking the refused one accepts.
+fn scalar_advice(name: &str) -> &'static str {
+    match name {
+        "u8" => "`i8` (`.aidl`'s `byte`; `u8` is the element spelling, as in `&[u8]`)",
+        "char" => "`u16`, which is what `.aidl` renders its own `char` as",
+        "i16" | "u32" => "`i32`",
+        _ => "`i64`, the widest scalar AIDL has",
+    }
+}
+
+/// Spellings that compile and carry the same wire as the `in` argument `.aidl`
+/// renders, but do not give the same call site.
+fn reject_borrowed_container(ty: &Type, nullable: bool) -> syn::Result<()> {
+    let ty = unwrap_group(ty);
+    if is_primitive(ty) {
+        if nullable {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "a primitive has no null form on the wire, so `.aidl` rejects `@nullable` on \
+                 one, and it renders an `in` primitive as the bare type; drop both the \
+                 `Option` and the `&`",
+            ));
+        }
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`.aidl` renders a primitive `in` argument as the bare type, never behind a \
+             reference, and a call site written against one does not take the other; drop \
+             the `&`",
+        ));
+    }
+    let (written, aidl, note) = if plain_name(ty).is_some_and(|n| n == "String") {
+        if nullable {
+            ("Option<&String>", "Option<&str>", "")
+        } else {
+            ("&String", "&str", "")
+        }
+    } else if named_generic(ty, "Vec").is_some() {
+        if nullable {
+            (
+                "Option<&Vec<T>>",
+                "Option<&[T]>",
+                " (and a `@nullable` array gives every non-primitive element an `Option` of \
+                 its own: `Option<&[Option<String>]>`)",
+            )
+        } else {
+            ("&Vec<T>", "&[T]", "")
+        }
+    } else if named_generic(ty, "Option").is_some() {
+        (
+            if nullable {
+                "Option<&Option<T>>"
+            } else {
+                "&Option<T>"
+            },
+            "Option<&T>",
+            " (`Option<&str>` for a string, `Option<&[T]>` for an array — whose non-primitive \
+             elements each carry an `Option` of their own: `Option<&[Option<String>]>`)",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(syn::Error::new_spanned(
+        ty,
+        format!(
+            "`{written}` is not the spelling `.aidl` renders for this argument — it renders \
+             `{aidl}`{note}, and a call site written against one does not take the other; \
+             use `{aidl}`"
+        ),
+    ))
 }
 
 /// Reject a reference anywhere in `ty`, itself included.
@@ -417,6 +668,17 @@ const PRIMITIVE_NAMES: &[&str] = &[
     "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "char",
 ];
 
+/// The scalar names `TypeGenerator::type_decl` renders; `u8` is an array
+/// element only, where `array_type_name` rewrites `byte`'s `i8`.
+const RENDERABLE_SCALARS: &[&str] = &["bool", "i8", "i32", "i64", "f32", "f64", "u16"];
+
+/// Rust's own scalar spellings, so a name outside `RENDERABLE_SCALARS` is
+/// refused as a scalar rather than taken for a user-defined type.
+const RUST_SCALARS: &[&str] = &[
+    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32",
+    "u64", "u128", "usize",
+];
+
 /// The last path segment of a bare, un-parameterised named type.
 fn plain_name(ty: &Type) -> Option<String> {
     let Type::Path(p) = unwrap_group(ty) else {
@@ -460,22 +722,14 @@ fn out_array_elem(ty: &Type) -> Option<&Type> {
     elem
 }
 
-/// Reject an array whose elements are `Option<_>` where `.aidl` renders them bare.
-///
-/// An element `Option` is the generator's, not a `@nullable`: it appears only
-/// where the callee has to default each slot, which is an `out` array or a
-/// fixed-size `inout` one, and only for a binder or a fd. A `@nullable` array
-/// is `Option<Vec<_>>` / `Option<[_; N]>`, and what it does to its elements
-/// depends on the element type, which a name alone does not give — so a
-/// wrapped array is left alone.
+/// Reject an array element spelling `.aidl` does not render for this direction.
 pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     let outer = unwrap_group(peel(ty));
-    if option_inner(outer).is_some() {
-        return Ok(());
-    }
-    let fixed = matches!(outer, Type::Array(_));
+    let nullable = option_inner(outer);
+    let start = nullable.map_or(outer, |inner| unwrap_group(peel(inner)));
+    let fixed = matches!(start, Type::Array(_));
 
-    let mut elem = outer;
+    let mut elem = start;
     let mut is_array = false;
     loop {
         if let Some(inner) = vec_elem(elem) {
@@ -498,24 +752,78 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     if !is_array {
         return Ok(());
     }
-    let Some(under) = option_inner(elem) else {
-        return Ok(());
+    // A return type's direction is `Direction::None`, which `list_type_decl` and
+    // `make_fixed_array` both render down the same arm as `in`.
+    let in_like = matches!(direction, "in" | "return");
+    let field = direction == "field";
+    let (article, label) = match direction {
+        "return" => ("a", "returned".to_string()),
+        "field" => ("a", "parcelable field".to_string()),
+        d => ("an", format!("`{d}`")),
     };
-    let renderable = lacks_default(under)
-        && match direction {
+    // A `@nullable` array wraps every non-primitive element except in a
+    // fixed-size `in` one; a bare array only where the callee defaults a slot.
+    // A field has no direction: `make_fixed_array`'s `is_struct` arm wraps a
+    // fixed slot with no `Default` of its own, whatever the nullability.
+    let wraps = if field {
+        nullable.is_some() || (fixed && lacks_default(option_inner(elem).unwrap_or(elem)))
+    } else if nullable.is_some() {
+        !(in_like && fixed)
+    } else {
+        match direction {
             "out" => true,
             "inout" => fixed,
             _ => false,
-        };
-    if renderable {
+        }
+    };
+    let Some(under) = option_inner(elem) else {
+        if wraps && (is_string(elem) || lacks_default(elem)) {
+            if nullable.is_some() {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    format!(
+                        "a nullable {label} array of this type needs `Option<_>` elements — \
+                         `.aidl` gives every element of a `@nullable` array its own `Option` \
+                         unless the element is a primitive"
+                    ),
+                ));
+            }
+            // Only as a field: an `out`/`inout` one gets `check_out_capable`'s message.
+            if field {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    format!(
+                        "a fixed-size {label} array of this type needs `Option<_>` elements — \
+                         the field has no value to start each slot from, so that is what \
+                         `.aidl` renders"
+                    ),
+                ));
+            }
+        }
         return Ok(());
+    };
+    if wraps && (nullable.is_some() || lacks_default(under)) {
+        return Ok(());
+    }
+    // Only reachable as `in_like && fixed`, the one `@nullable` array that stays bare.
+    if nullable.is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "a `@nullable` fixed-size {label} array keeps its elements bare — it is the one \
+                 `@nullable` array `.aidl` leaves alone, rendering `@nullable T[N]` as \
+                 `Option<&[T; N]>` (`Option<[T; N]>` for a return); drop the element `Option`"
+            ),
+        ));
     }
     Err(syn::Error::new_spanned(
         ty,
         format!(
-            "an `{direction}` array cannot have `Option<_>` elements — `.aidl` spells a nullable \
-             array `Option<Vec<_>>`, and gives elements their own `Option` only where the callee \
-             must default each one: an `out` binder or fd array, or a fixed-size `#[inout]` one"
+            "{article} {label} array cannot have `Option<_>` elements — `.aidl` gives an element \
+             its own `Option` in a `@nullable` array (except a fixed-size `in` or returned one, \
+             which keeps them bare) and where the slot has no value to start from (an `out` \
+             binder or fd array, a fixed-size `#[inout]` one, or a fixed-size parcelable field \
+             array of a binder or fd); this array is neither, so drop the element `Option`"
         ),
     ))
 }
@@ -530,21 +838,17 @@ pub fn check_out_capable(ty: &Type, direction: &str) -> syn::Result<()> {
     } else if is_string(named) {
         "`String`"
     } else {
-        // `inner`, not `named`: `&mut Option<_>` is the legal spelling.
-        let needs_option = direction == "out" && lacks_default(inner);
-        if needs_option {
+        // A fixed-size `inout` array declares each slot the way an `out` one does.
+        let fixed = matches!(inner, Type::Array(_));
+        if (direction == "out" || (direction == "inout" && fixed))
+            && out_array_elem(inner).is_some_and(lacks_default)
+        {
             return Err(syn::Error::new_spanned(
                 ty,
-                "an `out` parameter of this type has to be spelled `&mut Option<_>` — the \
-                 callee has no value to start from, so that is what `.aidl` renders; add the \
-                 `Option` (`.aidl`'s `out @nullable`), or make it `#[inout]`",
-            ));
-        }
-        if direction == "out" && out_array_elem(inner).is_some_and(lacks_default) {
-            return Err(syn::Error::new_spanned(
-                ty,
-                "an `out` array of this type needs `Option<_>` elements — the callee has no \
-                 value to start each one from, so that is what `.aidl` renders",
+                format!(
+                    "an `{direction}` array of this type needs `Option<_>` elements — the callee \
+                     has no value to start each one from, so that is what `.aidl` renders"
+                ),
             ));
         }
         return Ok(());

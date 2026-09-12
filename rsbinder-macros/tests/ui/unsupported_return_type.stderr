@@ -1,0 +1,11 @@
+error: a trait object has no wire form — pass a binder as `rsbinder::Strong<dyn IFoo>` (`&` it in an argument)
+ --> tests/ui/unsupported_return_type.rs:5:43
+  |
+5 |     fn f(&self) -> rsbinder::BinderResult<dyn std::fmt::Debug>;
+  |                                           ^^^^^^^^^^^^^^^^^^^
+
+error: qualified paths are not supported
+  --> tests/ui/unsupported_return_type.rs:10:43
+   |
+10 |     fn f(&self) -> rsbinder::BinderResult<<Vec<i32> as IntoIterator>::Item>;
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

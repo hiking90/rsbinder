@@ -1,0 +1,11 @@
+error: `()` has no wire form inside a type — `.aidl` accepts `void` only as the whole return type
+ --> tests/ui/unit_inside_a_container.rs:5:22
+  |
+5 |     fn f(&self, v: &[()]) -> rsbinder::BinderResult<()>;
+  |                      ^^
+
+error: `()` has no wire form inside a type — `.aidl` accepts `void` only as the whole return type
+  --> tests/ui/unit_inside_a_container.rs:10:12
+   |
+10 |     pub a: (),
+   |            ^^

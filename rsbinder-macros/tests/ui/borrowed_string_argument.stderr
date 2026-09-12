@@ -1,0 +1,29 @@
+error: `&String` is not the spelling `.aidl` renders for this argument — it renders `&str`, and a call site written against one does not take the other; use `&str`
+ --> tests/ui/borrowed_string_argument.rs:5:21
+  |
+5 |     fn f(&self, s: &String) -> rsbinder::BinderResult<()>;
+  |                     ^^^^^^
+
+error: `Option<&Vec<T>>` is not the spelling `.aidl` renders for this argument — it renders `Option<&[T]>` (and a `@nullable` array gives every non-primitive element an `Option` of its own: `Option<&[Option<String>]>`), and a call site written against one does not take the other; use `Option<&[T]>`
+  --> tests/ui/borrowed_string_argument.rs:10:28
+   |
+10 |     fn f(&self, v: Option<&Vec<i32>>) -> rsbinder::BinderResult<()>;
+   |                            ^^^^^^^^
+
+error: `&Option<T>` is not the spelling `.aidl` renders for this argument — it renders `Option<&T>` (`Option<&str>` for a string, `Option<&[T]>` for an array — whose non-primitive elements each carry an `Option` of their own: `Option<&[Option<String>]>`), and a call site written against one does not take the other; use `Option<&T>`
+  --> tests/ui/borrowed_string_argument.rs:15:21
+   |
+15 |     fn f(&self, v: &Option<String>) -> rsbinder::BinderResult<()>;
+   |                     ^^^^^^^^^^^^^^
+
+error: `.aidl` renders a primitive `in` argument as the bare type, never behind a reference, and a call site written against one does not take the other; drop the `&`
+  --> tests/ui/borrowed_string_argument.rs:20:21
+   |
+20 |     fn f(&self, n: &i32) -> rsbinder::BinderResult<()>;
+   |                     ^^^
+
+error: a nullable argument borrows immutably and without a named lifetime — use `Option<&str>`, or `Option<&[T]>` for an array (whose non-primitive elements each carry an `Option` of their own: `Option<&[Option<String>]>`)
+  --> tests/ui/borrowed_string_argument.rs:25:20
+   |
+25 |     fn f(&self, v: Option<&'static [String]>) -> rsbinder::BinderResult<()>;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^
