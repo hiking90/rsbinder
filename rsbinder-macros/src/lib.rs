@@ -39,6 +39,8 @@
 //! | `x: T` (must be `Copy`), `x: &T`, `x: &str`, `x: &[T]` | in argument |
 //! | `x: &mut T` | **out** argument |
 //! | `#[inout] x: &mut T` | written **and** read back |
+//! | `#[nonnull] x: &mut Option<T>` | an `out` binder or fd that is not `@nullable` |
+//! | `#[deprecated]` / `#[deprecated = "…"]` | AIDL's `@deprecated`, on a trait or a method |
 //! | `Option<T>` | nullable |
 //! | `#[oneway]` on a method | no reply; must return `BinderResult<()>` |
 //!
@@ -46,7 +48,40 @@
 //! have a null representation on the wire. A `#[derive(BinderEnum)]` enum is
 //! carried as its `repr` scalar and is not one of them: `Option<Mode>` fails to
 //! compile inside the generated code, because the enum has no `SerializeOption`
-//! — the same shape `.aidl` rejects at the AIDL level.
+//! — the same shape `.aidl` rejects at the AIDL level. A primitive has no null
+//! either, so `Option<i32>` is refused outright, wherever it sits.
+//!
+//! **Not everything can be an out parameter.** AIDL passes a primitive, a
+//! `String` and an enum `in` only. The first two are refused as `&mut` —
+//! `&mut String` even as `&mut Option<String>`, because `@nullable` does not
+//! widen the direction — but an enum is not: the macro sees only its name and
+//! cannot tell `&mut Mode` from a parcelable's `&mut Config`, which is a legal
+//! out parameter. Never take an enum by `&mut`; no `.aidl` can express it.
+//!
+//! A binder object (`Strong<dyn IFoo>`, `SIBinder`) and a
+//! `ParcelFileDescriptor` have no `Default` for the callee to start from, so
+//! `.aidl` renders an `out` one as `&mut Option<_>` whether or not it is
+//! `@nullable`, and a non-nullable `#[inout]` one bare. Here `&mut Option<_>`
+//! is the `@nullable` form, as `Option<T>` is everywhere else: a `None` the
+//! service leaves behind goes back as null. The exception is an `out` fd
+//! array: in `&mut Vec<Option<ParcelFileDescriptor>>` /
+//! `&mut [Option<ParcelFileDescriptor>; N]` the element `Option` is `.aidl`'s
+//! own, and one left `None` fails the call with `UNEXPECTED_NULL`;
+//! `&mut Option<Vec<Option<_>>>` is the `@nullable` form. For the other
+//! `.aidl` form of the scalar — a non-nullable `out IFoo`, whose server
+//! answers a `None` the service left behind with `UNEXPECTED_NULL` rather than
+//! writing null — mark the parameter `#[nonnull]`. That is the only place the
+//! attribute applies; everywhere else the spelling already says which form it
+//! is. A `ParcelableHolder` is a parcelable field type only and cannot appear
+//! in a signature at all.
+//!
+//! **An out vector is an array, never a `List`.** An out `&mut Vec<T>` is
+//! `.aidl`'s `out T[]`, and `&mut Option<Vec<T>>` its `out @nullable T[]`: the
+//! proxy sends the caller's current length (null for `None`) and the service
+//! starts from a vector pre-sized to it. `.aidl`'s `out List<T>` renders the
+//! very same signature but sends no length and starts the service from an
+//! empty vector (`None` when `@nullable`), so the two are not wire-compatible.
+//! `out List<T>` has no spelling here; it needs `.aidl`.
 //!
 //! **Paths resolve inside the generated module.** The body lands in a
 //! `{Trait}_binder` module one level below where the macro was written, and it
@@ -57,12 +92,17 @@
 //! left legal because it is the only way to name a type the generated module
 //! shadows (`BnFoo`, `BpFoo`, `transactions`, the trait's own name).
 //!
-//! **Spell out-parameter types directly.** A proc macro cannot see through a
-//! type alias, so `&mut Ids` for `type Ids = Vec<i32>` reads as an opaque
-//! named type: it loses the length word `.aidl` writes for an out vector, and
-//! an aliased `ParcelFileDescriptor` element loses the null guard that keeps a
-//! null fd off the wire. Path qualification is fine — `std::vec::Vec<i32>` is
-//! matched structurally — but an alias is not.
+//! **Spell types directly.** A proc macro cannot see through a type alias or
+//! a `use … as` rename, and every check above reads the spelling. `&mut Ids`
+//! for `type Ids = Vec<i32>` reads as an opaque named type: it loses the
+//! length word `.aidl` writes for an out array (`T[]`), and an aliased
+//! `ParcelFileDescriptor` element loses the null guard that keeps a null fd
+//! off the wire. Likewise a renamed `ParcelableHolder` or an alias of
+//! `Option<i32>` slips past the check that refuses it and generates the code
+//! that check exists to prevent, and a renamed `Strong` or
+//! `ParcelFileDescriptor` escapes the out-parameter rule above. Path
+//! qualification is fine — `std::vec::Vec<i32>` is matched structurally — but
+//! an alias or a rename is not.
 //!
 //! A doc comment on a method documents the declaration, not the generated
 //! trait: the render layer carries no doc field, so rustdoc for the emitted
@@ -123,6 +163,12 @@ impl Parse for Args {
         let metas = Punctuated::<syn::MetaNameValue, Token![,]>::parse_terminated(input)?;
         for meta in metas {
             if meta.path.is_ident("descriptor") {
+                if descriptor.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        &meta.path,
+                        "`descriptor` is given more than once",
+                    ));
+                }
                 let syn::Expr::Lit(syn::ExprLit {
                     lit: syn::Lit::Str(s),
                     ..
@@ -133,12 +179,7 @@ impl Parse for Args {
                         "descriptor must be a string literal",
                     ));
                 };
-                // The value is spliced into a Rust string literal in the
-                // generated source with no re-escaping, so a backslash or a
-                // quote would either change the wire descriptor or break the
-                // literal — surfacing as a parse failure over the whole
-                // generated module instead of a span on this attribute. The
-                // `.aidl` path is spared this by its grammar.
+                // Spliced unescaped into a generated literal; `.aidl`'s grammar never admits these.
                 let value = s.value();
                 if let Some(bad) = value.chars().find(|c| "\\\"\n\r".contains(*c)) {
                     return Err(syn::Error::new_spanned(
@@ -163,16 +204,23 @@ impl Parse for Args {
 
 /// `#[<name>(descriptor = "…")]` on a derive input.
 fn attr_descriptor(attrs: &[syn::Attribute], name: &str) -> syn::Result<Option<String>> {
+    let mut found = None;
     for attr in attrs {
         if !attr.path().is_ident(name) {
             continue;
         }
         let args: Args = attr.parse_args()?;
         if args.descriptor.is_some() {
-            return Ok(args.descriptor);
+            if found.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    format!("`descriptor` is given more than once; #[{name}(..)] appears twice"),
+                ));
+            }
+            found = args.descriptor;
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Parcel codec for a plain Rust struct — the `.aidl`-free `parcelable`.
@@ -187,11 +235,24 @@ fn attr_descriptor(attrs: &[syn::Attribute], name: &str) -> syn::Result<Option<S
 /// derive — but **`Default` is required**: reading a parcelable that arrives
 /// as `null` builds one from it. `#[derive(Parcelable, Default, Debug)]` is
 /// the normal shape. The descriptor defaults to the type name and is
-/// overridden with `#[parcelable(descriptor = "…")]`.
+/// overridden with `#[parcelable(descriptor = "…")]`. `#[deprecated]` and
+/// `#[deprecated = "…"]` carry through as AIDL's `@deprecated`, on the struct
+/// and on a field alike; the richer Rust forms carry fields `.aidl` has
+/// nowhere to put and are refused.
 ///
-/// Fields must be named and owned. `ParcelableHolder` and non-nullable binder
-/// fields are `.aidl`-only shapes: spell a binder field `Option<Strong<dyn
-/// IFoo>>`, which is AIDL's `@nullable`.
+/// Fields must be named and owned — owned all the way down, so `Option<&str>`
+/// and `Vec<&str>` are out too. A nullable primitive (`Option<i32>`) is
+/// refused for the same reason the interface path refuses it: `.aidl` has no
+/// `@nullable int`. `ParcelableHolder` and non-nullable binder or fd fields
+/// (`Strong<dyn IFoo>`, `SIBinder`, `ParcelFileDescriptor`) are `.aidl`-only
+/// shapes: here `Option<_>` on any of them is AIDL's `@nullable`, even though
+/// `.aidl` spells the non-nullable field the same way.
+///
+/// These checks read the field's spelling — a proc macro cannot see through a
+/// type alias or a `use … as` rename. A `ParcelableHolder` imported under
+/// another name, or a `type MaybeInt = Option<i32>`, is not caught and
+/// compiles into the very codec the check exists to refuse; spell them
+/// directly.
 #[proc_macro_derive(Parcelable, attributes(parcelable))]
 pub fn derive_parcelable(item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::DeriveInput);
@@ -263,23 +324,17 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<proc_macro2::TokenStream
         ));
     };
 
-    // Renamed because an explicit module would beat the glob re-export to the
-    // trait's name; `use super::*;` because the signature's paths are the
-    // user's, one level up.
+    // Renamed: a module named like the trait would shadow the trait's glob re-export.
     let raw_name = item.ident.to_string();
     let mod_ident = syn::Ident::new(
         &format!("{}_binder", strip_raw(&raw_name)),
         item.ident.span(),
     );
     module.ident = mod_ident.clone();
-    // The module is an implementation detail, but a `pub` one would still make
-    // a private trait nameable from outside; follow the trait's own visibility.
+    // A `pub` module would make a private trait nameable from outside.
     module.vis = item.vis.clone();
 
-    // The proxy passes each argument to `build_parcel_*` and then again to
-    // `read_response_*`, so a by-value argument has to be `Copy`. Asserted
-    // against the user's own type — and from *inside* the module, so a
-    // signature path resolves in the same scope the generated body uses it.
+    // The proxy passes a by-value argument twice, so assert `Copy` where the body resolves it.
     let copied = by_value_types(item)?;
     if let Some((_, items)) = module.content.as_mut() {
         items.insert(
@@ -311,20 +366,15 @@ pub(crate) fn strip_raw(ident: &str) -> &str {
     ident.strip_prefix("r#").unwrap_or(ident)
 }
 
-/// The generated module source, before the module wrapper is stripped — split
-/// out so the golden test can hold it against the `.aidl` output (plan 2-19 D1).
+/// The generated module source, split out for the golden test (plan 2-19 D1).
 fn render_source(args: &Args, item: &ItemTrait) -> syn::Result<String> {
     render_source_with(args, item, cfg!(feature = "async"))
 }
 
 fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn::Result<String> {
-    // The trait is re-rendered from scratch, so anything not read here is
-    // silently dropped: a `#[cfg]` would be emitted regardless of its
-    // condition, and a trait-level `#[oneway]` would become twoway.
-    check_attrs(&item.attrs, &[])?;
-    // The generated trait is re-rendered from the render layer, which carries
-    // no modifier — an accepted one would silently vanish, leaving a safe
-    // trait a `impl` could satisfy without ever writing `unsafe`.
+    // A trait-level `#[cfg]` or `#[oneway]` would vanish in the re-render.
+    check_attrs(&item.attrs, &["deprecated"])?;
+    // The render layer carries no trait modifier, so an accepted one would vanish.
     if let Some(unsafety) = &item.unsafety {
         return Err(syn::Error::new_spanned(
             unsafety,
@@ -362,6 +412,8 @@ fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn
     let raw = item.ident.to_string();
     let name = strip_raw(&raw).to_string();
     let mut fn_members = Vec::new();
+    // `r#type` and `type` are one name.
+    let mut seen = std::collections::HashSet::new();
     for (i, trait_item) in item.items.iter().enumerate() {
         let TraitItem::Fn(f) = trait_item else {
             return Err(syn::Error::new_spanned(
@@ -369,6 +421,13 @@ fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn
                 "only methods are supported; constants and associated types need `.aidl`",
             ));
         };
+        let ident = f.sig.ident.to_string();
+        if !seen.insert(strip_raw(&ident).to_string()) {
+            return Err(syn::Error::new_spanned(
+                &f.sig.ident,
+                format!("duplicate method name `{}`", strip_raw(&ident)),
+            ));
+        }
         fn_members.push(make_fn_member(f, i as u32)?);
     }
 
@@ -376,6 +435,7 @@ fn render_source_with(args: &Args, item: &ItemTrait, enabled_async: bool) -> syn
     let mut render = InterfaceRender::new(name, descriptor);
     render.fn_members = fn_members;
     render.enabled_async = enabled_async;
+    render.deprecated = deprecated_of(&item.attrs)?;
 
     render_interface(&render)
         .map(|s| s.trim().to_string())
@@ -401,8 +461,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
             "a where clause on a binder method is not supported",
         ));
     }
-    // Modifiers are dropped by the re-render, so the user's `impl` would fail
-    // against a signature they never wrote.
+    // The re-render drops these, so the user's `impl` would miss its own signature.
     if let Some(tok) = &f.sig.asyncness {
         return Err(syn::Error::new_spanned(
             tok,
@@ -410,8 +469,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
              alongside it",
         ));
     }
-    // `Safety::Safe` parses only inside an `extern` block, so a trait method
-    // reaches here as either `Default` or `Unsafe`.
+    // `Safety::Safe` parses only inside an `extern` block.
     if !matches!(f.sig.safety, syn::Safety::Default) {
         return Err(syn::Error::new_spanned(
             &f.sig.safety,
@@ -430,8 +488,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
             "an explicit ABI has no meaning on a binder method",
         ));
     }
-    // `syn` parses `...` here even outside an `extern` block, and the render
-    // layer has no place for it — the argument would vanish from the trait.
+    // `syn` parses `...` even outside an `extern` block; the render layer would drop it.
     if let Some(variadic) = &f.sig.variadic {
         return Err(syn::Error::new_spanned(
             variadic,
@@ -440,19 +497,27 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         ));
     }
     let oneway = has_attr(&f.attrs, "oneway");
-    check_attrs(&f.attrs, &["oneway"])?;
+    check_attrs(&f.attrs, &["oneway", "deprecated"])?;
+
+    const SHARED_RECEIVER: &str = "the first parameter must be `&self` — a binder object is \
+                                   shared, never owned or uniquely borrowed by a call";
 
     let mut inputs = f.sig.inputs.iter();
-    match inputs.next() {
-        Some(FnArg::Receiver(r)) if matches!(r.kind, syn::ReceiverKind::Reference(_, _, None)) => {}
-        _ => {
-            return Err(syn::Error::new_spanned(
-                &f.sig,
-                "the first parameter must be `&self` — a binder object is shared, never owned \
-                 or uniquely borrowed by a call",
-            ))
-        }
+    let Some(FnArg::Receiver(receiver)) = inputs.next() else {
+        return Err(syn::Error::new_spanned(&f.sig, SHARED_RECEIVER));
+    };
+    let syn::ReceiverKind::Reference(_, lifetime, None) = &receiver.kind else {
+        return Err(syn::Error::new_spanned(&f.sig, SHARED_RECEIVER));
+    };
+    // `&'_ self` is `&self`; a named one would be dropped by the re-render.
+    if let Some(lifetime) = lifetime.as_ref().filter(|lt| lt.ident != "_") {
+        return Err(syn::Error::new_spanned(
+            lifetime,
+            "an explicit lifetime on `self` is not supported — the generated trait takes a \
+             plain `&self`",
+        ));
     }
+    check_attrs(&receiver.attrs, &[])?;
 
     let mut args = "&self".to_string();
     let mut args_async = "&'a self".to_string();
@@ -462,6 +527,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
     let mut transaction_write = Vec::new();
     let mut transaction_params = String::new();
     let mut read_onto_params = Vec::new();
+    let mut arg_names = std::collections::HashSet::new();
 
     for input in inputs {
         let FnArg::Typed(pat_ty) = input else {
@@ -473,12 +539,17 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
                 "parameter patterns are not supported; use a plain name",
             ));
         };
-        // `rsbinder-aidl` prefixes every parameter with `_arg_`; match it so the
-        // two paths emit the same signature. Trait parameter names do not bind
-        // the `impl`, so this is invisible to users writing a service.
-        check_attrs(&pat_ty.attrs, &["inout"])?;
+        // `rsbinder-aidl`'s `_arg_` prefix; trait parameter names do not bind the `impl`.
+        check_attrs(&pat_ty.attrs, &["inout", "nonnull"])?;
         let raw_arg = pat_ident.ident.to_string();
         let ident = format!("_arg_{}", strip_raw(&raw_arg));
+        // AOSP `AidlMethod::CheckValid`; else E0415 lands on generated tokens.
+        if !arg_names.insert(ident.clone()) {
+            return Err(syn::Error::new_spanned(
+                &pat_ident.ident,
+                format!("duplicate argument name `{}`", strip_raw(&raw_arg)),
+            ));
+        }
         let dir = direction(&pat_ty.attrs, &pat_ty.ty)?;
         if oneway && dir != Dir::In {
             return Err(syn::Error::new_spanned(
@@ -489,9 +560,25 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         }
         type_str::check_supported(&pat_ty.ty)?;
         type_str::reject_nullable_primitive(&pat_ty.ty)?;
+        reject_holder_in_signature(&pat_ty.ty)?;
+        let word = match dir {
+            Dir::In => "in",
+            Dir::Out => "out",
+            Dir::Inout => "inout",
+        };
         if dir != Dir::In {
-            let word = if dir == Dir::Out { "out" } else { "inout" };
             type_str::check_out_capable(&pat_ty.ty, word)?;
+        }
+        type_str::check_array_elements(&pat_ty.ty, word)?;
+        // `out T` and `out @nullable T` share one Rust spelling for a binder or a fd.
+        let nonnull = has_attr(&pat_ty.attrs, "nonnull");
+        if nonnull && !(dir == Dir::Out && type_str::out_option_is_ambiguous(&pat_ty.ty)) {
+            return Err(syn::Error::new_spanned(
+                &pat_ty.ty,
+                "#[nonnull] applies only to an `out` binder object or file descriptor, spelled \
+                 `&mut Option<_>` — everywhere else the spelling already says which `.aidl` \
+                 form this is",
+            ));
         }
         let as_written = type_str::as_written(&pat_ty.ty)?;
         let owned = type_str::owned(&pat_ty.ty)?;
@@ -501,9 +588,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         args_async += &arg_str.replace('&', "&'a ");
         func_call_params += &format!("{ident}, ");
 
-        // Shape decisions read the `syn::Type`, not the rendered string: a
-        // qualified `std::vec::Vec<T>` is the same type as `Vec<T>` and must
-        // carry the same length word.
+        // Structural, not string: `std::vec::Vec<T>` carries the same length word as `Vec<T>`.
         let is_option_vec = type_str::option_vec_elem(&pat_ty.ty).is_some();
         let is_var_array = type_str::is_variable_array(&pat_ty.ty);
         if dir != Dir::Out {
@@ -516,8 +601,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
         } else if is_option_vec {
             write_funcs.push(format!("data.write_slice_size({ident}.as_deref())?;"));
         } else if is_var_array {
-            // An out `Vec` carries only its length on the request; the server
-            // sizes its own buffer from it (AOSP `resizeOutVector`).
+            // Only the length is sent; the server sizes from it (AOSP `resizeOutVector`).
             write_funcs.push(format!("data.write_slice_size(Some({ident}))?;"));
         }
 
@@ -540,10 +624,14 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
 
         if dir != Dir::In {
             let mut write = TransactionWrite::new(ident.clone());
-            // AOSP writes a non-nullable out fd array back only if every
-            // element is present; a `None` would otherwise go out as a null fd
-            // where `.aidl` raises `UNEXPECTED_NULL`.
-            write.needs_null_guard = dir == Dir::Out && type_str::is_option_pfd_vec(&pat_ty.ty);
+            // A `None` fd element would go out as a null fd; `.aidl` raises `UNEXPECTED_NULL`.
+            if dir == Dir::Out {
+                if let Some(flatten) = type_str::out_pfd_null_guard(&pat_ty.ty) {
+                    write.needs_null_guard = true;
+                    write.null_guard_flatten = flatten;
+                }
+            }
+            write.needs_unwrap = nonnull;
             transaction_write.push(write);
             read_onto_params.push(ident.clone());
         }
@@ -571,11 +659,11 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
     member.transaction_params = trim_comma(transaction_params);
     member.oneway = oneway;
     member.read_onto_params = read_onto_params;
+    member.deprecated = deprecated_of(&f.attrs)?;
     Ok(member)
 }
 
-/// Bridge what the server owns (`owned`) to what the trait asks for
-/// (`as_written`), driven off the signature so no type list is needed.
+/// Bridge `owned` to `as_written` off the signature alone, so no type list is needed.
 fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> String {
     if dir != Dir::In {
         return format!("&mut {ident}");
@@ -600,7 +688,8 @@ fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> Stri
 }
 
 fn direction(attrs: &[syn::Attribute], ty: &Type) -> syn::Result<Dir> {
-    let is_mut_ref = matches!(ty, Type::Reference(r) if r.mutability.is_some());
+    let is_mut_ref =
+        matches!(type_str::unwrap_group(ty), Type::Reference(r) if r.mutability.is_some());
     if has_attr(attrs, "inout") {
         if !is_mut_ref {
             return Err(syn::Error::new_spanned(
@@ -620,7 +709,7 @@ fn return_type(f: &TraitItemFn) -> syn::Result<String> {
             "a binder method must return `BinderResult<T>` — every call can fail on the wire",
         ));
     };
-    let Type::Path(p) = &**ty else {
+    let Type::Path(p) = type_str::unwrap_group(ty) else {
         return Err(syn::Error::new_spanned(ty, "expected `BinderResult<T>`"));
     };
     let last = p.path.segments.last().expect("non-empty path");
@@ -636,16 +725,32 @@ fn return_type(f: &TraitItemFn) -> syn::Result<String> {
             "`BinderResult` needs its success type: `BinderResult<()>` for no return",
         ));
     };
+    if args.args.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`BinderResult` takes exactly one type argument",
+        ));
+    }
     let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
         return Err(syn::Error::new_spanned(ty, "expected `BinderResult<T>`"));
     };
-    // Not `check_supported`: that lets `Option<&str>` through for nullable
-    // *arguments*, and a return value would then be silently rewritten to
-    // `Option<String>`, leaving the user's `impl` to fail with no diagnostic
-    // on the declaration.
+    // Not `check_supported`: its `Option<&str>` would silently become `Option<String>` here.
     type_str::reject_any_reference(inner)?;
     type_str::reject_nullable_primitive(inner)?;
+    reject_holder_in_signature(inner)?;
     type_str::owned(inner)
+}
+
+/// A holder's stability is set before the read, which a signature cannot express.
+fn reject_holder_in_signature(ty: &Type) -> syn::Result<()> {
+    if !type_str::mentions_parcelable_holder(ty) {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        ty,
+        "a `ParcelableHolder` cannot appear in a binder signature — `.aidl` refuses it as an \
+         argument or return type; carry it as a field of a parcelable instead",
+    ))
 }
 
 /// Argument types the signature takes by value.
@@ -667,27 +772,70 @@ fn by_value_types(item: &ItemTrait) -> syn::Result<Vec<Type>> {
     Ok(out)
 }
 
+/// `#[deprecated]` / `#[deprecated = "…"]` as `.aidl` renders `@deprecated`.
+pub(crate) fn deprecated_of(attrs: &[syn::Attribute]) -> syn::Result<String> {
+    let Some(attr) = attrs.iter().find(|a| a.path().is_ident("deprecated")) else {
+        return Ok(String::new());
+    };
+    match &attr.meta {
+        syn::Meta::Path(_) => Ok(rsbinder_aidl::render::deprecated_attr(Some(&String::new()))),
+        syn::Meta::NameValue(nv) => {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            else {
+                return Err(syn::Error::new_spanned(
+                    &nv.value,
+                    "a deprecation note must be a string literal",
+                ));
+            };
+            let note = s.value();
+            Ok(rsbinder_aidl::render::deprecated_attr(Some(&note)))
+        }
+        syn::Meta::List(list) => Err(syn::Error::new_spanned(
+            list,
+            "`.aidl` carries only `#[deprecated]` and `#[deprecated = \"…\"]`; the other fields \
+             of the Rust attribute have no AIDL form and would be dropped",
+        )),
+    }
+}
+
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-/// The trait is re-rendered from scratch, so an unrecognised attribute would be
-/// dropped: a mistyped `#[oneway]` becoming a twoway call, a `#[cfg]` ignored.
+/// The re-render drops an unrecognised attribute, e.g. a mistyped `#[oneway]` or a `#[cfg]`.
 fn check_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<()> {
     for attr in attrs {
-        if attr.path().is_ident("doc") || allowed.iter().any(|a| attr.path().is_ident(a)) {
+        if attr.path().is_ident("doc") {
             continue;
         }
-        return Err(syn::Error::new_spanned(
-            attr,
+        if let Some(name) = allowed.iter().find(|a| attr.path().is_ident(a)) {
+            // `#[deprecated]` carries its note; `deprecated_of` checks its shape.
+            if *name != "deprecated" && !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    format!("#[{name}] takes no arguments"),
+                ));
+            }
+            continue;
+        }
+        let expected = if allowed.is_empty() {
+            "no attribute is supported here".to_string()
+        } else {
             format!(
-                "unsupported attribute; #[rsbinder::interface] understands only {} here",
+                "#[rsbinder::interface] understands only {} here",
                 allowed
                     .iter()
                     .map(|a| format!("#[{a}]"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
+            )
+        };
+        return Err(syn::Error::new_spanned(
+            attr,
+            format!("unsupported attribute; {expected}"),
         ));
     }
     Ok(())
@@ -702,18 +850,13 @@ fn trim_comma(mut s: String) -> String {
 
 #[cfg(test)]
 mod golden {
-    //! The contract: a trait through this macro and the equivalent `.aidl`
-    //! through `rsbinder-aidl` must produce the **same** module source. If this
-    //! drifts, moving an interface from one path to the other stops being a
-    //! no-op for call sites, which is the whole reason the macro reuses the
-    //! render layer instead of emitting its own code (plan 2-19 D1).
+    //! A trait here and the equivalent `.aidl` must render the same module source (plan 2-19 D1).
 
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A temp directory that removes itself, so a `cargo test` run leaves
-    /// nothing behind in `/tmp`.
+    /// A temp directory that removes itself on drop.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -740,8 +883,7 @@ mod golden {
         }
     }
 
-    /// Generate `aidl` with `rsbinder-aidl` and return just the interface
-    /// module, without the file header.
+    /// The interface module `rsbinder-aidl` generates from `aidl`, without the file header.
     fn from_aidl(aidl: &str, module: &str, enabled_async: bool) -> String {
         let dir = TempDir::new(module);
         let src = dir.path().join(format!("{module}.aidl"));
@@ -760,8 +902,7 @@ mod golden {
         extract_module(&text, module)
     }
 
-    /// Pull `pub mod {module} { … }` out of a generated file and dedent it —
-    /// a packaged `.aidl` nests it, the macro emits it at column 0.
+    /// `pub mod {module} { … }`, dedented: a packaged `.aidl` nests it, the macro does not.
     fn extract_module(text: &str, module: &str) -> String {
         let needle = format!("pub mod {module} {{");
         let start_line = text
@@ -802,8 +943,7 @@ mod golden {
         render_source_with(&Args { descriptor: None }, &item, enabled_async).expect("render")
     }
 
-    /// Both `enabled_async` settings, because the golden gate is what pins the
-    /// two front-ends together and a `cfg!` would leave one half unchecked.
+    /// Both `enabled_async` settings: a `cfg!` would leave one half unchecked.
     #[track_caller]
     fn assert_same(aidl: &str, module: &str, tokens: proc_macro2::TokenStream) {
         for enabled_async in [false, true] {
@@ -869,8 +1009,7 @@ mod golden {
         }
     }
 
-    /// Same as [`from_aidl`] but with sibling files in the include dir, so a
-    /// fixture can reference another interface.
+    /// [`from_aidl`] with sibling files, so a fixture can reference another interface.
     fn from_aidl_files(
         files: &[(&str, &str)],
         main: &str,
@@ -958,6 +1097,26 @@ interface IGolden3 {
         );
     }
 
+    /// `out List<T>` renders the same signature without the length word, so pin the array side.
+    #[test]
+    fn an_out_vec_is_the_array_form_not_the_list_form() {
+        assert_same(
+            r#"
+interface IGolden12 {
+    void fill(out String[] values);
+    void maybe(out @nullable String[] values);
+}
+"#,
+            "IGolden12",
+            quote! {
+                pub trait IGolden12 {
+                    fn fill(&self, values: &mut Vec<String>) -> BinderResult<()>;
+                    fn maybe(&self, values: &mut Option<Vec<Option<String>>>) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
     #[test]
     fn nullable_arguments_and_returns() {
         assert_same(
@@ -981,8 +1140,7 @@ interface IGolden4 {
 
     #[test]
     fn binder_objects() {
-        // Cross-file: pins the `super::Mod::Type` path a packaged import
-        // produces, which a single-file fixture never exercises.
+        // Cross-file, to pin the `super::Mod::Type` path a packaged import produces.
         assert_same_files(
             &[
                 (
@@ -1013,9 +1171,391 @@ interface IGolden4 {
         );
     }
 
-    /// A self-referencing interface — the callback pattern users reach for
-    /// first, and the one shape where the two paths could disagree on how the
-    /// declaring interface names itself.
+    /// A fixed-size out fd array keeps the guard, one `.flatten()` per extra dimension.
+    #[test]
+    fn out_fd_arrays_keep_the_null_guard_at_every_arity() {
+        assert_same(
+            r#"
+interface IGolden8 {
+    void variable(out ParcelFileDescriptor[] fds);
+    void fixed(out ParcelFileDescriptor[3] fds);
+    void nested(out ParcelFileDescriptor[2][3] fds);
+}
+"#,
+            "IGolden8",
+            quote! {
+                pub trait IGolden8 {
+                    fn variable(
+                        &self,
+                        fds: &mut Vec<Option<rsbinder::ParcelFileDescriptor>>,
+                    ) -> BinderResult<()>;
+                    fn fixed(
+                        &self,
+                        fds: &mut [Option<rsbinder::ParcelFileDescriptor>; 3],
+                    ) -> BinderResult<()>;
+                    fn nested(
+                        &self,
+                        fds: &mut [[Option<rsbinder::ParcelFileDescriptor>; 3]; 2],
+                    ) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// Every out/inout shape `.aidl` renders, in one interface. A `Default`-less
+    /// element, a `@nullable` wrapper and a fixed dimension all meet in the out
+    /// rules, so a rule that is right for one row is easily wrong for the next.
+    ///
+    /// The first three are `@nullable` because that is what `&mut Option<T>`
+    /// means here: `out IFoo` spells the same Rust type but makes the server
+    /// answer `UNEXPECTED_NULL` on `None`, and the macro cannot say which.
+    #[test]
+    fn every_out_and_inout_shape_matches_aidl() {
+        assert_same_files(
+            &[
+                (
+                    "p/IGolden10.aidl",
+                    "package p;\nimport p.IGolden10Cb;\nimport p.Golden10Cfg;\n\
+                     interface IGolden10 {\n\
+                     \x20   void a(out @nullable ParcelFileDescriptor v);\n\
+                     \x20   void b(out @nullable IBinder v);\n\
+                     \x20   void c(out @nullable IGolden10Cb v);\n\
+                     \x20   void d(out Golden10Cfg v);\n\
+                     \x20   void e(out int[] v);\n\
+                     \x20   void f(out String[] v);\n\
+                     \x20   void g(out ParcelFileDescriptor[] v);\n\
+                     \x20   void h(out IGolden10Cb[] v);\n\
+                     \x20   void i(out Golden10Cfg[] v);\n\
+                     \x20   void j(out int[3] v);\n\
+                     \x20   void k(out ParcelFileDescriptor[3] v);\n\
+                     \x20   void l(out ParcelFileDescriptor[2][3] v);\n\
+                     \x20   void m(out Golden10Cfg[3] v);\n\
+                     \x20   void n(out @nullable Golden10Cfg v);\n\
+                     \x20   void o(out @nullable int[] v);\n\
+                     \x20   void p(out @nullable String[] v);\n\
+                     \x20   void q(out @nullable ParcelFileDescriptor[] v);\n\
+                     \x20   void r(out @nullable int[3] v);\n\
+                     \x20   void s(out @nullable Golden10Cfg[3] v);\n\
+                     \x20   void t(inout ParcelFileDescriptor v);\n\
+                     \x20   void u(inout IBinder v);\n\
+                     \x20   void w(inout ParcelFileDescriptor[] v);\n\
+                     \x20   void x(inout IGolden10Cb[] v);\n\
+                     \x20   void y(inout @nullable Golden10Cfg v);\n\
+                     \x20   void z(inout @nullable ParcelFileDescriptor[] v);\n}\n",
+                ),
+                (
+                    "p/IGolden10Cb.aidl",
+                    "package p;\ninterface IGolden10Cb {\n    void hit();\n}\n",
+                ),
+                (
+                    "p/Golden10Cfg.aidl",
+                    "package p;\nparcelable Golden10Cfg {\n    int a;\n}\n",
+                ),
+            ],
+            "p/IGolden10.aidl",
+            "IGolden10",
+            "p.IGolden10",
+            quote! {
+                pub trait IGolden10 {
+                    fn a(&self, v: &mut Option<rsbinder::ParcelFileDescriptor>) -> BinderResult<()>;
+                    fn b(&self, v: &mut Option<rsbinder::SIBinder>) -> BinderResult<()>;
+                    fn c(
+                        &self,
+                        v: &mut Option<rsbinder::Strong<dyn super::IGolden10Cb::IGolden10Cb>>,
+                    ) -> BinderResult<()>;
+                    fn d(&self, v: &mut super::Golden10Cfg::Golden10Cfg) -> BinderResult<()>;
+                    fn e(&self, v: &mut Vec<i32>) -> BinderResult<()>;
+                    fn f(&self, v: &mut Vec<String>) -> BinderResult<()>;
+                    fn g(
+                        &self,
+                        v: &mut Vec<Option<rsbinder::ParcelFileDescriptor>>,
+                    ) -> BinderResult<()>;
+                    fn h(
+                        &self,
+                        v: &mut Vec<Option<rsbinder::Strong<dyn super::IGolden10Cb::IGolden10Cb>>>,
+                    ) -> BinderResult<()>;
+                    fn i(&self, v: &mut Vec<super::Golden10Cfg::Golden10Cfg>) -> BinderResult<()>;
+                    fn j(&self, v: &mut [i32; 3]) -> BinderResult<()>;
+                    fn k(
+                        &self,
+                        v: &mut [Option<rsbinder::ParcelFileDescriptor>; 3],
+                    ) -> BinderResult<()>;
+                    fn l(
+                        &self,
+                        v: &mut [[Option<rsbinder::ParcelFileDescriptor>; 3]; 2],
+                    ) -> BinderResult<()>;
+                    fn m(&self, v: &mut [super::Golden10Cfg::Golden10Cfg; 3]) -> BinderResult<()>;
+                    fn n(
+                        &self,
+                        v: &mut Option<super::Golden10Cfg::Golden10Cfg>,
+                    ) -> BinderResult<()>;
+                    fn o(&self, v: &mut Option<Vec<i32>>) -> BinderResult<()>;
+                    fn p(&self, v: &mut Option<Vec<Option<String>>>) -> BinderResult<()>;
+                    fn q(
+                        &self,
+                        v: &mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>,
+                    ) -> BinderResult<()>;
+                    fn r(&self, v: &mut Option<[i32; 3]>) -> BinderResult<()>;
+                    fn s(
+                        &self,
+                        v: &mut Option<[Option<super::Golden10Cfg::Golden10Cfg>; 3]>,
+                    ) -> BinderResult<()>;
+                    fn t(
+                        &self,
+                        #[inout] v: &mut rsbinder::ParcelFileDescriptor,
+                    ) -> BinderResult<()>;
+                    fn u(&self, #[inout] v: &mut rsbinder::SIBinder) -> BinderResult<()>;
+                    fn w(
+                        &self,
+                        #[inout] v: &mut Vec<rsbinder::ParcelFileDescriptor>,
+                    ) -> BinderResult<()>;
+                    fn x(
+                        &self,
+                        #[inout] v: &mut Vec<rsbinder::Strong<dyn super::IGolden10Cb::IGolden10Cb>>,
+                    ) -> BinderResult<()>;
+                    fn y(
+                        &self,
+                        #[inout] v: &mut Option<super::Golden10Cfg::Golden10Cfg>,
+                    ) -> BinderResult<()>;
+                    fn z(
+                        &self,
+                        #[inout] v: &mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>,
+                    ) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// `#[nonnull]` is the other half of the ambiguous spelling: the same
+    /// `&mut Option<T>` that means `out @nullable T` without it.
+    #[test]
+    fn nonnull_out_binders_match_the_non_nullable_aidl() {
+        assert_same_files(
+            &[
+                (
+                    "p/IGolden11.aidl",
+                    "package p;\nimport p.IGolden11Cb;\n\
+                     interface IGolden11 {\n\
+                     \x20   void a(out ParcelFileDescriptor v);\n\
+                     \x20   void b(out IBinder v);\n\
+                     \x20   void c(out IGolden11Cb v);\n}\n",
+                ),
+                (
+                    "p/IGolden11Cb.aidl",
+                    "package p;\ninterface IGolden11Cb {\n    void hit();\n}\n",
+                ),
+            ],
+            "p/IGolden11.aidl",
+            "IGolden11",
+            "p.IGolden11",
+            quote! {
+                pub trait IGolden11 {
+                    fn a(
+                        &self,
+                        #[nonnull] v: &mut Option<rsbinder::ParcelFileDescriptor>,
+                    ) -> BinderResult<()>;
+                    fn b(
+                        &self,
+                        #[nonnull] v: &mut Option<rsbinder::SIBinder>,
+                    ) -> BinderResult<()>;
+                    fn c(
+                        &self,
+                        #[nonnull] v: &mut Option<
+                            rsbinder::Strong<dyn super::IGolden11Cb::IGolden11Cb>,
+                        >,
+                    ) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// Anywhere else the spelling already says which `.aidl` form it is, so the
+    /// attribute would be a second, silent source of truth.
+    #[test]
+    fn rejects_nonnull_where_the_spelling_is_not_ambiguous() {
+        for decl in [
+            quote!(
+                fn go(&self, #[nonnull] v: &mut Option<Cfg>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(
+                    &self,
+                    #[nonnull] v: &mut Vec<Option<rsbinder::ParcelFileDescriptor>>,
+                ) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(
+                    &self,
+                    #[nonnull]
+                    #[inout]
+                    v: &mut Option<rsbinder::SIBinder>,
+                ) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, #[nonnull] v: Option<&rsbinder::SIBinder>) -> BinderResult<()>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("#[nonnull] applies only"), "{err}");
+        }
+    }
+
+    /// `@deprecated` reaches the trait and the method alike, and renders the
+    /// same attribute `.aidl` renders.
+    #[test]
+    fn deprecation_matches_aidl() {
+        assert_same(
+            r#"
+/**
+ * @deprecated use IGolden12Next
+ */
+interface IGolden12 {
+    /**
+     * @deprecated use b
+     */
+    void a();
+    void b();
+}
+"#,
+            "IGolden12",
+            quote! {
+                #[deprecated = "use IGolden12Next"]
+                pub trait IGolden12 {
+                    #[deprecated = "use b"]
+                    fn a(&self) -> BinderResult<()>;
+                    fn b(&self) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// The richer Rust forms carry fields `.aidl` has nowhere to put.
+    #[test]
+    fn rejects_a_deprecation_the_wire_cannot_carry() {
+        let err = reject(quote! {
+            #[deprecated(since = "1.0", note = "use b")]
+            pub trait IBad {
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("no AIDL form"), "{err}");
+    }
+
+    /// Every `in` array shape `.aidl` renders. The element `Option` follows a
+    /// different rule here than for `out`, so the two tables are both needed.
+    #[test]
+    fn every_in_array_shape_matches_aidl() {
+        assert_same_files(
+            &[
+                (
+                    "p/IGolden14.aidl",
+                    "package p;\nimport p.IGolden14Cb;\nimport p.Golden14Cfg;\n\
+                     interface IGolden14 {\n\
+                     \x20   void a(in int[] v);\n\
+                     \x20   void b(in @nullable int[] v);\n\
+                     \x20   void c(in String[] v);\n\
+                     \x20   void d(in @nullable String[] v);\n\
+                     \x20   void e(in Golden14Cfg[] v);\n\
+                     \x20   void f(in @nullable Golden14Cfg[] v);\n\
+                     \x20   void g(in ParcelFileDescriptor[] v);\n\
+                     \x20   void h(in @nullable ParcelFileDescriptor[] v);\n\
+                     \x20   void i(in IGolden14Cb[] v);\n\
+                     \x20   void j(in @nullable IGolden14Cb[] v);\n\
+                     \x20   void k(in IBinder[] v);\n\
+                     \x20   void l(in @nullable IBinder[] v);\n\
+                     \x20   void m(in Golden14Cfg[3] v);\n\
+                     \x20   void n(in @nullable Golden14Cfg[3] v);\n\
+                     \x20   void o(in ParcelFileDescriptor[3] v);\n\
+                     \x20   void p(in @nullable ParcelFileDescriptor[3] v);\n}\n",
+                ),
+                (
+                    "p/IGolden14Cb.aidl",
+                    "package p;\ninterface IGolden14Cb {\n    void hit();\n}\n",
+                ),
+                (
+                    "p/Golden14Cfg.aidl",
+                    "package p;\nparcelable Golden14Cfg {\n    int a;\n}\n",
+                ),
+            ],
+            "p/IGolden14.aidl",
+            "IGolden14",
+            "p.IGolden14",
+            quote! {
+                pub trait IGolden14 {
+                    fn a(&self, v: &[i32]) -> BinderResult<()>;
+                    fn b(&self, v: Option<&[i32]>) -> BinderResult<()>;
+                    fn c(&self, v: &[String]) -> BinderResult<()>;
+                    fn d(&self, v: Option<&[Option<String>]>) -> BinderResult<()>;
+                    fn e(&self, v: &[super::Golden14Cfg::Golden14Cfg]) -> BinderResult<()>;
+                    fn f(
+                        &self,
+                        v: Option<&[Option<super::Golden14Cfg::Golden14Cfg>]>,
+                    ) -> BinderResult<()>;
+                    fn g(&self, v: &[rsbinder::ParcelFileDescriptor]) -> BinderResult<()>;
+                    fn h(
+                        &self,
+                        v: Option<&[Option<rsbinder::ParcelFileDescriptor>]>,
+                    ) -> BinderResult<()>;
+                    fn i(
+                        &self,
+                        v: &[rsbinder::Strong<dyn super::IGolden14Cb::IGolden14Cb>],
+                    ) -> BinderResult<()>;
+                    fn j(
+                        &self,
+                        v: Option<&[Option<rsbinder::Strong<dyn super::IGolden14Cb::IGolden14Cb>>]>,
+                    ) -> BinderResult<()>;
+                    fn k(&self, v: &[rsbinder::SIBinder]) -> BinderResult<()>;
+                    fn l(&self, v: Option<&[Option<rsbinder::SIBinder>]>) -> BinderResult<()>;
+                    fn m(&self, v: &[super::Golden14Cfg::Golden14Cfg; 3]) -> BinderResult<()>;
+                    fn n(
+                        &self,
+                        v: Option<&[super::Golden14Cfg::Golden14Cfg; 3]>,
+                    ) -> BinderResult<()>;
+                    fn o(&self, v: &[rsbinder::ParcelFileDescriptor; 3]) -> BinderResult<()>;
+                    fn p(
+                        &self,
+                        v: Option<&[rsbinder::ParcelFileDescriptor; 3]>,
+                    ) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// An element `Option` that `.aidl` spells bare lets the service send a
+    /// null element a conforming peer cannot decode.
+    #[test]
+    fn rejects_an_array_of_options_aidl_would_spell_bare() {
+        for decl in [
+            // `in` never gives an element its own `Option`.
+            quote!(
+                fn go(&self, v: &[Option<rsbinder::ParcelFileDescriptor>]) -> BinderResult<()>;
+            ),
+            // `out` gives one only to a binder or a fd.
+            quote!(
+                fn go(&self, v: &mut Vec<Option<String>>) -> BinderResult<()>;
+            ),
+            // A variable `inout` array is read in fully populated.
+            quote!(
+                fn go(
+                    &self,
+                    #[inout] v: &mut Vec<Option<rsbinder::ParcelFileDescriptor>>,
+                ) -> BinderResult<()>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("`Option<_>` elements"), "{err}");
+        }
+    }
+
+    /// The one shape where the two paths could disagree on how an interface names itself.
     #[test]
     fn self_referencing_interface() {
         assert_same(
@@ -1038,11 +1578,7 @@ interface IGolden6 {
         );
     }
 
-    /// The same contract for data types: `#[derive(Parcelable)]` must produce
-    /// the codec `.aidl` produces for the equivalent `parcelable`. The derive
-    /// then drops the struct and `Default` from this module (a derive adds to
-    /// a type, it cannot redeclare it) — what is compared here is the whole
-    /// module, so the parts that do survive are pinned too.
+    /// Compared before the derive drops the struct and `Default`, so the whole module is pinned.
     #[test]
     fn parcelable_codec_matches_aidl() {
         let input: syn::DeriveInput = syn::parse2(quote! {
@@ -1078,10 +1614,7 @@ parcelable GoldenConfig {
         }
     }
 
-    /// A method taking a parcelable and an enum. The enum is the case that
-    /// forced argument passing to follow the signature: `.aidl` treats an enum
-    /// as a scalar and hands it to the service by value, which a list of known
-    /// primitive type names would never have covered.
+    /// An enum is a scalar in `.aidl`, so it is passed by value.
     #[test]
     fn parcelable_and_enum_arguments() {
         let files = [
@@ -1189,8 +1722,7 @@ parcelable GoldenConfig {
             .to_string()
     }
 
-    /// The `_arg_` prefix and the templates' own `r#` would otherwise stack up
-    /// into `_arg_r#type` / `fn r#r#type`, neither of which lexes.
+    /// The `_arg_` prefix and the templates' `r#` must not stack into `_arg_r#` / `r#r#`.
     #[test]
     fn raw_identifiers_are_not_double_escaped() {
         let s = render(quote! {
@@ -1221,9 +1753,7 @@ parcelable GoldenConfig {
         syn::parse_file(&s).unwrap_or_else(|e| panic!("does not parse: {e}\n{s}"));
     }
 
-    /// The trait is re-rendered, so an attribute left on it would vanish —
-    /// a `#[cfg]` emitted regardless of its condition, a trait-level
-    /// `#[oneway]` silently becoming twoway.
+    /// The re-render would drop these: a `#[cfg]` ignored, a `#[oneway]` turned twoway.
     #[test]
     fn rejects_trait_level_attributes() {
         let err = reject(quote! {
@@ -1260,8 +1790,7 @@ parcelable GoldenConfig {
         assert!(err.contains("where clause"), "{err}");
     }
 
-    /// A modifier the re-render drops would leave the user's `impl` failing
-    /// against a signature they never wrote.
+    /// The re-render drops modifiers, so the user's `impl` would miss its own signature.
     #[test]
     fn rejects_signature_modifiers() {
         let err = reject(quote! {
@@ -1279,14 +1808,14 @@ parcelable GoldenConfig {
         assert!(err.contains("unsafe"), "{err}");
     }
 
-    /// `syn` keeps the `mut` of `&mut self` inside the receiver kind, not
-    /// beside it, so a shape-only check has to name the kind.
+    /// `syn` keeps `&mut self`'s `mut` inside the receiver kind, so the check names the kind.
     #[test]
     fn rejects_non_shared_receivers() {
         for recv in [
             quote!(self),
             quote!(mut self),
             quote!(&mut self),
+            quote!(&'static self),
             quote!(self: Box<Self>),
         ] {
             let err = reject(quote! {
@@ -1296,11 +1825,44 @@ parcelable GoldenConfig {
             });
             assert!(err.contains("`&self`"), "{recv}: {err}");
         }
+        // Already a shared borrow, so the reason has to be the lifetime.
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&'static self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("explicit lifetime on `self`"), "{err}");
+        // `&'_ self` is the same type as `&self`, so nothing is lost.
+        render(quote! {
+            pub trait IOk {
+                fn go(&'_ self) -> BinderResult<()>;
+            }
+        });
     }
 
-    /// `check_supported` lets `Option<&str>` through for nullable *arguments*;
-    /// as a return type it would be rewritten to `Option<String>` with no
-    /// diagnostic on the declaration.
+    /// A receiver's attribute is dropped by the re-render like any other.
+    #[test]
+    fn rejects_an_attribute_on_the_receiver() {
+        for recv in [
+            quote!(
+                #[oneway]
+                &self
+            ),
+            quote!(
+                #[cfg(feature = "never")]
+                &self
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(#recv) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("unsupported attribute"), "{recv}: {err}");
+        }
+    }
+
+    /// As a return type, `Option<&str>` would silently become `Option<String>`.
     #[test]
     fn rejects_borrowed_return_inside_option() {
         let err = reject(quote! {
@@ -1309,6 +1871,292 @@ parcelable GoldenConfig {
             }
         });
         assert!(err.contains("borrow"), "{err}");
+    }
+
+    /// `@nullable` does not widen a `String`'s direction.
+    #[test]
+    fn rejects_out_nullable_string() {
+        for decl in [
+            quote!(
+                fn go(&self, s: &mut Option<String>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, #[inout] s: &mut Option<String>) -> BinderResult<()>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("`String` cannot be an"), "{err}");
+        }
+    }
+
+    /// A bare out binder object or fd has no `.aidl` form and no `Default` to start from.
+    #[test]
+    fn rejects_a_bare_out_binder_object_or_fd() {
+        for ty in [
+            quote!(&mut rsbinder::Strong<dyn IOther>),
+            quote!(&mut rsbinder::ParcelFileDescriptor),
+            quote!(&mut rsbinder::SIBinder),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(&self, v: #ty) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("&mut Option<_>"), "{ty}: {err}");
+        }
+        // Bare `#[inout]` and `out` `Option` are both `.aidl` forms.
+        render(quote! {
+            pub trait IOk {
+                fn a(&self, #[inout] v: &mut rsbinder::Strong<dyn IOther>) -> BinderResult<()>;
+                fn b(&self, #[inout] v: &mut rsbinder::ParcelFileDescriptor) -> BinderResult<()>;
+                fn c(&self, v: &mut Option<rsbinder::Strong<dyn IOther>>) -> BinderResult<()>;
+                fn d(&self, v: &mut Option<rsbinder::ParcelFileDescriptor>) -> BinderResult<()>;
+            }
+        });
+    }
+
+    /// Each element of an out array needs a `Default` to be sized or started from.
+    #[test]
+    fn rejects_an_out_array_of_bare_binder_objects_or_fds() {
+        for ty in [
+            quote!(&mut Vec<rsbinder::ParcelFileDescriptor>),
+            quote!(&mut Option<Vec<rsbinder::ParcelFileDescriptor>>),
+            quote!(&mut Vec<rsbinder::Strong<dyn IOther>>),
+            quote!(&mut [rsbinder::SIBinder; 3]),
+            quote!(&mut [[rsbinder::ParcelFileDescriptor; 3]; 2]),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(&self, v: #ty) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("`Option<_>` elements"), "{ty}: {err}");
+        }
+        // `.aidl`'s non-nullable `inout` array is the bare form.
+        render(quote! {
+            pub trait IOk {
+                fn a(&self, #[inout] v: &mut Vec<rsbinder::ParcelFileDescriptor>)
+                    -> BinderResult<()>;
+            }
+        });
+    }
+
+    /// The macro's `&mut Option<_>` out is `.aidl`'s `out @nullable`.
+    #[test]
+    fn out_binder_objects_and_fds_are_the_nullable_form() {
+        assert_same(
+            r#"
+interface IGolden9 {
+    void take_cb(out @nullable IGolden9 cb);
+    void take_fd(out @nullable ParcelFileDescriptor fd);
+    void take_binder(out @nullable IBinder b);
+}
+"#,
+            "IGolden9",
+            quote! {
+                pub trait IGolden9 {
+                    fn take_cb(
+                        &self,
+                        cb: &mut Option<rsbinder::Strong<dyn IGolden9>>,
+                    ) -> BinderResult<()>;
+                    fn take_fd(
+                        &self,
+                        fd: &mut Option<rsbinder::ParcelFileDescriptor>,
+                    ) -> BinderResult<()>;
+                    fn take_binder(&self, b: &mut Option<rsbinder::SIBinder>) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// `macro_rules!` hands a `$t:ty` over wrapped in an invisible group.
+    #[test]
+    fn a_macro_interpolated_type_renders_like_the_bare_one() {
+        let str_ty = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(str));
+        let ref_str = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(&str));
+        assert_same(
+            r#"
+interface IGolden10 {
+    void take(in String s, in @nullable String t);
+}
+"#,
+            "IGolden10",
+            quote! {
+                pub trait IGolden10 {
+                    fn take(&self, s: &#str_ty, t: Option<#ref_str>) -> BinderResult<()>;
+                }
+            },
+        );
+    }
+
+    /// A whole interpolated parameter or return type keeps its direction and shape.
+    #[test]
+    fn a_macro_interpolated_parameter_keeps_its_direction() {
+        let vec_ty = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(&mut Vec<i32>));
+        let ret_ty =
+            proc_macro2::Group::new(proc_macro2::Delimiter::None, quote!(BinderResult<()>));
+        assert_same(
+            r#"
+interface IGolden11 {
+    void fill(out int[] v);
+    void bump(inout int[] v);
+}
+"#,
+            "IGolden11",
+            quote! {
+                pub trait IGolden11 {
+                    fn fill(&self, v: #vec_ty) -> #ret_ty;
+                    fn bump(&self, #[inout] v: #vec_ty) -> #ret_ty;
+                }
+            },
+        );
+    }
+
+    /// No wire form; rustc would otherwise blame generated tokens.
+    #[test]
+    fn rejects_argument_shapes_with_no_wire_form() {
+        for (ty, needle) in [
+            (quote!(()), "`()` is not an argument type"),
+            (quote!(dyn IOther), "trait object"),
+            (quote!(&dyn IOther), "trait object"),
+            (quote!(Option<&dyn IOther>), "trait object"),
+            (quote!(&mut [i32]), "`&mut [T]`"),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(&self, v: #ty) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains(needle), "{ty}: {err}");
+        }
+    }
+
+    /// `&[Option<i32>]` is the `Vec<Option<i32>>` shape, and as inexpressible.
+    #[test]
+    fn rejects_a_nullable_primitive_behind_a_slice_or_array() {
+        for ty in [
+            quote!(&[Option<i32>]),
+            quote!([Option<i32>; 4]),
+            quote!(&Vec<Option<i32>>),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    fn go(&self, v: #ty) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("cannot be nullable"), "{ty}: {err}");
+        }
+    }
+
+    /// `rsbinder-aidl` refuses a holder in a signature, however wrapped.
+    #[test]
+    fn rejects_a_parcelable_holder_in_a_signature() {
+        for decl in [
+            quote!(
+                fn go(&self, h: &rsbinder::ParcelableHolder) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, h: &[rsbinder::ParcelableHolder]) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<rsbinder::ParcelableHolder>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("`ParcelableHolder` cannot appear"), "{err}");
+        }
+    }
+
+    /// A duplicate would collide in generated tokens, away from the user's span.
+    #[test]
+    fn rejects_duplicate_names() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self, a: i32, a: i32) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("duplicate argument name `a`"), "{err}");
+
+        // The `r#` is not part of the name: the templates add their own.
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self, r#type: i32, r#type: i32) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("duplicate argument name `type`"), "{err}");
+
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self) -> BinderResult<()>;
+                fn go(&self, a: i32) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("duplicate method name `go`"), "{err}");
+    }
+
+    /// The receiver is the one place that allows nothing, and an empty
+    /// allow-list must not render as an empty `understands only` list.
+    #[test]
+    fn an_empty_allow_list_names_no_attribute() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(#[allow(dead_code)] &self) -> BinderResult<()>;
+            }
+        });
+        assert_eq!(
+            err, "unsupported attribute; no attribute is supported here",
+            "{err}"
+        );
+    }
+
+    /// The descriptor is the wire name, so a second one is refused, not picked.
+    #[test]
+    fn rejects_a_repeated_descriptor() {
+        let err = match syn::parse2::<Args>(quote!(descriptor = "a", descriptor = "b")) {
+            Ok(_) => panic!("a repeated `descriptor` must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// The re-render reads no attribute argument and no second type argument.
+    #[test]
+    fn rejects_what_the_re_render_would_drop() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self) -> BinderResult<i32, String>;
+            }
+        });
+        assert!(err.contains("exactly one type argument"), "{err}");
+
+        for decl in [
+            quote!(
+                #[oneway(false)]
+                fn go(&self) -> BinderResult<()>;
+            ),
+            quote!(
+                #[oneway = "no"]
+                fn go(&self) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, #[inout(no)] v: &mut Vec<i32>) -> BinderResult<()>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("takes no arguments"), "{err}");
+        }
     }
 
     /// `self::` would resolve inside the generated module, not the user's.
@@ -1322,8 +2170,7 @@ parcelable GoldenConfig {
         assert!(err.contains("`self::`"), "{err}");
     }
 
-    /// The out-vector wire decisions read the `syn::Type`, so a qualified path
-    /// spells the same type and must carry the same length word.
+    /// Matched structurally, so a qualified `Vec` carries the same length word.
     #[test]
     fn qualified_vec_is_still_a_length_carrying_out_vector() {
         let bare = render(quote! {
@@ -1344,8 +2191,7 @@ parcelable GoldenConfig {
         assert!(qualified.contains("resize_out_vec"), "{qualified}");
     }
 
-    /// Same for `Option<Vec<T>>` and for the out-fd-array null guard, whose
-    /// absence would put a null fd where `.aidl` raises `UNEXPECTED_NULL`.
+    /// Same for `Option<Vec<T>>`, and for the guard that keeps a null fd off the wire.
     #[test]
     fn qualified_paths_keep_the_nullable_and_fd_guards() {
         let s = render(quote! {
@@ -1367,10 +2213,7 @@ parcelable GoldenConfig {
         assert!(s.contains("iter().any(Option::is_none)"), "{s}");
     }
 
-    /// The proxy passes a by-value argument twice, so the macro asserts `Copy`
-    /// against the user's own type. Pinned here rather than in `tests/ui`: the
-    /// resulting rustc diagnostic is compiler wording that moves between
-    /// releases.
+    /// Pinned here, not in `tests/ui`: the rustc diagnostic's wording moves between releases.
     #[test]
     fn by_value_argument_is_asserted_copy() {
         let item: ItemTrait = syn::parse2(quote! {
@@ -1382,9 +2225,7 @@ parcelable GoldenConfig {
         let expanded = expand(&Args { descriptor: None }, &item)
             .expect("expand")
             .to_string();
-        // Both halves are pinned: that the bound is `Copy` — swapping it for a
-        // bound every type meets would otherwise go unnoticed — and that the
-        // user's own type is what gets asserted.
+        // Both the `Copy` bound and the asserted type, so neither can be weakened unnoticed.
         assert!(
             expanded.contains("T : :: core :: marker :: Copy"),
             "{expanded}"
@@ -1395,8 +2236,7 @@ parcelable GoldenConfig {
         );
     }
 
-    /// The assertion has to sit inside the generated module: it names types
-    /// straight from the signature, which the rendered body resolves there.
+    /// The assertion names signature types, so it must resolve them where the body does.
     #[test]
     fn copy_assertion_shares_the_generated_module_scope() {
         let item: ItemTrait = syn::parse2(quote! {
@@ -1419,8 +2259,7 @@ parcelable GoldenConfig {
         assert!(body.contains("__rsbinder_assert_copy"), "{body}");
     }
 
-    /// `#[doc(hidden)]` hides the module from docs, not from paths: a private
-    /// trait must not become nameable through it.
+    /// `#[doc(hidden)]` hides the module from docs, not from paths.
     #[test]
     fn generated_module_follows_the_trait_visibility() {
         let item: ItemTrait = syn::parse2(quote! {

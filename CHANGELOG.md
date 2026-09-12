@@ -44,6 +44,27 @@ This changelog starts at 0.9.0. For earlier releases, see the
   existing `.aidl` whose `/** @deprecated … */` javadoc was previously ignored
   now generates `#[deprecated]`, and by design that warns outside the generated
   module. Drop the javadoc tag, or allow the lint at the call site.
+- **`#[rsbinder::interface]` and the derives now refuse shapes `.aidl` cannot
+  express.** Each compiled in 0.11.0 and generated code that worked
+  rsbinder-to-rsbinder, but had no `.aidl` equivalent — so moving the interface
+  to `.aidl` later was not the no-op the macro promises, and some of them put a
+  value on the wire a conforming peer cannot decode. The diagnostic names the
+  `.aidl` form to use instead. Refused now: an `out`/`inout` `String`, even
+  spelled `&mut Option<String>` (`@nullable` does not widen a direction); a
+  nullable primitive (`Option<i32>`) anywhere, including behind a slice or an
+  array; a `ParcelableHolder` as an argument or a return type; an array with
+  `Option<_>` elements where `.aidl` spells them bare (`&mut Vec<Option<Cfg>>` —
+  the nullable array is `&mut Option<Vec<_>>`); a bare `out` binder or fd
+  (`&mut Strong<dyn IFoo>`, `&mut SIBinder`, `&mut ParcelFileDescriptor`), which
+  `.aidl` renders as `&mut Option<_>`; `()`, a trait object or `&mut [T]` as an
+  argument; a duplicate method or argument name; `BinderResult<T, E>`; an
+  argument to `#[oneway(..)]` / `#[inout(..)]`; an attribute or an explicit
+  lifetime on the receiver (`#[oneway] &self`, `&'static self`); a second
+  `descriptor = …`; and, on `#[derive(Parcelable)]`, a `#[parcelable(..)]` on a
+  field or a field borrowing below the top level (`Option<&str>`, `Vec<&str>`).
+- **`rsbinder-aidl` now rejects a duplicate method name in an interface.** The
+  second declaration used to collapse into the first, so the method vanished
+  and every transaction code after it shifted — silently, on both ends.
 
 ### Added
 
@@ -82,6 +103,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
     `AidlMethod::CheckValid`. Both arguments rendered as the same `_arg_<name>`
     binding, so the defect used to surface as rustc E0415 in the consumer's
     crate.
+  - A duplicate method name in an interface is rejected, porting AOSP
+    `AidlInterface::CheckValid`. The second declaration collapsed into the
+    first, so one method disappeared from the generated trait and every
+    transaction code after it shifted.
   - A type argument on a type that takes none (`String<int>`, `IBinder<T>`) is
     rejected, porting AOSP `AidlTypeSpecifier::CheckValid`. The generic was
     being dropped silently, so `String<int>` compiled as a plain `String`.
@@ -104,6 +129,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
   and only when it is a block comment. Generated modules carry a module-scoped
   `#![allow(deprecated)]` so the generated proxy and dispatch plumbing does not
   warn about the items it must name; callers outside the module still do.
+- **`rsbinder-macros`: `#[nonnull]` on an `out` binder or file descriptor.**
+  `out IFoo` and `out @nullable IFoo` share one Rust spelling —
+  `&mut Option<Strong<dyn IFoo>>` — because that `Option` is what the generator
+  reaches for when the callee has no value to start from, not a `@nullable`.
+  Without the attribute the macro means the nullable form; with it the server
+  answers a `None` the service left behind with `UNEXPECTED_NULL`, which is
+  AOSP's `out_scalar_needs_unwrap`. That is the only ambiguous spelling, so the
+  attribute is refused anywhere else.
+- **`rsbinder-macros`: `#[deprecated]` carries through as AIDL's
+  `@deprecated`.** On a trait, a method, a `#[derive(Parcelable)]` struct or one
+  of its fields, `#[deprecated]` and `#[deprecated = "…"]` render the attribute
+  the `.aidl` path renders, through the same `render::deprecated_attr`. The
+  richer Rust forms (`since`, `note = …`) carry fields `.aidl` has nowhere to
+  put and are refused rather than silently dropped.
+- **`rsbinder-aidl`: `render::deprecated_attr` is public.** A second front-end
+  filling the `deprecated` fields of the render structs needs the same escaping
+  the AIDL path uses; `#[rsbinder::interface]` is its first caller.
+- **`rsbinder-macros`: the signature checks now cover every out/inout and `in`
+  array shape `.aidl` renders.** Three golden tests hold the macro's output
+  against the generator's across the whole table — 25 out/inout forms, 16 `in`
+  array forms, and the `#[nonnull]` pair — so an element `Option`, a `@nullable`
+  wrapper and a fixed dimension, which interact differently in each direction,
+  are pinned per row instead of by a rule that is right for one and wrong for
+  the next.
 
 ### Fixed
 

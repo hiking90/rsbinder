@@ -1,0 +1,5 @@
+error: duplicate argument name `a`
+ --> tests/ui/duplicate_arg_name.rs:5:25
+  |
+5 |     fn f(&self, a: i32, a: i32) -> rsbinder::BinderResult<()>;
+  |                         ^

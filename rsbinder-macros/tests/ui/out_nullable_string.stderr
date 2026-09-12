@@ -1,0 +1,5 @@
+error: `String` cannot be an `out` parameter — `.aidl` passes it only `in`; return it instead, or use a `Vec<T>` or a parcelable
+ --> tests/ui/out_nullable_string.rs:5:20
+  |
+5 |     fn f(&self, s: &mut Option<String>) -> rsbinder::BinderResult<()>;
+  |                    ^^^^^^^^^^^^^^^^^^^

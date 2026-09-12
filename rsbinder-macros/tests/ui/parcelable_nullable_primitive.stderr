@@ -1,0 +1,5 @@
+error: a primitive has no null form on the wire, so it cannot be nullable — `.aidl` rejects `@nullable` on one too; use the bare type
+ --> tests/ui/parcelable_nullable_primitive.rs:5:12
+  |
+5 |     pub x: Option<i32>,
+  |            ^^^^^^^^^^^

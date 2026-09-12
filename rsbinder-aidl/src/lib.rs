@@ -118,9 +118,9 @@ pub use generator::Generator;
 /// nothing here needs to know what a value *is*, only how to write it.
 pub mod render {
     pub use crate::generator::{
-        interface_stem, render_enum, render_interface, render_parcelable, ConstMember, EnumMember,
-        EnumRender, FnMembers, InterfaceRender, ParcelableMember, ParcelableRender,
-        TransactionWrite,
+        deprecated_attr, interface_stem, render_enum, render_interface, render_parcelable,
+        ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender, ParcelableMember,
+        ParcelableRender, TransactionWrite,
     };
 }
 pub use parser::parse_document;
