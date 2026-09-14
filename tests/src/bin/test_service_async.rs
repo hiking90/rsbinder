@@ -866,7 +866,7 @@ fn main() {
 
     // Deliberately current-thread, so CI covers the flavor the book calls
     // advanced: correct only while this thread stays parked inside the
-    // `block_on` below (see `TokioRuntime`'s "Panics").
+    // `block_on` below (see `TokioRuntime`'s "Stalls").
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

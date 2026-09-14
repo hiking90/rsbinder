@@ -167,18 +167,20 @@ attribute a failure to the wrong one.
 | Inside a `LocalSet` | panic — `block_in_place` is not available there |
 
 **Which runtime the handle points at** decides whether the call finishes, whatever the
-answer above:
+answer above. The future itself is polled on the *calling* thread either way; what the
+handle's runtime supplies is the timer and IO drivers that wake it:
 
 | The `TokioRuntime` handle | Result |
 |---|---|
-| A multi-threaded runtime | completes — its workers drive the future |
-| A current-thread runtime with a thread parked in `Runtime::block_on` | completes |
-| A current-thread runtime with nobody parked in it | **never returns** — `Handle::block_on` does not run that runtime's timer and IO drivers |
+| A multi-threaded runtime | completes — its workers run the drivers, always |
+| A current-thread runtime with a thread parked in `Runtime::block_on` | completes — that parked call is what runs the drivers |
+| A current-thread runtime with nobody parked in it | **never returns** — `Handle::block_on` does not run those drivers itself |
 
 The cost is one core release per call made from a worker thread; from the other running
-positions the call is inline. A released core is offered to the `spawn_blocking` pool, and
-if no thread there is free it is not picked up — the call still completes, but a runtime
-with a *single* worker runs nothing else until it returns. Two workers avoid that.
+positions the call is inline. A released core is offered to the `spawn_blocking` pool,
+which spawns a thread on demand — so it goes unclaimed only when the pool is at its
+`max_blocking_threads` cap with every thread busy. Even then the call completes; what
+stops is the rest of a *single-worker* runtime, until it returns. Two workers avoid that.
 
 On a path that calls repeatedly, convert the handle once instead and await it. That route
 dispatches straight to the async service and never touches `block_on`:

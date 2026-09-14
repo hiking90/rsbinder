@@ -159,23 +159,28 @@ impl BinderAsyncPool for Tokio {
 /// # Stalls
 ///
 /// Which runtime the handle points at. This decides completion whatever the
-/// caller:
+/// caller.
 ///
-/// - A **multi-threaded** runtime drives the future on its own workers.
-/// - A **current-thread** runtime is driven only while some thread sits inside
-///   `Runtime::block_on` on it. `Handle::block_on` polls the future but does not
-///   run that runtime's timer and IO drivers, so with nobody parked there a
-///   handler that awaits a `sleep` or IO never completes and the call never
-///   returns.
+/// `Handle::block_on` polls the future on the **calling** thread — not on a
+/// worker — for either flavor. What it needs from the runtime the handle points
+/// at is the timer and IO drivers, which are what wake a `sleep` or an IO
+/// readiness back up:
+///
+/// - A **multi-threaded** runtime runs those drivers on its workers, always.
+/// - A **current-thread** runtime runs them only while some thread sits inside
+///   `Runtime::block_on` on it, and `Handle::block_on` does not run them itself.
+///   With nobody parked there, a handler that awaits a `sleep` or IO never
+///   completes and the call never returns.
 ///
 /// # Cost
 ///
 /// A call from a **worker** thread releases that worker's core for the duration
 /// and offers it to the `spawn_blocking` pool. From every other position nothing
-/// is released and the call runs inline. When the pool has no free thread the
-/// core is not picked up: the call still completes, but a runtime with a
-/// *single* worker runs nothing else until it returns. A second worker, or a
-/// pool with room, removes that.
+/// is released and the call runs inline. The pool spawns a thread on demand, so
+/// the core is only left unclaimed when the pool is at its
+/// `max_blocking_threads` cap with every thread busy; then the call still
+/// completes, but a runtime with a *single* worker runs nothing else until it
+/// returns. A second worker, or headroom under the cap, removes that.
 ///
 /// So on a path that calls a local async service repeatedly, convert the handle
 /// once with [`Strong::into_async`] and await it instead — that route dispatches

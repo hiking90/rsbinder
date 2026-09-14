@@ -315,10 +315,11 @@ pub mod {{mod}} {
         ///
         /// Calling the returned sync handle *in-process from async code* routes
         /// every method through `rt.block_on(..)`, which re-enters the runtime.
-        /// `rsbinder::TokioRuntime` absorbs that on a multi-threaded runtime at
-        /// the cost of a core handoff per call, and cannot on a current-thread
-        /// one; see its docs. On a path that calls repeatedly, convert the handle
-        /// once with `into_async::<P>()` and await it instead.
+        /// Two separate things decide what happens — the thread the call is made
+        /// from, and the runtime `rt` holds — and `rsbinder::TokioRuntime`
+        /// documents each. On a path that calls repeatedly, convert the handle
+        /// once with `into_async::<P>()` and await it instead: that route
+        /// dispatches to the async service directly and never enters `block_on`.
         pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
         where
             T: {{name}}AsyncService + Sync + Send + 'static,

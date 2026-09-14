@@ -74,8 +74,9 @@ fn current_thread() -> tokio::runtime::Runtime {
 
 // ---- axis 1: where the call is made from ----
 //
-// Every test below holds the handle fixed at a multi-threaded runtime, so a
-// failure can only be the calling position.
+// Each of these varies the calling position. The handle is held at a runtime
+// that completes — a multi-threaded one, or a current-thread one with its
+// owner parked — so nothing here can fail for an axis-2 reason.
 
 /// A — the sync handle called from inside `Runtime::block_on` on a
 /// multi-threaded runtime. Panicked with "Cannot start a runtime from
@@ -207,9 +208,17 @@ fn current_thread_handle_with_no_parked_owner_never_completes() {
         let _ = tx.send(svc.echo("idle"));
     });
 
-    assert!(
-        rx.recv_timeout(Duration::from_millis(300)).is_err(),
-        "a current-thread handle with no thread in Runtime::block_on answered, \
-         so Handle::block_on drove its timer driver after all"
-    );
+    // Timeout specifically: `is_err()` alone would also accept `Disconnected`,
+    // which is what a panicking call thread looks like — the test would go
+    // green without ever demonstrating the stall.
+    match rx.recv_timeout(Duration::from_millis(300)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the calling thread died instead of blocking; the stall was not observed")
+        }
+        Ok(answer) => panic!(
+            "a current-thread handle with no thread in Runtime::block_on answered with \
+             {answer:?}, so Handle::block_on ran its timer driver after all"
+        ),
+    }
 }
