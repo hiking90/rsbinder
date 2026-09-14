@@ -83,5 +83,16 @@ pub trait BinderAsyncPool {
 /// A runtime for executing an async binder server.
 pub trait BinderAsyncRuntime {
     /// Block on the provided future, running it to completion and returning its output.
+    ///
+    /// The usual caller is a thread outside the runtime — a kernel binder
+    /// looper or an RPC session thread delivering a transaction. An
+    /// implementation may also be called from *inside* its own runtime, because
+    /// a synchronous handle to a local async service routes every method
+    /// through here (`Bn*::new_async_binder` hands back `Strong<dyn IFoo>`, and
+    /// the generated wrapper implements its sync methods as
+    /// `block_on(inner.method())`). Handling that re-entrant case is the
+    /// implementation's job; runtimes that reject a nested `block_on` need to
+    /// release the current worker first, the way
+    /// [`TokioRuntime`](crate::TokioRuntime) does.
     fn block_on<F: Future>(&self, future: F) -> F::Output;
 }

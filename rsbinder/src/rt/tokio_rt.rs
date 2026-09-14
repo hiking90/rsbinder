@@ -119,23 +119,61 @@ impl BinderAsyncPool for Tokio {
     }
 }
 
-/// Wrapper around Tokio runtime types for providing a runtime to a binder server.
+/// Wrapper around a Tokio [`Handle`], for providing a runtime to a binder
+/// server.
+///
+/// An async server implementation is driven by [`BinderAsyncRuntime::block_on`]
+/// on whatever thread delivered the transaction — a kernel binder looper, or an
+/// RPC session thread. Those threads are outside the runtime, which is the case
+/// `Handle::block_on` is built for.
+///
+/// The same `block_on` is also reached from a *synchronous* handle to a local
+/// async service: `Bn*::new_async_binder` returns `Strong<dyn IFoo>`, whose
+/// generated wrapper implements each sync method as `block_on(inner.method())`.
+/// Calling that handle from a task on a multi-threaded runtime would otherwise
+/// panic with "Cannot start a runtime from within a runtime", so this impl
+/// hands the worker's core off with
+/// [`tokio::task::block_in_place`] first.
+///
+/// # Panics
+///
+/// The handoff covers the multi-threaded runtime only. Three cases still panic
+/// or stall, and are the caller's to avoid:
+///
+/// - **A current-thread runtime's own thread.** `block_on` there is
+///   re-entrant by construction and Tokio rejects it. Its *blocking pool*
+///   threads are fine — those are outside the runtime.
+/// - **Inside a [`LocalSet`].** `block_in_place` refuses to run there ("can
+///   call blocking only when running on the multi-threaded runtime"), so the
+///   panic message changes but the call still fails.
+/// - **A current-thread handle called from another runtime's worker.** This
+///   one does not panic: it stalls. `Handle::block_on` does not drive a
+///   current-thread runtime's timer and IO drivers, so any `sleep` or IO the
+///   handler awaits never completes.
+///
+/// Reaching a local async service through a sync handle costs a core handoff
+/// per call. On a path that calls repeatedly, convert the handle once with
+/// [`Strong::into_async`] instead and await it — that route skips `block_on`
+/// entirely.
+///
+/// [`Handle`]: tokio::runtime::Handle
+/// [`LocalSet`]: tokio::task::LocalSet
+/// [`Strong::into_async`]: crate::Strong::into_async
 pub struct TokioRuntime<R>(pub R);
-
-impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Runtime> {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
-    }
-}
-
-impl BinderAsyncRuntime for TokioRuntime<std::sync::Arc<tokio::runtime::Runtime>> {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
-    }
-}
 
 impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Handle> {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
+        match tokio::runtime::Handle::try_current() {
+            // On a multi-threaded runtime — a worker or one of its blocking
+            // threads. Give the core up so another thread keeps the scheduler
+            // running; on a blocking thread this is a plain inline call.
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.0.block_on(future))
+            }
+            // Outside any runtime (a binder looper, an RPC session thread), or
+            // on a current-thread runtime's blocking pool — where `block_on` is
+            // allowed, so the flavor must not be turned into a panic here.
+            _ => self.0.block_on(future),
+        }
     }
 }
