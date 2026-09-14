@@ -5,23 +5,29 @@
 //!
 //! `Bn*::new_async_binder` hands back a **synchronous** `Strong<dyn IFoo>`
 //! whose generated wrapper implements every method as
-//! `rt.block_on(inner.method())`. Whether that call works depends on which
-//! thread makes it, and the failing positions are ordinary ones — a
-//! gateway calling its own service, a service's own start-up code, a test.
+//! `rt.block_on(inner.method())`. The positions that get this wrong are
+//! ordinary ones — a gateway calling its own service, a service's own
+//! start-up code, a test.
 //!
-//! Every case here uses a **local** binder, so none of it needs a kernel
-//! device or the RPC transport: the same `TokioRuntime` adapter is on the
-//! path either way. The scenario names match the probe under
-//! `plans/11-async-probe/`.
+//! Two independent things decide the outcome, and the tests below are
+//! grouped by which one they pin:
 //!
-//! What is deliberately absent: a current-thread runtime whose owning
-//! thread is blocked *outside* `Runtime::block_on` (probe case B). Its
-//! timer and IO drivers stop, so the symptom is a call that never returns
-//! rather than an error, and no adapter change can fix it — it is
-//! documented in `TokioRuntime` and in the book instead.
+//!   1. **Where the call is made from** — decides whether it runs or panics.
+//!   2. **Which runtime the handle points at** — decides whether the future
+//!      can finish, whatever the answer to 1.
+//!
+//! Keeping them apart matters: the same calling thread succeeds or hangs
+//! depending only on the handle, and the same handle runs or panics
+//! depending only on the caller. `plans/11-async-matrix/` prints the full
+//! cross product these were cut from.
+//!
+//! Every case uses a **local** binder, so none of it needs a kernel device
+//! or the RPC transport: the same `TokioRuntime` adapter is on the path
+//! either way.
 
 #![allow(non_snake_case)]
 
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -66,6 +72,11 @@ fn current_thread() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+// ---- axis 1: where the call is made from ----
+//
+// Every test below holds the handle fixed at a multi-threaded runtime, so a
+// failure can only be the calling position.
+
 /// A — the sync handle called from inside `Runtime::block_on` on a
 /// multi-threaded runtime. Panicked with "Cannot start a runtime from
 /// within a runtime" before the adapter released the core.
@@ -105,10 +116,11 @@ fn async_handle_from_multi_thread() {
     });
 }
 
-/// B2 — a current-thread runtime whose owning thread is parked inside
-/// `Runtime::block_on`, called from one of its blocking-pool threads.
-/// `Handle::block_on` is legal there and the parked owner keeps the timer
-/// driver running, so the adapter must not reject the flavor.
+/// B2 — a current-thread handle whose owner is parked inside
+/// `Runtime::block_on`. This is the **axis 2 positive**: the parked owner is
+/// what keeps that runtime's timer driver running, so the handler's sleep
+/// completes. Called from its blocking pool, where `Handle::block_on` is
+/// legal — so the adapter must not turn the flavor into a panic.
 #[test]
 fn sync_handle_from_current_thread_blocking_pool() {
     let rt = current_thread();
@@ -155,11 +167,49 @@ fn sync_handle_from_multi_thread_blocking_pool() {
 /// stays a panic; the `TokioRuntime` docs name it. Asserted so the
 /// adapter is not quietly extended to swallow it.
 #[test]
-#[should_panic(expected = "Cannot start a runtime from within a runtime")]
+// Not the whole tokio sentence: it is an internal literal, and the point of
+// asserting on it is only to tell it apart from `block_in_place`'s "can call
+// blocking only when running on the multi-threaded runtime".
+#[should_panic(expected = "within a runtime")]
 fn sync_handle_from_current_thread_owner_panics() {
     let rt = current_thread();
     rt.block_on(async {
         let svc = service(tokio::runtime::Handle::current());
         let _ = svc.echo("owner");
     });
+}
+
+// ---- axis 2: which runtime the handle points at ----
+//
+// The calling position here is the one that always works — a plain thread
+// outside any runtime — so a failure can only be the handle.
+
+/// The stall. A current-thread handle with nobody inside `Runtime::block_on`
+/// on it has no timer driver running, so the handler's sleep never fires and
+/// the call never returns. No adapter change can fix it, which is why it is a
+/// documented condition rather than a bug — and why it is asserted here: if
+/// this ever starts completing, the docs are wrong and the `into_async`
+/// advice built on them is too.
+///
+/// Bounded, not joined: the call is expected never to return, so the thread
+/// is abandoned and the runtime deliberately leaked to keep its handle valid.
+/// The handler sleeps 20ms, so a driven runtime would answer ~15x inside the
+/// deadline.
+#[test]
+fn current_thread_handle_with_no_parked_owner_never_completes() {
+    let rt = current_thread();
+    let handle = rt.handle().clone();
+    std::mem::forget(rt);
+
+    let svc = service(handle);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(svc.echo("idle"));
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a current-thread handle with no thread in Runtime::block_on answered, \
+         so Handle::block_on drove its timer driver after all"
+    );
 }

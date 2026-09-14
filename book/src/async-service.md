@@ -83,7 +83,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // registers with the service manager. `spawn` starts the binder thread
     // pool and returns — unlike `run`, which joins it and never comes back.
     // Swap the URI for `unix:///tmp/my.sock` to serve the same service over
-    // RPC; nothing else changes.
+    // RPC; nothing else in this file changes, but rsbinder then needs
+    // `features = ["rpc"]`.
     let _guard = rsbinder::serve("binder://")?
         .add("com.example.myservice", &service)?
         .spawn()?;
@@ -107,6 +108,12 @@ Things worth naming:
   the kernel grows the pool up to `max_threads` as load arrives. `run` joins the pool,
   which blocks the calling thread forever — fine for a sync service, wrong here.
 - **`pending().await`** is the async counterpart of `ProcessState::join_thread_pool()`.
+- **`rt()`** in the snippets below is this one-liner:
+  ```rust
+  fn rt() -> TokioRuntime<tokio::runtime::Handle> {
+      TokioRuntime(tokio::runtime::Handle::current())
+  }
+  ```
 
 ### Advanced: a current-thread runtime
 
@@ -133,23 +140,45 @@ runtime.block_on(async {
 })
 ```
 
-`tests/src/bin/test_service_async.rs` is built this way, which is how the condition stays
-covered by CI. The multi-threaded recipe has no such condition, which is why it is the
-default advice.
+`tests/src/bin/test_service_async.rs` is built this way, and the integration suite runs the
+whole client test suite against it — on a manual workflow dispatch, not on every pull
+request. The multi-threaded recipe carries no such condition to get wrong, which is why it
+is the default advice.
 
 ### Calling a local async service through its sync handle
 
 `new_async_binder` hands back a **synchronous** `Strong<dyn IMyService>`. Each of its
 methods is implemented as `block_on(inner.method())`, so calling it from inside the
 runtime — a gateway that calls its own service, start-up code, a test — re-enters the
-runtime. On a multi-threaded runtime rsbinder handles this by releasing the worker's core
-first, at the cost of a core handoff per call. Three positions still fail:
+runtime. On a multi-threaded runtime rsbinder handles that by releasing the worker's core
+first.
 
-| Position | Result |
+Two independent things decide what such a call does. Read them as one list and you will
+attribute a failure to the wrong one.
+
+**Where you call from** decides whether the call runs:
+
+| Calling thread | Result |
 |---|---|
-| A current-thread runtime's own thread | panic — `block_on` there is re-entrant by construction |
+| Outside any runtime — a binder thread, an RPC session thread | runs |
+| A multi-threaded worker, or a `Runtime::block_on` body | runs |
+| Either flavor's `spawn_blocking` pool | runs |
+| A current-thread runtime's own thread | panic — "Cannot start a runtime from within a runtime" |
 | Inside a `LocalSet` | panic — `block_in_place` is not available there |
-| A current-thread handle, called from another runtime's worker | **stalls** — that runtime's drivers are not being polled |
+
+**Which runtime the handle points at** decides whether the call finishes, whatever the
+answer above:
+
+| The `TokioRuntime` handle | Result |
+|---|---|
+| A multi-threaded runtime | completes — its workers drive the future |
+| A current-thread runtime with a thread parked in `Runtime::block_on` | completes |
+| A current-thread runtime with nobody parked in it | **never returns** — `Handle::block_on` does not run that runtime's timer and IO drivers |
+
+The cost is one core release per call made from a worker thread; from the other running
+positions the call is inline. A released core is offered to the `spawn_blocking` pool, and
+if no thread there is free it is not picked up — the call still completes, but a runtime
+with a *single* worker runs nothing else until it returns. Two workers avoid that.
 
 On a path that calls repeatedly, convert the handle once instead and await it. That route
 dispatches straight to the async service and never touches `block_on`:
@@ -195,8 +224,8 @@ thread to strand, so `run()` is safe on it.
 
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // RPC async servers require a MULTI-THREAD runtime — the blocking serve
-    // worker calls `rt.block_on(handler)` from a non-runtime thread.
+    // RPC async servers need a MULTI-THREAD runtime: run() below parks this
+    // thread in the accept loop, which a current-thread runtime cannot survive.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -238,12 +267,15 @@ runtime.block_on(async {
 
 ### Switching transports
 
-To run the exact same async service over **kernel binder** instead, swap only the URI and
-the runtime flavor — the service `impl` is unchanged:
+To run the exact same async service over **kernel binder** instead, swap only the URI —
+the service `impl` is unchanged. Keep the multi-threaded runtime: `run()` parks the calling
+thread in the binder pool, which a current-thread runtime's owner cannot afford (see
+[Advanced: a current-thread runtime](#advanced-a-current-thread-runtime)) — use `spawn()`
+there.
 
 ```rust
 rsbinder::serve("binder://")?                      // instead of "unix:///tmp/hello.sock"
-    .add("hello", BnHello::new_async_binder(IHelloService {}, rt()))?
+    .add("hello", BnHello::new_async_binder(IHelloService {}, rt))?  // the `rt` bound above
     .run()?;                                       // joins the process-wide binder pool
 ```
 
@@ -562,8 +594,8 @@ macro_rules! impl_repeat {
 - **Budget threads in both directions.** Outbound, each async call in flight holds one
   blocking-pool thread plus one kernel binder thread until the reply lands. Inbound, each
   handler holds one binder thread for the whole `block_on`, so awaiting slow IO inside a
-  handler drains the pool at `max_threads` and nothing else gets served. `Builder::
-  max_blocking_threads` caps the outbound half.
+  handler drains the pool at `max_threads` and nothing else gets served.
+  `Builder::max_blocking_threads` caps the outbound half.
 - **Sync and async services coexist in one process.** Register some with
   `new_binder` and others with `new_async_binder`; they share the same binder
   thread pool.
@@ -583,7 +615,8 @@ steps:
 
 Because async lives in the generated stubs, the same async service runs over **either
 transport** — `add` the `new_async_binder` result to `rsbinder::serve(uri)` and look it up
-with [`connect`](./cross-transport-services.md). Nothing in the recipe changes but the URI.
+with [`connect`](./cross-transport-services.md). Nothing in the recipe changes but the URI —
+a non-`binder://` URI additionally needs rsbinder's `rpc` feature, which is not on by default.
 
 For complete working examples, see `tests/src/bin/test_service_async.rs` (kernel binder) and
 `tests/tests/rpc_async.rs` (RPC) in the rsbinder repository.

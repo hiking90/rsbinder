@@ -23,9 +23,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 default = ["tokio"]
-# `tokio/full` for a library that uses `spawn_blocking`, `Runtime` and
-# `Handle` and nothing else — `rt-multi-thread` is here for
-# `block_in_place` in the `BinderAsyncRuntime` adapter. A crate that wants
+# No `tokio/full`: the library uses `spawn_blocking`, `Handle` and nothing
+# else — `rt-multi-thread` is here for `block_in_place` in the
+# `BinderAsyncRuntime` adapter. A crate that wants
 # `net`, `time` or `signal` declares them itself rather than receiving them
 # by accident through feature unification.
 tokio = ["async", "tokio/rt", "tokio/rt-multi-thread"]

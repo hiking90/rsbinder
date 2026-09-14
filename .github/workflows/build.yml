@@ -156,7 +156,8 @@ jobs:
         # The only workspace-wide enumeration this workflow has — but it
         # compiles, it does not run, and a target gated on a feature the run
         # does not enable compiles to *zero* tests. So every test target is
-        # either named on a `--test` line in `rpc-suite` / `macos-build`, or
+        # either named on a `--test` line in this job, `rpc-suite` or
+        # `macos-build`, or
         # run whole-package (`-p rsbinder-aidl`, `-p rsbinder-macros`, whose
         # targets are ungated), or excluded here on purpose:
         #   * rsbinder/tests/rpc_vsock.rs — every test in it is `#[ignore]`d
@@ -188,6 +189,14 @@ jobs:
         # must run on every PR so codegen regressions are caught
         # before merge.
         run: cargo test -p rsbinder-aidl
+      - name: Async runtime adapter tests (hermetic — plan 11 AC-11.1)
+        # `tests/tests/async_runtime.rs` drives the `TokioRuntime`
+        # `block_on` adapter through a purely local binder — no /dev/binder,
+        # no servicemanager, no `rpc` feature — so it runs on this runner.
+        # The workspace line above only compiles it, and every `-p tests`
+        # line in `rpc-suite` enumerates `--test` targets, so without this
+        # step the adapter would have no run gate at all.
+        run: cargo test -p tests --test async_runtime
 
   rpc-suite:
     name: RPC Transport Suite

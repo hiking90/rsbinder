@@ -93,6 +93,7 @@ pub trait BinderAsyncRuntime {
     /// `block_on(inner.method())`). Handling that re-entrant case is the
     /// implementation's job; runtimes that reject a nested `block_on` need to
     /// release the current worker first, the way
-    /// [`TokioRuntime`](crate::TokioRuntime) does.
+    #[cfg_attr(feature = "tokio", doc = "[`TokioRuntime`](crate::TokioRuntime) does.")]
+    #[cfg_attr(not(feature = "tokio"), doc = "`TokioRuntime` does.")]
     fn block_on<F: Future>(&self, future: F) -> F::Output;
 }

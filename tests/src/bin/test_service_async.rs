@@ -865,12 +865,8 @@ fn main() {
     ProcessState::start_thread_pool();
 
     // Deliberately current-thread, so CI covers the flavor the book calls
-    // advanced. It is correct only while this thread stays parked inside
-    // `Runtime::block_on` below — that is what drives the timer and IO
-    // drivers the async handlers await on. Calling `join_thread_pool()`
-    // here instead would park it outside, and every handler would hang
-    // with no error. The binder pool is already running (`start_thread_pool`
-    // above), so nothing needs to be joined.
+    // advanced: correct only while this thread stays parked inside the
+    // `block_on` below (see `TokioRuntime`'s "Panics").
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
