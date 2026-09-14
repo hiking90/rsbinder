@@ -118,11 +118,11 @@ Things worth naming:
 ### Advanced: a current-thread runtime
 
 A current-thread runtime works too, under one condition that is easy to miss: **its
-owning thread must stay parked inside `Runtime::block_on`.** That runtime's timer and IO
-drivers only run while the owner is in there. Park the owner anywhere else — calling
-`ProcessState::join_thread_pool()` directly, joining a thread, a blocking read — and
-every `sleep` or IO your handlers await stops making progress. There is no error; calls
-simply never return.
+owning thread must stay parked inside `Runtime::block_on`.** That is the only thing that
+runs the runtime — its timer and IO drivers, and the tasks spawned on it. Park the owner
+anywhere else — calling `ProcessState::join_thread_pool()` directly, joining a thread, a
+blocking read — and every handler that awaits a timer, IO, or a task it spawned stops
+making progress. There is no error; those calls simply never return.
 
 So the recipe is the same shape as above, with the owner parked:
 
@@ -161,20 +161,21 @@ attribute a failure to the wrong one.
 | Calling thread | Result |
 |---|---|
 | Outside any runtime — a binder thread, an RPC session thread | runs |
-| A multi-threaded worker, or a `Runtime::block_on` body | runs |
+| A multi-threaded worker, or a multi-threaded `Runtime::block_on` body | runs |
 | Either flavor's `spawn_blocking` pool | runs |
 | A current-thread runtime's own thread | panic — "Cannot start a runtime from within a runtime" |
 | Inside a `LocalSet` | panic — `block_in_place` is not available there |
 
 **Which runtime the handle points at** decides whether the call finishes, whatever the
-answer above. The future itself is polled on the *calling* thread either way; what the
-handle's runtime supplies is the timer and IO drivers that wake it:
+answer above. The future itself is polled on the *calling* thread either way, and that is
+all `Handle::block_on` does. Whatever the handler needs the runtime itself to advance — a
+timer, IO readiness, or a task it spawned there — needs that runtime to be running:
 
 | The `TokioRuntime` handle | Result |
 |---|---|
-| A multi-threaded runtime | completes — its workers run the drivers, always |
-| A current-thread runtime with a thread parked in `Runtime::block_on` | completes — that parked call is what runs the drivers |
-| A current-thread runtime with nobody parked in it | **never returns** — `Handle::block_on` does not run those drivers itself |
+| A multi-threaded runtime | completes — its workers are always running |
+| A current-thread runtime with a thread parked in `Runtime::block_on` | completes — that parked call is what runs it |
+| A current-thread runtime with nobody parked in it | **never returns**, for a handler that awaits any of the three above. One that needs none of them — ready on the first poll, or suspending only on `yield_now` — still completes |
 
 The cost is one core release per call made from a worker thread; from the other running
 positions the call is inline. A released core is offered to the `spawn_blocking` pool,

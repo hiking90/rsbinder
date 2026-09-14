@@ -104,19 +104,6 @@ fn sync_handle_from_spawned_task() {
     });
 }
 
-/// A2 — the same local service reached as an async handle. `into_async`
-/// dispatches straight to the async service and never enters `block_on`,
-/// which is why it is the advice for a path that calls repeatedly.
-#[test]
-fn async_handle_from_multi_thread() {
-    let rt = multi_thread();
-    rt.block_on(async {
-        let svc: Strong<dyn IAsyncRtAsync<Tokio>> =
-            service(tokio::runtime::Handle::current()).into_async();
-        assert_eq!(svc.echo("local").await.expect("echo"), "echo:local");
-    });
-}
-
 /// B2 — a current-thread handle whose owner is parked inside
 /// `Runtime::block_on`. This is the **axis 2 positive**: the parked owner is
 /// what keeps that runtime's timer driver running, so the handler's sleep
@@ -185,24 +172,29 @@ fn sync_handle_from_current_thread_owner_panics() {
 // The calling position here is the one that always works — a plain thread
 // outside any runtime — so a failure can only be the handle.
 
-/// The stall. A current-thread handle with nobody inside `Runtime::block_on`
-/// on it has no timer driver running, so the handler's sleep never fires and
-/// the call never returns. No adapter change can fix it, which is why it is a
-/// documented condition rather than a bug — and why it is asserted here: if
-/// this ever starts completing, the docs are wrong and the `into_async`
-/// advice built on them is too.
-///
-/// Bounded, not joined: the call is expected never to return, so the thread
-/// is abandoned and the runtime deliberately leaked to keep its handle valid.
-/// The handler sleeps 20ms, so a driven runtime would answer ~15x inside the
-/// deadline.
-#[test]
-fn current_thread_handle_with_no_parked_owner_never_completes() {
+/// A current-thread runtime nobody is inside `Runtime::block_on` on. Nothing
+/// runs it, so the handler's `sleep` never fires. Leaked on purpose: no owner
+/// may ever appear, or the stall would resolve.
+fn idle_current_thread_handle() -> tokio::runtime::Handle {
     let rt = current_thread();
     let handle = rt.handle().clone();
     std::mem::forget(rt);
+    handle
+}
 
-    let svc = service(handle);
+/// The stall. `Handle::block_on` polls the handler on the calling thread and
+/// does nothing else, so a handler that awaits a timer — or IO, or a task it
+/// spawned there — waits for a runtime that is not running. No adapter change
+/// can fix it, which is why it is a documented condition rather than a bug,
+/// and why it is asserted here: if this ever starts completing, the docs are
+/// wrong and so is the `into_async` advice built on them.
+///
+/// Bounded, not joined: the call is expected never to return, so the thread is
+/// abandoned. The handler sleeps 20ms, so a runtime that was running would
+/// answer ~15x inside the deadline.
+#[test]
+fn current_thread_handle_with_no_parked_owner_never_completes() {
+    let svc = service(idle_current_thread_handle());
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let _ = tx.send(svc.echo("idle"));
@@ -218,7 +210,28 @@ fn current_thread_handle_with_no_parked_owner_never_completes() {
         }
         Ok(answer) => panic!(
             "a current-thread handle with no thread in Runtime::block_on answered with \
-             {answer:?}, so Handle::block_on ran its timer driver after all"
+             {answer:?}, so Handle::block_on ran that runtime after all"
         ),
     }
+}
+
+// ---- the route out: `into_async` ----
+
+/// A2 — the same local service reached as an async handle, against the handle
+/// the test above proves is unusable through `block_on`.
+///
+/// That pairing is the point. The docs advise `into_async` for a repeatedly
+/// called local service on the grounds that it dispatches to the async service
+/// directly and never enters `block_on`. Held against a multi-threaded handle
+/// the test would pass either way and prove nothing; held against this one, it
+/// can only pass if `block_on` really is off the path.
+#[test]
+fn async_handle_skips_block_on_entirely() {
+    let svc: Strong<dyn IAsyncRtAsync<Tokio>> = service(idle_current_thread_handle()).into_async();
+
+    // Driven by *this* runtime, which is running. The handle inside the binder
+    // is never asked to run anything.
+    multi_thread().block_on(async {
+        assert_eq!(svc.echo("local").await.expect("echo"), "echo:local");
+    });
 }

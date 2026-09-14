@@ -153,8 +153,10 @@ impl BinderAsyncPool for Tokio {
 ///   `LocalSet`.
 ///
 /// Every other position runs: a thread outside any runtime (a binder looper, an
-/// RPC session thread), a multi-threaded worker, a `Runtime::block_on` body, and
-/// either flavor's `spawn_blocking` pool.
+/// RPC session thread), a **multi-threaded** worker, a **multi-threaded**
+/// `Runtime::block_on` body, and either flavor's `spawn_blocking` pool. The
+/// flavor qualifiers are load-bearing — a current-thread runtime's
+/// `Runtime::block_on` body *is* its own thread, the first panic above.
 ///
 /// # Stalls
 ///
@@ -162,15 +164,17 @@ impl BinderAsyncPool for Tokio {
 /// caller.
 ///
 /// `Handle::block_on` polls the future on the **calling** thread — not on a
-/// worker — for either flavor. What it needs from the runtime the handle points
-/// at is the timer and IO drivers, which are what wake a `sleep` or an IO
-/// readiness back up:
+/// worker — for either flavor, and that is all it does. Anything the handler
+/// needs the runtime itself to advance — a timer, IO readiness, or a task it
+/// spawned there — needs that runtime to be running:
 ///
-/// - A **multi-threaded** runtime runs those drivers on its workers, always.
-/// - A **current-thread** runtime runs them only while some thread sits inside
-///   `Runtime::block_on` on it, and `Handle::block_on` does not run them itself.
-///   With nobody parked there, a handler that awaits a `sleep` or IO never
-///   completes and the call never returns.
+/// - A **multi-threaded** runtime always is: its workers drive the timer and IO
+///   drivers and run spawned tasks.
+/// - A **current-thread** runtime does so only while some thread sits inside
+///   `Runtime::block_on` on it, and `Handle::block_on` is not that. With nobody
+///   parked there, a handler that awaits any of those never completes and the
+///   call never returns. A handler that needs none of them — ready on the first
+///   poll, or suspending only on `yield_now` — still completes.
 ///
 /// # Cost
 ///
