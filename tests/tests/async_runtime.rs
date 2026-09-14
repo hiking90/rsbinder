@@ -57,6 +57,24 @@ fn service(handle: tokio::runtime::Handle) -> Strong<dyn IAsyncRt> {
     BnAsyncRt::new_async_binder(Svc, TokioRuntime(handle))
 }
 
+/// A service that fronts a second local service and calls it — through the
+/// **sync** handle — from inside its own handler. The gateway pattern, and the
+/// only way to reach a call that is nested rather than merely sequential.
+struct Gateway(Strong<dyn IAsyncRt>);
+impl Interface for Gateway {}
+
+#[async_trait]
+impl IAsyncRtAsyncService for Gateway {
+    async fn r#echo(&self, msg: &str) -> rsbinder::BinderResult<String> {
+        self.0.echo(msg)
+    }
+}
+
+fn gateway_service(handle: tokio::runtime::Handle) -> Strong<dyn IAsyncRt> {
+    let backend = service(handle.clone());
+    BnAsyncRt::new_async_binder(Gateway(backend), TokioRuntime(handle))
+}
+
 fn multi_thread() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -136,8 +154,9 @@ fn sync_handle_from_outside_runtime() {
 
 /// C2 — a multi-threaded runtime's blocking-pool thread: where a nested
 /// inbound transaction lands when the async client's `spawn_blocking` call
-/// is itself serving one. Tokio treats the thread as outside the runtime,
-/// so `block_in_place` runs inline.
+/// is itself serving one. `try_current()` still reports that runtime, so the
+/// adapter takes the `block_in_place` arm — but the thread is outside the
+/// runtime, so nothing is released and the call runs inline.
 #[test]
 fn sync_handle_from_multi_thread_blocking_pool() {
     let rt = multi_thread();
@@ -225,13 +244,75 @@ fn current_thread_handle_with_no_parked_owner_never_completes() {
 /// directly and never enters `block_on`. Held against a multi-threaded handle
 /// the test would pass either way and prove nothing; held against this one, it
 /// can only pass if `block_on` really is off the path.
+/// Bounded: if the claim breaks, the call blocks forever, and a test that
+/// hangs tells CI nothing. The deadline turns it into a failure.
 #[test]
 fn async_handle_skips_block_on_entirely() {
     let svc: Strong<dyn IAsyncRtAsync<Tokio>> = service(idle_current_thread_handle()).into_async();
 
-    // Driven by *this* runtime, which is running. The handle inside the binder
-    // is never asked to run anything.
-    multi_thread().block_on(async {
-        assert_eq!(svc.echo("local").await.expect("echo"), "echo:local");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        // Driven by *this* runtime, which is running. The handle inside the
+        // binder is never asked to run anything.
+        multi_thread().block_on(async {
+            let got = svc.echo("local").await;
+            let _ = tx.send(got);
+        });
     });
+
+    match rx.recv_timeout(Duration::from_millis(3000)) {
+        Ok(got) => assert_eq!(got.expect("echo"), "echo:local"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the async handle blocked on an idle current-thread runtime, so it does enter block_on")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the calling thread died"),
+    }
+}
+
+// ---- the nested call: a handler reaching a second local service ----
+
+/// The gateway pattern, and the position an enumeration of "calling threads"
+/// kept missing: a handler is *inside* the handle's runtime for as long as
+/// `block_on` drives it, whatever thread it started on. With a current-thread
+/// handle there is no `block_in_place` to step back out with, so a sync-handle
+/// call made from inside a handler hits the same re-entrancy panic as that
+/// runtime's own thread — even though the outer call came from a plain thread
+/// the docs classify as "runs".
+#[test]
+fn nested_sync_call_inside_a_current_thread_handler_panics() {
+    // Parked, so the backend's own `sleep` is not what fails here — this test
+    // is about axis 1, and an idle runtime would stall instead.
+    let rt = current_thread();
+    let handle = rt.handle().clone();
+    thread::spawn(move || rt.block_on(std::future::pending::<()>()));
+
+    let gateway = gateway_service(handle);
+
+    // The outer call comes from a plain thread: the row that runs.
+    let panicked = thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gateway.echo("via"))).is_err()
+    })
+    .join()
+    .expect("join");
+
+    assert!(
+        panicked,
+        "a nested sync-handle call under a current-thread handle completed; \
+         the documented last row no longer holds"
+    );
+}
+
+/// The same shape with a multi-threaded handle completes: `block_in_place`
+/// steps out of the runtime, so the nested call is legal. The pairing is what
+/// makes the row above about the *flavor* rather than about nesting.
+#[test]
+fn nested_sync_call_inside_a_multi_thread_handler_runs() {
+    let rt = multi_thread();
+    let gateway = gateway_service(rt.handle().clone());
+
+    let got = thread::spawn(move || gateway.echo("via").expect("gateway"))
+        .join()
+        .expect("join");
+
+    assert_eq!(got, "echo:via");
 }

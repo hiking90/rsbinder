@@ -156,15 +156,28 @@ first.
 Two independent things decide what such a call does. Read them as one list and you will
 attribute a failure to the wrong one.
 
-**Where you call from** decides whether the call runs:
+**Where you call from** decides whether the call runs. Tokio refuses a `block_on` on a
+thread already executing inside a runtime, and `block_in_place` — which steps back out of
+one — exists only for the multi-threaded runtime. That is the whole rule:
 
-| Calling thread | Result |
+| The calling thread | Result |
 |---|---|
-| Outside any runtime — a binder thread, an RPC session thread | runs |
-| A multi-threaded worker, or a multi-threaded `Runtime::block_on` body | runs |
-| Either flavor's `spawn_blocking` pool | runs |
-| A current-thread runtime's own thread | panic — "Cannot start a runtime from within a runtime" |
-| Inside a `LocalSet` | panic — `block_in_place` is not available there |
+| Not executing inside a runtime | runs |
+| Inside a multi-threaded runtime | runs, after releasing the core |
+| Inside a multi-threaded runtime, within a `LocalSet` | panic — `block_in_place` is refused there |
+| Inside a current-thread runtime | panic — "Cannot start a runtime from within a runtime" |
+
+Applying it takes some care, because "inside a runtime" is not "on a runtime's thread":
+
+- A `spawn_blocking` pool thread is *outside* the runtime it belongs to, either flavor.
+  Those calls run.
+- A `Runtime::block_on` body is *inside* — so a current-thread runtime's
+  `Runtime::block_on` body is the last row, not the first.
+- **An async handler is inside** for as long as `block_on` is driving it, and inside
+  *the handle's* runtime whatever thread it started on. A service whose `TokioRuntime`
+  holds a current-thread handle therefore cannot reach a second local service through a
+  sync handle from inside a handler — that is the last row, and it is the gateway pattern
+  exactly. Use `into_async` there, or give the service a multi-threaded handle.
 
 **Which runtime the handle points at** decides whether the call finishes, whatever the
 answer above. The future itself is polled on the *calling* thread either way, and that is
@@ -220,10 +233,11 @@ either flavor — it is the same position a binder looper is in.
 
 What rules out `current_thread` here is `run()`: it blocks the calling thread in the
 accept loop. On a current-thread runtime that thread is the runtime's owner, and parking
-it anywhere other than `Runtime::block_on` stops its timer and IO drivers — the condition
-from [Advanced: a current-thread runtime](#advanced-a-current-thread-runtime) above.
-Handlers would then hang on their first `sleep`. A multi-threaded runtime has no owner
-thread to strand, so `run()` is safe on it.
+it anywhere other than `Runtime::block_on` leaves nothing running that runtime — the
+condition from [Advanced: a current-thread runtime](#advanced-a-current-thread-runtime)
+above. Handlers would then hang the first time one awaits a timer, IO, or a task it
+spawned. A multi-threaded runtime has no owner thread to strand, so `run()` is safe on
+it.
 
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -587,9 +601,10 @@ macro_rules! impl_repeat {
 ## Tips
 
 - **Prefer `new_multi_thread()`.** `new_current_thread()` is correct only while its
-  owning thread stays parked in `Runtime::block_on`; park it elsewhere and the timer
-  and IO drivers stop with no error. An RPC server that calls `run()` parks it
-  elsewhere by definition.
+  owning thread stays parked in `Runtime::block_on`; park it elsewhere and nothing runs
+  that runtime — no error, just handlers that never return. An RPC server that calls
+  `run()` parks it elsewhere by definition. A current-thread handle also rules out
+  reaching a second local service through a sync handle from inside a handler.
 - **Never block inside an async method.** A CPU-bound or blocking call belongs
   in `tokio::task::spawn_blocking`, and a call to another binder service
   belongs behind `into_async::<Tokio>()` — a blocking proxy call from an async

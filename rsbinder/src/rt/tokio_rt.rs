@@ -142,21 +142,34 @@ impl BinderAsyncPool for Tokio {
 ///
 /// # Panics
 ///
-/// Where the call is made from. These two panic whatever the handle points at:
+/// Where the call is made from, whatever the handle points at. Tokio refuses a
+/// `Handle::block_on` on a thread that is already executing inside a runtime,
+/// and [`block_in_place`] — which steps back out of one — exists only for the
+/// multi-threaded runtime. That is the whole rule:
 ///
-/// - **A current-thread runtime's own thread** — "Cannot start a runtime from
-///   within a runtime". The flavor is not `MultiThread`, so no core is released,
-///   and the thread is already inside `Runtime::block_on`.
-/// - **Inside a [`LocalSet`]** — "can call blocking only when running on the
-///   multi-threaded runtime". The surrounding runtime *is* multi-threaded, so
-///   the core release is attempted, and `block_in_place` refuses to run in a
-///   `LocalSet`.
+/// | The calling thread | Result |
+/// |---|---|
+/// | Not executing inside a runtime | runs |
+/// | Inside a **multi-threaded** runtime | runs, after releasing the core |
+/// | Inside a multi-threaded runtime, within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime"; `block_in_place` is refused there |
+/// | Inside a **current-thread** runtime | **panic** — "Cannot start a runtime from within a runtime"; there is no way back out |
 ///
-/// Every other position runs: a thread outside any runtime (a binder looper, an
-/// RPC session thread), a **multi-threaded** worker, a **multi-threaded**
-/// `Runtime::block_on` body, and either flavor's `spawn_blocking` pool. The
-/// flavor qualifiers are load-bearing — a current-thread runtime's
-/// `Runtime::block_on` body *is* its own thread, the first panic above.
+/// Reading a position off that rule is the part worth doing carefully, because
+/// "inside a runtime" is not the same as "on a runtime's thread":
+///
+/// - A `spawn_blocking` pool thread is **outside** the runtime it belongs to,
+///   for either flavor. Those calls run.
+/// - A `Runtime::block_on` body is **inside** — so a current-thread runtime's
+///   `Runtime::block_on` body is the last row, not the first.
+/// - **A handler this adapter is already driving is inside**, for as long as
+///   `block_on` is driving it, and inside *the handle's* runtime whatever thread
+///   it started on. So a service whose `TokioRuntime` holds a current-thread
+///   handle cannot reach a second local service through a sync handle from
+///   within a handler — that nested call is the last row. Reach it with
+///   [`Strong::into_async`] instead, or drive the service from a
+///   multi-threaded handle.
+///
+/// [`block_in_place`]: tokio::task::block_in_place
 ///
 /// # Stalls
 ///
@@ -198,15 +211,19 @@ pub struct TokioRuntime<R>(pub R);
 impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Handle> {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         match tokio::runtime::Handle::try_current() {
-            // On a multi-threaded runtime — a worker or one of its blocking
-            // threads. Give the core up so another thread keeps the scheduler
-            // running; on a blocking thread this is a plain inline call.
+            // A multi-threaded runtime is in scope. Step out of it first:
+            // from a worker that releases the core, and from one of its
+            // blocking threads — which is outside the runtime already — it is
+            // a plain inline call.
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| self.0.block_on(future))
             }
-            // Outside any runtime (a binder looper, an RPC session thread), or
-            // on a current-thread runtime's blocking pool — where `block_on` is
-            // allowed, so the flavor must not be turned into a panic here.
+            // No runtime in scope (a binder looper, an RPC session thread), or a
+            // current-thread one. There is no equivalent of `block_in_place` for
+            // current-thread, so this arm is both the ordinary path and the one
+            // that panics when the thread is executing inside that runtime. The
+            // flavor alone must not decide: a current-thread runtime's blocking
+            // pool reaches here too and is allowed to block.
             _ => self.0.block_on(future),
         }
     }
