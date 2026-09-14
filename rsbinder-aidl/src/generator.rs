@@ -312,6 +312,13 @@ pub mod {{mod}} {
         /// **sync** `Strong<dyn {{name}}>` because a binder is transport-neutral:
         /// the async-ness lives in the server impl, not the handle. Clients still
         /// reach it as either `{{name}}` or `{{name}}Async<P>`.
+        ///
+        /// Calling the returned sync handle *in-process from async code* routes
+        /// every method through `rt.block_on(..)`, which re-enters the runtime.
+        /// `rsbinder::TokioRuntime` absorbs that on a multi-threaded runtime at
+        /// the cost of a core handoff per call, and cannot on a current-thread
+        /// one; see its docs. On a path that calls repeatedly, convert the handle
+        /// once with `into_async::<P>()` and await it instead.
         pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
         where
             T: {{name}}AsyncService + Sync + Send + 'static,
