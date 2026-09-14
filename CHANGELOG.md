@@ -102,6 +102,18 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **`rsbinder-aidl` now rejects a duplicate method name in an interface.** The
   second declaration used to collapse into the first, so the method vanished
   and every transaction code after it shifted — silently, on both ends.
+- **The `tokio` feature no longer enables `tokio/full`.** It now enables
+  `tokio/rt` and `tokio/rt-multi-thread`, which is everything the library uses
+  (`spawn_blocking`, `Runtime`, `Handle`, and `block_in_place` in the async
+  runtime adapter). A crate that was receiving `tokio/net`, `time`, `signal`,
+  `fs`, `io-util` or `macros` through feature unification with rsbinder now has
+  to declare them in its own `Cargo.toml` — which is where they belonged.
+- **`BinderAsyncRuntime for TokioRuntime<Runtime>` and
+  `for TokioRuntime<Arc<Runtime>>` are gone.** `TokioRuntime<Handle>` remains
+  and is what every recipe in the book and the examples uses. An owned runtime
+  inside a binder is a latent panic in any case: `Runtime::drop` aborts when the
+  last `Strong` to the service is released on one of that runtime's worker
+  threads. Wrap `runtime.handle().clone()` instead.
 
 ### Added
 
@@ -193,6 +205,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
+- **A synchronous handle to a local async service no longer panics when called
+  from async code.** `Bn*::new_async_binder` returns a *sync*
+  `Strong<dyn IFoo>` whose methods are implemented as
+  `rt.block_on(inner.method())`. Calling it from a task on a multi-threaded
+  runtime — a gateway fronting its own service, start-up code, a test — hit
+  Tokio's "Cannot start a runtime from within a runtime". `TokioRuntime` now
+  releases the worker's core with `block_in_place` first. Three positions still
+  fail and are documented on `TokioRuntime`: a current-thread runtime's own
+  thread, a `LocalSet`, and a current-thread handle called from another
+  runtime's worker (which stalls rather than panicking). On a path that calls
+  repeatedly, convert once with `into_async::<P>()` instead — that route never
+  enters `block_on`.
+- **Codegen `async` can be turned off again by a downstream crate.** 0.11.0 set
+  `rsbinder-aidl`'s default features to `[]` so that a sync-only `rsbinder`
+  would not receive async code it cannot compile, but at the same time pinned
+  `features = ["async"]` on rsbinder's own build-dependency. Cargo unifies
+  features across the build-dependency graph, so that pin reached every
+  downstream's `rsbinder-aidl` too: `rsbinder` with `default-features = false`
+  still generated async code, which then failed with "cannot find type
+  `BoxFuture`". The pin is gone; the conditional `async = ["rsbinder-aidl/async",
+  …]` edge carries it, so codegen follows the runtime's own feature with nothing
+  declared downstream. A crate that deliberately wants async codegen against a
+  sync-only runtime can still ask, with `features = ["async"]` or
+  `Builder::set_async_support(true)`.
 - **`rsbinder-aidl`: a nested declaration inside a `@VintfStability` type now
   inherits that stability.** AOSP resolves `@VintfStability` with a scoped
   lookup that walks to the enclosing type, so a parcelable nested in a
