@@ -1742,6 +1742,26 @@ impl ServiceManager {
     /// a transport error, so the wait does not give up early there — it keeps
     /// polling.
     pub fn wait_for_service(&self, name: &str) -> Option<SIBinder> {
+        // A wait nobody can cancel: the state is private to this call, so
+        // `cancelled` is never set and the loop below is AOSP's `while(true)`.
+        self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()))
+    }
+
+    /// [`wait_for_service`](Self::wait_for_service) with a caller-owned
+    /// [`WaiterState`], whose [`cancel`](WaiterState::cancel) ends the wait
+    /// with `None` at once instead of at the next tick.
+    ///
+    /// This is what makes the wait usable from a future that can be dropped
+    /// (`crate::wait_for_interface_async`, plan 11-1 §3.1): the async wrapper
+    /// runs this on the blocking pool and cancels from the guard's `Drop`, so
+    /// the thread leaves and `UnregisterOnDrop` runs immediately rather than
+    /// up to a second later. Cancellation is checked before registering too,
+    /// so a future dropped during the fast path never registers a callback.
+    pub(crate) fn wait_for_service_cancellable(
+        &self,
+        name: &str,
+        state: Arc<WaiterState>,
+    ) -> Option<SIBinder> {
         // Fast path: already registered — no callback needed. A transport error
         // means the SM is unreachable, so give up (AOSP's initial
         // `realGetService` error → `nullptr`).
@@ -1754,7 +1774,12 @@ impl ServiceManager {
             }
         }
 
-        let state = Arc::new(WaiterState::default());
+        // Cancelled during the fast-path round trip: leave without touching
+        // the service manager's callback list.
+        if state.is_cancelled() {
+            return None;
+        }
+
         let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
 
         if let Err(err) = self.register_for_notifications(name, &callback) {
@@ -1764,7 +1789,7 @@ impl ServiceManager {
                 "wait_for_service: notifications unavailable for {name} ({err:?}); \
                  falling back to polling"
             );
-            return self.poll_for_service(name);
+            return self.poll_for_service(name, &state);
         }
         // Always unregister, even on early return / panic (AOSP's `Defer`).
         let _unregister = UnregisterOnDrop {
@@ -1779,12 +1804,16 @@ impl ServiceManager {
                 let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let (guard, _) = state
                     .cv
-                    .wait_timeout_while(guard, std::time::Duration::from_secs(1), |binder| {
-                        binder.is_none()
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| {
+                        st.binder.is_none() && !st.cancelled
                     })
                     .unwrap_or_else(|e| e.into_inner());
-                if let Some(binder) = guard.as_ref() {
+                if let Some(binder) = guard.binder.as_ref() {
                     return Some(binder.clone());
+                }
+                // The caller gave up. `UnregisterOnDrop` fires on the way out.
+                if guard.cancelled {
+                    return None;
                 }
             }
             // Throttle to ~every 10s so a slow/missing service stays visible
@@ -1825,7 +1854,13 @@ impl ServiceManager {
     /// (`Some`) or a transport error shows the service manager is unreachable
     /// (`None`) — the same contract as the event path. On Android 10 a failure
     /// is reported as not-found, so it keeps polling rather than giving up.
-    fn poll_for_service(&self, name: &str) -> Option<SIBinder> {
+    ///
+    /// The per-tick sleep is a `cv` wait on `state` rather than
+    /// `thread::sleep`, so a cancelled wait leaves here as promptly as it
+    /// leaves the event path. Without that, the fallback — which is the whole
+    /// wait on Android 10 — would keep a blocking-pool thread polling after
+    /// the caller's future was dropped.
+    fn poll_for_service(&self, name: &str, state: &WaiterState) -> Option<SIBinder> {
         loop {
             match self.try_get_service(name) {
                 Ok(Some(binder)) => return Some(binder),
@@ -1835,7 +1870,14 @@ impl ServiceManager {
                     return None;
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let (guard, _) = state
+                .cv
+                .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| !st.cancelled)
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.cancelled {
+                return None;
+            }
         }
     }
 }
@@ -1844,10 +1886,45 @@ impl ServiceManager {
 /// manager) and the thread blocked in [`ServiceManager::wait_for_service`].
 /// `onRegistration` stores the binder and signals `cv`; the waiter observes
 /// it under `inner`.
+///
+/// A third party — the async wrapper's drop guard — reaches the same `cv`
+/// through [`cancel`](Self::cancel). Both wake-ups are the same mechanism, so
+/// the wait has one blocking point and the cancel latency is the notify, not
+/// the 1s tick.
 #[derive(Default)]
-struct WaiterState {
-    inner: std::sync::Mutex<Option<SIBinder>>,
+pub(crate) struct WaiterState {
+    inner: std::sync::Mutex<WaiterInner>,
     cv: std::sync::Condvar,
+}
+
+/// The `cv`-protected half of [`WaiterState`]: what the wait is waiting for,
+/// and whether the caller has given up.
+#[derive(Default)]
+struct WaiterInner {
+    binder: Option<SIBinder>,
+    cancelled: bool,
+}
+
+impl WaiterState {
+    /// End the wait without a service. The blocked thread wakes, returns
+    /// `None`, and unregisters its callback on the way out.
+    ///
+    /// Idempotent, and safe to call when no thread is waiting (the flag stays
+    /// set, so a wait that has not reached its blocking point yet also gives
+    /// up).
+    pub(crate) fn cancel(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.cancelled = true;
+        drop(guard);
+        self.cv.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled
+    }
 }
 
 /// One-shot [`IServiceCallback`] that records the registered binder and wakes
@@ -1860,7 +1937,7 @@ impl Interface for Waiter {}
 impl IServiceCallback for Waiter {
     fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
         let mut guard = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(service.clone());
+        guard.binder = Some(service.clone());
         drop(guard);
         // Exactly one thread waits on this state (the matching
         // `wait_for_service` call), mirroring AOSP's `mCv.notify_one()`.

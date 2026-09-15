@@ -3765,6 +3765,19 @@ impl core::marker::Unpin for rsbinder::ClientOptions
 impl core::marker::UnsafeUnpin for rsbinder::ClientOptions
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ClientOptions
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ClientOptions
+pub struct rsbinder::DeathSignal
+impl core::future::future::Future for rsbinder::DeathSignal
+pub type rsbinder::DeathSignal::Output = ()
+pub fn rsbinder::DeathSignal::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
+impl core::ops::drop::Drop for rsbinder::DeathSignal
+pub fn rsbinder::DeathSignal::drop(&mut self)
+impl core::marker::Freeze for rsbinder::DeathSignal
+impl core::marker::Send for rsbinder::DeathSignal
+impl core::marker::Sync for rsbinder::DeathSignal
+impl core::marker::Unpin for rsbinder::DeathSignal
+impl core::marker::UnsafeUnpin for rsbinder::DeathSignal
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::DeathSignal
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::DeathSignal
 pub struct rsbinder::ExtendedError
 pub rsbinder::ExtendedError::command: u32
 pub rsbinder::ExtendedError::id: u32
@@ -4965,10 +4978,12 @@ pub type dyn rsbinder::permission_controller::android::os::IPermissionController
 pub trait rsbinder::Transactable: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Transactable::transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::calling_caller() -> core::option::Option<rsbinder::thread_state::Caller>
+pub async fn rsbinder::check_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub fn rsbinder::clear_calling_identity() -> i64
 pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub async fn rsbinder::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::death_signal(&rsbinder::SIBinder) -> core::result::Result<rsbinder::DeathSignal, rsbinder::StatusCode>
 pub fn rsbinder::from_bytes<T: rsbinder::Deserialize>(&[u8]) -> rsbinder::Result<T>
 pub fn rsbinder::get_calling_pid() -> std::os::raw::c_int
 pub fn rsbinder::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CString>
@@ -4984,6 +4999,7 @@ pub fn rsbinder::sdk_at_least(u32) -> bool
 pub fn rsbinder::serve(&str) -> rsbinder::Result<rsbinder::Server>
 pub fn rsbinder::set_strict_mode_policy(i32)
 pub fn rsbinder::to_bytes<T: rsbinder::Serialize + ?core::marker::Sized>(&T) -> rsbinder::Result<alloc::vec::Vec<u8>>
+pub async fn rsbinder::wait_for_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub type rsbinder::BinderResult<T> = core::result::Result<T, rsbinder::Status>
 pub type rsbinder::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
 pub type rsbinder::Result<T> = core::result::Result<T, rsbinder::StatusCode>
