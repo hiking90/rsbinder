@@ -51,12 +51,12 @@ use std::task::{Context, Poll};
 /// Retrieve an existing service for a particular interface — one
 /// `getService` wire call, which does not block (see
 /// [`crate::hub::try_get_interface`]). For an event-driven wait use
-/// [`crate::hub::wait_for_interface`]; for a lookup that will not start an
-/// unregistered lazy service, [`crate::hub::check_interface`].
+/// [`wait_for_interface_async`]; for a lookup that will not start an
+/// unregistered lazy service, [`check_interface_async`].
 ///
-/// The `_async` suffix is what tells the two apart at the crate root: the
-/// synchronous lookups live in [`crate::hub`], and only this one has to be
-/// awaited. It matches [`crate::connect_async`], the facade entry point.
+/// The `_async` suffix is what separates the crate root's awaitable lookups
+/// from the synchronous ones in [`crate::hub`]. It matches
+/// [`crate::connect_async`], the facade entry point.
 pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {
@@ -96,10 +96,13 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 ///
 /// # Dropping the future
 ///
-/// Dropping it ends the wait: the callback registered with the service manager
-/// is unregistered and the thread carrying the wait returns. That is what makes
-/// it usable as one arm of a `select!` or under a `timeout`. Nothing is left
-/// behind on the service manager.
+/// Dropping it ends the wait: the drop marks it cancelled, the thread carrying
+/// the wait leaves its condvar at once, and on its way out it unregisters the
+/// callback it had registered with the service manager. That is what makes it
+/// usable as one arm of a `select!` or under a `timeout`. Nothing is left
+/// behind on the service manager — but the unregister is a wire call made
+/// after the drop returns, so a caller that re-registers the same name
+/// immediately can still see the old callback counted.
 ///
 /// Shutting the runtime down counts as dropping it — which matters, because
 /// `Runtime::drop` waits for blocking tasks: a wait that could not be
@@ -113,22 +116,41 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// that parks many simultaneous waits there reduces what is left for calls;
 /// service startup waits (a handful, at process start) are what this is for.
 ///
-/// # Requirements
+/// # What drives it
 ///
-/// - **The runtime has to be polling this future.** `onRegistration` arrives on
-///   a binder thread and wakes the task; the wake only runs if the runtime
-///   whose scheduler owns the task is being driven. A current-thread runtime
-///   that nobody is parked in advances neither the notification nor the
-///   per-second re-poll (see [`TokioRuntime`]'s *Stalls*).
-/// - **From inside a transaction this stalls the reply.** Calling it in a
-///   handler keeps that binder thread occupied until the service appears, and
-///   the in-flight transaction goes unanswered for that long. Unlike the
-///   single-round-trip lookups this does *not* run inline on the calling
-///   thread, so a `timeout` around it does work — but the handler is still
-///   parked. Look services up before serving, not while serving.
-/// - A thread pool ([`crate::ProcessState::start_thread_pool`]) makes the wait
-///   event-driven; without one it degrades to the ~1s re-poll, like the sync
-///   path.
+/// The wait is a single `spawn_blocking` task, and the blocking pool runs
+/// independently of any scheduler: `onRegistration` arriving on a binder thread
+/// and waking that task's condvar, and the per-second `getService` re-poll,
+/// both proceed whatever the runtime is doing. What the runtime decides is how
+/// this future — the handle to that task — is driven:
+///
+/// | How this future is driven | Completion | A `timeout` around it |
+/// |---|---|---|
+/// | awaited on a runtime that is being driven | observed | fires |
+/// | awaited inside a handler this crate drives with [`TokioRuntime`] | observed — the wake comes from the blocking pool, not from the scheduler | only while that runtime's timer is advancing, which is the condition in [`TokioRuntime`]'s *Stalls* |
+/// | `tokio::spawn`ed onto a current-thread runtime nobody is parked in | never — the task is not polled, so the wait never starts and no pool thread is taken | – |
+///
+/// The first poll is what submits the blocking task, so a runtime that stops
+/// being driven afterwards leaves the wait holding its pool thread and polling
+/// the service manager every second, with nobody there to take the result.
+///
+/// # From inside a transaction
+///
+/// Calling it while handling a transaction keeps that binder thread occupied
+/// until the service appears, and the in-flight transaction goes unanswered for
+/// that long — a `timeout` bounds the wait only under the condition in the
+/// table above. Look services up before serving, not while serving.
+///
+/// Unlike the single-round-trip lookups, this does not run inline on the
+/// calling thread: the wait goes to the blocking pool wherever it is called
+/// from, so it is the reply that is delayed, not the kernel's deadlock
+/// prevention that is lost.
+///
+/// # Thread pool
+///
+/// A binder thread pool ([`crate::ProcessState::start_thread_pool`]) is what
+/// makes the wait event-driven; without one it degrades to the ~1s re-poll,
+/// exactly as the synchronous path does.
 pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {
@@ -218,6 +240,18 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// report beyond the death itself, and the binder it watches is the one that
 /// was passed in.
 ///
+/// It is fused: once it has completed, polling it again returns
+/// [`Poll::Ready`] immediately instead of panicking. That matters because the
+/// future is [`Unpin`], so a `select!` arm written as `_ = &mut died` can be
+/// polled after the death has already been reported.
+///
+/// Fused means *always ready*, not *ignored*: after the death, a `select!` arm
+/// holding `&mut signal` is ready on every iteration, so a loop that keeps
+/// selecting on it runs that arm over and over and makes no other progress.
+/// Leave the loop from that arm, or disable it once it has fired — `select!`
+/// takes a per-arm precondition for exactly this:
+/// `_ = &mut died, if !dead => { dead = true; … }`.
+///
 /// Dropping it before the death unregisters the notification.
 pub struct DeathSignal {
     rx: tokio::sync::oneshot::Receiver<()>,
@@ -232,6 +266,10 @@ pub struct DeathSignal {
     binder: SIBinder,
     /// `false` for an already-dead binder, which never got a link to undo.
     linked: bool,
+    /// Set once `rx` has yielded. The `oneshot` receiver panics if it is
+    /// polled again after that, and this future is `Unpin` — so a `select!`
+    /// arm holding `&mut signal` across iterations would reach it.
+    fired: bool,
 }
 
 /// [`DeathRecipient`] that does nothing but wake a [`DeathSignal`].
@@ -261,11 +299,17 @@ impl Future for DeathSignal {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
+        if this.fired {
+            return Poll::Ready(());
+        }
         // `Err(RecvError)` is the sender being dropped without a send, which
         // cannot happen while this future holds the recipient. Resolving on it
         // beats hanging if it ever does.
         match Pin::new(&mut this.rx).poll(cx) {
-            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Ready(_) => {
+                this.fired = true;
+                Poll::Ready(())
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -337,6 +381,7 @@ pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
             recipient,
             binder: binder.clone(),
             linked: true,
+            fired: false,
         }),
         // Already dead (kernel and RPC both answer `DeadObject` once the
         // obituary has gone out). Hand back a completed signal rather than an
@@ -348,6 +393,7 @@ pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
                 recipient,
                 binder: binder.clone(),
                 linked: false,
+                fired: false,
             })
         }
         Err(err) => Err(err),
@@ -529,6 +575,7 @@ mod tests {
         link: Option<StatusCode>,
         unlink_panics: bool,
         unlinked: AtomicUsize,
+        strong: AtomicUsize,
         recipient: Mutex<Option<std::sync::Weak<dyn DeathRecipient>>>,
     }
 
@@ -538,12 +585,15 @@ mod tests {
                 link,
                 unlink_panics,
                 unlinked: AtomicUsize::new(0),
+                strong: AtomicUsize::new(0),
                 recipient: Mutex::new(None),
             })
         }
 
-        /// Deliver an obituary the way a binder worker thread would.
-        fn fire_obituary(&self, binder: &SIBinder) {
+        /// Deliver an obituary the way a binder worker thread would: through
+        /// the recipient the link stored, holding nothing but a weak reference
+        /// to the binder itself.
+        fn fire_obituary(&self, who: &WIBinder) {
             let recipient = self
                 .recipient
                 .lock()
@@ -552,7 +602,7 @@ mod tests {
             let recipient = recipient.expect("no recipient registered").upgrade();
             recipient
                 .expect("the signal dropped its recipient")
-                .binder_died(&SIBinder::downgrade(binder));
+                .binder_died(who);
         }
 
         fn unlink_count(&self) -> usize {
@@ -571,8 +621,24 @@ mod tests {
             *self.recipient.lock().unwrap_or_else(|e| e.into_inner()) = Some(recipient);
             Ok(())
         }
-        fn unlink_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> crate::Result<()> {
+        fn unlink_to_death(
+            &self,
+            recipient: std::sync::Weak<dyn DeathRecipient>,
+        ) -> crate::Result<()> {
             assert!(!self.unlink_panics, "injected unlink panic");
+            // The real proxy locates the recipient by `Weak::ptr_eq` and
+            // answers `NameNotFound` otherwise, and `DeathSignal::drop` only
+            // logs that — so without matching here, unlinking the wrong
+            // recipient (a death link left registered in production) still
+            // counts as an unlink.
+            let mut slot = self.recipient.lock().unwrap_or_else(|e| e.into_inner());
+            if !slot
+                .as_ref()
+                .is_some_and(|stored| std::sync::Weak::ptr_eq(stored, &recipient))
+            {
+                return Err(StatusCode::NameNotFound);
+            }
+            *slot = None;
             self.unlinked.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -595,12 +661,20 @@ mod tests {
             Stability::default()
         }
         fn inc_strong(&self, _: &SIBinder) -> crate::Result<()> {
+            self.strong.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn attempt_inc_strong(&self) -> bool {
             true
         }
         fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> crate::Result<()> {
+            // Losing the last strong reference destroys a proxy, and the
+            // kernel death subscription goes with it — so the registered
+            // recipient has to go too, or the fake would keep delivering
+            // obituaries for a binder nobody holds any more.
+            if self.strong.fetch_sub(1, Ordering::SeqCst) == 1 {
+                *self.recipient.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             Ok(())
         }
         fn inc_weak(&self, _: &WIBinder) -> crate::Result<()> {
@@ -625,7 +699,7 @@ mod tests {
         let mut signal = death_signal(&binder).unwrap();
 
         assert_eq!(poll_once(&mut signal), Poll::Pending);
-        fake.fire_obituary(&binder);
+        fake.fire_obituary(&SIBinder::downgrade(&binder));
         assert_eq!(poll_once(&mut signal), Poll::Ready(()));
     }
 
@@ -666,9 +740,9 @@ mod tests {
 
     #[test]
     fn a_panicking_unlink_stays_inside_drop() {
-        // Q5: the kernel `unlink_to_death` panics on a poisoned recipients
-        // lock, and a panic leaving `Drop` during an unwind aborts the
-        // process. Assert the panic is contained rather than propagated.
+        // The kernel `unlink_to_death` panics on a poisoned recipients lock,
+        // and a panic leaving `Drop` during an unwind aborts the process.
+        // Assert the panic is contained rather than propagated.
         let fake = FakeRemote::new(None, true);
         let binder = SIBinder::new(fake).unwrap();
         let signal = death_signal(&binder).unwrap();
@@ -679,15 +753,20 @@ mod tests {
 
     #[test]
     fn the_signal_survives_the_binder_handle_going_away() {
-        // Q4: the signal holds the binder strongly, so a caller that drops
-        // their own handle still gets told.
+        // The signal holds the binder strongly, so a caller that drops their
+        // own handle still gets told. The obituary has to come *after* that
+        // drop for this to be measured: with a weak reference in the signal
+        // the last strong one would leave with the caller's handle, and the
+        // fake drops its registered recipient at that point, the way a
+        // destroyed proxy takes the kernel subscription with it.
         let fake = FakeRemote::new(None, false);
-        let mut signal = {
+        let (mut signal, who) = {
             let binder = SIBinder::new(fake.clone()).unwrap();
-            let signal = death_signal(&binder).unwrap();
-            fake.fire_obituary(&binder);
-            signal
+            (death_signal(&binder).unwrap(), SIBinder::downgrade(&binder))
         };
+
+        assert_eq!(poll_once(&mut signal), Poll::Pending);
+        fake.fire_obituary(&who);
         assert_eq!(poll_once(&mut signal), Poll::Ready(()));
     }
 

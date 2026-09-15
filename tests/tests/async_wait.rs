@@ -69,12 +69,6 @@ fn the_wait_wakes_on_the_registration_notification() {
     ProcessState::init_default().expect("ProcessState::init_default");
     ProcessState::start_thread_pool();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
-
     // Registered services stay alive for the whole test: the service manager
     // holds a reference, and dropping the local object underneath it would
     // only add a way for a later round to fail.
@@ -91,21 +85,56 @@ fn the_wait_wakes_on_the_registration_notification() {
             // Long enough that the wait is past its fast path and blocked on
             // the condvar, short enough to stay under the 1s re-poll tick.
             std::thread::sleep(Duration::from_millis(300));
-            hub::add_service(&reg_name, &service).expect("add_service");
-            let _ = tx.try_send(Instant::now());
+            let added = hub::add_service(&reg_name, &service);
+            if added.is_ok() {
+                let _ = tx.try_send(Instant::now());
+            }
+            added
         });
 
-        let found_at = rt.block_on(async {
-            let svc = wait_for_interface_async::<dyn IAsyncRt>(&name)
-                .await
-                .expect("wait_for_interface_async");
-            let at = Instant::now();
-            // The lookup really did produce a working handle.
-            assert_eq!(svc.r#echo("hi").expect("echo"), "echo:hi");
-            at
+        // One runtime per round, so the shutdown below is reached before this
+        // round's assertions can panic.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        // The wait is unbounded, so a registration that never happens (an
+        // `add_service` the service manager denies, say) would park this
+        // `block_on` forever and wedge the whole test binary instead of
+        // failing. The bound is two orders of magnitude above the 100ms the
+        // measurement below asserts, so it never decides that question.
+        let waited = rt.block_on(async {
+            let res = tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_interface_async::<dyn IAsyncRt>(&name),
+            )
+            .await;
+            (res, Instant::now())
         });
 
-        registrar.join().expect("registrar thread");
+        // Same reason as the two tests below: `Runtime::drop` waits for
+        // blocking tasks, so a wait that ignored its cancellation would hold
+        // the test binary open — here through the unwind of any assertion
+        // below, which is why the shutdown comes first and is bounded.
+        rt.shutdown_timeout(Duration::from_secs(2));
+
+        // Joined before the wait's own result is unwrapped, so a failed
+        // registration is reported as itself rather than as the timeout it
+        // causes.
+        registrar
+            .join()
+            .expect("registrar thread")
+            .expect("add_service");
+
+        let (waited, found_at) = waited;
+        let svc = waited
+            .expect("the wait never resolved, though the registration succeeded")
+            .expect("wait_for_interface_async");
+        // The lookup really did produce a working handle.
+        assert_eq!(svc.r#echo("hi").expect("echo"), "echo:hi");
+
         let registered_at = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("registration timestamp");
@@ -261,8 +290,9 @@ fn dropping_the_wait_returns_the_blocking_thread() {
 /// back.
 ///
 /// Linux/`rsb_hub` only in substance: Android's `servicemanager` has no such
-/// cap (AOSP gates callers by uid/SELinux instead), so there the test passes
-/// without proving anything. It is listed for the Linux gate.
+/// cap (AOSP gates callers by uid/SELinux instead), so there the instrument
+/// cannot be armed and the test says so and returns rather than reporting a
+/// pass it did not measure. It is listed for the Linux gate.
 ///
 /// Mutant: removing `UnregisterOnDrop` from the cancelled return path (or
 /// returning without dropping it) keeps the list at the cap, and the final
@@ -308,7 +338,11 @@ fn a_dropped_wait_leaves_no_callback_registered() {
         .build()
         .expect("runtime");
 
-    rt.block_on(async {
+    // Registered only to read the cap, never to occupy a slot for long: a
+    // refusal leaves the list untouched, and an acceptance ends the test.
+    let arming_probe = BnServiceCallback::new_binder(Occupant);
+
+    let armed = rt.block_on(async {
         let waiting_name = name.clone();
         let waiting = tokio::spawn(async move {
             let _ = wait_for_interface_async::<dyn IAsyncRt>(&waiting_name).await;
@@ -316,12 +350,35 @@ fn a_dropped_wait_leaves_no_callback_registered() {
         // Long enough to have registered the 256th callback — the list is at
         // the cap while this wait is alive.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // Read the instrument before using it. Without the wait's own callback
+        // the list is one short of the cap, and every registration below is
+        // accepted whether or not anything unregistered.
+        let armed = sm.register_for_notifications(&name, &arming_probe).is_err();
         waiting.abort();
         let _ = waiting.await;
+        armed
     });
     // Same reason as in the test above: do not let a wait that ignored its
     // cancellation hold the runtime's shutdown (and the test binary) open.
     rt.shutdown_timeout(Duration::from_secs(2));
+
+    if !armed {
+        // Android's `servicemanager` has no per-name cap, so the probe is
+        // accepted there no matter what the wait did — vacuous rather than
+        // failing. On `rsb_hub` the cap exists, so an unarmed instrument means
+        // the wait never registered and there is nothing to measure.
+        if cfg!(target_os = "android") {
+            println!(
+                "skipped: no per-name callback cap on this service manager, so the unregister \
+                 cannot be observed from here"
+            );
+            return;
+        }
+        panic!(
+            "the wait registered no callback: the list never reached the cap ({CAP}), \
+             so nothing below observes the unregister"
+        );
+    }
 
     // Aborting the task drops the future, which cancels the wait; the
     // unregister is a wire call the blocking thread makes on its way out, so
