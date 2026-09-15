@@ -93,8 +93,11 @@ fn current_thread() -> tokio::runtime::Runtime {
 // ---- axis 1: where the call is made from ----
 //
 // Each of these varies the calling position. The handle is held at a runtime
-// that completes — a multi-threaded one, or a current-thread one with its
-// owner parked — so nothing here can fail for an axis-2 reason.
+// that completes — a multi-threaded one, or a current-thread one with its owner
+// parked — so nothing here can fail for an axis-2 reason. The one exception is
+// `sync_handle_from_current_thread_owner_panics`, where the owner is the
+// calling thread itself: nothing is running that runtime during the call, and
+// the test holds only because the panic lands before anything needs it to.
 
 /// A — the sync handle called from inside `Runtime::block_on` on a
 /// multi-threaded runtime. Panicked with "Cannot start a runtime from
@@ -215,9 +218,14 @@ fn idle_current_thread_handle() -> tokio::runtime::Handle {
 fn current_thread_handle_with_no_parked_owner_never_completes() {
     let svc = service(idle_current_thread_handle());
     let (tx, rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
     thread::spawn(move || {
+        // Without this, a slow thread start would spend the whole deadline and
+        // the test would pass having called nothing at all.
+        let _ = started_tx.send(());
         let _ = tx.send(svc.echo("idle"));
     });
+    started_rx.recv().expect("call thread started");
 
     // Timeout specifically: `is_err()` alone would also accept `Disconnected`,
     // which is what a panicking call thread looks like — the test would go
@@ -281,25 +289,51 @@ fn async_handle_skips_block_on_entirely() {
 #[test]
 fn nested_sync_call_inside_a_current_thread_handler_panics() {
     // Parked, so the backend's own `sleep` is not what fails here — this test
-    // is about axis 1, and an idle runtime would stall instead.
+    // is about axis 1, and an idle runtime would stall instead. Waited for:
+    // if the panic ever regressed, an owner that had not entered
+    // `Runtime::block_on` yet would turn the regression into a hang.
     let rt = current_thread();
     let handle = rt.handle().clone();
-    thread::spawn(move || rt.block_on(std::future::pending::<()>()));
+    let (parked_tx, parked_rx) = mpsc::channel();
+    thread::spawn(move || {
+        rt.block_on(async move {
+            let _ = parked_tx.send(());
+            std::future::pending::<()>().await
+        })
+    });
+    parked_rx.recv().expect("owner parked in Runtime::block_on");
 
     let gateway = gateway_service(handle);
 
     // The outer call comes from a plain thread: the row that runs.
-    let panicked = thread::spawn(move || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gateway.echo("via"))).is_err()
-    })
-    .join()
-    .expect("join");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let panic_msg =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gateway.echo("via")))
+                .err()
+                .map(|e| {
+                    e.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default()
+                });
+        let _ = tx.send(panic_msg);
+    });
 
-    assert!(
-        panicked,
-        "a nested sync-handle call under a current-thread handle completed; \
-         the documented last row no longer holds"
-    );
+    let panic_msg = rx
+        .recv_timeout(Duration::from_millis(3000))
+        .expect("the nested call neither returned nor panicked");
+
+    // The message matters: `block_in_place`'s refusal is a different failure,
+    // and only this one says the call was rejected as re-entrant.
+    match panic_msg {
+        Some(m) if m.contains("within a runtime") => {}
+        Some(m) => panic!("panicked, but not as a re-entrant block_on: {m}"),
+        None => panic!(
+            "a nested sync-handle call under a current-thread handle completed; \
+             the documented last row no longer holds"
+        ),
+    }
 }
 
 /// The same shape with a multi-threaded handle completes: `block_in_place`

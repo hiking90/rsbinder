@@ -150,7 +150,7 @@ impl BinderAsyncPool for Tokio {
 /// | The calling thread | Result |
 /// |---|---|
 /// | Not executing inside a runtime | runs |
-/// | Inside a **multi-threaded** runtime | runs, after releasing the core |
+/// | Inside a **multi-threaded** runtime | runs — releasing the core first when the caller is a worker holding one, inline otherwise |
 /// | Inside a multi-threaded runtime, within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime"; `block_in_place` is refused there |
 /// | Inside a **current-thread** runtime | **panic** — "Cannot start a runtime from within a runtime"; there is no way back out |
 ///
@@ -178,8 +178,8 @@ impl BinderAsyncPool for Tokio {
 ///
 /// `Handle::block_on` polls the future on the **calling** thread — not on a
 /// worker — for either flavor, and that is all it does. Anything the handler
-/// needs the runtime itself to advance — a timer, IO readiness, or a task it
-/// spawned there — needs that runtime to be running:
+/// needs that runtime's *scheduler* to advance — a timer, IO readiness, or a
+/// [`tokio::spawn`]ed task — needs that runtime to be running:
 ///
 /// - A **multi-threaded** runtime always is: its workers drive the timer and IO
 ///   drivers and run spawned tasks.
@@ -188,6 +188,13 @@ impl BinderAsyncPool for Tokio {
 ///   parked there, a handler that awaits any of those never completes and the
 ///   call never returns. A handler that needs none of them — ready on the first
 ///   poll, or suspending only on `yield_now` — still completes.
+///
+/// [`spawn_blocking`](tokio::task::spawn_blocking) is deliberately not in that
+/// set: the blocking pool runs independently of the scheduler, so awaiting one
+/// completes here too. That is why an *outbound* call through
+/// [`BinderAsyncPool`](crate::BinderAsyncPool) — which is `spawn_blocking` —
+/// works from a handler this adapter is driving on a current-thread handle,
+/// even though a `tokio::spawn`ed task in the same place would not.
 ///
 /// # Cost
 ///

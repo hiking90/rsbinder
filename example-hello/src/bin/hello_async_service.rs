@@ -27,15 +27,16 @@ impl IHelloAsyncService for HelloAsyncImpl {
     }
 }
 
-// Multi-threaded, which is `#[tokio::main]`'s default flavor. A
-// current-thread runtime also works, but only while this thread stays parked
-// inside `Runtime::block_on` — see the async chapter of the book.
+// Multi-threaded, which is `#[tokio::main]`'s default flavor. A current-thread
+// runtime completes handlers only while this thread stays parked inside
+// `Runtime::block_on`, and even parked it cannot reach a second local service
+// through a sync handle from inside a handler. See the async chapter of the book.
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // The runtime the inbound calls are driven on. Binder threads are outside
-    // the runtime, which is what `Handle::block_on` wants.
+    // The runtime `block_on` runs each inbound call against. Binder threads are
+    // outside it, which is what `Handle::block_on` wants.
     let rt = TokioRuntime(tokio::runtime::Handle::current());
     let service = BnHello::new_async_binder(HelloAsyncImpl, rt);
 
