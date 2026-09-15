@@ -215,6 +215,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   rejected as an unknown type, and with a misleading message at that. The walk
   now runs to the package boundary.
 
+### Security
+
+- Raised the `rustls` floor to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption level boundaries). Affects the `rpc-tls`
+  feature only. The floor is in the manifest, not just the lockfile: a library's
+  `Cargo.lock` does not constrain its consumers, so a `version = "0.23"` floor
+  would have left a downstream free to resolve a vulnerable 0.23.x.
+
 ### Migrating from 0.10.0
 
 The short form of this release's breaking changes; *Changed* and *Removed*
