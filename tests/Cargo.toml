@@ -19,7 +19,13 @@ rpc-tcp-debug = ["rsbinder/rpc-tcp-debug", "rpc"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
-tokio = { workspace = true }
+# Declared here rather than inherited: `rsbinder`'s `tokio` feature no longer
+# pulls `tokio/full`, so feature unification stops supplying these. `time` is
+# for `tests/async_runtime.rs`, where a timer is what tells a driven runtime
+# apart from an entered one; `macros` is for `tokio::join!` in
+# `tests/rpc_async.rs` (no `#[tokio::test]` anywhere — every async test builds
+# its runtime by hand).
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 env_logger = { workspace = true }
 rustix = { workspace = true, features = ["pipe", "param"] }
 async-trait = { workspace = true }

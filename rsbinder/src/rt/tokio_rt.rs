@@ -119,23 +119,119 @@ impl BinderAsyncPool for Tokio {
     }
 }
 
-/// Wrapper around Tokio runtime types for providing a runtime to a binder server.
+/// Wrapper around a Tokio [`Handle`], for providing a runtime to a binder
+/// server.
+///
+/// An async server implementation is driven by [`BinderAsyncRuntime::block_on`]
+/// on whatever thread delivered the transaction — a kernel binder looper, or an
+/// RPC session thread. Those threads are outside the runtime, which is the case
+/// `Handle::block_on` is built for.
+///
+/// The same `block_on` is also reached from a *synchronous* handle to a local
+/// async service: `Bn*::new_async_binder` returns `Strong<dyn IFoo>`, whose
+/// generated wrapper implements each sync method as `block_on(inner.method())`.
+/// Calling that handle from a task on a multi-threaded runtime would otherwise
+/// panic with "Cannot start a runtime from within a runtime", so this impl
+/// releases the worker's core with [`tokio::task::block_in_place`] first.
+///
+/// Two independent things then decide what the call does, and reading them as
+/// one list is how the failures get misattributed. **Where the call is made
+/// from** decides whether it runs at all. **Which runtime the handle points at**
+/// decides whether the future can finish. Either answer holds whatever the other
+/// one is.
+///
+/// # Panics
+///
+/// Where the call is made from, whatever the handle points at. Tokio refuses a
+/// `Handle::block_on` on a thread that is already executing inside a runtime,
+/// and [`block_in_place`] — which steps back out of one — exists only for the
+/// multi-threaded runtime. That is the whole rule:
+///
+/// | The calling thread | Result |
+/// |---|---|
+/// | Not executing inside a runtime | runs |
+/// | Inside a **multi-threaded** runtime | runs — releasing the core first when the caller is a worker holding one, inline otherwise |
+/// | Inside a multi-threaded runtime, within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime"; `block_in_place` is refused there |
+/// | Inside a **current-thread** runtime | **panic** — "Cannot start a runtime from within a runtime"; there is no way back out |
+///
+/// Reading a position off that rule is the part worth doing carefully, because
+/// "inside a runtime" is not the same as "on a runtime's thread":
+///
+/// - A `spawn_blocking` pool thread is **outside** the runtime it belongs to,
+///   for either flavor. Those calls run.
+/// - A `Runtime::block_on` body is **inside** — so a current-thread runtime's
+///   `Runtime::block_on` body is the last row, not the first.
+/// - **A handler this adapter is already driving is inside**, for as long as
+///   `block_on` is driving it, and inside *the handle's* runtime whatever thread
+///   it started on. So a service whose `TokioRuntime` holds a current-thread
+///   handle cannot reach a second local service through a sync handle from
+///   within a handler — that nested call is the last row. Reach it with
+///   [`Strong::into_async`] instead, or drive the service from a
+///   multi-threaded handle.
+///
+/// [`block_in_place`]: tokio::task::block_in_place
+///
+/// # Stalls
+///
+/// Which runtime the handle points at. This decides completion whatever the
+/// caller.
+///
+/// `Handle::block_on` polls the future on the **calling** thread — not on a
+/// worker — for either flavor, and that is all it does. Anything the handler
+/// needs that runtime's *scheduler* to advance — a timer, IO readiness, or a
+/// [`tokio::spawn`]ed task — needs that runtime to be running:
+///
+/// - A **multi-threaded** runtime always is: its workers drive the timer and IO
+///   drivers and run spawned tasks.
+/// - A **current-thread** runtime does so only while some thread sits inside
+///   `Runtime::block_on` on it, and `Handle::block_on` is not that. With nobody
+///   parked there, a handler that awaits any of those never completes and the
+///   call never returns. A handler that needs none of them — ready on the first
+///   poll, or suspending only on `yield_now` — still completes.
+///
+/// [`spawn_blocking`](tokio::task::spawn_blocking) is deliberately not in that
+/// set: the blocking pool runs independently of the scheduler, so awaiting one
+/// completes here too. That is why an *outbound* call through
+/// [`BinderAsyncPool`](crate::BinderAsyncPool) — which is `spawn_blocking` —
+/// works from a handler this adapter is driving on a current-thread handle,
+/// even though a `tokio::spawn`ed task in the same place would not.
+///
+/// # Cost
+///
+/// A call from a **worker** thread releases that worker's core for the duration
+/// and offers it to the `spawn_blocking` pool. From every other position nothing
+/// is released and the call runs inline. The pool spawns a thread on demand, so
+/// the core is only left unclaimed when the pool is at its
+/// `max_blocking_threads` cap with every thread busy; then the call still
+/// completes, but a runtime with a *single* worker runs nothing else until it
+/// returns. A second worker, or headroom under the cap, removes that.
+///
+/// So on a path that calls a local async service repeatedly, convert the handle
+/// once with [`Strong::into_async`] and await it instead — that route dispatches
+/// to the async service directly and never enters `block_on`.
+///
+/// [`Handle`]: tokio::runtime::Handle
+/// [`LocalSet`]: tokio::task::LocalSet
+/// [`Strong::into_async`]: crate::Strong::into_async
 pub struct TokioRuntime<R>(pub R);
-
-impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Runtime> {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
-    }
-}
-
-impl BinderAsyncRuntime for TokioRuntime<std::sync::Arc<tokio::runtime::Runtime>> {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
-    }
-}
 
 impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Handle> {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.0.block_on(future)
+        match tokio::runtime::Handle::try_current() {
+            // A multi-threaded runtime is in scope. Step out of it first:
+            // from a worker that releases the core, and from one of its
+            // blocking threads — which is outside the runtime already — it is
+            // a plain inline call.
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.0.block_on(future))
+            }
+            // No runtime in scope (a binder looper, an RPC session thread), or a
+            // current-thread one. There is no equivalent of `block_in_place` for
+            // current-thread, so this arm is both the ordinary path and the one
+            // that panics when the thread is executing inside that runtime. The
+            // flavor alone must not decide: a current-thread runtime's blocking
+            // pool reaches here too and is allowed to block.
+            _ => self.0.block_on(future),
+        }
     }
 }

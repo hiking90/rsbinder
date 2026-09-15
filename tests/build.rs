@@ -143,6 +143,16 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 11 Phase A fixture (`tests/async_runtime.rs`): the async
+    // `block_on` adapter is reached through a purely local binder, so this
+    // is generated unconditionally — the test needs neither a kernel device
+    // nor the `rpc` feature, and runs in every environment.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/async_rt/IAsyncRt.aidl"))
+        .output(PathBuf::from("async_rt.rs"))
+        .generate()
+        .unwrap();
+
     // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen

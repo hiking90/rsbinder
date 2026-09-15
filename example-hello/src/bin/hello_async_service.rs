@@ -27,22 +27,32 @@ impl IHelloAsyncService for HelloAsyncImpl {
     }
 }
 
+// Multi-threaded, which is `#[tokio::main]`'s default flavor. A current-thread
+// runtime completes handlers only while this thread stays parked inside
+// `Runtime::block_on`, and even parked it cannot reach a second local service
+// through a sync handle from inside a handler. See the async chapter of the book.
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    ProcessState::init_default()?;
-    ProcessState::start_thread_pool();
-
-    // Bridge the async impl onto sync binder dispatch; rt.block_on drives each call.
+    // The runtime `block_on` runs each inbound call against. Binder threads are
+    // outside it, which is what `Handle::block_on` wants.
     let rt = TokioRuntime(tokio::runtime::Handle::current());
     let service = BnHello::new_async_binder(HelloAsyncImpl, rt);
 
-    hub::add_service(SERVICE_NAME, &service)?;
-    println!("Registered async service: {SERVICE_NAME}");
+    // Same three calls as `hello_service`, except `spawn` instead of `run`:
+    // for kernel binder it starts the thread pool and returns, leaving this
+    // task free to await. (`run` would join the pool and block this thread,
+    // which a current-thread runtime could not survive.) The kernel grows the
+    // pool from there as load arrives.
+    println!("Serving {SERVICE_NAME} over kernel binder (async)...");
+    let _guard = rsbinder::serve("binder://")?
+        .add(SERVICE_NAME, &service)?
+        .spawn()?;
 
-    // `join_thread_pool` blocks forever; run it off the runtime so the Tokio
-    // worker threads stay free to drive the async handlers.
-    tokio::task::spawn_blocking(ProcessState::join_thread_pool).await??;
+    // Park until killed. To shut down on Ctrl-C instead, await
+    // `tokio::signal::ctrl_c()` here and declare `tokio/signal` in this
+    // crate's own Cargo.toml — rsbinder does not bring that feature in.
+    std::future::pending::<()>().await;
     Ok(())
 }

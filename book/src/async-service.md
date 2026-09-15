@@ -1,8 +1,15 @@
 # Async Service
 
 rsbinder supports async/await with the [Tokio](https://tokio.rs/) runtime, making it
-straightforward to build non-blocking Binder services. The `tokio` feature is enabled by
-default in rsbinder, so no extra feature flags are required for most projects.
+straightforward to build non-blocking Binder services. rsbinder's own `tokio` feature is on
+by default, but it enables only `tokio/rt` and `tokio/rt-multi-thread` — what the library
+itself uses. Your crate declares what *its* code needs, including the `macros` feature that
+`#[tokio::main]` in the recipes below comes from:
+
+```toml
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# add "time" for the `sleep` / `timeout` examples, "signal" for `ctrl_c`
+```
 
 If you have not yet read the [Hello, World!](./hello-world.md) chapter, it is recommended to
 do so first -- the async concepts here build on the synchronous service and client covered
@@ -23,8 +30,8 @@ sync- or async-backed is decided entirely by which constructor produced it
 **no transport-specific code**: pick the constructor, pick the transport, and the two
 compose.
 
-This chapter starts with the kernel-binder setup, then shows the RPC variant — which
-differs only in the URI and the runtime flavor.
+This chapter gives one setup recipe, then shows what the RPC variant does and does not
+change about it.
 
 > **Under the hood — it is a thread bridge, not a reactor.** rsbinder async is *not*
 > epoll-driven non-blocking I/O. On the client a transact runs on
@@ -46,80 +53,169 @@ Binder service in rsbinder.
 | Method signature | `fn method(&self) -> Result<T>` | `async fn method(&self) -> Result<T>` |
 | Service creation | `BnXxx::new_binder(impl)` | `BnXxx::new_async_binder(impl, rt())` |
 | Remote call (client) | `service.Method()` | `service.clone().into_async::<Tokio>().Method().await` |
-| Main loop | `ProcessState::join_thread_pool()` | `std::future::pending().await` |
+| Main loop | `serve(..).run()` | `serve(..).spawn()` + `std::future::pending().await` |
 | Runtime | Not needed | Tokio runtime required |
 
 The AIDL compiler generates both the sync trait (`IMyService`) and the async trait
 (`IMyServiceAsyncService`) from the same `.aidl` file. You choose which one to implement
 depending on whether your service needs async capabilities.
 
-The trait, proxy, and constructor rows above are **identical across transports** — only the
-"Main loop" and "Runtime" rows are the kernel-binder values shown here. Over RPC the main
-loop is `serve("unix://…").run()` (or `spawn()`) and the runtime must be
-**multi-threaded**; see [Async Over RPC](#async-over-rpc) below.
+Every row above is **identical across transports** — only the URI passed to `serve`
+changes. What does differ is how much slack the runtime flavor has: a current-thread
+runtime is usable for kernel binder under a condition spelled out below, and not usable
+at all for an RPC server that calls `run()`. Both cases come down to the same rule, so
+the recipe that follows uses a multi-threaded runtime and `spawn()` throughout.
 
-## Setting Up the Tokio Runtime (kernel binder)
+## Setting Up the Tokio Runtime
 
-An async Binder service must run inside a Tokio runtime. The standard pattern for **kernel
-binder** is:
+An async Binder service must run inside a Tokio runtime. One recipe covers both
+transports:
 
-1. Initialize the Binder process state and thread pool (same as sync).
-2. Build a Tokio runtime.
-3. Inside the runtime, create and register async services.
-4. Yield to the runtime with `std::future::pending().await`.
-
-Here is the full setup, based on
-`tests/src/bin/test_service_async.rs`:
+1. A **multi-threaded** runtime (what `#[tokio::main]` builds by default).
+2. `serve(..).add(..)` — the same two calls as a sync service.
+3. `spawn()` rather than `run()`, so this task is not blocked.
+4. Park on `std::future::pending().await`.
 
 ```rust
 use rsbinder::*;
 
-fn rt() -> TokioRuntime<tokio::runtime::Handle> {
-    TokioRuntime(tokio::runtime::Handle::current())
-}
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // The runtime `block_on` runs each inbound call against. Binder threads are
+    // outside it, which is the case `Handle::block_on` is built for.
+    let rt = TokioRuntime(tokio::runtime::Handle::current());
+    let service = BnMyService::new_async_binder(MyAsyncService::default(), rt);
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Initialize Binder -- same as the sync case.
-    ProcessState::init_default()?;
-    ProcessState::start_thread_pool();
+    // `serve("binder://")` initializes the kernel `ProcessState`; `add`
+    // registers with the service manager. `spawn` starts the binder thread
+    // pool and returns — unlike `run`, which joins it and never comes back.
+    // Swap the URI for `unix:///tmp/my.sock` to serve the same service over
+    // RPC; nothing else in this file changes, but rsbinder then needs
+    // `features = ["rpc"]`.
+    let _guard = rsbinder::serve("binder://")?
+        .add("com.example.myservice", &service)?
+        .spawn()?;
 
-    // Build a single-threaded Tokio runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    runtime.block_on(async {
-        // Create and register the async service (see next section).
-        // `add_service` accepts anything convertible into `SIBinder`, so
-        // the typed binder is passed directly — no `.as_binder()` needed.
-        let service = BnMyService::new_async_binder(
-            MyAsyncService::default(), rt(),
-        );
-        hub::add_service("com.example.myservice", &service)
-            .expect("Could not register service");
-
-        // Yield to the runtime. This keeps the process alive and
-        // drives the Tokio event loop on the current thread.
-        std::future::pending().await
-    })
+    // Never resolves, so the process stays alive. To shut down on Ctrl-C,
+    // await `tokio::signal::ctrl_c()` here instead and declare `tokio/signal`
+    // in your own `Cargo.toml` — rsbinder does not pull that feature in.
+    std::future::pending::<()>().await;
+    Ok(())
 }
 ```
 
-> `ProcessState::init_default()` returns `Result<&'static ProcessState, …>`,
-> so a `main` that calls it should also return `Result` (or call
-> `.expect()` / `.unwrap()` for the very first line of a quick demo).
+`example-hello/src/bin/hello_async_service.rs` is this code with a real interface.
 
-There are several things to note here:
+Things worth naming:
 
-- **`rt()`** is a small helper that wraps the current Tokio runtime handle in a
-  `TokioRuntime`. Every call to `new_async_binder` requires a `TokioRuntime` so it knows
-  where to spawn async work.
-- **`new_current_thread()`** creates a single-threaded Tokio runtime. This is the recommended
-  choice for Binder services because the Binder thread pool already provides its own threads.
-- **`std::future::pending().await`** is a future that never resolves. It keeps the `block_on`
-  call (and therefore the process) alive indefinitely, which is the async equivalent of the
-  synchronous `ProcessState::join_thread_pool()`.
+- **`TokioRuntime`** is what `new_async_binder` drives each inbound call with. It wraps
+  a `Handle`, not an owned `Runtime`: a binder that owns its runtime panics in
+  `Runtime::drop` when the last handle to it is released on a worker thread.
+- **`spawn()` over `run()`.** For kernel binder, `spawn` starts one looper and returns;
+  the kernel grows the pool up to `max_threads` as load arrives. `run` joins the pool,
+  which blocks the calling thread forever — fine for a sync service, wrong here.
+- **`pending().await`** is the async counterpart of `ProcessState::join_thread_pool()`.
+- **`rt()`** in the snippets below is this one-liner:
+  ```rust
+  fn rt() -> TokioRuntime<tokio::runtime::Handle> {
+      TokioRuntime(tokio::runtime::Handle::current())
+  }
+  ```
+
+### Advanced: a current-thread runtime
+
+A current-thread runtime works too, under one condition that is easy to miss: **its
+owning thread must stay parked inside `Runtime::block_on`.** That is the only thing that
+runs the runtime — its timer and IO drivers, and the tasks spawned on it. Park the owner
+anywhere else — calling `ProcessState::join_thread_pool()` directly, joining a thread, a
+blocking read — and every handler that awaits a timer, IO, or a task it spawned stops
+making progress. There is no error; those calls simply never return.
+
+So the recipe is the same shape as above, with the owner parked:
+
+```rust
+let runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()?;
+
+runtime.block_on(async {
+    let rt = TokioRuntime(tokio::runtime::Handle::current());
+    let service = BnMyService::new_async_binder(MyAsyncService::default(), rt);
+    let _guard = rsbinder::serve("binder://")?.add("com.example.myservice", &service)?.spawn()?;
+    std::future::pending::<()>().await;
+    Ok(())
+})
+```
+
+`tests/src/bin/test_service_async.rs` is built this way, and the integration suite runs the
+whole client test suite against it — on a manual workflow dispatch, not on every pull
+request. The multi-threaded recipe carries no such condition to get wrong, which is why it
+is the default advice.
+
+### Calling a local async service through its sync handle
+
+`new_async_binder` hands back a **synchronous** `Strong<dyn IMyService>`. Each of its
+methods is implemented as `block_on(inner.method())`, so calling it from inside the
+runtime — a gateway that calls its own service, start-up code, a test — re-enters the
+runtime. On a multi-threaded runtime rsbinder handles that by releasing the worker's core
+first.
+
+Two independent things decide what such a call does. Read them as one list and you will
+attribute a failure to the wrong one.
+
+**Where you call from** decides whether the call runs. Tokio refuses a `block_on` on a
+thread already executing inside a runtime, and `block_in_place` — which steps back out of
+one — exists only for the multi-threaded runtime. That is the whole rule:
+
+| The calling thread | Result |
+|---|---|
+| Not executing inside a runtime | runs |
+| Inside a multi-threaded runtime | runs — releasing the core first from a worker holding one, inline otherwise |
+| Inside a multi-threaded runtime, within a `LocalSet` | panic — `block_in_place` is refused there |
+| Inside a current-thread runtime | panic — "Cannot start a runtime from within a runtime" |
+
+Applying it takes some care, because "inside a runtime" is not "on a runtime's thread":
+
+- A `spawn_blocking` pool thread is *outside* the runtime it belongs to, either flavor.
+  Those calls run.
+- A `Runtime::block_on` body is *inside* — so a current-thread runtime's
+  `Runtime::block_on` body is the last row, not the first.
+- **An async handler is inside** for as long as `block_on` is driving it, and inside
+  *the handle's* runtime whatever thread it started on. A service whose `TokioRuntime`
+  holds a current-thread handle therefore cannot reach a second local service through a
+  sync handle from inside a handler — that is the last row, and it is the gateway pattern
+  exactly. Use `into_async` there, or give the service a multi-threaded handle.
+
+**Which runtime the handle points at** decides whether the call finishes, whatever the
+answer above. The future itself is polled on the *calling* thread either way, and that is
+all `Handle::block_on` does. Whatever the handler needs that runtime's *scheduler* to
+advance — a timer, IO readiness, or a `tokio::spawn`ed task — needs that runtime to be
+running:
+
+| The `TokioRuntime` handle | Result |
+|---|---|
+| A multi-threaded runtime | completes — its workers are always running |
+| A current-thread runtime with a thread parked in `Runtime::block_on` | completes — that parked call is what runs it |
+| A current-thread runtime with nobody parked in it | **never returns**, for a handler that awaits any of the three above. One that needs none of them — ready on the first poll, or suspending only on `yield_now` — still completes |
+
+`spawn_blocking` is not in that set: the blocking pool runs independently of the
+scheduler, so awaiting one completes here too. That is what makes an *outbound* call to
+another service work from a handler on a current-thread handle — rsbinder issues those
+through `spawn_blocking` — where a `tokio::spawn`ed task in the same place would hang.
+
+The cost is one core release per call made from a worker thread; from the other running
+positions the call is inline. A released core is offered to the `spawn_blocking` pool,
+which spawns a thread on demand — so it goes unclaimed only when the pool is at its
+`max_blocking_threads` cap with every thread busy. Even then the call completes; what
+stops is the rest of a *single-worker* runtime, until it returns. Two workers avoid that.
+
+On a path that calls repeatedly, convert the handle once instead and await it. That route
+dispatches straight to the async service and never touches `block_on`:
+
+```rust
+let svc = local_sync_handle.into_async::<Tokio>();
+svc.method().await?;
+```
 
 ## Async Over RPC
 
@@ -144,17 +240,22 @@ impl IHelloAsyncService for IHelloService {
 
 ### The server needs a multi-threaded runtime
 
-This is the one substantive difference from the kernel setup. An RPC async server is driven
-by a **blocking serve worker** that calls `rt.block_on(handler)`. That `block_on` runs on a
-thread that is *not* the runtime's own, so the runtime must be a **multi-threaded** one — a
-`current_thread` runtime cannot be driven from an outside thread while it is also being kept
-alive elsewhere. (Kernel binder gets away with `current_thread` only because the binder
-thread pool, not a serve loop, supplies the worker threads.)
+An RPC async server is driven by a **blocking serve worker** that calls
+`rt.block_on(handler)` from a thread that is not the runtime's own. That part is fine for
+either flavor — it is the same position a binder looper is in.
+
+What rules out `current_thread` here is `run()`: it blocks the calling thread in the
+accept loop. On a current-thread runtime that thread is the runtime's owner, and parking
+it anywhere other than `Runtime::block_on` leaves nothing running that runtime — the
+condition from [Advanced: a current-thread runtime](#advanced-a-current-thread-runtime)
+above. Handlers would then hang the first time one awaits a timer, IO, or a task it
+spawned. A multi-threaded runtime has no owner thread to strand, so `run()` is safe on
+it.
 
 ```rust
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // RPC async servers require a MULTI-THREAD runtime — the blocking serve
-    // worker calls `rt.block_on(handler)` from a non-runtime thread.
+    // RPC async servers need a MULTI-THREAD runtime: run() below parks this
+    // thread in the accept loop, which a current-thread runtime cannot survive.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -196,12 +297,15 @@ runtime.block_on(async {
 
 ### Switching transports
 
-To run the exact same async service over **kernel binder** instead, swap only the URI and
-the runtime flavor — the service `impl` is unchanged:
+To run the exact same async service over **kernel binder** instead, swap only the URI —
+the service `impl` is unchanged. Keep the multi-threaded runtime: `run()` parks the calling
+thread in the binder pool, which a current-thread runtime's owner cannot afford (see
+[Advanced: a current-thread runtime](#advanced-a-current-thread-runtime)) — use `spawn()`
+there.
 
 ```rust
 rsbinder::serve("binder://")?                      // instead of "unix:///tmp/hello.sock"
-    .add("hello", BnHello::new_async_binder(IHelloService {}, rt()))?
+    .add("hello", BnHello::new_async_binder(IHelloService {}, rt))?  // the `rt` bound above
     .run()?;                                       // joins the process-wide binder pool
 ```
 
@@ -319,6 +423,52 @@ The key difference is:
 
 The `.clone()` is necessary because `into_async` consumes the `Strong` reference. This is a
 cheap reference-count increment, not a deep copy.
+
+## Cancellation and Nesting
+
+Two properties of the async proxy surprise people who arrive from reactor-based async.
+Neither is going to change: the first follows from the binder wire having no cancel
+message, the second from how the kernel driver prevents deadlock.
+
+### Dropping a future does not cancel the call
+
+A generated proxy method is not wrapped in an `async` block. It issues the transaction
+**when you call it**, before the returned future is ever polled. So losing a `timeout` or
+a `select!` race — or dropping the future without polling it once — discards the reply,
+not the call:
+
+```rust
+// The remote side runs `transfer` either way. Only the reply is thrown away.
+let _ = tokio::time::timeout(Duration::from_millis(50), svc.transfer(amount)).await;
+```
+
+Wrapping a non-idempotent call in a timeout and treating expiry as "it did not happen" is
+therefore wrong. The blocking thread stays occupied until the reply arrives, so repeated
+timeouts against an unresponsive server fill the `spawn_blocking` pool (512 threads by
+default). Cap it with `Builder::max_blocking_threads`, and bound the wait at the source:
+over RPC, `RpcServer::set_reply_timeout` and the session read deadline. Kernel binder has
+no such bound.
+
+### A call made inside a handler runs inline
+
+While a thread is handling a transaction, an async proxy call on that thread executes
+**at the call site**, synchronously, before the first poll. This is deliberate: the
+kernel's deadlock prevention needs the nested outbound call to come from the thread that
+is holding the inbound one, and RPC needs the same thread to keep its session pin.
+
+The consequence is that the usual combinators do nothing there:
+
+```rust
+// Inside a handler: expires never — the call has already completed.
+let r = tokio::time::timeout(d, other.call()).await;
+
+// Inside a handler: sequential, not concurrent.
+let (a, b) = tokio::join!(first.call(), second.call());
+```
+
+To get real concurrency, leave the transaction context with `tokio::spawn` and call from
+there. That task's calls are no longer nested, so they also lose the deadlock avoidance —
+do not call back into a service that is currently blocked waiting on you.
 
 ## Creating Nested Async Binders
 
@@ -463,15 +613,23 @@ macro_rules! impl_repeat {
 
 ## Tips
 
-- **The runtime flavor is decided by the transport, not by taste.** Kernel
-  binder can use `new_current_thread()`, because the binder thread pool already
-  supplies the worker threads. An **RPC** server must use
-  `new_multi_thread()` — its serve worker calls `rt.block_on(handler)` from a
-  thread outside the runtime, which a `current_thread` runtime cannot serve.
+- **Prefer `new_multi_thread()`.** `new_current_thread()` is correct only while its
+  owning thread stays parked in `Runtime::block_on`; park it elsewhere and nothing runs
+  that runtime — no error, just a handler that never returns the moment it awaits a
+  timer, IO, or a task it spawned there. An RPC server that calls `run()` parks it
+  elsewhere by definition. A current-thread handle also rules out reaching a second local
+  service through a sync handle from inside a handler.
 - **Never block inside an async method.** A CPU-bound or blocking call belongs
   in `tokio::task::spawn_blocking`, and a call to another binder service
   belongs behind `into_async::<Tokio>()` — a blocking proxy call from an async
   method stalls the executor thread.
+- **Budget threads in both directions.** Outbound, each async call in flight holds one
+  blocking-pool thread until the reply lands; that thread talks to the driver but is not
+  a looper, so it does not come out of *your* `max_threads` — it spends one of the
+  callee's. Inbound, each handler holds one of your binder threads for the whole
+  `block_on`, so awaiting slow IO inside a handler drains the pool at `max_threads` and
+  nothing else gets served.
+  `Builder::max_blocking_threads` caps the outbound half.
 - **Sync and async services coexist in one process.** Register some with
   `new_binder` and others with `new_async_binder`; they share the same binder
   thread pool.
@@ -481,19 +639,18 @@ macro_rules! impl_repeat {
 Async services in rsbinder follow the same structure as sync services, with a few additional
 steps:
 
-1. Build a Tokio runtime and run your service setup inside `runtime.block_on(async { ... })`.
-2. Define an `rt()` helper that wraps `tokio::runtime::Handle::current()`.
-3. Implement `IMyServiceAsyncService` with `#[async_trait]` instead of `IMyService`.
-4. Create binders with `BnXxx::new_async_binder(impl, rt())`.
-5. Use `into_async::<Tokio>()` when calling other Binder services from async code.
-6. Keep the process alive with `std::future::pending().await` (kernel binder) or
-   `serve("unix://…").run()` / `spawn()` (RPC).
+1. Build a multi-threaded Tokio runtime — `#[tokio::main]` is one.
+2. Implement `IMyServiceAsyncService` with `#[async_trait]` instead of `IMyService`.
+3. Create binders with `BnXxx::new_async_binder(impl, TokioRuntime(Handle::current()))`.
+4. Register them with `serve(uri).add(name, &svc)` and start with `spawn()`, not `run()`.
+5. Keep the process alive with `std::future::pending().await`.
+6. Use `into_async::<Tokio>()` when calling other Binder services from async code —
+   including a local service of your own, where the sync handle would re-enter `block_on`.
 
 Because async lives in the generated stubs, the same async service runs over **either
 transport** — `add` the `new_async_binder` result to `rsbinder::serve(uri)` and look it up
-with [`connect`](./cross-transport-services.md). The only
-RPC-specific requirement is a **multi-threaded** runtime, because the blocking `serve` worker
-calls `rt.block_on(handler)`.
+with [`connect`](./cross-transport-services.md). Nothing in the recipe changes but the URI —
+a non-`binder://` URI additionally needs rsbinder's `rpc` feature, which is not on by default.
 
 For complete working examples, see `tests/src/bin/test_service_async.rs` (kernel binder) and
 `tests/tests/rpc_async.rs` (RPC) in the rsbinder repository.

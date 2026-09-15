@@ -23,7 +23,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 default = ["tokio"]
-tokio = ["async", "tokio/full"]
+# No `tokio/full`: the library uses `spawn_blocking`, `Handle` and nothing
+# else — `rt-multi-thread` is here for `block_in_place` in the
+# `BinderAsyncRuntime` adapter. A crate that wants
+# `net`, `time` or `signal` declares them itself rather than receiving them
+# by accident through feature unification.
+tokio = ["async", "tokio/rt", "tokio/rt-multi-thread"]
 async = ["rsbinder-aidl/async", "async-trait", "rsbinder-macros?/async"]
 # `#[rsbinder::interface]` — declare an interface as a Rust trait instead of
 # an `.aidl` file (plan 2-19). Off by default: it pulls the AIDL compiler
@@ -134,7 +139,13 @@ libc = { workspace = true }
 libc = { workspace = true }
 
 [build-dependencies]
-rsbinder-aidl = { workspace = true, features = ["async"] }
+# No `features = ["async"]` here. Cargo unifies features across the whole
+# build-dependency graph, so pinning it on turns codegen async on for every
+# downstream that has its own `rsbinder-aidl` build-dep — including one that
+# asked for a sync-only `rsbinder` and then cannot compile the result. The
+# `async` feature above carries the same edge conditionally, which is what
+# makes the two crates agree by default.
+rsbinder-aidl = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }

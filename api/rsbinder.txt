@@ -3115,12 +3115,8 @@ impl<I> core::marker::UnsafeUnpin for rsbinder::Strong<I> where I: ?core::marker
 impl<I> core::panic::unwind_safe::RefUnwindSafe for rsbinder::Strong<I> where I: core::panic::unwind_safe::RefUnwindSafe + ?core::marker::Sized
 impl<I> core::panic::unwind_safe::UnwindSafe for rsbinder::Strong<I> where I: core::panic::unwind_safe::UnwindSafe + ?core::marker::Sized
 pub struct rsbinder::TokioRuntime<R>(pub R)
-impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<alloc::sync::Arc<tokio::runtime::runtime::Runtime>>
-pub fn rsbinder::TokioRuntime<alloc::sync::Arc<tokio::runtime::runtime::Runtime>>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
 impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<tokio::runtime::handle::Handle>
 pub fn rsbinder::TokioRuntime<tokio::runtime::handle::Handle>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
-impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<tokio::runtime::runtime::Runtime>
-pub fn rsbinder::TokioRuntime<tokio::runtime::runtime::Runtime>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
 impl<R> core::marker::Freeze for rsbinder::TokioRuntime<R> where R: core::marker::Freeze
 impl<R> core::marker::Send for rsbinder::TokioRuntime<R> where R: core::marker::Send
 impl<R> core::marker::Sync for rsbinder::TokioRuntime<R> where R: core::marker::Sync
@@ -3196,12 +3192,8 @@ impl rsbinder::BinderAsyncPool for rsbinder::Tokio
 pub fn rsbinder::Tokio::spawn<'a, F1, F2, Fut, A, B, E>(F1, F2) -> rsbinder::BoxFuture<'a, core::result::Result<B, E>> where F1: core::ops::function::FnOnce() -> A + core::marker::Send + 'static, F2: core::ops::function::FnOnce(A) -> Fut + core::marker::Send + 'a, Fut: core::future::future::Future<Output = core::result::Result<B, E>> + core::marker::Send + 'a, A: core::marker::Send + 'static, B: core::marker::Send + 'a, E: core::convert::From<rsbinder::StatusCode>
 pub trait rsbinder::BinderAsyncRuntime
 pub fn rsbinder::BinderAsyncRuntime::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
-impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<alloc::sync::Arc<tokio::runtime::runtime::Runtime>>
-pub fn rsbinder::TokioRuntime<alloc::sync::Arc<tokio::runtime::runtime::Runtime>>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
 impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<tokio::runtime::handle::Handle>
 pub fn rsbinder::TokioRuntime<tokio::runtime::handle::Handle>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
-impl rsbinder::BinderAsyncRuntime for rsbinder::TokioRuntime<tokio::runtime::runtime::Runtime>
-pub fn rsbinder::TokioRuntime<tokio::runtime::runtime::Runtime>::block_on<F: core::future::future::Future>(&self, F) -> <F as core::future::future::Future>::Output
 pub trait rsbinder::DeathRecipient: core::marker::Send + core::marker::Sync
 pub fn rsbinder::DeathRecipient::binder_died(&self, &rsbinder::WIBinder)
 pub trait rsbinder::Deserialize: core::marker::Sized
