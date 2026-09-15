@@ -330,6 +330,27 @@ for as long as you want to hear about the death.
 (`Arc::downgrade(&(recipient.clone() as Arc<dyn DeathRecipient>))`) — use them
 when the recipient is already type-erased.
 
+### As a future
+
+In async code, `rsbinder::death_signal` replaces the whole `DeathRecipient`
+implementation with one `select!` arm (the `tokio` feature):
+
+```rust
+let died = rsbinder::death_signal(&service.as_binder())?;
+
+tokio::select! {
+    result = service_call() => result?,
+    _ = died => return Err("the service died mid-call".into()),
+}
+```
+
+It holds the binder and the recipient itself, so neither of the "easy to miss"
+conditions below applies to it, and dropping it unregisters the notification. A
+binder that is **already** dead is not an error — the future is simply complete
+on arrival, which is the honest answer to "tell me when this dies". A local
+binder still has no death notification: that is `InvalidOperation`, as with
+`link_to_death`.
+
 Two conditions are easy to miss:
 
 - Death notification works only for a **remote** binder. Linking to a local one
