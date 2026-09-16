@@ -25,6 +25,7 @@ pub mod rsbinder::entry::uri
 #[non_exhaustive] pub enum rsbinder::entry::uri::Endpoint
 pub rsbinder::entry::uri::Endpoint::Kernel
 pub rsbinder::entry::uri::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
+pub rsbinder::entry::uri::Endpoint::Kernel::mmap_size: core::option::Option<usize>
 pub rsbinder::entry::uri::Endpoint::Kernel::threads: core::option::Option<u32>
 pub rsbinder::entry::uri::Endpoint::Tls(alloc::string::String, u16)
 pub rsbinder::entry::uri::Endpoint::Unix(std::path::PathBuf)
@@ -72,6 +73,7 @@ pub fn rsbinder::entry::uri::parse(&str) -> rsbinder::Result<rsbinder::entry::ur
 #[non_exhaustive] pub enum rsbinder::entry::Endpoint
 pub rsbinder::entry::Endpoint::Kernel
 pub rsbinder::entry::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
+pub rsbinder::entry::Endpoint::Kernel::mmap_size: core::option::Option<usize>
 pub rsbinder::entry::Endpoint::Kernel::threads: core::option::Option<u32>
 pub rsbinder::entry::Endpoint::Tls(alloc::string::String, u16)
 pub rsbinder::entry::Endpoint::Unix(std::path::PathBuf)
@@ -120,6 +122,7 @@ pub rsbinder::entry::ClientOptions::driver: core::option::Option<std::path::Path
 pub rsbinder::entry::ClientOptions::fd_mode: core::option::Option<rsbinder::rpc::fd_mode::FileDescriptorTransportMode>
 pub rsbinder::entry::ClientOptions::handshake_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::entry::ClientOptions::incoming_connections: core::option::Option<u32>
+pub rsbinder::entry::ClientOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::entry::ClientOptions::outgoing_connections: core::option::Option<u32>
 pub rsbinder::entry::ClientOptions::session_id: core::option::Option<alloc::vec::Vec<u8>>
 pub rsbinder::entry::ClientOptions::timeout: core::option::Option<core::time::Duration>
@@ -141,6 +144,7 @@ pub rsbinder::entry::ServeOptions::fd_modes: core::option::Option<alloc::vec::Ve
 pub rsbinder::entry::ServeOptions::handshake_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::entry::ServeOptions::idle_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::entry::ServeOptions::max_connections: core::option::Option<usize>
+pub rsbinder::entry::ServeOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::entry::ServeOptions::reply_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::entry::ServeOptions::threads: core::option::Option<u32>
 impl core::default::Default for rsbinder::ServeOptions
@@ -3399,6 +3403,7 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::Caller
 #[non_exhaustive] pub enum rsbinder::Endpoint
 pub rsbinder::Endpoint::Kernel
 pub rsbinder::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
+pub rsbinder::Endpoint::Kernel::mmap_size: core::option::Option<usize>
 pub rsbinder::Endpoint::Kernel::threads: core::option::Option<u32>
 pub rsbinder::Endpoint::Tls(alloc::string::String, u16)
 pub rsbinder::Endpoint::Unix(std::path::PathBuf)
@@ -3759,6 +3764,7 @@ pub rsbinder::ClientOptions::driver: core::option::Option<std::path::PathBuf>
 pub rsbinder::ClientOptions::fd_mode: core::option::Option<rsbinder::rpc::fd_mode::FileDescriptorTransportMode>
 pub rsbinder::ClientOptions::handshake_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::ClientOptions::incoming_connections: core::option::Option<u32>
+pub rsbinder::ClientOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::ClientOptions::outgoing_connections: core::option::Option<u32>
 pub rsbinder::ClientOptions::session_id: core::option::Option<alloc::vec::Vec<u8>>
 pub rsbinder::ClientOptions::timeout: core::option::Option<core::time::Duration>
@@ -3938,12 +3944,15 @@ pub fn rsbinder::ProcessState::as_self() -> &'static rsbinder::ProcessState
 pub fn rsbinder::ProcessState::background_scheduling_disabled(&self) -> bool
 pub fn rsbinder::ProcessState::become_context_manager(&self, rsbinder::SIBinder) -> core::result::Result<(), alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::context_object(&self) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::ProcessState::default_mmap_size() -> usize
 pub fn rsbinder::ProcessState::disable_background_scheduling(&self, bool)
 pub fn rsbinder::ProcessState::driver(&self) -> alloc::sync::Arc<std::fs::File>
 pub fn rsbinder::ProcessState::init(&str, u32) -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::init_default() -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
+pub fn rsbinder::ProcessState::init_with_mmap_size(&str, u32, usize) -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::is_initialized() -> bool
 pub fn rsbinder::ProcessState::join_thread_pool() -> rsbinder::Result<()>
+pub fn rsbinder::ProcessState::mmap_size(&self) -> usize
 pub fn rsbinder::ProcessState::set_call_restriction(&self, rsbinder::CallRestriction)
 pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
@@ -4071,6 +4080,7 @@ pub rsbinder::ServeOptions::fd_modes: core::option::Option<alloc::vec::Vec<rsbin
 pub rsbinder::ServeOptions::handshake_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::ServeOptions::idle_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::ServeOptions::max_connections: core::option::Option<usize>
+pub rsbinder::ServeOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::ServeOptions::reply_timeout: core::option::Option<core::time::Duration>
 pub rsbinder::ServeOptions::threads: core::option::Option<u32>
 impl core::default::Default for rsbinder::ServeOptions
@@ -4355,6 +4365,7 @@ pub const rsbinder::INTERFACE_TRANSACTION: u32
 pub const rsbinder::LAST_CALL_TRANSACTION: u32
 pub const rsbinder::LEGACY_BINDER_PATH: &str
 pub const rsbinder::LIKE_TRANSACTION: u32
+pub const rsbinder::MAX_BINDER_MMAP_SIZE: usize
 pub const rsbinder::NON_NULL_PARCELABLE_FLAG: i32
 pub const rsbinder::NULL_PARCELABLE_FLAG: i32
 pub const rsbinder::PING_TRANSACTION: u32

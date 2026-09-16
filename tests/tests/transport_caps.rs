@@ -120,6 +120,7 @@ fn kernel_endpoint_has_every_capability() {
     let kernel = Endpoint::Kernel {
         driver: None,
         threads: None,
+        mmap_size: None,
     };
     assert_eq!(kernel.static_caps(), TransportCaps::KERNEL);
     for bit in [

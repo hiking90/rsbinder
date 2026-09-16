@@ -108,6 +108,17 @@ pub struct ClientOptions {
     /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
     /// rule on the server side.
     pub driver: Option<std::path::PathBuf>,
+    /// Kernel: `?mmap=` equivalent — the size of the mapping this
+    /// process receives into. A client is a receiver too: the reply to
+    /// every call it makes is allocated out of *its* mapping, so a
+    /// client expecting replies larger than the ~1 MB default raises it
+    /// here. Unlike [`ServeOptions::mmap_size`](super::ServeOptions::mmap_size),
+    /// this one takes effect — [`open`](Client::open) reads it before it
+    /// initializes `ProcessState`. A *different* size than the one
+    /// already in force is
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), as with
+    /// [`driver`](Self::driver).
+    pub mmap_size: Option<usize>,
 }
 
 /// A resolver for named services on one endpoint: the system service
@@ -157,6 +168,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("handshake_timeout", &self.handshake_timeout);
         d.field("timeout", &self.timeout)
             .field("driver", &self.driver)
+            .field("mmap_size", &self.mmap_size)
             .finish()
     }
 }
@@ -182,7 +194,11 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
         StatusCode::BadValue
     };
     match &uri.endpoint {
-        Endpoint::Kernel { driver, threads } => {
+        Endpoint::Kernel {
+            driver,
+            threads,
+            mmap_size,
+        } => {
             if o.session_id.is_some()
                 || o.outgoing_connections.is_some()
                 || o.incoming_connections.is_some()
@@ -201,7 +217,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
                 return Err(reject("tls/tls_server_name"));
             }
             let driver = o.driver.as_deref().or(driver.as_deref());
-            super::server::kernel_init(driver, *threads)?;
+            super::server::kernel_init(driver, *threads, o.mmap_size.or(*mmap_size))?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
                 endpoint: uri.endpoint.clone(),
@@ -218,8 +234,8 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
         }
         #[cfg(feature = "rpc")]
         _ => {
-            if o.driver.is_some() {
-                return Err(reject("driver"));
+            if o.driver.is_some() || o.mmap_size.is_some() {
+                return Err(reject("driver/mmap_size"));
             }
             if o.fd_mode == Some(crate::rpc::FileDescriptorTransportMode::Unix)
                 && !uri.endpoint.supports_fd_passing()

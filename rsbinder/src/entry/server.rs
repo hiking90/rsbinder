@@ -31,6 +31,20 @@ pub struct ServeOptions {
     /// [`spawn`](Server::spawn). A value equal to the pool in force is
     /// accepted (it asks for what is already true).
     pub threads: Option<u32>,
+    /// Kernel: the size of the mapping this process receives
+    /// transactions into — [`ProcessState::init_with_mmap_size`], where
+    /// the range and the driver's rules are documented. Raise it on a
+    /// service that must accept transactions larger than the ~1 MB
+    /// default.
+    ///
+    /// **The URI form (`binder://?mmap=`) is the only one that takes
+    /// effect**, for the same reason as [`threads`](Self::threads): the
+    /// mapping is made when [`serve`](super::serve) initializes
+    /// `ProcessState`, before this option is read. A value set here is
+    /// only compared against the mapping already in force, and a
+    /// *different* one (after page rounding) is [`StatusCode::BadValue`]
+    /// at [`run`](Server::run) / [`spawn`](Server::spawn).
+    pub mmap_size: Option<usize>,
     /// RPC: `RpcServer::set_max_connections`.
     pub max_connections: Option<usize>,
     /// RPC: `RpcServer::set_handshake_timeout`. `None` here means
@@ -156,8 +170,13 @@ impl Drop for ServerGuard {
 }
 
 pub(super) fn new_server(uri: Uri) -> Result<Server> {
-    if let Endpoint::Kernel { driver, threads } = &uri.endpoint {
-        kernel_init(driver.as_deref(), *threads)?;
+    if let Endpoint::Kernel {
+        driver,
+        threads,
+        mmap_size,
+    } = &uri.endpoint
+    {
+        kernel_init(driver.as_deref(), *threads, *mmap_size)?;
     }
     #[cfg(not(feature = "rpc"))]
     if !uri.endpoint.is_kernel() {
@@ -185,21 +204,31 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
 ///
 /// `max_threads` is `None` when the URI carried no `?threads=`, which is
 /// the only thing that means "the default" — `?threads=0` asks for a
-/// literal zero and gets it, as [`ProcessState::init`] documents.
+/// literal zero and gets it, as [`ProcessState::init`] documents. The
+/// same reading applies to `mmap_size`.
 pub(super) fn kernel_init(
     driver: Option<&std::path::Path>,
     max_threads: Option<u32>,
+    mmap_size: Option<usize>,
 ) -> Result<()> {
-    let ps = match driver {
-        Some(p) => ProcessState::init(
-            &p.to_string_lossy(),
-            max_threads.unwrap_or(crate::DEFAULT_MAX_BINDER_THREADS),
-        ),
-        None => match max_threads {
-            Some(n) => ProcessState::init(ProcessState::default_driver_path(), n),
-            None => ProcessState::init_default(),
-        },
-    }
+    // Round (and range-check) before init so an impossible size is
+    // `BadValue` — what every other rejected option here returns —
+    // rather than the `NoInit` an init failure maps to, and so the
+    // comparison below is against the size the kernel would map rather
+    // than the bytes the caller happened to type.
+    let mmap_size = mmap_size
+        .map(ProcessState::normalized_mmap_size)
+        .transpose()?;
+    let driver_path = driver.map(|p| p.to_string_lossy().into_owned());
+    let driver_path: &str = match &driver_path {
+        Some(p) => p,
+        None => ProcessState::default_driver_path(),
+    };
+    let ps = ProcessState::init_with_mmap_size(
+        driver_path,
+        max_threads.unwrap_or(crate::DEFAULT_MAX_BINDER_THREADS),
+        mmap_size.unwrap_or_else(ProcessState::default_mmap_size),
+    )
     .map_err(|e| {
         log::error!("rsbinder: ProcessState init failed: {e}");
         StatusCode::NoInit
@@ -211,13 +240,15 @@ pub(super) fn kernel_init(
     // construction, so the check costs nothing.
     let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
     let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
-    if driver_mismatch || threads_mismatch {
+    let mmap_mismatch = mmap_size.is_some_and(|n| n != ps.mmap_size());
+    if driver_mismatch || threads_mismatch || mmap_mismatch {
         log::error!(
-            "rsbinder: ProcessState is already initialized with driver={:?} max_threads={}; \
-             requested driver={driver:?} max_threads={max_threads:?} cannot be applied — \
-             initialize once, or omit the option",
+            "rsbinder: ProcessState is already initialized with driver={:?} max_threads={} \
+             mmap_size={}; requested driver={driver:?} max_threads={max_threads:?} \
+             mmap_size={mmap_size:?} cannot be applied — initialize once, or omit the option",
             ps.driver_name(),
-            ps.max_threads()
+            ps.max_threads(),
+            ps.mmap_size()
         );
         return Err(StatusCode::BadValue);
     }
@@ -338,11 +369,12 @@ impl Server {
         if o.tls.is_some() {
             return Err(self.reject("tls"));
         }
-        if o.threads.is_some() {
-            // `threads` after init cannot change the pool; treat like the
-            // URI form (`BadValue` on a mismatch) by re-running the
+        if o.threads.is_some() || o.mmap_size.is_some() {
+            // Neither can change anything after init — the pool size and
+            // the receive mapping are both fixed there. Treat them like
+            // the URI form (`BadValue` on a mismatch) by re-running the
             // idempotent init.
-            kernel_init(None, o.threads)?;
+            kernel_init(None, o.threads, o.mmap_size)?;
         }
         if let Some(cr) = o.call_restriction {
             ProcessState::as_self().set_call_restriction(cr);
@@ -358,9 +390,9 @@ impl Server {
             options: o,
             pending,
         } = self;
-        if o.call_restriction.is_some() {
+        if o.call_restriction.is_some() || o.mmap_size.is_some() {
             log::error!(
-                "rsbinder::serve: option `call_restriction` does not apply to {:?}",
+                "rsbinder::serve: option `call_restriction`/`mmap_size` does not apply to {:?}",
                 uri.endpoint
             );
             return Err(StatusCode::BadValue);

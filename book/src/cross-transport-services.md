@@ -33,7 +33,7 @@ hello.echo("hi")?;
 ## URIs
 
 ```text
-binder://[<service>][?driver=<path>&threads=<n>]
+binder://[<service>][?driver=<path>&threads=<n>&mmap=<bytes>]
 unix://<abs-path>[#<service>]               (three slashes: unix:///tmp/x.sock)
 unix-abstract://<name>[#<service>]          Linux/Android
 vsock://<cid>:<port>[#<service>]            feature rpc-vsock
@@ -44,6 +44,9 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
   `binder://#name`.
 - `?profile=android13plus[-vN]` on any RPC scheme selects the AOSP
   versioned wire (default `v2`); without it the session speaks the r34 wire.
+- `?mmap=<bytes>` (kernel only) sizes the mapping this process receives
+  transactions into — the real meaning of the "1 MB binder limit". See
+  [Receive mapping size](#receive-mapping-size).
 - `serve()` ignores the fragment, `connect()` requires it, and
   `Client::open()` rejects it.
 - An unknown scheme or query key, an empty `#`, or `binder://a#b` is
@@ -62,10 +65,12 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
 
 Kernel `serve("binder://")` initializes the process-wide `ProcessState`
 idempotently; a second kernel server in the same process reuses it, and is
-refused with `StatusCode::BadValue` if it asked for a different driver or
-thread count — the process cannot give it one. The refusal lands where the
-option is read: `serve()` itself for `?driver=` / `?threads=`, `run`/`spawn`
-for `ServeOptions::threads`, and `open` for `ClientOptions::driver`. RPC
+refused with `StatusCode::BadValue` if it asked for a different driver,
+thread count, or mapping size — the process cannot give it one. The refusal
+lands where the option is read: `serve()` itself for `?driver=` /
+`?threads=` / `?mmap=`, `run`/`spawn` for `ServeOptions::threads` and
+`ServeOptions::mmap_size`, and `open` for `ClientOptions::driver` and
+`ClientOptions::mmap_size`. RPC
 servers bind their listener at `run`/`spawn`, so options (TLS config, limits)
 set via `with` apply first.
 
@@ -114,12 +119,40 @@ let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |
 .get("hello")?;
 ```
 
-`ServeOptions`: `threads`, `max_connections`, `handshake_timeout`,
-`idle_timeout`, `reply_timeout`, `authorizer`, `tls`, `fd_modes`,
-`call_restriction`.
+`ServeOptions`: `threads`, `mmap_size`, `max_connections`,
+`handshake_timeout`, `idle_timeout`, `reply_timeout`, `authorizer`, `tls`,
+`fd_modes`, `call_restriction`.
 `ClientOptions`: `tls` / `tls_server_name`, `session_id`,
 `outgoing_connections`, `incoming_connections`, `fd_mode`, `timeout`,
-`handshake_timeout`, `driver`.
+`handshake_timeout`, `driver`, `mmap_size`.
+
+### Receive mapping size
+
+A binder transaction is copied into a buffer the driver allocates out of
+the **receiving** process's mapping, so that mapping — not the protocol —
+is what bounds a call. rsbinder maps the same ~1 MB AOSP `libbinder` does;
+raise it on a service that must accept larger calls:
+
+```rust
+rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceiling
+    .add("bulk", BnBulk::new_binder(MyService))?
+    .run()?;
+```
+
+- Bytes only (no `4M` shorthand), between two pages and
+  `MAX_BINDER_MMAP_SIZE` (4 MB, where the driver clamps silently — a
+  larger request is refused here rather than quietly shrunk), rounded up
+  to a page.
+- Set on the **receiver**. A caller needs nothing; a payload too large for
+  the destination comes back as `StatusCode::FailedTransaction`. A client
+  is a receiver of its own replies, which is what `ClientOptions::mmap_size`
+  is for.
+- Oneway transactions may use only half of it — the driver reserves the
+  rest so an async flood cannot starve synchronous calls.
+- Only address space is reserved; pages are faulted in as they are used.
+- Process-wide and fixed at the first `serve` / `Client::open`, like
+  `?driver=` and `?threads=`. `ProcessState::init_with_mmap_size` is the
+  direct form, and `ProcessState::mmap_size()` reports what is in force.
 
 `Client::open_with`'s closure also receives the parsed `Endpoint`, so an
 option that applies to only some transports is set from the endpoint rather

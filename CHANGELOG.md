@@ -15,6 +15,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Migrating
 
+- **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). The variant
+  is a struct variant without `#[non_exhaustive]`, so a struct literal that
+  builds one, or a `match` arm that names every field, is a compile error until
+  `mmap_size` is added (`mmap_size: None` reproduces the previous behavior).
+  Matching with `..`, and every other way of obtaining an `Endpoint` — `serve`,
+  `Client::open`, `Server::endpoint()` — are unaffected.
 - **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
   `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
   `ClientOptions::driver` are fixed process-wide by whoever initializes
@@ -146,6 +152,26 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **The receive mapping is now configurable** — `ProcessState::init_with_mmap_size`,
+  `binder://?mmap=<bytes>`, `ServeOptions::mmap_size` and
+  `ClientOptions::mmap_size`, with `MAX_BINDER_MMAP_SIZE`,
+  `ProcessState::default_mmap_size()` and `ProcessState::mmap_size()` alongside.
+  The "1 MB binder limit" is this mapping: the driver copies an incoming
+  transaction into a buffer allocated out of the **destination** process's
+  mapping, so raising it on a service is what lets that service accept larger
+  calls — from an AOSP `libbinder` peer as much as from rsbinder, since the wire
+  does not change and there is nothing to negotiate. A payload too large for the
+  destination still comes back to the sender as `FailedTransaction`.
+
+  Bytes only, between two pages and `MAX_BINDER_MMAP_SIZE` (4 MB); outside that
+  is `BadValue`, deliberately including *above*, because the driver clamps to
+  4 MB without telling anyone and a process that asked for 8 MB should not have
+  to discover it got half. The value is rounded up to a page (what `mmap(2)`
+  maps) and `ProcessState::mmap_size()` reports the rounded figure. Oneway
+  transactions may use only half of the mapping, the driver's rule, not a new
+  one. Process-wide and fixed by whoever initializes `ProcessState` first, so it
+  follows the `?driver=` / `?threads=` rule above: a later different value is
+  `BadValue`.
 - **`TransportCaps`** — what the transport under a binder can do, as five bits:
   `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`, `KERNEL_KNOBS`. Read it
   from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —

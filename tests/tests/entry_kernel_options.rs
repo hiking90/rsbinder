@@ -74,4 +74,60 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
         Some(StatusCode::BadValue),
         "a different driver must be refused on the client path too"
     );
+
+    // Plan 10-1 AC-1.3: the receive mapping joins the same rule. It is
+    // fixed by the same first `serve` above, which asked for the default.
+    let in_force = rsbinder::ProcessState::as_self().mmap_size();
+    assert_eq!(
+        in_force,
+        rsbinder::ProcessState::default_mmap_size(),
+        "the first serve carried no `?mmap=`, so the default is what it mapped"
+    );
+    rsbinder::serve(&format!("binder://?mmap={in_force}"))
+        .expect("the size already in force must be accepted");
+    assert_eq!(
+        rsbinder::serve(&format!(
+            "binder://?mmap={}",
+            rsbinder::MAX_BINDER_MMAP_SIZE
+        ))
+        .err(),
+        Some(StatusCode::BadValue),
+        "a different mapping size cannot be applied to a process that already mapped one"
+    );
+    // Out of range is the same answer, and it is reached before the
+    // comparison — a size the driver would never map is refused whether
+    // or not it happens to match what is in force.
+    assert_eq!(
+        rsbinder::serve("binder://?mmap=1").err(),
+        Some(StatusCode::BadValue),
+        "below the floor must be refused"
+    );
+    assert_eq!(
+        rsbinder::serve(&format!(
+            "binder://?mmap={}",
+            rsbinder::MAX_BINDER_MMAP_SIZE + 1
+        ))
+        .err(),
+        Some(StatusCode::BadValue),
+        "above the driver's silent 4 MB clamp must be refused, not clamped"
+    );
+    assert_eq!(
+        rsbinder::serve("binder://")
+            .expect("parse")
+            .with(|o| o.mmap_size = Some(rsbinder::MAX_BINDER_MMAP_SIZE))
+            .spawn()
+            .err(),
+        Some(StatusCode::BadValue),
+        "ServeOptions::mmap_size must follow the same rule as `?mmap=`"
+    );
+    assert_eq!(
+        rsbinder::Client::open_with("binder://", |o, _| {
+            o.mmap_size = Some(rsbinder::MAX_BINDER_MMAP_SIZE)
+        })
+        .err(),
+        Some(StatusCode::BadValue),
+        "and so must ClientOptions::mmap_size"
+    );
+    rsbinder::Client::open_with("binder://", |o, _| o.mmap_size = Some(in_force))
+        .expect("the size already in force must be accepted on the client path too");
 }

@@ -310,6 +310,13 @@ pub enum CallRestriction {
 pub const DEFAULT_MAX_BINDER_THREADS: u32 = 15;
 const DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION: u32 = 1;
 
+/// The largest receive mapping the binder driver honors: it clamps the
+/// mapped area to `SZ_4M` (`drivers/android/binder_alloc.c`) without
+/// telling the caller. [`ProcessState::init_with_mmap_size`] refuses
+/// anything larger rather than let a process believe it asked for 8 MB
+/// and got 4.
+pub const MAX_BINDER_MMAP_SIZE: usize = 4 * 1024 * 1024;
+
 struct MemoryMap {
     ptr: *mut c_void,
     size: usize,
@@ -442,18 +449,45 @@ impl ProcessState {
         }
     }
 
+    /// Check a requested receive-mapping size and return the size the
+    /// kernel will actually map.
+    ///
+    /// `mmap(2)` rounds a length up to a page boundary, so a request that
+    /// is not a whole number of pages buys more than it asked for. The
+    /// rounded value is what [`Self::mmap_size`] reports and what the
+    /// entry layer compares a later request against — carrying the raw
+    /// request instead would make the same size compare unequal to
+    /// itself.
+    pub(crate) fn normalized_mmap_size(mmap_size: usize) -> Result<usize> {
+        let page = rustix::param::page_size();
+        // Two pages is the floor because the driver hands out no buffer
+        // at all below it (and AOSP's own default is expressed as
+        // "1 MB minus two pages"). The ceiling is the driver's silent
+        // `SZ_4M` clamp.
+        if mmap_size < page * 2 || mmap_size > MAX_BINDER_MMAP_SIZE {
+            log::error!(
+                "binder mmap size {mmap_size} is outside [{}, {MAX_BINDER_MMAP_SIZE}]; \
+                 the driver clamps to 4 MB without saying so, which is why a larger \
+                 request is refused here rather than silently shrunk",
+                page * 2
+            );
+            return Err(StatusCode::BadValue);
+        }
+        Ok(mmap_size.next_multiple_of(page))
+    }
+
     fn inner_init(
         driver_name: &str,
         max_threads: u32,
+        mmap_size: usize,
     ) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
         Self::log_max_threads(max_threads);
+
+        let vm_size = Self::normalized_mmap_size(mmap_size)?;
 
         let driver_name = PathBuf::from(driver_name);
 
         let driver = open_driver(&driver_name, max_threads)?;
-
-        let vm_size = (1024 * 1024) - rustix::param::page_size() * 2;
-        // let vm_size = std::num::NonZeroUsize::new(vm_size).ok_or("vm_size is zero!")?;
 
         // SAFETY: `mmap` is unsafe because it creates a new mapping. `driver`
         // is a live, open binder device fd; `vm_size > 0`; addr is null so
@@ -521,6 +555,49 @@ impl ProcessState {
         driver_name: &str,
         max_threads: u32,
     ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
+        Self::init_with_mmap_size(driver_name, max_threads, Self::default_mmap_size())
+    }
+
+    /// [`init`](Self::init), plus the size of the buffer area this
+    /// process maps to **receive** transactions.
+    ///
+    /// The widely quoted "1 MB binder limit" is this mapping, not
+    /// anything in the protocol: the driver allocates an incoming
+    /// transaction's buffer out of the *destination* process's mapping,
+    /// so a transaction too large for it comes back to the sender as
+    /// [`StatusCode::FailedTransaction`]. Raising it here lets this
+    /// process accept larger calls from any peer, an AOSP `libbinder`
+    /// one included — the wire is unchanged, which is why there is
+    /// nothing to negotiate and nothing for the sender to set.
+    ///
+    /// Constraints, all of them the driver's:
+    ///
+    /// - The size must be between two pages and [`MAX_BINDER_MMAP_SIZE`];
+    ///   outside that, [`StatusCode::BadValue`]. The driver clamps to
+    ///   4 MB silently, so a larger request is refused here instead.
+    /// - It is rounded up to a page boundary, the granularity `mmap(2)`
+    ///   works in. [`mmap_size`](Self::mmap_size) reports the rounded
+    ///   value.
+    /// - **Oneway transactions may use only half of it.** The driver
+    ///   reserves the other half so an async flood cannot starve
+    ///   synchronous calls.
+    /// - Only the address range is reserved up front; pages are faulted
+    ///   in as transactions use them, so a 4 MB mapping does not cost
+    ///   4 MB of memory.
+    ///
+    /// Process-wide and set once, like every other `init` argument: the
+    /// first call wins and a later one with a different size returns the
+    /// existing state unchanged (the entry layer,
+    /// [`serve`](crate::serve) / [`Client`](crate::Client), reports that
+    /// mismatch as [`StatusCode::BadValue`] rather than passing it over).
+    /// Call it before [`start_thread_pool`](Self::start_thread_pool) —
+    /// once a pooled thread is serving, the mapping it serves out of is
+    /// already fixed.
+    pub fn init_with_mmap_size(
+        driver_name: &str,
+        max_threads: u32,
+        mmap_size: usize,
+    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
         let cell = Self::instance();
         if let Some(existing) = cell.get() {
             return Ok(existing);
@@ -529,8 +606,19 @@ impl ProcessState {
         // call can retry (this is why `get_or_try_init`, still unstable,
         // is avoided). If two threads race here, `get_or_init` keeps the
         // first stored instance and the extra one is dropped.
-        let instance = Self::inner_init(driver_name, max_threads)?;
+        let instance = Self::inner_init(driver_name, max_threads, mmap_size)?;
         Ok(cell.get_or_init(|| instance))
+    }
+
+    /// The receive-mapping size [`init`](Self::init) uses: 1 MB less two
+    /// pages, the same expression as AOSP's `BINDER_VM_SIZE`
+    /// (`ProcessState.cpp`). Page size is a runtime value, so this is a
+    /// function rather than a constant.
+    pub fn default_mmap_size() -> usize {
+        // Saturating because a page larger than 512 KB would underflow;
+        // the range check in `init_with_mmap_size` then refuses the 0
+        // rather than this panicking.
+        (1024usize * 1024).saturating_sub(rustix::param::page_size() * 2)
     }
 
     /// Initialize `ProcessState` on the default binder path with
@@ -1270,6 +1358,16 @@ impl ProcessState {
         self.max_threads
     }
 
+    /// The size of the receive mapping this process actually has, in
+    /// bytes — the value passed to
+    /// [`init_with_mmap_size`](Self::init_with_mmap_size) rounded up to a
+    /// page, or [`default_mmap_size`](Self::default_mmap_size) when the
+    /// process was initialized by [`init`](Self::init) /
+    /// [`init_default`](Self::init_default).
+    pub fn mmap_size(&self) -> usize {
+        self.mmap.read().unwrap_or_else(|e| e.into_inner()).size
+    }
+
     /// Start the binder thread pool: spawn one worker now and **enable
     /// kernel-driven spawning** for the rest of the process's life.
     ///
@@ -1482,6 +1580,49 @@ mod tests {
     #[test]
     fn the_default_thread_ceiling_matches_aosp() {
         assert_eq!(DEFAULT_MAX_BINDER_THREADS, 15);
+    }
+
+    /// Plan 10-1 AC-1.1. No device needed: the size is decided before
+    /// the driver is opened, so the range and the rounding are testable
+    /// on their own.
+    #[test]
+    fn a_receive_mapping_size_is_range_checked_then_page_rounded() {
+        let page = rustix::param::page_size();
+
+        // The AOSP-shaped default is what `init` asks for, and it is a
+        // whole number of pages already — rounding it must be identity,
+        // or every `init` would disagree with its own argument.
+        let default = ProcessState::default_mmap_size();
+        assert_eq!(default, (1024 * 1024) - page * 2);
+        assert_eq!(ProcessState::normalized_mmap_size(default), Ok(default));
+
+        // Below two pages and above the driver's silent 4 MB clamp are
+        // the two ends that must be refused rather than shrunk.
+        assert_eq!(
+            ProcessState::normalized_mmap_size(page * 2 - 1),
+            Err(StatusCode::BadValue)
+        );
+        assert_eq!(ProcessState::normalized_mmap_size(page * 2), Ok(page * 2));
+        assert_eq!(
+            ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE),
+            Ok(MAX_BINDER_MMAP_SIZE)
+        );
+        assert_eq!(
+            ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE + 1),
+            Err(StatusCode::BadValue)
+        );
+
+        // A request that is not a whole number of pages gets the next
+        // page up — what `mmap(2)` maps — and rounding never crosses the
+        // ceiling, since the ceiling is itself a page multiple.
+        assert_eq!(
+            ProcessState::normalized_mmap_size(page * 2 + 1),
+            Ok(page * 3)
+        );
+        assert_eq!(
+            ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE - 1),
+            Ok(MAX_BINDER_MMAP_SIZE)
+        );
     }
 
     fn assert_process_state_initialized() {

@@ -406,7 +406,9 @@ pub use parcelable::{
 };
 
 pub use parcelable_holder::ParcelableHolder;
-pub use process_state::{CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS};
+pub use process_state::{
+    CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS, MAX_BINDER_MMAP_SIZE,
+};
 
 // From `proxy` — client-side handle types.
 pub use proxy::{Proxy, ProxyHandle};
