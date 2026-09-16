@@ -17,13 +17,20 @@
 //!
 //! What each test pins:
 //!
-//!   * the **notification** path, by measuring how long after registration the
-//!     future completes — the per-second re-poll would show up as a wake
-//!     hundreds of milliseconds late;
+//!   * the **event path**, end to end: a callback registered with the service
+//!     manager receives `onRegistration`, and a wait started before the name
+//!     existed resolves to a working handle;
 //!   * the **re-poll** path, in a child process with no thread pool, where
 //!     `onRegistration` has no looper to arrive on;
 //!   * **cancellation**, by giving a runtime exactly one blocking thread: the
-//!     wait occupies it, and dropping the future has to give it back.
+//!     wait occupies it, and dropping the future has to give it back;
+//!   * that a dropped wait leaves **no callback registered**, using the
+//!     per-name callback cap as the instrument;
+//!   * that both async lookups are `Send + 'static` (compile-time).
+//!
+//! None of them asserts a wall-clock duration. Which of the two mechanisms
+//! answered a given wait is not observable from here, and timing it is not a
+//! substitute — see plan 11-1 §8.5.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 #![allow(non_snake_case)]
@@ -57,94 +64,117 @@ impl IAsyncRt for Svc {
 /// The notification arrives within milliseconds; a wait that only re-polled
 /// would answer at its next second boundary, so the delay between
 /// `add_service` returning and the future completing separates the two
-/// mechanisms. The per-round bound is what makes this a measurement rather
-/// than a coin flip: a re-poll lands uniformly in the following second, so
-/// ten rounds under 100ms each is not something the polling path produces.
+/// AC-11-1.1(a) — registration notifications reach this process, and a wait
+/// started before the service existed resolves to a working handle.
 ///
-/// Mutant: deleting the `register_for_notifications` call (so every wait falls
-/// back to `poll_for_service`) pushes the delay to ~700ms and fails here.
+/// Two claims, neither of them timed:
+///
+///   1. the event path is wired end to end — a callback this test registers
+///      with the service manager receives `onRegistration` once the name is
+///      added, which is the same wire the wait's internal waiter sits on;
+///   2. a wait that missed on its fast path resolves after the registration
+///      and yields a handle that answers a call.
+///
+/// What it deliberately does **not** claim is that the wait's own answer came
+/// from the notification rather than from its per-second re-poll. That
+/// distinction was asserted by comparing wall-clock stamps, and the clock is
+/// not a usable discriminator: on an emulator the same code completes one
+/// round in 1.5ms and another in 2.3s, because thread wake-ups there are late
+/// by tens to hundreds of milliseconds (a plain 200ms sleep measures
+/// 225-375ms). Asserting it properly needs the wait to report which branch
+/// answered, which is a counter behind `test-util` that the library does not
+/// have yet; see plan 11-1 §8.5.
+///
+/// Mutant: a `register_for_notifications` that does not reach the service
+/// manager, or a service manager that stops fanning out `onRegistration`,
+/// leaves the callback below unfired. A broken wait leaves claim 2 unmet.
 #[test]
 #[ignore = "needs a kernel binder device and a running service manager"]
-fn the_wait_wakes_on_the_registration_notification() {
+fn registration_notifies_this_client_and_the_wait_resolves() {
+    use rsbinder::hub::android_16::android::os::IServiceCallback::{
+        BnServiceCallback, IServiceCallback,
+    };
+
+    /// Reports the name it was told about, on the binder thread it arrives on.
+    struct Watcher(std::sync::mpsc::SyncSender<String>);
+    impl Interface for Watcher {}
+    impl IServiceCallback for Watcher {
+        fn onRegistration(&self, name: &str, _binder: &SIBinder) -> rsbinder::BinderResult<()> {
+            let _ = self.0.try_send(name.to_owned());
+            Ok(())
+        }
+    }
+
     ProcessState::init_default().expect("ProcessState::init_default");
     ProcessState::start_thread_pool();
 
-    // Registered services stay alive for the whole test: the service manager
-    // holds a reference, and dropping the local object underneath it would
-    // only add a way for a later round to fail.
-    let mut registered = Vec::new();
+    let sm = hub::default().expect("service manager");
+    let name = service_name("notify");
 
-    for round in 0..10 {
-        let name = service_name(&format!("notify{round}"));
-        let service = BnAsyncRt::new_binder(Svc);
-        registered.push(service.clone());
+    // Registered before the name exists, so the callback can only fire off the
+    // registration below.
+    let (tx_fired, rx_fired) = std::sync::mpsc::sync_channel::<String>(1);
+    let watcher = BnServiceCallback::new_binder(Watcher(tx_fired));
+    sm.register_for_notifications(&name, &watcher)
+        .expect("register_for_notifications");
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Instant>(1);
-        let reg_name = name.clone();
-        let registrar = std::thread::spawn(move || {
-            // Long enough that the wait is past its fast path and blocked on
-            // the condvar, short enough to stay under the 1s re-poll tick.
-            std::thread::sleep(Duration::from_millis(300));
-            let added = hub::add_service(&reg_name, &service);
-            if added.is_ok() {
-                let _ = tx.try_send(Instant::now());
-            }
-            added
-        });
+    // The service stays alive for the whole test: the service manager holds a
+    // reference, and dropping the local object underneath it would only add a
+    // way for the assertions below to fail.
+    let service = BnAsyncRt::new_binder(Svc);
 
-        // One runtime per round, so the shutdown below is reached before this
-        // round's assertions can panic.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime");
+    // Registered after the wait has started. There is no window to hit any
+    // more — nothing here depends on whether the wait had reached its blocking
+    // point first — so this only has to happen while the wait is outstanding.
+    let (tx_added, rx_added) = std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
+    let reg_name = name.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let added = hub::add_service(&reg_name, &service).map_err(|e| format!("{e:?}"));
+        let _ = tx_added.try_send(added);
+        // The thread ends here; the result travels by channel rather than by
+        // `join`, so a service manager that never answers cannot wedge the
+        // test binary on an unbounded join.
+    });
 
-        // The wait is unbounded, so a registration that never happens (an
-        // `add_service` the service manager denies, say) would park this
-        // `block_on` forever and wedge the whole test binary instead of
-        // failing. The bound is two orders of magnitude above the 100ms the
-        // measurement below asserts, so it never decides that question.
-        let waited = rt.block_on(async {
-            let res = tokio::time::timeout(
-                Duration::from_secs(10),
-                wait_for_interface_async::<dyn IAsyncRt>(&name),
-            )
-            .await;
-            (res, Instant::now())
-        });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
 
-        // Same reason as the two tests below: `Runtime::drop` waits for
-        // blocking tasks, so a wait that ignored its cancellation would hold
-        // the test binary open — here through the unwind of any assertion
-        // below, which is why the shutdown comes first and is bounded.
-        rt.shutdown_timeout(Duration::from_secs(2));
+    // Bounded only so a registration that never lands fails instead of parking
+    // this `block_on` forever. It is not a measurement.
+    let waited = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            wait_for_interface_async::<dyn IAsyncRt>(&name),
+        )
+        .await
+    });
 
-        // Joined before the wait's own result is unwrapped, so a failed
-        // registration is reported as itself rather than as the timeout it
-        // causes.
-        registrar
-            .join()
-            .expect("registrar thread")
-            .expect("add_service");
+    // `Runtime::drop` waits for blocking tasks, so a wait that ignored its
+    // cancellation would hold the test binary open through the unwind of any
+    // assertion below. Shut down first, bounded.
+    rt.shutdown_timeout(Duration::from_secs(2));
 
-        let (waited, found_at) = waited;
-        let svc = waited
-            .expect("the wait never resolved, though the registration succeeded")
-            .expect("wait_for_interface_async");
-        // The lookup really did produce a working handle.
-        assert_eq!(svc.r#echo("hi").expect("echo"), "echo:hi");
+    // The registration is checked first, so a denied `add_service` is reported
+    // as itself rather than as the wait timeout it causes.
+    rx_added
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the registrar never reported back")
+        .expect("add_service");
 
-        let registered_at = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("registration timestamp");
-        let delay = found_at.saturating_duration_since(registered_at);
-        assert!(
-            delay < Duration::from_millis(100),
-            "round {round}: the wait completed {delay:?} after registration — \
-             that is the re-poll tick, not the notification"
-        );
-    }
+    let svc = waited
+        .expect("the wait never resolved, though the registration succeeded")
+        .expect("wait_for_interface_async");
+    assert_eq!(svc.r#echo("hi").expect("echo"), "echo:hi");
+
+    // Claim 1. Generous: what is being pinned is that it arrives at all.
+    let fired = rx_fired
+        .recv_timeout(Duration::from_secs(10))
+        .expect("onRegistration never reached this process");
+    assert_eq!(fired, name, "the notification named a different service");
 }
 
 /// AC-11-1.1(c) — a client with no binder thread pool still finds the service.
