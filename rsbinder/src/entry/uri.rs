@@ -58,6 +58,56 @@ impl Endpoint {
     pub fn supports_fd_passing(&self) -> bool {
         matches!(self, Endpoint::Unix(_) | Endpoint::UnixAbstract(_))
     }
+
+    /// What this transport can offer **at all**, before anything is
+    /// negotiated or opened.
+    ///
+    /// This is what the transport *family* offers, not what a given
+    /// session has, and it is not a bound in one direction: the two bits
+    /// that differ in practice differ with opposite polarity.
+    ///
+    /// - [`FD_PASSING`](crate::TransportCaps::FD_PASSING) is an **upper**
+    ///   bound. It is set here for a Unix socket, but a session over one
+    ///   carries fds only after it negotiates
+    // The target only exists with `rpc`, so only link it then.
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "   [`FileDescriptorTransportMode::Unix`](crate::rpc::FileDescriptorTransportMode) —"
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "   `FileDescriptorTransportMode::Unix` (`rpc` feature) —"
+    )]
+    ///   the default is `None`, which carries none.
+    /// - [`CALLBACKS`](crate::TransportCaps::CALLBACKS) is a **lower**
+    ///   bound. It is never set here for an RPC endpoint, because it
+    ///   depends on the client having opened incoming connections — a
+    ///   session opened with
+    ///   [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections)
+    ///   `> 0` reports it on both ends although this does not.
+    ///
+    /// So neither direction makes this a substitute for the session
+    /// value: use [`Client::caps`](super::Client::caps) or
+    // The target only exists with `rpc`, so only link it then.
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "[`RpcSession::caps`](crate::rpc::RpcSession::caps) for what a live"
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "`RpcSession::caps` (`rpc` feature) for what a live"
+    )]
+    /// connection actually has.
+    pub fn static_caps(&self) -> crate::TransportCaps {
+        use crate::TransportCaps as C;
+        match self {
+            Endpoint::Kernel { .. } => C::KERNEL,
+            Endpoint::Unix(_) | Endpoint::UnixAbstract(_) => {
+                C::FD_PASSING | C::TRUSTED_UID | C::SAME_HOST
+            }
+            Endpoint::Vsock(..) | Endpoint::Tls(..) => C::NONE,
+        }
+    }
 }
 
 /// A parsed endpoint URI.

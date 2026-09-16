@@ -26,7 +26,10 @@ pub struct ServeOptions {
     /// process-wide `ProcessState` — where the kernel pool size is
     /// fixed, once, for the life of the process — before this option
     /// can be read, so a value set here is only compared against the
-    /// pool already in force and, on a mismatch, logged as ignored.
+    /// pool already in force, and a *different* one is
+    /// [`StatusCode::BadValue`] at [`run`](Server::run) /
+    /// [`spawn`](Server::spawn). A value equal to the pool in force is
+    /// accepted (it asks for what is already true).
     pub threads: Option<u32>,
     /// RPC: `RpcServer::set_max_connections`.
     pub max_connections: Option<usize>,
@@ -79,9 +82,10 @@ pub struct ServeOptions {
 ///
 /// Kernel (`binder://`): construction initializes the process-wide
 /// [`ProcessState`] (idempotently — a second kernel server in the same
-/// process reuses it and logs a warning if it asked for a different
-/// driver/thread count). RPC: the listener is bound at `run`/`spawn`
-/// so [`ServeOptions`] (TLS config, limits) can be applied first.
+/// process reuses it, and is refused with [`StatusCode::BadValue`] if it
+/// asked for a different driver or thread count, which the process
+/// cannot give it). RPC: the listener is bound at `run`/`spawn` so
+/// [`ServeOptions`] (TLS config, limits) can be applied first.
 pub struct Server {
     uri: Uri,
     options: ServeOptions,
@@ -171,8 +175,13 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
 }
 
 /// Initialize the process-global kernel `ProcessState` (idempotent).
-/// Loud on a lost config: a *different* driver / `max_threads` than the
-/// one already in force is warned about, never silently dropped.
+///
+/// The process-wide state is fixed by whoever initializes it first, so a
+/// later caller naming a *different* driver or `max_threads` cannot have
+/// what it asked for. That is [`StatusCode::BadValue`], the same answer
+/// every other inapplicable option gets from this layer — an option this
+/// facade cannot honor is refused, never silently dropped. Omitting the
+/// option (`None`) asks for nothing and always succeeds.
 ///
 /// `max_threads` is `None` when the URI carried no `?threads=`, which is
 /// the only thing that means "the default" — `?threads=0` asks for a
@@ -181,7 +190,6 @@ pub(super) fn kernel_init(
     driver: Option<&std::path::Path>,
     max_threads: Option<u32>,
 ) -> Result<()> {
-    let pre = ProcessState::is_initialized();
     let ps = match driver {
         Some(p) => ProcessState::init(
             &p.to_string_lossy(),
@@ -196,17 +204,22 @@ pub(super) fn kernel_init(
         log::error!("rsbinder: ProcessState init failed: {e}");
         StatusCode::NoInit
     })?;
-    if pre {
-        let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
-        let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
-        if driver_mismatch || threads_mismatch {
-            log::warn!(
-                "rsbinder: ProcessState already initialized; requested driver={driver:?} \
-                 max_threads={max_threads:?} ignored, using existing driver={:?} max_threads={}",
-                ps.driver_name(),
-                ps.max_threads()
-            );
-        }
+    // Compare against the state `init` returned, not against a
+    // `is_initialized()` sample taken before it: two threads racing the
+    // first init both read `false` there, and the loser would drop its
+    // own options silently. When this call won, the values match by
+    // construction, so the check costs nothing.
+    let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
+    let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
+    if driver_mismatch || threads_mismatch {
+        log::error!(
+            "rsbinder: ProcessState is already initialized with driver={:?} max_threads={}; \
+             requested driver={driver:?} max_threads={max_threads:?} cannot be applied — \
+             initialize once, or omit the option",
+            ps.driver_name(),
+            ps.max_threads()
+        );
+        return Err(StatusCode::BadValue);
     }
     Ok(())
 }
@@ -327,7 +340,8 @@ impl Server {
         }
         if o.threads.is_some() {
             // `threads` after init cannot change the pool; treat like the
-            // URI form (warn on mismatch) by re-running the idempotent init.
+            // URI form (`BadValue` on a mismatch) by re-running the
+            // idempotent init.
             kernel_init(None, o.threads)?;
         }
         if let Some(cr) = o.call_restriction {

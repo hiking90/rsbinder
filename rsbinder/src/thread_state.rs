@@ -46,7 +46,10 @@
 //! `rpc::session::DRIVING` (the nested-call recursion marker) and
 //! `RPC_CALLING` (below) both live across user callbacks — `rpc_transact`,
 //! `binder_died` — and every access copies its value out inside `with`,
-//! holding no guard across the callout.
+//! holding no guard across the callout. `RPC_CALLING_CAPS` (below) lives
+//! across the same callbacks but is outside R1 entirely: it is a `Cell`, so
+//! `get`/`set` copy a `Copy` value out with no borrow guard to hold in the
+//! first place.
 //!
 //! ## Patterns to satisfy R1
 //!
@@ -146,6 +149,16 @@ fn ensure_thread_exit_guard(driver: &Arc<File>) {
 thread_local! {
     static RPC_CALLING: std::cell::RefCell<Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>> =
         const { std::cell::RefCell::new(None) };
+    /// The dispatching session's [`TransportCaps`](crate::TransportCaps),
+    /// snapshotted alongside [`RPC_CALLING`] by the same guard.
+    ///
+    /// A separate cell rather than a field beside the peer, for two
+    /// reasons: `Caller::Rpc(PeerIdentity)` is a public tuple variant and
+    /// widening it would break every `match` on it, and caps are a `Copy`
+    /// `u32` that a `Cell` hands back without a borrow — so reading them
+    /// cannot hold anything across a user callback (module doc R1).
+    static RPC_CALLING_CAPS: std::cell::Cell<Option<crate::TransportCaps>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Fail-closed calling uid for RPC transports that carry **no** uid
@@ -157,21 +170,62 @@ thread_local! {
 #[cfg(feature = "rpc")]
 pub(crate) const RPC_UNKNOWN_CALLING_UID: binder::uid_t = binder::uid_t::MAX;
 
-/// Stamp the RPC caller's [`PeerIdentity`](crate::rpc::PeerIdentity) into
-/// [`RPC_CALLING`] for the duration of one `on_transact`, restoring the
-/// previous value on drop (so nested re-entrant callbacks over the same
-/// connection nest correctly). Installed by the RPC dispatch path
-/// (`rpc::session::execute_dispatched`) around `rpc_transact`.
+/// Owns this thread's RPC calling context — the caller's
+/// [`PeerIdentity`](crate::rpc::PeerIdentity) in [`RPC_CALLING`] and the
+/// dispatching session's caps in [`RPC_CALLING_CAPS`] — for the duration of
+/// one dispatch, restoring **both** cells to their previous values on drop
+/// (so nested dispatches nest correctly, unwind included).
+///
+/// It is constructed on both dispatch paths, one per direction of nesting.
+/// [`install`](Self::install) stamps the two cells and is used by the RPC
+/// dispatch path (`rpc::session::execute_dispatched`) around `rpc_transact`.
+/// [`suspend`](Self::suspend) clears them and is used by the kernel dispatch
+/// path (`execute_command`'s `BR_TRANSACTION` arm), where a re-entrant kernel
+/// transaction is the inner dispatch and must not be answered for with the
+/// RPC peer still on the stack.
 #[cfg(feature = "rpc")]
 pub(crate) struct RpcCallingGuard {
     previous: Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>,
+    previous_caps: Option<crate::TransportCaps>,
 }
 
 #[cfg(feature = "rpc")]
 impl RpcCallingGuard {
-    pub(crate) fn install(peer: std::sync::Arc<crate::rpc::transport::PeerIdentity>) -> Self {
+    /// Install the peer and the dispatching session's caps for one
+    /// handler. `caps` is a snapshot taken when the transaction was
+    /// dispatched — the session can gain or lose a connection while the
+    /// handler runs, and the handler still sees what the call arrived
+    /// over.
+    pub(crate) fn install(
+        peer: std::sync::Arc<crate::rpc::transport::PeerIdentity>,
+        caps: crate::TransportCaps,
+    ) -> Self {
         let previous = RPC_CALLING.with(|c| c.borrow_mut().replace(peer));
-        RpcCallingGuard { previous }
+        let previous_caps = RPC_CALLING_CAPS.with(|c| c.replace(Some(caps)));
+        RpcCallingGuard {
+            previous,
+            previous_caps,
+        }
+    }
+
+    /// Clear the RPC calling context for the duration of a **kernel**
+    /// transaction dispatched on this thread, restoring it on drop.
+    ///
+    /// Binder's nested IPC delivers a re-entrant `BR_TRANSACTION` to the
+    /// very thread parked in `wait_for_response`, so an RPC handler that
+    /// makes an outgoing kernel call can have a kernel transaction
+    /// dispatched inside it. That kernel transaction is the inner
+    /// dispatch and its caller is a kernel caller: leaving the RPC cells
+    /// installed would make every calling-identity accessor answer for
+    /// the suspended RPC peer instead (`calling_caps` would report the
+    /// RPC session's caps for a caller that has all of them).
+    pub(crate) fn suspend() -> Self {
+        let previous = RPC_CALLING.with(|c| c.borrow_mut().take());
+        let previous_caps = RPC_CALLING_CAPS.with(|c| c.take());
+        RpcCallingGuard {
+            previous,
+            previous_caps,
+        }
     }
 }
 
@@ -179,6 +233,7 @@ impl RpcCallingGuard {
 impl Drop for RpcCallingGuard {
     fn drop(&mut self) {
         RPC_CALLING.with(|c| *c.borrow_mut() = self.previous.take());
+        RPC_CALLING_CAPS.with(|c| c.set(self.previous_caps.take()));
     }
 }
 
@@ -223,6 +278,11 @@ fn rpc_calling() -> Option<(binder::uid_t, binder::pid_t)> {
 ///   boundary: a Unix `PeerIdentity::Local` uid ACL, a TLS
 ///   `Certificate` subject/fingerprint allowlist, etc.
 ///   `@EnforcePermission` is **denied** over RPC (Plan 2-16 Phase A).
+///
+/// What the transport can *do* is not part of this value: capabilities
+/// belong to the dispatch (for RPC, to the session it arrived on), not to
+/// the caller identity, and a `Caller` is `Clone` and outlives its
+/// handler. Ask [`calling_caps`] inside the handler instead.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Caller {
@@ -282,6 +342,52 @@ pub fn calling_caller() -> Option<Caller> {
                 sid,
             }
         })
+    })
+}
+
+/// What the in-flight transaction arrived over, as a
+/// [`TransportCaps`](crate::TransportCaps) set, or `None` when this
+/// thread is not dispatching one.
+///
+/// This is the server-side counterpart of
+/// [`Client::caps`](crate::Client::caps): a handler that wants to call
+/// back into its caller — hand it a pipe, park a callback binder, start
+/// a stream — can ask here whether that is possible before promising it.
+///
+/// Kernel binder is always the full set. An RPC caller's value is the
+/// snapshot taken when the transaction was dispatched, so it does not
+/// change under a running handler even if the session gains or loses a
+/// connection meanwhile.
+///
+/// The **innermost** dispatch answers. Binder's nested IPC can deliver a
+/// re-entrant kernel transaction to a thread that is running an RPC
+/// handler (the handler made an outgoing kernel call); inside that kernel
+/// handler this reports the full kernel set, not the suspended RPC
+/// session's caps, and the RPC value comes back when it returns.
+///
+/// Pure-RPC safe: the RPC arm never touches the kernel thread-local or
+/// [`ProcessState`].
+pub fn calling_caps() -> Option<crate::TransportCaps> {
+    // Same precedence as `calling_caller`: an RPC dispatch answers
+    // without forcing the ProcessState-coupled kernel thread-local. A
+    // kernel transaction dispatched inside an RPC handler clears the cell
+    // for its duration (`RpcCallingGuard::suspend`), so this precedence
+    // resolves to the innermost dispatch rather than to the RPC one.
+    #[cfg(feature = "rpc")]
+    {
+        if let Some(caps) = RPC_CALLING_CAPS.with(|c| c.get()) {
+            return Some(caps);
+        }
+    }
+    if !ProcessState::is_initialized() {
+        return None;
+    }
+    THREAD_STATE.with(|thread_state| {
+        let thread_state = thread_state.borrow();
+        thread_state
+            .transaction
+            .as_ref()
+            .map(|_| crate::TransportCaps::KERNEL)
     })
 }
 
@@ -1140,6 +1246,14 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                     transaction_old
                 };
+
+                // This thread may already be inside an RPC handler that made
+                // an outgoing kernel call (nested IPC re-enters here). The
+                // kernel transaction just installed is the inner dispatch, so
+                // the RPC calling context is suspended for its duration —
+                // restored on drop, including on unwind.
+                #[cfg(feature = "rpc")]
+                let _rpc_suspended = RpcCallingGuard::suspend();
 
                 let mut reply = Parcel::new();
 
@@ -2562,9 +2676,16 @@ mod tests {
         assert!(!is_handling_transaction());
         assert!(get_calling_sid().is_none());
         assert!(calling_caller().is_none());
+        assert!(calling_caps().is_none());
 
+        let unix_caps = crate::TransportCaps::FD_PASSING
+            | crate::TransportCaps::TRUSTED_UID
+            | crate::TransportCaps::SAME_HOST;
         {
-            let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1234, pid: 42 }));
+            let _g = RpcCallingGuard::install(
+                Arc::new(PeerIdentity::Local { uid: 1234, pid: 42 }),
+                unix_caps,
+            );
             assert_eq!(get_calling_uid(), 1234);
             assert_eq!(get_calling_pid(), 42);
             assert!(is_handling_transaction());
@@ -2579,12 +2700,25 @@ mod tests {
                 }
                 other => panic!("expected Caller::Rpc(Local), got {other:?}"),
             }
+            // The caps of the dispatching session.
+            assert_eq!(calling_caps(), Some(unix_caps));
+            // No callback connection on this session, so a feature that
+            // needs one is refused here rather than on the wire.
+            assert_eq!(
+                calling_caps()
+                    .unwrap()
+                    .require(crate::TransportCaps::CALLBACKS, "a callback"),
+                Err(crate::StatusCode::InvalidOperation)
+            );
 
             // Nested re-entrant callback over the same connection: a
             // non-uid transport (vsock) stamps the fail-closed sentinel;
             // the outer identity is restored when it returns.
             {
-                let _g2 = RpcCallingGuard::install(Arc::new(PeerIdentity::Vsock { cid: 7 }));
+                let _g2 = RpcCallingGuard::install(
+                    Arc::new(PeerIdentity::Vsock { cid: 7 }),
+                    crate::TransportCaps::NONE,
+                );
                 assert_eq!(get_calling_uid(), RPC_UNKNOWN_CALLING_UID);
                 assert_ne!(get_calling_uid(), 0, "sentinel must never read as root");
                 assert_eq!(get_calling_pid(), -1);
@@ -2593,11 +2727,17 @@ mod tests {
                     calling_caller(),
                     Some(Caller::Rpc(PeerIdentity::Vsock { cid: 7 }))
                 ));
+                assert_eq!(calling_caps(), Some(crate::TransportCaps::NONE));
             }
             assert_eq!(
                 get_calling_uid(),
                 1234,
                 "outer identity restored after nesting"
+            );
+            assert_eq!(
+                calling_caps(),
+                Some(unix_caps),
+                "outer caps restored after nesting"
             );
         }
 
@@ -2605,6 +2745,7 @@ mod tests {
         assert_eq!(get_calling_uid(), 0);
         assert!(!is_handling_transaction());
         assert!(calling_caller().is_none());
+        assert!(calling_caps().is_none());
     }
 
     #[test]
@@ -3286,6 +3427,167 @@ mod tests {
         let sid2 = get_calling_sid().expect("second call also returns Some");
         assert_eq!(sid, sid2);
         assert!(!std::ptr::eq(sid.as_ptr(), sid2.as_ptr()));
+    }
+
+    /// Native binder that records what the calling-identity accessors
+    /// answer *inside* the dispatch, so the test can read them back after
+    /// `execute_command` has returned and dropped its guards.
+    #[cfg(all(target_os = "linux", feature = "rpc"))]
+    #[derive(Default)]
+    struct RecordingNative {
+        observed: std::sync::Mutex<Option<(Option<crate::TransportCaps>, Option<Caller>)>>,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rpc"))]
+    impl Transactable for RecordingNative {
+        fn transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+            *self.observed.lock().unwrap() = Some((calling_caps(), calling_caller()));
+            Ok(())
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rpc"))]
+    impl IBinder for RecordingNative {
+        fn link_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn unlink_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn ping_binder(&self) -> Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn Transactable> {
+            Some(self)
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.RecordingNative"
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn attempt_inc_strong(&self) -> bool {
+            true
+        }
+        fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
+            Ok(())
+        }
+        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn dec_weak(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A kernel transaction dispatched inside an RPC handler (nested IPC
+    /// re-enters the thread parked in `wait_for_response`) answers for
+    /// the kernel caller, not for the RPC peer whose handler is still on
+    /// the stack.
+    ///
+    /// The `BR_TRANSACTION` is fed to `execute_command` directly rather
+    /// than faked around it, so what is pinned is that the kernel dispatch
+    /// path itself suspends the RPC calling context — deleting
+    /// `RpcCallingGuard::suspend()` from that path fails this test. The
+    /// forged transaction is `TF_ONE_WAY` (no `BC_REPLY`, so no driver
+    /// round trip) and carries an empty buffer; `free_buffer` would queue a
+    /// `BC_FREE_BUFFER` for a pointer the driver does not own, so the
+    /// thread is marked a looper for the call (suppressing the flush) and
+    /// those bytes are discarded afterwards.
+    ///
+    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "rpc"))]
+    #[serial_test::serial(binder)]
+    fn nested_kernel_transaction_answers_for_the_kernel_caller() {
+        use crate::rpc::transport::PeerIdentity;
+        use std::sync::Arc;
+
+        ProcessState::init_default().expect("init_default");
+        let _ = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take());
+
+        let recorder = Arc::new(RecordingNative::default());
+        let id = ProcessState::as_self().publish_native(recorder.clone());
+
+        let unix_caps = crate::TransportCaps::FD_PASSING
+            | crate::TransportCaps::TRUSTED_UID
+            | crate::TransportCaps::SAME_HOST;
+        // This thread is running an RPC handler that made an outgoing
+        // kernel call; the kernel transaction below is delivered into it.
+        let _rpc = RpcCallingGuard::install(
+            Arc::new(PeerIdentity::Local { uid: 1234, pid: 42 }),
+            unix_caps,
+        );
+        assert_eq!(calling_caps(), Some(unix_caps));
+
+        let mut buffer = [0u8; 8];
+        let mut offsets = [0 as binder_size_t; 1];
+        let tr = binder_transaction_data {
+            target: binder_transaction_data__bindgen_ty_1 { ptr: id },
+            cookie: 0,
+            code: 1,
+            flags: binder::transaction_flags_TF_ONE_WAY,
+            sender_pid: 9999,
+            sender_euid: 1000,
+            data_size: 0,
+            offsets_size: 0,
+            data: binder_transaction_data__bindgen_ty_2 {
+                ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
+                    buffer: buffer.as_mut_ptr() as _,
+                    offsets: offsets.as_mut_ptr() as _,
+                },
+            },
+        };
+
+        let (was_looper, mark) = THREAD_STATE.with(|ts| {
+            let mut ts = ts.borrow_mut();
+            let was_looper = ts.is_looper;
+            ts.is_looper = true;
+            let mark = ts.unflushed_mark();
+            ts.in_parcel.set_data_size(0).expect("reset in_parcel");
+            ts.in_parcel.set_data_position(0);
+            ts.in_parcel
+                .write_transaction(&tr)
+                .expect("forge BR_TRANSACTION payload");
+            ts.in_parcel.set_data_position(0);
+            (was_looper, mark)
+        });
+
+        let dispatched = execute_command(binder::BR_TRANSACTION as i32);
+
+        THREAD_STATE.with(|ts| {
+            discard_unflushed_commands(ts, mark, false);
+            let mut ts = ts.borrow_mut();
+            ts.is_looper = was_looper;
+            let _ = ts.in_parcel.set_data_size(0);
+        });
+        dispatched.expect("execute_command");
+
+        let (caps, caller) = recorder
+            .observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handler ran");
+        assert_eq!(caps, Some(crate::TransportCaps::KERNEL));
+        assert!(matches!(
+            caller,
+            Some(Caller::Kernel {
+                uid: 1000,
+                pid: 9999,
+                ..
+            })
+        ));
+
+        // The RPC handler resumes where it left off.
+        assert_eq!(calling_caps(), Some(unix_caps));
+        assert_eq!(get_calling_uid(), 1234);
     }
 
     /// When secctx is null (plain `BR_TRANSACTION`, not

@@ -293,6 +293,10 @@ mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
+// What the transport under a binder can do, summarized from the types
+// that already own each fact. Not under `rpc`: the kernel path answers
+// the same questions.
+mod transport_caps;
 
 /// RPC transport (binder-over-socket) — a separate stack from the
 /// kernel binder path. Present only with the `rpc` feature.
@@ -381,8 +385,8 @@ pub use native::{is_handling_transaction, Binder, BinderFeatures};
 // `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
 // its own `PeerIdentity` model under `rpc::PeerIdentity`.
 pub use thread_state::{
-    calling_caller, clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
-    get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
+    calling_caller, calling_caps, clear_calling_identity, get_calling_pid, get_calling_sid,
+    get_calling_uid, get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
     has_explicit_identity, restore_calling_identity, set_strict_mode_policy, Caller,
     CallingContext, ExtendedError,
 };
@@ -415,6 +419,7 @@ pub use rt::{
     DeathSignal, Tokio, TokioRuntime,
 };
 pub use status::{BinderResult, ExceptionCode, Status};
+pub use transport_caps::TransportCaps;
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

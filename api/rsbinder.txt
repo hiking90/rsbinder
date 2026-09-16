@@ -32,6 +32,7 @@ pub rsbinder::entry::uri::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
 pub rsbinder::entry::uri::Endpoint::Vsock(u32, u32)
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
@@ -78,6 +79,7 @@ pub rsbinder::entry::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
 pub rsbinder::entry::Endpoint::Vsock(u32, u32)
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
@@ -97,6 +99,7 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Endpoint
 pub struct rsbinder::entry::Client
 impl rsbinder::Client
 pub fn rsbinder::Client::binder(&self, &str) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::Client::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::Client::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Client::get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::Client::open(&str) -> rsbinder::Result<rsbinder::Client>
@@ -2245,6 +2248,7 @@ impl core::marker::UnsafeUnpin for rsbinder::thread_state::ExtendedError
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::thread_state::ExtendedError
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::ExtendedError
 pub fn rsbinder::thread_state::calling_caller() -> core::option::Option<rsbinder::thread_state::Caller>
+pub fn rsbinder::thread_state::calling_caps() -> core::option::Option<rsbinder::TransportCaps>
 pub fn rsbinder::thread_state::clear_calling_identity() -> i64
 pub fn rsbinder::thread_state::get_calling_pid() -> std::os::raw::c_int
 pub fn rsbinder::thread_state::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CString>
@@ -2307,6 +2311,7 @@ pub rsbinder::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
 pub rsbinder::Endpoint::Vsock(u32, u32)
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
@@ -2629,6 +2634,7 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::CallingCon
 pub struct rsbinder::Client
 impl rsbinder::Client
 pub fn rsbinder::Client::binder(&self, &str) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::Client::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::Client::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Client::get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::Client::open(&str) -> rsbinder::Result<rsbinder::Client>
@@ -3137,6 +3143,48 @@ impl<R> core::marker::Unpin for rsbinder::TokioRuntime<R> where R: core::marker:
 impl<R> core::marker::UnsafeUnpin for rsbinder::TokioRuntime<R> where R: core::marker::UnsafeUnpin
 impl<R> core::panic::unwind_safe::RefUnwindSafe for rsbinder::TokioRuntime<R> where R: core::panic::unwind_safe::RefUnwindSafe
 impl<R> core::panic::unwind_safe::UnwindSafe for rsbinder::TokioRuntime<R> where R: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder::TransportCaps(_)
+impl rsbinder::TransportCaps
+pub const rsbinder::TransportCaps::CALLBACKS: Self
+pub const rsbinder::TransportCaps::FD_PASSING: Self
+pub const rsbinder::TransportCaps::KERNEL: Self
+pub const rsbinder::TransportCaps::KERNEL_KNOBS: Self
+pub const rsbinder::TransportCaps::NONE: Self
+pub const rsbinder::TransportCaps::SAME_HOST: Self
+pub const rsbinder::TransportCaps::TRUSTED_UID: Self
+pub const fn rsbinder::TransportCaps::bits(self) -> u32
+pub const fn rsbinder::TransportCaps::contains(self, Self) -> bool
+pub const fn rsbinder::TransportCaps::difference(self, Self) -> Self
+pub const fn rsbinder::TransportCaps::is_empty(self) -> bool
+pub fn rsbinder::TransportCaps::require(self, Self, &str) -> rsbinder::Result<()>
+pub const fn rsbinder::TransportCaps::union(self, Self) -> Self
+impl core::clone::Clone for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::clone(&self) -> rsbinder::TransportCaps
+impl core::cmp::Eq for rsbinder::TransportCaps
+impl core::cmp::PartialEq for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::eq(&self, &rsbinder::TransportCaps) -> bool
+impl core::default::Default for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::default() -> rsbinder::TransportCaps
+impl core::fmt::Debug for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::TransportCaps
+impl core::marker::StructuralPartialEq for rsbinder::TransportCaps
+impl core::ops::bit::BitOr for rsbinder::TransportCaps
+pub type rsbinder::TransportCaps::Output = rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::bitor(self, Self) -> Self
+impl core::ops::bit::BitOrAssign for rsbinder::TransportCaps
+pub fn rsbinder::TransportCaps::bitor_assign(&mut self, Self)
+impl core::marker::Freeze for rsbinder::TransportCaps
+impl core::marker::Send for rsbinder::TransportCaps
+impl core::marker::Sync for rsbinder::TransportCaps
+impl core::marker::Unpin for rsbinder::TransportCaps
+impl core::marker::UnsafeUnpin for rsbinder::TransportCaps
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::TransportCaps
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::TransportCaps
 pub struct rsbinder::WIBinder
 impl rsbinder::WIBinder
 pub fn rsbinder::WIBinder::upgrade(&self) -> rsbinder::Result<rsbinder::SIBinder>
@@ -3814,6 +3862,7 @@ pub type dyn rsbinder::permission_controller::android::os::IPermissionController
 pub trait rsbinder::Transactable: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Transactable::transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::calling_caller() -> core::option::Option<rsbinder::thread_state::Caller>
+pub fn rsbinder::calling_caps() -> core::option::Option<rsbinder::TransportCaps>
 pub async fn rsbinder::check_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub fn rsbinder::clear_calling_identity() -> i64
 pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>

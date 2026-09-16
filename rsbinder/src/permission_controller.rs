@@ -285,6 +285,14 @@ fn warn_enforce_permission_over_rpc() {
 mod tests {
     use super::*;
 
+    /// What a Unix RPC session carries before it negotiates an fd mode —
+    /// the shape the simulated dispatches below stand in for. The value
+    /// is incidental to these tests, which are about the permission
+    /// decision, but the guard takes it.
+    #[cfg(feature = "rpc")]
+    const UNIX_CAPS: crate::TransportCaps =
+        crate::TransportCaps::TRUSTED_UID.union(crate::TransportCaps::SAME_HOST);
+
     /// The generated trait must expose the AOSP wire descriptor
     /// verbatim — `"android.os.IPermissionController"`.
     /// A mismatch here would silently fail every cross-process call to
@@ -330,7 +338,10 @@ mod tests {
         rpc_parcel.set_for_rpc(true);
         // Inside a (simulated) RPC transaction, so `is_handling_transaction()`
         // is `true` and only the kernel-backing gate can produce the denial.
-        let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+        let _g = RpcCallingGuard::install(
+            Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+            UNIX_CAPS,
+        );
         assert!(crate::is_handling_transaction());
         assert!(
             !check_permission(&rpc_parcel, "android.permission.INTERNET"),
@@ -389,7 +400,10 @@ mod tests {
         // Inside an RPC transaction from uid 1000: the authority grants the
         // one permission it knows, and denies everything else.
         {
-            let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+            let _g = RpcCallingGuard::install(
+                Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+                UNIX_CAPS,
+            );
             assert!(
                 check_permission(&rpc_parcel, "com.example.DO_THING"),
                 "authority must grant the allowed uid+permission over RPC"
@@ -401,7 +415,10 @@ mod tests {
         }
         // Different uid ⇒ deny.
         {
-            let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 2000, pid: 7 }));
+            let _g = RpcCallingGuard::install(
+                Arc::new(PeerIdentity::Local { uid: 2000, pid: 7 }),
+                UNIX_CAPS,
+            );
             assert!(
                 !check_permission(&rpc_parcel, "com.example.DO_THING"),
                 "authority must deny a non-allowed uid"
@@ -412,7 +429,10 @@ mod tests {
 
         // Restore the default so other tests see kernel-PMS / RPC-deny.
         clear_permission_authority();
-        let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+        let _g = RpcCallingGuard::install(
+            Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+            UNIX_CAPS,
+        );
         assert!(
             !check_permission(&rpc_parcel, "com.example.DO_THING"),
             "after clear, the default RPC deny is restored"

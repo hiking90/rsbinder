@@ -101,7 +101,12 @@ pub struct ClientOptions {
     /// purpose.
     #[cfg(feature = "rpc")]
     pub handshake_timeout: Option<Duration>,
-    /// Kernel: `?driver=` equivalent.
+    /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
+    /// whoever initializes `ProcessState` first, so a *different* path here
+    /// is [`StatusCode::BadValue`](crate::StatusCode::BadValue) at
+    /// [`open`](Client::open) — see
+    /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
+    /// rule on the server side.
     pub driver: Option<std::path::PathBuf>,
 }
 
@@ -518,6 +523,40 @@ impl Client {
             Inner::Kernel => crate::hub::wait_for_service(name).ok_or(StatusCode::NameNotFound),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => s.get_service(name),
+        }
+    }
+
+    /// What this client's transport can do, as a
+    /// [`TransportCaps`](crate::TransportCaps) set.
+    ///
+    /// Kernel is always the full set. An RPC client reports what its
+    // The target only exists with `rpc`, so only link it then.
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "session has *now* — see [`RpcSession::caps`](crate::rpc::RpcSession::caps)"
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "session has *now* — see `RpcSession::caps` (`rpc` feature)"
+    )]
+    /// for why that is a snapshot, and
+    /// [`Endpoint::static_caps`] for what the transport could offer at
+    /// best.
+    ///
+    /// ```no_run
+    /// # fn f() -> rsbinder::Result<()> {
+    /// use rsbinder::TransportCaps;
+    /// let client = rsbinder::Client::open("unix:///tmp/x.sock")?;
+    /// // Fails here, naming the option to set, rather than on the first
+    /// // callback.
+    /// client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
+    /// # Ok(()) }
+    /// ```
+    pub fn caps(&self) -> crate::TransportCaps {
+        match &self.inner {
+            Inner::Kernel => crate::TransportCaps::KERNEL,
+            #[cfg(feature = "rpc")]
+            Inner::Rpc(s) => s.caps(),
         }
     }
 

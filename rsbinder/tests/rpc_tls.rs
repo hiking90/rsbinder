@@ -171,6 +171,31 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     let root = client.get_root().expect("get_root over TLS");
     assert_eq!(ping_via(&root, "hello").unwrap(), "pong:hello");
     assert_eq!(ping_via(&root, "").unwrap(), "pong:");
+
+    // Plan 10-0: a certificate is an identity, but not a uid, and TCP
+    // carries neither file descriptors nor a shared kernel — so a TLS
+    // session has no capabilities at all, and cannot gain `CALLBACKS`
+    // either, because incoming connections are Unix-only. Anything
+    // needing one is refused here, before the first transaction, rather
+    // than on the wire later.
+    use rsbinder::TransportCaps;
+    assert_eq!(client.caps(), TransportCaps::NONE);
+    assert_eq!(
+        client
+            .caps()
+            .require(TransportCaps::CALLBACKS, "streaming sink"),
+        Err(StatusCode::InvalidOperation)
+    );
+    assert_eq!(
+        client.caps().require(TransportCaps::FD_PASSING, "a pipe"),
+        Err(StatusCode::InvalidOperation)
+    );
+    // The endpoint agrees, without needing a session at all.
+    assert_eq!(
+        rsbinder::Endpoint::Tls("localhost".into(), addr.port()).static_caps(),
+        TransportCaps::NONE
+    );
+
     drop(root);
     drop(client);
     server.join().unwrap();

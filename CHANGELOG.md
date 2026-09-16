@@ -15,6 +15,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Migrating
 
+- **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
+  `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
+  `ClientOptions::driver` are fixed process-wide by whoever initializes
+  `ProcessState` first. A later call naming a *different* value used to log a
+  warning and continue with the value already in force; it now returns
+  `StatusCode::BadValue`, which is what every other inapplicable option in this
+  layer already returned. Omitting the option, or passing the value already in
+  force, is unaffected — so a second `serve("binder://")` in one process still
+  works. Code that called `serve` twice with different thread counts was not
+  getting the second one; now it is told.
 - **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects.** The
   new checks are listed under *Added*. Each one fires on a contract the AOSP
   compiler already refuses, so an `.aidl` that builds against both compilers is
@@ -114,9 +124,48 @@ This changelog starts at 0.9.0. For earlier releases, see the
   inside a binder is a latent panic in any case: `Runtime::drop` panics when the
   last `Strong` to the service is released on one of that runtime's worker
   threads. Wrap `runtime.handle().clone()` instead.
+- **A kernel transaction dispatched inside an RPC handler now reports the
+  kernel caller.** Binder's nested IPC delivers a re-entrant `BR_TRANSACTION`
+  to the very thread parked waiting for a reply, so an RPC handler that makes
+  an outgoing kernel call can have a kernel transaction dispatched inside it.
+  Inside that inner kernel handler, `calling_caller()` used to return
+  `Caller::Rpc(..)` and `get_calling_uid()` / `get_calling_pid()` /
+  `get_calling_sid()` / `CallingContext::default()` the suspended RPC peer's
+  values — for a transport that carries no uid, the `u32::MAX` sentinel and pid
+  `-1`. They now answer for
+  the kernel caller the inner transaction actually came from:
+  `Caller::Kernel`, the kernel-delivered `sender_euid` / `sender_pid`, and the
+  SELinux context (`CallingContext::default()` reports those same three in one
+  value). The RPC values come back when the inner transaction
+  returns, and `is_handling_transaction()` is unchanged in both places. Only a
+  process that mixes kernel binder and RPC on one thread is affected; a
+  handler that `match`es on the `Caller` arm to pick an authorization rule now
+  takes the `Kernel` arm there, so re-check such handlers — a rule written for
+  the RPC arm (a cert allowlist, a Unix-peer uid ACL) no longer runs for a
+  caller that arrived over kernel binder.
 
 ### Added
 
+- **`TransportCaps`** — what the transport under a binder can do, as five bits:
+  `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`, `KERNEL_KNOBS`. Read it
+  from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —
+  inside a handler, for the call being served — `calling_caps()`.
+  `caps.require(bits, "what for")` turns a missing capability
+  into `InvalidOperation` plus a log line naming the option that would grant it,
+  at setup rather than on the first transaction.
+
+  It is a **summary, not a rule**: every bit is derived from a fact some other
+  type already owns and still enforces. Ignore `FD_PASSING` and the fd write
+  refuses on its own, exactly as before; ignore `TRUSTED_UID` and
+  `get_calling_uid()` still returns its fail-closed sentinel. Two distinctions
+  are worth reading the rustdoc for — `Endpoint::static_caps()` answers for the
+  transport *family*, and it bounds a session in neither direction:
+  `FD_PASSING` is an upper bound (a `unix://` endpoint claims it before any
+  session negotiates the `Unix` fd mode), while `CALLBACKS` is a lower one (no
+  *RPC* endpoint reports it — `binder://` does, since kernel binder has every
+  bit — although a session opened with `ClientOptions::incoming_connections > 0`
+  does) — and a session's caps are a
+  snapshot that changes as connections come and go.
 - **`wait_for_interface_async` and `check_interface_async`** — the awaitable
   forms of `hub::wait_for_interface` / `hub::check_interface`, at the crate root
   next to `get_interface_async` (`tokio` feature). The wait keeps the

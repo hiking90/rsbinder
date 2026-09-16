@@ -2190,6 +2190,84 @@ impl RpcSessionInner {
             .len()
     }
 
+    /// This session's **callback** connections — the ones that carry a
+    /// request in the direction the founding connection does not, so a
+    /// binder handed across the session can be transacted on outside a
+    /// dispatch.
+    ///
+    /// Which [`SlotRole`] that is depends on which side asks, because one
+    /// physical connection is `Incoming` to the client that opened it and
+    /// `Outgoing` to the server that accepted it:
+    ///
+    /// | This endpoint | Founding slot | Callback slots |
+    /// |---|---|---|
+    /// | [`AddressSpace::Initiator`] (client) | `Outgoing` | `Incoming` |
+    /// | [`AddressSpace::Acceptor`] (server) | `Incoming` | `Outgoing` |
+    ///
+    /// So a default one-connection session counts zero on **both** ends,
+    /// which is the answer
+    /// [`TransportCaps::CALLBACKS`](crate::TransportCaps::CALLBACKS)
+    /// needs: the client may transact on its founding connection whenever
+    /// it likes, but nothing can call *it*.
+    ///
+    /// Not [`live_conn_count`](Self::live_conn_count), which counts every
+    /// connection regardless of direction. Slots the owner has retired as
+    /// unreadable are excluded — they carry nothing more.
+    pub(crate) fn callback_conn_count(&self) -> usize {
+        let callback_role = match self.shared.space() {
+            AddressSpace::Initiator => SlotRole::Incoming,
+            AddressSpace::Acceptor => SlotRole::Outgoing,
+        };
+        self.conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .slots
+            .iter()
+            .filter(|s| s.role == callback_role && !s.unreadable)
+            .count()
+    }
+
+    /// This session's [`TransportCaps`](crate::TransportCaps) right now —
+    /// see [`RpcSession::caps`] for what each bit means here.
+    pub(crate) fn caps(&self) -> crate::TransportCaps {
+        // A session's connections all run to the same peer process, so
+        // the identity is a session property even though it is read off
+        // one transport. `None` only once the pool is empty, which is a
+        // session being torn down: no connection, no capabilities.
+        let peer = self
+            .conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .slots
+            .first()
+            .map(|s| s.transport.peer_identity());
+        match peer {
+            Some(p) => self.caps_with_peer(&p),
+            None => crate::TransportCaps::NONE,
+        }
+    }
+
+    /// [`caps`](Self::caps) for a caller that already holds the peer
+    /// identity — the dispatch path, which was handed the identity of the
+    /// very connection the transaction arrived on. Saves re-reading it
+    /// under the pool lock on every transaction, and is the more direct
+    /// answer besides.
+    pub(crate) fn caps_with_peer(&self, peer: &PeerIdentity) -> crate::TransportCaps {
+        use crate::TransportCaps as C;
+        let mut caps = C::NONE;
+        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+            caps |= C::FD_PASSING;
+        }
+        if peer.is_local() {
+            // A kernel-vouched uid, and the same kernel on both ends.
+            caps |= C::TRUSTED_UID | C::SAME_HOST;
+        }
+        if self.callback_conn_count() > 0 {
+            caps |= C::CALLBACKS;
+        }
+        caps
+    }
+
     /// A client's incoming (callback) slot: served by a thread this
     /// session owns and not counted in `live_conns`.
     fn is_client_incoming_slot(&self, slot_id: u64) -> bool {
@@ -3042,6 +3120,13 @@ impl RpcSessionInner {
         // connection admits a same-thread nested call only while a
         // *twoway* handler runs on it — a oneway leaves nobody reading.
         let _nested = AllowNestedGuard::arm(self, !oneway);
+        // Snapshot the session's capabilities for the handler. Taken here,
+        // before the guard below installs it: reading it locks the
+        // connection pool, and nothing may hold that lock across the user
+        // callback. The value is a `Copy` `u32`, so the handler sees what
+        // the call arrived over even if a connection comes or goes while
+        // it runs.
+        let caps = self.caps_with_peer(&peer);
         // Plan 2-16 Phase B/C: stamp the caller's peer identity into the
         // RPC calling context for the duration of the user handler, so
         // `get_calling_uid()`/`get_calling_pid()` work over Unix RPC and
@@ -3063,7 +3148,8 @@ impl RpcSessionInner {
             // empty body with the status), so a partially-written `reply`
             // cannot leak to the peer.
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _calling = crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer));
+                let _calling =
+                    crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer), caps);
                 target.rpc_transact(t.code, &mut reader, &mut reply)
             }))
             .unwrap_or_else(|payload| {
@@ -3963,6 +4049,38 @@ impl RpcSession {
     /// The negotiated FD-over-RPC mode (default `None`).
     pub fn fd_transport_mode(&self) -> FileDescriptorTransportMode {
         self.inner.fd_mode()
+    }
+
+    /// What this session can do, as a
+    /// [`TransportCaps`](crate::TransportCaps) set.
+    ///
+    /// **A snapshot.** Connections come and go, so the answer can change:
+    /// [`CALLBACKS`](crate::TransportCaps::CALLBACKS) is lost when the
+    /// last callback connection dies, and
+    /// [`FD_PASSING`](crate::TransportCaps::FD_PASSING) appears only once
+    /// [`negotiate_fd_transport`](Self::negotiate_fd_transport) (or the
+    /// android-13+ handshake) has agreed the `Unix` mode. Read it when
+    /// you are about to act, not once at setup.
+    ///
+    /// Where each bit comes from:
+    ///
+    /// - `FD_PASSING` — the **negotiated** mode is `Unix`, not merely a
+    ///   Unix socket underneath. A session that never negotiated carries
+    ///   no fds, and
+    ///   [`Endpoint::static_caps`](crate::Endpoint::static_caps) is the
+    ///   one that answers "could it".
+    /// - `TRUSTED_UID` and `SAME_HOST` — the peer is
+    ///   [`PeerIdentity::Local`], the
+    ///   same test [`get_calling_uid`](crate::get_calling_uid) applies.
+    /// - `CALLBACKS` — this session holds at least one callback
+    ///   connection, so calls cross in both directions. Those are the
+    ///   connections opened with
+    ///   [`RpcUnixClientConfig::incoming_connections`], counted from
+    ///   whichever end asks. A default one-connection session reports it
+    ///   on neither end.
+    /// - `KERNEL_KNOBS` — never; this is a socket.
+    pub fn caps(&self) -> crate::TransportCaps {
+        self.inner.caps()
     }
 
     /// Publish the server's root object (returned by `get_root`).
