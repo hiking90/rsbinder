@@ -195,6 +195,15 @@ wait* and *how they encode "not registered"* — pick by what your client needs:
 | `try_get_interface::<T>` | no | `Result<Option<Strong<T>>>` | `Ok(None)` |
 | `try_get_service` | no | `Result<Option<SIBinder>>` | `Ok(None)` |
 
+The three awaitable ones live at the crate root rather than in `hub`, because only they
+have to be awaited (the `tokio` feature, on by default):
+
+| Function | Waits? | Returns | Not registered |
+|---|---|---|---|
+| `wait_for_interface_async::<T>` | awaits until registered | `Result<Strong<T>>` | *awaits* |
+| `check_interface_async::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
+| `get_interface_async::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
+
 > **Removed in 0.11.0**: `hub::get_service` and `hub::get_interface` are
 > gone (deprecated in 0.10.0) because their wait behavior was inconsistent
 > across Android versions. `try_get_service` / `try_get_interface` issue the
@@ -224,6 +233,28 @@ if the service manager itself is unreachable. The wait is event-driven
 (registration-callback based) when the process runs a binder thread pool
 (`ProcessState::start_thread_pool()`); without one it degrades gracefully to
 ~1-second polling.
+
+### The same wait from async code
+
+`rsbinder::wait_for_interface_async` is the awaitable form — same contract, same
+event-driven wake, and it can be given up on:
+
+```rust
+let service = tokio::time::timeout(
+    Duration::from_secs(5),
+    rsbinder::wait_for_interface_async::<dyn IMyService::IMyService>("com.example.myservice"),
+).await??;
+```
+
+Dropping the future (a `timeout` that expires, a `select!` arm that loses) ends the wait
+and unregisters the callback it placed with the service manager. Do **not** hand-roll it as
+`spawn_blocking(hub::wait_for_interface)`: dropping that future only detaches the
+`JoinHandle`, leaving a blocking-pool thread waiting for a service nobody is waiting for
+any more.
+
+Each outstanding wait holds one thread of the same `spawn_blocking` pool your outbound
+calls go through, so this is for the handful of waits a process does at start-up — not for
+polling a name in a loop.
 
 `hub::wait_for_service` is the untyped variant — it returns
 `Option<SIBinder>` when you need the raw handle (for example, to inspect the

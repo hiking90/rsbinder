@@ -23,12 +23,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 default = ["tokio"]
-# No `tokio/full`: the library uses `spawn_blocking`, `Handle` and nothing
-# else — `rt-multi-thread` is here for `block_in_place` in the
-# `BinderAsyncRuntime` adapter. A crate that wants
-# `net`, `time` or `signal` declares them itself rather than receiving them
-# by accident through feature unification.
-tokio = ["async", "tokio/rt", "tokio/rt-multi-thread"]
+# No `tokio/full`: the library uses `spawn_blocking`, `Handle`, and a
+# `oneshot` to carry a death notification into a future — `rt-multi-thread`
+# is here for `block_in_place` in the `BinderAsyncRuntime` adapter, `sync` for
+# that channel. The waits use a condvar rather than a timer, so no `time`. A
+# crate that wants `net`, `time`, `macros` or `signal` declares them itself
+# rather than receiving them by accident through feature unification.
+tokio = ["async", "tokio/rt", "tokio/rt-multi-thread", "tokio/sync"]
 async = ["rsbinder-aidl/async", "async-trait", "rsbinder-macros?/async"]
 # `#[rsbinder::interface]` — declare an interface as a Rust trait instead of
 # an `.aidl` file (plan 2-19). Off by default: it pulls the AIDL compiler

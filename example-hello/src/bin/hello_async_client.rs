@@ -20,11 +20,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ProcessState::init_default()?;
     ProcessState::start_thread_pool();
 
-    // SM lookups are sync; run off the runtime, then upgrade to the async view.
-    let hello: Strong<IHelloAsyncTokio> =
-        tokio::task::spawn_blocking(|| hub::wait_for_interface::<dyn IHello>(SERVICE_NAME))
-            .await??
-            .into_async::<Tokio>();
+    // Wait for the service, then upgrade to the async view. The wait runs off
+    // the runtime on its own and ends if this future is dropped — hand-rolling
+    // it as `spawn_blocking(hub::wait_for_interface)` leaves the thread waiting
+    // forever on a cancelled lookup.
+    let hello: Strong<IHelloAsyncTokio> = wait_for_interface_async::<dyn IHello>(SERVICE_NAME)
+        .await?
+        .into_async::<Tokio>();
 
     // The call now returns a future.
     let echo = hello.echo("Hello (async) World!").await?;

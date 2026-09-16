@@ -2821,6 +2821,91 @@ fn rpc_death_recipient_fires_on_session_drop() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The same obituary, taken as a future: `death_signal` completes when the
+/// session's connection drops (plan 11-1 AC-11-1.2, RPC leg). What this adds
+/// over the recipient test above is the wake-up path — the send happens on the
+/// session thread and has to reach a task parked in another runtime — plus the
+/// already-dead contract, which `death_signal` answers with a *completed*
+/// future rather than an error.
+///
+/// Mutant: making `DeathSignal::poll` return `Pending` unconditionally, or
+/// dropping the `oneshot` send from `binder_died`, leaves the `recv_timeout`
+/// below empty.
+#[cfg(feature = "tokio")]
+#[test]
+fn rpc_death_signal_completes_on_session_drop() {
+    if let Ok(path) = std::env::var("RSB_RPC_DEATH_SIGNAL_SERVER") {
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server
+            .set_root(make_service(Arc::new(AtomicI64::new(0))))
+            .expect("set_root");
+        let _ = server.run(); // blocks until killed
+        std::process::exit(0);
+    }
+
+    let path = tmp_sock("death_signal");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "rpc_death_signal_completes_on_session_drop",
+            "--nocapture",
+        ])
+        .env("RSB_RPC_DEATH_SIGNAL_SERVER", &path)
+        .spawn()
+        .expect("spawn server child");
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_unix_client(&path).expect("connect");
+    let root = client.get_root().expect("get_root");
+    let signal = rsbinder::death_signal(&root).expect("death_signal on a live RPC proxy");
+
+    // Awaited from a runtime of its own, so the completion has to travel from
+    // the session thread through the `oneshot` waker. A current-thread runtime
+    // parked in `Runtime::block_on` is being driven, which is the condition
+    // the API documents.
+    let (tx_done, rx_done) = std::sync::mpsc::sync_channel::<()>(1);
+    let awaiting = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(signal);
+        let _ = tx_done.try_send(());
+    });
+
+    // The "incoming thread" requirement, as in the test above.
+    let serving = client.clone();
+    let serve = std::thread::spawn(move || {
+        let _ = serving.serve_blocking();
+    });
+
+    child.kill().expect("kill server");
+    child.wait().expect("reap server");
+
+    rx_done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("death_signal must complete when the session connection drops");
+    let _ = awaiting.join();
+
+    // Already dead: not an error, and the future is complete on arrival.
+    let late = rsbinder::death_signal(&root).expect("death_signal on a dead proxy is not an error");
+    let (tx_late, rx_late) = std::sync::mpsc::sync_channel::<()>(1);
+    let late_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(late);
+        let _ = tx_late.try_send(());
+    });
+    rx_late
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a death_signal for an already-dead binder must be complete at once");
+    let _ = late_thread.join();
+
+    let _ = serve.join();
+    let _ = std::fs::remove_file(&path);
+}
+
 // ---- opt-in authorization hook -------------------------------------
 
 /// The opt-in `set_authorizer` gate runs *before any RPC

@@ -2,9 +2,10 @@
 
 rsbinder supports async/await with the [Tokio](https://tokio.rs/) runtime, making it
 straightforward to build non-blocking Binder services. rsbinder's own `tokio` feature is on
-by default, but it enables only `tokio/rt` and `tokio/rt-multi-thread` — what the library
-itself uses. Your crate declares what *its* code needs, including the `macros` feature that
-`#[tokio::main]` in the recipes below comes from:
+by default, but it enables only `tokio/rt`, `tokio/rt-multi-thread` and `tokio/sync` — what
+the library itself uses (`sync` carries a death notification into a future; the waits use a
+condvar, so no `time`). Your crate declares what *its* code needs, including the `macros`
+feature that `#[tokio::main]` in the recipes below comes from:
 
 ```toml
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

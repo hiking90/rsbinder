@@ -117,6 +117,26 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **`wait_for_interface_async` and `check_interface_async`** — the awaitable
+  forms of `hub::wait_for_interface` / `hub::check_interface`, at the crate root
+  next to `get_interface_async` (`tokio` feature). The wait keeps the
+  synchronous contract (unbounded, event-driven through the service manager's
+  registration callback, ~1s re-poll without a thread pool, `BadType` on a
+  descriptor mismatch) and adds one thing the hand-rolled
+  `spawn_blocking(hub::wait_for_interface)` cannot do: **dropping the future
+  ends the wait**, unregistering the callback and releasing the blocking-pool
+  thread. Each outstanding wait holds one thread of the pool outbound calls
+  share, so it is meant for the waits a process does at start-up.
+- **`death_signal` / `DeathSignal`** — await a binder's death instead of
+  implementing `DeathRecipient` (`tokio` feature). The signal holds the binder
+  and the recipient itself, so the usual "keep your `Arc` alive" and "keep the
+  handle alive" conditions do not apply; an already-dead binder yields a
+  completed future rather than an error, a local binder is still
+  `InvalidOperation`, and dropping the signal unlinks. Works over kernel binder
+  and RPC (where death is the session's connection dropping).
+- **`rsbinder`'s `tokio` feature now also enables `tokio/sync`** (for the
+  `oneshot` behind `DeathSignal`). Still no `tokio/time` or `tokio/macros`: the
+  waits are condvar-based, so nothing here needs a timer.
 - **`rsbinder-aidl`: AIDL type-placement validation matching AOSP.** The
   `@FixedSize` and `@VintfStability` rules are contract-level — rsbinder
   generated compiling code either way, so without them an `.aidl` authored here
