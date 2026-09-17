@@ -76,6 +76,12 @@ status.transaction_error()   // -> StatusCode
 // Get the service-specific error code (only meaningful when exception is ServiceSpecific)
 status.service_specific_error() // -> i32
 
+// The same code as your own type (see "Typed Error Codes" below)
+status.service_error::<LookupError>() // -> Option<LookupError>
+
+// The message the sender attached, if any
+status.message()             // -> Option<&str>
+
 // Check if the status represents success
 status.is_ok()               // -> bool
 ```
@@ -128,6 +134,42 @@ Err(rsbinder::Status::new_service_specific_error(
 ))
 ```
 
+### Typed Error Codes
+
+An `i32` is what crosses the wire, but it does not have to be what your code
+handles. A type that implements `rsbinder::ServiceSpecificError` carries the
+mapping once, so neither end writes a `match` over bare numbers:
+
+```rust
+// A plain Rust enum (needs the `macros` feature):
+#[derive(rsbinder::ServiceSpecificError, Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub enum LookupError {
+    NotFound = 1,
+    Busy = 2,
+}
+
+fn lookup(&self, key: &str) -> rsbinder::BinderResult<i32> {
+    Err(rsbinder::Status::service_specific(
+        LookupError::NotFound,
+        Some("no such key"),
+    ))
+}
+```
+
+For an enum that comes from `.aidl`, the generated type is an open newtype
+rather than a Rust enum, so attach the trait with a macro instead:
+
+```rust
+rsbinder::impl_service_specific_error!(my_package::LookupError::LookupError);
+```
+
+Either way the bytes are the ones AOSP's `Status::fromServiceSpecificError`
+produces — a C++ or Java peer reads the same code it always did. The code
+space is `i32`, so an `.aidl` enum backed by `long` cannot be an error type;
+attaching the trait to one is a compile error rather than a value that
+truncates on the wire.
+
 ### Unimplemented Methods
 
 When a service does not support a particular transaction (for example, a method
@@ -178,6 +220,21 @@ assert_eq!(
     rsbinder::ExceptionCode::ServiceSpecific,
 );
 assert_eq!(status.service_specific_error(), -1);
+```
+
+With a typed error the two checks collapse into one, because
+`service_error::<T>()` answers `None` unless the status really is a
+service-specific failure carrying one of `T`'s values:
+
+```rust
+match service.lookup("k").unwrap_err().service_error::<LookupError>() {
+    Some(LookupError::NotFound) => { /* create it */ }
+    Some(LookupError::Busy) => { /* retry later */ }
+    // Also reached for a code this build does not know: a peer compiled
+    // against a newer contract sends one, and `service_specific_error()`
+    // still has the raw number to log or forward.
+    _ => log::warn!("unhandled: {status}"),
+}
 ```
 
 ### Distinguishing Error Categories

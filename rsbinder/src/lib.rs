@@ -337,8 +337,10 @@ pub use async_trait::async_trait as __async_trait;
 // See the `rsbinder_macros` crate docs for the signature rules and for what
 // still needs `.aidl`. `Parcelable` is re-exported as both a trait and a
 // derive; they live in different namespaces, so the one name serves both.
+// `ServiceSpecificError` is re-exported as both a trait and a derive for the
+// same reason as `Parcelable`.
 #[cfg(feature = "macros")]
-pub use rsbinder_macros::{interface, BinderEnum, Parcelable};
+pub use rsbinder_macros::{interface, BinderEnum, Parcelable, ServiceSpecificError};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
@@ -420,7 +422,7 @@ pub use rt::{
     check_interface_async, death_signal, get_interface_async, wait_for_interface_async,
     DeathSignal, Tokio, TokioRuntime,
 };
-pub use status::{BinderResult, ExceptionCode, Status};
+pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
 pub use transport_caps::TransportCaps;
 
 /// Default path to the binder control device

@@ -716,6 +716,58 @@ macro_rules! declare_binder_enum {
 /// `IHello` is only a naming convention), so the re-export path is still given
 /// explicitly. The `build.rs` codegen step (`Builder`) is unaffected — this
 /// replaces only the `lib.rs` include/`use` boilerplate.
+/// Make an `.aidl` enum usable as a binder service-specific error code.
+///
+/// ```no_run
+/// # use rsbinder::*;
+/// # rsbinder::declare_binder_enum! {
+/// #     LookupError : [i32; 2] { NOT_FOUND = 1, BUSY = 2, }
+/// # }
+/// rsbinder::impl_service_specific_error!(LookupError);
+///
+/// # fn f() -> BinderResult<()> {
+/// Err(Status::service_specific(LookupError::BUSY, Some("try again")))
+/// # }
+/// ```
+///
+/// Opt-in rather than something [`declare_binder_enum!`] emits for every
+/// enum, because the code space is `i32`: an enum backed by `long` has no
+/// place in it, and the generated `enum_values()` comparison would have to
+/// narrow. Applying this to one is a compile error here — `i32: From<i64>`
+/// does not exist — instead of a value that truncates on the wire. `byte`
+/// and `int` backings both work.
+///
+/// ```compile_fail
+/// # use rsbinder::*;
+/// rsbinder::declare_binder_enum! {
+///     BigError : [i64; 1] { HUGE = 1, }
+/// }
+/// // No `i32: From<i64>`: a `long` enum has no i32 code space.
+/// rsbinder::impl_service_specific_error!(BigError);
+/// ```
+///
+/// For a plain Rust enum that is not an `.aidl` type, use
+/// `#[derive(ServiceSpecificError)]` instead. Do not use both on one type:
+/// two impls of the same trait do not compile.
+#[macro_export]
+macro_rules! impl_service_specific_error {
+    ($enum:ty) => {
+        impl $crate::ServiceSpecificError for $enum {
+            fn code(&self) -> i32 {
+                // `From`, not `as`: it is what refuses a `long` backing
+                // here rather than truncating it into the wire's i32.
+                i32::from(self.get())
+            }
+
+            fn from_code(code: i32) -> ::core::option::Option<Self> {
+                Self::enum_values()
+                    .into_iter()
+                    .find(|value| i32::from(value.get()) == code)
+            }
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! include_aidl {
     ($file:literal, $($use_path:tt)+) => {

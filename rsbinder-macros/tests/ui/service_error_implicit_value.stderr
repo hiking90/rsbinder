@@ -1,0 +1,5 @@
+error: every variant needs an explicit value: it is the code a peer matches on, so it must be visible here rather than implied by declaration order
+ --> tests/ui/service_error_implicit_value.rs:8:5
+  |
+8 |     NotFound,
+  |     ^^^^^^^^

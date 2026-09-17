@@ -174,6 +174,7 @@ use syn::{
 mod aidl_shape;
 mod binder_enum;
 mod parcelable;
+mod service_error;
 #[cfg(test)]
 mod type_matrix;
 mod type_str;
@@ -346,6 +347,44 @@ pub fn derive_parcelable(item: TokenStream) -> TokenStream {
 pub fn derive_binder_enum(item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::DeriveInput);
     match binder_enum::expand(&input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Binder service-specific error codes for a plain Rust enum.
+///
+/// Implements `rsbinder::ServiceSpecificError`, so the type can be passed to
+/// `Status::service_specific` and read back with
+/// `Status::service_error::<T>()` instead of a bare `i32`.
+///
+/// ```ignore
+/// #[derive(ServiceSpecificError, Clone, Copy, PartialEq, Eq, Debug)]
+/// #[repr(i32)]
+/// pub enum LookupError { NotFound = 1, Busy = 2 }
+///
+/// Err(Status::service_specific(LookupError::Busy, Some("try again")))
+/// ```
+///
+/// `#[repr(i8)]`, `#[repr(i16)]` or `#[repr(i32)]` is required, and every
+/// variant needs an explicit value — it is the number a peer matches on, so
+/// it belongs at the declaration rather than in declaration order. A wider
+/// repr is refused here rather than truncated on the wire, where a binder
+/// status carries the code as an `i32`.
+///
+/// This derive does not touch the parcel: an error code travels in the
+/// status header, not as a value in the payload. Combine it with
+/// `#[derive(BinderEnum)]` when the same enum is also a method argument or
+/// return value.
+///
+/// For an `.aidl` enum, use `rsbinder::impl_service_specific_error!` instead
+/// — the generated type is an open newtype, not a Rust enum, so a derive
+/// cannot be attached to it. Never both on one type: two impls of one trait
+/// do not compile.
+#[proc_macro_derive(ServiceSpecificError)]
+pub fn derive_service_specific_error(item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::DeriveInput);
+    match service_error::expand(&input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

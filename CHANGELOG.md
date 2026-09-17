@@ -152,6 +152,25 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **Service-specific errors can be a type instead of an `i32`** —
+  `ServiceSpecificError` (trait), `Status::service_specific` and
+  `Status::service_error::<T>()`, with `#[derive(ServiceSpecificError)]` for a
+  plain Rust enum and `impl_service_specific_error!` for one that came from
+  `.aidl`. The wire is untouched: a code is the `i32` AOSP's
+  `Status::fromServiceSpecificError` writes, so a C++ or Java peer reads what
+  it always did — what changes is that the enum ↔ code mapping is written once
+  rather than at each call site.
+
+  `service_error` answers `None` for a status that is not a service-specific
+  failure at all *and* for one whose code the type does not declare, which is
+  what a peer built against a newer contract looks like from here;
+  `service_specific_error()` still has the raw number in both cases. Attaching
+  either macro is deliberate rather than automatic for every enum: the code
+  space is `i32`, so a `long`-backed `.aidl` enum has none, and saying so is a
+  compile error at the attachment rather than a value that truncates on the
+  wire.
+- **`Status::message()`** — the message a peer attached, which until now only
+  `Display` could reach.
 - **The receive mapping is now configurable** — `ProcessState::init_with_mmap_size`,
   `binder://?mmap=<bytes>` and `ClientOptions::mmap_size`, with
   `MAX_BINDER_MMAP_SIZE`,

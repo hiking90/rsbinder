@@ -3362,6 +3362,7 @@ pub macro rsbinder::declare_binder_enum!
 pub macro rsbinder::declare_binder_interface!
 pub macro rsbinder::impl_deserialize_for_parcelable!
 pub macro rsbinder::impl_serialize_for_parcelable!
+pub macro rsbinder::impl_service_specific_error!
 pub macro rsbinder::include_aidl!
 #[non_exhaustive] pub enum rsbinder::CallRestriction
 pub rsbinder::CallRestriction::ErrorIfNotOneway
@@ -4125,7 +4126,10 @@ pub struct rsbinder::Status
 impl rsbinder::Status
 pub fn rsbinder::Status::exception_code(&self) -> rsbinder::ExceptionCode
 pub fn rsbinder::Status::is_ok(&self) -> bool
+pub fn rsbinder::Status::message(&self) -> core::option::Option<&str>
 pub fn rsbinder::Status::new_service_specific_error(i32, core::option::Option<alloc::string::String>) -> Self
+pub fn rsbinder::Status::service_error<E: rsbinder::ServiceSpecificError>(&self) -> core::option::Option<E>
+pub fn rsbinder::Status::service_specific<E: rsbinder::ServiceSpecificError>(E, core::option::Option<&str>) -> Self
 pub fn rsbinder::Status::service_specific_error(&self) -> i32
 pub fn rsbinder::Status::transaction_error(&self) -> rsbinder::StatusCode
 impl core::clone::Clone for rsbinder::Status
@@ -5014,6 +5018,9 @@ impl<T: rsbinder::SerializeOption + ?core::marker::Sized> rsbinder::SerializeOpt
 pub fn &T::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeOption> rsbinder::SerializeOption for alloc::boxed::Box<T>
 pub fn alloc::boxed::Box<T>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub trait rsbinder::ServiceSpecificError: core::marker::Sized
+pub fn rsbinder::ServiceSpecificError::code(&self) -> i32
+pub fn rsbinder::ServiceSpecificError::from_code(i32) -> core::option::Option<Self>
 pub trait rsbinder::ToAsyncInterface<P> where Self: rsbinder::Interface, Self::Target: rsbinder::FromIBinder
 pub type rsbinder::ToAsyncInterface::Target: ?core::marker::Sized
 impl<P: rsbinder::BinderAsyncPool> rsbinder::ToAsyncInterface<P> for dyn rsbinder::hub::android_16::IAccessor

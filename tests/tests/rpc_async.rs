@@ -67,6 +67,11 @@ impl IRpcSmokeAsyncService for SmokeAsyncSvc {
     async fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
+    // Only `rpc_generated_stub.rs` asserts on this method; here it just
+    // has to exist.
+    async fn r#fail(&self, code: i32) -> rsbinder::BinderResult<()> {
+        Err(rsbinder::Status::new_service_specific_error(code, None))
+    }
 }
 
 /// Server root = an **async** service binder. `rt` is a multi-thread

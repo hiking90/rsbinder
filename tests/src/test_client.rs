@@ -653,6 +653,45 @@ fn test_service_specific_exception() {
     }
 }
 
+rsbinder::declare_binder_enum! {
+    /// Plan 10-4: the codes `ThrowServiceException` is asked for above,
+    /// as a type. Declared here rather than in `.aidl` because which
+    /// enum a service's codes belong to is not something `.aidl` says.
+    ThrownError : [i32; 2] {
+        MINUS_ONE = -1,
+        ZERO = 0,
+    }
+}
+rsbinder::impl_service_specific_error!(ThrownError);
+
+/// Plan 10-4 AC-4.1, kernel half: the same exception the test above
+/// reads as an `i32`, read as the type instead. Crosses a real binder
+/// transaction, so it is the `Status` codec on the wire rather than a
+/// parcel built in this process.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
+fn test_service_specific_exception_reads_as_a_typed_error() {
+    let service = get_test_service();
+
+    for (code, expected) in [(-1, ThrownError::MINUS_ONE), (0, ThrownError::ZERO)] {
+        let status = service
+            .ThrowServiceException(code)
+            .expect_err("ThrowServiceException always fails");
+        assert_eq!(status.service_error::<ThrownError>(), Some(expected));
+    }
+
+    // A code the enum does not declare — what a peer built against a
+    // newer contract looks like — is `None`, and the raw code survives.
+    let status = service
+        .ThrowServiceException(1)
+        .expect_err("ThrowServiceException always fails");
+    assert_eq!(status.service_error::<ThrownError>(), None);
+    assert_eq!(status.service_specific_error(), 1);
+}
+
 macro_rules! test_nullable {
     ($test:ident, $func:ident, $value:expr) => {
         #[test]

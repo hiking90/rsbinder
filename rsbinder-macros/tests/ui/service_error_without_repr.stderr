@@ -1,0 +1,5 @@
+error: a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or `#[repr(i32)]` — a binder status carries the code as an i32, so a wider repr would truncate on the wire rather than fail here
+ --> tests/ui/service_error_without_repr.rs:4:10
+  |
+4 | pub enum LookupError {
+  |          ^^^^^^^^^^^
