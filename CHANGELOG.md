@@ -152,6 +152,21 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **`ParcelFileDescriptor::pipe()`**, plus `Read` and `Write` for
+  `ParcelFileDescriptor` and `&ParcelFileDescriptor` — the AOSP idiom for an
+  open-ended payload (`ParcelFileDescriptor.createPipe`), with the two
+  boilerplate steps it used to take now gone: a hand-rolled `pipe()` with two
+  `unsafe` `from_raw_fd`s, and cloning the descriptor into a `std::fs::File`
+  before anything could read or write it. Both ends are `O_CLOEXEC`, as AOSP's
+  are.
+
+  The adapters mean what `File`'s mean, including `Ok(0)` at end of file and
+  `BrokenPipe` once the reader is gone. Note that a pipe holds about 64 KB:
+  whoever writes more needs a reader already draining it, usually the peer once
+  the read end has been sent. For `tokio`, convert once with
+  `tokio::fs::File::from_std(std::fs::File::from(OwnedFd::from(pfd)))` —
+  rsbinder does not wrap that, since its `tokio` feature deliberately does not
+  pull `tokio/fs`.
 - **`Parcel::write_blob` / `read_blob`** — AOSP's convention for a large byte
   payload: inline when it is at most `BLOB_INPLACE_LIMIT` (16 KB), through a
   shared-memory region when it is larger, with the form recorded on the wire as

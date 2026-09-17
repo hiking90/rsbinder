@@ -2999,6 +2999,7 @@ impl !core::panic::unwind_safe::UnwindSafe for rsbinder::Parcel
 pub struct rsbinder::ParcelFileDescriptor(_)
 impl rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::new<F: core::convert::Into<std::os::fd::owned::OwnedFd>>(F) -> Self
+pub fn rsbinder::ParcelFileDescriptor::pipe() -> rsbinder::Result<(Self, Self)>
 pub fn rsbinder::ParcelFileDescriptor::try_clone(&self) -> rsbinder::Result<Self>
 impl core::cmp::Eq for rsbinder::ParcelFileDescriptor
 impl core::cmp::PartialEq for rsbinder::ParcelFileDescriptor
@@ -3027,6 +3028,16 @@ impl rsbinder::SerializeArray for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl std::io::Read for &rsbinder::ParcelFileDescriptor
+pub fn &rsbinder::ParcelFileDescriptor::read(&mut self, &mut [u8]) -> std::io::error::Result<usize>
+impl std::io::Read for rsbinder::ParcelFileDescriptor
+pub fn rsbinder::ParcelFileDescriptor::read(&mut self, &mut [u8]) -> std::io::error::Result<usize>
+impl std::io::Write for &rsbinder::ParcelFileDescriptor
+pub fn &rsbinder::ParcelFileDescriptor::flush(&mut self) -> std::io::error::Result<()>
+pub fn &rsbinder::ParcelFileDescriptor::write(&mut self, &[u8]) -> std::io::error::Result<usize>
+impl std::io::Write for rsbinder::ParcelFileDescriptor
+pub fn rsbinder::ParcelFileDescriptor::flush(&mut self) -> std::io::error::Result<()>
+pub fn rsbinder::ParcelFileDescriptor::write(&mut self, &[u8]) -> std::io::error::Result<usize>
 impl std::os::fd::owned::AsFd for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for rsbinder::ParcelFileDescriptor

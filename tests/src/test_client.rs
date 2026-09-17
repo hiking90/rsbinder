@@ -529,29 +529,15 @@ fn test_interface_list_exchange() {
     );
 }
 
-fn build_pipe() -> (File, File) {
-    let fds = rustix::pipe::pipe().expect("error creating pipe");
-    // Safety: we get two file descriptors from pipe()
-    // and pass them after checking if the function returned
-    // without an error, so the descriptors should be valid
-    // by that point
-    unsafe {
-        (
-            File::from_raw_fd(fds.0.into_raw_fd()),
-            File::from_raw_fd(fds.1.into_raw_fd()),
-        )
-    }
-}
-
-/// Helper function that constructs a `File` from a `ParcelFileDescriptor`.
-///
-/// This is needed because `File` is currently the way to read and write
-/// to pipes using the `Read` and `Write` traits.
-fn file_from_pfd(fd: &rsbinder::ParcelFileDescriptor) -> File {
-    fd.as_ref()
-        .try_clone()
-        .expect("failed to clone file descriptor")
-        .into()
+/// Plan 10-3: `(read, write)` straight from the library — this used to
+/// be a hand-rolled `rustix::pipe::pipe()` plus two `unsafe`
+/// `from_raw_fd`s, and `ParcelFileDescriptor` used to need cloning into
+/// a `File` before anything could read or write it.
+fn build_pipe() -> (
+    rsbinder::ParcelFileDescriptor,
+    rsbinder::ParcelFileDescriptor,
+) {
+    rsbinder::ParcelFileDescriptor::pipe().expect("error creating pipe")
 }
 
 #[test]
@@ -561,20 +547,19 @@ fn file_from_pfd(fd: &rsbinder::ParcelFileDescriptor) -> File {
 )]
 fn test_parcel_file_descriptor() {
     let service = get_test_service();
-    let (mut read_file, write_file) = build_pipe();
+    let (read_end, write_pfd) = build_pipe();
 
-    let write_pfd = rsbinder::ParcelFileDescriptor::new(write_file);
     let result_pfd = service
         .RepeatParcelFileDescriptor(&write_pfd)
         .expect("error calling RepeatParcelFileDescriptor");
 
     const TEST_DATA: &[u8] = b"FrazzleSnazzleFlimFlamFlibbityGumboChops";
-    file_from_pfd(&result_pfd)
+    (&result_pfd)
         .write_all(TEST_DATA)
         .expect("error writing to pipe");
 
     let mut buf = [0u8; TEST_DATA.len()];
-    read_file
+    (&read_end)
         .read_exact(&mut buf)
         .expect("error reading from pipe");
     assert_eq!(&buf[..], TEST_DATA);
@@ -588,11 +573,8 @@ fn test_parcel_file_descriptor() {
 fn test_parcel_file_descriptor_array() {
     let service = get_test_service();
 
-    let (read_file, write_file) = build_pipe();
-    let input = [
-        rsbinder::ParcelFileDescriptor::new(read_file),
-        rsbinder::ParcelFileDescriptor::new(write_file),
-    ];
+    let (read_end, write_end) = build_pipe();
+    let input = [read_end, write_end];
 
     let mut repeated = vec![];
 
@@ -610,23 +592,21 @@ fn test_parcel_file_descriptor_array() {
         .ReverseParcelFileDescriptorArray(&input[..], &mut repeated)
         .expect("error calling ReverseParcelFileDescriptorArray");
 
-    file_from_pfd(&input[1])
+    (&input[1])
         .write_all(b"First")
         .expect("error writing to pipe");
-    file_from_pfd(
-        repeated[1]
-            .as_ref()
-            .expect("received None for ParcelFileDescriptor"),
-    )
-    .write_all(b"Second")
-    .expect("error writing to pipe");
-    file_from_pfd(&result[0])
+    repeated[1]
+        .as_ref()
+        .expect("received None for ParcelFileDescriptor")
+        .write_all(b"Second")
+        .expect("error writing to pipe");
+    (&result[0])
         .write_all(b"Third")
         .expect("error writing to pipe");
 
     const TEST_DATA: &[u8] = b"FirstSecondThird";
     let mut buf = [0u8; TEST_DATA.len()];
-    file_from_pfd(&input[0])
+    (&input[0])
         .read_exact(&mut buf)
         .expect("error reading from pipe");
     assert_eq!(&buf[..], TEST_DATA);
@@ -2073,7 +2053,7 @@ fn test_death_recipient() {
     let (mut read_file, write_file) = build_pipe();
 
     struct MyDeathRecipient {
-        write_file: Mutex<File>,
+        write_file: Mutex<rsbinder::ParcelFileDescriptor>,
     }
 
     impl DeathRecipient for MyDeathRecipient {
@@ -2878,8 +2858,8 @@ fn test_wibinder_upgrade_after_obituary() {
 
     // Set up a death recipient so we can wait for the obituary to
     // propagate.
-    let (mut read_file, write_file) = build_pipe();
-    struct DR(Mutex<File>);
+    let (read_file, write_file) = build_pipe();
+    struct DR(Mutex<rsbinder::ParcelFileDescriptor>);
     impl DeathRecipient for DR {
         fn binder_died(&self, _: &WIBinder) {
             self.0
@@ -2907,7 +2887,7 @@ fn test_wibinder_upgrade_after_obituary() {
     // ("died\n") with `read_exact`, which returns as soon as the data
     // is available without needing the writer side to close.
     let mut buf = [0u8; 5];
-    read_file.read_exact(&mut buf).expect("read death pipe");
+    (&read_file).read_exact(&mut buf).expect("read death pipe");
     assert_eq!(&buf, b"died\n");
 
     // Now we can drop `recipient` so the pipe writer side closes —
@@ -2998,7 +2978,7 @@ fn test_death_recipient_panic_does_not_starve_others() {
         }
     }
 
-    struct WritingRecipient(Mutex<File>);
+    struct WritingRecipient(Mutex<rsbinder::ParcelFileDescriptor>);
     impl DeathRecipient for WritingRecipient {
         fn binder_died(&self, _: &WIBinder) {
             self.0
@@ -3080,7 +3060,7 @@ fn test_unlink_to_death_single_remove_via_obituary() {
     let counted: Arc<dyn DeathRecipient> = Arc::new(CountingRecipient(counter.clone()));
 
     let (mut signal_read, signal_write) = build_pipe();
-    struct SignalRecipient(Mutex<File>);
+    struct SignalRecipient(Mutex<rsbinder::ParcelFileDescriptor>);
     impl DeathRecipient for SignalRecipient {
         fn binder_died(&self, _: &WIBinder) {
             self.0
@@ -3239,8 +3219,8 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
     let binder = test_service.as_binder();
 
     // Wait for obituary by registering a death recipient + pipe.
-    let (mut death_read, death_write) = build_pipe();
-    struct DR(Mutex<File>);
+    let (death_read, death_write) = build_pipe();
+    struct DR(Mutex<rsbinder::ParcelFileDescriptor>);
     impl DeathRecipient for DR {
         fn binder_died(&self, _: &WIBinder) {
             self.0.lock().unwrap().write_all(b"died\n").unwrap();
@@ -3254,7 +3234,7 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
     test_service.killService().expect("killService");
 
     let mut sentinel = [0u8; 5];
-    death_read
+    (&death_read)
         .read_exact(&mut sentinel)
         .expect("read death pipe");
     assert_eq!(&sentinel, b"died\n");

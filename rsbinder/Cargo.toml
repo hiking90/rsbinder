@@ -103,7 +103,7 @@ android_15_plus = ["android_15", "android_16"]
 android_16_plus = ["android_16"]
 
 [dependencies]
-rustix = { workspace = true, features = ["process", "param", "mm", "fs", "net"] }
+rustix = { workspace = true, features = ["process", "param", "mm", "fs", "net", "pipe"] }
 log = { workspace = true }
 pretty_hex = { workspace = true }
 async-trait = { workspace = true, optional = true }

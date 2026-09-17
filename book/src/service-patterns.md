@@ -170,13 +170,13 @@ On the client side, you can invoke `dump()` on a remote service through its prox
 The output is written to a file descriptor (typically a pipe):
 
 ```rust
-let (mut read_file, write_file) = build_pipe();
+let (read_end, write_end) = rsbinder::ParcelFileDescriptor::pipe()?;
 let args = vec!["dump".to_owned(), "MyService".to_owned()];
 
-service.as_binder().as_proxy().unwrap().dump(write_file, &args)?;
+service.as_binder().as_proxy().unwrap().dump(write_end, &args)?;
 
 let mut buf = String::new();
-read_file.read_to_string(&mut buf)?;
+(&read_end).read_to_string(&mut buf)?;
 // buf now contains the dump output
 ```
 
