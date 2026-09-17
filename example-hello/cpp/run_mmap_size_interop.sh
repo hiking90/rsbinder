@@ -97,6 +97,9 @@ cleanup() {
     # A bracket in the pattern so pkill does not match the shell running
     # this very command (the trap fires inside an `adb shell`, too).
     "${ADB[@]}" shell 'pkill -f "[m]map_probe" 2>/dev/null' >/dev/null 2>&1 || true
+    # `timeout` kills the host-side `adb`, not the client it started on
+    # the device; that one keeps blocking in ioctl unless killed here.
+    "${ADB[@]}" shell 'pkill -f "[m]map_size_interop" 2>/dev/null' >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup
@@ -118,11 +121,23 @@ start_service() {
     done
     return 1
 }
+# A synchronous kernel transaction blocks in ioctl until a reply or
+# BR_DEAD_REPLY, and the `SERVING` line is printed before `run()` starts
+# the thread pool — a regression there would hang this script instead of
+# failing it. Unset on a host without coreutils `timeout` (word-split on
+# purpose, so an empty value adds no word).
+CALL_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then CALL_TIMEOUT="timeout 60"; fi
 run_client() {
-    # `|| true`: the client exits non-zero on anything but OK, and the
-    # refusal in (b) is the expected outcome there — the line it prints
-    # is what this script judges, not its exit status.
-    "${ADB[@]}" shell "$DEV_DIR/mmap_size_interop $1 $PAYLOAD || true" | tr -d '\r'
+    # The inner `|| true`: the client exits non-zero on anything but OK,
+    # and the refusal in (b) is the expected outcome there — the line it
+    # prints is what this script judges, not its exit status. The outer
+    # one absorbs `timeout`'s own 124, which the device-side `|| true`
+    # never sees: `set -euo pipefail` would otherwise end the script at
+    # the caller's `out=$(run_client ...)`, before the comparison, the
+    # (b) half and the tally line. Absorbed, a timeout leaves the output
+    # empty and the comparison fails, which is the point.
+    { $CALL_TIMEOUT "${ADB[@]}" shell "$DEV_DIR/mmap_size_interop $1 $PAYLOAD || true" || true; } | tr -d '\r'
 }
 
 echo

@@ -94,9 +94,11 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
         Some(StatusCode::BadValue),
         "a different mapping size cannot be applied to a process that already mapped one"
     );
-    // Out of range is the same answer, and it is reached before the
-    // comparison — a size the driver would never map is refused whether
-    // or not it happens to match what is in force.
+    // A size outside the range comes back as the same `BadValue`. It
+    // does not tell the range check apart from the mismatch check —
+    // that would need a size that is in force *and* out of range, which
+    // this process cannot produce; the range and rounding contract is
+    // covered by the unit tests in `process_state.rs`.
     assert_eq!(
         rsbinder::serve("binder://?mmap=1").err(),
         Some(StatusCode::BadValue),

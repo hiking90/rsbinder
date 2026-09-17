@@ -153,8 +153,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
 ### Added
 
 - **The receive mapping is now configurable** — `ProcessState::init_with_mmap_size`,
-  `binder://?mmap=<bytes>`, `ServeOptions::mmap_size` and
-  `ClientOptions::mmap_size`, with `MAX_BINDER_MMAP_SIZE`,
+  `binder://?mmap=<bytes>` and `ClientOptions::mmap_size`, with
+  `MAX_BINDER_MMAP_SIZE`,
   `ProcessState::default_mmap_size()` and `ProcessState::mmap_size()` alongside.
   The "1 MB binder limit" is this mapping: the driver copies an incoming
   transaction into a buffer allocated out of the **destination** process's
@@ -163,7 +163,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   does not change and there is nothing to negotiate. A payload too large for the
   destination still comes back to the sender as `FailedTransaction`.
 
-  Bytes only, between two pages and `MAX_BINDER_MMAP_SIZE` (4 MB); outside that
+  Bytes only, between one page and `MAX_BINDER_MMAP_SIZE` (4 MB); outside that
   is `BadValue`, deliberately including *above*, because the driver clamps to
   4 MB without telling anyone and a process that asked for 8 MB should not have
   to discover it got half. The value is rounded up to a page (what `mmap(2)`
@@ -172,6 +172,17 @@ This changelog starts at 0.9.0. For earlier releases, see the
   one. Process-wide and fixed by whoever initializes `ProcessState` first, so it
   follows the `?driver=` / `?threads=` rule above: a later different value is
   `BadValue`.
+
+  Both the range check and that refusal belong to `serve` / `Client::open` and
+  to the call that initializes the process. `ProcessState::init_with_mmap_size`
+  called directly on a process that is already initialized does not look at its
+  arguments at all — it returns the existing state, whatever size was asked
+  for. `ServeOptions::mmap_size` is in the position `ServeOptions::threads` is
+  in: `serve` initializes `ProcessState` before the option is read, so the
+  field cannot make the mapping — it is compared against the size already in
+  force, and a different one is `BadValue` at `run` / `spawn`. On a kernel
+  server the size is set by `binder://?mmap=`, or by
+  `ProcessState::init_with_mmap_size` called before `serve`.
 - **`TransportCaps`** — what the transport under a binder can do, as five bits:
   `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`, `KERNEL_KNOBS`. Read it
   from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —

@@ -460,16 +460,18 @@ impl ProcessState {
     /// itself.
     pub(crate) fn normalized_mmap_size(mmap_size: usize) -> Result<usize> {
         let page = rustix::param::page_size();
-        // Two pages is the floor because the driver hands out no buffer
-        // at all below it (and AOSP's own default is expressed as
-        // "1 MB minus two pages"). The ceiling is the driver's silent
+        // One page is the granularity `mmap(2)` works in and the
+        // smallest mapping the driver serves a buffer from (measured: a
+        // 4096-byte mapping carries a ~3.9 KB call). It also keeps a
+        // `default_mmap_size()` that degenerated to 0 out of
+        // `mmap(len = 0)`, which the `vm_size > 0` in `inner_init`'s
+        // SAFETY comment rests on. The ceiling is the driver's silent
         // `SZ_4M` clamp.
-        if mmap_size < page * 2 || mmap_size > MAX_BINDER_MMAP_SIZE {
+        if mmap_size < page || mmap_size > MAX_BINDER_MMAP_SIZE {
             log::error!(
-                "binder mmap size {mmap_size} is outside [{}, {MAX_BINDER_MMAP_SIZE}]; \
+                "binder mmap size {mmap_size} is outside [{page}, {MAX_BINDER_MMAP_SIZE}]; \
                  the driver clamps to 4 MB without saying so, which is why a larger \
-                 request is refused here rather than silently shrunk",
-                page * 2
+                 request is refused here rather than silently shrunk"
             );
             return Err(StatusCode::BadValue);
         }
@@ -570,11 +572,15 @@ impl ProcessState {
     /// one included — the wire is unchanged, which is why there is
     /// nothing to negotiate and nothing for the sender to set.
     ///
-    /// Constraints, all of them the driver's:
+    /// Constraints, the driver's except where noted:
     ///
-    /// - The size must be between two pages and [`MAX_BINDER_MMAP_SIZE`];
+    /// - The size must be between one page and [`MAX_BINDER_MMAP_SIZE`];
     ///   outside that, [`StatusCode::BadValue`]. The driver clamps to
-    ///   4 MB silently, so a larger request is refused here instead.
+    ///   4 MB silently, so a larger request is refused here instead. The
+    ///   floor is the page: the driver sets none of its own but serves
+    ///   nothing from less than one page, and `mmap(2)` cannot map less
+    ///   than that either. A one-page mapping is legal and carries a
+    ///   call of a few KB; it is the caller's to choose.
     /// - It is rounded up to a page boundary, the granularity `mmap(2)`
     ///   works in. [`mmap_size`](Self::mmap_size) reports the rounded
     ///   value.
@@ -1596,13 +1602,21 @@ mod tests {
         assert_eq!(default, (1024 * 1024) - page * 2);
         assert_eq!(ProcessState::normalized_mmap_size(default), Ok(default));
 
-        // Below two pages and above the driver's silent 4 MB clamp are
-        // the two ends that must be refused rather than shrunk.
+        // Below a page and above the driver's silent 4 MB clamp are the
+        // two ends that must be refused rather than shrunk. The floor
+        // also keeps a `default_mmap_size()` that degenerated to 0 (a
+        // page above 512 KB) out of `mmap(len = 0)`.
         assert_eq!(
-            ProcessState::normalized_mmap_size(page * 2 - 1),
+            ProcessState::normalized_mmap_size(0),
             Err(StatusCode::BadValue)
         );
-        assert_eq!(ProcessState::normalized_mmap_size(page * 2), Ok(page * 2));
+        assert_eq!(
+            ProcessState::normalized_mmap_size(page - 1),
+            Err(StatusCode::BadValue)
+        );
+        // One page is legal: the driver serves a buffer from it, so
+        // refusing it would refuse a mapping that works.
+        assert_eq!(ProcessState::normalized_mmap_size(page), Ok(page));
         assert_eq!(
             ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE),
             Ok(MAX_BINDER_MMAP_SIZE)
@@ -1615,10 +1629,7 @@ mod tests {
         // A request that is not a whole number of pages gets the next
         // page up — what `mmap(2)` maps — and rounding never crosses the
         // ceiling, since the ceiling is itself a page multiple.
-        assert_eq!(
-            ProcessState::normalized_mmap_size(page * 2 + 1),
-            Ok(page * 3)
-        );
+        assert_eq!(ProcessState::normalized_mmap_size(page + 1), Ok(page * 2));
         assert_eq!(
             ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE - 1),
             Ok(MAX_BINDER_MMAP_SIZE)

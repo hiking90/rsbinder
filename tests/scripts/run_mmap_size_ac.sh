@@ -46,6 +46,10 @@ kill -0 "$HUB_PID" 2>/dev/null || { echo "hub did not start"; cat "$LOG"; exit 1
 SVC_PID=""
 # start_service <bytes|default> <name>
 start_service() {
+    # Truncate here, not in the background job: the redirection below
+    # runs in the forked child, so the poll loop could otherwise read a
+    # `SERVING` line an interrupted earlier run left behind.
+    : > "$SVCLOG"
     RUST_LOG=info nohup $PROBE serve "$1" "$2" > "$SVCLOG" 2>&1 &
     SVC_PID=$!; disown 2>/dev/null
     for _ in $(seq 1 20); do
@@ -71,7 +75,11 @@ if start_service "$BIG" rsb101.big; then
     got=$(sed -n 's/^SERVING rsb101.big mmap=//p' "$SVCLOG")
     [ "$got" = "$BIG" ] && ok "the service reports the mapping it asked for ($got)" \
                         || bad "mapping is $got, want $BIG"
-    $PROBE call "$PAYLOAD" rsb101.big > "$OUT" 2>/tmp/rsb101-call.err
+    # `timeout`: a synchronous kernel transaction blocks in ioctl until a
+    # reply or BR_DEAD_REPLY, and the `SERVING` line is printed before
+    # `run()` starts the pool — a regression there would hang instead of
+    # failing. An empty $OUT then fails the comparison below.
+    timeout 60 $PROBE call "$PAYLOAD" rsb101.big > "$OUT" 2>/tmp/rsb101-call.err
     want OK "3 MB accepted"
 else
     bad "the 4 MB service did not start"; cat "$SVCLOG"
@@ -84,12 +92,16 @@ if start_service default rsb101.small; then
     got=$(sed -n 's/^SERVING rsb101.small mmap=//p' "$SVCLOG")
     [ "$got" -lt "$PAYLOAD" ] && ok "the default mapping ($got) is smaller than the payload" \
                               || bad "default mapping is $got, expected below $PAYLOAD"
-    $PROBE call "$PAYLOAD" rsb101.small > "$OUT" 2>/tmp/rsb101-call.err
+    timeout 60 $PROBE call "$PAYLOAD" rsb101.small > "$OUT" 2>/tmp/rsb101-call.err
     want FAILEDTXN "3 MB refused, and refused as FailedTransaction"
     # The refusal must not take the service down with it: the driver
-    # rejects the transaction, it does not kill the target.
-    kill -0 "$SVC_PID" 2>/dev/null && ok "the service survived the refusal" \
-                                   || bad "the service died on the oversized transaction"
+    # rejects the transaction, it does not kill the target. A second,
+    # small call is the evidence — the process still being alive is not,
+    # since a worker can panic without the process exiting.
+    timeout 60 $PROBE call 1024 rsb101.small > "$OUT" 2>>/tmp/rsb101-call.err
+    grep -qx "RESULT call 1024 OK" "$OUT" \
+        && ok "the service still answers transactions after the refusal" \
+        || bad "the service stopped answering after the oversized transaction (got '$(cat "$OUT")')"
 else
     bad "the default-sized service did not start"; cat "$SVCLOG"
 fi

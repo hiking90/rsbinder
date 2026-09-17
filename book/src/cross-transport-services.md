@@ -139,10 +139,10 @@ rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceilin
     .run()?;
 ```
 
-- Bytes only (no `4M` shorthand), between two pages and
+- Bytes only (no `4M` shorthand), between one page and
   `MAX_BINDER_MMAP_SIZE` (4 MB, where the driver clamps silently — a
   larger request is refused here rather than quietly shrunk), rounded up
-  to a page.
+  to a page. A one-page mapping is legal and carries a call of a few KB.
 - Set on the **receiver**. A caller needs nothing; a payload too large for
   the destination comes back as `StatusCode::FailedTransaction`. A client
   is a receiver of its own replies, which is what `ClientOptions::mmap_size`
@@ -153,6 +153,12 @@ rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceilin
 - Process-wide and fixed at the first `serve` / `Client::open`, like
   `?driver=` and `?threads=`. `ProcessState::init_with_mmap_size` is the
   direct form, and `ProcessState::mmap_size()` reports what is in force.
+- `ServeOptions::mmap_size` cannot make the mapping: `serve` initializes
+  `ProcessState` before the option is read, so the field can only agree with
+  the size already in force and a different one is `BadValue` at
+  `run`/`spawn` — the same rule as `ServeOptions::threads`. What sets the
+  size on a kernel server is `binder://?mmap=`, or
+  `ProcessState::init_with_mmap_size` called before `serve`.
 
 `Client::open_with`'s closure also receives the parsed `Endpoint`, so an
 option that applies to only some transports is set from the endpoint rather
