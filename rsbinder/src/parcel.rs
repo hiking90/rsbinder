@@ -750,6 +750,42 @@ impl Parcel {
         true
     }
 
+    /// Whether a file descriptor written to this parcel can travel —
+    /// AOSP `Parcel::allowFds()`.
+    ///
+    /// A kernel parcel always can. An RPC one can only over a session
+    /// that negotiated
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "[`FileDescriptorTransportMode::Unix`](crate::rpc::FileDescriptorTransportMode),"
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "`FileDescriptorTransportMode::Unix` (`rpc` feature),"
+    )]
+    /// which rules out vsock and TLS, and rules out the session-less
+    /// data-only mode behind `to_bytes` as well.
+    ///
+    /// This is what a *writer* asks before choosing a representation, in
+    /// the way [`write_blob`](Self::write_blob) picks an inline copy
+    /// where it cannot hand over a shared-memory fd. It does not gate
+    /// anything on its own: writing an fd into a parcel that answers
+    /// `false` still fails with
+    /// [`StatusCode::FdsNotAllowed`](crate::StatusCode::FdsNotAllowed)
+    /// at the one place that enforces it.
+    #[cfg(feature = "rpc")]
+    pub fn allow_fds(&self) -> bool {
+        self.is_kernel_backed()
+            || self.rpc_fd_mode() == crate::rpc::FileDescriptorTransportMode::Unix
+    }
+
+    /// `true` always — see the `rpc` arm. Without that feature every
+    /// parcel is kernel-marshalled, and the kernel carries fds.
+    #[cfg(not(feature = "rpc"))]
+    pub fn allow_fds(&self) -> bool {
+        true
+    }
+
     /// `true` if this parcel serializes binders/FDs the RPC way.
     #[deprecated(
         since = "0.11.0",

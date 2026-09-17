@@ -311,6 +311,11 @@ pub mod hub;
 /// AOSP-faithful surface and fail-closed `check_permission` helper.
 pub mod permission_controller;
 
+// Large byte payloads in a parcel (AOSP `Parcel::writeBlob`): inline
+// when small, shared memory when large. Plain comment for the same
+// reason as `cancel` below.
+pub mod blob;
+
 // Cooperative cancellation (`android.os.ICancellationSignal`): a service
 // hands out a transport binder, the caller cancels through it. Kept as a
 // plain (non-doc) comment for the same reason as `entry` below: an outer

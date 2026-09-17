@@ -35,6 +35,36 @@ A shared region is a file descriptor, so it travels wherever an fd can:
   parcel fails with `StatusCode::FdsNotAllowed`, exactly like a plain
   `ParcelFileDescriptor`.
 
+## 0. One large value: `Parcel::write_blob`
+
+Before reaching for a region of your own, note that a **byte payload** has a
+ready-made form. `Parcel::write_blob` carries it inline when it is at most
+16 KB and through a shared region when it is larger, tagging the wire so the
+reader knows which it got — AOSP's `Parcel::writeBlob`, byte-compatible with
+C++ and Java peers:
+
+```rust
+parcel.write_blob(&payload, false)?;      // false: the reader may not write it
+
+let blob = parcel.read_blob()?;
+let bytes = blob.to_vec()?;               // whichever form it took
+```
+
+Two properties make it the right default for "a big lump of bytes":
+
+- **The transport decides, not your code.** Where fds cannot travel — vsock,
+  TLS, or a data-only parcel — the payload simply goes inline, as AOSP does
+  when `mAllowFds` is false. There is nothing to configure and no error to
+  handle. `Parcel::allow_fds()` answers the same question if you want to know
+  in advance.
+- **An immutable blob is sealed** (`F_SEAL_FUTURE_WRITE`), so the reader maps
+  a snapshot it cannot modify. Pass `true` for a region both sides may write,
+  which is a buffer they share rather than a value one sends.
+
+Reach for the sections below when you need the region itself: a window into a
+larger heap, a lifetime longer than one call, or many buffers out of one
+allocation.
+
 ## 1. One region: `SharedMemory` + `ParcelFileDescriptor`
 
 This is the simplest and the most portable form — it is what Android apps

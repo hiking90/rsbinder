@@ -1,6 +1,33 @@
 pub mod rsbinder
 pub mod rsbinder::binderfs
 pub fn rsbinder::binderfs::add_device(&std::path::Path, &str) -> std::io::error::Result<(u32, u32)>
+pub mod rsbinder::blob
+pub enum rsbinder::blob::Blob
+pub rsbinder::blob::Blob::Inline(alloc::vec::Vec<u8>)
+pub rsbinder::blob::Blob::Shared
+pub rsbinder::blob::Blob::Shared::heap: alloc::sync::Arc<rsbinder::shared_memory::heap::MappedHeap>
+pub rsbinder::blob::Blob::Shared::len: usize
+pub rsbinder::blob::Blob::Shared::mutable: bool
+impl rsbinder::blob::Blob
+pub fn rsbinder::blob::Blob::inline(&self) -> core::option::Option<&[u8]>
+pub fn rsbinder::blob::Blob::is_empty(&self) -> bool
+pub fn rsbinder::blob::Blob::is_mutable(&self) -> bool
+pub fn rsbinder::blob::Blob::len(&self) -> usize
+pub fn rsbinder::blob::Blob::mapped(&self) -> core::option::Option<&alloc::sync::Arc<rsbinder::shared_memory::heap::MappedHeap>>
+pub fn rsbinder::blob::Blob::to_vec(&self) -> rsbinder::Result<alloc::vec::Vec<u8>>
+impl core::fmt::Debug for rsbinder::blob::Blob
+pub fn rsbinder::blob::Blob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::blob::Blob
+impl core::marker::Send for rsbinder::blob::Blob
+impl core::marker::Sync for rsbinder::blob::Blob
+impl core::marker::Unpin for rsbinder::blob::Blob
+impl core::marker::UnsafeUnpin for rsbinder::blob::Blob
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::blob::Blob
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::blob::Blob
+pub const rsbinder::blob::BLOB_ASHMEM_IMMUTABLE: i32
+pub const rsbinder::blob::BLOB_ASHMEM_MUTABLE: i32
+pub const rsbinder::blob::BLOB_INPLACE: i32
+pub const rsbinder::blob::BLOB_INPLACE_LIMIT: usize
 pub mod rsbinder::bridge
 pub struct rsbinder::bridge::Rewrap<I: rsbinder::FromIBinder + ?core::marker::Sized>
 impl<I: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::bridge::Rewrap<I>
@@ -2913,6 +2940,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::thread_state::Extende
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::ExtendedError
 pub struct rsbinder::Parcel
 impl rsbinder::Parcel
+pub fn rsbinder::Parcel::allow_fds(&self) -> bool
 pub fn rsbinder::Parcel::data_avail(&self) -> usize
 pub fn rsbinder::Parcel::data_position(&self) -> usize
 pub fn rsbinder::Parcel::data_size(&self) -> usize
@@ -2949,6 +2977,9 @@ pub fn rsbinder::Parcel::write_slice_size<T>(&mut self, core::option::Option<&[T
 pub fn rsbinder::Parcel::write_u32(&mut self, u32) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_u64(&mut self, u64) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_u8(&mut self, u8) -> rsbinder::Result<()>
+impl rsbinder::Parcel
+pub fn rsbinder::Parcel::read_blob(&mut self) -> rsbinder::Result<rsbinder::blob::Blob>
+pub fn rsbinder::Parcel::write_blob(&mut self, &[u8], bool) -> rsbinder::Result<()>
 impl core::default::Default for rsbinder::Parcel
 pub fn rsbinder::Parcel::default() -> Self
 impl core::fmt::Debug for rsbinder::Parcel

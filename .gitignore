@@ -33,6 +33,7 @@ example-hello/cpp/codegen_shapes_interop
 example-hello/cpp/mmap_size_interop
 example-hello/cpp/typed_error_interop
 example-hello/cpp/cancel_interop
+example-hello/cpp/blob_interop
 
 # Core dumps. A test that deliberately panics or is killed mid-run drops
 # gigabyte-scale files here, and they are the right size to slip into a

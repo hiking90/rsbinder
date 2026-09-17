@@ -152,6 +152,22 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **`Parcel::write_blob` / `read_blob`** — AOSP's convention for a large byte
+  payload: inline when it is at most `BLOB_INPLACE_LIMIT` (16 KB), through a
+  shared-memory region when it is larger, with the form recorded on the wire as
+  a tag the reader follows. Byte-compatible with C++ `Parcel::writeBlob` and
+  Java `Parcel.writeBlob`, so a framework peer reads what rsbinder wrote.
+
+  The region is a memfd, which AOSP's reader accepts: libcutils' `ashmem_valid`
+  answers yes for a `/memfd:` link and takes the size from `fstat`, and an
+  immutable blob carries `F_SEAL_FUTURE_WRITE` — the same seal AOSP's own memfd
+  path adds for `ashmem_set_prot_region(fd, PROT_READ)`.
+
+  Where a transport carries no file descriptors — vsock, TLS, or the
+  session-less data-only parcel behind `to_bytes` — the payload goes inline
+  whatever its size, which is AOSP's `!mAllowFds` branch and needs no option.
+  `Parcel::allow_fds()` is the predicate behind that, public because a
+  handwritten parcelable choosing its own representation needs the same answer.
 - **Cooperative cancellation** — `cancel::CancellationSignal`,
   `cancel::CancellationToken` and `cancel::cancel_remote`, over a vendored
   `android.os.ICancellationSignal`. A service makes a signal per operation,
