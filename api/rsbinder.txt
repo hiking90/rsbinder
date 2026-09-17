@@ -20,6 +20,201 @@ impl<I> core::marker::Unpin for rsbinder::bridge::Rewrap<I> where I: ?core::mark
 impl<I> core::marker::UnsafeUnpin for rsbinder::bridge::Rewrap<I> where I: ?core::marker::Sized
 impl<I> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::bridge::Rewrap<I>
 impl<I> !core::panic::unwind_safe::UnwindSafe for rsbinder::bridge::Rewrap<I>
+pub mod rsbinder::cancel
+pub mod rsbinder::cancel::android
+pub mod rsbinder::cancel::android::os
+pub mod rsbinder::cancel::android::os::ICancellationSignal
+pub struct rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal(_)
+impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder_with_features<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Unpin for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::UnsafeUnpin for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub struct rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl rsbinder::Interface for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+impl rsbinder::Proxy for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal where rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Unpin for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::UnsafeUnpin for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub trait rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignalAdapter
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignalAdapter::as_async(&self) -> &dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignalAdapter::as_sync(&self) -> &dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignalAdapter::try_as_async(&self) -> core::option::Option<&dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService>
+pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync::descriptor() -> &'static str where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService::cancel<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = rsbinder::BinderResult<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService::descriptor() -> &'static str where Self: core::marker::Sized
+pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefault: core::marker::Send + core::marker::Sync
+pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefault::cancel(&self) -> rsbinder::BinderResult<()>
+pub type rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef = alloc::sync::Arc<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefault>
+pub struct rsbinder::cancel::BnCancellationSignal(_)
+impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder_with_features<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::Unpin for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl core::marker::UnsafeUnpin for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub struct rsbinder::cancel::BpCancellationSignal
+impl rsbinder::Interface for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+impl rsbinder::Proxy for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal where rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::Unpin for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl core::marker::UnsafeUnpin for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub struct rsbinder::cancel::CancellationSignal(_)
+impl rsbinder::cancel::CancellationSignal
+pub fn rsbinder::cancel::CancellationSignal::cancel(&self)
+pub fn rsbinder::cancel::CancellationSignal::create_transport(&self) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::cancel::CancellationSignal::is_canceled(&self) -> bool
+pub fn rsbinder::cancel::CancellationSignal::new() -> Self
+pub fn rsbinder::cancel::CancellationSignal::set_on_cancel(&self, impl core::ops::function::FnOnce() + core::marker::Send + 'static)
+pub fn rsbinder::cancel::CancellationSignal::token(&self) -> rsbinder::cancel::CancellationToken
+impl core::clone::Clone for rsbinder::cancel::CancellationSignal
+pub fn rsbinder::cancel::CancellationSignal::clone(&self) -> rsbinder::cancel::CancellationSignal
+impl core::default::Default for rsbinder::cancel::CancellationSignal
+pub fn rsbinder::cancel::CancellationSignal::default() -> Self
+impl core::fmt::Debug for rsbinder::cancel::CancellationSignal
+pub fn rsbinder::cancel::CancellationSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::cancel::CancellationSignal
+impl core::marker::Send for rsbinder::cancel::CancellationSignal
+impl core::marker::Sync for rsbinder::cancel::CancellationSignal
+impl core::marker::Unpin for rsbinder::cancel::CancellationSignal
+impl core::marker::UnsafeUnpin for rsbinder::cancel::CancellationSignal
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::CancellationSignal
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::CancellationSignal
+pub struct rsbinder::cancel::CancellationToken(_)
+impl rsbinder::cancel::CancellationToken
+pub async fn rsbinder::cancel::CancellationToken::canceled(&self)
+pub fn rsbinder::cancel::CancellationToken::is_canceled(&self) -> bool
+impl core::clone::Clone for rsbinder::cancel::CancellationToken
+pub fn rsbinder::cancel::CancellationToken::clone(&self) -> rsbinder::cancel::CancellationToken
+impl core::fmt::Debug for rsbinder::cancel::CancellationToken
+pub fn rsbinder::cancel::CancellationToken::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::cancel::CancellationToken
+impl core::marker::Send for rsbinder::cancel::CancellationToken
+impl core::marker::Sync for rsbinder::cancel::CancellationToken
+impl core::marker::Unpin for rsbinder::cancel::CancellationToken
+impl core::marker::UnsafeUnpin for rsbinder::cancel::CancellationToken
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::cancel::CancellationToken
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::cancel::CancellationToken
+pub trait rsbinder::cancel::ICancellationSignal: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::ICancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::ICancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::ICancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::ICancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
+pub trait rsbinder::cancel::ICancellationSignalAsync<P>: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::ICancellationSignalAsync::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::ICancellationSignalAsync::descriptor() -> &'static str where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub trait rsbinder::cancel::ICancellationSignalAsyncService: rsbinder::Interface + core::marker::Send
+pub fn rsbinder::cancel::ICancellationSignalAsyncService::cancel<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = rsbinder::BinderResult<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn rsbinder::cancel::ICancellationSignalAsyncService::descriptor() -> &'static str where Self: core::marker::Sized
+pub trait rsbinder::cancel::ICancellationSignalDefault: core::marker::Send + core::marker::Sync
+pub fn rsbinder::cancel::ICancellationSignalDefault::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::cancel::cancel_remote(&rsbinder::SIBinder) -> rsbinder::Result<()>
+pub type rsbinder::cancel::ICancellationSignalDefaultRef = alloc::sync::Arc<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefault>
 pub mod rsbinder::entry
 pub mod rsbinder::entry::uri
 #[non_exhaustive] pub enum rsbinder::entry::uri::Endpoint
@@ -2509,6 +2704,11 @@ pub fn rsbinder::Binder<T>::new_with_stability_and_features(T, rsbinder::Stabili
 impl<T: 'static + rsbinder::Remotable> rsbinder::Binder<T>
 pub fn rsbinder::Binder<T>::get_extension(&self) -> rsbinder::Result<core::option::Option<rsbinder::SIBinder>>
 pub fn rsbinder::Binder<T>::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
 impl rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
@@ -2551,6 +2751,9 @@ pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissio
 impl<B: rsbinder::Remotable + 'static> core::convert::TryFrom<rsbinder::SIBinder> for rsbinder::Binder<B>
 pub type rsbinder::Binder<B>::Error = rsbinder::StatusCode
 pub fn rsbinder::Binder<B>::try_from(rsbinder::SIBinder) -> rsbinder::Result<Self>
+impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
+pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
 impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
@@ -3063,6 +3266,11 @@ pub fn rsbinder::Strong<I>::link_to_death_arc<R: rsbinder::DeathRecipient + 'sta
 pub fn rsbinder::Strong<I>::new(alloc::boxed::Box<I>) -> Self
 pub fn rsbinder::Strong<I>::try_into_async<P>(self) -> rsbinder::Result<rsbinder::Strong<<I as rsbinder::ToAsyncInterface<P>>::Target>> where I: rsbinder::ToAsyncInterface<P>
 pub fn rsbinder::Strong<I>::unlink_to_death_arc<R: rsbinder::DeathRecipient + 'static>(&self, &alloc::sync::Arc<R>) -> rsbinder::Result<()>
+impl rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal for rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
 impl rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
 pub fn rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
@@ -3487,6 +3695,8 @@ pub fn rsbinder::Strong<T>::deserialize_option(&mut rsbinder::Parcel) -> rsbinde
 pub fn rsbinder::Strong<T>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::FromIBinder: rsbinder::Interface
 pub fn rsbinder::FromIBinder::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<Self>>
+impl rsbinder::FromIBinder for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback
 pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback
@@ -3495,6 +3705,8 @@ impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServ
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>>
 impl rsbinder::FromIBinder for dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController
 pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>>
+impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>
+pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>
 pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>
@@ -3550,6 +3762,9 @@ pub fn rsbinder::ProxyHandle::was_parceled(&self) -> bool
 pub trait rsbinder::Interface: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Interface::as_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::Interface::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+impl rsbinder::Interface for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 impl rsbinder::Interface for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::as_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
@@ -3604,6 +3819,9 @@ pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithM
 pub trait rsbinder::Proxy: core::marker::Sized + rsbinder::Interface
 pub fn rsbinder::Proxy::descriptor() -> &'static str
 pub fn rsbinder::Proxy::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
+impl rsbinder::Proxy for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal where rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
 impl rsbinder::Proxy for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback where rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::descriptor() -> &'static str
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
@@ -3620,6 +3838,10 @@ pub trait rsbinder::Remotable: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Remotable::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Remotable::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::Remotable::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
@@ -3652,6 +3874,8 @@ pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 pub trait rsbinder::Serialize
 pub fn rsbinder::Serialize::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Serialize for (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + '_) where dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal: rsbinder::Interface
+pub fn (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + '_)::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + '_) where dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback: rsbinder::Interface
 pub fn (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + '_)::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for (dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + '_) where dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback: rsbinder::Interface
@@ -3712,6 +3936,8 @@ impl rsbinder::Serialize for u64
 pub fn u64::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for u8
 pub fn u8::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<P: rsbinder::BinderAsyncPool> rsbinder::Serialize for (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> + '_)
+pub fn (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> + '_)::serialize(&self, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::Serialize for (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> + '_)
 pub fn (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> + '_)::serialize(&self, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::Serialize for (dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> + '_)
@@ -3786,6 +4012,8 @@ impl<T: rsbinder::SerializeOption> rsbinder::SerializeArray for core::option::Op
 pub fn core::option::Option<T>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::SerializeOption: rsbinder::Serialize
 pub fn rsbinder::SerializeOption::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeOption for (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + '_)
+pub fn (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + '_)
 pub fn (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for (dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + '_)
@@ -3834,6 +4062,8 @@ impl rsbinder::SerializeOption for u64
 pub fn u64::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for u8
 pub fn u8::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<P: rsbinder::BinderAsyncPool> rsbinder::SerializeOption for (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> + '_)
+pub fn (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::SerializeOption for (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> + '_)
 pub fn (dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::SerializeOption for (dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> + '_)
@@ -3859,6 +4089,8 @@ pub fn rsbinder::ServiceSpecificError::code(&self) -> i32
 pub fn rsbinder::ServiceSpecificError::from_code(i32) -> core::option::Option<Self>
 pub trait rsbinder::ToAsyncInterface<P> where Self: rsbinder::Interface, Self::Target: rsbinder::FromIBinder
 pub type rsbinder::ToAsyncInterface::Target: ?core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::ToAsyncInterface<P> for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub type dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::Target = dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::ToAsyncInterface<P> for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback
 pub type dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback::Target = dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::ToAsyncInterface<P> for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback
@@ -3869,6 +4101,8 @@ impl<P: rsbinder::BinderAsyncPool> rsbinder::ToAsyncInterface<P> for dyn rsbinde
 pub type dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController::Target = dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>
 pub trait rsbinder::ToSyncInterface where Self: rsbinder::Interface, Self::Target: rsbinder::FromIBinder
 pub type rsbinder::ToSyncInterface::Target: ?core::marker::Sized
+impl<P: rsbinder::BinderAsyncPool> rsbinder::ToSyncInterface for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>
+pub type dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>::Target = dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
 impl<P: rsbinder::BinderAsyncPool> rsbinder::ToSyncInterface for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>
 pub type dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>::Target = dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback
 impl<P: rsbinder::BinderAsyncPool> rsbinder::ToSyncInterface for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>

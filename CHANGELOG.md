@@ -152,6 +152,25 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **Cooperative cancellation** — `cancel::CancellationSignal`,
+  `cancel::CancellationToken` and `cancel::cancel_remote`, over a vendored
+  `android.os.ICancellationSignal`. A service makes a signal per operation,
+  returns `create_transport()` to the caller, and watches
+  `token.is_canceled()` (or, with the `tokio` feature,
+  `token.canceled().await`); the caller sends the `oneway cancel()` through the
+  transport binder. Since the descriptor is AOSP's, a framework client can
+  cancel an rsbinder service and rsbinder can cancel one of theirs — both
+  directions are covered by a STAGE3 harness against real `libbinder`.
+
+  Only this direction exists: the service creates, the caller cancels. The
+  mirror image makes every poll a transaction back to the caller, and on the
+  RPC stack it would require the client to have opened incoming connections.
+  Two properties worth reading the module docs for — what a cancellation
+  *means* is the service's to decide (as it is in AOSP, which throws
+  `OperationCanceledException` from the service), and delivery is both
+  best-effort and unordered against your other calls, because the transport is
+  a different binder object than the service and the kernel orders a `oneway`
+  to one against a twoway to the other not at all.
 - **Service-specific errors can be a type instead of an `i32`** —
   `ServiceSpecificError` (trait), `Status::service_specific` and
   `Status::service_error::<T>()`, with `#[derive(ServiceSpecificError)]` for a

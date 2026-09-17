@@ -86,4 +86,17 @@ fn main() {
         .output(PathBuf::from("permission_controller.rs"))
         .generate()
         .unwrap();
+
+    // Plan 10-5: the AOSP cancellation idiom. One AIDL, unchanged since
+    // 2012, so it lives beside IPermissionController rather than in the
+    // versioned trees. rsbinder implements **both** sides of this one —
+    // a service hands out a transport (`cancel::CancellationSignal`) and
+    // a client cancels through the generated proxy.
+    new_builder()
+        .source(PathBuf::from(
+            "aidl/cancel/android/os/ICancellationSignal.aidl",
+        ))
+        .output(PathBuf::from("cancellation_signal.rs"))
+        .generate()
+        .unwrap();
 }

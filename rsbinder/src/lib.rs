@@ -311,6 +311,13 @@ pub mod hub;
 /// AOSP-faithful surface and fail-closed `check_permission` helper.
 pub mod permission_controller;
 
+// Cooperative cancellation (`android.os.ICancellationSignal`): a service
+// hands out a transport binder, the caller cancels through it. Kept as a
+// plain (non-doc) comment for the same reason as `entry` below: an outer
+// doc here merges with the module's inner `//!` docs and re-resolves
+// their intra-doc links at the crate root, breaking them.
+pub mod cancel;
+
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;

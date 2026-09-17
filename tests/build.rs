@@ -194,6 +194,16 @@ fn main() {
             .generate()
             .unwrap();
 
+        // Plan 10-5: a service that hands out a cancellation transport,
+        // for `tests/cancel_rpc.rs`. The kernel half of the same
+        // mechanism is driven by `tests/scripts/run_cancel_ac.sh`
+        // against `cancel_probe`, which needs two processes.
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/canceldemo/ICancelDemo.aidl"))
+            .output(PathBuf::from("cancel_demo.rs"))
+            .generate()
+            .unwrap();
+
         // Plan 2-19 P3: the `.aidl` half of the macro interop test
         // (`tests/macro_cross.rs`), which declares the same interface as a
         // Rust trait and calls in both directions.
