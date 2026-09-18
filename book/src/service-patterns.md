@@ -352,7 +352,10 @@ fn start_export(&self, path: &str) -> rsbinder::BinderResult<Strong<dyn ICancell
 }
 ```
 
-The caller cancels with the binder it got back:
+The caller cancels through the binder it got back. A typed proxy calls
+`transport.cancel()?` directly. A method that returns a bare `IBinder` hands
+the caller an `SIBinder`, which `cancel_remote` takes without compiling the
+interface a second time:
 
 ```rust
 rsbinder::cancel::cancel_remote(&transport)?;

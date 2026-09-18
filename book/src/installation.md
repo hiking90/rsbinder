@@ -103,30 +103,33 @@ Add the following configuration to your Cargo.toml file:
 
 ```toml
 [dependencies]
-rsbinder = "0.11"
+rsbinder = "0.12"
 async-trait = "0.1"
 env_logger = "0.11"  # Optional: for logging
 
 [build-dependencies]
-rsbinder-aidl = "0.11"
+rsbinder-aidl = "0.12"
 ```
 
 ### Feature flags
 
 ```toml
-rsbinder = "0.11"                                          # default: tokio async
-rsbinder = { version = "0.11", default-features = false }   # synchronous only
-rsbinder = { version = "0.11", features = ["rpc", "macros"] }
+rsbinder = "0.12"                                          # default: tokio async
+rsbinder = { version = "0.12", default-features = false }   # synchronous only
+rsbinder = { version = "0.12", features = ["rpc", "macros"] }
 ```
 
-- `tokio` (default) — full tokio async runtime support (implies `async`).
+- `tokio` (default) — Tokio integration (implies `async`). It enables only
+  `tokio/rt`, `rt-multi-thread` and `sync`; declare `macros`, `time`, `net`
+  and the rest on your own `tokio` dependency.
 - `async` — async-trait support without tokio, for a different runtime.
 - `rpc` — the RPC transport (binder-over-socket). Add `rpc-vsock`, `rpc-tls`,
   or `rpc-tcp-debug` for the matching backend. See
   [RPC Transport](./rpc-transport.md).
 - `macros` — `#[rsbinder::interface]` and the `Parcelable` / `BinderEnum`
   derives: an interface as a Rust trait, with no `.aidl` file and no
-  `build.rs`. See [Interface Macros](./interface-macros.md).
+  `build.rs`. See [Interface Macros](./interface-macros.md). Also the
+  `ServiceSpecificError` derive (see [Error Handling](./error-handling.md)).
 - `android_*` — Android version compatibility (see
   [Android Development](./android.md)).
 

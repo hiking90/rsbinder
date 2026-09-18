@@ -94,6 +94,13 @@ fn authorize() -> rsbinder::BinderResult<()> {
 }
 ```
 
+The arm is the transport of the transaction being served now, not of the one
+that started the thread. An RPC handler that makes an outgoing kernel call can
+have a kernel transaction dispatched inside it (binder's nested IPC); inside
+that inner handler `calling_caller()` is `Caller::Kernel`, and the uid, pid
+and `sid` getters report the kernel caller, until the inner transaction
+returns.
+
 `Caller` and `PeerIdentity` are `#[non_exhaustive]`, so the compiler forces
 a catch-all arm — which nudges you toward a fail-closed default.
 

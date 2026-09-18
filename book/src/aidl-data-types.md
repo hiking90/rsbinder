@@ -19,7 +19,7 @@ The following table shows how AIDL primitive types map to Rust types. Input para
 | @utf8InCpp String | &str | — (not allowed) | Same mapping in rsbinder |
 | T[] | &[T] | &mut Vec\<T\> | |
 | @nullable T | Option\<&T\> | &mut Option\<T\> | A nullable `String` input is `Option<&str>` |
-| @nullable T[] | Option\<&[T]\> | &mut Option\<Vec\<T\>\> | For a primitive or enum element. A non-primitive element keeps its own `Option`: `&mut Option<Vec<Option<T>>>` |
+| @nullable T[] | Option\<&[T]\> | &mut Option\<Vec\<T\>\> | For a primitive or enum element. A non-primitive element keeps its own `Option` in both directions: `Option<&[Option<T>]>` and `&mut Option<Vec<Option<T>>>` (a fixed-size `in` array keeps its elements bare) |
 | IBinder | &SIBinder | &mut Option\<SIBinder\> | |
 | ParcelFileDescriptor | &ParcelFileDescriptor | &mut Option\<ParcelFileDescriptor\> | |
 | An interface | &Strong\<dyn I\> | &mut Option\<Strong\<dyn I\>\> | |

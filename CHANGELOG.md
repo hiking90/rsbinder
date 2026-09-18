@@ -13,7 +13,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-### Migrating
+## [0.12.0] - 2026-09-19
+
+### Migrating from 0.11.0
 
 - **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). The variant
   is a struct variant without `#[non_exhaustive]`, so a struct literal that
@@ -137,9 +139,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
   whether or not the field is `@nullable` — the field has no value to start
   from, so the wrapping applies to the whole field and not only to an array
   slot, and here that `Option<_>` is AIDL's `@nullable` field.
-- **`rsbinder-aidl` now rejects a duplicate method name in an interface.** The
-  second declaration used to collapse into the first, so the method vanished
-  and every transaction code after it shifted — silently, on both ends.
 - **The `tokio` feature no longer enables `tokio/full`.** It now enables
   `tokio/rt` and `tokio/rt-multi-thread`, which is everything the library uses
   (`spawn_blocking`, `Handle`, and `block_in_place` in the async
@@ -192,8 +191,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **`Parcel::write_blob` / `read_blob`** — AOSP's convention for a large byte
   payload: inline when it is at most `BLOB_INPLACE_LIMIT` (16 KB), through a
   shared-memory region when it is larger, with the form recorded on the wire as
-  a tag the reader follows. Byte-compatible with C++ `Parcel::writeBlob` and
-  Java `Parcel.writeBlob`, so a framework peer reads what rsbinder wrote.
+  a tag the reader follows. The bytes are Java's `Parcel.writeBlob` — an int32
+  length, then what C++ `Parcel::writeBlob` writes — so a Java peer reads what
+  rsbinder wrote, and a C++ peer does by reading the length before
+  `Parcel::readBlob(len, …)`, as the JNI layer does.
 
   The region is a memfd, which AOSP's reader accepts: libcutils' `ashmem_valid`
   answers yes for a `/memfd:` link and takes the size from `fstat`, and an
@@ -467,6 +468,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   feature only. The floor is in the manifest, not just the lockfile: a library's
   `Cargo.lock` does not constrain its consumers, so a `version = "0.23"` floor
   would have left a downstream free to resolve a vulnerable 0.23.x.
+
+## [0.11.0] - 2026-09-10
 
 ### Migrating from 0.10.0
 
@@ -2498,7 +2501,8 @@ A large body of correctness work from multiple review and audit rounds
 - Addressed RUSTSEC-2025-0134 by replacing `rustls-pemfile` with
   `rustls-pki-types`.
 
-[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/hiking90/rsbinder/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/hiking90/rsbinder/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hiking90/rsbinder/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hiking90/rsbinder/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/hiking90/rsbinder/compare/v0.8.0...v0.9.0

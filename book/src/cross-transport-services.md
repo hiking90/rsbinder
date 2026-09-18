@@ -314,8 +314,8 @@ you commit:
 use rsbinder::TransportCaps;
 
 let client = rsbinder::Client::open("unix:///run/app.sock")?;
-// Fails here, naming the option that would fix it, instead of on the
-// first callback the server tries to make.
+// Fails here, logging which bits are missing and when each one holds,
+// instead of on the first callback the server tries to make.
 client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
 ```
 
@@ -339,7 +339,7 @@ Three things to keep straight.
 
 **Caps never replace the checks they summarize.** Skipping the check is
 not less safe; the fd write still refuses, the uid is still a sentinel.
-What you lose is being told early, and being told which option to change.
+What you lose is being told early, and being told when the missing bit holds.
 
 **`Endpoint::static_caps()` and the session's caps answer different
 questions.** The endpoint answers for the transport family; the session says

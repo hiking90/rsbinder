@@ -227,7 +227,8 @@ With a typed error the two checks collapse into one, because
 service-specific failure carrying one of `T`'s values:
 
 ```rust
-match service.lookup("k").unwrap_err().service_error::<LookupError>() {
+let status = service.lookup("k").unwrap_err();
+match status.service_error::<LookupError>() {
     Some(LookupError::NotFound) => { /* create it */ }
     Some(LookupError::Busy) => { /* retry later */ }
     // Also reached for a code this build does not know: a peer compiled
@@ -293,7 +294,9 @@ let status: rsbinder::Status = rsbinder::StatusCode::BadValue.into();
 // ExceptionCode -> Status
 let status: rsbinder::Status = rsbinder::ExceptionCode::IllegalArgument.into();
 
-// Status -> StatusCode (extracts the transport error code)
+// Status -> StatusCode: the code the status carries, or `FailedTransaction`
+// for an exception that carries none. A status built from
+// `ExceptionCode::ServiceSpecific` carries `ServiceSpecific(0)`.
 let code: rsbinder::StatusCode = status.into();
 ```
 

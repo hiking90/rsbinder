@@ -13,4 +13,17 @@ If you have not yet seen rsbinder running end-to-end, read [Hello, World!](./hel
 - **[Enum and Union](./aidl-enum-union.md)** — Backed enums (newtype structs in Rust, for wire-stable forward compatibility) and unions (tagged variants).
 - **[Annotations](./aidl-annotations.md)** — `@RustDerive`, `@nullable`, `@Backing`, `@JavaDerive`-equivalents, and the other annotations the Rust backend honors.
 
-Read them in that order the first time; *Annotations* is a reference to come back to when the generated Rust does not look the way you expected. Then move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.
+Read them in that order the first time; *Annotations* is a reference to come back to when the generated Rust does not look the way you expected.
+
+## What the compiler rejects
+
+`rsbinder-aidl` rejects the `.aidl` that AOSP's `aidl` rejects, so a contract written here also builds for the other backends. Each diagnostic names the rule. Besides the `@FixedSize` and `@VintfStability` rules in [Annotations](./aidl-annotations.md), it rejects:
+
+- `ParcelableHolder` anywhere but a parcelable field: as a method argument or return type, a union member, an array or `List` element, or `@nullable`.
+- `void` anywhere but a method return type.
+- A `union` with no fields (`const` members do not count).
+- A duplicate method name in an interface, or a duplicate argument name in a method.
+- A type argument on a type that takes none (`String<int>`, `IBinder<T>`).
+- A `const` whose type is not a primitive, a `String`, or an array of those.
+
+rsbinder keeps `boolean`, `char` and array constants, which AOSP refuses. Then move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.

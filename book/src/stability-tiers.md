@@ -70,7 +70,8 @@ tweaks; wire formats are already locked.
   `#[rsbinder::interface]`, `#[derive(Parcelable)]`, `#[derive(BinderEnum)]`.
   Feature-gated but **not** Experimental: the emitted code is byte-for-byte
   the `.aidl` code, so the wire is whatever `.aidl` already guarantees. Only
-  the Rust-facing spelling is provisional. See
+  the Rust-facing spelling is provisional; 0.12.0 narrowed it to what `.aidl`
+  renders and added `#[nonnull]` and `#[deprecated]`. See
   [Interface Macros](./interface-macros.md).
 - **Shared memory (new in 0.11.0)** — `SharedMemory`, `MemoryHeapBase`,
   `MappedHeap`, `MemoryDealer`, `HeapCache`, and the `IMemory` / `IMemoryHeap`
@@ -86,6 +87,26 @@ tweaks; wire formats are already locked.
 - **`lazy_service` (new in 0.11.0)** — `LazyServiceRegistrar` and the AOSP
   `registerService` / client-callback lifecycle, gated against Android's own
   `servicemanager`.
+- **Receive mapping size (new in 0.12.0)** — `ProcessState::init_with_mmap_size`,
+  `binder://?mmap=`, `ClientOptions::mmap_size` / `ServeOptions::mmap_size`.
+  The size is local to the receiving process and nothing about it crosses the
+  wire.
+- **`TransportCaps` (new in 0.12.0)** — `Client::caps()`, `RpcSession::caps()`,
+  `Endpoint::static_caps()`, `calling_caps()`. Each bit is derived from a
+  check another type still performs, so the set of bits is what may grow.
+- **Cancellation (new in 0.12.0)** — the `cancel` module over AOSP's
+  `android.os.ICancellationSignal`, STAGE3-gated against real `libbinder` in
+  both directions.
+- **Typed service-specific errors (new in 0.12.0)** — `ServiceSpecificError`,
+  `#[derive(ServiceSpecificError)]`, `impl_service_specific_error!`,
+  `Status::service_specific`, `Status::service_error`, `Status::message`. The
+  code on the wire is the `i32` AOSP writes; only the Rust mapping is new.
+- **Large payloads and pipes (new in 0.12.0)** — `Parcel::write_blob` /
+  `read_blob` (AOSP's blob wire, inline up to 16 KB and a memfd region above),
+  `ParcelFileDescriptor::pipe()` and its `Read` / `Write` impls.
+- **Awaitable lookups and death (new in 0.12.0, `tokio` feature)** —
+  `wait_for_interface_async`, `check_interface_async`, `death_signal` /
+  `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **AIDL compiler, beyond the Stable entry points** —
   `Builder::{dest_dir, hash}` and the public `render` module, the seam
   `rsbinder-macros` plugs into. Its input structs are `#[non_exhaustive]`, so
