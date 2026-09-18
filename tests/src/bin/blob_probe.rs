@@ -19,6 +19,9 @@
 //! RESULT blob <bytes> ERROR <detail>
 //! ```
 //!
+//! Exit 0 on the blob asked for, 1 otherwise — the convention the C++
+//! half already follows.
+//!
 //! The wire contract is shared with
 //! `example-hello/cpp/blob_interop.cpp`: descriptor
 //! "rsbinder.test.blob.IProbe", code 1 = GET (request: int32 length;
@@ -84,7 +87,9 @@ fn serve(name: &str) -> Result<()> {
     server.run()
 }
 
-fn read(name: &str, len: usize) -> Result<()> {
+/// `Ok(false)` = the peer answered, but not with the blob asked for; the
+/// caller turns that into a non-zero exit, as the C++ half does.
+fn read(name: &str, len: usize) -> Result<bool> {
     let binder = rsbinder::Client::open("binder://")
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
@@ -102,7 +107,7 @@ fn read(name: &str, len: usize) -> Result<()> {
     let blob = reply.read_blob()?;
     if blob.len() != len {
         println!("RESULT blob {len} ERROR length={}", blob.len());
-        return Ok(());
+        return Ok(false);
     }
     let form = if blob.inline().is_some() {
         "INLINE"
@@ -112,10 +117,10 @@ fn read(name: &str, len: usize) -> Result<()> {
     let bytes = blob.to_vec()?;
     if bytes != pattern(len) {
         println!("RESULT blob {len} ERROR payload-mismatch");
-        return Ok(());
+        return Ok(false);
     }
     println!("RESULT blob {len} {form} {}", checksum(&bytes));
-    Ok(())
+    Ok(true)
 }
 
 fn main() {
@@ -125,17 +130,28 @@ fn main() {
         eprintln!("usage: blob_probe serve <name> | read <name> <bytes>");
         std::process::exit(2)
     };
-    let r = match args.get(1).map(String::as_str) {
-        Some("serve") if args.len() == 3 => serve(&args[2]),
-        Some("read") if args.len() == 4 => match args[3].parse() {
-            Ok(len) => read(&args[2], len),
-            Err(_) => usage(),
-        },
+    match args.get(1).map(String::as_str) {
+        Some("serve") if args.len() == 3 => {
+            if let Err(e) = serve(&args[2]) {
+                eprintln!("blob_probe: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        Some("read") if args.len() == 4 => {
+            let len = match args[3].parse() {
+                Ok(len) => len,
+                Err(_) => usage(),
+            };
+            match read(&args[2], len) {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    println!("RESULT blob {len} ERROR {e:?}");
+                    eprintln!("blob_probe: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => usage(),
-    };
-    if let Err(e) = r {
-        println!("RESULT blob ERROR {e:?}");
-        eprintln!("blob_probe: {e:?}");
-        std::process::exit(1);
     }
 }

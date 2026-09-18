@@ -16,8 +16,8 @@
 //! `caps_do_not_replace_the_write_time_check`.
 //!
 //! Third, the split `require` draws: a requirement is met only when every
-//! bit is present, and the refusal names the absent bits only. That is
-//! `require_reports_the_missing_bits_only`.
+//! bit is present, so one absent bit out of two is still a refusal. That
+//! is `require_refuses_a_partially_satisfied_requirement`.
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`: most cases need a
 //! live session, and the `Endpoint` rows — the kernel one included — are
@@ -234,6 +234,27 @@ fn mem_transport_is_a_local_peer_that_carries_no_fds() {
         .expect("negotiate");
     assert_eq!(agreed, FileDescriptorTransportMode::None);
     assert_eq!(client.caps(), TRUST_HOST);
+
+    // Now the other half of the conjunction: let the negotiation agree
+    // `Unix`, so only the transport's own answer is left to keep the bit
+    // away. This is the guard a vsock/TLS session needs — a mode it can
+    // reach over a transport that fails every fd send.
+    server
+        .session
+        .set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+    let agreed = client
+        .negotiate_fd_transport(FileDescriptorTransportMode::Unix)
+        .expect("negotiate");
+    assert_eq!(agreed, FileDescriptorTransportMode::Unix);
+    assert_eq!(
+        client.fd_transport_mode(),
+        FileDescriptorTransportMode::Unix
+    );
+    assert_eq!(
+        client.caps(),
+        TRUST_HOST,
+        "a transport that carries no fds must not gain FD_PASSING from the mode alone"
+    );
     drop(server);
     drop(client);
 }
@@ -318,7 +339,8 @@ fn caps_do_not_replace_the_write_time_check() {
 /// **The positive `CALLBACKS` case.** A client that opened an incoming
 /// connection can be called back, and the bit appears on *both* ends —
 /// they are the two ends of the same connection. The founding connection
-/// alone never grants it, which the assertions before the attach pin.
+/// alone never grants it, which `a_session_without_callback_connections_refuses_up_front`
+/// and `outgoing_connections_do_not_grant_callbacks` pin.
 #[test]
 fn incoming_connections_grant_callbacks_on_both_ends() {
     use rsbinder::rpc::{RpcServer, RpcUnixClientConfig};
@@ -377,12 +399,12 @@ fn incoming_connections_grant_callbacks_on_both_ends() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// `require` names the missing bits and the transport, so the log line is
-/// the fix rather than a restatement. The message is not an API contract;
-/// what is pinned here is that a partially-satisfied requirement fails —
-/// and reports only what is absent.
+/// A requirement holds only when every bit is present. The log line
+/// `require` writes names the missing bits and the transport, but the
+/// message is not an API contract; what is pinned here is that a
+/// partially-satisfied requirement fails.
 #[test]
-fn require_reports_the_missing_bits_only() {
+fn require_refuses_a_partially_satisfied_requirement() {
     let unix_no_fds = TRUST_HOST;
     let missing = (TransportCaps::FD_PASSING | TransportCaps::CALLBACKS).difference(unix_no_fds);
     assert_eq!(
@@ -435,6 +457,9 @@ fn outgoing_connections_do_not_grant_callbacks() {
     let observed = Arc::new(Mutex::new(None));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
+    // fan-out is min(local, remote); the server default of 1 silently folds
+    // outgoing_connections(2) into a single-connection session.
+    server.set_max_threads(2);
     server
         .set_root(BnRpcCaller::new_binder(CapsSvc(Arc::clone(&observed))).as_binder())
         .expect("set_root");
@@ -444,6 +469,11 @@ fn outgoing_connections_do_not_grant_callbacks() {
         RpcUnixClientConfig::path(&path, 2).outgoing_connections(2),
     )
     .expect("connect with a fan-out");
+    assert_eq!(
+        client.negotiated_max_threads(),
+        2,
+        "the second outgoing connection must exist for this case to mean anything"
+    );
 
     assert_eq!(
         client.caps(),

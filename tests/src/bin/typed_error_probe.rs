@@ -20,6 +20,9 @@
 //! RESULT typed <code> <TYPED name|UNTYPED code|ERROR detail>
 //! ```
 //!
+//! Exit 0 on a service-specific answer (`TYPED` or `UNTYPED`), 1
+//! otherwise — the convention the C++ half already follows.
+//!
 //! Hand-written on both sides rather than generated from `.aidl`,
 //! because what is under test is the `Status` header — the one part of a
 //! reply the generated code would otherwise hide.
@@ -101,7 +104,10 @@ fn serve(name: &str) -> Result<()> {
     server.run()
 }
 
-fn call(name: &str, code: i32) -> Result<()> {
+/// `Ok(false)` = the peer answered with something other than a
+/// service-specific error; the caller turns that into a non-zero exit,
+/// as the C++ half does.
+fn call(name: &str, code: i32) -> Result<bool> {
     let binder = rsbinder::Client::open("binder://")
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
@@ -115,7 +121,7 @@ fn call(name: &str, code: i32) -> Result<()> {
         Some(reply) => reply,
         None => {
             println!("RESULT typed {code} ERROR no-reply");
-            return Ok(());
+            return Ok(false);
         }
     };
     reply.set_data_position(0);
@@ -126,7 +132,7 @@ fn call(name: &str, code: i32) -> Result<()> {
             "RESULT typed {code} ERROR exception={:?}",
             status.exception_code()
         );
-        return Ok(());
+        return Ok(false);
     }
     match status.service_error::<ProbeError>() {
         // The typed read is the claim: the peer's `i32` came back as one
@@ -140,7 +146,7 @@ fn call(name: &str, code: i32) -> Result<()> {
         ),
     }
     eprintln!("typed_error_probe: message={:?}", status.message());
-    Ok(())
+    Ok(true)
 }
 
 fn main() {
@@ -150,16 +156,30 @@ fn main() {
         eprintln!("usage: typed_error_probe serve <name> | call <name> <code>");
         std::process::exit(2)
     };
-    let r = match args.get(1).map(String::as_str) {
-        Some("serve") if args.len() == 3 => serve(&args[2]),
-        Some("call") if args.len() == 4 => match args[3].parse() {
-            Ok(code) => call(&args[2], code),
-            Err(_) => usage(),
-        },
+    match args.get(1).map(String::as_str) {
+        Some("serve") if args.len() == 3 => {
+            if let Err(e) = serve(&args[2]) {
+                eprintln!("typed_error_probe: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        Some("call") if args.len() == 4 => {
+            let code = match args[3].parse() {
+                Ok(code) => code,
+                Err(_) => usage(),
+            };
+            match call(&args[2], code) {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    // The driving script discards stderr and judges the
+                    // stdout line, so a failed lookup has to say so there.
+                    println!("RESULT typed {code} ERROR {e:?}");
+                    eprintln!("typed_error_probe: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => usage(),
-    };
-    if let Err(e) = r {
-        eprintln!("typed_error_probe: {e:?}");
-        std::process::exit(1);
     }
 }

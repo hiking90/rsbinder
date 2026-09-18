@@ -14,7 +14,8 @@
 //! Any RPC scheme accepts `?profile=android13plus[-v<N>]` (the AOSP
 //! versioned wire, `N` = max `RPC_WIRE_PROTOCOL_VERSION`, default 2).
 //! The service name is the `#fragment` on every scheme; `binder://name`
-//! is a shorthand for `binder://#name`. Unknown query keys are rejected.
+//! is a shorthand for `binder://#name`. Unknown query keys are rejected,
+//! and so is a key given twice.
 
 use std::path::PathBuf;
 
@@ -149,6 +150,9 @@ pub fn parse(uri: &str) -> Result<Uri> {
     };
     let mut service = match fragment {
         Some("") => return Err(bad("empty `#service`", uri)),
+        // A raw `?` here is a query written after the fragment, which would
+        // otherwise be swallowed into the service name and never applied.
+        Some(f) if f.contains('?') => return Err(bad("`?query` must come before `#service`", uri)),
         Some(f) => Some(percent_decode_str(f, uri)?),
         None => None,
     };
@@ -162,6 +166,16 @@ pub fn parse(uri: &str) -> Result<Uri> {
             let (k, v) = kv
                 .split_once('=')
                 .ok_or_else(|| bad("query item is not `key=value`", uri))?;
+            let already_set = match k {
+                "driver" => driver.is_some(),
+                "threads" => threads.is_some(),
+                "mmap" => mmap_size.is_some(),
+                "profile" => wire_max_version.is_some(),
+                _ => false,
+            };
+            if already_set {
+                return Err(bad(&format!("duplicate query key `{k}`"), uri));
+            }
             match k {
                 "driver" if scheme == "binder" => {
                     driver = Some(PathBuf::from(percent_decode_str(v, uri)?))
@@ -337,6 +351,15 @@ mod tests {
         // Bytes only: a `4M` shorthand would have to be guessed at, and
         // this parser refuses what it does not know rather than guess.
         assert!(parse("binder://?mmap=4M").is_err());
+        // Last-value-wins would hand `kernel_init` the 4 KB and silently
+        // drop the 4 MB the caller also asked for.
+        assert!(parse("binder://?mmap=4194304&mmap=4096").is_err());
+        assert!(parse("binder://?threads=1&threads=2").is_err());
+        // A query after the fragment would become part of the service
+        // name and never be applied.
+        assert!(parse("binder://#svc?driver=/dev/x").is_err());
+        assert!(parse("unix:///tmp/x.sock#svc?profile=android13plus").is_err());
+        assert_eq!(p("binder://#a%3Fb").service.as_deref(), Some("a?b"));
         // The range itself is `ProcessState`'s to judge, at init time —
         // the parser only insists on a number.
         assert_eq!(

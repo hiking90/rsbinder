@@ -59,8 +59,8 @@
 //! cancels and then asks the service what it saw can be answered before
 //! the cancel is delivered; measured, that is not rare. Poll, or have
 //! the service report through the result of the operation being
-//! cancelled. (One RPC session serializes its transactions, so the same
-//! sequence happens to be ordered there — do not build on that.)
+//! cancelled. The RPC stack promises no order between the two either;
+//! the same rule holds on every transport.
 //!
 //! Spelling follows AOSP — `canceled` with one `l`, as in
 //! `CancellationSignal.isCanceled()` — everywhere in this module,
@@ -92,7 +92,7 @@ pub use android::os::ICancellationSignal::{
 struct Inner {
     canceled: AtomicBool,
     /// Taken out before it is called, which is both how "at most once"
-    /// is enforced and how the lock is kept off the user's callback (R6).
+    /// is enforced and how the lock is kept off the user's callback.
     on_cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "tokio")]
     notify: tokio::sync::Notify,
@@ -312,8 +312,29 @@ impl std::fmt::Debug for CancellationToken {
 /// Cancel through a transport binder a service handed back.
 ///
 /// The caller's half of the exchange, in one line. `binder` must be an
-/// `android.os.ICancellationSignal`; anything else is
-/// [`StatusCode::BadType`].
+/// `android.os.ICancellationSignal`.
+///
+/// How much of that is checked depends on what the binder already knows
+/// about itself. A binder whose interface is established — a kernel
+/// binder, which can ask the remote object for its descriptor, or an RPC
+/// proxy already cast to some interface — is refused with
+/// [`StatusCode::BadType`] when that interface is not
+/// `android.os.ICancellationSignal`. An RPC proxy whose interface has
+/// not been established yet cannot be checked at all: the RPC wire
+/// carries an address and no interface, so the descriptor is empty until
+/// something stamps it. Such a binder is accepted here, and the
+/// `oneway cancel()` that follows carries no reply — a server that
+/// refuses the interface token says so in its log, not to this caller.
+///
+/// **This call does not decide the proxy's interface.** For that
+/// unstamped RPC proxy the request is built and sent on the proxy
+/// itself rather than through a typed cast, because a cast stamps the
+/// descriptor once and for all (`OnceLock`) onto the proxy the
+/// per-address cache shares. Were it stamped here, a later
+/// [`FromIBinder::try_from`] to the interface the object really
+/// implements would fail with [`StatusCode::BadType`] for the rest of
+/// the process's life. So passing the wrong binder costs one wasted
+/// oneway, not the object.
 ///
 /// A method declared in `.aidl` as returning `ICancellationSignal` gives
 /// the caller a typed proxy it can call `cancel()` on directly — but
@@ -322,6 +343,28 @@ impl std::fmt::Debug for CancellationToken {
 /// way). Taking the transport as a bare `IBinder` and cancelling it with
 /// this function avoids compiling a second copy.
 pub fn cancel_remote(binder: &SIBinder) -> Result<()> {
+    let expected = <BpCancellationSignal as crate::Proxy>::descriptor();
+    let actual = binder.descriptor();
+    if actual.is_empty() {
+        // An RPC proxy off the wire, with no interface yet. Send on it
+        // directly: a typed cast would stamp it permanently.
+        #[cfg(feature = "rpc")]
+        if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            let data = rp.build_request(expected)?;
+            rp.transact(
+                android::os::ICancellationSignal::transactions::r#cancel,
+                &data,
+                crate::FLAG_ONEWAY | crate::FLAG_CLEAR_BUF | crate::FLAG_PRIVATE_LOCAL,
+            )?;
+            return Ok(());
+        }
+        log::error!("cancel_remote: a descriptor-less binder that is not an RPC proxy");
+        return Err(StatusCode::BadType);
+    }
+    if actual != expected {
+        log::error!("cancel_remote: not an {expected}: {actual}");
+        return Err(StatusCode::BadType);
+    }
     let signal: Strong<dyn ICancellationSignal> =
         FromIBinder::try_from(binder.clone()).map_err(|e| {
             log::error!("cancel_remote: not an android.os.ICancellationSignal: {e:?}");
@@ -424,9 +467,9 @@ mod tests {
                 let _ = tx.send(());
             }
         });
-        // No synchronization with the task reaching its await on
-        // purpose: cancelling before it gets there is exactly the race
-        // the register-before-check in `canceled` has to survive.
+        // No synchronization with the task reaching its await: the cancel
+        // almost always lands first, so what this pins is that a token
+        // already cancelled still wakes a waiter that arrives later.
         signal.cancel();
         rx.recv_timeout(Duration::from_secs(5))
             .expect("canceled() did not wake within 5s");

@@ -1616,6 +1616,14 @@ impl RpcServer {
                             );
                             return;
                         }
+                        Err(StatusCode::BadType) => {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: attach refused (transport differs \
+                                 from the session's founding connection)"
+                            );
+                            return;
+                        }
                         Err(e) => {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(

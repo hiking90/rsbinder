@@ -226,13 +226,15 @@ impl Status {
     /// The service-specific code as `E`, or `None` when this status does
     /// not carry one of `E`'s values.
     ///
-    /// `None` covers two different situations, and neither is an error
-    /// on its own: this status is not a service-specific failure at all
-    /// (a `Security` exception whose code happens to be `2` is not
-    /// `MyErr::Busy`), or it is one whose code `E` does not declare —
-    /// a peer built against a newer `.aidl`. Reach for
+    /// `None` when the exception is not
+    /// [`ExceptionCode::ServiceSpecific`], or when `E` does not declare
+    /// the code — a peer built against a newer `.aidl`. Reach for
     /// [`service_specific_error`](Self::service_specific_error) when the
     /// raw `i32` is what you need to log or forward.
+    ///
+    /// A status built from the bare [`ExceptionCode::ServiceSpecific`]
+    /// carries code `0`, as AOSP's
+    /// `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` does.
     ///
     /// ```
     /// # use rsbinder::*;
@@ -259,7 +261,10 @@ impl Status {
         if self.exception != ExceptionCode::ServiceSpecific {
             return None;
         }
-        E::from_code(self.service_specific_error())
+        let StatusCode::ServiceSpecific(code) = self.code else {
+            return None;
+        };
+        E::from_code(code)
     }
 
     pub fn is_ok(&self) -> bool {
@@ -286,14 +291,31 @@ impl Status {
         }
     }
 
-    /// The message a peer sent with this status, if any.
+    /// The message carried by this status, if any.
     ///
-    /// Present only when the sender supplied one: AOSP writes the string
-    /// for an exception and omits it for `EX_NONE` and
-    /// `EX_TRANSACTION_FAILED`, and this reports what arrived rather
-    /// than substituting anything for a missing one. [`Display`] already
-    /// folds it into a line for logging; this is for a caller that wants
-    /// the string itself.
+    /// What `None` means depends on where the status came from, because
+    /// the wire has no way to say "no message":
+    ///
+    /// - A status built locally reports exactly what was supplied, so
+    ///   `None` is the `None` that was passed in.
+    /// - An *exception* read from a parcel reports `Some("")` when the
+    ///   sender supplied no message: the serializer writes
+    ///   `message.unwrap_or("")`, as AOSP's C++ `Status` does, and a
+    ///   zero-length String16 reads back as an empty `String`. There,
+    ///   `None` arrives only from a peer that wrote a *null* string — in
+    ///   practice a Java peer throwing an exception with no detail
+    ///   message.
+    /// - An `EX_NONE` status carries no message field on the wire at all:
+    ///   `serialize` returns right after the exception code and
+    ///   `deserialize` reads none, so a successful status read from a
+    ///   parcel always reports `None`. The `EX_HAS_REPLY_HEADER` path,
+    ///   which folds to `EX_NONE`, is the same. `EX_TRANSACTION_FAILED`
+    ///   is never written either.
+    ///
+    /// Nothing is folded in either direction; callers that treat an
+    /// absent message and an empty one alike should test both.
+    /// [`Display`] already folds it into a line for logging; this is for
+    /// a caller that wants the string itself.
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
     }
@@ -355,6 +377,9 @@ impl From<ExceptionCode> for StatusCode {
     fn from(exception: ExceptionCode) -> Self {
         match exception {
             ExceptionCode::TransactionFailed => StatusCode::FailedTransaction,
+            // AOSP `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` carries
+            // code 0, and 0 is what the wire would read back anyway.
+            ExceptionCode::ServiceSpecific => StatusCode::ServiceSpecific(0),
             _ => StatusCode::Ok,
         }
     }
@@ -521,16 +546,10 @@ impl Deserialize for Status {
             let message: Option<String> = parcel.read::<Option<String>>()?;
 
             // AOSP `Status::readFromParcel` (frameworks/native/libs/binder/
-            // Status.cpp): capture the header start position and the
-            // available bytes BEFORE reading the size int32. The remote
-            // stack-trace header size is size-INCLUSIVE (it counts the
-            // 4-byte size field itself), so reposition to
-            // `header_start + size` — and ONLY when size != 0. size == 0
-            // (the native writer's "empty remote stack trace header") leaves
-            // the cursor right after the size field. The previous
-            // size-EXCLUSIVE arithmetic (`current_pos_after_read + size`)
-            // landed 4 bytes too far whenever a Java peer propagated a
-            // non-zero stack-trace header.
+            // Status.cpp): the remote stack-trace header size is
+            // size-INCLUSIVE, so the skip target is `header_start + size`,
+            // captured before the size int32 is read; `size == 0` means no
+            // header and leaves the cursor where it is.
             let header_start = parcel.data_position();
             let header_avail = parcel.data_avail();
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
@@ -590,7 +609,9 @@ mod tests {
 
     #[test]
     fn test_status() -> Result<()> {
-        let _status = Status::from(StatusCode::Unknown);
+        let status = Status::from(StatusCode::Unknown);
+        assert_eq!(status.exception_code(), ExceptionCode::TransactionFailed);
+        assert_eq!(status.transaction_error(), StatusCode::Unknown);
 
         Ok(())
     }
@@ -607,7 +628,10 @@ mod tests {
     // the i32 a status carries. (A `long`-backed one is not, and the
     // macro is what refuses it — see the trait's rustdoc.)
     crate::declare_binder_enum! {
-        SmallError : [i8; 1] {
+        SmallError : [i8; 2] {
+            // A declared 0: without it nothing here would notice a
+            // `service_error` that fell back to code 0.
+            NONE = 0,
             OFFLINE = -3,
         }
     }
@@ -638,6 +662,36 @@ mod tests {
         );
         assert_eq!(small.message(), None);
 
+        // The wire cannot say "no message": a `None` goes out as a
+        // zero-length String16 and reads back as `Some("")`. Only a null
+        // string (a Java peer) reads back as `None`.
+        let mut parcel = Parcel::new();
+        parcel.write(&small).expect("write status");
+        parcel.set_data_position(0);
+        let small_back: Status = parcel.read().expect("read status");
+        assert_eq!(small_back.message(), Some(""));
+        assert_eq!(
+            small_back.service_error::<SmallError>(),
+            Some(SmallError::OFFLINE)
+        );
+
+        // A bare service-specific exception carries code 0, as AOSP's
+        // `fromExceptionCode(EX_SERVICE_SPECIFIC)` does — the same answer
+        // before and after the wire.
+        let codeless = Status::from(ExceptionCode::ServiceSpecific);
+        assert_eq!(
+            codeless.service_error::<SmallError>(),
+            Some(SmallError::NONE)
+        );
+        let mut parcel = Parcel::new();
+        parcel.write(&codeless).expect("write status");
+        parcel.set_data_position(0);
+        let codeless_back: Status = parcel.read().expect("read status");
+        assert_eq!(
+            codeless_back.service_error::<SmallError>(),
+            Some(SmallError::NONE)
+        );
+
         // AC-4.2: a code the enum does not declare is not one of its
         // values, and the raw `i32` is still there to log or forward.
         let newer = Status::new_service_specific_error(9, None);
@@ -645,9 +699,9 @@ mod tests {
         assert_eq!(newer.service_specific_error(), 9);
 
         // AC-4.3: another exception that happens to carry the same
-        // number is not this error. `Security` keeps its code in
-        // `StatusCode`, so `service_specific_error()` reports 0 — the
-        // exception check is what makes the answer `None` either way.
+        // number is not this error. `service_specific_error()` still
+        // reports 2 here, so the exception check is the only thing that
+        // makes the answer `None`.
         let security = Status::new(
             ExceptionCode::Security,
             StatusCode::ServiceSpecific(2),
@@ -709,9 +763,7 @@ mod tests {
     // Regression: a non-zero, size-INCLUSIVE remote stack-trace header
     // (as a Java peer propagating an exception trace emits) must be skipped
     // by exactly `header_start + size` so the following EX_SERVICE_SPECIFIC
-    // code reads back correctly. The previous size-EXCLUSIVE arithmetic
-    // (`pos_after_size_read + size`) overshot by 4 bytes and desynced the
-    // cursor.
+    // code reads back correctly.
     #[test]
     fn deserialize_skips_nonzero_remote_stack_trace_header() {
         let mut parcel = Parcel::new();

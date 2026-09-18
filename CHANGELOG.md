@@ -31,6 +31,28 @@ This changelog starts at 0.9.0. For earlier releases, see the
   force, is unaffected — so a second `serve("binder://")` in one process still
   works. Code that called `serve` twice with different thread counts was not
   getting the second one; now it is told.
+- **A kernel setting given twice to `Client::open` must agree.**
+  `ClientOptions::driver` used to override a different `binder://?driver=`
+  without a word. The two — and `ClientOptions::mmap_size` against `?mmap=` —
+  are now `StatusCode::BadValue` when they differ, the same answer as for a key
+  repeated inside the URI. Giving the value once, or the same value twice, is
+  unaffected.
+- **An RPC session refuses a connection whose transport differs from its
+  founding one.** A later connection must match the first in whether it can
+  carry file descriptors and in whether its peer is local; one that does not
+  is dropped at attach (`BadType` on the server's attach path). Every
+  built-in setup path opens all of a session's connections over one transport
+  and is unaffected. What this rules out is a hand-assembled session — say a
+  Unix socket attached to a session founded over vsock through
+  `RpcServer::serve_connection` — whose `caps()` had no single right answer.
+- **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
+  `ServiceSpecific(0)`, not `Ok`.** A `Status` built from the bare exception
+  code therefore carries code `0` — what AOSP's
+  `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` carries and what the wire
+  always read back — instead of a local-only state that changed on its first
+  trip through a parcel. `service_specific_error()` returned `0` for it before
+  and still does; `StatusCode::from(status)` now yields `ServiceSpecific(0)`
+  where it yielded `FailedTransaction`.
 - **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects.** The
   new checks are listed under *Added*. Each one fires on a contract the AOSP
   compiler already refuses, so an `.aidl` that builds against both compilers is
@@ -176,7 +198,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   The region is a memfd, which AOSP's reader accepts: libcutils' `ashmem_valid`
   answers yes for a `/memfd:` link and takes the size from `fstat`, and an
   immutable blob carries `F_SEAL_FUTURE_WRITE` — the same seal AOSP's own memfd
-  path adds for `ashmem_set_prot_region(fd, PROT_READ)`.
+  path adds for `ashmem_set_prot_region(fd, PROT_READ)`. On a kernel that cannot
+  apply that seal (Linux before 5.1) an immutable blob goes inline instead of
+  out over a region a reader could write.
 
   Where a transport carries no file descriptors — vsock, TLS, or the
   session-less data-only parcel behind `to_bytes` — the payload goes inline
@@ -257,7 +281,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —
   inside a handler, for the call being served — `calling_caps()`.
   `caps.require(bits, "what for")` turns a missing capability
-  into `InvalidOperation` plus a log line naming the option that would grant it,
+  into `InvalidOperation` plus a log line saying when the missing bit holds,
   at setup rather than on the first transaction.
 
   It is a **summary, not a rule**: every bit is derived from a fact some other

@@ -2415,6 +2415,7 @@ pub fn rsbinder::rpc::transport::MemTransport::send_raw_with_fds(&self, &[u8], &
 pub fn rsbinder::rpc::transport::MemTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::MemTransport::supports_fd_passing(&self) -> bool
 impl !core::marker::Freeze for rsbinder::rpc::transport::MemTransport
 impl core::marker::Send for rsbinder::rpc::transport::MemTransport
 impl core::marker::Sync for rsbinder::rpc::transport::MemTransport
@@ -2443,6 +2444,7 @@ pub fn rsbinder::rpc::transport::UnixTransport::send_raw_with_fds(&self, &[u8], 
 pub fn rsbinder::rpc::transport::UnixTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::UnixTransport::supports_fd_passing(&self) -> bool
 impl !core::marker::Freeze for rsbinder::rpc::transport::UnixTransport
 impl core::marker::Send for rsbinder::rpc::transport::UnixTransport
 impl core::marker::Sync for rsbinder::rpc::transport::UnixTransport
@@ -2465,6 +2467,7 @@ pub fn rsbinder::rpc::transport::RpcTransport::send_raw_with_fds(&self, &[u8], &
 pub fn rsbinder::rpc::transport::RpcTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::RpcTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::RpcTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::RpcTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::describe(&self) -> &str
 pub fn rsbinder::rpc::transport::MemTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
@@ -2479,6 +2482,7 @@ pub fn rsbinder::rpc::transport::MemTransport::send_raw_with_fds(&self, &[u8], &
 pub fn rsbinder::rpc::transport::MemTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::MemTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::describe(&self) -> &str
 pub fn rsbinder::rpc::transport::UnixTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
@@ -2493,6 +2497,7 @@ pub fn rsbinder::rpc::transport::UnixTransport::send_raw_with_fds(&self, &[u8], 
 pub fn rsbinder::rpc::transport::UnixTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::UnixTransport::supports_fd_passing(&self) -> bool
 pub enum rsbinder::rpc::AddressSpace
 pub rsbinder::rpc::AddressSpace::Acceptor
 pub rsbinder::rpc::AddressSpace::Initiator
@@ -2913,6 +2918,7 @@ pub fn rsbinder::rpc::RpcTransport::send_raw_with_fds(&self, &[u8], &[std::os::f
 pub fn rsbinder::rpc::RpcTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::RpcTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::RpcTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::RpcTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::describe(&self) -> &str
 pub fn rsbinder::rpc::transport::MemTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
@@ -2927,6 +2933,7 @@ pub fn rsbinder::rpc::transport::MemTransport::send_raw_with_fds(&self, &[u8], &
 pub fn rsbinder::rpc::transport::MemTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::MemTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::describe(&self) -> &str
 pub fn rsbinder::rpc::transport::UnixTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
@@ -2941,6 +2948,7 @@ pub fn rsbinder::rpc::transport::UnixTransport::send_raw_with_fds(&self, &[u8], 
 pub fn rsbinder::rpc::transport::UnixTransport::set_read_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::set_write_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::shutdown(&self) -> rsbinder::rpc::RpcResult<()>
+pub fn rsbinder::rpc::transport::UnixTransport::supports_fd_passing(&self) -> bool
 pub type rsbinder::rpc::RpcResult<T> = core::result::Result<T, rsbinder::rpc::RpcError>
 pub mod rsbinder::shared_memory
 pub mod rsbinder::shared_memory::dealer

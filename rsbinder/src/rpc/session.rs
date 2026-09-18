@@ -880,6 +880,42 @@ struct ConnSlot {
 struct ConnState {
     slots: Vec<ConnSlot>,
     next_slot_id: u64,
+    /// The founding connection's traits; every later slot must match.
+    traits: ConnTraits,
+}
+
+/// What [`RpcSessionInner::caps`] reads off a connection. Fixed by the
+/// founding connection and enforced on every slot added after it, so the
+/// answer is a property of the session and not of whichever slot is asked
+/// — AOSP gets the same from one `RpcTransportCtxFactory` per `RpcServer`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ConnTraits {
+    passes_fds: bool,
+    local_peer: bool,
+}
+
+impl ConnTraits {
+    fn of(transport: &dyn RpcTransport) -> Self {
+        ConnTraits {
+            passes_fds: transport.supports_fd_passing(),
+            local_peer: transport.peer_identity().is_local(),
+        }
+    }
+}
+
+impl ConnState {
+    /// Whether `transport` may join this session's pool.
+    fn admits(&self, transport: &dyn RpcTransport) -> bool {
+        let traits = ConnTraits::of(transport);
+        if traits != self.traits {
+            log::error!(
+                "RPC: connection refused — its transport ({traits:?}) differs from the \
+                 session's founding connection ({:?})",
+                self.traits
+            );
+        }
+        traits == self.traits
+    }
 }
 
 /// RAII guard for one selected connection slot. Built by
@@ -1731,7 +1767,7 @@ impl RpcSessionInner {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         // Anti-resurrection gate — must share the push's critical section
         // (see this fn's rustdoc).
-        if self.shared.lifecycle.is_torn_down() {
+        if self.shared.lifecycle.is_torn_down() || !st.admits(&*transport) {
             return None;
         }
         let id = st.next_slot_id;
@@ -1771,6 +1807,10 @@ impl RpcSessionInner {
             >= cap
         {
             return Err(StatusCode::FailedTransaction);
+        }
+        // Before the bump, which a refusal would have to undo.
+        if !st.admits(&*transport) {
+            return Err(StatusCode::BadType);
         }
         if !self.shared.try_bump_live_conns() {
             return Err(StatusCode::DeadObject);
@@ -1842,6 +1882,7 @@ impl RpcSessionInner {
             .filter(|s| s.role == SlotRole::Outgoing)
             .count()
             >= cap
+            || !st.admits(&*transport)
         {
             return None;
         }
@@ -2230,35 +2271,16 @@ impl RpcSessionInner {
     /// This session's [`TransportCaps`](crate::TransportCaps) right now —
     /// see [`RpcSession::caps`] for what each bit means here.
     pub(crate) fn caps(&self) -> crate::TransportCaps {
-        // A session's connections all run to the same peer process, so
-        // the identity is a session property even though it is read off
-        // one transport. `None` only once the pool is empty, which is a
-        // session being torn down: no connection, no capabilities.
-        let peer = self
-            .conn_state
-            .lock()
-            .expect("conn_state poisoned")
-            .slots
-            .first()
-            .map(|s| s.transport.peer_identity());
-        match peer {
-            Some(p) => self.caps_with_peer(&p),
-            None => crate::TransportCaps::NONE,
-        }
-    }
-
-    /// [`caps`](Self::caps) for a caller that already holds the peer
-    /// identity — the dispatch path, which was handed the identity of the
-    /// very connection the transaction arrived on. Saves re-reading it
-    /// under the pool lock on every transaction, and is the more direct
-    /// answer besides.
-    pub(crate) fn caps_with_peer(&self, peer: &PeerIdentity) -> crate::TransportCaps {
         use crate::TransportCaps as C;
+        let traits = self.conn_state.lock().expect("conn_state poisoned").traits;
         let mut caps = C::NONE;
-        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+        // The negotiated mode alone is not enough: `Unix` fd mode is
+        // agreed without regard to the transport kind, so a vsock/TLS
+        // session can reach `Unix` and still fail every fd send.
+        if self.fd_mode() == FileDescriptorTransportMode::Unix && traits.passes_fds {
             caps |= C::FD_PASSING;
         }
-        if peer.is_local() {
+        if traits.local_peer {
             // A kernel-vouched uid, and the same kernel on both ends.
             caps |= C::TRUSTED_UID | C::SAME_HOST;
         }
@@ -3126,7 +3148,7 @@ impl RpcSessionInner {
         // callback. The value is a `Copy` `u32`, so the handler sees what
         // the call arrived over even if a connection comes or goes while
         // it runs.
-        let caps = self.caps_with_peer(&peer);
+        let caps = self.caps();
         // Plan 2-16 Phase B/C: stamp the caller's peer identity into the
         // RPC calling context for the duration of the user handler, so
         // `get_calling_uid()`/`get_calling_pid()` work over Unix RPC and
@@ -3517,6 +3539,7 @@ impl RpcSession {
             AddressSpace::Initiator => SlotRole::Outgoing,
             AddressSpace::Acceptor => SlotRole::Incoming,
         };
+        let traits = ConnTraits::of(&*transport);
         let founding = ConnSlot {
             transport: Arc::from(transport),
             exclusive_tid: None,
@@ -3531,6 +3554,7 @@ impl RpcSession {
             conn_state: Mutex::new(ConnState {
                 slots: vec![founding],
                 next_slot_id: 2,
+                traits,
             }),
             slot_cv: Condvar::new(),
             profile,
@@ -4064,21 +4088,27 @@ impl RpcSession {
     ///
     /// Where each bit comes from:
     ///
-    /// - `FD_PASSING` — the **negotiated** mode is `Unix`, not merely a
-    ///   Unix socket underneath. A session that never negotiated carries
-    ///   no fds, and
+    /// - `FD_PASSING` — the **negotiated** mode is `Unix` *and* the
+    ///   transport underneath can carry fds (`SCM_RIGHTS`, i.e. a
+    ///   Unix-domain socket). Both are required: a vsock or TLS session
+    ///   that negotiated `Unix` reports the bit as absent, because the
+    ///   send would fail in the transport, and so does a session that
+    ///   never negotiated.
     ///   [`Endpoint::static_caps`](crate::Endpoint::static_caps) is the
     ///   one that answers "could it".
     /// - `TRUSTED_UID` and `SAME_HOST` — the peer is
     ///   [`PeerIdentity::Local`], the
     ///   same test [`get_calling_uid`](crate::get_calling_uid) applies.
     /// - `CALLBACKS` — this session holds at least one callback
-    ///   connection, so calls cross in both directions. Those are the
-    ///   connections opened with
-    ///   [`RpcUnixClientConfig::incoming_connections`], counted from
-    ///   whichever end asks. A default one-connection session reports it
-    ///   on neither end.
+    ///   connection, so calls cross in both directions. A default
+    ///   one-connection session reports it on neither end.
     /// - `KERNEL_KNOBS` — never; this is a socket.
+    ///
+    /// The transport-derived bits are the same for every connection of
+    /// the session, so [`calling_caps`](crate::calling_caps) in a handler
+    /// gives this same answer. A session refuses a further connection
+    /// whose transport differs from its founding one in fd capability or
+    /// peer locality.
     pub fn caps(&self) -> crate::TransportCaps {
         self.inner.caps()
     }
@@ -5971,6 +6001,38 @@ mod tests {
             "no slot may be pushed onto a torn-down session"
         );
         assert_eq!(session.inner.slot_count(), 0, "the dead pool stays empty");
+    }
+
+    /// `caps` answers for the session from its founding connection, which
+    /// holds only while no later slot differs: a fd-carrying Unix socket
+    /// may not join a session founded on a transport that carries none.
+    #[test]
+    fn slot_of_a_different_transport_kind_is_refused() {
+        use crate::rpc::transport::{MemTransport, UnixTransport};
+        let (t0, _p0) = MemTransport::pair();
+        let codec = Android13PlusCodec::android14_15();
+        let session = RpcSession::from_android13plus(Box::new(t0), codec, FD_MODE_NONE, false)
+            .expect("build session");
+
+        let (u, _pu) = UnixTransport::pair().expect("socketpair");
+        assert!(session.inner.add_outgoing_slot(Box::new(u)).is_none());
+        let (u, _pu) = UnixTransport::pair().expect("socketpair");
+        assert!(session
+            .inner
+            .add_slot_inner_capped(Box::new(u), 2, false)
+            .is_none());
+        let (u, _pu) = UnixTransport::pair().expect("socketpair");
+        assert_eq!(
+            session.inner.add_incoming_slot_capped(Box::new(u), 2),
+            Err(StatusCode::BadType)
+        );
+        assert_eq!(session.inner.slot_count(), 1, "only the founding slot");
+
+        let (m, _pm) = MemTransport::pair();
+        assert!(
+            session.inner.add_outgoing_slot(Box::new(m)).is_some(),
+            "a slot of the founding kind still joins"
+        );
     }
 
     /// A proxy minted by one session names a node in *that* peer's address

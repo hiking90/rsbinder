@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | linux / android | `memfd_create(MFD_CLOEXEC \| MFD_ALLOW_SEALING)` | `F_SEAL_GROW \| F_SEAL_SHRINK` (+`F_SEAL_FUTURE_WRITE` for read-only, +`F_SEAL_SEAL` unless [`FLAG_MEMFD_ALLOW_SEALING`]) — the AOSP `MemoryHeapBase::FORCE_MEMFD` path |
 //! | macos | `shm_open` + immediate `shm_unlink` (two fds: `O_RDWR` for the owner, `O_RDONLY` to export) | kernel-inherent: a POSIX shm object accepts exactly **one** `ftruncate` (≡ `F_SEAL_GROW \| F_SEAL_SHRINK`), and an `O_RDONLY` fd refuses `PROT_WRITE` mappings and `mprotect` upgrades (≡ `F_SEAL_FUTURE_WRITE`). See `plan/4-7b-macos-shared-memory.md` |
-//! | other | unsupported — every constructor returns `InvalidOperation` | — |
+//! | other | no backing store — every [`MemoryHeapBase`] constructor returns `InvalidOperation`, and [`is_supported`] is `false`. The receiver side is not all gone: see [`MappedHeap::from_fd`] | — |
 //!
 //! The owner mapping is always created *before* seals are applied so
 //! that `F_SEAL_FUTURE_WRITE` leaves the owner's own mapping writable,
@@ -417,6 +417,12 @@ pub(super) fn is_read_only_fd<F: AsFd>(fd: F) -> bool {
     backend::is_read_only_fd(fd)
 }
 
+/// Effective protections (`SEAL_*` bits) of a bare fd, before any
+/// mapping exists — the fd-level form of [`MappedHeap::seals`].
+pub(crate) fn fd_seals(fd: &OwnedFd) -> Option<u32> {
+    backend::get_seals(fd)
+}
+
 /// Whether this build has a shared-memory backing store at all.
 pub const fn is_supported() -> bool {
     cfg!(any(
@@ -602,9 +608,22 @@ impl MappedHeap {
     /// must fit inside the fd's `st_size`; the one fd kind that reports
     /// `0` yet backs a region — a legacy `/dev/ashmem` fd — is trusted
     /// only after it is verified to *be* ashmem. Any other zero-length
-    /// fd (a memfd the sender never `ftruncate`d, say) is refused: the
-    /// `mmap` past EOF would succeed and the first access would `SIGBUS`
-    /// this process on the peer's behalf.
+    /// fd (a memfd the sender never `ftruncate`d, say) is refused
+    /// because an `st_size` of `0` on a non-ashmem fd carries no usable
+    /// size information.
+    ///
+    /// That check is not a shrink defence — a non-zero fd the peer
+    /// `ftruncate`s after this call still `SIGBUS`es on the next access.
+    /// [`from_fd_strict`](Self::from_fd_strict) is the opt-in that
+    /// demands the sender sealed against it.
+    ///
+    /// This constructor works on every unix target, including the ones
+    /// with no backing store of their own (the `other` row of the table
+    /// in this module's docs): it only needs `fstat` and `mmap`, never
+    /// the backend. There [`is_supported`] is `false` and
+    /// [`from_fd_strict`](Self::from_fd_strict) returns
+    /// `InvalidOperation` because the fd's seals cannot be read, while
+    /// this call still maps.
     pub fn from_fd(fd: OwnedFd, size: usize, offset: usize, flags: u32) -> Result<Self> {
         if size == 0 || offset % page_size() != 0 {
             return Err(StatusCode::BadValue);
@@ -636,9 +655,21 @@ impl MappedHeap {
     /// [`from_fd`](Self::from_fd) plus protection verification: the fd
     /// must be shrink-protected, and a [`FLAG_READ_ONLY`] heap must
     /// also be write-protected (`F_SEAL_WRITE` / `F_SEAL_FUTURE_WRITE`
-    /// on Linux/Android, an `O_RDONLY` fd on macOS). `BadValue` when
-    /// the sender's claims are not backed by the kernel;
-    /// `InvalidOperation` on targets with no backing store.
+    /// on Linux/Android, an `O_RDONLY` fd on macOS).
+    ///
+    /// The error says which of the two questions failed. `BadValue`: the
+    /// protections were read and do not back the sender's claims.
+    /// `InvalidOperation`: they could not be read — `F_GET_SEALS` fails
+    /// on Linux/Android, the fd is not a POSIX shm object on macOS, or
+    /// the target has no backing store. Which one a given kind of fd
+    /// lands on is the kernel's answer, not this function's: a tmpfs file
+    /// does answer `F_GET_SEALS` and so reaches `BadValue`.
+    ///
+    /// Android's legacy `/dev/ashmem` fd is `InvalidOperation`: it
+    /// answers `F_GET_SEALS` with `EINVAL` even though an ashmem region
+    /// is in fact unresizable once mapped. A receiver that must accept an
+    /// ashmem sender takes [`from_fd`](Self::from_fd) and checks
+    /// `ASHMEM_GET_PROT_MASK` itself.
     pub fn from_fd_strict(fd: OwnedFd, size: usize, offset: usize, flags: u32) -> Result<Self> {
         let seals = backend::get_seals(&fd).ok_or(StatusCode::InvalidOperation)?;
         if seals & SEAL_SHRINK == 0 {

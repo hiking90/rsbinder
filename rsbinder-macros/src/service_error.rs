@@ -13,6 +13,12 @@ use syn::{Data, DeriveInput, Fields, Ident};
 /// truncated.
 const REPRS: [&str; 3] = ["i8", "i16", "i32"];
 
+/// Int reprs a user plausibly writes and this derive refuses, echoed in
+/// the diagnostic.
+const REJECTED_REPRS: [&str; 9] = [
+    "u8", "u16", "u32", "u64", "u128", "usize", "i64", "i128", "isize",
+];
+
 pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -88,6 +94,9 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
 /// wire unchanged.
 fn require_repr(input: &DeriveInput) -> syn::Result<Ident> {
     let mut found = None;
+    // Kept apart from the unknown so the refusal can say which of the two
+    // reasons applies: unsigned, or wider than the i32 the wire carries.
+    let mut rejected: Option<Ident> = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("repr") {
             continue;
@@ -100,18 +109,23 @@ fn require_repr(input: &DeriveInput) -> syn::Result<Ident> {
         };
         for token in list.tokens.clone() {
             if let proc_macro2::TokenTree::Ident(ident) = token {
-                if REPRS.contains(&ident.to_string().as_str()) {
+                let name = ident.to_string();
+                if REPRS.contains(&name.as_str()) {
                     found = Some(ident);
+                } else if REJECTED_REPRS.contains(&name.as_str()) {
+                    rejected = Some(ident);
                 }
             }
         }
     }
-    found.ok_or_else(|| {
-        syn::Error::new_spanned(
-            &input.ident,
-            "a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or \
-             `#[repr(i32)]` — a binder status carries the code as an i32, so a wider repr \
-             would truncate on the wire rather than fail here",
-        )
-    })
+    if let Some(ident) = found {
+        return Ok(ident);
+    }
+    let needs = "a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or \
+                 `#[repr(i32)]`";
+    let msg = match &rejected {
+        Some(repr) => format!("{needs}, found `#[repr({repr})]`"),
+        None => format!("{needs}, found none"),
+    };
+    Err(syn::Error::new_spanned(&input.ident, msg))
 }

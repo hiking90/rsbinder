@@ -65,16 +65,18 @@ impl UnixTransport {
     /// Used by hermetic tests; no filesystem path involved.
     pub fn pair() -> RpcResult<(Self, Self)> {
         use rustix::net::{AddressFamily, SocketFlags, SocketType};
-        // `SocketFlags::CLOEXEC` is `cfg(not(apple))` in rustix
-        // (Apple has no `SOCK_CLOEXEC`), so create without it and set
-        // `FD_CLOEXEC` explicitly — portable Linux + macOS.
-        let (a, b) = rustix::net::socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::empty(),
-            None,
-        )
-        .map_err(std::io::Error::from)?;
+        // Atomic wherever the platform has `SOCK_CLOEXEC`: between a bare
+        // `socketpair` and a follow-up `fcntl`, a `fork`+`exec` on another
+        // thread inherits both ends and the peer never sees EOF on drop.
+        #[cfg(not(target_vendor = "apple"))]
+        let flags = SocketFlags::CLOEXEC;
+        // Apple has no `SOCK_CLOEXEC` (`SocketFlags::CLOEXEC` is
+        // `cfg(not(apple))` in rustix), so there the flag is set afterwards.
+        #[cfg(target_vendor = "apple")]
+        let flags = SocketFlags::empty();
+        let (a, b) = rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, flags, None)
+            .map_err(std::io::Error::from)?;
+        #[cfg(target_vendor = "apple")]
         for fd in [&a, &b] {
             rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)
                 .map_err(std::io::Error::from)?;
@@ -493,6 +495,10 @@ impl RpcTransport for UnixTransport {
             leftover.clear();
         }
         super::absorb_already_shut(shut)
+    }
+
+    fn supports_fd_passing(&self) -> bool {
+        true
     }
 
     /// Send `buf` as a length-prefixed frame, passing `fds` out-of-band

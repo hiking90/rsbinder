@@ -20,8 +20,11 @@
 //! ```text
 //! RESULT call <bytes> OK           # the service received and echoed the length
 //! RESULT call <bytes> FAILEDTXN    # the driver refused it: no room in the receiver
-//! RESULT call <bytes> ERROR <code> # anything else
+//! RESULT call <bytes> ERROR <what> # anything else: a status, `no-reply`, `echoed=<n>`
 //! ```
+//!
+//! Exit 0 on `OK`, 1 otherwise (`FAILEDTXN` included — it is a documented
+//! outcome, not a transaction that went through).
 //!
 //! Driven by `tests/scripts/run_mmap_size_ac.sh`, which needs a live
 //! `rsb_hub`.
@@ -82,7 +85,10 @@ fn serve(size: &str, name: &str) -> Result<()> {
     server.run()
 }
 
-fn call(bytes: usize, name: &str) -> Result<()> {
+/// `Ok(false)` = anything but the echo coming back, `FAILEDTXN` included;
+/// the caller turns that into a non-zero exit, as the C++ half does. The
+/// printed line stays the outcome the driving script reads.
+fn call(bytes: usize, name: &str) -> Result<bool> {
     // A plain client: it neither serves nor receives callbacks, so the
     // default mapping is all it needs (the reply here is four bytes).
     let binder = rsbinder::Client::open("binder://")
@@ -103,15 +109,25 @@ fn call(bytes: usize, name: &str) -> Result<()> {
             let echoed: i32 = reply.read()?;
             if echoed as usize == bytes {
                 println!("RESULT call {bytes} OK");
+                Ok(true)
             } else {
                 println!("RESULT call {bytes} ERROR echoed={echoed}");
+                Ok(false)
             }
         }
-        Ok(None) => println!("RESULT call {bytes} ERROR no-reply"),
-        Err(StatusCode::FailedTransaction) => println!("RESULT call {bytes} FAILEDTXN"),
-        Err(e) => println!("RESULT call {bytes} ERROR {e:?}"),
+        Ok(None) => {
+            println!("RESULT call {bytes} ERROR no-reply");
+            Ok(false)
+        }
+        Err(StatusCode::FailedTransaction) => {
+            println!("RESULT call {bytes} FAILEDTXN");
+            Ok(false)
+        }
+        Err(e) => {
+            println!("RESULT call {bytes} ERROR {e:?}");
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 fn main() {
@@ -124,16 +140,28 @@ fn main() {
     if args.len() != 4 {
         usage();
     }
-    let r = match args[1].as_str() {
-        "serve" => serve(&args[2], &args[3]),
-        "call" => match args[2].parse() {
-            Ok(n) => call(n, &args[3]),
-            Err(_) => usage(),
-        },
+    match args[1].as_str() {
+        "serve" => {
+            if let Err(e) = serve(&args[2], &args[3]) {
+                eprintln!("mmap_probe: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        "call" => {
+            let n = match args[2].parse() {
+                Ok(n) => n,
+                Err(_) => usage(),
+            };
+            match call(n, &args[3]) {
+                Ok(true) => {}
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    println!("RESULT call {n} ERROR {e:?}");
+                    eprintln!("mmap_probe: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => usage(),
-    };
-    if let Err(e) = r {
-        eprintln!("mmap_probe: {e:?}");
-        std::process::exit(1);
     }
 }

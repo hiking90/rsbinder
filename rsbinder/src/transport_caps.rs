@@ -126,9 +126,13 @@ impl TransportCaps {
     /// a socket.
     pub const KERNEL_KNOBS: Self = Self(1 << 4);
 
-    /// No capabilities — what a vsock or TLS session has. Incoming
-    /// (callback) connections are Unix-only today, so
-    /// [`CALLBACKS`](Self::CALLBACKS) is out of reach there too.
+    /// No capabilities — what a vsock or TLS session has. The incoming
+    /// (callback) connections *rsbinder* opens are Unix-only today, so an
+    /// rsbinder client cannot reach [`CALLBACKS`](Self::CALLBACKS) there
+    /// either. A server can: its accept path is transport-generic, so a
+    /// peer that attaches an incoming connection over vsock or TLS — as
+    /// AOSP's `RpcSession` does — makes that session report `CALLBACKS`
+    /// and nothing else.
     pub const NONE: Self = Self(0);
 
     /// Everything: kernel binder, which is the only transport that has
@@ -173,9 +177,9 @@ impl TransportCaps {
     /// malformed request.
     ///
     /// The point is the timing: a streaming sink or a cancellation that
-    /// needs [`CALLBACKS`](Self::CALLBACKS) fails here, at setup, naming
-    /// the option that would grant it, rather than on a transaction
-    /// minutes later.
+    /// needs [`CALLBACKS`](Self::CALLBACKS) fails here, at setup, with a
+    /// log line saying when the missing bit holds, rather than on a
+    /// transaction minutes later.
     pub fn require(self, needed: Self, what: &str) -> Result<()> {
         if self.contains(needed) {
             return Ok(());
@@ -189,9 +193,10 @@ impl TransportCaps {
         Err(StatusCode::InvalidOperation)
     }
 
-    /// One line of advice per missing bit, joined by `; `, for the
-    /// [`require`](Self::require) log. Keep it actionable: name the option
-    /// or the transport, not the bit again.
+    /// One clause per missing bit, joined by `; `, for the
+    /// [`require`](Self::require) log. Each states when the bit holds, not
+    /// a procedure: the reader may be on either end of any transport, and
+    /// a procedure is right for only one of those positions.
     ///
     /// Every missing bit gets its own clause, because acting on only the
     /// first one leaves the call failing for the bits it did not mention.
@@ -200,28 +205,28 @@ impl TransportCaps {
         for (bit, advice) in [
             (
                 Self::CALLBACKS,
-                "open the client with `ClientOptions::incoming_connections > 0` \
-                 (RPC), or use kernel binder",
+                "CALLBACKS holds on kernel binder, and on an RPC session whose \
+                 client end opened incoming connections — see \
+                 `TransportCaps::CALLBACKS`",
             ),
             (
                 Self::FD_PASSING,
-                "use kernel binder or a `unix://` endpoint with \
-                 `fd_mode = FileDescriptorTransportMode::Unix` — vsock and TLS \
-                 cannot carry file descriptors",
+                "FD_PASSING holds on kernel binder, and on a Unix-socket RPC \
+                 session that negotiated `FileDescriptorTransportMode::Unix`",
             ),
             (
                 Self::TRUSTED_UID,
-                "only kernel binder and `unix://` carry a kernel-vouched uid; \
-                 authorize a vsock or TLS peer by its own identity instead",
+                "TRUSTED_UID holds on kernel binder and Unix-socket RPC, where \
+                 the kernel vouches for the peer's uid",
             ),
             (
                 Self::SAME_HOST,
-                "shared memory needs both ends on one host — use kernel binder \
-                 or `unix://`",
+                "SAME_HOST holds on kernel binder and Unix-socket RPC, where \
+                 both ends share a kernel",
             ),
             (
                 Self::KERNEL_KNOBS,
-                "this is a kernel binder facility; it has no RPC equivalent",
+                "KERNEL_KNOBS holds on kernel binder only",
             ),
         ] {
             if self.contains(bit) {

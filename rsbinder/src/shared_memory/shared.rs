@@ -190,8 +190,8 @@ pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
     ashmem_size(fd.as_fd())
 }
 
-/// libcutils `__ashmem_is_ashmem`: is `fd` open on the legacy `/dev/ashmem`
-/// character device? A peer-supplied fd must pass this before any
+/// libcutils `__ashmem_is_ashmem`: is `fd` open on the ashmem character
+/// device? A peer-supplied fd must pass this before any
 /// ashmem ioctl is sent to it (and before an `st_size == 0` is trusted as
 /// "ashmem reports 0" rather than "never `ftruncate`d").
 #[cfg(target_os = "android")]
@@ -199,13 +199,39 @@ pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     let Ok(st) = rustix::fs::fstat(fd) else {
         return false;
     };
-    if st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+    if !is_char_device(&st) {
         return false;
     }
-    match rustix::fs::stat("/dev/ashmem") {
-        Ok(dev) => st.st_rdev == dev.st_rdev,
-        Err(_) => false,
+    ashmem_rdev().is_some_and(|rdev| st.st_rdev == rdev)
+}
+
+/// The ashmem device number, the way libcutils `__init_ashmem_rdev` finds
+/// it: Android 11+ init duplicates the node as `/dev/ashmem<boot_id>`
+/// (same major/minor) and means to retire the bare name, so that path is
+/// tried first. Only a success is cached, as libcutils retries on `0`.
+#[cfg(target_os = "android")]
+fn ashmem_rdev() -> Option<u64> {
+    static RDEV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if let Some(rdev) = RDEV.get() {
+        return Some(*rdev);
     }
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+    let with_boot_id = boot_id.map(|id| format!("/dev/ashmem{}", id.trim()));
+    let rdev = with_boot_id
+        .iter()
+        .map(String::as_str)
+        .chain(["/dev/ashmem"])
+        .find_map(|path| rustix::fs::stat(path).ok())
+        .filter(is_char_device)
+        .map(|dev| dev.st_rdev)?;
+    let _ = RDEV.set(rdev);
+    Some(rdev)
+}
+
+// Not `st_mode & libc::S_IFMT`: the two differ in width on 32-bit Android.
+#[cfg(target_os = "android")]
+fn is_char_device(st: &rustix::fs::Stat) -> bool {
+    rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
 }
 
 #[cfg(not(target_os = "android"))]

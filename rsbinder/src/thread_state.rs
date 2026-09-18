@@ -176,13 +176,10 @@ pub(crate) const RPC_UNKNOWN_CALLING_UID: binder::uid_t = binder::uid_t::MAX;
 /// one dispatch, restoring **both** cells to their previous values on drop
 /// (so nested dispatches nest correctly, unwind included).
 ///
-/// It is constructed on both dispatch paths, one per direction of nesting.
-/// [`install`](Self::install) stamps the two cells and is used by the RPC
-/// dispatch path (`rpc::session::execute_dispatched`) around `rpc_transact`.
-/// [`suspend`](Self::suspend) clears them and is used by the kernel dispatch
-/// path (`execute_command`'s `BR_TRANSACTION` arm), where a re-entrant kernel
-/// transaction is the inner dispatch and must not be answered for with the
-/// RPC peer still on the stack.
+/// [`install`](Self::install) stamps the two cells around an RPC dispatch.
+/// [`suspend`](Self::suspend) clears them wherever the kernel driver makes
+/// this thread run user code — that code's caller is not the RPC peer, even
+/// when an RPC dispatch is further up the stack.
 #[cfg(feature = "rpc")]
 pub(crate) struct RpcCallingGuard {
     previous: Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>,
@@ -208,16 +205,14 @@ impl RpcCallingGuard {
         }
     }
 
-    /// Clear the RPC calling context for the duration of a **kernel**
-    /// transaction dispatched on this thread, restoring it on drop.
+    /// Clear the RPC calling context while the kernel driver runs user
+    /// code on this thread, restoring it on drop.
     ///
-    /// Binder's nested IPC delivers a re-entrant `BR_TRANSACTION` to the
-    /// very thread parked in `wait_for_response`, so an RPC handler that
-    /// makes an outgoing kernel call can have a kernel transaction
-    /// dispatched inside it. That kernel transaction is the inner
-    /// dispatch and its caller is a kernel caller: leaving the RPC cells
-    /// installed would make every calling-identity accessor answer for
-    /// the suspended RPC peer instead (`calling_caps` would report the
+    /// A thread parked in `wait_for_response` executes whatever the driver
+    /// returns, so an RPC handler that makes an outgoing kernel call can
+    /// have driver-initiated user code run inside it. Leaving the RPC
+    /// cells installed would make every calling-identity accessor answer
+    /// for the suspended RPC peer instead (`calling_caps` would report the
     /// RPC session's caps for a caller that has all of them).
     pub(crate) fn suspend() -> Self {
         let previous = RPC_CALLING.with(|c| c.borrow_mut().take());
@@ -331,9 +326,9 @@ pub fn calling_caller() -> Option<Caller> {
             } else {
                 // SAFETY: `calling_sid` is the kernel-delivered, NUL-
                 // terminated SELinux context for this in-flight
-                // `BR_TRANSACTION_SEC_CTX`, valid until `BC_FREE_BUFFER`
-                // (after the handler returns). Same contract as
-                // `get_calling_sid`.
+                // `BR_TRANSACTION_SEC_CTX`. The dispatch arm nulls it when
+                // it frees the buffer, so non-null means the buffer is
+                // still ours. Same contract as `get_calling_sid`.
                 Some(unsafe { CStr::from_ptr(tr.calling_sid as _).to_owned() })
             };
             Caller::Kernel {
@@ -1234,17 +1229,21 @@ fn execute_command(cmd: i32) -> Result<()> {
                 // const void* origServingStackPointer = mServingStackPointer;
                 // mServingStackPointer = &origServingStackPointer; // anything on the stack
 
-                let transaction_old = {
+                let (transaction_old, strict_mode_policy_old) = {
                     let mut thread_state = thread_state.borrow_mut();
                     let transaction_old = thread_state.transaction;
-
-                    thread_state.clear_calling_work_source();
-                    thread_state.clear_propagate_work_source();
+                    let strict_mode_policy_old = thread_state.strict_mode_policy;
 
                     thread_state.transaction =
                         Some(TransactionState::from_transaction_data(&tr_secctx));
 
-                    transaction_old
+                    // Both work-source fields live in `TransactionState`, so
+                    // the reset only reaches this transaction if it runs after
+                    // the state is installed.
+                    thread_state.clear_calling_work_source();
+                    thread_state.clear_propagate_work_source();
+
+                    (transaction_old, strict_mode_policy_old)
                 };
 
                 // This thread may already be inside an RPC handler that made
@@ -1340,6 +1339,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                         }
                     }
                 };
+                // Freed before the reply, as AOSP `executeCommand` does
+                // (b/238777741): the client can otherwise receive the reply and
+                // send its next transaction while this one's space is still
+                // charged to it.
+                drop(reader);
+                // `calling_sid` points into the buffer just freed; a death
+                // recipient run during the reply wait must not read it.
+                if let Some(tr) = thread_state.borrow_mut().transaction.as_mut() {
+                    tr.calling_sid = std::ptr::null();
+                }
                 let flags = tr_secctx.transaction_data.flags;
                 // Restore the saved transaction state on every exit (an `Err`
                 // or panic must not leak it into the next command), and contain
@@ -1389,7 +1398,16 @@ fn execute_command(cmd: i32) -> Result<()> {
                         Ok(())
                     }));
 
-                thread_state.borrow_mut().transaction = transaction_old;
+                {
+                    // `check_interface` overwrites `strict_mode_policy` with
+                    // the inbound header's value, so a thread that also acts
+                    // as a client would ship the last caller's policy on its
+                    // own outgoing calls unless it is put back here
+                    // (`IPCThreadState::executeCommand` does the same).
+                    let mut thread_state = thread_state.borrow_mut();
+                    thread_state.transaction = transaction_old;
+                    thread_state.strict_mode_policy = strict_mode_policy_old;
+                }
 
                 match reply_result {
                     Ok(inner) => inner?,
@@ -1530,6 +1548,11 @@ fn execute_command(cmd: i32) -> Result<()> {
                 };
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
+
+                // `binder_died` runs inside the handshake below and is not an
+                // RPC dispatch, so the suspended RPC peer must not answer for it.
+                #[cfg(feature = "rpc")]
+                let _rpc_suspended = RpcCallingGuard::suspend();
 
                 drive_dead_binder_handshake(
                     handle,
@@ -2212,8 +2235,9 @@ impl std::default::Default for CallingContext {
                 Some(transaction) => {
                     let calling_sid = if !transaction.calling_sid.is_null() {
                         // SAFETY: The calling_sid pointer is provided by the binder driver
-                        // and is guaranteed to be a valid null-terminated C string during
-                        // the transaction lifetime. We check for null before dereferencing.
+                        // and is a valid null-terminated C string while the transaction
+                        // buffer is held. The dispatch arm nulls it when it frees the
+                        // buffer, and null was checked above.
                         // The pointer is cast from *const u8 to *const i8 as required by CStr::from_ptr.
                         unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
                     } else {
@@ -2289,9 +2313,9 @@ pub fn get_calling_sid() -> Option<CString> {
         // region for the current BR_TRANSACTION_SEC_CTX (set in
         // `TransactionState::from_transaction_data`). The kernel guarantees
         // it points to a null-terminated string that stays valid until we
-        // issue `BC_FREE_BUFFER` for the same transaction — which only
-        // happens after `Transactable::transact` returns, so any caller
-        // observing `is_handling_transaction() == true` may safely read it.
+        // issue `BC_FREE_BUFFER` for the same transaction. The dispatch arm
+        // nulls this pointer in the same step, so a non-null value (checked
+        // above) means the buffer has not been freed.
         Some(unsafe { CStr::from_ptr(transaction.calling_sid as _).to_owned() })
     })
 }
@@ -2449,10 +2473,22 @@ pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
 /// `IPCThreadState` fields that persist between transactions — but the
 /// AOSP user-facing semantics (clear before downstream call, restore
 /// after) match.
+///
+/// # Behavior during an RPC transaction
+///
+/// **Also a no-op, and the RPC peer stays visible.** While an RPC
+/// calling context is installed this function returns `0` and changes
+/// nothing; any kernel transaction below it on the stack belongs to an
+/// outer frame. [`get_calling_uid`] / [`get_calling_pid`] keep answering
+/// for the peer, so the AOSP idiom `let t = clear_calling_identity(); …;
+/// restore_calling_identity(t);` drops nothing over RPC. The 64-bit
+/// token cannot carry a `PeerIdentity` back. Authorize an RPC caller
+/// through [`calling_caller`] or `RpcServer::set_authorizer` instead.
 pub fn clear_calling_identity() -> i64 {
-    // Pure-RPC process: no kernel `THREAD_STATE` (touching it would panic),
-    // and no kernel-delivered identity to clear — the documented no-op.
-    if !ProcessState::is_initialized() {
+    // An RPC dispatch is the innermost frame: any kernel transaction under it
+    // belongs to an outer frame and is not this handler's to rewrite. In a
+    // pure-RPC process there is no kernel `THREAD_STATE` to touch at all.
+    if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return 0;
     }
     THREAD_STATE.with(|thread_state| {
@@ -2481,11 +2517,11 @@ pub fn clear_calling_identity() -> i64 {
 /// same as AOSP). Callers needing both UID/PID and SID restoration must
 /// save the SID separately before clearing.
 ///
-/// # Behavior outside a transaction
+/// # When this is a no-op
 ///
-/// No-op when not currently dispatching a transaction (consistent with
-/// [`clear_calling_identity`] returning 0 in that case). The token is
-/// silently discarded — there is no transaction state to write into.
+/// Under the same two conditions in which [`clear_calling_identity`]
+/// returns `0` — outside a kernel transaction, and during an RPC
+/// dispatch. The token is discarded.
 ///
 /// # Token mismatch
 ///
@@ -2496,7 +2532,9 @@ pub fn clear_calling_identity() -> i64 {
 /// (caller wraps `clear`/`restore` in a `Drop` impl) is recommended; see
 /// AOSP `IPCThreadState::CallingIdentityScope` for the C++ analogue.
 pub fn restore_calling_identity(token: i64) {
-    if !ProcessState::is_initialized() {
+    // Same gate as `clear_calling_identity`: the token an RPC handler holds
+    // is `0`, and the kernel transaction under it is an outer frame's.
+    if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return;
     }
     THREAD_STATE.with(|thread_state| {
@@ -2639,9 +2677,12 @@ pub fn get_extended_error() -> Result<ExtendedError> {
 /// `BR_TRANSACTION`, matching AOSP's per-transaction lifecycle
 /// (`IPCThreadState.cpp:1141`).
 ///
-/// Returns `false` when not currently dispatching a transaction.
+/// Returns `false` when not currently dispatching a transaction, and also
+/// while an RPC transaction is being dispatched — [`clear_calling_identity`]
+/// is a no-op there, and the kernel transaction that may sit underneath a
+/// nested RPC dispatch belongs to an outer frame.
 pub fn has_explicit_identity() -> bool {
-    if !ProcessState::is_initialized() {
+    if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return false;
     }
     THREAD_STATE.with(|thread_state| {

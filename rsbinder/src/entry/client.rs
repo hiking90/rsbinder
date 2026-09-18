@@ -179,6 +179,26 @@ enum Inner {
     Rpc(crate::rpc::RpcSession),
 }
 
+/// A setting that can arrive both as a [`ClientOptions`] field and as a
+/// URI query key: two different values are refused, like every other
+/// conflict in [`Client::open`].
+fn one_source<T: PartialEq + std::fmt::Debug>(
+    what: &str,
+    from_option: Option<T>,
+    from_uri: Option<T>,
+) -> Result<Option<T>> {
+    match (from_option, from_uri) {
+        (Some(o), Some(u)) if o != u => {
+            log::error!(
+                "rsbinder::Client::open: ClientOptions::{what}={o:?} conflicts with the URI's \
+                 {u:?} — give the value once"
+            );
+            Err(StatusCode::BadValue)
+        }
+        (o, u) => Ok(o.or(u)),
+    }
+}
+
 pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!(
@@ -216,8 +236,9 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
             if o.tls.is_some() || o.tls_server_name.is_some() {
                 return Err(reject("tls/tls_server_name"));
             }
-            let driver = o.driver.as_deref().or(driver.as_deref());
-            super::server::kernel_init(driver, *threads, o.mmap_size.or(*mmap_size))?;
+            let driver = one_source("driver", o.driver.as_deref(), driver.as_deref())?;
+            let mmap_size = one_source("mmap_size", o.mmap_size, *mmap_size)?;
+            super::server::kernel_init(driver, *threads, mmap_size)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
                 endpoint: uri.endpoint.clone(),
@@ -583,5 +604,32 @@ impl Client {
             Inner::Rpc(s) => Some(s),
             Inner::Kernel => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One rule for every setting that has both a `ClientOptions` field
+    /// and a URI key: agreeing or single values pass, a conflict is
+    /// refused rather than resolved in favor of either side.
+    #[test]
+    fn a_setting_given_twice_must_agree() {
+        assert_eq!(one_source::<usize>("mmap_size", None, None), Ok(None));
+        assert_eq!(one_source("mmap_size", Some(8192), None), Ok(Some(8192)));
+        assert_eq!(one_source("mmap_size", None, Some(8192)), Ok(Some(8192)));
+        assert_eq!(
+            one_source("mmap_size", Some(8192), Some(8192)),
+            Ok(Some(8192))
+        );
+        assert_eq!(
+            one_source("mmap_size", Some(8192), Some(4096)),
+            Err(StatusCode::BadValue)
+        );
+        assert_eq!(
+            one_source("driver", Some("/dev/binder"), Some("/dev/vndbinder")),
+            Err(StatusCode::BadValue)
+        );
     }
 }

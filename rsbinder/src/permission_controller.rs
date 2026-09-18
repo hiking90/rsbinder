@@ -180,15 +180,24 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// transaction vouched for the caller; a freshly constructed
 /// [`Parcel::new`] reports `true` as well. Whether a transaction is in
 /// flight is a second question, which this function asks separately via
-/// [`crate::is_handling_transaction`], and the two can disagree: while an
-/// RPC dispatch is on the stack, a nested kernel `BR_TRANSACTION`
-/// dispatched on the same thread hands the handler a kernel-marshalled
-/// `reader`, yet the outer RPC calling context is still installed, so
-/// [`crate::is_handling_transaction`] and [`crate::get_calling_uid`] /
-/// [`crate::get_calling_pid`] answer for the **RPC** peer — PMS is then
-/// asked about the RPC peer's uid while a kernel caller is being served.
-/// That residual gap is not closed here: it needs the calling context to
-/// be scoped per dispatch, not a stronger parcel predicate.
+/// [`crate::is_handling_transaction`]. Nesting is handled: while an RPC
+/// dispatch is on the stack, a nested kernel `BR_TRANSACTION` dispatched
+/// on the same thread hands the handler a kernel-marshalled `reader`, and
+/// the outer RPC calling context is suspended for the duration of that
+/// inner dispatch, so [`crate::get_calling_uid`] /
+/// [`crate::get_calling_pid`] answer for the **kernel** caller. PMS is
+/// therefore asked about the kernel caller's uid, not the suspended RPC
+/// peer's.
+///
+/// The other direction is not symmetric. While a kernel dispatch calls out
+/// over RPC, the peer's inbound dispatch is the innermost frame and its
+/// calling context stays installed, so an RPC handler that passes a
+/// kernel-marshalled parcel — a fresh [`Parcel::new`], or the outer kernel
+/// `reader` it captured — gets past both gates above and PMS is asked about
+/// the **RPC peer's** uid. A Unix peer running as root is granted
+/// unconditionally there. Producing that combination takes a hand-written
+/// handler that hands this function a parcel other than the one it was
+/// dispatched with.
 ///
 /// RPC services needing authorization must use transport-native means
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
