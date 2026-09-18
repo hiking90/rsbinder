@@ -40,8 +40,10 @@ A shared region is a file descriptor, so it travels wherever an fd can:
 Before reaching for a region of your own, note that a **byte payload** has a
 ready-made form. `Parcel::write_blob` carries it inline when it is at most
 16 KB and through a shared region when it is larger, tagging the wire so the
-reader knows which it got — AOSP's `Parcel::writeBlob`, byte-compatible with
-C++ and Java peers:
+reader knows which it got. The bytes are Java's `Parcel.writeBlob`: an int32
+length, then what C++ `Parcel::writeBlob` writes. A C++ peer reads the length
+itself and passes it to `Parcel::readBlob(len, …)`, as the JNI layer under
+Java does:
 
 ```rust
 parcel.write_blob(&payload, false)?;      // false: the reader may not write it
@@ -58,8 +60,10 @@ Two properties make it the right default for "a big lump of bytes":
   handle. `Parcel::allow_fds()` answers the same question if you want to know
   in advance.
 - **An immutable blob is sealed** (`F_SEAL_FUTURE_WRITE`), so the reader maps
-  a snapshot it cannot modify. Pass `true` for a region both sides may write,
-  which is a buffer they share rather than a value one sends.
+  a snapshot it cannot modify. Pass `true` to leave the reader's copy
+  writable (`BLOB_ASHMEM_MUTABLE`). The writer keeps no handle on the region,
+  so nothing the reader writes comes back; for a buffer both sides share, use
+  a region of your own (below).
 
 Reach for the sections below when you need the region itself: a window into a
 larger heap, a lifetime longer than one call, or many buffers out of one

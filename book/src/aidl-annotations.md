@@ -239,7 +239,9 @@ parcelable VintfData {
 
 In the upstream Android toolchain, VINTF-stable types are meant to contain only other VINTF-stable types so that their serialization format stays stable across independent system/vendor updates — critical for framework↔HAL compatibility.
 
-rsbinder's generator **recognizes** `@VintfStability` and stamps the generated type/interface with `Stability::Vintf` (so it carries the right stability tier on the wire), but it does **not** statically or dynamically enforce the "fields must also be VINTF-stable" rule — there is no field-tree validation and no `BadValue` raised for embedding a non-VINTF type. Treat the constraint as a contract you are responsible for upholding, not one the compiler checks for you.
+rsbinder's generator stamps the generated type or interface with `Stability::Vintf` and enforces the rule at compile time: a `@VintfStability` declaration that references a type which is not VINTF-stable is an error. AOSP enforces the same rule through `aidl_interface { stability: "vintf" }`; rsbinder has no such build mode and checks the references instead, which rejects the same contracts. A `@RustOnlyStableParcelable` is exempt, as AOSP exempts a stable-API parcelable, and a non-VINTF type may still use a VINTF one.
+
+A declaration nested inside a `@VintfStability` type is VINTF-stable too, matching AOSP's scoped lookup. At run time, `ParcelableHolder::set_parcelable` on a VINTF holder returns `BadValue` for a payload whose stability does not include VINTF.
 
 ## @FixedSize
 
@@ -253,17 +255,18 @@ parcelable FixedPoint {
 }
 ```
 
-### Intended constraints
+### Constraints
 
-In upstream Android, a fixed-size parcelable may only contain:
+A `@FixedSize` parcelable or union may only contain:
 
 - Primitive types (`boolean`, `byte`, `char`, `int`, `long`, `float`, `double`)
-- Other `@FixedSize` parcelables
-- Enums with a `@Backing` annotation
+- Enums
+- Other `@FixedSize` parcelables and unions
+- Fixed-size arrays (`int[4]`) of the above
 
-and may not contain `String`/`@utf8InCpp String`, arrays (`T[]`), `ParcelFileDescriptor`, `IBinder`, or any other variable-length type.
+and may not contain `String`, `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`, an interface, a variable-length array (`T[]`), a `List<T>`, or a `@nullable` type. `@FixedSize` is not inherited by nested declarations.
 
-> **rsbinder note:** the generator accepts `@FixedSize` but currently treats it as a no-op — it neither validates these constraints nor changes the generated layout or wire format. The constraints above are the contract you should follow; rsbinder does not check them for you.
+rsbinder-aidl rejects a field that breaks these rules, porting AOSP's `CanBeFixedSize`. The annotation does not change the generated layout or wire format.
 
 ### Relationship with @RustDerive(Copy=true)
 
@@ -320,8 +323,9 @@ exist so every method can declare its permission posture).
 | `@nullable(heap=true)` | field | `heap=true` is ignored; rsbinder boxes a field its own cycle analysis finds recursive |
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
-| `@VintfStability` | parcelable, interface | Stamps `Stability::Vintf`; structural constraints not enforced |
-| `@FixedSize` | parcelable | Recognized; currently a no-op (`Copy` comes from `@RustDerive(Copy=true)`) |
+| `@VintfStability` | parcelable, interface | Stamps `Stability::Vintf`; every referenced type must be VINTF-stable (checked) |
+| `@FixedSize` | parcelable, union | Fields checked to be fixed-size; no layout change (`Copy` comes from `@RustDerive(Copy=true)`) |
+| `@deprecated` (javadoc) | any declaration, method, field, constant, enumerator | Emits `#[deprecated]` / `#[deprecated = "note"]` |
 | `@EnforcePermission` | interface method | Generates a `PermissionManagerService` check (kernel-only; denied over RPC) |
 
 When writing AIDL files for rsbinder, the most commonly used annotations are `@RustDerive` (for ergonomic Rust types), `@Backing` (for enums), and `@nullable` (for optional values). The remaining annotations are important for interoperability with Android or for specific use cases like recursive types and interface migration.

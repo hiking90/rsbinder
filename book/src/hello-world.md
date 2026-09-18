@@ -18,12 +18,12 @@ publish = false
 edition = "2021"
 
 [dependencies]
-rsbinder = "0.11"
+rsbinder = "0.12"
 async-trait = "0.1"
 env_logger = "0.11"
 
 [build-dependencies]
-rsbinder-aidl = "0.11"
+rsbinder-aidl = "0.12"
 ```
 
 ## Create an AIDL File

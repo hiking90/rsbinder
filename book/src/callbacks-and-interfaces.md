@@ -344,12 +344,15 @@ tokio::select! {
 }
 ```
 
-It holds the binder and the recipient itself, so neither of the "easy to miss"
-conditions below applies to it, and dropping it unregisters the notification. A
+`select!` is `tokio/macros`, which rsbinder's `tokio` feature does not enable;
+declare it on your own `tokio` dependency.
+
+The signal holds the binder and the recipient itself, so there is no `Arc` or
+handle for you to keep alive, and dropping it unregisters the notification. A
 binder that is **already** dead is not an error — the future is simply complete
-on arrival, which is the honest answer to "tell me when this dies". A local
-binder still has no death notification: that is `InvalidOperation`, as with
-`link_to_death`.
+on arrival, which is the honest answer to "tell me when this dies". The two
+conditions below still apply: a local binder is `InvalidOperation`, as with
+`link_to_death`, and without a running thread pool the future never completes.
 
 Two conditions are easy to miss:
 

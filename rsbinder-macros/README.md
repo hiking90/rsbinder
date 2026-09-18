@@ -28,12 +28,17 @@ The macro is not a second code generator. It fills the same
 `rsbinder_aidl::render` structs the AIDL front-end fills and runs the same
 templates, so a trait here and the equivalent `.aidl` produce **identical**
 generated code — moving from one to the other never touches a call site. That
-equality is enforced by golden tests in this crate.
+equality is enforced by golden tests in this crate. For the same reason a
+signature `.aidl` cannot express, or spells differently, is a compile error
+naming the `.aidl` form; the crate docs carry the full type table. Two
+attributes fill the gaps a Rust signature leaves: `#[nonnull]` marks an `out`
+binder or fd that is not `@nullable`, and `#[deprecated]` renders AIDL's
+`@deprecated`.
 
 Enable it through `rsbinder`:
 
 ```toml
-rsbinder = { version = "0.11", features = ["macros"] }
+rsbinder = { version = "0.12", features = ["macros"] }
 ```
 
 Licensed under the Apache License, Version 2.0.

@@ -89,7 +89,7 @@ same questions are answered by `dumpsys`, `service list` and the init/VINTF
 files:
 
 ```text
-rsb_hub 0.11.0
+rsb_hub 0.12.0
 access control: enforcing, 4 rule(s)
 declarations: 2
 death subscriptions: 3
@@ -245,6 +245,9 @@ let service = tokio::time::timeout(
     rsbinder::wait_for_interface_async::<dyn IMyService::IMyService>("com.example.myservice"),
 ).await??;
 ```
+
+`timeout` is `tokio/time`, which rsbinder's `tokio` feature does not enable;
+declare it on your own `tokio` dependency.
 
 Dropping the future (a `timeout` that expires, a `select!` arm that loses) ends the wait
 and unregisters the callback it placed with the service manager. Do **not** hand-roll it as

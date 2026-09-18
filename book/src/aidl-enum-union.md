@@ -203,7 +203,7 @@ In this example, the default value is the first field (`intEnum`) initialized to
 assert_eq!(EnumUnion::default(), EnumUnion::IntEnum(IntEnum::FOO));
 ```
 
-Note that AIDL accepts a `@deprecated` Javadoc tag on a field, but rsbinder's generator does not currently translate it into a Rust `#[deprecated]` attribute — the field is generated normally and using it produces no compiler warning.
+A `/** @deprecated note */` block on a field becomes `#[deprecated = "note"]` on the generated variant (`#[deprecated]` when there is no note). The generated module allows the lint for its own plumbing, so only your code's uses warn — which fails a `-D warnings` build until you migrate or allow it.
 
 ### Nested Unions
 

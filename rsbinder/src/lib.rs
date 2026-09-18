@@ -87,8 +87,10 @@
 //!
 //! # Feature flags
 //!
-//! - `tokio` *(default)* — full async/await support on the Tokio runtime
-//!   (implies `async`).
+//! - `tokio` *(default)* — async/await support on the Tokio runtime
+//!   (implies `async`). It enables only `tokio/rt`, `rt-multi-thread` and
+//!   `sync`; declare `macros`, `time`, `net` and the rest on your own `tokio`
+//!   dependency.
 //! - `async` — generic async-trait support, without committing to a
 //!   specific runtime.
 //! - `rpc` — master switch for the RPC transport (binder-over-socket), a
@@ -101,8 +103,8 @@
 //!   Linux and Android targets only).
 //! - `rpc-tls` — TLS backend over rustls (implies `rpc`). rsbinder never
 //!   invents crypto; the caller supplies the `rustls` configuration.
-//! - `macros` — `#[rsbinder::interface]`, `#[derive(Parcelable)]` and
-//!   `#[derive(BinderEnum)]`: declare an interface as a Rust trait, with no
+//! - `macros` — `#[rsbinder::interface]`, `#[derive(Parcelable)]`,
+//!   `#[derive(BinderEnum)]` and `#[derive(ServiceSpecificError)]`: declare an interface as a Rust trait, with no
 //!   `.aidl` file and no `build.rs`. The emitted code is byte-for-byte what
 //!   `.aidl` produces. Off by default: it pulls the AIDL compiler in as a
 //!   proc-macro dependency.
@@ -127,8 +129,8 @@
 //! type-safe Rust bindings for IPC services.
 //!
 //! **[`serve`] and [`connect`] are the way in.** One URI picks the
-//! transport — `binder:///dev/binderfs/binder` for kernel binder,
-//! `unix:///run/svc.sock` or `tcp://…` for RPC — and the service and
+//! transport — `binder://` for kernel binder, `unix:///run/svc.sock`,
+//! `vsock://…` or `tls://…` for RPC — and the service and
 //! client code either side of it is identical. The lower-level route
 //! ([`ProcessState`] plus the [`hub`] service-manager calls) stays
 //! available and is what the entry API is built on; reach for it when you

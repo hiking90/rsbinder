@@ -22,7 +22,7 @@
 //! [`TransportCaps`] is the read-only summary of the same facts, available
 //! *before* the first transaction. It exists so a feature that needs
 //! something the transport lacks can say so up front, with a message
-//! naming the option to change, instead of failing on the wire later.
+//! stating when the missing bit holds, instead of failing on the wire later.
 //! It never replaces the checks it summarizes — see the type's own docs.
 
 use crate::error::{Result, StatusCode};

@@ -4,7 +4,7 @@
 `.aidl` file, no `build.rs`, no generated-code directory:
 
 ```toml
-rsbinder = { version = "0.11", features = ["macros"] }
+rsbinder = { version = "0.12", features = ["macros"] }
 ```
 
 ```rust
@@ -53,20 +53,43 @@ could be mistaken for one, it is a compile error naming the reason.
 
 | Signature | Meaning |
 |---|---|
-| `x: T` (must be `Copy`), `x: &T`, `x: &str`, `x: &[T]` | `in` argument |
+| `x: i32` — an AIDL scalar, or a bare name that may be an enum (asserted `Copy`) | `in` argument, by value |
+| `x: &Cfg`, `x: &str`, `x: &[T]`, `Option<&T>` — every other `in` type borrows | `in` argument |
 | `x: &mut T` | **`out`** — the server fills the caller's value |
 | `#[inout] x: &mut T` | written **and** read back |
+| `#[nonnull] x: &mut Option<T>` | an `out` binder or fd that is not `@nullable` |
 | `Option<T>` | `@nullable` |
 | `#[oneway]` on a method | no reply; must return `BinderResult<()>` |
+| `#[deprecated]` / `#[deprecated = "…"]` | AIDL's `@deprecated`, on the trait, a method, a `#[derive(Parcelable)]` struct or a field |
 
-What the wire cannot carry is a compile error where you wrote it:
+The macro accepts only what `.aidl` renders, spelled the way `.aidl` renders
+it, so moving the interface to `.aidl` later never changes a call site. A
+shape with no `.aidl` equivalent is a compile error naming the form to use:
 
-- A primitive cannot be `out` — `.aidl` passes it only `in`. Return it, or use
-  a `Vec<T>` or a parcelable.
+- Only AIDL's scalars: `bool`, `i8`, `i32`, `i64`, `f32`, `f64`, `u16`, and
+  `u8` as an array element. `u32`, `u64`, `i16`, `usize`, `u128`, Rust's
+  `char`, and `i8` inside an array are refused.
+- An `in` argument other than a scalar or an enum is borrowed: `&str` rather
+  than `String` or `&String`, `&[T]` rather than `Vec<T>` or `&Vec<T>`,
+  `Option<&T>` rather than `&Option<T>`.
+- A primitive or a `String` cannot be `out` — `.aidl` passes them only `in`,
+  and `@nullable` does not change that (`&mut Option<String>` is refused too).
+  Return the value, or use a `Vec<T>` or a parcelable.
+- An `out` binder or fd is `&mut Option<_>`, since the callee has no value to
+  start from; bare `&mut Strong<dyn IFoo>` is refused. Add `#[nonnull]` when
+  the `.aidl` form is not `@nullable`, and a `None` left by the service then
+  fails the call with `UNEXPECTED_NULL`.
 - A primitive has no null form, so `Option<i32>` is refused; so is
   `Option<Mode>` for a derived enum, which travels as its `repr` scalar.
 - A borrowed type nested inside another (`&[&str]`) has nothing to borrow from
   once decoded. Use the owned form.
+- `BinderResult<T, E>`, `()` or a trait object as an argument, and a duplicate
+  method or argument name are refused. `#[deprecated(since = …)]` and
+  `note = …` are refused too, because `@deprecated` has nowhere to put them.
+
+The exact spelling for every array and `Option` combination, in each
+direction, is the type table in the
+[`rsbinder-macros` docs](https://docs.rs/rsbinder-macros).
 
 Methods are declared `fn`, not `async fn`. The `async` feature emits the
 `IFooAsync` halves from the same declaration.

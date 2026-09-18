@@ -7,8 +7,10 @@
 //! A blob is a byte string that travels **inline when small and through
 //! shared memory when large** — the writer decides by size, and the
 //! reader is told which it got by a tag on the wire. That choice is a
-//! wire convention, not an optimization each service invents: a Java or
-//! C++ peer reading with `readBlob` expects exactly these bytes.
+//! wire convention, not an optimization each service invents: a Java peer
+//! reading with `Parcel.readBlob` expects exactly these bytes. C++
+//! `Parcel::readBlob(len, …)` reads them after the leading `length`,
+//! which in AOSP the JNI layer reads and writes, not C++ `Parcel`.
 //!
 //! ```text
 //! int32  length          (-1 = null, which `read_blob` reports as UnexpectedNull)

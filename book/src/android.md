@@ -33,7 +33,7 @@ In your `Cargo.toml`, specify the Android versions you want to support:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.11", features = ["android_14_plus"] }
+rsbinder = { version = "0.12", features = ["android_14_plus"] }
 ```
 
 Available feature combinations:
