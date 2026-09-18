@@ -453,7 +453,10 @@ jobs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: aarch64-linux-android
+        # The AVD below is x86_64. An aarch64 build only runs there through
+        # the image's ARM translation, which API 29 does not have — the
+        # test binary was "not executable" on it and never ran.
+        targets: x86_64-linux-android
 
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
@@ -549,8 +552,8 @@ jobs:
     - name: Create REMOTE_ANDROID file
       run: |
         cat > REMOTE_ANDROID << EOF
-        arm64-v8a
-        aarch64
+        x86_64
+        x86_64
         /data/rsbinder
         EOF
 
@@ -567,10 +570,15 @@ jobs:
         source ./envsetup.sh
         ndk_prepare
 
-    - name: Run ndk_build and ndk_sync
+    - name: Run ndk_build and push test_service
       run: |
         source ./envsetup.sh
-        ndk_build && ndk_sync
+        ndk_build
+        # Only what the steps below run. `ndk_sync` pushes every executable
+        # under debug/ and debug/deps/ (~5 GB), which no longer fits the
+        # API 36 image's /data: "No space left on device".
+        read_remote_android
+        adb push "$source_directory/test_service" "$remote_directory/"
 
     - name: Copy test executables to Android device
       run: |
@@ -608,33 +616,61 @@ jobs:
       run: |
         echo "Waiting for test_service to stabilize on API level ${{ matrix.api-level }}..."
         sleep 3
-        echo "Checking test_service process with timeout..."
-        timeout 10 adb shell "ps | grep test_service" || echo "test_service process check completed"
         echo "Checking /data/rsbinder directory:"
         timeout 10 adb shell "ls -la /data/rsbinder/" || echo "Directory check failed"
         echo "Checking test_service log:"
         timeout 10 adb shell "cat /data/rsbinder/test_service.log | head -10" || echo "No log output yet"
-        echo "Test setup completed successfully on Android API level ${{ matrix.api-level }}!"
-        echo "test_service execution attempted on Android emulator"
+        # Hard gate: every test below needs the service, and a service that
+        # died at startup would otherwise surface as 100+ unrelated failures.
+        if ! timeout 10 adb shell "pidof test_service" >/dev/null; then
+          echo "::error::test_service is not running on API level ${{ matrix.api-level }}"
+          timeout 10 adb shell "cat /data/rsbinder/test_service.log" || true
+          exit 1
+        fi
+        echo "test_service is running on Android API level ${{ matrix.api-level }}"
 
     - name: Run tests on Android device (20 iterations)
       run: |
         echo "Looking for test executables on API level ${{ matrix.api-level }}..."
         timeout 10 adb shell "ls -la /data/rsbinder/tests-*" || echo "No test executables found"
         echo "Finding and running test executables (20 iterations)..."
-        timeout 30 adb shell "
+        # The verdict is the exit code, written on the device and read back:
+        # a test failure, a binary that will not execute, a run with no test
+        # binary at all and a timeout all fail this step. The budget covers
+        # 20 iterations at a few seconds each with room to spare.
+        rc=0
+        timeout 900 adb shell "
           cd /data/rsbinder
+          rm -f tests.rc
+          ran=0
           for iteration in \$(seq 1 20); do
             echo \"=== Iteration \$iteration/20 ===\"
             for test_file in tests-*; do
-              if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
-                chmod +x \"\$test_file\"
-                ./\"\$test_file\" || echo \"Test \$test_file failed\"
+              [ -f \"\$test_file\" ] || continue
+              chmod +x \"\$test_file\"
+              ran=\$((ran + 1))
+              if ! ./\"\$test_file\"; then
+                echo \"Test \$test_file failed in iteration \$iteration\"
+                echo 1 > tests.rc
+                exit 1
               fi
             done
           done
-        " || echo "Test execution completed with timeout"
-        echo "All 20 test iterations attempted on Android API level ${{ matrix.api-level }}"
+          if [ \"\$ran\" -eq 0 ]; then
+            echo \"no tests-* binary on the device\"
+            echo 2 > tests.rc
+            exit 2
+          fi
+          echo 0 > tests.rc
+        " || rc=$?
+        device_rc=$(timeout 10 adb shell "cat /data/rsbinder/tests.rc 2>/dev/null" | tr -d '\r')
+        if [ "$rc" -ne 0 ] || [ "$device_rc" != "0" ]; then
+          echo "::error::Android API ${{ matrix.api-level }}: tests did not pass (adb rc=$rc, device rc=${device_rc:-none; timed out?})"
+          echo "---- test_service.log (tail) ----"
+          timeout 10 adb shell "tail -n 60 /data/rsbinder/test_service.log" || true
+          exit 1
+        fi
+        echo "All 20 test iterations passed on Android API level ${{ matrix.api-level }}"
 
   # --------------------------------------------------------------------------
   # macOS RPC integration test — cross-process e2e + hermetic soak

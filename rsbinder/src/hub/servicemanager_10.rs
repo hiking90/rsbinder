@@ -143,16 +143,21 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
     let mut n: i32 = 0;
 
     loop {
-        let result = (|| -> Result<String> {
+        let result = (|| -> Result<Parcel> {
             let mut data = sm.proxy().prepare_transact(true)?;
             data.write::<i32>(&n)?;
             data.write::<i32>(&dump_priority)?;
-            sm.transact(LIST_SERVICES, &data)?.read::<String>()
+            sm.transact(LIST_SERVICES, &data)
         })();
 
         match result {
-            Ok(name) => {
-                services.push(name);
+            Ok(mut reply) => {
+                // Only a failed transaction ends the list, as in AOSP's
+                // `listServices`. An entry whose name cannot be read is kept
+                // as an empty string: the C service manager replies out of
+                // a 256-byte buffer, which a 127-character name overflows,
+                // and ending here would hide every service after it.
+                services.push(reply.read::<String>().unwrap_or_default());
                 n += 1;
             }
             Err(err) => {
