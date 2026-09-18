@@ -404,6 +404,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
+- **`list_services` on Android 10 no longer stops at a name it cannot read.**
+  The legacy C service manager answers a listing one entry at a time out of a
+  256-byte reply buffer, which a 127-character name — the longest it lets you
+  register — overflows, so that entry comes back without a string. rsbinder
+  took the failed read for the end of the list and returned only the services
+  registered *after* that one; every other service on the device was missing.
+  The loop now ends only on a failed transaction, as AOSP's Android 10
+  `listServices` does, and keeps such an entry as an empty string. Found when
+  the Android CI job started running its tests natively: the API 29 image has
+  no ARM translation, so the aarch64 test binary had never executed there.
 - **A synchronous handle to a local async service no longer panics when called
   from async code.** `Bn*::new_async_binder` returns a *sync*
   `Strong<dyn IFoo>` whose methods are implemented as

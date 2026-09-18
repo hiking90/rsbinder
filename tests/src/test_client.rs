@@ -2126,9 +2126,12 @@ fn test_hub() {
         .expect("service manager")
         .unwrap();
     let list = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
-    assert!(list
-        .iter()
-        .any(|s| s == ITestService::BpTestService::descriptor()));
+    assert!(
+        list.iter()
+            .any(|s| s == ITestService::BpTestService::descriptor()),
+        "the test service is missing from the {} listed: {list:?}",
+        list.len()
+    );
 
     #[cfg(target_os = "android")]
     if get_android_sdk_version() < 31 {

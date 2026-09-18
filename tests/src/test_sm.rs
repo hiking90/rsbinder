@@ -49,11 +49,30 @@ fn test_add_service() -> rsbinder::Result<()> {
     let s = "a".repeat(127);
     assert!(hub::add_service(&s, service.as_binder()).is_ok());
 
+    // Android 10's C service manager prepends new entries and answers a
+    // listing out of a 256-byte buffer, which this name overflows. The
+    // entry then reads back empty; it must not end the listing, or "foo"
+    // and everything else behind it would disappear.
+    let listed = hub::list_services(hub::DUMP_FLAG_PRIORITY_DEFAULT);
+    assert!(
+        listed.iter().any(|name| name == "foo"),
+        "\"foo\" is missing from the {} listed: {listed:?}",
+        listed.len()
+    );
+
     let s = "a".repeat(128);
     assert!(hub::add_service(&s, service.as_binder()).is_err());
 
-    // Weird characters are not allowed.
-    assert!(hub::add_service("happy$foo$fo", service.as_binder()).is_err());
+    // Weird characters are not allowed — except by Android 10's C service
+    // manager, whose `do_add_service` checks the length and nothing else.
+    #[cfg(target_os = "android")]
+    let validates_name = get_android_sdk_version() != hub::sdk_versions::ANDROID_10;
+    #[cfg(not(target_os = "android"))]
+    let validates_name = true;
+    assert_eq!(
+        hub::add_service("happy$foo$fo", service.as_binder()).is_err(),
+        validates_name
+    );
 
     // Overwrite the service
     assert_eq!(hub::add_service("foo", service.as_binder()), Ok(()));
@@ -69,8 +88,10 @@ fn test_add_service() -> rsbinder::Result<()> {
 fn test_get_check_list_service() -> rsbinder::Result<()> {
     setup();
 
+    // The service manager registers itself as "manager" from Android 11
+    // on (`cmds/servicemanager/main.cpp`); the C one on Android 10 does not.
     #[cfg(target_os = "android")]
-    {
+    if get_android_sdk_version() != hub::sdk_versions::ANDROID_10 {
         let manager_name = "manager";
         let binder = hub::try_get_service(manager_name).expect("service manager");
         assert!(binder.is_some());
