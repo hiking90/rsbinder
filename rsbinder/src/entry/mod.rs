@@ -35,7 +35,7 @@
 //! | [`crate::get_calling_uid`] | kernel-vouched | kernel-vouched on `unix://`, fail-closed sentinel elsewhere |
 //! | death | process death | session disconnect |
 //! | `list_services`, notifications, lazy services | via [`crate::hub`] | not available |
-//! | an option that does not apply | [`crate::StatusCode::BadValue`] at `run`/`open`, logged |
+//! | an option that does not apply, or that the process cannot honor | [`crate::StatusCode::BadValue`] at `serve`/`run`/`open`, logged |
 
 pub mod uri;
 
@@ -54,6 +54,12 @@ use crate::{FromIBinder, SIBinder, Strong};
 /// Start assembling a server on `uri` (see [`uri`] for the grammar; a
 /// `#service` fragment is ignored). Add services with [`Server::add`],
 /// then [`Server::run`] or [`Server::spawn`].
+///
+/// On `binder://` this also initializes the process-wide
+/// [`ProcessState`](crate::ProcessState), so a `?driver=` / `?threads=`
+/// that disagrees with one already initialized is
+/// [`StatusCode::BadValue`](crate::StatusCode::BadValue) here rather than
+/// at [`Server::run`] — see [`Server`].
 pub fn serve(uri: &str) -> Result<Server> {
     server::new_server(uri::parse(uri)?)
 }

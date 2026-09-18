@@ -157,6 +157,28 @@ pub trait RpcTransport: Send + Sync {
     /// and covered only by its own `#[ignore]`d tests.
     fn shutdown(&self) -> RpcResult<()>;
 
+    /// Whether this transport can actually carry file descriptors.
+    ///
+    /// Default `false`, matching the fd-rejecting defaults of
+    /// [`send_frame_with_fds`](Self::send_frame_with_fds) /
+    /// [`send_raw_with_fds`](Self::send_raw_with_fds): a backend that
+    /// does not override those cannot pass an fd whatever fd mode the
+    /// session negotiated, and `SCM_RIGHTS` is `unix` only.
+    ///
+    /// **An implementor that overrides the fd send/recv methods must
+    /// override this too.** The two are separate switches: leaving this
+    /// at `false` while the sends work makes the session report no
+    /// [`FD_PASSING`](crate::TransportCaps::FD_PASSING), and a caller
+    /// that branches on that bit gives up a path that would have
+    /// worked. The reverse — `true` with the defaults in place — trips
+    /// a `debug_assert` on the first fd send.
+    ///
+    /// A session reads this off its founding connection and refuses a
+    /// later connection that answers differently.
+    fn supports_fd_passing(&self) -> bool {
+        false
+    }
+
     /// Send one frame plus passed file descriptors out-of-band (opt-in
     /// `FileDescriptorTransportMode::Unix`).
     ///
@@ -172,6 +194,10 @@ pub trait RpcTransport: Send + Sync {
         if fds.is_empty() {
             self.send_frame(buf)
         } else {
+            // The predicate and this default must not disagree: a `true`
+            // here would have the session advertise FD_PASSING for a
+            // send that always fails.
+            debug_assert!(!self.supports_fd_passing());
             Err(RpcError::Protocol(
                 "this transport cannot pass file descriptors (UDS only)",
             ))
@@ -222,6 +248,7 @@ pub trait RpcTransport: Send + Sync {
         if fds.is_empty() {
             self.send_raw(buf)
         } else {
+            debug_assert!(!self.supports_fd_passing());
             Err(RpcError::Protocol(
                 "this transport cannot pass file descriptors (UDS only)",
             ))
@@ -632,8 +659,8 @@ mod tests {
 
     #[test]
     fn write_frame_rejects_oversize_payload() {
-        // We don't actually allocate MAX+1; just check the guard via a
-        // fake writer that would error if written to.
+        // `Trap` panics on any write: reaching it means the length guard
+        // did not fire.
         struct Trap;
         impl Write for Trap {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -643,10 +670,6 @@ mod tests {
                 Ok(())
             }
         }
-        // Build a slice header claiming oversize without allocating it:
-        // use a zero-filled Vec of MAX+1 only conceptually — instead
-        // assert the boundary with a borrowed empty slice and a forged
-        // length check by calling the guard logic directly.
         let big = vec![0u8; MAX_FRAME_LEN + 1];
         assert!(matches!(
             write_frame(&mut Trap, &big),

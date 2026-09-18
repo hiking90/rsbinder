@@ -15,6 +15,44 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Migrating
 
+- **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). The variant
+  is a struct variant without `#[non_exhaustive]`, so a struct literal that
+  builds one, or a `match` arm that names every field, is a compile error until
+  `mmap_size` is added (`mmap_size: None` reproduces the previous behavior).
+  Matching with `..`, and every other way of obtaining an `Endpoint` — `serve`,
+  `Client::open`, `Server::endpoint()` — are unaffected.
+- **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
+  `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
+  `ClientOptions::driver` are fixed process-wide by whoever initializes
+  `ProcessState` first. A later call naming a *different* value used to log a
+  warning and continue with the value already in force; it now returns
+  `StatusCode::BadValue`, which is what every other inapplicable option in this
+  layer already returned. Omitting the option, or passing the value already in
+  force, is unaffected — so a second `serve("binder://")` in one process still
+  works. Code that called `serve` twice with different thread counts was not
+  getting the second one; now it is told.
+- **A kernel setting given twice to `Client::open` must agree.**
+  `ClientOptions::driver` used to override a different `binder://?driver=`
+  without a word. The two — and `ClientOptions::mmap_size` against `?mmap=` —
+  are now `StatusCode::BadValue` when they differ, the same answer as for a key
+  repeated inside the URI. Giving the value once, or the same value twice, is
+  unaffected.
+- **An RPC session refuses a connection whose transport differs from its
+  founding one.** A later connection must match the first in whether it can
+  carry file descriptors and in whether its peer is local; one that does not
+  is dropped at attach (`BadType` on the server's attach path). Every
+  built-in setup path opens all of a session's connections over one transport
+  and is unaffected. What this rules out is a hand-assembled session — say a
+  Unix socket attached to a session founded over vsock through
+  `RpcServer::serve_connection` — whose `caps()` had no single right answer.
+- **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
+  `ServiceSpecific(0)`, not `Ok`.** A `Status` built from the bare exception
+  code therefore carries code `0` — what AOSP's
+  `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` carries and what the wire
+  always read back — instead of a local-only state that changed on its first
+  trip through a parcel. `service_specific_error()` returned `0` for it before
+  and still does; `StatusCode::from(status)` now yields `ServiceSpecific(0)`
+  where it yielded `FailedTransaction`.
 - **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects.** The
   new checks are listed under *Added*. Each one fires on a contract the AOSP
   compiler already refuses, so an `.aidl` that builds against both compilers is
@@ -114,9 +152,150 @@ This changelog starts at 0.9.0. For earlier releases, see the
   inside a binder is a latent panic in any case: `Runtime::drop` panics when the
   last `Strong` to the service is released on one of that runtime's worker
   threads. Wrap `runtime.handle().clone()` instead.
+- **A kernel transaction dispatched inside an RPC handler now reports the
+  kernel caller.** Binder's nested IPC delivers a re-entrant `BR_TRANSACTION`
+  to the very thread parked waiting for a reply, so an RPC handler that makes
+  an outgoing kernel call can have a kernel transaction dispatched inside it.
+  Inside that inner kernel handler, `calling_caller()` used to return
+  `Caller::Rpc(..)` and `get_calling_uid()` / `get_calling_pid()` /
+  `get_calling_sid()` / `CallingContext::default()` the suspended RPC peer's
+  values — for a transport that carries no uid, the `u32::MAX` sentinel and pid
+  `-1`. They now answer for
+  the kernel caller the inner transaction actually came from:
+  `Caller::Kernel`, the kernel-delivered `sender_euid` / `sender_pid`, and the
+  SELinux context (`CallingContext::default()` reports those same three in one
+  value). The RPC values come back when the inner transaction
+  returns, and `is_handling_transaction()` is unchanged in both places. Only a
+  process that mixes kernel binder and RPC on one thread is affected; a
+  handler that `match`es on the `Caller` arm to pick an authorization rule now
+  takes the `Kernel` arm there, so re-check such handlers — a rule written for
+  the RPC arm (a cert allowlist, a Unix-peer uid ACL) no longer runs for a
+  caller that arrived over kernel binder.
 
 ### Added
 
+- **`ParcelFileDescriptor::pipe()`**, plus `Read` and `Write` for
+  `ParcelFileDescriptor` and `&ParcelFileDescriptor` — the AOSP idiom for an
+  open-ended payload (`ParcelFileDescriptor.createPipe`), with the two
+  boilerplate steps it used to take now gone: a hand-rolled `pipe()` with two
+  `unsafe` `from_raw_fd`s, and cloning the descriptor into a `std::fs::File`
+  before anything could read or write it. Both ends are `O_CLOEXEC`, as AOSP's
+  are.
+
+  The adapters mean what `File`'s mean, including `Ok(0)` at end of file and
+  `BrokenPipe` once the reader is gone. Note that a pipe holds about 64 KB:
+  whoever writes more needs a reader already draining it, usually the peer once
+  the read end has been sent. For `tokio`, convert once with
+  `tokio::fs::File::from_std(std::fs::File::from(OwnedFd::from(pfd)))` —
+  rsbinder does not wrap that, since its `tokio` feature deliberately does not
+  pull `tokio/fs`.
+- **`Parcel::write_blob` / `read_blob`** — AOSP's convention for a large byte
+  payload: inline when it is at most `BLOB_INPLACE_LIMIT` (16 KB), through a
+  shared-memory region when it is larger, with the form recorded on the wire as
+  a tag the reader follows. Byte-compatible with C++ `Parcel::writeBlob` and
+  Java `Parcel.writeBlob`, so a framework peer reads what rsbinder wrote.
+
+  The region is a memfd, which AOSP's reader accepts: libcutils' `ashmem_valid`
+  answers yes for a `/memfd:` link and takes the size from `fstat`, and an
+  immutable blob carries `F_SEAL_FUTURE_WRITE` — the same seal AOSP's own memfd
+  path adds for `ashmem_set_prot_region(fd, PROT_READ)`. On a kernel that cannot
+  apply that seal (Linux before 5.1) an immutable blob goes inline instead of
+  out over a region a reader could write.
+
+  Where a transport carries no file descriptors — vsock, TLS, or the
+  session-less data-only parcel behind `to_bytes` — the payload goes inline
+  whatever its size, which is AOSP's `!mAllowFds` branch and needs no option.
+  `Parcel::allow_fds()` is the predicate behind that, public because a
+  handwritten parcelable choosing its own representation needs the same answer.
+- **Cooperative cancellation** — `cancel::CancellationSignal`,
+  `cancel::CancellationToken` and `cancel::cancel_remote`, over a vendored
+  `android.os.ICancellationSignal`. A service makes a signal per operation,
+  returns `create_transport()` to the caller, and watches
+  `token.is_canceled()` (or, with the `tokio` feature,
+  `token.canceled().await`); the caller sends the `oneway cancel()` through the
+  transport binder. Since the descriptor is AOSP's, a framework client can
+  cancel an rsbinder service and rsbinder can cancel one of theirs — both
+  directions are covered by a STAGE3 harness against real `libbinder`.
+
+  Only this direction exists: the service creates, the caller cancels. The
+  mirror image makes every poll a transaction back to the caller, and on the
+  RPC stack it would require the client to have opened incoming connections.
+  Two properties worth reading the module docs for — what a cancellation
+  *means* is the service's to decide (as it is in AOSP, which throws
+  `OperationCanceledException` from the service), and delivery is both
+  best-effort and unordered against your other calls, because the transport is
+  a different binder object than the service and the kernel orders a `oneway`
+  to one against a twoway to the other not at all.
+- **Service-specific errors can be a type instead of an `i32`** —
+  `ServiceSpecificError` (trait), `Status::service_specific` and
+  `Status::service_error::<T>()`, with `#[derive(ServiceSpecificError)]` for a
+  plain Rust enum and `impl_service_specific_error!` for one that came from
+  `.aidl`. The wire is untouched: a code is the `i32` AOSP's
+  `Status::fromServiceSpecificError` writes, so a C++ or Java peer reads what
+  it always did — what changes is that the enum ↔ code mapping is written once
+  rather than at each call site.
+
+  `service_error` answers `None` for a status that is not a service-specific
+  failure at all *and* for one whose code the type does not declare, which is
+  what a peer built against a newer contract looks like from here;
+  `service_specific_error()` still has the raw number in both cases. Attaching
+  either macro is deliberate rather than automatic for every enum: the code
+  space is `i32`, so a `long`-backed `.aidl` enum has none, and saying so is a
+  compile error at the attachment rather than a value that truncates on the
+  wire.
+- **`Status::message()`** — the message a peer attached, which until now only
+  `Display` could reach.
+- **The receive mapping is now configurable** — `ProcessState::init_with_mmap_size`,
+  `binder://?mmap=<bytes>` and `ClientOptions::mmap_size`, with
+  `MAX_BINDER_MMAP_SIZE`,
+  `ProcessState::default_mmap_size()` and `ProcessState::mmap_size()` alongside.
+  The "1 MB binder limit" is this mapping: the driver copies an incoming
+  transaction into a buffer allocated out of the **destination** process's
+  mapping, so raising it on a service is what lets that service accept larger
+  calls — from an AOSP `libbinder` peer as much as from rsbinder, since the wire
+  does not change and there is nothing to negotiate. A payload too large for the
+  destination still comes back to the sender as `FailedTransaction`.
+
+  Bytes only, between one page and `MAX_BINDER_MMAP_SIZE` (4 MB); outside that
+  is `BadValue`, deliberately including *above*, because the driver clamps to
+  4 MB without telling anyone and a process that asked for 8 MB should not have
+  to discover it got half. The value is rounded up to a page (what `mmap(2)`
+  maps) and `ProcessState::mmap_size()` reports the rounded figure. Oneway
+  transactions may use only half of the mapping, the driver's rule, not a new
+  one. Process-wide and fixed by whoever initializes `ProcessState` first, so it
+  follows the `?driver=` / `?threads=` rule above: a later different value is
+  `BadValue`.
+
+  Both the range check and that refusal belong to `serve` / `Client::open` and
+  to the call that initializes the process. `ProcessState::init_with_mmap_size`
+  called directly on a process that is already initialized does not look at its
+  arguments at all — it returns the existing state, whatever size was asked
+  for. `ServeOptions::mmap_size` is in the position `ServeOptions::threads` is
+  in: `serve` initializes `ProcessState` before the option is read, so the
+  field cannot make the mapping — it is compared against the size already in
+  force, and a different one is `BadValue` at `run` / `spawn`. On a kernel
+  server the size is set by `binder://?mmap=`, or by
+  `ProcessState::init_with_mmap_size` called before `serve`.
+- **`TransportCaps`** — what the transport under a binder can do, as five bits:
+  `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`, `KERNEL_KNOBS`. Read it
+  from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —
+  inside a handler, for the call being served — `calling_caps()`.
+  `caps.require(bits, "what for")` turns a missing capability
+  into `InvalidOperation` plus a log line saying when the missing bit holds,
+  at setup rather than on the first transaction.
+
+  It is a **summary, not a rule**: every bit is derived from a fact some other
+  type already owns and still enforces. Ignore `FD_PASSING` and the fd write
+  refuses on its own, exactly as before; ignore `TRUSTED_UID` and
+  `get_calling_uid()` still returns its fail-closed sentinel. Two distinctions
+  are worth reading the rustdoc for — `Endpoint::static_caps()` answers for the
+  transport *family*, and it bounds a session in neither direction:
+  `FD_PASSING` is an upper bound (a `unix://` endpoint claims it before any
+  session negotiates the `Unix` fd mode), while `CALLBACKS` is a lower one (no
+  *RPC* endpoint reports it — `binder://` does, since kernel binder has every
+  bit — although a session opened with `ClientOptions::incoming_connections > 0`
+  does) — and a session's caps are a
+  snapshot that changes as connections come and go.
 - **`wait_for_interface_async` and `check_interface_async`** — the awaitable
   forms of `hub::wait_for_interface` / `hub::check_interface`, at the crate root
   next to `get_interface_async` (`tokio` feature). The wait keeps the

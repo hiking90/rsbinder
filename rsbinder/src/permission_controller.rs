@@ -180,15 +180,24 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// transaction vouched for the caller; a freshly constructed
 /// [`Parcel::new`] reports `true` as well. Whether a transaction is in
 /// flight is a second question, which this function asks separately via
-/// [`crate::is_handling_transaction`], and the two can disagree: while an
-/// RPC dispatch is on the stack, a nested kernel `BR_TRANSACTION`
-/// dispatched on the same thread hands the handler a kernel-marshalled
-/// `reader`, yet the outer RPC calling context is still installed, so
-/// [`crate::is_handling_transaction`] and [`crate::get_calling_uid`] /
-/// [`crate::get_calling_pid`] answer for the **RPC** peer — PMS is then
-/// asked about the RPC peer's uid while a kernel caller is being served.
-/// That residual gap is not closed here: it needs the calling context to
-/// be scoped per dispatch, not a stronger parcel predicate.
+/// [`crate::is_handling_transaction`]. Nesting is handled: while an RPC
+/// dispatch is on the stack, a nested kernel `BR_TRANSACTION` dispatched
+/// on the same thread hands the handler a kernel-marshalled `reader`, and
+/// the outer RPC calling context is suspended for the duration of that
+/// inner dispatch, so [`crate::get_calling_uid`] /
+/// [`crate::get_calling_pid`] answer for the **kernel** caller. PMS is
+/// therefore asked about the kernel caller's uid, not the suspended RPC
+/// peer's.
+///
+/// The other direction is not symmetric. While a kernel dispatch calls out
+/// over RPC, the peer's inbound dispatch is the innermost frame and its
+/// calling context stays installed, so an RPC handler that passes a
+/// kernel-marshalled parcel — a fresh [`Parcel::new`], or the outer kernel
+/// `reader` it captured — gets past both gates above and PMS is asked about
+/// the **RPC peer's** uid. A Unix peer running as root is granted
+/// unconditionally there. Producing that combination takes a hand-written
+/// handler that hands this function a parcel other than the one it was
+/// dispatched with.
 ///
 /// RPC services needing authorization must use transport-native means
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
@@ -285,6 +294,14 @@ fn warn_enforce_permission_over_rpc() {
 mod tests {
     use super::*;
 
+    /// What a Unix RPC session carries before it negotiates an fd mode —
+    /// the shape the simulated dispatches below stand in for. The value
+    /// is incidental to these tests, which are about the permission
+    /// decision, but the guard takes it.
+    #[cfg(feature = "rpc")]
+    const UNIX_CAPS: crate::TransportCaps =
+        crate::TransportCaps::TRUSTED_UID.union(crate::TransportCaps::SAME_HOST);
+
     /// The generated trait must expose the AOSP wire descriptor
     /// verbatim — `"android.os.IPermissionController"`.
     /// A mismatch here would silently fail every cross-process call to
@@ -330,7 +347,10 @@ mod tests {
         rpc_parcel.set_for_rpc(true);
         // Inside a (simulated) RPC transaction, so `is_handling_transaction()`
         // is `true` and only the kernel-backing gate can produce the denial.
-        let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+        let _g = RpcCallingGuard::install(
+            Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+            UNIX_CAPS,
+        );
         assert!(crate::is_handling_transaction());
         assert!(
             !check_permission(&rpc_parcel, "android.permission.INTERNET"),
@@ -389,7 +409,10 @@ mod tests {
         // Inside an RPC transaction from uid 1000: the authority grants the
         // one permission it knows, and denies everything else.
         {
-            let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+            let _g = RpcCallingGuard::install(
+                Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+                UNIX_CAPS,
+            );
             assert!(
                 check_permission(&rpc_parcel, "com.example.DO_THING"),
                 "authority must grant the allowed uid+permission over RPC"
@@ -401,7 +424,10 @@ mod tests {
         }
         // Different uid ⇒ deny.
         {
-            let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 2000, pid: 7 }));
+            let _g = RpcCallingGuard::install(
+                Arc::new(PeerIdentity::Local { uid: 2000, pid: 7 }),
+                UNIX_CAPS,
+            );
             assert!(
                 !check_permission(&rpc_parcel, "com.example.DO_THING"),
                 "authority must deny a non-allowed uid"
@@ -412,7 +438,10 @@ mod tests {
 
         // Restore the default so other tests see kernel-PMS / RPC-deny.
         clear_permission_authority();
-        let _g = RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }));
+        let _g = RpcCallingGuard::install(
+            Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
+            UNIX_CAPS,
+        );
         assert!(
             !check_permission(&rpc_parcel, "com.example.DO_THING"),
             "after clear, the default RPC deny is restored"

@@ -195,6 +195,78 @@ impl Status {
         )
     }
 
+    /// [`new_service_specific_error`](Self::new_service_specific_error)
+    /// from a typed error instead of a bare `i32`.
+    ///
+    /// The wire is the same — one `i32` and an optional message, AOSP's
+    /// `Status::fromServiceSpecificError` — so a C++ or Java peer reads
+    /// exactly what it read before. What changes is that the enum ↔ code
+    /// mapping lives in one place instead of at every call site.
+    ///
+    /// ```
+    /// # use rsbinder::*;
+    /// rsbinder::declare_binder_enum! {
+    ///     LookupError : [i32; 2] { NOT_FOUND = 1, BUSY = 2, }
+    /// }
+    /// rsbinder::impl_service_specific_error!(LookupError);
+    ///
+    /// fn lookup() -> BinderResult<i32> {
+    ///     Err(Status::service_specific(LookupError::NOT_FOUND, Some("no such row")))
+    /// }
+    /// # assert_eq!(lookup().unwrap_err().service_specific_error(), 1);
+    /// ```
+    ///
+    /// A plain Rust enum gets there with `#[derive(ServiceSpecificError)]`
+    /// (the `macros` feature) instead of the two macros above. Read the
+    /// value back with [`service_error`](Self::service_error).
+    pub fn service_specific<E: ServiceSpecificError>(err: E, message: Option<&str>) -> Self {
+        Self::new_service_specific_error(err.code(), message.map(str::to_owned))
+    }
+
+    /// The service-specific code as `E`, or `None` when this status does
+    /// not carry one of `E`'s values.
+    ///
+    /// `None` when the exception is not
+    /// [`ExceptionCode::ServiceSpecific`], or when `E` does not declare
+    /// the code — a peer built against a newer `.aidl`. Reach for
+    /// [`service_specific_error`](Self::service_specific_error) when the
+    /// raw `i32` is what you need to log or forward.
+    ///
+    /// A status built from the bare [`ExceptionCode::ServiceSpecific`]
+    /// carries code `0`, as AOSP's
+    /// `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` does.
+    ///
+    /// ```
+    /// # use rsbinder::*;
+    /// # rsbinder::declare_binder_enum! {
+    /// #     LookupError : [i32; 2] { NOT_FOUND = 1, BUSY = 2, }
+    /// # }
+    /// # rsbinder::impl_service_specific_error!(LookupError);
+    /// fn handle(status: &Status) -> &'static str {
+    ///     match status.service_error::<LookupError>() {
+    ///         Some(LookupError::NOT_FOUND) => "create it",
+    ///         Some(LookupError::BUSY) => "retry later",
+    ///         _ => "unhandled",
+    ///     }
+    /// }
+    /// # let busy = Status::service_specific(LookupError::BUSY, None);
+    /// # assert_eq!(handle(&busy), "retry later");
+    /// # assert_eq!(handle(&Status::new_service_specific_error(9, None)), "unhandled");
+    /// ```
+    ///
+    /// The `_` arm is not optional: an `.aidl` enum is an open newtype,
+    /// so `Some(LookupError(9))` is a value the type can hold even
+    /// though `from_code` never produces one.
+    pub fn service_error<E: ServiceSpecificError>(&self) -> Option<E> {
+        if self.exception != ExceptionCode::ServiceSpecific {
+            return None;
+        }
+        let StatusCode::ServiceSpecific(code) = self.code else {
+            return None;
+        };
+        E::from_code(code)
+    }
+
     pub fn is_ok(&self) -> bool {
         self.exception == ExceptionCode::None
     }
@@ -218,6 +290,63 @@ impl Status {
             0
         }
     }
+
+    /// The message carried by this status, if any.
+    ///
+    /// What `None` means depends on where the status came from, because
+    /// the wire has no way to say "no message":
+    ///
+    /// - A status built locally reports exactly what was supplied, so
+    ///   `None` is the `None` that was passed in.
+    /// - An *exception* read from a parcel reports `Some("")` when the
+    ///   sender supplied no message: the serializer writes
+    ///   `message.unwrap_or("")`, as AOSP's C++ `Status` does, and a
+    ///   zero-length String16 reads back as an empty `String`. There,
+    ///   `None` arrives only from a peer that wrote a *null* string — in
+    ///   practice a Java peer throwing an exception with no detail
+    ///   message.
+    /// - An `EX_NONE` status carries no message field on the wire at all:
+    ///   `serialize` returns right after the exception code and
+    ///   `deserialize` reads none, so a successful status read from a
+    ///   parcel always reports `None`. The `EX_HAS_REPLY_HEADER` path,
+    ///   which folds to `EX_NONE`, is the same. `EX_TRANSACTION_FAILED`
+    ///   is never written either.
+    ///
+    /// Nothing is folded in either direction; callers that treat an
+    /// absent message and an empty one alike should test both.
+    /// [`Display`] already folds it into a line for logging; this is for
+    /// a caller that wants the string itself.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+/// A type whose values are binder **service-specific error codes**.
+///
+/// Implement it with [`impl_service_specific_error!`](crate::impl_service_specific_error)
+/// for an `.aidl` enum, or `#[derive(ServiceSpecificError)]` for a plain
+/// Rust enum; then [`Status::service_specific`] and
+/// [`Status::service_error`] carry values of the type instead of bare
+/// `i32`s. Nothing about the wire changes — a code is an `i32` there, as
+/// it is for AOSP.
+///
+/// The code space is `i32` because that is the field AOSP's `Status`
+/// carries. An `.aidl` enum backed by `long` therefore cannot be an
+/// error type, and attaching this to one is a compile error rather than
+/// a value that truncates on the wire.
+pub trait ServiceSpecificError: Sized {
+    /// The `i32` this value goes on the wire as.
+    ///
+    /// An inherent `code` method on the implementing type shadows this
+    /// one at a call site (Rust resolves inherent methods first), which
+    /// is a reason to reach for `Status::service_specific` rather than
+    /// calling this directly.
+    fn code(&self) -> i32;
+
+    /// The value a code names, or `None` if this type declares no such
+    /// value — which is what a peer built against a newer contract looks
+    /// like from here.
+    fn from_code(code: i32) -> Option<Self>;
 }
 
 impl std::error::Error for Status {}
@@ -248,6 +377,9 @@ impl From<ExceptionCode> for StatusCode {
     fn from(exception: ExceptionCode) -> Self {
         match exception {
             ExceptionCode::TransactionFailed => StatusCode::FailedTransaction,
+            // AOSP `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` carries
+            // code 0, and 0 is what the wire would read back anyway.
+            ExceptionCode::ServiceSpecific => StatusCode::ServiceSpecific(0),
             _ => StatusCode::Ok,
         }
     }
@@ -414,16 +546,10 @@ impl Deserialize for Status {
             let message: Option<String> = parcel.read::<Option<String>>()?;
 
             // AOSP `Status::readFromParcel` (frameworks/native/libs/binder/
-            // Status.cpp): capture the header start position and the
-            // available bytes BEFORE reading the size int32. The remote
-            // stack-trace header size is size-INCLUSIVE (it counts the
-            // 4-byte size field itself), so reposition to
-            // `header_start + size` — and ONLY when size != 0. size == 0
-            // (the native writer's "empty remote stack trace header") leaves
-            // the cursor right after the size field. The previous
-            // size-EXCLUSIVE arithmetic (`current_pos_after_read + size`)
-            // landed 4 bytes too far whenever a Java peer propagated a
-            // non-zero stack-trace header.
+            // Status.cpp): the remote stack-trace header size is
+            // size-INCLUSIVE, so the skip target is `header_start + size`,
+            // captured before the size int32 is read; `size == 0` means no
+            // header and leaves the cursor where it is.
             let header_start = parcel.data_position();
             let header_avail = parcel.data_avail();
             let remote_stack_trace_header_size = parcel.read::<i32>()?;
@@ -483,9 +609,105 @@ mod tests {
 
     #[test]
     fn test_status() -> Result<()> {
-        let _status = Status::from(StatusCode::Unknown);
+        let status = Status::from(StatusCode::Unknown);
+        assert_eq!(status.exception_code(), ExceptionCode::TransactionFailed);
+        assert_eq!(status.transaction_error(), StatusCode::Unknown);
 
         Ok(())
+    }
+
+    crate::declare_binder_enum! {
+        LookupError : [i32; 2] {
+            NOT_FOUND = 1,
+            BUSY = 2,
+        }
+    }
+    crate::impl_service_specific_error!(LookupError);
+
+    // A `byte`-backed enum is a legal error type: its codes widen into
+    // the i32 a status carries. (A `long`-backed one is not, and the
+    // macro is what refuses it — see the trait's rustdoc.)
+    crate::declare_binder_enum! {
+        SmallError : [i8; 2] {
+            // A declared 0: without it nothing here would notice a
+            // `service_error` that fell back to code 0.
+            NONE = 0,
+            OFFLINE = -3,
+        }
+    }
+    crate::impl_service_specific_error!(SmallError);
+
+    /// Plan 10-4 AC-4.1/4.2/4.3. The transports share one `Status`
+    /// codec, so this is the round trip both of them make.
+    #[test]
+    fn a_typed_service_error_survives_the_wire() {
+        let sent = Status::service_specific(LookupError::BUSY, Some("try again"));
+        let mut parcel = Parcel::new();
+        parcel.write(&sent).expect("write status");
+        parcel.set_data_position(0);
+        let got: Status = parcel.read().expect("read status");
+
+        assert_eq!(got.exception_code(), ExceptionCode::ServiceSpecific);
+        assert_eq!(got.service_error::<LookupError>(), Some(LookupError::BUSY));
+        assert_eq!(got.service_specific_error(), 2);
+        assert_eq!(got.message(), Some("try again"));
+
+        // A negative code through a narrower backing: the widening is
+        // sign-preserving, not a reinterpretation of the bits.
+        let small = Status::service_specific(SmallError::OFFLINE, None);
+        assert_eq!(small.service_specific_error(), -3);
+        assert_eq!(
+            small.service_error::<SmallError>(),
+            Some(SmallError::OFFLINE)
+        );
+        assert_eq!(small.message(), None);
+
+        // The wire cannot say "no message": a `None` goes out as a
+        // zero-length String16 and reads back as `Some("")`. Only a null
+        // string (a Java peer) reads back as `None`.
+        let mut parcel = Parcel::new();
+        parcel.write(&small).expect("write status");
+        parcel.set_data_position(0);
+        let small_back: Status = parcel.read().expect("read status");
+        assert_eq!(small_back.message(), Some(""));
+        assert_eq!(
+            small_back.service_error::<SmallError>(),
+            Some(SmallError::OFFLINE)
+        );
+
+        // A bare service-specific exception carries code 0, as AOSP's
+        // `fromExceptionCode(EX_SERVICE_SPECIFIC)` does — the same answer
+        // before and after the wire.
+        let codeless = Status::from(ExceptionCode::ServiceSpecific);
+        assert_eq!(
+            codeless.service_error::<SmallError>(),
+            Some(SmallError::NONE)
+        );
+        let mut parcel = Parcel::new();
+        parcel.write(&codeless).expect("write status");
+        parcel.set_data_position(0);
+        let codeless_back: Status = parcel.read().expect("read status");
+        assert_eq!(
+            codeless_back.service_error::<SmallError>(),
+            Some(SmallError::NONE)
+        );
+
+        // AC-4.2: a code the enum does not declare is not one of its
+        // values, and the raw `i32` is still there to log or forward.
+        let newer = Status::new_service_specific_error(9, None);
+        assert_eq!(newer.service_error::<LookupError>(), None);
+        assert_eq!(newer.service_specific_error(), 9);
+
+        // AC-4.3: another exception that happens to carry the same
+        // number is not this error. `service_specific_error()` still
+        // reports 2 here, so the exception check is the only thing that
+        // makes the answer `None`.
+        let security = Status::new(
+            ExceptionCode::Security,
+            StatusCode::ServiceSpecific(2),
+            None,
+        );
+        assert_eq!(security.service_error::<LookupError>(), None);
     }
 
     #[test]
@@ -541,9 +763,7 @@ mod tests {
     // Regression: a non-zero, size-INCLUSIVE remote stack-trace header
     // (as a Java peer propagating an exception trace emits) must be skipped
     // by exactly `header_start + size` so the following EX_SERVICE_SPECIFIC
-    // code reads back correctly. The previous size-EXCLUSIVE arithmetic
-    // (`pos_after_size_read + size`) overshot by 4 bytes and desynced the
-    // cursor.
+    // code reads back correctly.
     #[test]
     fn deserialize_skips_nonzero_remote_stack_trace_header() {
         let mut parcel = Parcel::new();

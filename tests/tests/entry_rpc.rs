@@ -33,6 +33,11 @@ impl IRpcSmoke for TaggedSvc {
     fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
+    // Only `rpc_generated_stub.rs` asserts on this method; here it just
+    // has to exist.
+    fn r#fail(&self, code: i32) -> rsbinder::BinderResult<()> {
+        Err(rsbinder::Status::new_service_specific_error(code, None))
+    }
 }
 
 fn tagged(tag: &str) -> Strong<dyn IRpcSmoke> {

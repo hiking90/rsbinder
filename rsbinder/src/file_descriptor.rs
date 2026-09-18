@@ -58,6 +58,97 @@ impl ParcelFileDescriptor {
         let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
         Ok(Self(dup))
     }
+
+    /// A new pipe as two `ParcelFileDescriptor`s, `(read, write)` —
+    /// AOSP `ParcelFileDescriptor.createPipe()`.
+    ///
+    /// This is how a large or open-ended payload crosses binder: the
+    /// parcel carries one end as a file descriptor and the bytes go
+    /// through the kernel pipe, so neither side has to size a buffer or
+    /// fit the whole thing in a transaction.
+    ///
+    /// ```no_run
+    /// # use rsbinder::*;
+    /// # use std::io::Write;
+    /// # fn f() -> Result<()> {
+    /// let (read_end, write_end) = ParcelFileDescriptor::pipe()?;
+    /// // Hand `read_end` to the peer in a parcel, then fill the pipe:
+    /// (&write_end).write_all(b"...")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Both ends are `O_CLOEXEC`, as AOSP's are: an fd on its way into a
+    /// parcel must not leak into a child this process happens to
+    /// `exec` in between.
+    ///
+    /// **A pipe holds about 64 KB before it blocks.** Whoever writes
+    /// more than that must have a reader already draining it — usually
+    /// the peer, once the read end has been sent, or another thread.
+    /// Writing the whole payload before sending the read end works only
+    /// while it fits the buffer.
+    pub fn pipe() -> Result<(Self, Self)> {
+        // `pipe2(O_CLOEXEC)` where it exists; Apple has no pipe2, so the
+        // flag goes on afterwards — a window this process could only
+        // race with an `exec` on another thread.
+        #[cfg(not(target_vendor = "apple"))]
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        #[cfg(target_vendor = "apple")]
+        let (read, write) = {
+            let (read, write) = rustix::pipe::pipe()?;
+            rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
+            rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+            (read, write)
+        };
+        Ok((Self(read), Self(write)))
+    }
+}
+
+/// Read from the descriptor, as [`std::fs::File`] does — including
+/// `Ok(0)` for end of file, which for a pipe means every writer is gone.
+///
+/// Both this and the `&ParcelFileDescriptor` impl exist for the same
+/// reason `File` has both: a reader that owns the descriptor writes
+/// `pfd.read(..)`, and one that only borrowed it writes
+/// `(&pfd).read(..)`.
+///
+/// For `tokio`, convert once: `tokio::fs::File::from_std(
+/// std::fs::File::from(OwnedFd::from(pfd)))`. rsbinder does not wrap
+/// that — its `tokio` feature deliberately does not pull `tokio/fs`.
+impl std::io::Read for ParcelFileDescriptor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+impl std::io::Read for &ParcelFileDescriptor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(rustix::io::read(&self.0, buf)?)
+    }
+}
+
+/// Write to the descriptor, as [`std::fs::File`] does — including
+/// `EPIPE` once the reading end is closed. [`flush`](std::io::Write::flush)
+/// is a no-op: there is no buffer here, and the pipe's own is the
+/// kernel's.
+impl std::io::Write for ParcelFileDescriptor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Write for &ParcelFileDescriptor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(rustix::io::write(&self.0, buf)?)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl AsRef<OwnedFd> for ParcelFileDescriptor {
@@ -444,6 +535,46 @@ mod tests {
     use std::os::fd::FromRawFd;
 
     use super::*;
+
+    /// Plan 10-3 AC-3.4. The adapters have to mean what `std::fs::File`'s
+    /// mean, because that is what a caller will assume of them.
+    #[test]
+    fn a_pipe_reads_and_writes_like_a_file() {
+        use std::io::{Read, Write};
+
+        let (read_end, write_end) = ParcelFileDescriptor::pipe().expect("pipe");
+
+        // Both ends are close-on-exec, so neither leaks into a child
+        // this process execs while the fd is on its way to a parcel.
+        for end in [&read_end, &write_end] {
+            let flags = rustix::io::fcntl_getfd(end).expect("F_GETFD");
+            assert!(
+                flags.contains(rustix::io::FdFlags::CLOEXEC),
+                "a pipe end must be O_CLOEXEC"
+            );
+        }
+
+        (&write_end).write_all(b"hello").expect("write_all");
+        let mut buf = [0u8; 5];
+        (&read_end).read_exact(&mut buf).expect("read_exact");
+        assert_eq!(&buf, b"hello");
+
+        // End of file is `Ok(0)`, as it is for a `File` — here it means
+        // every writing end is gone.
+        drop(write_end);
+        let mut rest = Vec::new();
+        (&read_end).read_to_end(&mut rest).expect("read_to_end");
+        assert!(rest.is_empty());
+
+        // And writing into a pipe nobody reads is `EPIPE`. `SIGPIPE` is
+        // ignored by the Rust runtime, so this returns rather than dies.
+        let (read_end, write_end) = ParcelFileDescriptor::pipe().expect("pipe");
+        drop(read_end);
+        let err = (&write_end)
+            .write_all(b"x")
+            .expect_err("a broken pipe fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
 
     #[test]
     fn test_parcel_file_descriptor() {

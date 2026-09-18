@@ -170,13 +170,13 @@ On the client side, you can invoke `dump()` on a remote service through its prox
 The output is written to a file descriptor (typically a pipe):
 
 ```rust
-let (mut read_file, write_file) = build_pipe();
+let (read_end, write_end) = rsbinder::ParcelFileDescriptor::pipe()?;
 let args = vec!["dump".to_owned(), "MyService".to_owned()];
 
-service.as_binder().as_proxy().unwrap().dump(write_file, &args)?;
+service.as_binder().as_proxy().unwrap().dump(write_end, &args)?;
 
 let mut buf = String::new();
-read_file.read_to_string(&mut buf)?;
+(&read_end).read_to_string(&mut buf)?;
 // buf now contains the dump output
 ```
 
@@ -324,6 +324,61 @@ To stop receiving notifications, call `unlink_to_death` with the same weak refer
 
 `binder_died` arrives as an inbound binder command, so it too needs the thread
 pool running in the client.
+
+## Cancelling a Long Operation
+
+Binder has no per-call deadline and no way to abort a transaction in flight,
+so a long call is stopped the way the Android framework stops one
+(`android.os.ICancellationSignal`): the **service** creates a signal, returns
+its transport binder to the caller, and the caller sends a `oneway cancel()`
+to that binder. Only the service's own loop can act on it.
+
+```rust
+use rsbinder::cancel::{CancellationSignal, ICancellationSignal};
+
+fn start_export(&self, path: &str) -> rsbinder::BinderResult<Strong<dyn ICancellationSignal>> {
+    let signal = CancellationSignal::new();
+    let transport = signal.create_transport();
+    let token = signal.token();          // the work keeps this
+    std::thread::spawn(move || {
+        for chunk in 0..10_000 {
+            if token.is_canceled() {
+                break;
+            }
+            // ... one chunk of work
+        }
+    });
+    Ok(transport)
+}
+```
+
+The caller cancels with the binder it got back:
+
+```rust
+rsbinder::cancel::cancel_remote(&transport)?;
+```
+
+Points worth knowing before you build on it:
+
+- **The service decides what cancellation means.** This carries the
+  notification only; returning a service-specific error saying "cancelled" is
+  the service's call (AOSP likewise throws `OperationCanceledException` from
+  the service).
+- **Delivery is best-effort and unordered against your other calls.** The
+  transport is a different binder object than the service, and the kernel does
+  not order a `oneway` to one against a twoway to another: a caller that
+  cancels and then immediately asks the service what it saw can be answered
+  first. Poll, or report through the result of the operation itself.
+- **Only this direction.** A caller creating the signal and the service
+  polling it would make every poll a transaction back to the caller — and on
+  the RPC stack it would need the client to have opened incoming connections.
+- **Declaring it in `.aidl`:** returning `android.os.ICancellationSignal` means
+  your crate compiles its own copy of that interface, which is a different Rust
+  type from `rsbinder::cancel::ICancellationSignal` (the wire is the same).
+  Returning a bare `IBinder` and cancelling it with `cancel_remote` avoids the
+  second copy.
+- **`async`:** `signal.token().canceled().await` (the `tokio` feature) waits
+  instead of polling.
 
 ## Tips
 

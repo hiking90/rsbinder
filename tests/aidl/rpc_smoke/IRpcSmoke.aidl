@@ -11,4 +11,7 @@ interface IRpcSmoke {
     String echo(String s);
     int add(int a, int b);
     oneway void ping();
+    // Plan 10-4: always fails with `code` as a service-specific error, so
+    // the Status codec is exercised over each RPC transport too.
+    void fail(int code);
 }

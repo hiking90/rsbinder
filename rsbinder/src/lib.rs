@@ -293,6 +293,10 @@ mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
+// What the transport under a binder can do, summarized from the types
+// that already own each fact. Not under `rpc`: the kernel path answers
+// the same questions.
+mod transport_caps;
 
 /// RPC transport (binder-over-socket) — a separate stack from the
 /// kernel binder path. Present only with the `rpc` feature.
@@ -306,6 +310,18 @@ pub mod hub;
 /// (`android.os.IPermissionController`). See module doc for the
 /// AOSP-faithful surface and fail-closed `check_permission` helper.
 pub mod permission_controller;
+
+// Large byte payloads in a parcel (AOSP `Parcel::writeBlob`): inline
+// when small, shared memory when large. Plain comment for the same
+// reason as `cancel` below.
+pub mod blob;
+
+// Cooperative cancellation (`android.os.ICancellationSignal`): a service
+// hands out a transport binder, the caller cancels through it. Kept as a
+// plain (non-doc) comment for the same reason as `entry` below: an outer
+// doc here merges with the module's inner `//!` docs and re-resolves
+// their intra-doc links at the crate root, breaking them.
+pub mod cancel;
 
 /// Async runtime implementations
 #[cfg(feature = "async")]
@@ -333,8 +349,10 @@ pub use async_trait::async_trait as __async_trait;
 // See the `rsbinder_macros` crate docs for the signature rules and for what
 // still needs `.aidl`. `Parcelable` is re-exported as both a trait and a
 // derive; they live in different namespaces, so the one name serves both.
+// `ServiceSpecificError` is re-exported as both a trait and a derive for the
+// same reason as `Parcelable`.
 #[cfg(feature = "macros")]
-pub use rsbinder_macros::{interface, BinderEnum, Parcelable};
+pub use rsbinder_macros::{interface, BinderEnum, Parcelable, ServiceSpecificError};
 
 // Explicit re-exports: glob re-exports would silently leak every
 // newly-added `pub` item in these modules, defeating semver review.
@@ -381,8 +399,8 @@ pub use native::{is_handling_transaction, Binder, BinderFeatures};
 // `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
 // its own `PeerIdentity` model under `rpc::PeerIdentity`.
 pub use thread_state::{
-    calling_caller, clear_calling_identity, get_calling_pid, get_calling_sid, get_calling_uid,
-    get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
+    calling_caller, calling_caps, clear_calling_identity, get_calling_pid, get_calling_sid,
+    get_calling_uid, get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
     has_explicit_identity, restore_calling_identity, set_strict_mode_policy, Caller,
     CallingContext, ExtendedError,
 };
@@ -402,7 +420,9 @@ pub use parcelable::{
 };
 
 pub use parcelable_holder::ParcelableHolder;
-pub use process_state::{CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS};
+pub use process_state::{
+    CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS, MAX_BINDER_MMAP_SIZE,
+};
 
 // From `proxy` — client-side handle types.
 pub use proxy::{Proxy, ProxyHandle};
@@ -414,7 +434,8 @@ pub use rt::{
     check_interface_async, death_signal, get_interface_async, wait_for_interface_async,
     DeathSignal, Tokio, TokioRuntime,
 };
-pub use status::{BinderResult, ExceptionCode, Status};
+pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
+pub use transport_caps::TransportCaps;
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

@@ -28,7 +28,7 @@ use std::thread;
 
 use rsbinder::rpc::transport::{MemTransport, UnixTransport};
 use rsbinder::rpc::{AddressSpace, RpcSession, RpcTransport};
-use rsbinder::{Binder, FromIBinder, Interface, Remotable, SIBinder};
+use rsbinder::{Binder, FromIBinder, Interface, Remotable, SIBinder, ServiceSpecificError};
 
 include!(concat!(env!("OUT_DIR"), "/rpc_smoke.rs"));
 
@@ -48,7 +48,23 @@ impl IRpcSmoke for SmokeSvc {
     fn r#ping(&self) -> rsbinder::BinderResult<()> {
         Ok(())
     }
+    fn r#fail(&self, code: i32) -> rsbinder::BinderResult<()> {
+        // Built from the type, not the `i32`, so the typed-error path is
+        // what is on the wire here (plan 10-4).
+        match SmokeError::from_code(code) {
+            Some(err) => Err(rsbinder::Status::service_specific(err, Some("typed"))),
+            None => Err(rsbinder::Status::new_service_specific_error(code, None)),
+        }
+    }
 }
+
+rsbinder::declare_binder_enum! {
+    SmokeError : [i32; 2] {
+        REFUSED = 1,
+        EXHAUSTED = 2,
+    }
+}
+rsbinder::impl_service_specific_error!(SmokeError);
 
 fn root() -> SIBinder {
     BnRpcSmoke::new_binder(SmokeSvc).as_binder()
@@ -89,6 +105,24 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         // Re-call to prove the stamped descriptor is stable across
         // transactions (OnceLock first-write-wins, not per-call).
         assert_eq!(smoke.r#echo("again").unwrap(), "again");
+
+        // Plan 10-4 AC-4.1, RPC half: the typed error crosses this
+        // transport with the same meaning it has over kernel binder.
+        let status = smoke.r#fail(2).expect_err("fail always fails");
+        assert_eq!(
+            status.exception_code(),
+            rsbinder::ExceptionCode::ServiceSpecific
+        );
+        assert_eq!(
+            status.service_error::<SmokeError>(),
+            Some(SmokeError::EXHAUSTED)
+        );
+        assert_eq!(status.message(), Some("typed"));
+        // A code this enum does not declare stays an `i32` and reads as
+        // `None` rather than as some other variant.
+        let unknown = smoke.r#fail(41).expect_err("fail always fails");
+        assert_eq!(unknown.service_error::<SmokeError>(), None);
+        assert_eq!(unknown.service_specific_error(), 41);
     }
 
     handle.join().expect("server thread");

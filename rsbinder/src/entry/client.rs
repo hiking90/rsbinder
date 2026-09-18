@@ -101,8 +101,24 @@ pub struct ClientOptions {
     /// purpose.
     #[cfg(feature = "rpc")]
     pub handshake_timeout: Option<Duration>,
-    /// Kernel: `?driver=` equivalent.
+    /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
+    /// whoever initializes `ProcessState` first, so a *different* path here
+    /// is [`StatusCode::BadValue`](crate::StatusCode::BadValue) at
+    /// [`open`](Client::open) — see
+    /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
+    /// rule on the server side.
     pub driver: Option<std::path::PathBuf>,
+    /// Kernel: `?mmap=` equivalent — the size of the mapping this
+    /// process receives into. A client is a receiver too: the reply to
+    /// every call it makes is allocated out of *its* mapping, so a
+    /// client expecting replies larger than the ~1 MB default raises it
+    /// here. Unlike [`ServeOptions::mmap_size`](super::ServeOptions::mmap_size),
+    /// this one takes effect — [`open`](Client::open) reads it before it
+    /// initializes `ProcessState`. A *different* size than the one
+    /// already in force is
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), as with
+    /// [`driver`](Self::driver).
+    pub mmap_size: Option<usize>,
 }
 
 /// A resolver for named services on one endpoint: the system service
@@ -152,6 +168,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("handshake_timeout", &self.handshake_timeout);
         d.field("timeout", &self.timeout)
             .field("driver", &self.driver)
+            .field("mmap_size", &self.mmap_size)
             .finish()
     }
 }
@@ -160,6 +177,26 @@ enum Inner {
     Kernel,
     #[cfg(feature = "rpc")]
     Rpc(crate::rpc::RpcSession),
+}
+
+/// A setting that can arrive both as a [`ClientOptions`] field and as a
+/// URI query key: two different values are refused, like every other
+/// conflict in [`Client::open`].
+fn one_source<T: PartialEq + std::fmt::Debug>(
+    what: &str,
+    from_option: Option<T>,
+    from_uri: Option<T>,
+) -> Result<Option<T>> {
+    match (from_option, from_uri) {
+        (Some(o), Some(u)) if o != u => {
+            log::error!(
+                "rsbinder::Client::open: ClientOptions::{what}={o:?} conflicts with the URI's \
+                 {u:?} — give the value once"
+            );
+            Err(StatusCode::BadValue)
+        }
+        (o, u) => Ok(o.or(u)),
+    }
 }
 
 pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
@@ -177,7 +214,11 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
         StatusCode::BadValue
     };
     match &uri.endpoint {
-        Endpoint::Kernel { driver, threads } => {
+        Endpoint::Kernel {
+            driver,
+            threads,
+            mmap_size,
+        } => {
             if o.session_id.is_some()
                 || o.outgoing_connections.is_some()
                 || o.incoming_connections.is_some()
@@ -195,8 +236,9 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
             if o.tls.is_some() || o.tls_server_name.is_some() {
                 return Err(reject("tls/tls_server_name"));
             }
-            let driver = o.driver.as_deref().or(driver.as_deref());
-            super::server::kernel_init(driver, *threads)?;
+            let driver = one_source("driver", o.driver.as_deref(), driver.as_deref())?;
+            let mmap_size = one_source("mmap_size", o.mmap_size, *mmap_size)?;
+            super::server::kernel_init(driver, *threads, mmap_size)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
                 endpoint: uri.endpoint.clone(),
@@ -213,8 +255,8 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
         }
         #[cfg(feature = "rpc")]
         _ => {
-            if o.driver.is_some() {
-                return Err(reject("driver"));
+            if o.driver.is_some() || o.mmap_size.is_some() {
+                return Err(reject("driver/mmap_size"));
             }
             if o.fd_mode == Some(crate::rpc::FileDescriptorTransportMode::Unix)
                 && !uri.endpoint.supports_fd_passing()
@@ -521,6 +563,40 @@ impl Client {
         }
     }
 
+    /// What this client's transport can do, as a
+    /// [`TransportCaps`](crate::TransportCaps) set.
+    ///
+    /// Kernel is always the full set. An RPC client reports what its
+    // The target only exists with `rpc`, so only link it then.
+    #[cfg_attr(
+        feature = "rpc",
+        doc = "session has *now* — see [`RpcSession::caps`](crate::rpc::RpcSession::caps)"
+    )]
+    #[cfg_attr(
+        not(feature = "rpc"),
+        doc = "session has *now* — see `RpcSession::caps` (`rpc` feature)"
+    )]
+    /// for why that is a snapshot, and
+    /// [`Endpoint::static_caps`] for what the transport could offer at
+    /// best.
+    ///
+    /// ```no_run
+    /// # fn f() -> rsbinder::Result<()> {
+    /// use rsbinder::TransportCaps;
+    /// let client = rsbinder::Client::open("unix:///tmp/x.sock")?;
+    /// // Fails here, naming the option to set, rather than on the first
+    /// // callback.
+    /// client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
+    /// # Ok(()) }
+    /// ```
+    pub fn caps(&self) -> crate::TransportCaps {
+        match &self.inner {
+            Inner::Kernel => crate::TransportCaps::KERNEL,
+            #[cfg(feature = "rpc")]
+            Inner::Rpc(s) => s.caps(),
+        }
+    }
+
     /// The underlying RPC session (`None` for `binder://`).
     #[cfg(feature = "rpc")]
     pub fn session(&self) -> Option<&crate::rpc::RpcSession> {
@@ -528,5 +604,32 @@ impl Client {
             Inner::Rpc(s) => Some(s),
             Inner::Kernel => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One rule for every setting that has both a `ClientOptions` field
+    /// and a URI key: agreeing or single values pass, a conflict is
+    /// refused rather than resolved in favor of either side.
+    #[test]
+    fn a_setting_given_twice_must_agree() {
+        assert_eq!(one_source::<usize>("mmap_size", None, None), Ok(None));
+        assert_eq!(one_source("mmap_size", Some(8192), None), Ok(Some(8192)));
+        assert_eq!(one_source("mmap_size", None, Some(8192)), Ok(Some(8192)));
+        assert_eq!(
+            one_source("mmap_size", Some(8192), Some(8192)),
+            Ok(Some(8192))
+        );
+        assert_eq!(
+            one_source("mmap_size", Some(8192), Some(4096)),
+            Err(StatusCode::BadValue)
+        );
+        assert_eq!(
+            one_source("driver", Some("/dev/binder"), Some("/dev/vndbinder")),
+            Err(StatusCode::BadValue)
+        );
     }
 }

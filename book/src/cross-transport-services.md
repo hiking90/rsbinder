@@ -33,7 +33,7 @@ hello.echo("hi")?;
 ## URIs
 
 ```text
-binder://[<service>][?driver=<path>&threads=<n>]
+binder://[<service>][?driver=<path>&threads=<n>&mmap=<bytes>]
 unix://<abs-path>[#<service>]               (three slashes: unix:///tmp/x.sock)
 unix-abstract://<name>[#<service>]          Linux/Android
 vsock://<cid>:<port>[#<service>]            feature rpc-vsock
@@ -44,6 +44,9 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
   `binder://#name`.
 - `?profile=android13plus[-vN]` on any RPC scheme selects the AOSP
   versioned wire (default `v2`); without it the session speaks the r34 wire.
+- `?mmap=<bytes>` (kernel only) sizes the mapping this process receives
+  transactions into — the real meaning of the "1 MB binder limit". See
+  [Receive mapping size](#receive-mapping-size).
 - `serve()` ignores the fragment, `connect()` requires it, and
   `Client::open()` rejects it.
 - An unknown scheme or query key, an empty `#`, or `binder://a#b` is
@@ -61,10 +64,15 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
 | `spawn()` | serve in the background; returns a `ServerGuard`. RPC: dropping the guard (or `ServerGuard::stop_and_join()`) ends the server — every session is closed and the threads are joined. Kernel: the guard is inert (the process thread pool has no shutdown). |
 
 Kernel `serve("binder://")` initializes the process-wide `ProcessState`
-idempotently; a second kernel server in the same process reuses it and logs
-a warning if it asked for a different driver / thread count. RPC servers
-bind their listener at `run`/`spawn`, so options (TLS config, limits) set
-via `with` apply first.
+idempotently; a second kernel server in the same process reuses it, and is
+refused with `StatusCode::BadValue` if it asked for a different driver,
+thread count, or mapping size — the process cannot give it one. The refusal
+lands where the option is read: `serve()` itself for `?driver=` /
+`?threads=` / `?mmap=`, `run`/`spawn` for `ServeOptions::threads` and
+`ServeOptions::mmap_size`, and `open` for `ClientOptions::driver` and
+`ClientOptions::mmap_size`. RPC
+servers bind their listener at `run`/`spawn`, so options (TLS config, limits)
+set via `with` apply first.
 
 ## `Client`
 
@@ -111,12 +119,46 @@ let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |
 .get("hello")?;
 ```
 
-`ServeOptions`: `threads`, `max_connections`, `handshake_timeout`,
-`idle_timeout`, `reply_timeout`, `authorizer`, `tls`, `fd_modes`,
-`call_restriction`.
+`ServeOptions`: `threads`, `mmap_size`, `max_connections`,
+`handshake_timeout`, `idle_timeout`, `reply_timeout`, `authorizer`, `tls`,
+`fd_modes`, `call_restriction`.
 `ClientOptions`: `tls` / `tls_server_name`, `session_id`,
 `outgoing_connections`, `incoming_connections`, `fd_mode`, `timeout`,
-`handshake_timeout`, `driver`.
+`handshake_timeout`, `driver`, `mmap_size`.
+
+### Receive mapping size
+
+A binder transaction is copied into a buffer the driver allocates out of
+the **receiving** process's mapping, so that mapping — not the protocol —
+is what bounds a call. rsbinder maps the same ~1 MB AOSP `libbinder` does;
+raise it on a service that must accept larger calls:
+
+```rust
+rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceiling
+    .add("bulk", BnBulk::new_binder(MyService))?
+    .run()?;
+```
+
+- Bytes only (no `4M` shorthand), between one page and
+  `MAX_BINDER_MMAP_SIZE` (4 MB, where the driver clamps silently — a
+  larger request is refused here rather than quietly shrunk), rounded up
+  to a page. A one-page mapping is legal and carries a call of a few KB.
+- Set on the **receiver**. A caller needs nothing; a payload too large for
+  the destination comes back as `StatusCode::FailedTransaction`. A client
+  is a receiver of its own replies, which is what `ClientOptions::mmap_size`
+  is for.
+- Oneway transactions may use only half of it — the driver reserves the
+  rest so an async flood cannot starve synchronous calls.
+- Only address space is reserved; pages are faulted in as they are used.
+- Process-wide and fixed at the first `serve` / `Client::open`, like
+  `?driver=` and `?threads=`. `ProcessState::init_with_mmap_size` is the
+  direct form, and `ProcessState::mmap_size()` reports what is in force.
+- `ServeOptions::mmap_size` cannot make the mapping: `serve` initializes
+  `ProcessState` before the option is read, so the field can only agree with
+  the size already in force and a different one is `BadValue` at
+  `run`/`spawn` — the same rule as `ServeOptions::threads`. What sets the
+  size on a kernel server is `binder://?mmap=`, or
+  `ProcessState::init_with_mmap_size` called before `serve`.
 
 `Client::open_with`'s closure also receives the parsed `Endpoint`, so an
 option that applies to only some transports is set from the endpoint rather
@@ -133,7 +175,10 @@ let client = rsbinder::Client::open_with(&uri, |o, endpoint| {
 An option that does not apply to the transport (a TLS config on
 `binder://`, `call_restriction` on `unix://`) is **`BadValue` at
 `run`/`spawn`/`open` time**, with a log line naming the option — never
-silently ignored. Users who want that checked at compile time use the
+silently ignored. A kernel option that *does* apply but the process cannot
+honor — `?threads=` or `?driver=` against a `ProcessState` already
+initialized with another value — is refused the same way, at `serve()` for
+the URI form. Users who want that checked at compile time use the
 low-level types directly.
 
 ## Bridging two transports in one process
@@ -253,6 +298,61 @@ Moving a service between transports changes its trust boundary — read
 | death | process death | session disconnect |
 | `list_services`, notifications, lazy services | via [`hub`](./service-manager.md) | not available |
 | abandoning a session | nothing to do | call `RpcSession::close_session()` if a service you exported holds a proxy back into it (`client.session()`) |
+
+## Transport capabilities
+
+The differences above are enforced where they happen: writing a file
+descriptor into a parcel that cannot carry one fails at the write, and
+`get_calling_uid()` returns a sentinel that no ACL matches. Those answers
+arrive at the moment of use, which is late if you were about to promise a
+caller something the transport cannot do.
+
+`TransportCaps` is the same information available up front. Ask before
+you commit:
+
+```rust,ignore
+use rsbinder::TransportCaps;
+
+let client = rsbinder::Client::open("unix:///run/app.sock")?;
+// Fails here, naming the option that would fix it, instead of on the
+// first callback the server tries to make.
+client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
+```
+
+Read it from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`,
+or — inside a handler, for the call being served — `calling_caps()`.
+
+| | `binder://` | `unix://` | `vsock://` | `tls://` |
+|---|:---:|:---:|:---:|:---:|
+| `FD_PASSING` | ✅ | after negotiating `Unix` fd mode | ❌ | ❌ |
+| `TRUSTED_UID` | ✅ | ✅ | ❌ | ❌ |
+| `CALLBACKS` | ✅ | with `incoming_connections > 0` | ❌[^cb] | ❌[^cb] |
+| `SAME_HOST` | ✅ | ✅ | ❌ | ❌ |
+| `KERNEL_KNOBS` | ✅ | ❌ | ❌ | ❌ |
+
+[^cb]: Incoming (callback) connections are Unix-only today —
+`ClientOptions::incoming_connections` on a `vsock://` or `tls://` URI is
+`BadValue`, and the session layer offers the option only on
+`RpcUnixClientConfig`. So a vsock or TLS session never reports `CALLBACKS`.
+
+Three things to keep straight.
+
+**Caps never replace the checks they summarize.** Skipping the check is
+not less safe; the fd write still refuses, the uid is still a sentinel.
+What you lose is being told early, and being told which option to change.
+
+**`Endpoint::static_caps()` and the session's caps answer different
+questions.** The endpoint answers for the transport family; the session says
+what it has. The endpoint bounds the session in neither direction: a `unix://`
+endpoint reports `FD_PASSING`, but a session over it carries no descriptors
+until both ends negotiate the `Unix` fd mode — the default is `None`; and no
+*RPC* endpoint reports `CALLBACKS` (the `binder://` column does, because kernel
+binder has every bit), although a session opened with
+`incoming_connections > 0` does. The table's two qualified cells are session
+values for that reason, not endpoint ones.
+
+**A session's caps are a snapshot.** `CALLBACKS` goes away when the last
+callback connection dies. Read them where you act, not once at startup.
 
 ## Async
 

@@ -23,10 +23,9 @@ use std::fs::File;
 let file = File::open("/dev/null").unwrap();
 let pfd = rsbinder::ParcelFileDescriptor::new(file);
 
-// From a pipe created with rustix
-let (reader, writer) = rustix::pipe::pipe().unwrap();
-let read_pfd = rsbinder::ParcelFileDescriptor::new(reader);
-let write_pfd = rsbinder::ParcelFileDescriptor::new(writer);
+// A pipe, both ends already wrapped (AOSP `createPipe`). Both are
+// O_CLOEXEC.
+let (read_pfd, write_pfd) = rsbinder::ParcelFileDescriptor::pipe().unwrap();
 ```
 
 Since 0.10.0 `ParcelFileDescriptor` also implements `From<std::fs::File>`
@@ -45,18 +44,17 @@ rsbinder test suite:
 ```rust
 use std::io::{Read, Write};
 
-let (mut read_file, write_file) = build_pipe();
-let write_pfd = rsbinder::ParcelFileDescriptor::new(write_file);
+let (read_end, write_pfd) = rsbinder::ParcelFileDescriptor::pipe()?;
 
 // Send the write end to the service; it returns a (duplicated) copy
 let result_pfd = service.RepeatParcelFileDescriptor(&write_pfd)?;
 
 // Write through the returned file descriptor
-file_from_pfd(&result_pfd).write_all(b"Hello")?;
+(&result_pfd).write_all(b"Hello")?;
 
 // Read from the original pipe's read end
 let mut buf = [0u8; 5];
-read_file.read_exact(&mut buf)?;
+(&read_end).read_exact(&mut buf)?;
 assert_eq!(&buf, b"Hello");
 ```
 
@@ -112,41 +110,44 @@ The `repeated` output parameter receives a copy of the input in the original
 order, while the return value contains the input in reverse order. Every
 descriptor is duplicated so that each `Vec` owns its own set of file handles.
 
-## Helper Functions
+## Reading and Writing
 
-Two small helpers cover most of what application code needs.
-
-### build_pipe
-
-Creates a Unix pipe and returns both ends as `std::fs::File` values. `pipe()`
-hands back `OwnedFd`s and `File` converts from one, so no `unsafe` is involved:
+`ParcelFileDescriptor` implements `Read` and `Write` — both by value and by
+reference, as `std::fs::File` does — so a descriptor you hold or one a service
+returned is used directly:
 
 ```rust
-use std::fs::File;
+use std::io::{Read, Write};
 
-fn build_pipe() -> (File, File) {
-    let (reader, writer) = rustix::pipe::pipe().expect("error creating pipe");
-    (File::from(reader), File::from(writer))
-}
+let (read_end, write_end) = rsbinder::ParcelFileDescriptor::pipe()?;
+
+// Borrowed: the descriptor stays yours, e.g. to send in a parcel.
+(&write_end).write_all(b"payload")?;
+
+let mut buf = [0u8; 7];
+(&read_end).read_exact(&mut buf)?;
 ```
 
-### file_from_pfd
+They mean what `File`'s do: reading at end of file is `Ok(0)` — for a pipe,
+every writing end is gone — and writing into a pipe whose reader has closed is
+`BrokenPipe`. `flush()` is a no-op, since the only buffer involved is the
+kernel's.
 
-Converts a `ParcelFileDescriptor` reference into a `File` suitable for use
-with the standard `Read` and `Write` traits. The descriptor is cloned first
-so the original `ParcelFileDescriptor` remains valid:
+**A pipe holds about 64 KB.** Writing more than that blocks until someone
+drains it, so the usual shape is: create the pipe, send the read end, then
+fill it — from another thread if the same process is doing both.
+
+For `tokio`, convert once rather than per call:
 
 ```rust
-use std::fs::File;
-use rsbinder::ParcelFileDescriptor;
+use std::os::fd::OwnedFd;
 
-fn file_from_pfd(fd: &ParcelFileDescriptor) -> File {
-    fd.as_ref()
-        .try_clone()
-        .expect("failed to clone file descriptor")
-        .into()
-}
+let file = std::fs::File::from(OwnedFd::from(read_end));
+let mut async_file = tokio::fs::File::from_std(file);
 ```
+
+rsbinder does not wrap that: its `tokio` feature deliberately does not pull
+`tokio/fs`.
 
 ## File Descriptors over RPC
 

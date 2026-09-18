@@ -24,6 +24,7 @@ macro_rules! __declare_binder_interface {
         $interface:path[$descriptor:expr] {
             native: {
                 $native:ident($on_transact:path),
+                doc: $native_doc:expr,
                 $(adapter: $native_adapter:ident,)?
                 $(r#async: $native_async:ident,)?
             },
@@ -40,13 +41,14 @@ macro_rules! __declare_binder_interface {
                 #[allow(dead_code)]
                 fn as_async(&self) -> &dyn $native_async;
                 /// `Some` only for an async-backed service; `None` for a
-                /// sync-only one. Lets the async [`$crate::FromIBinder`] cast
+                /// sync-only one. Lets the async `FromIBinder` cast
                 /// reject a sync-only local binder up front instead of letting
                 /// [`Self::as_async`] panic when a method is later called.
                 #[allow(dead_code)]
                 fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async>;
             }
 
+            #[doc = $native_doc]
             pub struct $native(::std::boxed::Box<dyn $native_adapter + ::core::marker::Send + ::core::marker::Sync + 'static>);
 
             impl $native {
@@ -179,6 +181,7 @@ macro_rules! __declare_binder_interface {
         $interface:path[$descriptor:expr] {
             native: {
                 $native:ident($on_transact:path),
+                doc: $native_doc:expr,
                 $(adapter: $native_adapter:ident,)?
                 $(r#async: $native_async:ident,)?
             },
@@ -189,6 +192,7 @@ macro_rules! __declare_binder_interface {
             stability: $stability:expr,
         }
     } => {
+        #[doc = $native_doc]
         pub struct $native(::std::boxed::Box<dyn $interface + ::core::marker::Send + ::core::marker::Sync + 'static>);
 
         impl $native {
@@ -386,28 +390,11 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::SIBinder) -> ::core::option::Option<Self> {
-                // An `RpcProxy` resolved from the RPC wire carries no
-                // descriptor (the wire transmits only an address). Stamp
-                // this stub's descriptor onto the *cached* proxy in
-                // place — never a new proxy (that doubles the DEC_STRONG
-                // and splits the dedup cache). Done before the descriptor
-                // check so it then passes for RPC too. The shim is gated
-                // inside rsbinder (no-op without `rpc`), so the kernel
-                // path and `rpc`-off builds are byte-unaffected.
+                // Stamps the RPC wire's descriptor-less proxy in place; see
+                // `RpcProxy::stamp_descriptor`.
                 $crate::__rpc_stamp_descriptor(&binder, $descriptor);
-                // NOTE (RPC type-safety asymmetry): for a kernel
-                // `ProxyHandle` the check below validates the *remote's*
-                // interface (its descriptor comes from the driver). For
-                // a fresh `RpcProxy` the wire carries no descriptor, so
-                // the stamp above just wrote `$descriptor` — this check
-                // is then self-referential and cannot reject a
-                // wrong-interface cast. An `IBar` object cast to
-                // `BpFoo` therefore succeeds here and surfaces only as a
-                // transact-time `StatusCode` (the server rejects the
-                // `IFoo` interface token), not as a `from_binder` `None`.
-                // Inherent to the Android RPC wire; see
-                // `RpcProxy::stamp_descriptor`'s one-address-one-
-                // interface note.
+                // Self-referential for a fresh `RpcProxy` — see
+                // `RpcProxy::stamp_descriptor`'s type-safety note.
                 if binder.descriptor() != $descriptor {
                     return ::core::option::Option::None
                 }
@@ -423,6 +410,7 @@ macro_rules! declare_binder_interface {
             $interface[$descriptor] {
                 native: {
                     $native($on_transact),
+                    doc: $native_doc,
                     $(adapter: $native_adapter,)?
                     $(r#async: $native_async,)?
                 },
@@ -677,6 +665,58 @@ macro_rules! declare_binder_enum {
     };
 }
 
+/// Make an `.aidl` enum usable as a binder service-specific error code.
+///
+/// ```no_run
+/// # use rsbinder::*;
+/// # rsbinder::declare_binder_enum! {
+/// #     LookupError : [i32; 2] { NOT_FOUND = 1, BUSY = 2, }
+/// # }
+/// rsbinder::impl_service_specific_error!(LookupError);
+///
+/// # fn f() -> BinderResult<()> {
+/// Err(Status::service_specific(LookupError::BUSY, Some("try again")))
+/// # }
+/// ```
+///
+/// Opt-in rather than something [`declare_binder_enum!`] emits for every
+/// enum, because the code space is `i32`: an enum backed by `long` has no
+/// place in it, and the generated `enum_values()` comparison would have to
+/// narrow. Applying this to one is a compile error here — `i32: From<i64>`
+/// does not exist — instead of a value that truncates on the wire. `byte`
+/// and `int` backings both work.
+///
+/// ```compile_fail
+/// # use rsbinder::*;
+/// rsbinder::declare_binder_enum! {
+///     BigError : [i64; 1] { HUGE = 1, }
+/// }
+/// // No `i32: From<i64>`: a `long` enum has no i32 code space.
+/// rsbinder::impl_service_specific_error!(BigError);
+/// ```
+///
+/// For a plain Rust enum that is not an `.aidl` type, use
+/// `#[derive(ServiceSpecificError)]` (the `macros` feature) instead. Do
+/// not use both on one type: two impls of the same trait do not compile.
+#[macro_export]
+macro_rules! impl_service_specific_error {
+    ($enum:ty) => {
+        impl $crate::ServiceSpecificError for $enum {
+            fn code(&self) -> i32 {
+                // `From`, not `as`: it is what refuses a `long` backing
+                // here rather than truncating it into the wire's i32.
+                i32::from(self.get())
+            }
+
+            fn from_code(code: i32) -> ::core::option::Option<Self> {
+                Self::enum_values()
+                    .into_iter()
+                    .find(|value| i32::from(value.get()) == code)
+            }
+        }
+    };
+}
+
 /// Include AIDL-generated Rust and (optionally) flatten an interface's items
 /// into the current module — the one-call form of the
 /// `include!(concat!(env!("OUT_DIR"), …))` + `pub use …::*` pair that every
@@ -719,11 +759,11 @@ macro_rules! declare_binder_enum {
 #[macro_export]
 macro_rules! include_aidl {
     ($file:literal, $($use_path:tt)+) => {
-        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+        ::core::include!(::core::concat!(::core::env!("OUT_DIR"), "/", $file, ".rs"));
         pub use $($use_path)+;
     };
     ($file:literal $(,)?) => {
-        include!(concat!(env!("OUT_DIR"), "/", $file, ".rs"));
+        ::core::include!(::core::concat!(::core::env!("OUT_DIR"), "/", $file, ".rs"));
     };
 }
 
