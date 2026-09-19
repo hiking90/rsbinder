@@ -37,6 +37,12 @@ async = ["rsbinder-aidl/async", "async-trait", "rsbinder-macros?/async"]
 # consumes generated code has no reason to carry. `.aidl` stays canonical;
 # see the `rsbinder-macros` crate docs for what the macro cannot express.
 macros = ["dep:rsbinder-macros"]
+# `tracing` spans named as AOSP names its ATrace sections
+# (`AIDL::rust::<descriptor>::<method>::server|client`): the server span
+# through `observe::TracingObserver`, the client span from proxies generated
+# with `rsbinder_aidl::Builder::trace(true)`. Off by default; without it the
+# client hook in generated code compiles to a plain call.
+tracing = ["dep:tracing"]
 # RPC transport (binder-over-socket) — a separate stack from the kernel
 # binder path. Off by default; enabling it pulls in `getrandom` (CSPRNG for
 # 32-byte RPC session ids — subplan 2-12 A0a/A0b makes the id a
@@ -128,6 +134,7 @@ getrandom = { version = "0.4", optional = true }
 
 # `#[rsbinder::interface]`, behind the `macros` feature.
 rsbinder-macros = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 # subplan 2-9 Phase A: macOS/BSD peer-credential resolution
 # (`getpeereid`/`LOCAL_PEERPID`) — `rustix` exposes only Linux `SO_PEERCRED`.

@@ -1571,6 +1571,111 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::lazy_service::LazySe
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::lazy_service::LazyServiceRegistrar
 pub type rsbinder::lazy_service::ActiveServicesCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync)>
 pub mod rsbinder::observe
+pub struct rsbinder::observe::LatencyHistogram
+impl rsbinder::observe::LatencyHistogram
+pub fn rsbinder::observe::LatencyHistogram::counts(&self) -> &[u64; 25]
+pub fn rsbinder::observe::LatencyHistogram::upper_bound(usize) -> core::option::Option<core::time::Duration>
+impl core::clone::Clone for rsbinder::observe::LatencyHistogram
+pub fn rsbinder::observe::LatencyHistogram::clone(&self) -> rsbinder::observe::LatencyHistogram
+impl core::cmp::Eq for rsbinder::observe::LatencyHistogram
+impl core::cmp::PartialEq for rsbinder::observe::LatencyHistogram
+pub fn rsbinder::observe::LatencyHistogram::eq(&self, &rsbinder::observe::LatencyHistogram) -> bool
+impl core::default::Default for rsbinder::observe::LatencyHistogram
+pub fn rsbinder::observe::LatencyHistogram::default() -> Self
+impl core::fmt::Debug for rsbinder::observe::LatencyHistogram
+pub fn rsbinder::observe::LatencyHistogram::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::observe::LatencyHistogram
+impl core::marker::StructuralPartialEq for rsbinder::observe::LatencyHistogram
+impl core::marker::Freeze for rsbinder::observe::LatencyHistogram
+impl core::marker::Send for rsbinder::observe::LatencyHistogram
+impl core::marker::Sync for rsbinder::observe::LatencyHistogram
+impl core::marker::Unpin for rsbinder::observe::LatencyHistogram
+impl core::marker::UnsafeUnpin for rsbinder::observe::LatencyHistogram
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::LatencyHistogram
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::observe::LatencyHistogram
+pub struct rsbinder::observe::LogObserver
+impl core::clone::Clone for rsbinder::observe::LogObserver
+pub fn rsbinder::observe::LogObserver::clone(&self) -> rsbinder::observe::LogObserver
+impl core::default::Default for rsbinder::observe::LogObserver
+pub fn rsbinder::observe::LogObserver::default() -> rsbinder::observe::LogObserver
+impl core::fmt::Debug for rsbinder::observe::LogObserver
+pub fn rsbinder::observe::LogObserver::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::observe::LogObserver
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::LogObserver
+pub fn rsbinder::observe::LogObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::LogObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl core::marker::Freeze for rsbinder::observe::LogObserver
+impl core::marker::Send for rsbinder::observe::LogObserver
+impl core::marker::Sync for rsbinder::observe::LogObserver
+impl core::marker::Unpin for rsbinder::observe::LogObserver
+impl core::marker::UnsafeUnpin for rsbinder::observe::LogObserver
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::LogObserver
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::observe::LogObserver
+#[non_exhaustive] pub struct rsbinder::observe::MethodStats
+pub rsbinder::observe::MethodStats::calls: u64
+pub rsbinder::observe::MethodStats::code: rsbinder::TransactionCode
+pub rsbinder::observe::MethodStats::descriptor: alloc::string::String
+pub rsbinder::observe::MethodStats::errors: u64
+pub rsbinder::observe::MethodStats::latency: rsbinder::observe::LatencyHistogram
+pub rsbinder::observe::MethodStats::max: core::time::Duration
+pub rsbinder::observe::MethodStats::method: core::option::Option<&'static str>
+pub rsbinder::observe::MethodStats::total: core::time::Duration
+impl core::clone::Clone for rsbinder::observe::MethodStats
+pub fn rsbinder::observe::MethodStats::clone(&self) -> rsbinder::observe::MethodStats
+impl core::cmp::Eq for rsbinder::observe::MethodStats
+impl core::cmp::PartialEq for rsbinder::observe::MethodStats
+pub fn rsbinder::observe::MethodStats::eq(&self, &rsbinder::observe::MethodStats) -> bool
+impl core::default::Default for rsbinder::observe::MethodStats
+pub fn rsbinder::observe::MethodStats::default() -> rsbinder::observe::MethodStats
+impl core::fmt::Debug for rsbinder::observe::MethodStats
+pub fn rsbinder::observe::MethodStats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::observe::MethodStats
+impl core::marker::Freeze for rsbinder::observe::MethodStats
+impl core::marker::Send for rsbinder::observe::MethodStats
+impl core::marker::Sync for rsbinder::observe::MethodStats
+impl core::marker::Unpin for rsbinder::observe::MethodStats
+impl core::marker::UnsafeUnpin for rsbinder::observe::MethodStats
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::MethodStats
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::observe::MethodStats
+pub struct rsbinder::observe::StatsObserver
+impl rsbinder::observe::StatsObserver
+pub fn rsbinder::observe::StatsObserver::new() -> Self
+pub fn rsbinder::observe::StatsObserver::snapshot(&self) -> rsbinder::observe::StatsSnapshot
+impl core::default::Default for rsbinder::observe::StatsObserver
+pub fn rsbinder::observe::StatsObserver::default() -> rsbinder::observe::StatsObserver
+impl core::fmt::Debug for rsbinder::observe::StatsObserver
+pub fn rsbinder::observe::StatsObserver::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::StatsObserver
+pub fn rsbinder::observe::StatsObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::StatsObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl !core::marker::Freeze for rsbinder::observe::StatsObserver
+impl core::marker::Send for rsbinder::observe::StatsObserver
+impl core::marker::Sync for rsbinder::observe::StatsObserver
+impl core::marker::Unpin for rsbinder::observe::StatsObserver
+impl core::marker::UnsafeUnpin for rsbinder::observe::StatsObserver
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::StatsObserver
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::observe::StatsObserver
+#[non_exhaustive] pub struct rsbinder::observe::StatsSnapshot
+pub rsbinder::observe::StatsSnapshot::in_flight: usize
+pub rsbinder::observe::StatsSnapshot::max_in_flight: usize
+pub rsbinder::observe::StatsSnapshot::methods: alloc::vec::Vec<rsbinder::observe::MethodStats>
+impl core::clone::Clone for rsbinder::observe::StatsSnapshot
+pub fn rsbinder::observe::StatsSnapshot::clone(&self) -> rsbinder::observe::StatsSnapshot
+impl core::cmp::Eq for rsbinder::observe::StatsSnapshot
+impl core::cmp::PartialEq for rsbinder::observe::StatsSnapshot
+pub fn rsbinder::observe::StatsSnapshot::eq(&self, &rsbinder::observe::StatsSnapshot) -> bool
+impl core::default::Default for rsbinder::observe::StatsSnapshot
+pub fn rsbinder::observe::StatsSnapshot::default() -> rsbinder::observe::StatsSnapshot
+impl core::fmt::Debug for rsbinder::observe::StatsSnapshot
+pub fn rsbinder::observe::StatsSnapshot::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::observe::StatsSnapshot
+impl core::marker::Freeze for rsbinder::observe::StatsSnapshot
+impl core::marker::Send for rsbinder::observe::StatsSnapshot
+impl core::marker::Sync for rsbinder::observe::StatsSnapshot
+impl core::marker::Unpin for rsbinder::observe::StatsSnapshot
+impl core::marker::UnsafeUnpin for rsbinder::observe::StatsSnapshot
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::StatsSnapshot
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::observe::StatsSnapshot
 #[non_exhaustive] pub struct rsbinder::observe::TxnContext<'a>
 pub rsbinder::observe::TxnContext::calling_pid: std::os::raw::c_int
 pub rsbinder::observe::TxnContext::calling_uid: std::os::raw::c_uint
@@ -1590,9 +1695,16 @@ impl<'a> core::marker::Unpin for rsbinder::observe::TxnContext<'a>
 impl<'a> core::marker::UnsafeUnpin for rsbinder::observe::TxnContext<'a>
 impl<'a> core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::TxnContext<'a>
 impl<'a> core::panic::unwind_safe::UnwindSafe for rsbinder::observe::TxnContext<'a>
+pub const rsbinder::observe::LATENCY_BUCKETS: usize
 pub trait rsbinder::observe::TransactionObserver: core::marker::Send + core::marker::Sync
 pub fn rsbinder::observe::TransactionObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
 pub fn rsbinder::observe::TransactionObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::LogObserver
+pub fn rsbinder::observe::LogObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::LogObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::StatsObserver
+pub fn rsbinder::observe::StatsObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::StatsObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
 pub fn rsbinder::observe::set_observer(core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>)
 pub mod rsbinder::permission_controller
 pub mod rsbinder::permission_controller::android

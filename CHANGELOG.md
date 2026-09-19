@@ -51,6 +51,19 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Closest AOSP counterpart: Java `Binder.setObserver`; nothing on the wire
   changes. `Transactable` gained a defaulted `transaction_name` so the
   dispatcher can name the method.
+- **Provided observers**: `observe::LogObserver` (one `debug` line per
+  transaction, target `rsbinder::observe`) and `observe::StatsObserver`
+  (per-method call and transport-error counts, total/max handler time, a
+  power-of-two microsecond latency histogram, and the current and peak number
+  of transactions served at once, read through `snapshot()`).
+- **`tracing` feature** (off by default): AIDL spans named as AOSP names its
+  ATrace sections, `AIDL::rust::<descriptor>::<method>::server|client`, in the
+  `name` field of a `TRACE`-level span `aidl` (target `rsbinder::aidl`).
+  `observe::TracingObserver` opens the server span around each handler; proxies
+  generated with `Builder::trace(true)` open the client span around each
+  transaction, parented to the caller's current span for the async proxy as
+  well. Without the feature the generated hook is a plain call, and output
+  generated without `trace` does not change.
 
 ## [0.12.0] - 2026-09-19
 

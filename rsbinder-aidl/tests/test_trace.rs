@@ -13,9 +13,13 @@
 use rsbinder_aidl::render::{function_names, FnMembers};
 
 fn generate(input: &str, trace: bool) -> String {
+    generate_with(input, trace, false)
+}
+
+fn generate_with(input: &str, trace: bool, enabled_async: bool) -> String {
     let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
     let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
-    let gen = rsbinder_aidl::Generator::new(false, false).with_trace(trace);
+    let gen = rsbinder_aidl::Generator::new(enabled_async, false).with_trace(trace);
     gen.document(&document).expect("generate").1
 }
 
@@ -30,8 +34,28 @@ interface IFoo {
 
 #[test]
 fn trace_off_emits_no_table() {
-    let out = generate(IMPLICIT, false);
-    assert!(!out.contains("function_names"), "{out}");
+    for enabled_async in [false, true] {
+        let out = generate_with(IMPLICIT, false, enabled_async);
+        assert!(!out.contains("function_names"), "{out}");
+        assert!(!out.contains("__trace_client"), "{out}");
+    }
+}
+
+/// Every proxy call, sync and async, opens its client span with the method's
+/// own name and code. `getInterfaceVersion`/`getInterfaceHash` take the same
+/// hook; `tests/tests/aidl_spans.rs` calls them at runtime.
+#[test]
+fn trace_on_opens_a_client_span_per_proxy_call() {
+    for enabled_async in [false, true] {
+        let out = generate_with(IMPLICIT, true, enabled_async);
+        let copies = if enabled_async { 2 } else { 1 };
+        for method in ["ping", "add", "notify"] {
+            let hook = format!(
+                "rsbinder::observe::__trace_client(\"test.pkg.IFoo\", \"{method}\", transactions::r#{method})"
+            );
+            assert_eq!(out.matches(&hook).count(), copies, "{method}:\n{out}");
+        }
+    }
 }
 
 #[test]

@@ -47,6 +47,20 @@
 //! - `result` is the transport-level result of the handler. An AIDL method
 //!   that returns an exception or service-specific error writes it into the
 //!   reply and still reports `Ok(())` here.
+//!
+//! # Provided observers
+//!
+//! - [`LogObserver`] — one `debug` log line per transaction.
+//! - [`StatsObserver`] — per-method call and error counts, handler-time
+//!   histograms, and the number of transactions served at once.
+//! - `TracingObserver` (feature `tracing`) — a `tracing` span per
+//!   transaction, named `AIDL::rust::<descriptor>::<method>::server` as AOSP
+//!   names its ATrace sections. Proxies generated with
+//!   `rsbinder_aidl::Builder::trace(true)` open the matching `::client`
+//!   span under the same feature.
+//!
+//! Only one observer is installed at a time; to combine these, write one
+//! that forwards to each and returns their tags together.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +68,17 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::{binder::TransactionCode, Result, TransportCaps};
+
+mod log_observer;
+mod span;
+mod stats;
+
+pub use log_observer::LogObserver;
+#[cfg(feature = "tracing")]
+pub use span::TracingObserver;
+#[doc(hidden)]
+pub use span::{__ClientSpan, __trace_client};
+pub use stats::{LatencyHistogram, MethodStats, StatsObserver, StatsSnapshot, LATENCY_BUCKETS};
 
 /// What an observer learns about one incoming transaction.
 ///

@@ -57,3 +57,7 @@ thiserror = "2"
 # Held at 3.x: 4.0 declares `rust-version = 1.93.1`, above this workspace's
 # 1.85, and the `rust_min` CI job builds dev-dependencies.
 serial_test = { version = "3", default-features = false }
+# `rsbinder`'s optional `tracing` feature (AIDL transaction spans). No
+# `attributes`: nothing here uses `#[instrument]`, and it would add a
+# proc-macro build to every consumer that turns the feature on.
+tracing = { version = "0.1.40", default-features = false, features = ["std"] }
