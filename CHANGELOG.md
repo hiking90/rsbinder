@@ -58,7 +58,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   of transactions served at once, read through `snapshot()`).
 - **`tracing` feature** (off by default): AIDL spans named as AOSP names its
   ATrace sections, `AIDL::rust::<descriptor>::<method>::server|client`, in the
-  `name` field of a `TRACE`-level span `aidl` (target `rsbinder::aidl`).
+  `name` field of a `TRACE`-level span `aidl` (target `rsbinder::aidl`); a code
+  the name table does not cover is written `#<code>`, as in AOSP.
   `observe::TracingObserver` opens the server span around each handler; proxies
   generated with `Builder::trace(true)` open the client span around each
   transaction, parented to the caller's current span for the async proxy as
