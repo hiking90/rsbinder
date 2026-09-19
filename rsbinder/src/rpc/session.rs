@@ -3172,6 +3172,9 @@ impl RpcSessionInner {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _calling =
                     crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer), caps);
+                // AOSP RPC leaves the work source alone; resetting it keeps a
+                // handler's `set` from leaking into the next call on this thread.
+                let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
                 target.rpc_transact(t.code, &mut reader, &mut reply)
             }))
             .unwrap_or_else(|payload| {

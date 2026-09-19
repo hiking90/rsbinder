@@ -51,5 +51,10 @@ name = "data_serde"
 path = "tests/data_serde.rs"
 required-features = ["rpc", "macros"]
 
+[[test]]
+name = "work_source_rpc"
+path = "tests/work_source_rpc.rs"
+required-features = ["rpc"]
+
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

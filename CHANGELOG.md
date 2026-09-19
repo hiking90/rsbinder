@@ -13,6 +13,24 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
+  `set_calling_work_source_uid`, `get_calling_work_source_uid`,
+  `clear_calling_work_source`, `restore_calling_work_source`,
+  `clear_propagate_work_source` and `should_propagate_work_source`, at the crate
+  root and in `thread_state`. The work source is now per-thread state, as in
+  AOSP: a client thread can set it outside any transaction and every outgoing
+  kernel binder call carries it in the request header, which previously always
+  said "unset" because the value could only be stored while a transaction was
+  being served. A handler sees what its caller sent; a received value is not
+  forwarded unless the handler sets it again, and the thread's own value comes
+  back when the handler returns. The RPC wire format has no work-source field
+  (AOSP's neither), so an RPC handler always reports the unset value; a value
+  set inside one still propagates to the kernel binder calls it makes, and the
+  RPC dispatch resets it per call so it cannot leak into the next call served
+  on that thread.
+
 ## [0.12.0] - 2026-09-19
 
 ### Migrating from 0.11.0

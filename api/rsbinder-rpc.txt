@@ -3578,15 +3578,21 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::ExtendedEr
 pub fn rsbinder::thread_state::calling_caller() -> core::option::Option<rsbinder::thread_state::Caller>
 pub fn rsbinder::thread_state::calling_caps() -> core::option::Option<rsbinder::TransportCaps>
 pub fn rsbinder::thread_state::clear_calling_identity() -> i64
+pub fn rsbinder::thread_state::clear_calling_work_source() -> i64
+pub fn rsbinder::thread_state::clear_propagate_work_source()
 pub fn rsbinder::thread_state::get_calling_pid() -> std::os::raw::c_int
 pub fn rsbinder::thread_state::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CString>
 pub fn rsbinder::thread_state::get_calling_uid() -> std::os::raw::c_uint
+pub fn rsbinder::thread_state::get_calling_work_source_uid() -> std::os::raw::c_uint
 pub fn rsbinder::thread_state::get_current_scheduler_policy() -> rsbinder::Result<i32>
 pub fn rsbinder::thread_state::get_extended_error() -> rsbinder::Result<rsbinder::thread_state::ExtendedError>
 pub fn rsbinder::thread_state::get_strict_mode_policy() -> i32
 pub fn rsbinder::thread_state::has_explicit_identity() -> bool
 pub fn rsbinder::thread_state::restore_calling_identity(i64)
+pub fn rsbinder::thread_state::restore_calling_work_source(i64)
+pub fn rsbinder::thread_state::set_calling_work_source_uid(std::os::raw::c_uint) -> i64
 pub fn rsbinder::thread_state::set_strict_mode_policy(i32)
+pub fn rsbinder::thread_state::should_propagate_work_source() -> bool
 pub macro rsbinder::__declare_binder_interface!
 pub macro rsbinder::declare_binder_enum!
 pub macro rsbinder::declare_binder_interface!
@@ -5333,6 +5339,8 @@ pub fn rsbinder::calling_caller() -> core::option::Option<rsbinder::thread_state
 pub fn rsbinder::calling_caps() -> core::option::Option<rsbinder::TransportCaps>
 pub async fn rsbinder::check_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub fn rsbinder::clear_calling_identity() -> i64
+pub fn rsbinder::clear_calling_work_source() -> i64
+pub fn rsbinder::clear_propagate_work_source()
 pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub async fn rsbinder::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
@@ -5341,6 +5349,7 @@ pub fn rsbinder::from_bytes<T: rsbinder::Deserialize>(&[u8]) -> rsbinder::Result
 pub fn rsbinder::get_calling_pid() -> std::os::raw::c_int
 pub fn rsbinder::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CString>
 pub fn rsbinder::get_calling_uid() -> std::os::raw::c_uint
+pub fn rsbinder::get_calling_work_source_uid() -> std::os::raw::c_uint
 pub fn rsbinder::get_current_scheduler_policy() -> rsbinder::Result<i32>
 pub fn rsbinder::get_extended_error() -> rsbinder::Result<rsbinder::thread_state::ExtendedError>
 pub async fn rsbinder::get_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
@@ -5348,9 +5357,12 @@ pub fn rsbinder::get_strict_mode_policy() -> i32
 pub fn rsbinder::has_explicit_identity() -> bool
 pub fn rsbinder::is_handling_transaction() -> bool
 pub fn rsbinder::restore_calling_identity(i64)
+pub fn rsbinder::restore_calling_work_source(i64)
 pub fn rsbinder::sdk_at_least(u32) -> bool
 pub fn rsbinder::serve(&str) -> rsbinder::Result<rsbinder::Server>
+pub fn rsbinder::set_calling_work_source_uid(std::os::raw::c_uint) -> i64
 pub fn rsbinder::set_strict_mode_policy(i32)
+pub fn rsbinder::should_propagate_work_source() -> bool
 pub fn rsbinder::to_bytes<T: rsbinder::Serialize + ?core::marker::Sized>(&T) -> rsbinder::Result<alloc::vec::Vec<u8>>
 pub async fn rsbinder::wait_for_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub type rsbinder::BinderResult<T> = core::result::Result<T, rsbinder::Status>

@@ -68,7 +68,7 @@
 
 use log::error;
 use std::backtrace::Backtrace;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::fmt::Debug;
@@ -478,8 +478,6 @@ struct TransactionState {
     calling_uid: binder::uid_t,
     // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
-    work_source: binder::uid_t,
-    propagate_work_source: bool,
     /// AOSP `mHasExplicitIdentity` — `true` after `clear_calling_identity()`
     /// has overridden the kernel-delivered `calling_uid`/`calling_pid`
     /// with the current process's own uid/pid. Reset to `false` on every
@@ -498,8 +496,6 @@ impl TransactionState {
             calling_uid: data.transaction_data.sender_euid,
             // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
-            work_source: 0,
-            propagate_work_source: false,
             has_explicit_identity: false,
         }
     }
@@ -704,41 +700,6 @@ impl ThreadState {
         self.in_parcel.data_position() >= self.in_parcel.data_size()
     }
 
-    fn clear_propagate_work_source(&mut self) {
-        if let Some(ref mut state) = self.transaction {
-            state.propagate_work_source = false;
-        }
-    }
-
-    fn clear_calling_work_source(&mut self) {
-        self.set_calling_work_source_uid(UNSET_WORK_SOURCE as _);
-    }
-
-    fn set_calling_work_source_uid(&mut self, uid: binder::uid_t) -> i64 {
-        let token = self.set_calling_work_source_uid_without_propagation(uid);
-        if let Some(ref mut state) = self.transaction {
-            state.propagate_work_source = true;
-        }
-        token
-    }
-
-    pub(crate) fn set_calling_work_source_uid_without_propagation(
-        &mut self,
-        uid: binder::uid_t,
-    ) -> i64 {
-        match self.transaction {
-            Some(ref mut state) => {
-                let propagated_bit =
-                    (state.propagate_work_source as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX;
-                let token = propagated_bit | (state.work_source as i64);
-                state.work_source = uid;
-
-                token
-            }
-            None => 0,
-        }
-    }
-
     fn write_transaction_data(
         &mut self,
         cmd: u32,
@@ -874,22 +835,158 @@ pub fn get_strict_mode_policy() -> i32 {
     THREAD_STATE.with(|thread_state| thread_state.borrow().strict_mode_policy)
 }
 
-pub(crate) fn should_propagate_work_source() -> bool {
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .is_some_and(|state| state.propagate_work_source)
-    })
+/// AOSP `IPCThreadState::mWorkSource` + `mPropagateWorkSource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkSource {
+    uid: binder::uid_t,
+    propagate: bool,
 }
 
-pub(crate) fn calling_work_source_uid() -> binder::uid_t {
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .map_or(0, |state| state.work_source)
+impl WorkSource {
+    const UNSET: WorkSource = WorkSource {
+        uid: UNSET_WORK_SOURCE as binder::uid_t,
+        propagate: false,
+    };
+
+    // AOSP sign-extends the uid into the token, which loses the propagate
+    // bit when the uid is unset; zero-extending keeps `restore` exact. The
+    // token never leaves the process.
+    fn token(self) -> i64 {
+        ((self.propagate as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX) | (self.uid as i64)
+    }
+
+    fn from_token(token: i64) -> Self {
+        WorkSource {
+            uid: token as u32 as binder::uid_t,
+            propagate: (token >> WORK_SOURCE_PROPAGATED_BIT_INDEX) & 1 == 1,
+        }
+    }
+}
+
+thread_local! {
+    // Its own `Cell` rather than a `ThreadState` field: the work source is
+    // set on client threads outside any transaction and in pure-RPC
+    // processes, where `THREAD_STATE` cannot be initialized.
+    static WORK_SOURCE: Cell<WorkSource> = const { Cell::new(WorkSource::UNSET) };
+}
+
+fn work_source() -> WorkSource {
+    WORK_SOURCE.with(Cell::get)
+}
+
+fn replace_work_source(ws: WorkSource) -> WorkSource {
+    WORK_SOURCE.with(|c| c.replace(ws))
+}
+
+/// Resets the thread's work source to unset for the duration of an
+/// inbound dispatch and restores the caller's value on drop, including on
+/// unwind. AOSP `IPCThreadState::executeCommand` `BR_TRANSACTION`
+/// (`IPCThreadState.cpp:1521-1527`, `:1617-1618`).
+pub(crate) struct WorkSourceDispatchGuard {
+    saved: WorkSource,
+}
+
+impl WorkSourceDispatchGuard {
+    pub(crate) fn enter() -> Self {
+        WorkSourceDispatchGuard {
+            saved: replace_work_source(WorkSource::UNSET),
+        }
+    }
+}
+
+impl Drop for WorkSourceDispatchGuard {
+    fn drop(&mut self) {
+        let _ = WORK_SOURCE.try_with(|c| c.set(self.saved));
+    }
+}
+
+/// Set the uid of the work being done on behalf of the current caller and
+/// mark it for propagation, so every outgoing kernel binder call made from
+/// this thread carries it in the request header until it is cleared or
+/// restored. Returns a token for [`restore_calling_work_source`].
+///
+/// The work source is per-thread state that exists outside transactions:
+/// a client thread sets it before calling, and a server reads what the
+/// caller sent with [`get_calling_work_source_uid`]. A value received in a
+/// transaction is **not** propagated further unless the handler sets it
+/// again. An inbound dispatch starts from the unset value and the thread's
+/// previous value comes back when the handler returns.
+///
+/// Mirrors AOSP `IPCThreadState::setCallingWorkSourceUid`
+/// (`IPCThreadState.cpp:589`) and Java `Binder.setCallingWorkSourceUid`.
+///
+/// # Transports
+///
+/// Only the kernel binder request header has a work-source field; the RPC
+/// wire format (AOSP's included) has none. Inside an RPC handler,
+/// [`get_calling_work_source_uid`] therefore reports the unset value, and a
+/// value set there propagates only to kernel binder calls the handler
+/// makes. Pure-RPC processes can call these functions freely.
+pub fn set_calling_work_source_uid(uid: binder::uid_t) -> i64 {
+    replace_work_source(WorkSource {
+        uid,
+        propagate: true,
     })
+    .token()
+}
+
+/// Replace the work source uid without touching the propagation flag.
+/// AOSP marks this "internal only"; `check_interface` uses it to install
+/// the value read from the request header.
+pub(crate) fn set_calling_work_source_uid_without_propagation(uid: binder::uid_t) -> i64 {
+    let current = work_source();
+    replace_work_source(WorkSource { uid, ..current }).token()
+}
+
+/// The work source uid of the current thread: inside a kernel binder
+/// handler, the value the caller sent (`u32::MAX` when it sent none);
+/// elsewhere, whatever this thread last set. The unset value is AOSP
+/// `kUnsetWorkSource` (`-1`) viewed as `uid_t`.
+///
+/// Mirrors AOSP `IPCThreadState::getCallingWorkSourceUid`
+/// (`IPCThreadState.cpp:614`). See [`set_calling_work_source_uid`] for the
+/// propagation rules and the RPC behavior.
+pub fn get_calling_work_source_uid() -> binder::uid_t {
+    work_source().uid
+}
+
+/// Set the work source to unset **and mark it for propagation**, so
+/// outgoing kernel calls send the unset value rather than one inherited
+/// from an earlier [`set_calling_work_source_uid`]. Returns a token for
+/// [`restore_calling_work_source`].
+///
+/// Mirrors AOSP `IPCThreadState::clearCallingWorkSource`
+/// (`IPCThreadState.cpp:619`), which is `setCallingWorkSourceUid(-1)`.
+pub fn clear_calling_work_source() -> i64 {
+    set_calling_work_source_uid(UNSET_WORK_SOURCE as binder::uid_t)
+}
+
+/// Restore the work source uid and propagation flag saved in a token from
+/// [`set_calling_work_source_uid`] or [`clear_calling_work_source`].
+///
+/// Mirrors AOSP `IPCThreadState::restoreCallingWorkSource`
+/// (`IPCThreadState.cpp:624`). The token is only meaningful to this
+/// function; its bit layout is not a stable interface.
+pub fn restore_calling_work_source(token: i64) {
+    replace_work_source(WorkSource::from_token(token));
+}
+
+/// Stop propagating the work source on outgoing calls; the uid itself is
+/// kept. Mirrors AOSP `IPCThreadState::clearPropagateWorkSource`
+/// (`IPCThreadState.cpp:604`).
+pub fn clear_propagate_work_source() {
+    let current = work_source();
+    replace_work_source(WorkSource {
+        propagate: false,
+        ..current
+    });
+}
+
+/// Whether outgoing kernel binder calls from this thread carry the work
+/// source uid (otherwise they send the unset value). Mirrors AOSP
+/// `IPCThreadState::shouldPropagateWorkSource` (`IPCThreadState.cpp:609`).
+pub fn should_propagate_work_source() -> bool {
+    work_source().propagate
 }
 
 pub(crate) fn _setup_polling() -> Result<()> {
@@ -1237,14 +1334,11 @@ fn execute_command(cmd: i32) -> Result<()> {
                     thread_state.transaction =
                         Some(TransactionState::from_transaction_data(&tr_secctx));
 
-                    // Both work-source fields live in `TransactionState`, so
-                    // the reset only reaches this transaction if it runs after
-                    // the state is installed.
-                    thread_state.clear_calling_work_source();
-                    thread_state.clear_propagate_work_source();
-
                     (transaction_old, strict_mode_policy_old)
                 };
+                // `check_interface` installs the caller's value; only
+                // AIDL-style stubs call it, so everything else sees unset.
+                let _work_source = WorkSourceDispatchGuard::enter();
 
                 // This thread may already be inside an RPC handler that made
                 // an outgoing kernel call (nested IPC re-enters here). The
@@ -1905,13 +1999,12 @@ pub(crate) fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<b
             strict_policy = 0;
         }
         thread_state.set_strict_mode_policy(strict_policy);
-        reader.update_work_source_request_header_pos();
-
-        let work_source: i32 = reader.read()?;
-        thread_state.set_calling_work_source_uid_without_propagation(work_source as _);
-
         Ok(())
     })?;
+
+    reader.update_work_source_request_header_pos();
+    let work_source: i32 = reader.read()?;
+    set_calling_work_source_uid_without_propagation(work_source as _);
 
     if crate::sdk_at_least(30) {
         let header: u32 = reader.read()?;
@@ -3397,8 +3490,6 @@ mod tests {
                 calling_sid,
                 calling_uid,
                 last_transaction_binder_flags: 0,
-                work_source: 0,
-                propagate_work_source: false,
                 has_explicit_identity: false,
             };
             let previous = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.replace(new_state));
@@ -3730,6 +3821,107 @@ mod tests {
         assert_eq!(get_strict_mode_policy(), 0x1234_5678);
         set_strict_mode_policy(saved);
         assert_eq!(get_strict_mode_policy(), saved);
+    }
+
+    const UNSET_UID: binder::uid_t = UNSET_WORK_SOURCE as binder::uid_t;
+
+    /// Plan 10-9 AC-9.2: the six AOSP work-source calls on a thread with no
+    /// transaction and no `ProcessState` (each `#[test]` runs on its own
+    /// thread, so the thread-local starts unset).
+    #[test]
+    fn work_source_set_clear_restore_outside_a_transaction() {
+        assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+        assert!(!should_propagate_work_source());
+
+        let before_set = set_calling_work_source_uid(1234);
+        assert_eq!(get_calling_work_source_uid(), 1234);
+        assert!(should_propagate_work_source());
+
+        let before_clear = clear_calling_work_source();
+        assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+        assert!(
+            should_propagate_work_source(),
+            "clear sends the unset value on purpose, so it still propagates"
+        );
+
+        clear_propagate_work_source();
+        assert!(!should_propagate_work_source());
+        assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+
+        restore_calling_work_source(before_clear);
+        assert_eq!(get_calling_work_source_uid(), 1234);
+        assert!(should_propagate_work_source());
+
+        restore_calling_work_source(before_set);
+        assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+        assert!(
+            !should_propagate_work_source(),
+            "restoring an unset, non-propagating token must not turn propagation on"
+        );
+    }
+
+    /// A received value is installed without propagation: it reaches the
+    /// handler but not the next hop unless the handler sets it again.
+    #[test]
+    fn work_source_received_value_does_not_propagate() {
+        let token = set_calling_work_source_uid_without_propagation(77);
+        assert_eq!(get_calling_work_source_uid(), 77);
+        assert!(!should_propagate_work_source());
+        restore_calling_work_source(token);
+        assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+    }
+
+    /// The dispatch guard hands the handler an unset work source and puts
+    /// the thread's own value back afterwards — also when nested, which is
+    /// how a server thread that is itself a client re-enters dispatch.
+    #[test]
+    fn work_source_dispatch_guard_resets_and_restores_when_nested() {
+        set_calling_work_source_uid(10);
+        {
+            let _outer = WorkSourceDispatchGuard::enter();
+            assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+            assert!(!should_propagate_work_source());
+            set_calling_work_source_uid_without_propagation(20);
+            set_calling_work_source_uid(30);
+            {
+                let _inner = WorkSourceDispatchGuard::enter();
+                assert_eq!(get_calling_work_source_uid(), UNSET_UID);
+                set_calling_work_source_uid(40);
+            }
+            assert_eq!(get_calling_work_source_uid(), 30);
+            assert!(should_propagate_work_source());
+        }
+        assert_eq!(get_calling_work_source_uid(), 10);
+        assert!(should_propagate_work_source());
+    }
+
+    #[test]
+    fn work_source_dispatch_guard_restores_on_unwind() {
+        set_calling_work_source_uid(10);
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = WorkSourceDispatchGuard::enter();
+            set_calling_work_source_uid(99);
+            panic!("handler panicked");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(get_calling_work_source_uid(), 10);
+    }
+
+    /// The request header carries the work source only while propagation
+    /// is on (AOSP `Parcel::writeInterfaceToken`, `Parcel.cpp:1136-1140`).
+    #[test]
+    fn work_source_is_written_to_the_request_header_only_when_propagating() {
+        fn header_work_source() -> i32 {
+            let mut p = Parcel::new();
+            p.write_interface_token("x.y.IZ").unwrap();
+            p.set_data_position(4);
+            p.read::<i32>().unwrap()
+        }
+        assert_eq!(header_work_source(), UNSET_WORK_SOURCE);
+        set_calling_work_source_uid(4321);
+        assert_eq!(header_work_source(), 4321);
+        clear_propagate_work_source();
+        assert_eq!(header_work_source(), UNSET_WORK_SOURCE);
     }
 
     /// The driver reports how far it got, not which command it disliked; the
