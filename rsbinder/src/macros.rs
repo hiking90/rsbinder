@@ -33,6 +33,7 @@ macro_rules! __declare_binder_interface {
             },
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
         }
     } => {
         $(
@@ -103,8 +104,14 @@ macro_rules! __declare_binder_interface {
                 fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                     self.0.as_sync().dump(_writer, _args)
                 }
+
+                fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
+                    Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
+                }
             }
         )?
+
+        $crate::__transaction_names! { $native $(, $function_names)? }
 
         $(
             // Async interface trait implementations.
@@ -190,10 +197,13 @@ macro_rules! __declare_binder_interface {
             },
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
         }
     } => {
         #[doc = $native_doc]
         pub struct $native(::std::boxed::Box<dyn $interface + ::core::marker::Send + ::core::marker::Sync + 'static>);
+
+        $crate::__transaction_names! { $native $(, $function_names)? }
 
         impl $native {
             /// Create a new binder service.
@@ -231,6 +241,32 @@ macro_rules! __declare_binder_interface {
             fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                 self.0.dump(_writer, _args)
             }
+
+            fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
+                Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
+            }
+        }
+    };
+}
+
+/// The generated `Bn*` type's method-name table, `None` unless the
+/// interface was generated with `trace` (AOSP `aidl --trace`). A separate
+/// macro because in the `async` variant the `Remotable` impl sits inside
+/// an optional repetition, where the optional `function_names` argument
+/// cannot be repeated again.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __transaction_names {
+    ($native:ident) => {
+        impl $native {
+            const __TRANSACTION_NAMES: ::core::option::Option<&'static [&'static str]> =
+                ::core::option::Option::None;
+        }
+    };
+    ($native:ident, $names:tt) => {
+        impl $native {
+            const __TRANSACTION_NAMES: ::core::option::Option<&'static [&'static str]> =
+                ::core::option::Option::Some(&$names);
         }
     };
 }
@@ -249,6 +285,7 @@ macro_rules! declare_binder_interface {
             },
             proxy: $proxy:ident,
             $(r#async: $async_interface:ident,)?
+            $(function_names: $function_names:tt,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -261,6 +298,7 @@ macro_rules! declare_binder_interface {
                 proxy: $proxy {},
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
+                $(function_names: $function_names,)?
             }
         }
     };
@@ -275,6 +313,7 @@ macro_rules! declare_binder_interface {
             proxy: $proxy:ident,
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -287,6 +326,7 @@ macro_rules! declare_binder_interface {
                 proxy: $proxy {},
                 $(r#async: $async_interface,)?
                 stability: $stability,
+                $(function_names: $function_names,)?
             }
         }
     };
@@ -302,6 +342,7 @@ macro_rules! declare_binder_interface {
                 $($fname:ident: $fty:ty = $finit:expr),*
             },
             $(r#async: $async_interface:ident,)?
+            $(function_names: $function_names:tt,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -316,6 +357,7 @@ macro_rules! declare_binder_interface {
                 },
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
+                $(function_names: $function_names,)?
             }
         }
     };
@@ -332,6 +374,7 @@ macro_rules! declare_binder_interface {
             },
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -348,6 +391,7 @@ macro_rules! declare_binder_interface {
                 },
                 $(r#async: $async_interface,)?
                 stability: $stability,
+                $(function_names: $function_names,)?
             }
         }
     };
@@ -367,6 +411,7 @@ macro_rules! declare_binder_interface {
             $( r#async: $async_interface:ident, )?
 
             stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
         }
     } => {
         #[doc = $proxy_doc]
@@ -419,6 +464,7 @@ macro_rules! declare_binder_interface {
                 },
                 $(r#async: $async_interface,)?
                 stability: $stability,
+                $(function_names: $function_names,)?
             }
         }
 

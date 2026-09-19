@@ -153,6 +153,17 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 10-9: traced interfaces for `tests/transaction_names.rs`; `version`/`hash` stamp the preceding source.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))
+        .version(1)
+        .hash("trace-demo")
+        .source(PathBuf::from("aidl/tracedemo/ITraceVintf.aidl"))
+        .trace(true)
+        .output(PathBuf::from("trace_demo.rs"))
+        .generate()
+        .unwrap();
+
     // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen

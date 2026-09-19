@@ -268,6 +268,8 @@ mod macros;
 // Server-side binder construction: `Binder`, `BinderFeatures` and
 // `is_handling_transaction`, re-exported at the crate root.
 mod native;
+// Server-side transaction observers; no outer doc (it would break the inner `//!` links).
+pub mod observe;
 // `Parcel`, re-exported at the crate root.
 mod parcel;
 // The (de)serialization trait stack, re-exported at the crate root.
@@ -382,6 +384,9 @@ pub use binder::{
 // in consumer crates, so this helper must stay reachable at the crate root.
 #[doc(hidden)]
 pub use binder::__rpc_stamp_descriptor;
+// Same reason: the `function_names` arm of `declare_binder_interface!`.
+#[doc(hidden)]
+pub use binder::__transaction_name;
 
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
@@ -401,10 +406,12 @@ pub use native::{is_handling_transaction, Binder, BinderFeatures};
 // `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
 // its own `PeerIdentity` model under `rpc::PeerIdentity`.
 pub use thread_state::{
-    calling_caller, calling_caps, clear_calling_identity, get_calling_pid, get_calling_sid,
-    get_calling_uid, get_current_scheduler_policy, get_extended_error, get_strict_mode_policy,
-    has_explicit_identity, restore_calling_identity, set_strict_mode_policy, Caller,
-    CallingContext, ExtendedError,
+    calling_caller, calling_caps, clear_calling_identity, clear_calling_work_source,
+    clear_propagate_work_source, get_calling_pid, get_calling_sid, get_calling_uid,
+    get_calling_work_source_uid, get_current_scheduler_policy, get_extended_error,
+    get_strict_mode_policy, has_explicit_identity, restore_calling_identity,
+    restore_calling_work_source, set_calling_work_source_uid, set_strict_mode_policy,
+    should_propagate_work_source, Caller, CallingContext, ExtendedError,
 };
 
 pub use parcel::Parcel;
