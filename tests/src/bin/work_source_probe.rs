@@ -11,10 +11,16 @@
 //! ```text
 //! work_source_probe serve <name> [<next>]   # serves; FORWARD calls <next>
 //! work_source_probe check <front>           # runs the checks against <front>
+//! work_source_probe get <name> <uid|unset>  # one GET, after setting <uid>
 //! ```
 //!
 //! `check` prints `PASS`/`FAIL` lines and ends with `RESULT ok` or
 //! `RESULT fail`. `tests/scripts/run_work_source_ac.sh` drives it.
+//!
+//! `get` prints `RESULT rs get <uid|unset> SEEN <uid> <propagate>`. It and
+//! `serve` are the rsbinder end of the AC-9.3 STAGE3 harness, whose AOSP
+//! end (`example-hello/cpp/work_source_interop.cpp`) speaks the same
+//! protocol; `example-hello/cpp/run_work_source_interop.sh` drives both.
 
 use rsbinder::*;
 
@@ -165,13 +171,35 @@ fn check(front: &str) -> Result<bool> {
     Ok(ok)
 }
 
+fn get_once(name: &str, uid: &str) -> Result<(i32, bool)> {
+    rsbinder::Client::open("binder://")?;
+    if uid != "unset" {
+        set_calling_work_source_uid(uid.parse().map_err(|_| StatusCode::BadValue)?);
+    }
+    get(&lookup(name)?)
+}
+
 fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
     let usage = || -> ! {
-        eprintln!("usage: work_source_probe serve <name> [<next>] | check <front>");
+        eprintln!(
+            "usage: work_source_probe serve <name> [<next>] | check <front> | get <name> <uid|unset>"
+        );
         std::process::exit(2)
     };
+    if let (Some("get"), 4) = (args.get(1).map(String::as_str), args.len()) {
+        match get_once(&args[2], &args[3]) {
+            Ok((uid, propagate)) => {
+                println!("RESULT rs get {} SEEN {uid} {}", args[3], propagate as i32)
+            }
+            Err(e) => {
+                println!("RESULT rs get {} ERROR {e:?}", args[3]);
+                std::process::exit(1)
+            }
+        }
+        return;
+    }
     let result = match (args.get(1).map(String::as_str), args.len()) {
         (Some("serve"), 3 | 4) => serve(&args[2], args.get(3).cloned()).map(|()| true),
         (Some("check"), 3) => check(&args[2]),
