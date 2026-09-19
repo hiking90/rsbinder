@@ -15,6 +15,14 @@
 //     MemoryHeapBase + MemoryBase, addService("rsbinder.test.cppshm"),
 //     joinThreadPool. rsbinder's `BpMemory` is the client.
 //
+//   imemory_interop client-large <service-name> <bytes>
+//   imemory_interop server-large <service-name> <bytes>
+//     The same two roles over a heap far above the 4 MB transaction
+//     limit, paired with `tests/src/bin/shm_probe.rs`: the window covers
+//     the whole heap, filled with `i % 251`. `client-large` checks every
+//     byte, prints `RESULT cpp-shm <bytes> OK <checksum>`, then writes
+//     `cpp-large-tail` into the last 16 bytes for rsbinder to read back.
+//
 // Built with the NDK clang against AOSP libbinder headers and the
 // emulator's own libbinder.so (see run_imemory_interop.sh).
 
@@ -26,7 +34,9 @@
 #include <binder/ProcessState.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -101,9 +111,78 @@ static int runServer() {
     return 0;
 }
 
+static const size_t kTailLen = 16;
+static const char kCppTail[kTailLen] = "cpp-large-tail";
+
+static uint8_t byteAt(size_t i) { return static_cast<uint8_t>(i % 251); }
+
+static int runClientLarge(const char* name, size_t bytes) {
+    sp<IBinder> binder = defaultServiceManager()->checkService(String16(name));
+    if (binder == nullptr) {
+        printf("RESULT cpp-shm %zu ERROR not-found\n", bytes);
+        return 1;
+    }
+    sp<IMemory> mem = interface_cast<IMemory>(binder);
+    ssize_t offset = -1;
+    size_t size = 0;
+    sp<IMemoryHeap> heap = mem == nullptr ? nullptr : mem->getMemory(&offset, &size);
+    if (heap == nullptr || heap->getSize() < bytes || offset != 0 || size != bytes) {
+        printf("RESULT cpp-shm %zu ERROR geometry heap=%zu offset=%zd size=%zu\n", bytes,
+               heap == nullptr ? 0 : heap->getSize(), offset, size);
+        return 1;
+    }
+    uint8_t* base = static_cast<uint8_t*>(mem->unsecurePointer());
+    if (base == nullptr) {
+        printf("RESULT cpp-shm %zu ERROR unmapped\n", bytes);
+        return 1;
+    }
+    uint32_t sum = 0;
+    for (size_t i = 0; i < bytes; i++) {
+        if (base[i] != byteAt(i)) {
+            printf("RESULT cpp-shm %zu ERROR payload-mismatch at %zu\n", bytes, i);
+            return 1;
+        }
+        sum += static_cast<uint32_t>(i) ^ static_cast<uint32_t>(base[i]);
+    }
+    memcpy(base + bytes - kTailLen, kCppTail, kTailLen);
+    printf("RESULT cpp-shm %zu OK %u\n", bytes, sum);
+    return 0;
+}
+
+static int runServerLarge(const char* name, size_t bytes) {
+    sp<MemoryHeapBase> heap = new MemoryHeapBase(bytes, 0, "rsbinder-stage3-large");
+    if (heap->getHeapID() < 0 || heap->getBase() == MAP_FAILED) {
+        fprintf(stderr, "FAIL: MemoryHeapBase(%zu) allocation failed\n", bytes);
+        return 1;
+    }
+    uint8_t* base = static_cast<uint8_t*>(heap->getBase());
+    for (size_t i = 0; i < bytes; i++) base[i] = byteAt(i);    sp<MemoryBase> mem = new MemoryBase(heap, 0, bytes);
+    status_t st = defaultServiceManager()->addService(String16(name), mem);
+    if (st != OK) {
+        fprintf(stderr, "FAIL: addService(%s) = %d\n", name, st);
+        return 1;
+    }
+    printf("SERVING %s %zu\n", name, bytes);
+    fflush(stdout);
+    ProcessState::self()->startThreadPool();
+    IPCThreadState::self()->joinThreadPool();
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 4) {
+        std::string mode = argv[1];
+        size_t bytes = strtoull(argv[3], nullptr, 10);
+        if (bytes < kTailLen) {
+            fprintf(stderr, "bytes must be at least %zu\n", kTailLen);
+            return 2;
+        }
+        if (mode == "client-large") return runClientLarge(argv[2], bytes);
+        if (mode == "server-large") return runServerLarge(argv[2], bytes);
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s client|server\n", argv[0]);
+        fprintf(stderr, "usage: %s client|server | client-large|server-large <name> <bytes>\n",
+                argv[0]);
         return 2;
     }
     std::string mode = argv[1];
