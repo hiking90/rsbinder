@@ -6,7 +6,7 @@
 //! AOSP (`Binder.cpp` `BBinder::getTraceName`, `ndk/ibinder.cpp`
 //! `getTraceSectionName`) names a section
 //! `AIDL::<backend>::<descriptor>::<method>::server|client`, with
-//! `unknown_code_<n>` for a code the name table does not cover. rsbinder
+//! `#<n>` for a code the name table does not cover. rsbinder
 //! builds the same string with `rust` as the backend and records it as the
 //! `name` field of a `tracing` span called `aidl` (target `rsbinder::aidl`,
 //! level `TRACE`): a `tracing` span name must be `&'static str`, and the
@@ -28,7 +28,7 @@ impl fmt::Display for AidlSpanName<'_> {
         write!(f, "AIDL::rust::{}::", self.descriptor)?;
         match self.method {
             Some(method) => f.write_str(method)?,
-            None => write!(f, "unknown_code_{}", self.code)?,
+            None => write!(f, "#{}", self.code)?,
         }
         f.write_str(if self.server { "::server" } else { "::client" })
     }
@@ -103,7 +103,7 @@ mod tracing_observer {
     /// Opens the server-side span of every incoming transaction, as AOSP's
     /// `BBinder::transact` opens an ATrace section: named
     /// `AIDL::rust::<descriptor>::<method>::server` (see the `name` field),
-    /// with `unknown_code_<n>` in place of the method when the interface
+    /// with `#<n>` in place of the method when the interface
     /// carries no name table (`rsbinder_aidl::Builder::trace`) or the code is
     /// a meta transaction.
     ///
@@ -127,9 +127,7 @@ mod tracing_observer {
                 server: true,
             };
             let span = tracing::trace_span!(target: "rsbinder::aidl", "aidl", name = %name);
-            // `Span::enter` returns a guard that is not `Send`, and the tag
-            // must be. The two calls run on the same thread (module rule),
-            // so enter here and exit in `on_reply` through the subscriber.
+            // Tag must be Send, so no `Span::enter` guard; `on_reply` exits on this thread.
             span.with_subscriber(|(id, dispatch)| dispatch.enter(id))?;
             Some(Box::new(span))
         }
@@ -173,7 +171,7 @@ mod tests {
         );
         assert_eq!(
             name(None, 0x5f504e47, true),
-            "AIDL::rust::a.b.IFoo::unknown_code_1599098439::server"
+            "AIDL::rust::a.b.IFoo::#1599098439::server"
         );
     }
 }

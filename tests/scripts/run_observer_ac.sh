@@ -8,7 +8,7 @@
 #   ./tests/scripts/run_observer_ac.sh
 #
 # Starts and stops its own hub, so run it with nothing else holding
-# handle 0 — an already running `rsb_hub` is stopped too.
+# handle 0; it refuses to start while any `target/debug/rsb_hub` runs.
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -22,9 +22,13 @@ FAIL=0
 
 cleanup() {
     pkill -f '[t]arget/debug/observer_probe' 2>/dev/null
-    pkill -f '[t]arget/debug/rsb_hub' 2>/dev/null
+    [ -n "${HUB_PID:-}" ] && kill "$HUB_PID" 2>/dev/null
 }
 trap cleanup EXIT
+if pgrep -f '[t]arget/debug/rsb_hub' >/dev/null; then
+    echo "an rsb_hub is already running; stop it first (this script starts its own)"
+    exit 1
+fi
 cleanup; sleep 1
 
 for b in "$HUB" "$PROBE"; do

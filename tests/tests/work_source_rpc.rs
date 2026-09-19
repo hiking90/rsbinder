@@ -61,8 +61,7 @@ impl Remotable for Probe {
 }
 
 fn call(remote: &dyn RemoteProxy, code: TransactionCode) -> (i32, bool) {
-    // A hand-written client has no stamped descriptor; the RPC interface
-    // token is just the descriptor string.
+    // Hand-written client: the RPC interface token is just the descriptor string.
     let mut data = remote.prepare_transact(false).expect("prepare_transact");
     data.write(&DESCRIPTOR).expect("interface token");
     let mut reply = remote

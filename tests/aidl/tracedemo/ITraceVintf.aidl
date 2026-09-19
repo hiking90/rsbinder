@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Plan 10-9 fixture: the `stability:` arm of `declare_binder_interface!`
-// followed by `function_names:`, and the meta methods a versioned interface
-// adds.
+// followed by `function_names:`, for an unversioned interface.
 package tracedemo;
 
 @VintfStability

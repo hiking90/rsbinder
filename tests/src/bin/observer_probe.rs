@@ -76,9 +76,7 @@ impl TransactionObserver for Recorder {
         result: &rsbinder::Result<()>,
         _elapsed: Duration,
     ) {
-        // Unnamed codes are the binder meta transactions (the hub and
-        // `connect` query the descriptor), which kernel binder delivers to
-        // the object as well; they are not what this probe compares.
+        // Skip unnamed codes: meta transactions the hub and `connect` also deliver here.
         if ctx.descriptor == DESCRIPTOR && ctx.method.is_some_and(|m| m != "observed") {
             self.lines
                 .lock()

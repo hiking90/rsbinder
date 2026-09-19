@@ -91,9 +91,10 @@ interface IFoo {
 }
 
 #[test]
-fn trace_on_interface_without_methods_emits_no_table() {
+fn trace_on_interface_without_methods_emits_an_empty_table() {
+    // An empty table still turns on the runtime's meta-method names.
     let out = generate("package test.pkg;\ninterface IEmpty {}\n", true);
-    assert!(!out.contains("function_names"), "{out}");
+    assert!(out.contains("function_names: ["), "{out}");
 }
 
 fn member(name: &str, code: Option<u32>) -> FnMembers {

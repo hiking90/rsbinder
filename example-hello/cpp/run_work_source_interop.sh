@@ -120,7 +120,7 @@ if command -v timeout >/dev/null 2>&1; then CALL_TIMEOUT="timeout 60"; fi
 # expect <description> <device command> <wanted line>
 expect() {
     local out
-    out=$($CALL_TIMEOUT "${ADB[@]}" shell "$2 2>/dev/null || true" | tr -d '\r')
+    out=$($CALL_TIMEOUT "${ADB[@]}" shell "$2 2>/dev/null || true" | tr -d '\r') || true
     [ "$out" = "$3" ] && ok "$1" || bad "$1: got '$out', want '$3'"
 }
 
@@ -171,8 +171,10 @@ for i in 1 2 3 4; do
     expect "rsbinder thread starts clean ($i)" \
         "$CPP get $RS_SVC unset" "RESULT cpp get unset SEEN -1 0"
 done
-expect "the handler's own value did not stay on the forwarding path" \
-    "$PROBE get $CPP_SVC unset" "RESULT rs get unset SEEN -1 0"
+for i in 1 2 3; do
+    expect "the handler's own value did not stay on the forwarding path ($i)" \
+        "$CPP forward $RS_SVC 5678 none" "RESULT cpp forward 5678 none HERE 5678 DOWN -1"
+done
 
 printf '\n==== Plan 10-9 AC-9.3: %d passed, %d failed ====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

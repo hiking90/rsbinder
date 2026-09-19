@@ -402,7 +402,10 @@ impl Builder {
     /// `aidl --trace`. The generated service then answers
     /// `rsbinder::Remotable::transaction_name(code)` with the AIDL method
     /// name, which rsbinder uses to name transactions in traces and
-    /// transaction observers; without it they are identified by code only.
+    /// transaction observers, and generated proxies open the client span
+    /// around each call. Without it only the server span exists, named by
+    /// code, and no client span is opened (AOSP opens the client section
+    /// regardless of `--trace`).
     /// Applies to all sources. Off by default, as in AOSP: the table adds one
     /// string per method to the binary. The wire format is unaffected.
     pub fn trace(mut self, enable: bool) -> Self {

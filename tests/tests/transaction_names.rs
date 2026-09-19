@@ -4,9 +4,10 @@
 //! Plan 10-9 AC-9.7, runtime half: a service generated with
 //! `Builder::trace(true)` names its transactions, and one generated without
 //! it does not. Compiling this file is itself part of the check: the name
-//! table goes through every `declare_binder_interface!` arm the generator
-//! uses, with and without `stability:`, and through the `async` variant this
-//! crate's build enables.
+//! table goes through the `declare_binder_interface!` arms for a versioned
+//! interface without `stability:` (`ITraceDemo`) and an unversioned one with
+//! it (`ITraceVintf`), and through the `async` variant this crate's build
+//! enables.
 
 use rsbinder::{Remotable, FIRST_CALL_TRANSACTION};
 

@@ -142,9 +142,13 @@ static OBSERVER: RwLock<Option<Arc<dyn TransactionObserver>>> = RwLock::new(None
 /// [`TxnContext::transport`]. To run several, install one that forwards to
 /// each.
 pub fn set_observer(observer: Option<Arc<dyn TransactionObserver>>) {
-    let mut slot = OBSERVER.write().unwrap_or_else(PoisonError::into_inner);
-    INSTALLED.store(observer.is_some(), Ordering::Release);
-    *slot = observer;
+    // The old observer's Drop is user code; run it after the write lock is released.
+    let old = {
+        let mut slot = OBSERVER.write().unwrap_or_else(PoisonError::into_inner);
+        INSTALLED.store(observer.is_some(), Ordering::Release);
+        std::mem::replace(&mut *slot, observer)
+    };
+    drop(old);
 }
 
 fn current() -> Option<Arc<dyn TransactionObserver>> {
@@ -216,8 +220,7 @@ mod tests {
         panic_in: Option<&'static str>,
     }
 
-    // Other lib tests dispatch real transactions in parallel while this one's
-    // observer is installed; only the context built here is recorded.
+    // Parallel lib tests dispatch real transactions; record only this test's context.
     impl TransactionObserver for Recorder {
         fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
             if ctx.descriptor != "x.y.IZ" {

@@ -199,17 +199,14 @@ fn client_and_server_spans_carry_aosp_names() {
             <dyn ITraceDemo as FromIBinder>::try_from(root)
                 .expect("proxy")
                 .into_async::<Tokio>();
-        // The span is created when the future is, inside `async_caller`,
-        // and entered later on a blocking-pool thread.
+        // Created with the future in `async_caller`; entered later on a blocking-pool thread.
         rt.block_on(async {
             let call = tracing::trace_span!("async_caller").in_scope(|| async_svc.ping());
             call.await
         })
         .expect("async ping");
     }
-    // Dropping the client session ends `serve_blocking`. `notify` is one-way,
-    // but the session serves one transaction at a time in arrival order, so
-    // it finished before `ping` was answered.
+    // One-way `notify` finished before `ping`'s reply: the session serves in arrival order.
     serving.join().expect("server thread");
     set_observer(None);
 

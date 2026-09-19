@@ -102,8 +102,8 @@ pub struct StatsSnapshot {
 ///
 /// `max_in_flight` reaching the binder thread-pool size (`max_threads` of
 /// [`ProcessState::init`](crate::ProcessState::init) plus the threads that
-/// joined the pool themselves) means the pool was exhausted at some point:
-/// further callers waited in the driver for a free thread. The count covers every transport the observer sees, so an
+/// joined the pool themselves) is necessary but not sufficient for the pool
+/// having been exhausted: a nested callback on the same thread counts twice. The count covers every transport the observer sees, so an
 /// RPC server's threads add to it too; filter by
 /// [`TxnContext::transport`] in a wrapper to separate them.
 ///
@@ -122,8 +122,7 @@ pub struct StatsSnapshot {
 /// ```
 #[derive(Debug, Default)]
 pub struct StatsObserver {
-    // Keyed by descriptor first so the per-call lookup borrows `&str`; a key
-    // is allocated only the first time a descriptor is seen.
+    // Descriptor first, so the per-call lookup borrows `&str` instead of allocating.
     methods: Mutex<HashMap<String, HashMap<TransactionCode, MethodStats>>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,

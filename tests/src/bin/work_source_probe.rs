@@ -159,8 +159,7 @@ fn check(front: &str) -> Result<bool> {
     );
     restore_calling_work_source(token);
 
-    // Every server thread either served one of the calls above with a
-    // work source installed or never ran; none may carry it into this one.
+    // No server thread may carry an earlier call's work source into a later one.
     for i in 0..8 {
         expect(
             &format!("no leak into a later call ({i})"),

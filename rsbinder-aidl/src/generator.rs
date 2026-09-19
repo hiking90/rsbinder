@@ -444,7 +444,7 @@ pub mod {{mod}} {
             {%- if is_vintf %}
             stability: {{crate}}::Stability::Vintf,
             {%- endif %}
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             function_names: [
                 {%- for function_name in function_names %}
                 "{{ function_name }}",
@@ -526,7 +526,7 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }})
                 .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
             {%- else %}
@@ -544,7 +544,7 @@ pub mod {{mod}} {
             let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
             if _aidl_version != -1 { return Ok(_aidl_version); }
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion)
                 .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
@@ -562,7 +562,7 @@ pub mod {{mod}} {
                 }
             }
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash)
                 .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
@@ -581,7 +581,7 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }});
             P::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
@@ -608,7 +608,7 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion);
             P::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
@@ -635,7 +635,7 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
-            {%- if function_names %}
+            {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash);
             P::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),

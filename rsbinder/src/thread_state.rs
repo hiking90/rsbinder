@@ -850,9 +850,7 @@ impl WorkSource {
         propagate: false,
     };
 
-    // AOSP sign-extends the uid into the token, which loses the propagate
-    // bit when the uid is unset; zero-extending keeps `restore` exact. The
-    // token never leaves the process.
+    // Zero-extended, unlike AOSP, so an unset uid keeps the propagate bit on restore.
     fn token(self) -> i64 {
         ((self.propagate as i64) << WORK_SOURCE_PROPAGATED_BIT_INDEX) | (self.uid as i64)
     }
@@ -866,9 +864,7 @@ impl WorkSource {
 }
 
 thread_local! {
-    // Its own `Cell` rather than a `ThreadState` field: the work source is
-    // set on client threads outside any transaction and in pure-RPC
-    // processes, where `THREAD_STATE` cannot be initialized.
+    // Not a `ThreadState` field: it must work without `ProcessState` (pure-RPC, idle clients).
     static WORK_SOURCE: Cell<WorkSource> = const { Cell::new(WorkSource::UNSET) };
 }
 
@@ -1362,8 +1358,7 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                     (transaction_old, strict_mode_policy_old)
                 };
-                // `check_interface` installs the caller's value; only
-                // AIDL-style stubs call it, so everything else sees unset.
+                // Unset until an AIDL stub's `check_interface` installs the caller's value.
                 let _work_source = WorkSourceDispatchGuard::enter();
 
                 // This thread may already be inside an RPC handler that made

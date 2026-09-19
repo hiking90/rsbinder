@@ -153,9 +153,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 10-9: interfaces generated with a method-name table, for
-    // `tests/transaction_names.rs`. `version`/`hash` apply to the source
-    // just added, so `ITraceDemo` also gets the two meta methods.
+    // Plan 10-9: traced interfaces for `tests/transaction_names.rs`; `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))
         .version(1)

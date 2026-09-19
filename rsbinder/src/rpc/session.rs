@@ -3170,40 +3170,39 @@ impl RpcSessionInner {
                 transport: caps,
             }
         };
-        let result = crate::observe::observed(observed_ctx, || {
-            consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
-                // Mirror the kernel server entrypoint's `dispatch_transact_caught`
-                // (thread_state.rs): a panic in the user `on_transact` handler
-                // must NOT unwind through the serve loop, because that would skip
-                // the `serve_blocking_on_inner` cleanup (drop_connection /
-                // send_session_obituaries / remove_slot) and leave a slot pinned
-                // to a dead worker — deadlock + session-lifecycle corruption +
-                // missed obituaries. Catch it here and turn it into a
-                // deterministic error reply, symmetric with the kernel path. The
-                // `RpcCallingGuard` is created inside the closure so its `Drop`
-                // (which restores the calling context) still runs on unwind. On
-                // the error path the reply parcel is unused (`send_reply` sends an
-                // empty body with the status), so a partially-written `reply`
-                // cannot leak to the peer.
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _calling =
-                        crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer), caps);
-                    // AOSP RPC leaves the work source alone; resetting it keeps a
-                    // handler's `set` from leaking into the next call on this thread.
-                    let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
-                    target.rpc_transact(code, &mut reader, &mut reply)
-                }))
-                .unwrap_or_else(|payload| {
-                    let msg = payload
-                        .downcast_ref::<&'static str>()
-                        .copied()
-                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("<non-string panic payload>");
-                    log::error!("RPC on_transact panicked for code {code}: {msg}");
-                    Err(crate::StatusCode::Unknown)
+        // Guards outside `observed`: the observer sees the handler's thread state, as on kernel.
+        let result = {
+            let _calling = crate::thread_state::RpcCallingGuard::install(Arc::clone(&peer), caps);
+            // AOSP RPC leaves the work source alone; reset it so a handler's `set` cannot leak.
+            let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
+            crate::observe::observed(observed_ctx, || {
+                consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
+                    // Mirror the kernel server entrypoint's `dispatch_transact_caught`
+                    // (thread_state.rs): a panic in the user `on_transact` handler
+                    // must NOT unwind through the serve loop, because that would skip
+                    // the `serve_blocking_on_inner` cleanup (drop_connection /
+                    // send_session_obituaries / remove_slot) and leave a slot pinned
+                    // to a dead worker — deadlock + session-lifecycle corruption +
+                    // missed obituaries. Catch it here and turn it into a
+                    // deterministic error reply, symmetric with the kernel path. On
+                    // the error path the reply parcel is unused (`send_reply` sends an
+                    // empty body with the status), so a partially-written `reply`
+                    // cannot leak to the peer.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        target.rpc_transact(code, &mut reader, &mut reply)
+                    }))
+                    .unwrap_or_else(|payload| {
+                        let msg = payload
+                            .downcast_ref::<&'static str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("<non-string panic payload>");
+                        log::error!("RPC on_transact panicked for code {code}: {msg}");
+                        Err(crate::StatusCode::Unknown)
+                    })
                 })
             })
-        });
+        };
 
         if oneway {
             if let Err(e) = result {

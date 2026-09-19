@@ -87,9 +87,7 @@ static const char* resolve() {
 static void* on_create(void*) { return nullptr; }
 static void on_destroy(void*) {}
 
-// libbinder_ndk has checked the interface token, and with it installed the
-// header's work source, before this runs. Reply as the rsbinder probe's GET
-// does: `[uid][propagate]`, the uid signed so that unset reads as -1.
+// The NDK already installed the header's work source; reply `[uid][propagate]` like the probe's GET.
 static binder_status_t on_transact(AIBinder*, transaction_code_t code, const AParcel*,
                                    AParcel* out) {
     if (code != kGet) return STATUS_UNKNOWN_TRANSACTION;
@@ -133,8 +131,7 @@ static int run_client(const char* name, const char* uid, const char* set) {
         snprintf(label, sizeof label, "get %s", uid);
     }
 
-    // Set on this thread, outside any transaction: the value the next
-    // outgoing header carries.
+    // Set outside any transaction, so the next outgoing header carries it.
     if (strcmp(uid, "unset") != 0) {
         g_set(g_self(), static_cast<uint32_t>(strtoul(uid, nullptr, 10)));
     }
@@ -182,8 +179,7 @@ static int run_client(const char* name, const char* uid, const char* set) {
 
 int main(int argc, char** argv) {
     if (const char* err = resolve()) {
-        // The question AC-9.3 left open: whether an executable under
-        // /data/local/tmp may load the platform-private libbinder.so.
+        // AC-9.3: can a /data/local/tmp executable load the platform-private libbinder.so?
         printf("RESULT cpp ERROR dlopen %s\n", err);
         return 4;
     }

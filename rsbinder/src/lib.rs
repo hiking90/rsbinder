@@ -268,8 +268,7 @@ mod macros;
 // Server-side binder construction: `Binder`, `BinderFeatures` and
 // `is_handling_transaction`, re-exported at the crate root.
 mod native;
-// Server-side transaction observers. No outer doc here: it would be merged
-// with the module's `//!` docs and break their relative links.
+// Server-side transaction observers; no outer doc (it would break the inner `//!` links).
 pub mod observe;
 // `Parcel`, re-exported at the crate root.
 mod parcel;
