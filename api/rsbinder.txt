@@ -62,6 +62,7 @@ impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
@@ -141,6 +142,7 @@ impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 impl core::marker::Send for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 impl core::marker::Sync for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
@@ -456,6 +458,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IClientCall
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
@@ -536,6 +539,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceCal
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
@@ -616,6 +620,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceMan
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
@@ -1026,6 +1031,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IClientCall
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
@@ -1044,6 +1050,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceCal
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
@@ -1062,6 +1069,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceMan
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
@@ -1372,6 +1380,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IClientCall
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
@@ -1390,6 +1399,7 @@ impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceCal
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Send for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 impl core::marker::Sync for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
@@ -1560,6 +1570,30 @@ impl core::marker::UnsafeUnpin for rsbinder::lazy_service::LazyServiceRegistrar
 impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::lazy_service::LazyServiceRegistrar
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::lazy_service::LazyServiceRegistrar
 pub type rsbinder::lazy_service::ActiveServicesCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync)>
+pub mod rsbinder::observe
+#[non_exhaustive] pub struct rsbinder::observe::TxnContext<'a>
+pub rsbinder::observe::TxnContext::calling_pid: std::os::raw::c_int
+pub rsbinder::observe::TxnContext::calling_uid: std::os::raw::c_uint
+pub rsbinder::observe::TxnContext::code: rsbinder::TransactionCode
+pub rsbinder::observe::TxnContext::descriptor: &'a str
+pub rsbinder::observe::TxnContext::is_oneway: bool
+pub rsbinder::observe::TxnContext::method: core::option::Option<&'static str>
+pub rsbinder::observe::TxnContext::transport: rsbinder::TransportCaps
+impl<'a> core::clone::Clone for rsbinder::observe::TxnContext<'a>
+pub fn rsbinder::observe::TxnContext<'a>::clone(&self) -> rsbinder::observe::TxnContext<'a>
+impl<'a> core::fmt::Debug for rsbinder::observe::TxnContext<'a>
+pub fn rsbinder::observe::TxnContext<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for rsbinder::observe::TxnContext<'a>
+impl<'a> core::marker::Send for rsbinder::observe::TxnContext<'a>
+impl<'a> core::marker::Sync for rsbinder::observe::TxnContext<'a>
+impl<'a> core::marker::Unpin for rsbinder::observe::TxnContext<'a>
+impl<'a> core::marker::UnsafeUnpin for rsbinder::observe::TxnContext<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::TxnContext<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for rsbinder::observe::TxnContext<'a>
+pub trait rsbinder::observe::TransactionObserver: core::marker::Send + core::marker::Sync
+pub fn rsbinder::observe::TransactionObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::TransactionObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+pub fn rsbinder::observe::set_observer(core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>)
 pub mod rsbinder::permission_controller
 pub mod rsbinder::permission_controller::android
 pub mod rsbinder::permission_controller::android::os
@@ -1575,6 +1609,7 @@ impl rsbinder::Remotable for rsbinder::permission_controller::android::os::IPerm
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 impl core::marker::Send for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 impl core::marker::Sync for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
@@ -1698,6 +1733,7 @@ impl rsbinder::Remotable for rsbinder::permission_controller::android::os::IPerm
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 impl core::marker::Send for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 impl core::marker::Sync for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
@@ -2005,6 +2041,7 @@ impl rsbinder::Remotable for rsbinder::shared_memory::wire::BnMemory
 pub fn rsbinder::shared_memory::wire::BnMemory::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemory::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemory::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemory::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::shared_memory::wire::BnMemory
 impl core::marker::Send for rsbinder::shared_memory::wire::BnMemory
 impl core::marker::Sync for rsbinder::shared_memory::wire::BnMemory
@@ -2019,6 +2056,7 @@ impl<H: rsbinder::shared_memory::IMemoryHeap + 'static> rsbinder::Remotable for 
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl<H> core::marker::Freeze for rsbinder::shared_memory::wire::BnMemoryHeap<H>
 impl<H> core::marker::Send for rsbinder::shared_memory::wire::BnMemoryHeap<H>
 impl<H> core::marker::Sync for rsbinder::shared_memory::wire::BnMemoryHeap<H>
@@ -2136,6 +2174,7 @@ impl rsbinder::Remotable for rsbinder::shared_memory::wire::BnMemory
 pub fn rsbinder::shared_memory::wire::BnMemory::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemory::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemory::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemory::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::shared_memory::wire::BnMemory
 impl core::marker::Send for rsbinder::shared_memory::wire::BnMemory
 impl core::marker::Sync for rsbinder::shared_memory::wire::BnMemory
@@ -2150,6 +2189,7 @@ impl<H: rsbinder::shared_memory::IMemoryHeap + 'static> rsbinder::Remotable for 
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl<H> core::marker::Freeze for rsbinder::shared_memory::wire::BnMemoryHeap<H>
 impl<H> core::marker::Send for rsbinder::shared_memory::wire::BnMemoryHeap<H>
 impl<H> core::marker::Sync for rsbinder::shared_memory::wire::BnMemoryHeap<H>
@@ -3886,34 +3926,42 @@ pub trait rsbinder::Remotable: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Remotable::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Remotable::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::Remotable::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::Remotable::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl rsbinder::Remotable for rsbinder::shared_memory::wire::BnMemory
 pub fn rsbinder::shared_memory::wire::BnMemory::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemory::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemory::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemory::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 impl<H: rsbinder::shared_memory::IMemoryHeap + 'static> rsbinder::Remotable for rsbinder::shared_memory::wire::BnMemoryHeap<H>
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::descriptor() -> &'static str
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 pub trait rsbinder::RemoteProxy
 pub fn rsbinder::RemoteProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::RemoteProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
@@ -4161,6 +4209,7 @@ impl<P: rsbinder::BinderAsyncPool> rsbinder::ToSyncInterface for dyn rsbinder::p
 pub type dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>::Target = dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController
 pub trait rsbinder::Transactable: core::marker::Send + core::marker::Sync
 pub fn rsbinder::Transactable::transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::Transactable::transaction_name(&self, rsbinder::TransactionCode) -> core::option::Option<&'static str>
 pub fn rsbinder::calling_caller() -> core::option::Option<rsbinder::thread_state::Caller>
 pub fn rsbinder::calling_caps() -> core::option::Option<rsbinder::TransportCaps>
 pub async fn rsbinder::check_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>

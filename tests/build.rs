@@ -153,6 +153,19 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 10-9: interfaces generated with a method-name table, for
+    // `tests/transaction_names.rs`. `version`/`hash` apply to the source
+    // just added, so `ITraceDemo` also gets the two meta methods.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))
+        .version(1)
+        .hash("trace-demo")
+        .source(PathBuf::from("aidl/tracedemo/ITraceVintf.aidl"))
+        .trace(true)
+        .output(PathBuf::from("trace_demo.rs"))
+        .generate()
+        .unwrap();
+
     // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen

@@ -56,5 +56,10 @@ name = "work_source_rpc"
 path = "tests/work_source_rpc.rs"
 required-features = ["rpc"]
 
+[[test]]
+name = "observer_rpc"
+path = "tests/observer_rpc.rs"
+required-features = ["rpc"]
+
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

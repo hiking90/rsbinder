@@ -268,6 +268,9 @@ mod macros;
 // Server-side binder construction: `Binder`, `BinderFeatures` and
 // `is_handling_transaction`, re-exported at the crate root.
 mod native;
+// Server-side transaction observers. No outer doc here: it would be merged
+// with the module's `//!` docs and break their relative links.
+pub mod observe;
 // `Parcel`, re-exported at the crate root.
 mod parcel;
 // The (de)serialization trait stack, re-exported at the crate root.
@@ -382,6 +385,9 @@ pub use binder::{
 // in consumer crates, so this helper must stay reachable at the crate root.
 #[doc(hidden)]
 pub use binder::__rpc_stamp_descriptor;
+// Same reason: the `function_names` arm of `declare_binder_interface!`.
+#[doc(hidden)]
+pub use binder::__transaction_name;
 
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};

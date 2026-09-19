@@ -30,6 +30,27 @@ This changelog starts at 0.9.0. For earlier releases, see the
   set inside one still propagates to the kernel binder calls it makes, and the
   RPC dispatch resets it per call so it cannot leak into the next call served
   on that thread.
+- **Transaction names** (AOSP `aidl --trace`): `rsbinder_aidl::Builder::trace(true)`
+  emits a method-name table for every interface, and the generated service
+  answers the new `Remotable::transaction_name(code)` with the AIDL method name
+  (plus `getInterfaceVersion` / `getInterfaceHash`). The table follows AOSP's
+  layout — indexed by method id, cut off once more than ten ids are skipped —
+  and is off by default, as in AOSP. `transaction_name` has a default that
+  returns `None`, so hand-written `Remotable`s are unaffected. The wire format
+  does not change.
+  `declare_binder_interface!` takes an optional trailing `function_names: [..]`
+  argument to carry the table.
+- **Transaction observers** (`rsbinder::observe`): `set_observer` installs one
+  process-wide `TransactionObserver`, called on the serving thread before and
+  after every incoming transaction, on kernel binder and over RPC alike. Its
+  `TxnContext` carries the descriptor, code, method name (with
+  `Builder::trace`), one-way flag, caller uid/pid and transport; `on_reply` gets
+  the handler's result and its duration. A panic in the observer is logged and
+  does not change the transaction's result, and the observer may make binder
+  calls itself. With no observer installed a dispatch pays one atomic load.
+  Closest AOSP counterpart: Java `Binder.setObserver`; nothing on the wire
+  changes. `Transactable` gained a defaulted `transaction_name` so the
+  dispatcher can name the method.
 
 ## [0.12.0] - 2026-09-19
 

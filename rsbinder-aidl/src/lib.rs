@@ -118,9 +118,9 @@ pub use generator::Generator;
 /// nothing here needs to know what a value *is*, only how to write it.
 pub mod render {
     pub use crate::generator::{
-        deprecated_attr, interface_stem, render_enum, render_interface, render_parcelable,
-        ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender, ParcelableMember,
-        ParcelableRender, TransactionWrite,
+        deprecated_attr, function_names, interface_stem, render_enum, render_interface,
+        render_parcelable, ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender,
+        ParcelableMember, ParcelableRender, TransactionWrite,
     };
 }
 pub use parser::parse_document;
@@ -257,6 +257,7 @@ pub struct Builder {
     output: PathBuf,
     enabled_async: bool,
     is_crate: bool,
+    trace: bool,
     /// Per-source version/hash overrides. Keyed by the source path passed
     /// to [`Builder::source`]. [`Builder::version`] and [`Builder::hash`]
     /// apply to the most recently added source.
@@ -282,6 +283,7 @@ impl Builder {
             output: "rsbinder_generated_aidl.rs".into(),
             enabled_async: cfg!(feature = "async"),
             is_crate: false,
+            trace: false,
             version_meta: HashMap::new(),
             dependencies: Vec::new(),
         }
@@ -393,6 +395,18 @@ impl Builder {
     /// It generates the rust output file with crate::??? instead of rsbinder::???.
     pub fn set_crate_support(mut self, enable: bool) -> Self {
         self.is_crate = enable;
+        self
+    }
+
+    /// Emit a method-name table for every interface, equivalent to AOSP
+    /// `aidl --trace`. The generated service then answers
+    /// `rsbinder::Remotable::transaction_name(code)` with the AIDL method
+    /// name, which rsbinder uses to name transactions in traces and
+    /// transaction observers; without it they are identified by code only.
+    /// Applies to all sources. Off by default, as in AOSP: the table adds one
+    /// string per method to the binary. The wire format is unaffected.
+    pub fn trace(mut self, enable: bool) -> Self {
+        self.trace = enable;
         self
     }
 
@@ -712,7 +726,8 @@ impl Builder {
                 .cloned()
                 .unwrap_or_default();
             let gen = generator::Generator::new(self.enabled_async, self.is_crate)
-                .with_version_meta(meta.version, meta.hash);
+                .with_version_meta(meta.version, meta.hash)
+                .with_trace(self.trace);
             match gen.document(&document.1) {
                 Ok(package) => {
                     package_list.push((package.0, package.1, document.0.clone()));

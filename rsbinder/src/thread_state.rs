@@ -237,7 +237,9 @@ impl Drop for RpcCallingGuard {
 /// `Certificate` / `Anonymous`) map to the fail-closed
 /// [`RPC_UNKNOWN_CALLING_UID`] sentinel and pid `-1`.
 #[cfg(feature = "rpc")]
-fn peer_uid_pid(peer: &crate::rpc::transport::PeerIdentity) -> (binder::uid_t, binder::pid_t) {
+pub(crate) fn peer_uid_pid(
+    peer: &crate::rpc::transport::PeerIdentity,
+) -> (binder::uid_t, binder::pid_t) {
     match peer {
         crate::rpc::transport::PeerIdentity::Local { uid, pid } => (*uid, *pid),
         _ => (RPC_UNKNOWN_CALLING_UID, -1),
@@ -1274,6 +1276,30 @@ fn dispatch_transact_caught(
     }
 }
 
+/// [`dispatch_transact_caught`] between the transaction observer's calls.
+/// Runs where the handler runs: no `THREAD_STATE` borrow is held.
+fn dispatch_kernel_observed(
+    descriptor: &str,
+    transactable: &dyn Transactable,
+    tr: &binder::binder_transaction_data,
+    reader: &mut Parcel,
+    reply: &mut Parcel,
+) -> Result<()> {
+    let code = tr.code;
+    crate::observe::observed(
+        || crate::observe::TxnContext {
+            descriptor,
+            code,
+            method: transactable.transaction_name(code),
+            is_oneway: tr.flags & transaction_flags_TF_ONE_WAY != 0,
+            calling_uid: tr.sender_euid,
+            calling_pid: tr.sender_pid,
+            transport: crate::TransportCaps::KERNEL,
+        },
+        || dispatch_transact_caught(transactable, code, reader, reply),
+    )
+}
+
 fn execute_command(cmd: i32) -> Result<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
 
@@ -1378,9 +1404,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                                     // may return `None` for a caller-supplied `IBinder`;
                                     // reject rather than `expect`-panic on the worker loop.
                                     let result = match strong.as_transactable() {
-                                        Some(t) => dispatch_transact_caught(
+                                        Some(t) => dispatch_kernel_observed(
+                                            strong.descriptor(),
                                             t,
-                                            tr_secctx.transaction_data.code,
+                                            &tr_secctx.transaction_data,
                                             &mut reader,
                                             &mut reply,
                                         ),
@@ -1413,9 +1440,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                     } else {
                         match ProcessState::as_self().context_manager() {
                             Some(context) => match context.as_transactable() {
-                                Some(t) => dispatch_transact_caught(
+                                Some(t) => dispatch_kernel_observed(
+                                    context.descriptor(),
                                     t,
-                                    tr_secctx.transaction_data.code,
+                                    &tr_secctx.transaction_data,
                                     &mut reader,
                                     &mut reply,
                                 ),
