@@ -176,6 +176,10 @@ jobs:
         #     and needs /dev/binder plus a live rsb_hub to drive an RPC client
         #     through a gateway to a kernel service, so integration-test.yml
         #     owns it.
+        #   * tests/tests/async_wait.rs, tests/tests/entry_kernel_options.rs —
+        #     `#[ignore]`d for the same reason: the first waits on a live
+        #     service manager, the second needs the process's one kernel
+        #     binder mapping. integration-test.yml owns both.
         # Adding a test target means adding it to one of those lines, or to
         # this list with the reason it cannot run here.
         run: |
@@ -255,7 +259,15 @@ jobs:
           t cargo test -p rsbinder --features rpc --lib parcelable_holder::
           t cargo test -p rsbinder --features rpc --lib permission_controller::
           t cargo test -p rsbinder --features rpc --lib thread_state::tests::rpc_
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
+          # Modules that touch no device at all — a local binder dispatches
+          # in-process — and so belong on a hermetic runner as much as the
+          # RPC ones do. Without a line here their unit tests run nowhere
+          # in this workflow.
+          t cargo test -p rsbinder --features rpc --lib stream::
+          t cargo test -p rsbinder --features rpc --lib cancel::
+          t cargo test -p rsbinder --features rpc --lib transport_caps::
+          t cargo test -p rsbinder --features rpc --lib observe::
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
@@ -273,14 +285,16 @@ jobs:
         # crate is therefore named here: `entry_rpc` (the
         # `serve`/`connect`/`Client` gate), `codegen_shapes`, the async stub
         # adapter, `get_calling_uid` over RPC, the `@EnforcePermission` deny,
-        # and `gateway_rpc` (the re-publish/`Rewrap` gate). `macro_cross`
+        # `gateway_rpc` (the re-publish/`Rewrap` gate), `transport_caps`, and
+        # the RPC halves of cancellation and streaming. `macro_cross`
         # and `data_serde` need `macros` too and are on the next step; the
         # two mesh targets and `gateway_kernel` are integration-test.yml's
         # (see the ledger on `linux-build`'s "Check test builds").
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
-            --test work_source_rpc --test observer_rpc --test transaction_names
+            --test work_source_rpc --test observer_rpc --test transaction_names \
+            --test transport_caps --test cancel_rpc --test stream_rpc
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
           # `aidl_spans` installs a global `tracing` subscriber, so it needs
           # the `tracing` feature on top of `rpc`.
