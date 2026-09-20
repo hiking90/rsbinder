@@ -1912,6 +1912,11 @@ impl WaiterState {
     /// Idempotent, and safe to call when no thread is waiting (the flag stays
     /// set, so a wait that has not reached its blocking point yet also gives
     /// up).
+    ///
+    /// The one caller is the async wrapper's drop guard, which only exists
+    /// with `tokio`; the synchronous `wait_for_service` owns a state nobody
+    /// else can reach and so never cancels.
+    #[cfg(feature = "tokio")]
     pub(crate) fn cancel(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.cancelled = true;

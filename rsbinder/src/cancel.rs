@@ -64,7 +64,12 @@
 //!
 //! Spelling follows AOSP — `canceled` with one `l`, as in
 //! `CancellationSignal.isCanceled()` — everywhere in this module,
-//! including the async [`CancellationToken::canceled`].
+//! including the async
+#![cfg_attr(feature = "tokio", doc = "[`CancellationToken::canceled`].")]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = "`CancellationToken::canceled` (`tokio` feature)."
+)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
