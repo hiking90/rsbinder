@@ -42,6 +42,7 @@ use streamdemo::IStreamDemo::{BnStreamDemo, IStreamDemo};
 struct DemoSvc {
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
+    last_error: Arc<AtomicI32>,
 }
 
 impl Interface for DemoSvc {}
@@ -56,6 +57,7 @@ impl DemoSvc {
         count: i32,
         max_batch_bytes: usize,
         initial_credits: u32,
+        delay: Duration,
         ending: Option<Status>,
     ) -> BinderResult<SIBinder> {
         let (mut producer, source) =
@@ -63,23 +65,31 @@ impl DemoSvc {
         let handle = source.as_binder();
         let sent = self.sent.clone();
         let finished = self.finished.clone();
+        let last_error = self.last_error.clone();
         thread::spawn(move || {
             // Held so the source object outlives the stream even if the
             // consumer is slow to resolve it.
             let _source = source;
             let mut stopped_early = false;
             for item in 0..count {
-                if producer.send(&item).is_err() {
+                if let Err(e) = producer.send(&item) {
+                    last_error.store(i32::from(e), Ordering::SeqCst);
                     stopped_early = true;
                     break;
                 }
                 sent.fetch_add(1, Ordering::SeqCst);
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
             }
             if !stopped_early {
-                let _ = match ending {
+                let ended = match ending {
                     Some(status) => producer.end_with(&status),
                     None => producer.end(),
                 };
+                if let Err(e) = ended {
+                    last_error.store(i32::from(e), Ordering::SeqCst);
+                }
             }
             finished.store(true, Ordering::SeqCst);
         });
@@ -94,12 +104,14 @@ impl IStreamDemo for DemoSvc {
         count: i32,
         max_batch_bytes: i32,
         initial_credits: i32,
+        delay_micros: i32,
     ) -> BinderResult<SIBinder> {
         self.spawn(
             sink,
             count,
             max_batch_bytes as usize,
             initial_credits as u32,
+            Duration::from_micros(delay_micros.max(0) as u64),
             None,
         )
     }
@@ -116,6 +128,7 @@ impl IStreamDemo for DemoSvc {
             count,
             DEFAULT_MAX_BATCH_BYTES,
             DEFAULT_CREDIT_WINDOW,
+            Duration::ZERO,
             Some(Status::new_service_specific_error(
                 code,
                 Some(message.to_string()),
@@ -129,6 +142,10 @@ impl IStreamDemo for DemoSvc {
 
     fn r#finished(&self) -> BinderResult<bool> {
         Ok(self.finished.load(Ordering::SeqCst))
+    }
+
+    fn r#lastError(&self) -> BinderResult<i32> {
+        Ok(self.last_error.load(Ordering::SeqCst))
     }
 }
 
@@ -194,7 +211,7 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     let (mut rx, sink_binder) = Receiver::<i32>::new();
     let source = f
         .demo
-        .r#subscribe(&sink_binder, 1000, 64, DEFAULT_CREDIT_WINDOW as i32)
+        .r#subscribe(&sink_binder, 1000, 64, DEFAULT_CREDIT_WINDOW as i32, 0)
         .expect("subscribe");
     // The source arrives as a proxy with no interface on it — the RPC
     // wire carries an address and no descriptor — so this is also the
@@ -223,7 +240,7 @@ fn a_session_without_callback_connections_refuses_the_stream() {
     let (_rx, sink_binder) = Receiver::<i32>::new();
     let refused = f
         .demo
-        .r#subscribe(&sink_binder, 10, 64, DEFAULT_CREDIT_WINDOW as i32)
+        .r#subscribe(&sink_binder, 10, 64, DEFAULT_CREDIT_WINDOW as i32, 0)
         .expect_err("the service cannot push over this session");
     assert_eq!(
         refused.transaction_error(),
@@ -268,7 +285,7 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
     // credit, so exactly one item may leave before a grant.
     let source = f
         .demo
-        .r#subscribe(&sink_binder, 100, 4, 1)
+        .r#subscribe(&sink_binder, 100, 4, 1, 0)
         .expect("subscribe");
 
     // Deliberately before `attach_source`: nothing can grant credit yet.
@@ -284,6 +301,48 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
     assert_eq!(got, (0..100).collect::<Vec<_>>());
 }
 
+/// A session that ends releases a consumer blocked in `recv`, the way a
+/// dead process does on kernel binder (`run_stream_ac.sh`).
+///
+/// Back-pressure means there is usually no call in flight to fail, so
+/// nothing reports the loss on its own: the death link `attach_source`
+/// puts on the source is what ends the wait.
+#[test]
+fn a_session_that_ends_releases_a_blocked_consumer() {
+    let f = fixture("dead", 1);
+
+    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    // Paced at 5 ms an item with credit to spare, so when the session
+    // goes the consumer is waiting and the producer is not parked.
+    let source = f
+        .demo
+        .r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5_000)
+        .expect("subscribe");
+    rx.attach_source(&source).expect("attach_source");
+    assert!(rx.next().expect("item 0").is_ok());
+
+    f.client.close_session();
+
+    // Bounded rather than `recv`: without the death link this waits for
+    // a batch that cannot come, and a test that hangs reports nothing.
+    let failure = loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            // Batches already queued come out first.
+            Ok(Some(_)) => continue,
+            Ok(None) if rx.is_finished() => {
+                panic!("the stream ended clean, which the producer never did")
+            }
+            Ok(None) => panic!("the lost session left the consumer waiting"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(
+        failure.transaction_error(),
+        rsbinder::StatusCode::DeadObject,
+        "a lost peer is reported as such: {failure:?}"
+    );
+}
+
 /// A consumer that walks away releases the producer instead of leaving
 /// it parked on a credit that will never come.
 #[test]
@@ -293,7 +352,7 @@ fn dropping_the_receiver_stops_the_producer() {
     let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
     let source = f
         .demo
-        .r#subscribe(&sink_binder, 1_000_000, 4, 1)
+        .r#subscribe(&sink_binder, 1_000_000, 4, 1, 0)
         .expect("subscribe");
     rx.attach_source(&source).expect("attach_source");
     assert_eq!(rx.next().expect("item 0").expect("ok"), 0);

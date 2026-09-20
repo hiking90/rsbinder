@@ -27,6 +27,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   so a service-specific failure reaches the consumer with its code and message
   intact even though the method that started the stream already returned.
   Dropping a `Receiver` cancels, releasing a producer waiting for credit.
+  Each end watches the other's binder for death, because back-pressure means
+  there is usually no call in flight to fail: a producer parked for credit and
+  a consumer blocked in `recv` both end with `DeadObject` when the peer's
+  process goes, rather than waiting forever.
   The contract is two ordinary AIDL interfaces shipped in
   `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` and
   `IStreamSource` — so a C++ or Java peer can be either end. `Sink::new`

@@ -67,6 +67,15 @@
 //! [`send`](Sink::send) — see [`crate::to_bytes`], which uses the same
 //! parcel mode.
 //!
+//! **A peer that dies ends the stream.** Back-pressure means that most
+//! of the time neither side has a call in flight to fail on, so each
+//! watches the other's binder instead: the producer's [`Sink::send`]
+//! reports [`StatusCode::DeadObject`] rather than staying parked for
+//! credit, and the consumer's [`Receiver::recv`] yields that same error
+//! rather than waiting for a batch. The consumer's half needs
+//! [`Receiver::attach_source`] — before that it holds no remote handle to
+//! watch.
+//!
 //! **Ordering.** `onBatch` and `onEnd` are both `oneway` to the same
 //! object, and the kernel keeps `oneway` calls to one node in order, so
 //! the terminator cannot overtake the batches. The credit call runs the
@@ -137,12 +146,16 @@ struct CreditState {
     available: u64,
     /// The consumer asked for no more. Latched: a cancel is never undone.
     canceled: bool,
+    /// The consumer's process is gone. Latched, and checked before
+    /// `canceled` because it is the more specific answer.
+    dead: bool,
 }
 
 #[derive(Default)]
 struct Credit {
     state: Mutex<CreditState>,
-    /// Woken by a grant and by a cancel; both release a waiting producer.
+    /// Woken by a grant, a cancel and the consumer's death — each of the
+    /// three releases a waiting producer.
     wake: Condvar,
 }
 
@@ -164,6 +177,11 @@ impl Credit {
         self.wake.notify_all();
     }
 
+    fn mark_dead(&self) {
+        self.lock().dead = true;
+        self.wake.notify_all();
+    }
+
     fn is_canceled(&self) -> bool {
         self.lock().canceled
     }
@@ -171,12 +189,18 @@ impl Credit {
     /// Take one credit, waiting until one is granted.
     ///
     /// This is the back-pressure: a producer ahead of its consumer parks
-    /// here instead of filling the driver's asynchronous space. It
-    /// returns [`StatusCode::InvalidOperation`] once the consumer has
-    /// cancelled, which is the only way out other than a grant.
+    /// here instead of filling the driver's asynchronous space. Three
+    /// things end the wait: a grant, a cancel
+    /// ([`StatusCode::InvalidOperation`]) and the consumer's process
+    /// dying ([`StatusCode::DeadObject`]). Without that last one a
+    /// producer parked here would never learn that its consumer is gone
+    /// — no batch is in flight to fail, and nothing else will arrive.
     fn wait_credit(&self) -> Result<()> {
         let mut state = self.lock();
         loop {
+            if state.dead {
+                return Err(StatusCode::DeadObject);
+            }
             if state.canceled {
                 return Err(StatusCode::InvalidOperation);
             }
@@ -185,6 +209,40 @@ impl Credit {
                 return Ok(());
             }
             state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Watches the consumer's sink so a producer parked on
+/// [`Credit::wait_credit`] learns that nobody is there any more.
+struct SinkDeath(Arc<Credit>);
+
+impl crate::DeathRecipient for SinkDeath {
+    fn binder_died(&self, _who: &crate::WIBinder) {
+        self.0.mark_dead();
+    }
+}
+
+/// Register `recipient` for `binder`'s death, if that is a thing `binder`
+/// can do.
+///
+/// A local object cannot die while the process holding it runs, and its
+/// `link_to_death` says so with an error and a log line, so it is not
+/// asked. The returned `Arc` is what keeps the link alive — the binder
+/// holds only a `Weak`.
+fn watch_death<R>(binder: &SIBinder, recipient: R) -> Option<Arc<dyn crate::DeathRecipient>>
+where
+    R: crate::DeathRecipient + 'static,
+{
+    binder.as_remote()?;
+    let recipient: Arc<dyn crate::DeathRecipient> = Arc::new(recipient);
+    match binder.link_to_death(Arc::downgrade(&recipient)) {
+        Ok(()) => Some(recipient),
+        Err(e) => {
+            // Not fatal: the stream still runs, it just cannot report a
+            // peer that vanishes while nothing is in flight.
+            log::warn!("stream: cannot watch the peer for death: {e:?}");
+            None
         }
     }
 }
@@ -349,6 +407,8 @@ pub struct Sink<T: ?Sized> {
     batch: Parcel,
     count: i32,
     max_batch_bytes: usize,
+    /// Holds the death link on the sink; the binder keeps only a `Weak`.
+    _death: Option<Arc<dyn crate::DeathRecipient>>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -413,12 +473,14 @@ impl<T: Serialize + ?Sized> Sink<T> {
         let credit = Arc::new(Credit::default());
         credit.grant(initial_credits);
         let source_binder = BnStreamSource::new_binder(SourceObject(credit.clone())).as_binder();
+        let death = watch_death(sink, SinkDeath(credit.clone()));
         let sink = Sink {
             peer,
             credit: credit.clone(),
             batch: Parcel::new_data_only(),
             count: 0,
             max_batch_bytes: max_batch_bytes.max(1),
+            _death: death,
             _item: PhantomData,
         };
         Ok((
@@ -731,6 +793,27 @@ impl Stream {
     }
 }
 
+/// Watches the producer's source so a consumer blocked in
+/// [`Receiver::recv`] learns that no batch is coming.
+///
+/// It ends the stream the same way a terminator does, with
+/// [`StatusCode::DeadObject`] as the reason, so every consuming path
+/// reports it without a case of its own.
+struct SourceDeath(Arc<Stream>);
+
+impl crate::DeathRecipient for SourceDeath {
+    fn binder_died(&self, _who: &crate::WIBinder) {
+        {
+            let mut state = self.0.lock();
+            if state.end.is_some() {
+                return;
+            }
+            state.end = Some(Status::from(StatusCode::DeadObject));
+        }
+        self.0.wake();
+    }
+}
+
 /// The binder the consumer hands to the producer.
 struct SinkObject(Arc<Stream>);
 
@@ -804,6 +887,8 @@ pub struct Receiver<T> {
     /// Set once the terminator or a decode failure has been reported, so
     /// the error is yielded once and the stream then reads as finished.
     finished: bool,
+    /// Holds the death link on the source; the binder keeps only a `Weak`.
+    _death: Option<Arc<dyn crate::DeathRecipient>>,
 }
 
 impl<T: Deserialize> Receiver<T> {
@@ -833,6 +918,7 @@ impl<T: Deserialize> Receiver<T> {
             unacked: 0,
             decoded: VecDeque::new(),
             finished: false,
+            _death: None,
         };
         (receiver, sink_binder)
     }
@@ -849,6 +935,12 @@ impl<T: Deserialize> Receiver<T> {
     /// Until this is called the producer runs on its opening window alone
     /// and then stops. Calling it twice replaces the source.
     ///
+    /// This is also where the producer's process starts being watched: if
+    /// it dies the stream ends with [`StatusCode::DeadObject`] instead of
+    /// leaving [`recv`](Self::recv) blocked for a batch that nobody will
+    /// send. A receiver with no source attached has no remote handle to
+    /// watch and so keeps waiting.
+    ///
     /// # Errors
     ///
     /// [`StatusCode::BadType`] when `source` states an interface other
@@ -859,6 +951,7 @@ impl<T: Deserialize> Receiver<T> {
             <BpStreamSource as crate::Proxy>::descriptor(),
             "Receiver::attach_source",
         )?);
+        self._death = watch_death(source, SourceDeath(self.stream.clone()));
         Ok(())
     }
 
@@ -1112,8 +1205,6 @@ impl<T: Deserialize> Receiver<T> {
             );
             return Err(StatusCode::BadValue);
         }
-        self.unacked += 1;
-        self.replenish();
         Ok(())
     }
 
@@ -1224,6 +1315,7 @@ impl Peer<dyn IStreamSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
 
@@ -1302,6 +1394,59 @@ mod tests {
 
         let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
         assert_eq!(got, vec![0, 1, 2, 3]);
+        producer.join().expect("producer thread");
+    }
+
+    /// The window is what the producer may have in flight, not twice it.
+    ///
+    /// The tests above only show that the producer stops somewhere, which
+    /// a window of any size satisfies. This one counts: one batch drained
+    /// buys exactly one batch more.
+    #[test]
+    fn draining_a_batch_buys_exactly_one_batch_more() {
+        // A window of two puts the grant threshold at one batch, so every
+        // drained batch is paid back at once; four bytes to a batch makes
+        // a batch and an `i32` the same thing.
+        let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(2);
+        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
+        rx.attach_source(&source.as_binder())
+            .expect("attach_source");
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = sent.clone();
+        let producer = thread::spawn(move || {
+            for item in 0..1000i32 {
+                if sink.send(&item).is_err() {
+                    return;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        const DRAINED: usize = 3;
+        for expected in 0..DRAINED as i32 {
+            assert_eq!(rx.next().expect("an item").expect("item"), expected);
+        }
+        let allowed = 1 + DRAINED;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.load(Ordering::SeqCst) < allowed {
+            assert!(
+                Instant::now() < deadline,
+                "the producer has credit for {allowed} batches and has sent {}",
+                sent.load(Ordering::SeqCst)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Long enough for a surplus grant to have been spent.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            allowed,
+            "the opening credit plus one per drained batch is the whole budget"
+        );
+
+        rx.cancel().expect("cancel");
         producer.join().expect("producer thread");
     }
 

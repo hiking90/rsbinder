@@ -16,8 +16,12 @@ package streamdemo;
 interface IStreamDemo {
     // Stream `count` integers, starting at 0, into `sink`. Batches hold
     // at most `maxBatchBytes`, and the producer opens with
-    // `initialCredits` of them. Returns the source to grant credit on.
-    IBinder subscribe(IBinder sink, int count, int maxBatchBytes, int initialCredits);
+    // `initialCredits` of them. `delayMicros` paces the producer, which
+    // is how a test decides whether a consumer that dies finds it holding
+    // credit or parked waiting for some. Returns the source to grant
+    // credit on.
+    IBinder subscribe(IBinder sink, int count, int maxBatchBytes, int initialCredits,
+                      int delayMicros);
 
     // Stream `count` integers and then end with a service-specific
     // failure carrying `code` and `message`.
@@ -30,4 +34,10 @@ interface IStreamDemo {
     // neither finished the stream nor was cancelled is still parked on
     // credit, so this is what tells a released producer from a stuck one.
     boolean finished();
+
+    // The `StatusCode` the last `send` or `end` failed with, as its
+    // integer value, or 0 while nothing has failed. A consumer that dies
+    // mid-stream is only visible to the producer this way, and only on
+    // kernel binder — which is why `run_stream_ac.sh` exists.
+    int lastError();
 }

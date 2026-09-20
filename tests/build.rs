@@ -164,6 +164,16 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 10-7: a service that streams into a caller-supplied sink. Both
+    // halves of the same fixture use it — `tests/stream_rpc.rs` over a
+    // session, and `src/bin/stream_probe.rs` over kernel binder — so it is
+    // generated unconditionally rather than behind `rpc`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))
+        .output(PathBuf::from("stream_demo.rs"))
+        .generate()
+        .unwrap();
+
     // Test-only fixture for the generated-stub RPC e2e
     // (`tests/rpc_generated_stub.rs`). This integration-test crate —
     // not the production `rsbinder` crate — is the home for codegen
@@ -212,16 +222,6 @@ fn main() {
         rsbinder_aidl::Builder::new()
             .source(PathBuf::from("aidl/canceldemo/ICancelDemo.aidl"))
             .output(PathBuf::from("cancel_demo.rs"))
-            .generate()
-            .unwrap();
-
-        // Plan 10-7: a service that streams into a caller-supplied sink,
-        // for `tests/stream_rpc.rs`. That test is the wire half of
-        // `rsbinder::stream` — its unit tests keep both ends in one
-        // process, where no parcel is ever built.
-        rsbinder_aidl::Builder::new()
-            .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))
-            .output(PathBuf::from("stream_demo.rs"))
             .generate()
             .unwrap();
 
