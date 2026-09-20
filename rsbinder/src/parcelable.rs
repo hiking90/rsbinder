@@ -497,11 +497,18 @@ impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         // RPC mode: marshal as `RpcAddress` via the attached session
         // hooks, not `flat_binder_object`. Kernel path below is
-        // byte-identical on a driver-backed parcel.
-        #[cfg(feature = "rpc")]
+        // byte-identical on a driver-backed parcel. With no hooks —
+        // the session-less data-only mode behind `to_bytes` — there is
+        // nowhere for the binder to go, and the refusal has to come
+        // before `binder.into()` below, which reaches
+        // `ProcessState::as_self()` and panics where the driver was
+        // never opened.
         if !parcel.is_kernel_backed() {
-            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
-            return ops.write_binder(this, parcel);
+            #[cfg(feature = "rpc")]
+            if let Some(ops) = parcel.rpc_ops() {
+                return ops.write_binder(this, parcel);
+            }
+            return Err(StatusCode::BadType);
         }
 
         match this {
@@ -563,11 +570,15 @@ impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         // RPC mode: unmarshal from `RpcAddress` via the attached
         // session hooks. The kernel `flat_binder_object`
-        // path below is byte-identical on a driver-backed parcel.
-        #[cfg(feature = "rpc")]
+        // path below is byte-identical on a driver-backed parcel. With
+        // no hooks, bytes claiming a binder decode to nothing: the
+        // session-less mode has no table that could make them one.
         if !parcel.is_kernel_backed() {
-            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
-            return ops.read_binder(parcel);
+            #[cfg(feature = "rpc")]
+            if let Some(ops) = parcel.rpc_ops() {
+                return ops.read_binder(parcel);
+            }
+            return Err(StatusCode::BadType);
         }
 
         let flat: flat_binder_object = parcel.read()?;

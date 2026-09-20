@@ -347,9 +347,9 @@ impl Parcelable for ParcelableHolder {
         // null-cookie object without consulting the offset table, so
         // `BINDER_TYPE_HANDLE` with handle 0 would become a live proxy.
         let mut new_parcel = Parcel::new();
-        #[cfg(feature = "rpc")]
         if !parcel.is_kernel_backed() {
             new_parcel.set_for_rpc(true);
+            #[cfg(feature = "rpc")]
             if let Some(ops) = parcel.rpc_ops() {
                 new_parcel.attach_rpc_ops(ops);
             }
@@ -455,7 +455,6 @@ mod tests {
     /// `ProcessState::as_self()` in a process that never initialized the
     /// driver). Both outcomes contradict what `from_bytes` promises
     /// about bytes you did not write.
-    #[cfg(feature = "rpc")]
     #[test]
     fn a_forged_object_inside_a_holder_never_becomes_a_binder() {
         #[derive(Debug, Default)]
@@ -512,7 +511,6 @@ mod tests {
     /// no offset-table entry, so one kernel round trip would turn file
     /// bytes into a proxy for the context manager. `append_from` refuses
     /// the copy instead; a same-mode sink still accepts the holder.
-    #[cfg(feature = "rpc")]
     #[test]
     fn a_data_only_holder_is_refused_by_a_kernel_parcel() {
         let mut payload = Parcel::new_data_only();

@@ -53,7 +53,7 @@ required-features = ["rpc", "macros"]
 [[test]]
 name = "data_serde"
 path = "tests/data_serde.rs"
-required-features = ["rpc", "macros"]
+required-features = ["macros"]
 
 [[test]]
 name = "work_source_rpc"

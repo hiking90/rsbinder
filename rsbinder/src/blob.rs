@@ -449,7 +449,6 @@ mod tests {
     /// payload inline whatever its size — AOSP's `!mAllowFds` branch —
     /// and the data-only parcel behind `to_bytes` is exactly such a
     /// parcel, so a blob survives a round trip through plain bytes.
-    #[cfg(feature = "rpc")]
     #[test]
     fn a_parcel_that_cannot_carry_an_fd_writes_the_payload_inline() {
         let data = pattern(1024 * 1024);

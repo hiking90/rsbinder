@@ -4332,6 +4332,7 @@ pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) 
 pub async fn rsbinder::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::death_signal(&rsbinder::SIBinder) -> core::result::Result<rsbinder::DeathSignal, rsbinder::StatusCode>
+pub fn rsbinder::from_bytes<T: rsbinder::Deserialize>(&[u8]) -> rsbinder::Result<T>
 pub fn rsbinder::get_calling_pid() -> std::os::raw::c_int
 pub fn rsbinder::get_calling_sid() -> core::option::Option<alloc::ffi::c_str::CString>
 pub fn rsbinder::get_calling_uid() -> std::os::raw::c_uint
@@ -4349,6 +4350,7 @@ pub fn rsbinder::serve(&str) -> rsbinder::Result<rsbinder::Server>
 pub fn rsbinder::set_calling_work_source_uid(std::os::raw::c_uint) -> i64
 pub fn rsbinder::set_strict_mode_policy(i32)
 pub fn rsbinder::should_propagate_work_source() -> bool
+pub fn rsbinder::to_bytes<T: rsbinder::Serialize + ?core::marker::Sized>(&T) -> rsbinder::Result<alloc::vec::Vec<u8>>
 pub async fn rsbinder::wait_for_interface_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> core::result::Result<rsbinder::Strong<T>, rsbinder::StatusCode>
 pub type rsbinder::BinderResult<T> = core::result::Result<T, rsbinder::Status>
 pub type rsbinder::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>

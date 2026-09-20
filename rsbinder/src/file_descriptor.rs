@@ -205,7 +205,11 @@ impl Eq for ParcelFileDescriptor {}
 
 /// Which RPC fd body a parcel carries. The single place the
 /// `FileDescriptorTransportMode` policy is decided for fd writes/reads.
-#[cfg(feature = "rpc")]
+///
+/// Without `rpc` no parcel can carry one — `rpc_fd_profile` answers
+/// `Ok(None)` or `Err(FdsNotAllowed)` there — so the variants are
+/// constructed only under that feature.
+#[cfg_attr(not(feature = "rpc"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RpcFdProfile {
     /// R34 / v0: rsbinder-only bare ancillary index (AOSP
@@ -217,19 +221,25 @@ enum RpcFdProfile {
 }
 
 /// `Ok(None)` ⇒ kernel-marshalled (fd crosses as `BINDER_TYPE_FD`);
-/// `Err(FdsNotAllowed)` ⇒ RPC parcel whose fd mode forbids fds
-/// (AOSP `Parcel::writeFileDescriptor`, android-16.0.0_r4).
-#[cfg(feature = "rpc")]
+/// `Err(FdsNotAllowed)` ⇒ a parcel whose fd mode forbids fds — an RPC
+/// session that negotiated none, or the session-less data-only mode,
+/// which negotiated nothing (AOSP `Parcel::writeFileDescriptor`,
+/// android-16.0.0_r4).
 fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
-    use crate::rpc::FileDescriptorTransportMode as M;
     if parcel.is_kernel_backed() {
         return Ok(None);
     }
-    match parcel.rpc_fd_mode() {
-        M::None => Err(StatusCode::FdsNotAllowed),
-        M::Unix if parcel.rpc_record_fd_positions() => Ok(Some(RpcFdProfile::V1Plus)),
-        M::Unix => Ok(Some(RpcFdProfile::V0)),
+    #[cfg(feature = "rpc")]
+    {
+        use crate::rpc::FileDescriptorTransportMode as M;
+        match parcel.rpc_fd_mode() {
+            M::None => Err(StatusCode::FdsNotAllowed),
+            M::Unix if parcel.rpc_record_fd_positions() => Ok(Some(RpcFdProfile::V1Plus)),
+            M::Unix => Ok(Some(RpcFdProfile::V0)),
+        }
     }
+    #[cfg(not(feature = "rpc"))]
+    Err(StatusCode::FdsNotAllowed)
 }
 
 /// AOSP `Parcel::writeFileDescriptor` equivalent: the **bare** fd object
@@ -250,10 +260,7 @@ pub(crate) fn write_raw_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()
 /// anything — a dup failure (`EMFILE`) or a rejected fd mode then
 /// leaves the parcel untouched.
 fn dup_for_parcel(parcel: &Parcel, fd: BorrowedFd<'_>) -> Result<OwnedFd> {
-    #[cfg(feature = "rpc")]
     rpc_fd_profile(parcel)?;
-    #[cfg(not(feature = "rpc"))]
-    let _ = parcel;
     Ok(rustix::io::fcntl_dupfd_cloexec(fd, 0)?)
 }
 
@@ -297,8 +304,13 @@ fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
 /// itself, **consumed** (a second read of the same position is
 /// `BadValue`).
 pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
+    // Decides the body shape, and refuses a parcel whose fd mode
+    // forbids fds before any of it is read.
+    let profile = rpc_fd_profile(parcel)?;
+    #[cfg(not(feature = "rpc"))]
+    let _ = profile;
     #[cfg(feature = "rpc")]
-    if let Some(profile) = rpc_fd_profile(parcel)? {
+    if let Some(profile) = profile {
         if profile == RpcFdProfile::V1Plus {
             // AOSP readFileDescriptor: object-position miss ⇒ BAD_TYPE
             // for v1 and v2 alike (plan/2-11).
@@ -383,8 +395,11 @@ impl DeserializeOption for ParcelFileDescriptor {
             return Err(StatusCode::UnexpectedNull);
         }
 
+        let profile = rpc_fd_profile(parcel)?;
+        #[cfg(not(feature = "rpc"))]
+        let _ = profile;
         #[cfg(feature = "rpc")]
-        if let Some(profile) = rpc_fd_profile(parcel)? {
+        if let Some(profile) = profile {
             if profile == RpcFdProfile::V1Plus {
                 // rsbinder has no comm channel: a non-zero hasComm is
                 // BadValue (real libbinder always writes 0 here).

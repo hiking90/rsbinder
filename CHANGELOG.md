@@ -94,6 +94,21 @@ This changelog starts at 0.9.0. For earlier releases, see the
   founding connection's `supports_fd_passing()`, instead of failing on the
   first fd sent.
 
+### Changed
+
+- **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Storing a
+  value was never a transport concern: the encoder runs in the session-less
+  parcel mode, and it is the *absence* of a session that refuses a binder
+  (`BadType`) and a file descriptor (`FdsNotAllowed`). Those refusals now
+  compile into a build without `rpc` as well, where the same writes previously
+  reached the kernel arm — a binder went out as a `flat_binder_object` (or
+  panicked in a process that never opened the driver) and an fd was dup'd and
+  marshalled as `BINDER_TYPE_FD`. Reading is refused the same way, so a forged
+  object in stored bytes cannot become a proxy. `Parcel::allow_fds` answers
+  `false` on such a parcel in every feature configuration, which is what makes
+  `write_blob` store its payload inline there. Nothing about the wire changes,
+  and no signature changes; a build with `rpc` behaves as before.
+
 ### Deprecated
 
 - **`rpc::RpcUnixClientConfig`** → `RpcClientConfig::unix` / `unix_abstract`.

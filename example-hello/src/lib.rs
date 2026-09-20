@@ -70,7 +70,6 @@ pub mod shm {
 /// a file with [`rsbinder::to_bytes`] instead of into a transaction. Carries
 /// two versions of one record so the example can show what a reader built
 /// against the other version sees.
-#[cfg(feature = "rpc")]
 pub mod settings {
     rsbinder::include_aidl!("settings", self::settings::*);
     /// File `serde_demo` writes and reads back.

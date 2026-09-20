@@ -9,7 +9,7 @@
 //! against a *different* version of its definition. That comes from the
 //! length header a parcelable writes, not from anything in `to_bytes`.
 
-#![cfg(all(feature = "rpc", feature = "macros"))]
+#![cfg(feature = "macros")]
 
 use rsbinder::{from_bytes, to_bytes, BinderEnum, Parcelable};
 

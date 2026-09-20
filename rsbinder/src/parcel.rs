@@ -228,8 +228,8 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(Vec::with_capacity(capacity))
     }
 
-    // Only the RPC stack adopts a ready-made byte buffer as a parcel.
-    #[cfg(feature = "rpc")]
+    // Adopting a ready-made byte buffer as a parcel: the RPC stack, and
+    // `from_bytes` decoding a stored value.
     fn from_vec(data: Vec<T>) -> Self {
         ParcelData::Vec(data)
     }
@@ -368,34 +368,44 @@ pub(crate) trait RpcParcelOps: Send + Sync {
     fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<crate::binder::SIBinder>>;
 }
 
-/// All RPC-mode serialization state for a [`Parcel`], bundled into one
-/// struct (AOSP `Parcel.h`'s `RpcFields`, the RPC arm of its
+/// All non-kernel serialization state for a [`Parcel`], bundled into
+/// one struct (AOSP `Parcel.h`'s `RpcFields`, the RPC arm of its
 /// `std::variant<KernelFields, RpcFields> mVariantFields`). Unlike
 /// AOSP we need no `KernelFields`: rsbinder keeps the kernel offset
 /// table in [`Parcel::objects`], a wholly separate field, so only the
 /// RPC arm has to be bundled.
 ///
-/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ RPC mode,
-/// `None` ⇒ kernel path ([`Parcel::is_kernel_backed`]),
-/// byte-identical to the kernel wire. Tying every RPC field's
-/// existence to the mode flag in the type makes "RPC mode ⇒ RPC state
-/// present" an invariant the compiler enforces, instead of seven
-/// independently-defaulted fields gated on a separate bool.
-#[cfg(feature = "rpc")]
+/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ the
+/// session-less RPC mode, `None` ⇒ kernel path
+/// ([`Parcel::is_kernel_backed`]), byte-identical to the kernel wire.
+/// Tying every RPC field's existence to the mode flag in the type
+/// makes "RPC mode ⇒ RPC state present" an invariant the compiler
+/// enforces, instead of seven independently-defaulted fields gated on
+/// a separate bool.
+///
+/// Every field is behind `rpc`, the struct is not: without the
+/// feature it is empty and `Some(RpcFields::default())` is exactly
+/// what [`Parcel::new_data_only`] needs — a parcel that has no session
+/// to marshal a binder or an fd through. `rpc` adds the state a
+/// session fills in.
 #[derive(Default)]
 struct RpcFields {
     /// Object-marshalling hooks for RPC mode (android `mSession`
     /// equivalent). `Some` only on an RPC-mode parcel that will carry
     /// binders.
+    #[cfg(feature = "rpc")]
     ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
     /// Negotiated FD-over-RPC mode. Default `None` ⇒ FD writes are
     /// rejected, bit-identical to a parcel that carries no FDs.
+    #[cfg(feature = "rpc")]
     fd_mode: crate::rpc::FileDescriptorTransportMode,
     /// FDs collected while serializing this (outgoing) RPC parcel in
     /// `Unix` fd-mode — sent out-of-band via `SCM_RIGHTS`.
+    #[cfg(feature = "rpc")]
     fds_out: Vec<std::os::fd::OwnedFd>,
     /// FDs received out-of-band with this (incoming) RPC parcel,
     /// indexed by the in-body fd-table index.
+    #[cfg(feature = "rpc")]
     fds_in: Vec<Option<std::os::fd::OwnedFd>>,
     /// AOSP `RpcFields::mObjectPositions` — sorted byte offsets of
     /// flattened RPC objects (binder at android-16 v2, FD at v1+),
@@ -404,6 +414,7 @@ struct RpcFields {
     /// `u32[]` object table. The kernel path never touches it (kernel
     /// objects live in [`Parcel::objects`]); empty ⇒ byte-identical to
     /// a wire with no object table.
+    #[cfg(feature = "rpc")]
     object_positions: Vec<u32>,
     /// Whether an FD flattened into this parcel records its position
     /// in `object_positions`. The session sets this from its wire
@@ -411,6 +422,7 @@ struct RpcFields {
     /// v1+ profile (R34 has no object table). Binder positions are
     /// recorded by the session directly (it owns the profile); only
     /// the FD path needs this Parcel-side flag.
+    #[cfg(feature = "rpc")]
     record_fd_positions: bool,
     /// Session addresses of local binders that bumped their `timesSent`
     /// (`RpcState::on_binder_leaving`) while being flattened into this
@@ -418,10 +430,12 @@ struct RpcFields {
     /// (`cancel_binder_leaving`) so the unreceived binder's node does not leak.
     /// Write-only on the success path (the peer's DEC balances the bumps), so
     /// the wire is byte-unchanged.
+    #[cfg(feature = "rpc")]
     leaving_addrs: Vec<crate::rpc::RpcAddress>,
     /// Remote proxies flattened into this outgoing parcel, held until the
     /// parcel is dropped so their `DEC_STRONG` cannot overtake the send
     /// that names them (AOSP keeps argument refs until the reply is out).
+    #[cfg(feature = "rpc")]
     pinned: Vec<crate::binder::SIBinder>,
 }
 
@@ -528,7 +542,6 @@ pub struct Parcel {
     /// [`Parcel::is_kernel_backed`] reports). Only object marshalling and the
     /// object/FD lifetime branch on this; scalar/string/POD paths are
     /// unaffected. See [`RpcFields`].
-    #[cfg(feature = "rpc")]
     rpc: Option<RpcFields>,
 }
 
@@ -556,7 +569,6 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
-            #[cfg(feature = "rpc")]
             rpc: None,
         }
     }
@@ -588,12 +600,10 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: Some(free_buffer),
-            #[cfg(feature = "rpc")]
             rpc: None,
         }
     }
 
-    #[cfg(feature = "rpc")]
     pub(crate) fn from_vec(data: Vec<u8>) -> Self {
         Parcel {
             data: ParcelData::from_vec(data),
@@ -607,7 +617,6 @@ impl Parcel {
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
-            #[cfg(feature = "rpc")]
             rpc: None,
         }
     }
@@ -623,7 +632,10 @@ impl Parcel {
     /// wholesale — carries its own write-time refusal for them. All of
     /// them refuse before anything is written, which is why there is no
     /// second check on the finished bytes to keep in step with them.
-    #[cfg(feature = "rpc")]
+    ///
+    /// Available without the `rpc` feature: the mode is the absence of a
+    /// session, and the refusals follow from that absence rather than
+    /// from anything the RPC transport contributes.
     pub(crate) fn new_data_only() -> Self {
         let mut p = Parcel::new();
         p.set_for_rpc(true);
@@ -635,7 +647,6 @@ impl Parcel {
     /// Data-only matters on the read side too: it makes `read_object` an
     /// immediate `BadType`, so a forged `flat_binder_object` in the input
     /// cannot become a binder.
-    #[cfg(feature = "rpc")]
     pub(crate) fn from_slice(bytes: &[u8]) -> Self {
         let mut p = Parcel::from_vec(bytes.to_vec());
         p.set_for_rpc(true);
@@ -651,17 +662,20 @@ impl Parcel {
     /// construction on an RPC parcel, so a check of that alone would hand
     /// out the bytes of a parcel carrying binders — bytes that are
     /// meaningless without the object table that travelled beside them.
-    #[cfg(feature = "rpc")]
     pub(crate) fn is_self_contained(&self) -> bool {
-        self.objects.len() == 0
-            && self.rpc_object_positions().is_empty()
-            && self.rpc_out_fds().is_empty()
+        if self.objects.len() != 0 {
+            return false;
+        }
+        #[cfg(feature = "rpc")]
+        if !self.rpc_object_positions().is_empty() || !self.rpc_out_fds().is_empty() {
+            return false;
+        }
+        true
     }
 
     /// The encoded bytes, or `Err(BadType)` if the parcel carries a
     /// process-local reference ([`Parcel::is_self_contained`]). Cannot
     /// fail on a parcel from [`Parcel::new_data_only`].
-    #[cfg(feature = "rpc")]
     pub(crate) fn as_bytes(&self) -> Result<&[u8]> {
         if !self.is_self_contained() {
             return Err(StatusCode::BadType);
@@ -670,7 +684,6 @@ impl Parcel {
     }
 
     /// [`Parcel::as_bytes`], taking ownership.
-    #[cfg(feature = "rpc")]
     pub(crate) fn into_bytes(self) -> Result<Vec<u8>> {
         self.as_bytes().map(<[u8]>::to_vec)
     }
@@ -700,7 +713,6 @@ impl Parcel {
     /// modes. Default is kernel mode; only object
     /// marshalling and the object/FD lifetime branch on this — scalar,
     /// string and POD bytes are identical in both modes.
-    #[cfg(feature = "rpc")]
     pub(crate) fn set_for_rpc(&mut self, yes: bool) {
         if yes {
             // Idempotent: preserve any RpcFields already configured
@@ -736,18 +748,8 @@ impl Parcel {
     /// contents. A security branch needs the second question too, and
     /// must ask it separately with [`crate::is_handling_transaction`] —
     /// see [`crate::permission_controller::check_permission`].
-    #[cfg(feature = "rpc")]
     pub fn is_kernel_backed(&self) -> bool {
         self.rpc.is_none()
-    }
-
-    /// `true` always — without the `rpc` feature the kernel driver is
-    /// the only thing that can back a parcel. This `cfg`-off arm exists
-    /// so callers that branch on it compile in any feature
-    /// configuration without a `cfg` of their own.
-    #[cfg(not(feature = "rpc"))]
-    pub fn is_kernel_backed(&self) -> bool {
-        true
     }
 
     /// Whether a file descriptor written to this parcel can travel —
@@ -773,17 +775,18 @@ impl Parcel {
     /// `false` still fails with
     /// [`StatusCode::FdsNotAllowed`](crate::StatusCode::FdsNotAllowed)
     /// at the one place that enforces it.
-    #[cfg(feature = "rpc")]
     pub fn allow_fds(&self) -> bool {
-        self.is_kernel_backed()
-            || self.rpc_fd_mode() == crate::rpc::FileDescriptorTransportMode::Unix
-    }
-
-    /// `true` always — see the `rpc` arm. Without that feature every
-    /// parcel is kernel-marshalled, and the kernel carries fds.
-    #[cfg(not(feature = "rpc"))]
-    pub fn allow_fds(&self) -> bool {
-        true
+        if self.is_kernel_backed() {
+            return true;
+        }
+        #[cfg(feature = "rpc")]
+        {
+            self.rpc_fd_mode() == crate::rpc::FileDescriptorTransportMode::Unix
+        }
+        // Without `rpc` the only non-kernel parcel is the session-less
+        // data-only one, which has no session to carry an fd over.
+        #[cfg(not(feature = "rpc"))]
+        false
     }
 
     /// `true` if this parcel serializes binders/FDs the RPC way.
@@ -1046,7 +1049,6 @@ impl Parcel {
     pub(crate) fn close_file_descriptors(&self) {
         // RPC-mode parcels never carry kernel FD objects (FD over RPC
         // is rejected by default / opt-in via Unix mode); nothing to close here.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             return;
         }
@@ -1210,7 +1212,6 @@ impl Parcel {
         // RPC-mode parcel (RPC carries `RpcAddress`, not
         // `flat_binder_object`). Reaching here in RPC mode is a
         // protocol error, not a silent mis-read.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             return Err(StatusCode::BadType);
         }
@@ -1756,7 +1757,6 @@ impl Parcel {
         // table or take a kernel `acquire()` — RPC has its own
         // refcount. The kernel path below is byte-identical on a
         // kernel-backed parcel.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             self.write_aligned(obj)?;
             return Ok(());
@@ -1872,7 +1872,6 @@ impl Parcel {
         // The opposite direction needs no gate: `read_object` is an immediate
         // `BadType` on an RPC-mode parcel, so nothing there can be laundered
         // into an object.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_none() && other.rpc.is_some() {
             log::error!("Parcel::append_from: refusing RPC/data-only bytes into a kernel parcel");
             return Err(StatusCode::BadType);
@@ -1921,7 +1920,6 @@ impl Parcel {
         // nothing left to mark it as an object. After the copy that is
         // indistinguishable from data, which is why this is a write-time
         // refusal and not a check on the finished bytes.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_some() && num_objects > 0 {
             let src_data = other.data.as_slice();
             let src_objects = other.objects.as_slice();
@@ -1975,10 +1973,7 @@ impl Parcel {
 
         // Kernel-only: in RPC mode `num_objects > 0` already returned above,
         // so this arm is only reached with nothing to relocate.
-        #[cfg(feature = "rpc")]
         let skip_objects = self.rpc.is_some();
-        #[cfg(not(feature = "rpc"))]
-        let skip_objects = false;
 
         if num_objects > 0 && !skip_objects {
             self.objects.reserve(num_objects as usize);
@@ -2029,7 +2024,6 @@ impl Parcel {
         // `decref_publish` — RPC objects have a different
         // (DecStrong-based) lifetime. `self.objects` is empty in RPC
         // mode anyway; this is defence-in-depth + intent.
-        #[cfg(feature = "rpc")]
         if self.rpc.is_some() {
             return;
         }
@@ -2158,7 +2152,6 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 /// value they came from does not read back on any host: decoding the
 /// payload returns `BadType`, since the decoder has no session to marshal
 /// a binder through.
-#[cfg(feature = "rpc")]
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut parcel = Parcel::new_data_only();
     parcel.write(value)?;
@@ -2181,7 +2174,6 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 /// - `FdsNotAllowed` — the input claims to contain a file descriptor.
 ///   The decoder has no session and therefore no negotiated fd mode,
 ///   which is the condition AOSP answers this way.
-#[cfg(feature = "rpc")]
 pub fn from_bytes<T: Deserialize>(bytes: &[u8]) -> Result<T> {
     // Parcel offsets are `i32`; past that the read path asserts.
     if bytes.len() >= i32::MAX as usize {
@@ -3153,7 +3145,11 @@ mod wire_golden {
 /// `to_bytes` / `from_bytes`: the promise is that the bytes are
 /// self-contained, so every test here is about something that would
 /// break that.
-#[cfg(all(test, feature = "rpc"))]
+///
+/// The module is not behind `rpc`: the refusals it pins are what a
+/// build without that feature relies on too, and there the kernel
+/// arms they guard are the only ones compiled in.
+#[cfg(test)]
 mod data_serde {
     use super::*;
 
@@ -3267,6 +3263,9 @@ mod data_serde {
         );
     }
 
+    // An object position is RPC state; without the feature a data-only
+    // parcel has no way to acquire one.
+    #[cfg(feature = "rpc")]
     #[test]
     fn a_parcel_holding_a_reference_refuses_to_hand_out_its_bytes() {
         // `objects` is always empty in RPC mode, so a guard that only
@@ -3311,6 +3310,8 @@ mod data_serde {
         }
     }
 
+    // Needs a session's marshalling hooks, which only `rpc` supplies.
+    #[cfg(feature = "rpc")]
     #[test]
     fn a_holder_cut_from_a_session_parcel_cannot_be_exported() {
         // The RPC binder encoding lives in the *body* (`[1i32][address]`),

@@ -77,9 +77,9 @@ tweaks; wire formats are already locked.
   `MappedHeap`, `MemoryDealer`, `HeapCache`, and the `IMemory` / `IMemoryHeap`
   wire (handwritten AOSP wire, not AIDL). STAGE3-gated against real
   `libbinder` in both directions.
-- **Data serialization (new in 0.11.0)** — `to_bytes` / `from_bytes` (`rpc`
-  feature). The bytes are the IPC bytes, so only the two signatures may still
-  change. See [Storing Values](./data-serialization.md).
+- **Data serialization (new in 0.11.0)** — `to_bytes` / `from_bytes`, no
+  feature required since 0.13.0. The bytes are the IPC bytes, so only the two
+  signatures may still change. See [Storing Values](./data-serialization.md).
 - **Cross-stack bridging (new in 0.11.0)** — `impl Interface for Strong<I>`
   (a proxy publishes as a local service, so a gateway is one line) and
   `bridge::Rewrap`. See

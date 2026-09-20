@@ -61,13 +61,12 @@
 //! # Data serialization
 //!
 //! An AIDL interface is already a schema, and the code generated from it
-//! is already a complete serializer. `to_bytes` and `from_bytes` (with
-//! the `rpc` feature) let you use it for storage rather than only for a
-//! transaction:
+//! is already a complete serializer. `to_bytes` and `from_bytes` let you
+//! use it for storage rather than only for a transaction:
 //!
 //! ```no_run
 //! # fn main() {}
-//! # #[cfg(all(feature = "rpc", feature = "macros"))]
+//! # #[cfg(feature = "macros")]
 //! # mod example {
 //! # #[derive(rsbinder::Parcelable, Default, Debug, Clone)]
 //! # struct Settings { volume: i32, name: String }
@@ -416,10 +415,9 @@ pub use thread_state::{
 
 pub use parcel::Parcel;
 // Value ↔ bytes, for storing what an interface already knows how to
-// describe. Behind `rpc` because the encoder runs in the session-less
-// RPC parcel mode — that mode is what refuses binders and fds — and not
-// because anything here talks to a socket.
-#[cfg(feature = "rpc")]
+// describe. The encoder runs in the session-less parcel mode — the
+// absence of a session is what refuses binders and fds — so this needs
+// no feature: nothing here talks to a socket.
 pub use parcel::{from_bytes, to_bytes};
 
 // From `parcelable` — (de)serialization trait stack.

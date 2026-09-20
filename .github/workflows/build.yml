@@ -359,9 +359,17 @@ jobs:
         # matches nothing, so a renamed or newly `cfg`-gated `mod tests`
         # would empty these lines silently and the job would stay green
         # with no big-endian signal at all.
+        #
+        # The `blob` line is x86_64-only: it is the one test that pins
+        # `allow_fds() == false` on a data-only parcel, which is what
+        # makes `write_blob` store its payload inline there, and it
+        # exercises a memfd on the shared-memory side that qemu-user
+        # does not implement.
         run: |
           cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/control_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_parcel.out
+          cargo test -p rsbinder --no-default-features --lib blob:: 2>&1 | tee /tmp/control_blob.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_blob.out
       - name: Install cross
         run: cargo install cross --locked
       - name: Confirm the binary really is big-endian
@@ -382,11 +390,13 @@ jobs:
         # which qemu-user does not implement. They are endianness-blind
         # and covered by every other job.
         #
-        # The fd-over-RPC body goldens and `parcel::data_serde` are
-        # `#[cfg(feature = "rpc")]`, so the `--no-default-features` run
-        # cannot see them even though they too assert literal LE bytes.
-        # The feature set matches the AC-7.2 step below so the build is
-        # shared rather than a third cross compile.
+        # The fd-over-RPC body goldens are `#[cfg(feature = "rpc")]`, so
+        # the `--no-default-features` run cannot see them even though
+        # they too assert literal LE bytes. The feature set matches the
+        # AC-7.2 step below so the build is shared rather than a third
+        # cross compile. (`parcel::data_serde` needs no feature and so
+        # runs in the first line, where its stored bytes are asserted
+        # against the same goldens on a big-endian host.)
         run: |
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/be_parcel.out
