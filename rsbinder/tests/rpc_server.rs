@@ -15,7 +15,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcProxy, RpcServer, RpcSession, RpcUnixClientConfig};
+use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcSession};
 use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
     FIRST_CALL_TRANSACTION,
@@ -399,8 +399,11 @@ fn real_process_e2e_and_negotiation() {
 
     {
         let client = RpcSession::setup_unix_client(&path).expect("connect");
+        let r34bad = tmp_sock("r34bad");
         assert!(matches!(
-            client.add_outgoing_connection_android13plus(tmp_sock("r34bad"), 1, &[0u8; 32]),
+            client.add_outgoing_connection_with_config(
+                RpcClientConfig::unix(&r34bad, 1).session_id(&[0u8; 32])
+            ),
             Err(StatusCode::BadType)
         ));
         // Explicit negotiation, local=8, server advertises 2.
@@ -465,8 +468,8 @@ fn real_process_abstract_unix_socket_e2e() {
 
     let client = 'connect: {
         for _ in 0..400 {
-            if let Ok(c) = RpcSession::setup_unix_client_android13plus_with_config(
-                RpcUnixClientConfig::abstract_name(name.as_bytes(), 2),
+            if let Ok(c) = RpcSession::setup_client_android13plus_with_config(
+                RpcClientConfig::unix_abstract(name.as_bytes(), 2),
             ) {
                 break 'connect c;
             }
@@ -478,16 +481,16 @@ fn real_process_abstract_unix_socket_e2e() {
     assert_eq!(client.wire_protocol_version(), Some(2));
     assert_eq!(client.negotiate(8).expect("negotiate"), 3);
     let sid = client.get_session_id().expect("get_session_id");
-    let attached = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::abstract_name(name.as_bytes(), 2).session_id(&sid),
+    let attached = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(name.as_bytes(), 2).session_id(&sid),
     )
     .expect("attach abstract child session");
     assert_eq!(attached.get_session_id().expect("attached id"), sid);
     let root = EchoProxy(attached.get_root().expect("attached get_root"));
     assert_eq!(root.echo("abstract-process").unwrap(), "abstract-process");
 
-    let fan = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::abstract_name(name.as_bytes(), 2).outgoing_connections(3),
+    let fan = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(name.as_bytes(), 2).outgoing_connections(3),
     )
     .expect("abstract child fan-out");
     assert_eq!(fan.negotiated_max_threads(), 3);
@@ -956,8 +959,8 @@ fn abstract_unix_socket_e2e() {
 
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
-    let attached = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::abstract_name(&a13_name, 2).session_id(&sid),
+    let attached = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(&a13_name, 2).session_id(&sid),
     )
     .expect("attach abstract android13plus");
     assert_eq!(attached.get_session_id().expect("attached id"), sid);
@@ -980,8 +983,8 @@ fn abstract_unix_socket_e2e() {
         path: None,
     };
 
-    let fan_client = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::abstract_name(&fan_name, 2).outgoing_connections(3),
+    let fan_client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(&fan_name, 2).outgoing_connections(3),
     )
     .expect("abstract fan-out");
     assert_eq!(fan_client.negotiated_max_threads(), 3);
@@ -1218,8 +1221,10 @@ fn a0b_multi_connection_shared_session() {
 
     // --- client #2: echo #1's id ⇒ server ATTACHES it to #1's
     //     SharedSession (shared state/root/rpc_session_id).
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid1)
-        .expect("a13+ connect #2 (attach)");
+    let c2 = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid1),
+    )
+    .expect("a13+ connect #2 (attach)");
     let sid2 = c2.get_session_id().expect("get_session_id #2");
     assert_eq!(
         sid2, sid1,
@@ -1256,13 +1261,15 @@ fn a0b_multi_connection_shared_session() {
     // `From<io::Error> for RpcError`, kind-preserving in both
     // directions per
     // `rpc::tests::peer_closed_and_timeout_round_trip_through_io_error`).
-    // This path arms no deadline (`RpcUnixClientConfig`'s
+    // This path arms no deadline (`RpcClientConfig`'s
     // `handshake_timeout` defaults to `None`), so a `TimedOut` or an
     // unclassified `Unknown` here means a different bug — as does `Ok`,
     // the true mutant: server honored the unknown id.
-    let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &bogus)
-        .err()
-        .expect("unknown id rejected");
+    let err = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&bogus),
+    )
+    .err()
+    .expect("unknown id rejected");
     assert_eq!(
         err,
         StatusCode::DeadObject,
@@ -1385,8 +1392,10 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     // Attached connection (#2): echo #1's id ⇒ the attach arm
     // adds a *slot* to the founding inner (rather than building a
     // fresh inner sharing only SharedSession — the mutant).
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("a13+ #2 (attach)");
+    let c2 = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid),
+    )
+    .expect("a13+ #2 (attach)");
     // Bound without the conventional `_` prefix — `root2` is moved into
     // an explicit `drop(...)` below to trigger the partial-loss
     // reap; an underscore-prefix would have read as "intentionally
@@ -1469,8 +1478,10 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
         .as_slice()
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("a13+ #2 (attach within cap)");
+    let c2 = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid),
+    )
+    .expect("a13+ #2 (attach within cap)");
     let _r2 = EchoProxy(c2.get_root().expect("get_root #2"));
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
@@ -1484,9 +1495,11 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     // (`GET_SESSION_ID` on the fresh connection) reports it from the
     // constructor — a valid id refused by the cap is the case no
     // client-side id check could catch.
-    let err = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .err()
-        .expect("3rd attach must be rejected by the per-session cap");
+    let err = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid),
+    )
+    .err()
+    .expect("3rd attach must be rejected by the per-session cap");
     assert_eq!(
         err,
         StatusCode::DeadObject,
@@ -1523,10 +1536,10 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
 }
 
 /// AOSP `setupClient` fan-out automation, multi-conn path.
-/// `RpcSession::setup_unix_client_android13plus_fan_out` does
+/// `RpcClientConfig::outgoing_connections` does
 /// in one helper what the manual API requires three explicit steps for:
 /// founding connect → `negotiate(local)` → N-1 additional outgoing
-/// `add_outgoing_connection_android13plus`. Witnesses that the helper's
+/// `add_outgoing_connection_with_config`. Witnesses that the helper's
 /// fan-out loop actually mints `N - 1` extras under the server's
 /// `set_max_threads(N)` cap.
 ///
@@ -1550,10 +1563,15 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 3)
-        .expect("setupClient fan-out");
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).outgoing_connections(3),
+    )
+    .expect("setupClient fan-out");
+    let badid = tmp_sock("badid");
     assert!(matches!(
-        client.add_outgoing_connection_android13plus(tmp_sock("badid"), 1, b"bad"),
+        client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&badid, 1).session_id(b"bad")
+        ),
         Err(StatusCode::BadValue)
     ));
     // `negotiate` was the second step of the helper ⇒ negotiated value
@@ -1564,9 +1582,10 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
         "helper performed GET_MAX_THREADS and recorded min(local=3, server=3) = 3"
     );
     let sid = client.get_session_id().expect("get_session_id");
+    let badfd = tmp_sock("badfd");
     assert!(matches!(
-        client.add_outgoing_connection_android13plus_with_config(
-            RpcUnixClientConfig::path(&tmp_sock("badfd"), 1)
+        client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&badfd, 1)
                 .session_id(&sid)
                 .fd_mode(rsbinder::rpc::FileDescriptorTransportMode::Unix),
         ),
@@ -1632,8 +1651,10 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let client = RpcSession::setup_unix_client_android13plus_fan_out(&path, 1, 1)
-        .expect("setupClient (single-conn)");
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).outgoing_connections(1),
+    )
+    .expect("setupClient (single-conn)");
     // Negotiation skipped ⇒ session.negotiated_max_threads() stays at
     // its default (0 = "not negotiated"). The byte-identical witness.
     assert_eq!(
@@ -1670,8 +1691,10 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let bg2 = server2.run_background();
     let _cu2 = ServeCleanup::new(Arc::clone(&server2), bg2, path2.clone());
     wait_for_sock(&path2);
-    let client_zero = RpcSession::setup_unix_client_android13plus_fan_out(&path2, 1, 0)
-        .expect("local_max_outgoing == 0 normalized to 1");
+    let client_zero = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path2, 1).outgoing_connections(0),
+    )
+    .expect("local_max_outgoing == 0 normalized to 1");
     assert_eq!(
         client_zero.negotiated_max_threads(),
         0,
@@ -1682,7 +1705,7 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
 /// A **refused** outgoing attach must be an error at attach time, not
 /// an `Ok` slot the pool keeps. The outgoing attach wire has no
 /// server→client acknowledgement (the server refuses by closing), so
-/// `RpcSession::add_outgoing_connection_android13plus` confirms
+/// `RpcSession::add_outgoing_connection_with_config` confirms
 /// admission with one `GET_SESSION_ID` round trip on the fresh
 /// connection.
 ///
@@ -1718,14 +1741,18 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     );
     assert!(
         client
-            .add_outgoing_connection_android13plus(&path, 1, &client.session_id())
+            .add_outgoing_connection_with_config(
+                RpcClientConfig::unix(&path, 1).session_id(&client.session_id())
+            )
             .is_err(),
         "attaching with the client-local id must fail here, not later"
     );
     // (b) Plain garbage.
     assert!(
         client
-            .add_outgoing_connection_android13plus(&path, 1, &[0xABu8; 32])
+            .add_outgoing_connection_with_config(
+                RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
+            )
             .is_err(),
         "attaching with an unknown id must fail here, not later"
     );
@@ -1745,7 +1772,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     //     clean — 200 calls across 4 threads, zero failures.
     assert_eq!(
         client
-            .add_outgoing_connection_android13plus(&path, 1, &sid)
+            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
             .expect("attach with the server-minted id"),
         2
     );
@@ -1793,14 +1820,16 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
 
     assert_eq!(
         client
-            .add_outgoing_connection_android13plus(&path, 1, &sid)
+            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
             .expect("first attach is under the cap"),
         2
     );
     for n in 0..2 {
         assert!(
             client
-                .add_outgoing_connection_android13plus(&path, 1, &sid)
+                .add_outgoing_connection_with_config(
+                    RpcClientConfig::unix(&path, 1).session_id(&sid)
+                )
                 .is_err(),
             "attach #{n} past max_threads=2 must be refused at attach time"
         );
@@ -1841,16 +1870,16 @@ fn attach_max_version_below_the_session_version_is_bad_type() {
     assert_eq!(client.wire_protocol_version(), Some(2));
     let sid = client.get_session_id().expect("get_session_id");
     assert!(matches!(
-        client.add_outgoing_connection_android13plus(&path, 1, &sid),
+        client
+            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid)),
         Err(StatusCode::BadType)
     ));
     // `wire_protocol_version()` is the value that works.
     assert_eq!(
         client
-            .add_outgoing_connection_android13plus(
-                &path,
-                client.wire_protocol_version().expect("versioned"),
-                &sid,
+            .add_outgoing_connection_with_config(
+                RpcClientConfig::unix(&path, client.wire_protocol_version().expect("versioned"))
+                    .session_id(&sid),
             )
             .expect("attach at the session's version"),
         2
@@ -1892,7 +1921,7 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
 }
 
 /// A standalone attach *session*
-/// ([`RpcSession::setup_unix_client_android13plus_with_id`], and the
+/// ([`RpcClientConfig::session_id`], and the
 /// `ClientOptions::session_id` path over it) is confirmed the same way:
 /// a refused attach is an error from the constructor, not a session
 /// whose every call fails somewhere else.
@@ -1912,13 +1941,18 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
     let founding = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = founding.get_session_id().expect("get_session_id");
     assert!(
-        RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &[0xCDu8; 32]).is_err(),
+        RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&path, 1).session_id(&[0xCDu8; 32])
+        )
+        .is_err(),
         "an unknown id must not yield a session object"
     );
     // Control: the real id builds a usable second session handle on the
     // same server-side session.
-    let attached = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid)
-        .expect("attach session with the server-minted id");
+    let attached = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid),
+    )
+    .expect("attach session with the server-minted id");
     let root = EchoProxy(attached.get_root().expect("get_root"));
     assert_eq!(root.echo("standalone").unwrap(), "standalone");
 }
@@ -2004,7 +2038,9 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
         // connection) now sees it — so the constructor itself fails.
         // Folded into one result with the first call so the test still
         // holds if a future reject arm moves to either side of it.
-        let c2 = RpcSession::setup_unix_client_android13plus_with_id(&attach_path, 1, &attach_sid)?;
+        let c2 = RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&attach_path, 1).session_id(&attach_sid),
+        )?;
         c2.set_timeout(Some(Duration::from_secs(3)));
         c2.get_root().map(|_| ())
     });
@@ -2084,8 +2120,10 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     // ONE server SharedSession (shared RpcState).
     let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect #1");
     let sid1 = c1.get_session_id().expect("session id");
-    let c2 = RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid1)
-        .expect("connect #2 (attach)");
+    let c2 = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).session_id(&sid1),
+    )
+    .expect("connect #2 (attach)");
     assert!(
         poll_until(|| server.attached_count() == 1),
         "c2 attached to c1's shared session"
@@ -2208,7 +2246,7 @@ fn f7_excess_receipt_no_leak_single_client() {
 /// parallel** — not serialized through one connection.
 ///
 /// Wire-up: founding connection (slot 1) + one echoed-id outgoing
-/// (slot 2) via [`RpcSession::add_outgoing_connection_android13plus`].
+/// (slot 2) via [`RpcSession::add_outgoing_connection_with_config`].
 /// The slots end up id-demuxed to the *same* `SharedSession`,
 /// so the test's two threads transact through different sockets but
 /// the same server session.
@@ -2241,7 +2279,7 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = c.get_session_id().expect("get_session_id");
     let slot2 = c
-        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
         .expect("add outgoing slot");
     assert_ne!(slot2, 1, "second slot has a fresh id (founding == 1)");
 
@@ -2307,7 +2345,7 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = c.get_session_id().expect("get_session_id");
     let slot2 = c
-        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
         .expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id (founding == 1)");
 
@@ -2403,7 +2441,7 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = c.get_session_id().expect("get_session_id");
     let slot2 = c
-        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
         .expect("slot 2");
     assert_ne!(
         slot2, 1,
@@ -2474,7 +2512,7 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     c.set_timeout(Some(Duration::from_secs(3)));
     let sid = c.get_session_id().expect("get_session_id");
     let slot2 = c
-        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
         .expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id");
 
@@ -2532,7 +2570,7 @@ fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = c.get_session_id().expect("get_session_id");
     let slot2 = c
-        .add_outgoing_connection_android13plus(&path, 1, &sid)
+        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
         .expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id");
 
@@ -3033,8 +3071,8 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
     let cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
     let client = if cfg.a13 {
-        RpcSession::setup_unix_client_android13plus_with_config(
-            RpcUnixClientConfig::path(&path, 2)
+        RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&path, 2)
                 .outgoing_connections(cfg.fan_out)
                 .incoming_connections(cfg.incoming),
         )
@@ -3229,7 +3267,7 @@ fn a_served_slot_never_taken_by_outside_transact() {
 }
 
 /// The android-13+ connect handshake must be bounded by
-/// `RpcUnixClientConfig::handshake_timeout`. Without it a peer that accepts
+/// `RpcClientConfig::handshake_timeout`. Without it a peer that accepts
 /// the socket and then writes nothing blocks the setup call forever —
 /// `RpcSession::set_timeout` cannot cover this phase, since it is applied to
 /// a session that does not exist yet.
@@ -3258,8 +3296,8 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let p = path.clone();
     std::thread::spawn(move || {
-        let r = RpcSession::setup_unix_client_android13plus_with_config(
-            RpcUnixClientConfig::path(&p, 2).handshake_timeout(Duration::from_millis(300)),
+        let r = RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&p, 2).handshake_timeout(Duration::from_millis(300)),
         );
         let _ = tx.send(r.map(|_| ()));
     });
@@ -3280,8 +3318,8 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path2.clone());
     wait_for_sock(&path2);
-    let client = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&path2, 2).handshake_timeout(Duration::from_millis(300)),
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path2, 2).handshake_timeout(Duration::from_millis(300)),
     )
     .expect("connect");
     let root = EchoProxy(client.get_root().expect("root"));
@@ -3579,24 +3617,24 @@ fn b_incoming_config_validation() {
     let path = h.server.path().expect("unix path").to_path_buf();
     let sid = h.client.get_session_id().expect("session id");
     assert!(matches!(
-        RpcSession::setup_unix_client_android13plus_with_config(
-            RpcUnixClientConfig::path(&path, 2)
+        RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&path, 2)
                 .session_id(&sid)
                 .incoming_connections(1)
         ),
         Err(StatusCode::BadValue)
     ));
     assert!(matches!(
-        h.client.add_outgoing_connection_android13plus_with_config(
-            RpcUnixClientConfig::path(&path, 2)
+        h.client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&path, 2)
                 .session_id(&sid)
                 .incoming_connections(1)
         ),
         Err(StatusCode::BadValue)
     ));
     assert!(matches!(
-        h.client.add_incoming_connection_android13plus_with_config(
-            RpcUnixClientConfig::path(&path, 2)
+        h.client.add_incoming_connection_with_config(
+            RpcClientConfig::unix(&path, 2)
                 .session_id(&sid)
                 .outgoing_connections(2)
         ),
@@ -3604,9 +3642,7 @@ fn b_incoming_config_validation() {
     ));
     // Manual attach works and is served.
     h.client
-        .add_incoming_connection_android13plus_with_config(
-            RpcUnixClientConfig::path(&path, 2).session_id(&sid),
-        )
+        .add_incoming_connection_with_config(RpcClientConfig::unix(&path, 2).session_id(&sid))
         .expect("manual incoming attach");
     // 1 is the founding slot; the attach must mint a fresh one.
     assert!(
@@ -3629,10 +3665,9 @@ fn b_incoming_config_validation() {
     let r34 = boot_held("b_cfg_r34");
     let r34_path = r34.server.path().expect("r34 server path").to_path_buf();
     assert!(matches!(
-        r34.client
-            .add_incoming_connection_android13plus_with_config(
-                RpcUnixClientConfig::path(&r34_path, 2).session_id(&[7u8; 32])
-            ),
+        r34.client.add_incoming_connection_with_config(
+            RpcClientConfig::unix(&r34_path, 2).session_id(&[7u8; 32])
+        ),
         Err(StatusCode::BadType)
     ));
 }
@@ -3640,6 +3675,8 @@ fn b_incoming_config_validation() {
 /// The server budgets callback slots at `2 * max_threads`: a third
 /// incoming connection on a default server is refused (and the partially
 /// built session is dropped), two are admitted.
+// Pins the deprecated `RpcUnixClientConfig` wrapper's delegation to `RpcClientConfig`.
+#[allow(deprecated)]
 #[test]
 fn b_incoming_over_server_cap_is_refused() {
     let h = boot_held_cfg(
@@ -3660,7 +3697,7 @@ fn b_incoming_over_server_cap_is_refused() {
     assert!(poll_until(|| h.server.session_slot_count(&sid) == Some(3)));
     let path = h.server.path().expect("unix path").to_path_buf();
     let r = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
+        rsbinder::rpc::RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
     );
     // The regression this guards against *admits* the third slot. Leaking
     // that session would leave its incoming threads serving past the panic
@@ -3745,8 +3782,8 @@ fn c_server_death_is_eager_with_incoming() {
             .expect("spawn server child"),
     );
     wait_for_sock(&path);
-    let eager = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&path, 2).incoming_connections(1),
+    let eager = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 2).incoming_connections(1),
     )
     .expect("eager client");
     let lazy = RpcSession::setup_unix_client_android13plus(&path, 2).expect("lazy client");
@@ -3912,8 +3949,8 @@ fn terminate_ends_every_session_and_joins_workers() {
         .expect("set_root");
     let a13_bg = a13_server.run_background();
     wait_for_sock(&a13_path);
-    let a13 = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&a13_path, 2).outgoing_connections(2),
+    let a13 = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&a13_path, 2).outgoing_connections(2),
     )
     .expect("android-13+ connect");
     let a13_root = EchoProxy(a13.get_root().expect("root"));

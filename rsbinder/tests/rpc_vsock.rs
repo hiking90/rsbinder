@@ -242,3 +242,143 @@ fn vsock_session_shutdown_ends_serve_thread() {
         eprintln!("WARNING: vsock accept loop panicked: {p:?}");
     }
 }
+
+/// Plan 10-7 Phase 0: `ClientOptions::incoming_connections` on
+/// `vsock://`. The server reaches the client's callback from a thread
+/// inside no handler, twoway and oneway; without an incoming connection
+/// the same call fails at once with `WouldBlock`.
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn entry_vsock_incoming_connections_carry_callbacks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use vsock::VMADDR_CID_LOCAL;
+
+    const TX_HOLD: TransactionCode = FIRST_CALL_TRANSACTION + 1;
+    struct Holder(Arc<Mutex<Option<SIBinder>>>);
+    impl Interface for Holder {}
+    impl Remotable for Holder {
+        fn descriptor() -> &'static str {
+            DESC
+        }
+        fn on_transact(
+            &self,
+            code: TransactionCode,
+            r: &mut Parcel,
+            reply: &mut Parcel,
+        ) -> Result<()> {
+            match code {
+                TX_HOLD => {
+                    *self.0.lock().unwrap() = Some(r.read()?);
+                    reply.write(&Status::from(StatusCode::Ok))
+                }
+                _ => Err(StatusCode::UnknownTransaction),
+            }
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+    struct CountingPing(Arc<AtomicUsize>);
+    impl Interface for CountingPing {}
+    impl IPing for CountingPing {
+        fn ping(&self, s: &str) -> Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("pong:{s}"))
+        }
+    }
+    let hold = |holder: &SIBinder, cb: &SIBinder| -> Result<()> {
+        let rp = (**holder)
+            .as_any()
+            .downcast_ref::<rsbinder::rpc::RpcProxy>()
+            .expect("RpcProxy");
+        let mut d = rp.build_request(DESC)?;
+        d.write(cb)?;
+        let mut r = rp
+            .transact(TX_HOLD, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        let st: Status = r.read()?;
+        if st.is_ok() {
+            Ok(())
+        } else {
+            Err(StatusCode::from(st))
+        }
+    };
+    let held = Arc::new(Mutex::new(None::<SIBinder>));
+    // Twoway, then oneway, from a fresh thread: inside no handler.
+    let call_back = || {
+        let cb = held.lock().unwrap().take().expect("a held callback");
+        std::thread::spawn(move || {
+            let twoway = ping_via(&cb, "outside");
+            let rp = (*cb)
+                .as_any()
+                .downcast_ref::<rsbinder::rpc::RpcProxy>()
+                .expect("RpcProxy");
+            let oneway = rp.build_request(DESC).and_then(|mut d| {
+                d.write(&"oneway")?;
+                rp.transact(TX_PING, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+            });
+            (twoway, oneway)
+        })
+        .join()
+        .expect("caller thread")
+    };
+    let counting = || {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cb = Interface::as_binder(&Binder::new(BnPing(Box::new(CountingPing(Arc::clone(
+            &calls,
+        ))))));
+        (cb, calls)
+    };
+
+    let port = TEST_PORT + 3;
+    let uri = format!("vsock://{VMADDR_CID_LOCAL}:{port}?profile=android13plus");
+    let _guard = rsbinder::serve(&uri)
+        .expect("serve vsock://")
+        .add(
+            "holder",
+            Interface::as_binder(&Binder::new(Holder(Arc::clone(&held)))),
+        )
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    // Control: no incoming connection, nothing for the server to send on.
+    {
+        let client = rsbinder::Client::open(&uri).expect("open vsock://");
+        let (cb, calls) = counting();
+        hold(&client.binder("holder").expect("holder"), &cb).expect("hold");
+        let (twoway, oneway) = call_back();
+        assert_eq!(twoway, Err(StatusCode::WouldBlock));
+        assert_eq!(oneway, Err(StatusCode::WouldBlock));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
+        .expect("open vsock:// with an incoming connection");
+    let session = client.session().expect("rpc session").clone();
+    let (cb, calls) = counting();
+    hold(&client.binder("holder").expect("holder"), &cb).expect("hold");
+    let has_callbacks = client.caps().contains(rsbinder::TransportCaps::CALLBACKS);
+    let (twoway, oneway) = call_back();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Off-thread under a deadline: an incoming thread `close_session`
+    // fails to wake would otherwise hang the run.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        session.close_session();
+        let _ = tx.send(session.__incoming_thread_live_count());
+    });
+    let live = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("close_session did not return");
+    assert!(has_callbacks, "an incoming connection grants CALLBACKS");
+    assert_eq!(twoway.as_deref(), Ok("pong:outside"));
+    assert_eq!(oneway, Ok(()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the oneway never landed");
+    assert_eq!(live, 0, "incoming thread still running after close_session");
+}

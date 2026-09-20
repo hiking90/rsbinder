@@ -65,6 +65,51 @@ This changelog starts at 0.9.0. For earlier releases, see the
   transaction, parented to the caller's current span for the async proxy as
   well. Without the feature the generated hook is a plain call, and output
   generated without `trace` does not change.
+- **Incoming (callback) connections and outgoing fan-out on every RPC
+  transport.** `ClientOptions::incoming_connections` and
+  `outgoing_connections` now work on `vsock://` and `tls://` as well as
+  `unix://` (they were `BadValue` there), so a server can call a vsock or TLS
+  client's callbacks from outside a handler and the session reports
+  `TransportCaps::CALLBACKS`. Each extra connection is a further connection to
+  the same endpoint — over `tls://` its own TLS session — which is how AOSP
+  `RpcSession::setupClient` builds them over inet and vsock; the server side
+  already accepted such attaches on every transport. For transports the entry
+  does not name (TLS over a Unix socket or vsock, `rpc-tcp-debug`), the new
+  `rpc::RpcClientConfig` takes a `connect` function called once per connection,
+  consumed by `RpcSession::setup_client_android13plus_with_config`. No wire
+  change.
+- **`rpc::RpcClientConfig`, one android-13+ client config for every
+  transport.** Constructors `unix`, `unix_abstract`, `vsock`, `tls`,
+  `tcp_debug` and `new` (your own connect function), with the same knobs on all
+  of them (`session_id`, `outgoing_connections`, `incoming_connections`,
+  `fd_mode`, `timeout`, `handshake_timeout`). `RpcSession` gained
+  `add_outgoing_connection_with_config` and
+  `add_incoming_connection_with_config`, which take it; the incoming one
+  attaches a callback connection over any transport, where the call it replaces
+  was Unix-only. `RpcClientConfig::tls` resolves its host once and opens every
+  connection of the session to that address (AOSP `setupInetClient` does the
+  same); `handshake_timeout` bounds its `connect(2)` and TLS handshake too.
+  Requesting `FileDescriptorTransportMode::Unix` on a transport that cannot
+  pass descriptors is now `BadValue` from the setup call, decided by the
+  founding connection's `supports_fd_passing()`, instead of failing on the
+  first fd sent.
+
+### Deprecated
+
+- **`rpc::RpcUnixClientConfig`** → `RpcClientConfig::unix` / `unix_abstract`.
+- **`RpcSession::setup_unix_client_android13plus_with_config`** →
+  `setup_client_android13plus_with_config` with a `RpcClientConfig`.
+- **`RpcSession::setup_unix_client_android13plus_with_id`** and
+  **`_fan_out`** → the same call with `RpcClientConfig::unix(path, v)` plus
+  `.session_id(id)` or `.outgoing_connections(n)`.
+- **`RpcSession::add_outgoing_connection_android13plus`** and both
+  **`add_{outgoing,incoming}_connection_android13plus_with_config`** →
+  `add_{outgoing,incoming}_connection_with_config`.
+
+The deprecated items still work and delegate to the new ones; they are removed
+in the release after 0.13.0. The single-connection one-liners
+(`setup_unix_client_android13plus`, `_abstract`, `_fd`,
+`setup_tcp_client_tls_android13plus`) are not deprecated.
 
 ## [0.12.0] - 2026-09-19
 

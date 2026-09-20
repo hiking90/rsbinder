@@ -376,7 +376,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn fd_v1_abstract_unix_roundtrip_arg() {
-    use rsbinder::rpc::RpcUnixClientConfig;
+    use rsbinder::rpc::RpcClientConfig;
 
     let name = format!("rsb_rpcfd_abs_{}", std::process::id()).into_bytes();
     let server = RpcServer::setup_unix_server_abstract(&name).expect("bind abstract fd");
@@ -388,8 +388,8 @@ fn fd_v1_abstract_unix_roundtrip_arg() {
         .expect("set_root");
     let bg = server.run_background();
 
-    let client = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::abstract_name(&name, 1)
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(&name, 1)
             .fd_mode(FdMode::Unix)
             .outgoing_connections(2),
     )

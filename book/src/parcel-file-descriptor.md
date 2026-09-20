@@ -157,7 +157,7 @@ kernel binder, FD passing over RPC is **opt-in and negotiated per
 connection**: the server declares the modes it accepts with
 `RpcServer::set_supported_fd_modes`, and the client requests one with
 `RpcSession::negotiate_fd_transport` (or the `fd_mode` knob on the
-`RpcUnixClientConfig` builder). Descriptors then travel out-of-band via
+`RpcClientConfig` builder). Descriptors then travel out-of-band via
 `SCM_RIGHTS`, which requires a Unix-domain socket and the android-14+
 wire version. Service and client code using `ParcelFileDescriptor` is
 otherwise unchanged. See

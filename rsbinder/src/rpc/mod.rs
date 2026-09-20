@@ -123,7 +123,9 @@ pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
-pub use session::{RpcSession, RpcUnixClientConfig};
+#[allow(deprecated)]
+pub use session::RpcUnixClientConfig;
+pub use session::{RpcClientConfig, RpcSession};
 pub use transport::{CertId, PeerIdentity, RpcTransport};
 
 /// Re-export of the exact `rustls` the `tls` backend links, so callers

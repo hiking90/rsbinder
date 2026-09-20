@@ -126,13 +126,11 @@ impl TransportCaps {
     /// a socket.
     pub const KERNEL_KNOBS: Self = Self(1 << 4);
 
-    /// No capabilities — what a vsock or TLS session has. The incoming
-    /// (callback) connections *rsbinder* opens are Unix-only today, so an
-    /// rsbinder client cannot reach [`CALLBACKS`](Self::CALLBACKS) there
-    /// either. A server can: its accept path is transport-generic, so a
-    /// peer that attaches an incoming connection over vsock or TLS — as
-    /// AOSP's `RpcSession` does — makes that session report `CALLBACKS`
-    /// and nothing else.
+    /// No capabilities — what a default vsock or TLS session has. With
+    /// incoming connections
+    /// ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections))
+    /// such a session reports [`CALLBACKS`](Self::CALLBACKS) and nothing
+    /// else, on both ends.
     pub const NONE: Self = Self(0);
 
     /// Everything: kernel binder, which is the only transport that has

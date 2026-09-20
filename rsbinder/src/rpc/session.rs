@@ -47,32 +47,22 @@ use super::{RpcError, RpcResult};
 /// `RPC_CONNECTION_OPTION_INCOMING` flag.
 type Android13PlusAccept = (Box<dyn RpcTransport>, Android13PlusCodec, u8, Vec<u8>, bool);
 
+#[derive(Clone, Copy)]
 enum RpcUnixAddr<'a> {
     Path(&'a Path),
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Abstract(&'a [u8]),
 }
 
-/// Unix-domain android-13+ RPC client configuration — the builder
-/// consumed by
-/// [`RpcSession::setup_unix_client_android13plus_with_config`],
-/// [`RpcSession::add_outgoing_connection_android13plus_with_config`] and
-/// [`RpcSession::add_incoming_connection_android13plus_with_config`].
+/// Unix-domain android-13+ RPC client configuration.
 ///
-/// One config expresses everything the per-shape convenience helpers
-/// (`setup_unix_client_android13plus{,_abstract,_with_id,_fan_out}`)
-/// take positionally: the address (filesystem path or Linux/Android
-/// abstract name), the highest wire version to offer, and the optional
-/// session-id attach / fan-out / incoming-connection / fd-transport-mode
-/// knobs. The defaults (`session_id = empty`, `outgoing_connections = 1`,
-/// `incoming_connections = 0`, `fd_mode = None`) reproduce the plain
-/// single-connection
-/// [`RpcSession::setup_unix_client_android13plus`] byte-for-byte.
-///
-/// `session_id` is mutually exclusive with both `outgoing_connections > 1`
-/// and `incoming_connections > 0` (attaching joins a session someone else
-/// owns; growing the pool is the owner's business) — the consuming setup
-/// call rejects the combination with `BadValue`.
+/// Superseded by [`RpcClientConfig`], which takes the same knobs on every
+/// transport: [`RpcClientConfig::unix`] and
+/// [`RpcClientConfig::unix_abstract`] replace the two constructors here.
+#[deprecated(
+    since = "0.13.0",
+    note = "use `RpcClientConfig::unix`/`unix_abstract`, which carry the same knobs on every transport"
+)]
 pub struct RpcUnixClientConfig<'a> {
     addr: RpcUnixAddr<'a>,
     max_version: u32,
@@ -84,6 +74,7 @@ pub struct RpcUnixClientConfig<'a> {
     handshake_timeout: Option<Duration>,
 }
 
+#[allow(deprecated)]
 impl<'a> RpcUnixClientConfig<'a> {
     fn new(addr: RpcUnixAddr<'a>, max_version: u32) -> Self {
         Self {
@@ -98,17 +89,363 @@ impl<'a> RpcUnixClientConfig<'a> {
         }
     }
 
-    /// Config for a filesystem-path Unix socket, offering at most wire
-    /// version `max_version` in the handshake.
+    /// See [`RpcClientConfig::unix`].
     pub fn path(path: &'a Path, max_version: u32) -> Self {
         Self::new(RpcUnixAddr::Path(path), max_version)
     }
 
-    /// Config for a Linux/Android abstract Unix socket, offering at
-    /// most wire version `max_version` in the handshake.
+    /// See [`RpcClientConfig::unix_abstract`].
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn abstract_name(name: &'a [u8], max_version: u32) -> Self {
         Self::new(RpcUnixAddr::Abstract(name), max_version)
+    }
+
+    /// See [`RpcClientConfig::session_id`].
+    pub fn session_id(mut self, session_id: &'a [u8]) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// See [`RpcClientConfig::outgoing_connections`].
+    pub fn outgoing_connections(mut self, n: u32) -> Self {
+        self.outgoing_connections = n;
+        self
+    }
+
+    /// See [`RpcClientConfig::incoming_connections`].
+    pub fn incoming_connections(mut self, n: u32) -> Self {
+        self.incoming_connections = n;
+        self
+    }
+
+    /// See [`RpcClientConfig::fd_mode`].
+    pub fn fd_mode(mut self, mode: FileDescriptorTransportMode) -> Self {
+        self.fd_mode = Some(mode);
+        self
+    }
+
+    /// See [`RpcClientConfig::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// See [`RpcClientConfig::handshake_timeout`].
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    fn into_generic(self) -> RpcClientConfig<'a> {
+        RpcClientConfig {
+            source: ClientSource::Unix(self.addr),
+            max_version: self.max_version,
+            session_id: self.session_id,
+            outgoing_connections: self.outgoing_connections,
+            incoming_connections: self.incoming_connections,
+            fd_mode: self.fd_mode,
+            timeout: self.timeout,
+            handshake_timeout: self.handshake_timeout,
+        }
+    }
+}
+
+fn unix_connect(addr: RpcUnixAddr<'_>) -> Result<Box<dyn RpcTransport>> {
+    let t = match addr {
+        RpcUnixAddr::Path(path) => super::transport::UnixTransport::connect(path),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        RpcUnixAddr::Abstract(name) => super::transport::UnixTransport::connect_abstract(name),
+    }
+    .map_err(StatusCode::from)?;
+    Ok(Box::new(t))
+}
+
+/// Opens one connection to the server; see [`RpcClientConfig::new`].
+type Connector<'a> = Box<dyn FnMut() -> Result<Box<dyn RpcTransport>> + 'a>;
+
+/// Where a [`RpcClientConfig`] opens its connections. The connect
+/// function is built from this once the handshake deadline is known, so
+/// a built-in transport can apply that deadline to its own connect.
+enum ClientSource<'a> {
+    Unix(RpcUnixAddr<'a>),
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+    Vsock {
+        cid: u32,
+        port: u32,
+    },
+    #[cfg(feature = "rpc-tcp-debug")]
+    TcpDebug(std::net::SocketAddr),
+    #[cfg(feature = "rpc-tls")]
+    Tls {
+        host: &'a str,
+        port: u16,
+        server_name: &'a str,
+        config: std::sync::Arc<rustls::ClientConfig>,
+    },
+    Custom(Connector<'a>),
+}
+
+impl<'a> ClientSource<'a> {
+    fn into_connector(self, handshake_timeout: Option<Duration>) -> Connector<'a> {
+        let _ = handshake_timeout;
+        match self {
+            ClientSource::Unix(addr) => Box::new(move || unix_connect(addr)),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            ClientSource::Vsock { cid, port } => Box::new(move || {
+                Ok(
+                    Box::new(super::transport::VsockTransport::connect(cid, port)?)
+                        as Box<dyn RpcTransport>,
+                )
+            }),
+            #[cfg(feature = "rpc-tcp-debug")]
+            ClientSource::TcpDebug(addr) => Box::new(move || {
+                Ok(
+                    Box::new(super::transport::TcpDebugTransport::connect(addr)?)
+                        as Box<dyn RpcTransport>,
+                )
+            }),
+            #[cfg(feature = "rpc-tls")]
+            ClientSource::Tls {
+                host,
+                port,
+                server_name,
+                config,
+            } => {
+                let mut pinned = None;
+                Box::new(move || {
+                    connect_tls(
+                        host,
+                        port,
+                        &mut pinned,
+                        server_name,
+                        &config,
+                        handshake_timeout,
+                    )
+                })
+            }
+            ClientSource::Custom(connect) => connect,
+        }
+    }
+}
+
+/// A fresh TCP connection and TLS session to `host:port`, each blocking
+/// step bounded by `handshake_timeout`. The first address that connects
+/// is pinned for the session's later connections, as AOSP
+/// `setupInetClient` resolves once: another server behind the same name
+/// would not know the session id.
+#[cfg(feature = "rpc-tls")]
+fn connect_tls(
+    host: &str,
+    port: u16,
+    pinned: &mut Option<std::net::SocketAddr>,
+    server_name: &str,
+    config: &std::sync::Arc<rustls::ClientConfig>,
+    handshake_timeout: Option<Duration>,
+) -> Result<Box<dyn RpcTransport>> {
+    let tcp_connect = |addr: &std::net::SocketAddr| match handshake_timeout {
+        Some(d) => std::net::TcpStream::connect_timeout(addr, d),
+        None => std::net::TcpStream::connect(addr),
+    };
+    let tcp = match *pinned {
+        Some(addr) => tcp_connect(&addr)?,
+        None => {
+            use std::net::ToSocketAddrs;
+            let mut last = None;
+            let mut sock = None;
+            for addr in (host, port).to_socket_addrs()? {
+                match tcp_connect(&addr) {
+                    Ok(t) => {
+                        sock = Some((t, addr));
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            match sock {
+                Some((t, addr)) => {
+                    *pinned = Some(addr);
+                    t
+                }
+                None => {
+                    return Err(StatusCode::from(last.unwrap_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "no address resolved")
+                    })))
+                }
+            }
+        }
+    };
+    // The TLS handshake is the rest of this phase, and it is blocking I/O
+    // on the socket: bound it too, or a peer that accepts the connection
+    // and never sends a ServerHello hangs the setup — the very failure
+    // this option promises to cut. The server side bounds its half the
+    // same way, before `wrap_accepted`.
+    if let Some(d) = handshake_timeout {
+        tcp.set_read_timeout(Some(d))?;
+        tcp.set_write_timeout(Some(d))?;
+    }
+    let t = super::transport::TlsTransport::connect(tcp, server_name, config.clone())
+        .map_err(StatusCode::from)?;
+    if handshake_timeout.is_some() {
+        // Handshake over: what follows (the android-13+ handshake, then
+        // the session's own traffic) arms its own deadlines, and a sticky
+        // one here would cut an idle session short.
+        t.set_read_timeout(None).map_err(StatusCode::from)?;
+        t.set_write_timeout(None).map_err(StatusCode::from)?;
+    }
+    Ok(Box::new(t))
+}
+
+/// What a manual attach needs out of a [`RpcClientConfig`].
+struct AttachParts<'a> {
+    connect: Connector<'a>,
+    max_version: u32,
+    session_id: &'a [u8],
+    fd_mode: FileDescriptorTransportMode,
+    handshake_timeout: Option<Duration>,
+}
+
+/// android-13+ RPC client configuration, consumed by
+/// [`RpcSession::setup_client_android13plus_with_config`] and the two
+/// manual attach calls
+/// ([`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config),
+/// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config)).
+///
+/// One constructor per transport: [`unix`](Self::unix),
+/// [`unix_abstract`](Self::unix_abstract), `vsock` (`rpc-vsock`), `tls`
+/// (`rpc-tls`), `tcp_debug` (`rpc-tcp-debug`), or [`new`](Self::new)
+/// with a connect function of your own. The knobs are
+/// the same whichever one built it, because the setup opens every
+/// connection the same way: one connect per connection — the founding
+/// one, each outgoing fan-out connection, each incoming (callback)
+/// connection. That is AOSP's own shape (`RpcSession::setupClient` takes
+/// a per-connection `connectAndInit`), which is why
+/// `setMaxIncomingThreads` works over vsock and inet there, and why
+/// incoming connections and
+/// [`TransportCaps::CALLBACKS`](crate::TransportCaps::CALLBACKS) are
+/// available on every transport here.
+///
+/// The defaults (`session_id` empty, `outgoing_connections = 1`,
+/// `incoming_connections = 0`, `fd_mode` unset) reproduce a plain
+/// single-connection [`RpcSession::connect_android13plus`] on the first
+/// transport, byte for byte.
+///
+/// `session_id` is mutually exclusive with both `outgoing_connections > 1`
+/// and `incoming_connections > 0` (attaching joins a session someone else
+/// owns; growing the pool is the owner's business) — the consuming setup
+/// call rejects the combination with `BadValue`.
+pub struct RpcClientConfig<'a> {
+    source: ClientSource<'a>,
+    max_version: u32,
+    session_id: &'a [u8],
+    outgoing_connections: u32,
+    incoming_connections: u32,
+    fd_mode: Option<FileDescriptorTransportMode>,
+    timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
+}
+
+impl<'a> RpcClientConfig<'a> {
+    fn with_source(source: ClientSource<'a>, max_version: u32) -> Self {
+        Self {
+            source,
+            max_version,
+            session_id: &[],
+            outgoing_connections: 1,
+            incoming_connections: 0,
+            fd_mode: None,
+            timeout: None,
+            handshake_timeout: None,
+        }
+    }
+
+    /// Connect to a filesystem-path Unix socket, offering at most wire
+    /// version `max_version` in the handshake.
+    pub fn unix(path: &'a Path, max_version: u32) -> Self {
+        Self::with_source(ClientSource::Unix(RpcUnixAddr::Path(path)), max_version)
+    }
+
+    /// Connect to a Linux/Android abstract Unix socket.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn unix_abstract(name: &'a [u8], max_version: u32) -> Self {
+        Self::with_source(ClientSource::Unix(RpcUnixAddr::Abstract(name)), max_version)
+    }
+
+    /// Connect to a vsock server (cid 2 = the host from inside a guest;
+    /// the VM's own cid from the host).
+    #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+    pub fn vsock(cid: u32, port: u32, max_version: u32) -> Self {
+        Self::with_source(ClientSource::Vsock { cid, port }, max_version)
+    }
+
+    /// Connect to a **plaintext** TCP server — the `rpc-tcp-debug`
+    /// transport, which is for tests and bring-up, not for a network you
+    /// do not control. [`tls`](Self::tls) is the TCP transport to ship.
+    #[cfg(feature = "rpc-tcp-debug")]
+    pub fn tcp_debug(addr: std::net::SocketAddr, max_version: u32) -> Self {
+        Self::with_source(ClientSource::TcpDebug(addr), max_version)
+    }
+
+    /// Connect to a TCP server over TLS: `host` is a host name or an IP
+    /// literal, `server_name` is the name verified against the server's
+    /// certificate per `config` (a bad or untrusted certificate fails
+    /// before any RPC byte), and every connection gets its own TLS
+    /// session.
+    ///
+    /// `host` is resolved once, and every further connection of the
+    /// session goes to the address the founding one reached — AOSP
+    /// `setupInetClient` resolves once too. A second resolve could land a
+    /// fan-out or incoming connection on another server behind the same
+    /// name, which does not know the session id.
+    #[cfg(feature = "rpc-tls")]
+    pub fn tls(
+        host: &'a str,
+        port: u16,
+        server_name: &'a str,
+        config: std::sync::Arc<rustls::ClientConfig>,
+        max_version: u32,
+    ) -> Self {
+        Self::with_source(
+            ClientSource::Tls {
+                host,
+                port,
+                server_name,
+                config,
+            },
+            max_version,
+        )
+    }
+
+    /// Connect with `connect`, for a transport the constructors above do
+    /// not name — TLS over a Unix socket or vsock, a preconnected fd, a
+    /// backend of your own.
+    ///
+    /// It is called once per connection and must return a transport ready
+    /// for the android-13+ handshake: for TLS, connected *and*
+    /// TLS-handshaken. It should bound its own blocking steps
+    /// (`connect(2)`, a TLS handshake) if the peer may be silent —
+    /// [`handshake_timeout`](Self::handshake_timeout) covers only the
+    /// android-13+ handshake that follows, and only the constructors
+    /// above apply it earlier than that.
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
+    /// # fn f() -> rsbinder::Result<()> {
+    /// use rsbinder::rpc::{transport::VsockTransport, RpcClientConfig, RpcSession, RpcTransport};
+    ///
+    /// let session = RpcSession::setup_client_android13plus_with_config(
+    ///     RpcClientConfig::new(2, || {
+    ///         Ok(Box::new(VsockTransport::connect(3, 5000)?) as Box<dyn RpcTransport>)
+    ///     })
+    ///     .incoming_connections(1),
+    /// )?;
+    /// # session.close_session();
+    /// # Ok(()) }
+    /// ```
+    pub fn new(
+        max_version: u32,
+        connect: impl FnMut() -> Result<Box<dyn RpcTransport>> + 'a,
+    ) -> Self {
+        Self::with_source(ClientSource::Custom(Box::new(connect)), max_version)
     }
 
     /// Attach to an existing server session by echoing its 32-byte id
@@ -130,13 +467,15 @@ impl<'a> RpcUnixClientConfig<'a> {
 
     /// Open `n` **incoming (callback) connections** in addition to the
     /// outgoing pool — AOSP `RpcSession::setMaxIncomingThreads(n)`.
-    /// Each one is attached with the `INCOMING` header bit, added to
-    /// the server's session as a slot the server *sends* on, and served
-    /// here by a dedicated thread. Without at least one, the server can
-    /// reach this client's callbacks only from inside a handler that is
-    /// answering one of this client's calls (a nested call); a call
-    /// from any other server thread — a timer, a worker, a oneway
-    /// notification — fails with `FailedTransaction` on the server.
+    /// Each one is a further connection to the same endpoint (over TLS,
+    /// its own TLS session), attached with the `INCOMING` header bit,
+    /// added to the server's session as a slot the server *sends* on,
+    /// and served here by a dedicated thread. Without at least one, the
+    /// server can reach this client's callbacks only from inside a
+    /// handler that is answering one of this client's calls (a nested
+    /// call); a call from any other server thread — a timer, a worker, a
+    /// oneway notification — fails at once with
+    /// [`StatusCode::WouldBlock`] on the server (AOSP `WOULD_BLOCK`).
     ///
     /// Side effect: a session with an incoming connection detects the
     /// server's death as soon as the connection drops (obituaries fire
@@ -173,6 +512,13 @@ impl<'a> RpcUnixClientConfig<'a> {
 
     /// Request an fd transport mode in the connection header (AOSP
     /// `setFileDescriptorTransportMode`). Default is no fd support.
+    ///
+    /// Only a Unix-domain transport carries fds, so
+    /// [`FileDescriptorTransportMode::Unix`] on any other is
+    /// [`StatusCode::BadValue`] from the setup call. The founding
+    /// connection decides it
+    /// ([`RpcTransport::supports_fd_passing`]),
+    /// so the rule holds for a [`new`](Self::new) connect function too.
     pub fn fd_mode(mut self, mode: FileDescriptorTransportMode) -> Self {
         self.fd_mode = Some(mode);
         self
@@ -191,9 +537,11 @@ impl<'a> RpcUnixClientConfig<'a> {
     }
 
     /// Deadline for each **connection handshake** this config performs —
-    /// the founding connect and every fan-out / incoming attach.
-    /// Unset (the default) blocks forever, so a peer that accepts the
-    /// socket and then writes nothing hangs the setup call.
+    /// the founding connect and every fan-out / incoming attach. Unset
+    /// (the default) blocks forever, so a peer that accepts the socket
+    /// and then writes nothing hangs the setup call. With the `tls`
+    /// constructor it also bounds the `connect(2)` and the TLS handshake
+    /// that precede each android-13+ handshake.
     ///
     /// Distinct from [`timeout`](Self::timeout), which is the session's
     /// *reply* deadline and cannot cover this phase: it is applied to the
@@ -210,13 +558,10 @@ impl<'a> RpcUnixClientConfig<'a> {
         self
     }
 
-    fn connect(&self) -> Result<super::transport::UnixTransport> {
-        match &self.addr {
-            RpcUnixAddr::Path(path) => super::transport::UnixTransport::connect(path),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            RpcUnixAddr::Abstract(name) => super::transport::UnixTransport::connect_abstract(name),
-        }
-        .map_err(StatusCode::from)
+    /// One connection, for a caller that drives the wire itself (the
+    /// entry layer's r34 path).
+    pub(crate) fn connect_once(self) -> Result<Box<dyn RpcTransport>> {
+        (self.source.into_connector(self.handshake_timeout))()
     }
 }
 
@@ -4555,53 +4900,98 @@ impl RpcSession {
     /// admission is confirmed before the session is returned (see
     /// `confirm_attach`) — a refused attach is an error here, not a
     /// session whose every call fails.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).session_id(id))`"
+    )]
+    #[allow(deprecated)]
     pub fn setup_unix_client_android13plus_with_id(
         path: impl AsRef<std::path::Path>,
         max_version: u32,
         session_id: &[u8],
     ) -> Result<RpcSession> {
-        Self::setup_unix_client_android13plus_with_config(
-            RpcUnixClientConfig::path(path.as_ref(), max_version).session_id(session_id),
+        Self::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(path.as_ref(), max_version).session_id(session_id),
         )
     }
 
     /// Client: connect to a Unix-domain android-13+ server using a config object.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `setup_client_android13plus_with_config` with `RpcClientConfig::unix`/`unix_abstract`"
+    )]
+    #[allow(deprecated)]
     pub fn setup_unix_client_android13plus_with_config(
         config: RpcUnixClientConfig,
     ) -> Result<RpcSession> {
-        reject_zero_handshake_timeout(
-            config.handshake_timeout,
+        Self::setup_client_android13plus(
+            config.into_generic(),
             "RpcUnixClientConfig::handshake_timeout",
-        )?;
-        let local = config.outgoing_connections.max(1);
-        let incoming = config.incoming_connections;
+        )
+    }
+
+    /// Client: connect to an android-13+ server over any transport — the
+    /// founding connection, the outgoing fan-out and the incoming
+    /// (callback) connections each come from one call to the config's
+    /// `connect`. See [`RpcClientConfig`].
+    pub fn setup_client_android13plus_with_config(config: RpcClientConfig) -> Result<RpcSession> {
+        Self::setup_client_android13plus(config, "RpcClientConfig::handshake_timeout")
+    }
+
+    fn setup_client_android13plus(config: RpcClientConfig, what: &str) -> Result<RpcSession> {
+        reject_zero_handshake_timeout(config.handshake_timeout, what)?;
+        let RpcClientConfig {
+            source,
+            max_version,
+            session_id: requested_id,
+            outgoing_connections,
+            incoming_connections: incoming,
+            fd_mode: requested_fd_mode,
+            timeout,
+            handshake_timeout,
+        } = config;
+        let local = outgoing_connections.max(1);
         // Fan-out and incoming connections are a session *owner*'s
         // business: an attach (echoed id) gets neither.
-        if (local > 1 || incoming > 0) && !config.session_id.is_empty() {
+        if (local > 1 || incoming > 0) && !requested_id.is_empty() {
             return Err(StatusCode::BadValue);
         }
 
+        let mut connect = source.into_connector(handshake_timeout);
+        let founding = connect()?;
+        // Decided by the transport, not by how the config was built, so a
+        // `RpcClientConfig::new` connector is held to it too. The
+        // handshake would otherwise agree on `Unix` mode and every fd
+        // send fail later.
+        if requested_fd_mode == Some(FileDescriptorTransportMode::Unix)
+            && !founding.supports_fd_passing()
+        {
+            log::error!(
+                "RPC client: FileDescriptorTransportMode::Unix needs a Unix-domain transport"
+            );
+            return Err(StatusCode::BadValue);
+        }
         let session = RpcSession::connect_android13plus_fd_with_id_hs(
-            Box::new(config.connect()?),
-            config.max_version,
-            config.fd_mode.unwrap_or(FileDescriptorTransportMode::None),
-            config.session_id,
-            config.handshake_timeout,
+            founding,
+            max_version,
+            requested_fd_mode.unwrap_or(FileDescriptorTransportMode::None),
+            requested_id,
+            handshake_timeout,
         )?;
         // Before `negotiate`/`get_session_id` below — those are ordinary
         // `client_transact` round trips and read this value when they run.
-        if config.timeout.is_some() {
-            session.set_timeout(config.timeout);
+        if timeout.is_some() {
+            session.set_timeout(timeout);
         }
         if local == 1 && incoming == 0 {
             // Single-connection path: byte-identical to
-            // `setup_unix_client_android13plus`.
+            // `connect_android13plus_fd` on the first transport.
             return Ok(session);
         }
 
         // AOSP `setupClient` order: outgoing fan-out first, then the
         // incoming connections.
-        let build = || -> Result<()> {
+        let mut build = || -> Result<()> {
             let negotiated = if local > 1 {
                 session.negotiate(local)?
             } else {
@@ -4611,20 +5001,20 @@ impl RpcSession {
             let fd_mode = session.fd_transport_mode();
             for _ in 1..negotiated {
                 session.add_outgoing_connection_android13plus_transport(
-                    || config.connect(),
-                    config.max_version,
+                    &mut connect,
+                    max_version,
                     &session_id,
                     fd_mode,
-                    config.handshake_timeout,
+                    handshake_timeout,
                 )?;
             }
             for _ in 0..incoming {
                 session.add_incoming_connection_android13plus_transport(
-                    || config.connect(),
-                    config.max_version,
+                    &mut connect,
+                    max_version,
                     &session_id,
                     fd_mode,
-                    config.handshake_timeout,
+                    handshake_timeout,
                 )?;
             }
             Ok(())
@@ -4667,25 +5057,61 @@ impl RpcSession {
     /// The default single-connection sessions never call this ⇒ the
     /// pool stays at one slot ⇒ `find_conn` is byte-identical to the
     /// `enter_connection` path.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `add_outgoing_connection_with_config(RpcClientConfig::unix(path, v).session_id(id))`"
+    )]
     pub fn add_outgoing_connection_android13plus(
         &self,
         path: impl AsRef<std::path::Path>,
         max_version: u32,
         session_id: &[u8],
     ) -> Result<u64> {
-        self.add_outgoing_connection_android13plus_with_config(
-            RpcUnixClientConfig::path(path.as_ref(), max_version).session_id(session_id),
+        self.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(path.as_ref(), max_version).session_id(session_id),
         )
     }
 
     /// Client multi-outgoing using a [`RpcUnixClientConfig`].
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `add_outgoing_connection_with_config` with a `RpcClientConfig`"
+    )]
+    #[allow(deprecated)]
     pub fn add_outgoing_connection_android13plus_with_config(
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
+        self.add_outgoing_connection_with_config(config.into_generic())
+    }
+
+    /// Client multi-outgoing using a [`RpcClientConfig`] — the config's
+    /// `session_id` is required (this is an attach), and its fan-out and
+    /// incoming counts must be left at their defaults, since this call
+    /// opens exactly one connection.
+    pub fn add_outgoing_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
+        let AttachParts {
+            mut connect,
+            max_version,
+            session_id,
+            fd_mode,
+            handshake_timeout,
+        } = self.attach_parts(config)?;
+        self.add_outgoing_connection_android13plus_transport(
+            &mut connect,
+            max_version,
+            session_id,
+            fd_mode,
+            handshake_timeout,
+        )
+    }
+
+    /// The single connection and knobs a manual attach runs on, with the
+    /// combinations an attach cannot express refused first.
+    fn attach_parts<'a>(&self, config: RpcClientConfig<'a>) -> Result<AttachParts<'a>> {
         reject_zero_handshake_timeout(
             config.handshake_timeout,
-            "RpcUnixClientConfig::handshake_timeout",
+            "RpcClientConfig::handshake_timeout",
         )?;
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
@@ -4697,18 +5123,18 @@ impl RpcSession {
         if config.fd_mode.is_some_and(|mode| mode != fd_mode) {
             return Err(StatusCode::BadValue);
         }
-        self.add_outgoing_connection_android13plus_transport(
-            || config.connect(),
-            config.max_version,
-            config.session_id,
+        Ok(AttachParts {
+            connect: config.source.into_connector(config.handshake_timeout),
+            max_version: config.max_version,
+            session_id: config.session_id,
             fd_mode,
-            config.handshake_timeout,
-        )
+            handshake_timeout: config.handshake_timeout,
+        })
     }
 
     fn add_outgoing_connection_android13plus_transport(
         &self,
-        connect: impl FnOnce() -> Result<super::transport::UnixTransport>,
+        connect: impl FnOnce() -> Result<Box<dyn RpcTransport>>,
         max_version: u32,
         session_id: &[u8],
         fd_mode: FileDescriptorTransportMode,
@@ -4741,8 +5167,8 @@ impl RpcSession {
         };
         let t = connect()?;
         let codec = {
-            let _hs = HandshakeDeadline::arm(&t, handshake_timeout).map_err(StatusCode::from)?;
-            let mut io = RawTransportIo(&t);
+            let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
+            let mut io = RawTransportIo(&*t);
             client_connect_with_id(&mut io, effective_max, false, hdr_fd_mode, session_id)
                 .map_err(StatusCode::from)?
         };
@@ -4769,14 +5195,14 @@ impl RpcSession {
             // handshake timeout is configured.
             let probe_deadline =
                 handshake_timeout.or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
-            let _hs = HandshakeDeadline::arm(&t, probe_deadline).map_err(StatusCode::from)?;
-            if let Err(e) = confirm_attach(&t, &codec, session_id) {
+            let _hs = HandshakeDeadline::arm(&*t, probe_deadline).map_err(StatusCode::from)?;
+            if let Err(e) = confirm_attach(&*t, &codec, session_id) {
                 log_attach_refused(&e);
                 return Err(StatusCode::from(e));
             }
         }
         self.inner
-            .add_outgoing_slot(Box::new(t))
+            .add_outgoing_slot(t)
             .ok_or(StatusCode::DeadObject)
     }
 
@@ -4794,36 +5220,43 @@ impl RpcSession {
     /// founding version ⇒ `BadType`). The server refusing the attach
     /// (its callback-slot budget, `2 * set_max_threads`, is spent)
     /// surfaces as a handshake error.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `add_incoming_connection_with_config` with a `RpcClientConfig`"
+    )]
+    #[allow(deprecated)]
     pub fn add_incoming_connection_android13plus_with_config(
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
-        reject_zero_handshake_timeout(
-            config.handshake_timeout,
-            "RpcUnixClientConfig::handshake_timeout",
-        )?;
-        if config.outgoing_connections.max(1) != 1
-            || config.incoming_connections != 0
-            || config.session_id.len() != 32
-        {
-            return Err(StatusCode::BadValue);
-        }
-        let fd_mode = self.fd_transport_mode();
-        if config.fd_mode.is_some_and(|mode| mode != fd_mode) {
-            return Err(StatusCode::BadValue);
-        }
-        self.add_incoming_connection_android13plus_transport(
-            || config.connect(),
-            config.max_version,
-            config.session_id,
+        self.add_incoming_connection_with_config(config.into_generic())
+    }
+
+    /// Open one *additional* incoming (callback) connection using a
+    /// [`RpcClientConfig`] — on any transport, not only a Unix socket.
+    /// The config's `session_id` is required and its fan-out and incoming
+    /// counts must be left at their defaults, since this call opens
+    /// exactly one connection.
+    pub fn add_incoming_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
+        let AttachParts {
+            mut connect,
+            max_version,
+            session_id,
             fd_mode,
-            config.handshake_timeout,
+            handshake_timeout,
+        } = self.attach_parts(config)?;
+        self.add_incoming_connection_android13plus_transport(
+            &mut connect,
+            max_version,
+            session_id,
+            fd_mode,
+            handshake_timeout,
         )
     }
 
     fn add_incoming_connection_android13plus_transport(
         &self,
-        connect: impl FnOnce() -> Result<super::transport::UnixTransport>,
+        connect: impl FnOnce() -> Result<Box<dyn RpcTransport>>,
         max_version: u32,
         session_id: &[u8],
         fd_mode: FileDescriptorTransportMode,
@@ -4854,8 +5287,8 @@ impl RpcSession {
         let codec = {
             // Cleared before the slot is pushed: this transport gets a
             // serve loop, which a lingering read deadline would break.
-            let _hs = HandshakeDeadline::arm(&t, handshake_timeout).map_err(StatusCode::from)?;
-            let mut io = RawTransportIo(&t);
+            let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
+            let mut io = RawTransportIo(&*t);
             // `incoming = true`: the header carries the INCOMING bit and
             // this side *reads* the server's `"cci"`.
             client_connect_with_id(&mut io, effective_max, true, hdr_fd_mode, session_id)
@@ -4868,7 +5301,7 @@ impl RpcSession {
         // on a connection this session will never serve.
         let slot_id = self
             .inner
-            .add_slot_inner(Box::new(t), SlotRole::Incoming)
+            .add_slot_inner(t, SlotRole::Incoming)
             .ok_or(StatusCode::DeadObject)?;
         let inner = Arc::clone(&self.inner);
         // Bump *before* the spawn so the counter is never observed low
@@ -4941,13 +5374,17 @@ impl RpcSession {
     /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus) +
     /// manual `add_outgoing_connection_android13plus` loop and tolerate
     /// per-extra failures.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).outgoing_connections(n))`"
+    )]
     pub fn setup_unix_client_android13plus_fan_out(
         path: impl AsRef<std::path::Path>,
         max_version: u32,
         local_max_outgoing: u32,
     ) -> Result<RpcSession> {
-        Self::setup_unix_client_android13plus_with_config(
-            RpcUnixClientConfig::path(path.as_ref(), max_version)
+        Self::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(path.as_ref(), max_version)
                 .outgoing_connections(local_max_outgoing),
         )
     }
@@ -5177,6 +5614,57 @@ mod tests {
     use super::*;
     use std::os::fd::{AsFd, OwnedFd};
 
+    /// After the first TCP connect, `connect_tls` no longer resolves the
+    /// host: the second call reaches the pinned address even though its
+    /// host name cannot resolve. The peer drops every connection, so both
+    /// TLS handshakes fail — only the TCP connects are under test.
+    #[cfg(feature = "rpc-tls")]
+    #[test]
+    fn tls_connections_stay_on_the_first_resolved_address() {
+        use rustls::{ClientConfig, RootCertStore};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for s in listener.incoming().take(2) {
+                drop(s);
+                let _ = tx.send(());
+            }
+        });
+        let cfg = std::sync::Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut pinned = None;
+        let timeout = Some(Duration::from_secs(2));
+        let wait = Duration::from_secs(2);
+
+        let first = connect_tls(
+            "127.0.0.1",
+            addr.port(),
+            &mut pinned,
+            "localhost",
+            &cfg,
+            timeout,
+        );
+        assert!(first.is_err());
+        rx.recv_timeout(wait).expect("first TCP connect");
+        assert_eq!(pinned, Some(addr));
+
+        let second = connect_tls(
+            "rsbinder-pin-test.invalid",
+            addr.port(),
+            &mut pinned,
+            "localhost",
+            &cfg,
+            timeout,
+        );
+        assert!(second.is_err());
+        rx.recv_timeout(wait)
+            .expect("second TCP connect went to the pinned address");
+    }
+
     /// Build a Unix socketpair and return one half as `OwnedFd`.
     fn unix_socketpair_fd() -> (OwnedFd, OwnedFd) {
         use rustix::net::{AddressFamily, SocketFlags, SocketType};
@@ -5217,8 +5705,8 @@ mod tests {
     fn zero_handshake_timeout_is_bad_value_at_the_config_entries() {
         let path = std::path::Path::new("/nonexistent/rsb-zero-handshake.sock");
         assert_eq!(
-            RpcSession::setup_unix_client_android13plus_with_config(
-                RpcUnixClientConfig::path(path, 2).handshake_timeout(Duration::ZERO),
+            RpcSession::setup_client_android13plus_with_config(
+                RpcClientConfig::unix(path, 2).handshake_timeout(Duration::ZERO),
             )
             .err(),
             Some(StatusCode::BadValue),

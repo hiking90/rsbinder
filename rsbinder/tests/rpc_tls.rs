@@ -15,8 +15,10 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use rsbinder::rpc::rustls::pki_types::pem::PemObject;
 use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -173,11 +175,11 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     assert_eq!(ping_via(&root, "").unwrap(), "pong:");
 
     // Plan 10-0: a certificate is an identity, but not a uid, and TCP
-    // carries neither file descriptors nor a shared kernel — so a TLS
-    // session has no capabilities at all, and cannot gain `CALLBACKS`
-    // either, because incoming connections are Unix-only. Anything
-    // needing one is refused here, before the first transaction, rather
-    // than on the wire later.
+    // carries neither file descriptors nor a shared kernel — so a default
+    // TLS session has no capabilities at all; `CALLBACKS` needs incoming
+    // connections (`entry_tls_incoming_connections_carry_callbacks`).
+    // Anything needing one is refused here, before the first transaction,
+    // rather than on the wire later.
     use rsbinder::TransportCaps;
     assert_eq!(client.caps(), TransportCaps::NONE);
     assert_eq!(
@@ -866,6 +868,322 @@ fn setup_unix_server_tls_e2e() {
 
     drop(root);
     drop(client);
+    server.stop_accepting();
+    let _ = bg.join();
+}
+
+// ---- incoming (callback) connections over TLS ----------------------
+
+const HOLDER_DESC: &str = "rsbinder.test.IHolder";
+const TX_HOLD: TransactionCode = FIRST_CALL_TRANSACTION;
+
+/// Keeps the last binder a client hands it, for the test to call back on
+/// from outside any handler.
+struct Holder(Arc<Mutex<Option<SIBinder>>>);
+impl Interface for Holder {}
+impl Remotable for Holder {
+    fn descriptor() -> &'static str {
+        HOLDER_DESC
+    }
+    fn on_transact(&self, code: TransactionCode, r: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        match code {
+            TX_HOLD => {
+                *self.0.lock().unwrap() = Some(r.read()?);
+                reply.write(&Status::from(StatusCode::Ok))
+            }
+            _ => Err(StatusCode::UnknownTransaction),
+        }
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn hold_via(holder: &SIBinder, cb: &SIBinder) -> Result<()> {
+    let rp = (**holder)
+        .as_any()
+        .downcast_ref::<rsbinder::rpc::RpcProxy>()
+        .expect("RpcProxy");
+    let mut d = rp.build_request(HOLDER_DESC)?;
+    d.write(cb)?;
+    let mut r = rp
+        .transact(TX_HOLD, &d, 0)?
+        .ok_or(StatusCode::UnexpectedNull)?;
+    let st: Status = r.read()?;
+    if st.is_ok() {
+        Ok(())
+    } else {
+        Err(StatusCode::from(st))
+    }
+}
+
+/// A ping callback that counts its calls, so a oneway one can be seen
+/// landing.
+struct CountingPing(Arc<AtomicUsize>);
+impl Interface for CountingPing {}
+impl IPing for CountingPing {
+    fn ping(&self, s: &str) -> Result<String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("pong:{s}"))
+    }
+}
+
+fn counting_callback() -> (SIBinder, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cb = Interface::as_binder(&Binder::new(BnPing(Box::new(CountingPing(Arc::clone(
+        &calls,
+    ))))));
+    (cb, calls)
+}
+
+/// Call the held callback from a fresh thread — inside no handler — once
+/// twoway and once oneway.
+fn call_back_from_outside(held: &Mutex<Option<SIBinder>>) -> (Result<String>, Result<()>) {
+    let cb = held.lock().unwrap().take().expect("a held callback");
+    thread::spawn(move || {
+        let twoway = ping_via(&cb, "outside");
+        let oneway = (|| {
+            let rp = (*cb)
+                .as_any()
+                .downcast_ref::<rsbinder::rpc::RpcProxy>()
+                .expect("RpcProxy");
+            let mut d = rp.build_request(DESC)?;
+            d.write(&"oneway")?;
+            rp.transact(TX_PING, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+        })();
+        (twoway, oneway)
+    })
+    .join()
+    .expect("caller thread")
+}
+
+fn poll_until(mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    f()
+}
+
+/// Close the session off-thread under a deadline: a TLS incoming thread
+/// that `close_session` fails to wake would hang the test otherwise.
+fn close_within(session: &RpcSession, what: &str) {
+    let s = session.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        s.close_session();
+        let _ = tx.send(s.__incoming_thread_live_count());
+    });
+    let live = rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("{what}: close_session did not return"));
+    assert_eq!(live, 0, "{what}: incoming threads still running");
+}
+
+/// Plan 10-7 Phase 0: `ClientOptions::incoming_connections` on `tls://`.
+/// Each incoming connection is its own TCP connection and TLS session to
+/// the same endpoint, as AOSP `setupClient` opens them over inet; with
+/// one, the server reaches the client's callback from a thread inside no
+/// handler, twoway and oneway, and both ends report `CALLBACKS`. Without
+/// one, the same call fails at once with `WouldBlock`. The outgoing
+/// fan-out, bound by the same unix-only gate before, rides along.
+#[test]
+fn entry_tls_incoming_connections_carry_callbacks() {
+    use rsbinder::TransportCaps;
+
+    let held = Arc::new(Mutex::new(None));
+    let guard = rsbinder::serve("tls://127.0.0.1:0?profile=android13plus")
+        .expect("serve tls://")
+        .with(|o| {
+            o.tls = Some(server_config(SRV_CRT, SRV_KEY));
+            o.threads = Some(2);
+        })
+        .add(
+            "holder",
+            Interface::as_binder(&Binder::new(Holder(Arc::clone(&held)))),
+        )
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+    let addr = guard
+        .server()
+        .expect("rpc server")
+        .tcp_address()
+        .expect("bound TCP address");
+    let open = |incoming: Option<u32>, outgoing: Option<u32>| {
+        rsbinder::Client::open_with(&format!("tls://{addr}?profile=android13plus"), |o, _| {
+            o.tls = Some(client_config_trusting(CA));
+            o.tls_server_name = Some("localhost".to_string());
+            o.incoming_connections = incoming;
+            o.outgoing_connections = outgoing;
+            o.handshake_timeout = Some(Duration::from_secs(5));
+        })
+    };
+
+    // Control: no incoming connection, so nothing for the server to send on.
+    {
+        let client = open(None, None).expect("open tls://");
+        assert!(!client.caps().contains(TransportCaps::CALLBACKS));
+        let (cb, calls) = counting_callback();
+        hold_via(&client.binder("holder").expect("holder"), &cb).expect("hold");
+        let (twoway, oneway) = call_back_from_outside(&held);
+        assert_eq!(twoway, Err(StatusCode::WouldBlock));
+        assert_eq!(oneway, Err(StatusCode::WouldBlock));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    let client = open(Some(1), Some(2)).expect("open tls:// with incoming connections");
+    let session = client.session().expect("rpc session").clone();
+    // Founding + one fan-out (the server allows two) + one incoming.
+    let slots = session.__slot_count();
+    let threads = session.__incoming_thread_count();
+    let caps = client.caps();
+    if slots != 3 || threads != 1 || !caps.contains(TransportCaps::CALLBACKS) {
+        close_within(&session, "shape check");
+        panic!("slots={slots} incoming threads={threads} caps={caps}");
+    }
+
+    let (cb, calls) = counting_callback();
+    hold_via(&client.binder("holder").expect("holder"), &cb).expect("hold");
+    let (twoway, oneway) = call_back_from_outside(&held);
+    let landed = poll_until(|| calls.load(Ordering::SeqCst) == 2);
+    close_within(&session, "tls://");
+    assert_eq!(twoway.as_deref(), Ok("pong:outside"));
+    assert_eq!(oneway, Ok(()));
+    assert!(landed, "the oneway callback never reached the client");
+}
+
+/// The transport-generic session API: `RpcClientConfig` over a transport
+/// the entry does not name — TLS over a Unix socket — with `connect`
+/// called once per connection.
+#[test]
+fn client_config_opens_incoming_connections_over_tls_on_unix() {
+    let path = std::env::temp_dir().join(format!("rsb_tls_in_{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let server =
+        rsbinder::rpc::RpcServer::setup_unix_server_tls(&path, server_config(SRV_CRT, SRV_KEY))
+            .expect("setup_unix_server_tls");
+    server.set_android13plus(2);
+    let held = Arc::new(Mutex::new(None));
+    server
+        .set_root(Interface::as_binder(&Binder::new(Holder(Arc::clone(
+            &held,
+        )))))
+        .expect("set_root");
+    let bg = server.run_background();
+
+    let connects = AtomicUsize::new(0);
+    let session = RpcSession::setup_client_android13plus_with_config(
+        rsbinder::rpc::RpcClientConfig::new(2, || {
+            connects.fetch_add(1, Ordering::SeqCst);
+            let unix = UnixStream::connect(&path)?;
+            let t = TlsTransport::connect_stream(
+                Box::new(unix),
+                "localhost",
+                client_config_trusting(CA),
+            )?;
+            Ok(Box::new(t) as Box<dyn RpcTransport>)
+        })
+        .incoming_connections(1)
+        .handshake_timeout(Duration::from_secs(5)),
+    )
+    .expect("setup over TLS-on-unix with an incoming connection");
+
+    let (cb, calls) = counting_callback();
+    let root = session.get_root().expect("root");
+    hold_via(&root, &cb).expect("hold");
+    let (twoway, oneway) = call_back_from_outside(&held);
+    let landed = poll_until(|| calls.load(Ordering::SeqCst) == 2);
+    close_within(&session, "tls over unix");
+    drop(root);
+    server.stop_accepting();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(connects.load(Ordering::SeqCst), 2, "founding + incoming");
+    assert_eq!(twoway.as_deref(), Ok("pong:outside"));
+    assert_eq!(oneway, Ok(()));
+    assert!(landed, "the oneway callback never reached the client");
+}
+
+/// A TLS server for the two `RpcClientConfig::tls` cases below: android-13+,
+/// two threads, a `PingSvc` root.
+fn tls_ping_server() -> (Arc<rsbinder::rpc::RpcServer>, std::net::SocketAddr) {
+    let server = rsbinder::rpc::RpcServer::setup_tcp_server_tls(
+        "127.0.0.1:0",
+        server_config(SRV_CRT, SRV_KEY),
+    )
+    .expect("setup_tcp_server_tls");
+    server.set_android13plus(2);
+    server.set_max_threads(2);
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+            PingSvc,
+        )))))
+        .expect("set_root");
+    let addr = server.tcp_address().expect("tcp_address");
+    (server, addr)
+}
+
+/// Plan 10-7 Phase 0b: the `tls` constructor drives the same setup the
+/// entry layer uses, fan-out included.
+#[test]
+fn client_config_tls_constructor_opens_a_fan_out_session() {
+    use rsbinder::rpc::RpcClientConfig;
+
+    let (server, addr) = tls_ping_server();
+    let bg = server.run_background();
+    let host = addr.ip().to_string();
+    let session = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::tls(
+            &host,
+            addr.port(),
+            "localhost",
+            client_config_trusting(CA),
+            2,
+        )
+        .outgoing_connections(2)
+        .handshake_timeout(Duration::from_secs(5)),
+    )
+    .expect("tls constructor");
+    assert_eq!(session.negotiated_max_threads(), 2);
+    let root = session.get_root().expect("get_root");
+    assert_eq!(ping_via(&root, "cfg-tls").unwrap(), "pong:cfg-tls");
+
+    drop(root);
+    close_within(&session, "tls constructor");
+    server.stop_accepting();
+    let _ = bg.join();
+}
+
+/// Fd passing needs a Unix-domain socket, so the setup refuses the mode
+/// instead of agreeing on it and failing on the first descriptor sent.
+/// The founding connection decides it, which is what makes the rule reach
+/// a `RpcClientConfig::new` connect function too.
+#[test]
+fn fd_mode_unix_over_tls_is_refused_at_setup() {
+    use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig};
+
+    let (server, addr) = tls_ping_server();
+    server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+    let bg = server.run_background();
+    let host = addr.ip().to_string();
+    let refused = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::tls(
+            &host,
+            addr.port(),
+            "localhost",
+            client_config_trusting(CA),
+            2,
+        )
+        .fd_mode(FileDescriptorTransportMode::Unix)
+        .handshake_timeout(Duration::from_secs(5)),
+    );
+    assert_eq!(refused.err(), Some(StatusCode::BadValue));
+
     server.stop_accepting();
     let _ = bg.join();
 }

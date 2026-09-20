@@ -23,6 +23,10 @@ android_16 = ["rsbinder/android_16"]
 # a STAGE3 harness rather than an example, so it carries the feature
 # rather than the counters being on for everyone.
 test-util = ["rsbinder/test-util"]
+# Plaintext TCP (`rsbinder/rpc-tcp-debug`) for the inet half of
+# `run_rpc_incoming_interop.sh`: libbinder's inet RPC server has no TLS
+# unless both sides set up certificates.
+tcp-debug = ["rsbinder/rpc-tcp-debug"]
 
 [[bin]]
 name = "rpc_hello_service"

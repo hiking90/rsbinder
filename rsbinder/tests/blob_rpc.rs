@@ -130,12 +130,12 @@ impl Bound {
         }
         #[cfg(target_os = "android")]
         {
-            use rsbinder::rpc::RpcUnixClientConfig;
-            let mut cfg = RpcUnixClientConfig::abstract_name(&self.name, 1);
+            use rsbinder::rpc::RpcClientConfig;
+            let mut cfg = RpcClientConfig::unix_abstract(&self.name, 1);
             if fd_mode {
                 cfg = cfg.fd_mode(FdMode::Unix);
             }
-            RpcSession::setup_unix_client_android13plus_with_config(cfg).expect("connect abstract")
+            RpcSession::setup_client_android13plus_with_config(cfg).expect("connect abstract")
         }
     }
 

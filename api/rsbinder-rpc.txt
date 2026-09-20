@@ -2430,13 +2430,33 @@ impl core::marker::UnsafeUnpin for rsbinder::rpc::server::RpcServer
 impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::rpc::server::RpcServer
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::server::RpcServer
 pub mod rsbinder::rpc::session
+pub struct rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> rsbinder::rpc::session::RpcClientConfig<'a>
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::fd_mode(self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::handshake_timeout(self, core::time::Duration) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::incoming_connections(self, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + 'a) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::outgoing_connections(self, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::session_id(self, &'a [u8]) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::timeout(self, core::time::Duration) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix(&'a std::path::Path, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix_abstract(&'a [u8], u32) -> Self
+impl<'a> core::marker::Freeze for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::marker::Sync for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::Unpin for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::UnsafeUnpin for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::session::RpcClientConfig<'a>
 pub struct rsbinder::rpc::session::RpcSession
 impl rsbinder::rpc::session::RpcSession
 pub fn rsbinder::rpc::session::RpcSession::accept_android13plus(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::accept_android13plus_fd(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32, bool) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::add_incoming_connection_android13plus_with_config(&self, rsbinder::rpc::session::RpcUnixClientConfig<'_>) -> rsbinder::Result<u64>
+pub fn rsbinder::rpc::session::RpcSession::add_incoming_connection_with_config(&self, rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_android13plus(&self, impl core::convert::AsRef<std::path::Path>, u32, &[u8]) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_android13plus_with_config(&self, rsbinder::rpc::session::RpcUnixClientConfig<'_>) -> rsbinder::Result<u64>
+pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_with_config(&self, rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::rpc::session::RpcSession::close_session(&self)
 pub fn rsbinder::rpc::session::RpcSession::connect_android13plus(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
@@ -2458,6 +2478,7 @@ pub fn rsbinder::rpc::session::RpcSession::session_id(&self) -> [u8; 32]
 pub fn rsbinder::rpc::session::RpcSession::set_root(&self, rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::session::RpcSession::set_supported_fd_modes(&self, &[rsbinder::rpc::fd_mode::FileDescriptorTransportMode])
 pub fn rsbinder::rpc::session::RpcSession::set_timeout(&self, core::option::Option<core::time::Duration>)
+pub fn rsbinder::rpc::session::RpcSession::setup_client_android13plus_with_config(rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client(impl core::convert::AsRef<std::path::Path>) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client_abstract(&[u8]) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client_android13plus(impl core::convert::AsRef<std::path::Path>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
@@ -2883,6 +2904,24 @@ impl core::marker::Unpin for rsbinder::rpc::address::RpcAddress
 impl core::marker::UnsafeUnpin for rsbinder::rpc::address::RpcAddress
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::rpc::address::RpcAddress
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::address::RpcAddress
+pub struct rsbinder::rpc::RpcClientConfig<'a>
+impl<'a> rsbinder::rpc::session::RpcClientConfig<'a>
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::fd_mode(self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::handshake_timeout(self, core::time::Duration) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::incoming_connections(self, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + 'a) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::outgoing_connections(self, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::session_id(self, &'a [u8]) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::timeout(self, core::time::Duration) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix(&'a std::path::Path, u32) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix_abstract(&'a [u8], u32) -> Self
+impl<'a> core::marker::Freeze for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::marker::Sync for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::Unpin for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::UnsafeUnpin for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> !core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::session::RpcClientConfig<'a>
 pub struct rsbinder::rpc::RpcProxy
 impl rsbinder::rpc::proxy::RpcProxy
 pub fn rsbinder::rpc::proxy::RpcProxy::address(&self) -> rsbinder::rpc::address::RpcAddress
@@ -2964,8 +3003,10 @@ impl rsbinder::rpc::session::RpcSession
 pub fn rsbinder::rpc::session::RpcSession::accept_android13plus(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::accept_android13plus_fd(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32, bool) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::add_incoming_connection_android13plus_with_config(&self, rsbinder::rpc::session::RpcUnixClientConfig<'_>) -> rsbinder::Result<u64>
+pub fn rsbinder::rpc::session::RpcSession::add_incoming_connection_with_config(&self, rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_android13plus(&self, impl core::convert::AsRef<std::path::Path>, u32, &[u8]) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_android13plus_with_config(&self, rsbinder::rpc::session::RpcUnixClientConfig<'_>) -> rsbinder::Result<u64>
+pub fn rsbinder::rpc::session::RpcSession::add_outgoing_connection_with_config(&self, rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<u64>
 pub fn rsbinder::rpc::session::RpcSession::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::rpc::session::RpcSession::close_session(&self)
 pub fn rsbinder::rpc::session::RpcSession::connect_android13plus(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
@@ -2987,6 +3028,7 @@ pub fn rsbinder::rpc::session::RpcSession::session_id(&self) -> [u8; 32]
 pub fn rsbinder::rpc::session::RpcSession::set_root(&self, rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::session::RpcSession::set_supported_fd_modes(&self, &[rsbinder::rpc::fd_mode::FileDescriptorTransportMode])
 pub fn rsbinder::rpc::session::RpcSession::set_timeout(&self, core::option::Option<core::time::Duration>)
+pub fn rsbinder::rpc::session::RpcSession::setup_client_android13plus_with_config(rsbinder::rpc::session::RpcClientConfig<'_>) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client(impl core::convert::AsRef<std::path::Path>) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client_abstract(&[u8]) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::setup_unix_client_android13plus(impl core::convert::AsRef<std::path::Path>, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>

@@ -284,7 +284,7 @@ impl IBinder for RpcProxy {
     /// to AOSP's incoming-thread requirement.
     ///
     /// A client built with
-    /// [`RpcUnixClientConfig::incoming_connections`](super::session::RpcUnixClientConfig::incoming_connections)
+    /// [`RpcClientConfig::incoming_connections`](super::session::RpcClientConfig::incoming_connections)
     /// `≥ 1` *is* served — by the threads on its incoming (callback)
     /// connections — so it observes the drop at once (AOSP
     /// `onSessionAllIncomingThreadsEnded`) with no serve loop of its own.

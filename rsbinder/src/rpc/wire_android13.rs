@@ -1030,7 +1030,7 @@ pub fn client_connect<S: Read + Write>(
 /// writes `RpcNewSessionResponse` for `requestingNewSession`). The
 /// caller enforces uniformity by clamping `max_version =
 /// min(caller_max, session_version)` *before* the handshake (see
-/// [`super::session::RpcSession::add_outgoing_connection_android13plus`]); a peer
+/// [`super::session::RpcSession::add_outgoing_connection_with_config`]); a peer
 /// running a different actual version on an id-echoing attach is an
 /// unverifiable wire condition on both sides.
 pub fn client_connect_with_id<S: Read + Write>(
