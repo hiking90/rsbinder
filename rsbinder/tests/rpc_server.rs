@@ -3672,6 +3672,58 @@ fn b_incoming_config_validation() {
     ));
 }
 
+/// A session `timeout` has nowhere to go on a manual attach. The calls
+/// that take a `RpcClientConfig` refuse it; the deprecated ones shipped
+/// in 0.12.0 ignoring it, and a released call keeps what it did.
+#[allow(deprecated)]
+#[test]
+fn a_manual_attach_with_a_session_timeout() {
+    let h = boot_held_cfg(
+        "b_cfg_timeout",
+        HeldCfg {
+            a13: true,
+            // Room for the outgoing attach beside the founding slot.
+            max_threads: 2,
+            ..Default::default()
+        },
+    );
+    let path = h.server.path().expect("unix path").to_path_buf();
+    let sid = h.client.get_session_id().expect("session id");
+    let timeout = std::time::Duration::from_secs(5);
+
+    assert!(matches!(
+        h.client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&path, 2)
+                .session_id(&sid)
+                .timeout(timeout)
+        ),
+        Err(StatusCode::BadValue)
+    ));
+    assert!(matches!(
+        h.client.add_incoming_connection_with_config(
+            RpcClientConfig::unix(&path, 2)
+                .session_id(&sid)
+                .timeout(timeout)
+        ),
+        Err(StatusCode::BadValue)
+    ));
+
+    h.client
+        .add_outgoing_connection_android13plus_with_config(
+            rsbinder::rpc::RpcUnixClientConfig::path(&path, 2)
+                .session_id(&sid)
+                .timeout(timeout),
+        )
+        .expect("the deprecated outgoing attach still ignores it");
+    h.client
+        .add_incoming_connection_android13plus_with_config(
+            rsbinder::rpc::RpcUnixClientConfig::path(&path, 2)
+                .session_id(&sid)
+                .timeout(timeout),
+        )
+        .expect("the deprecated incoming attach still ignores it");
+}
+
 /// The server budgets callback slots at `2 * max_threads`: a third
 /// incoming connection on a default server is refused (and the partially
 /// built session is dropped), two are admitted.

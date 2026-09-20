@@ -127,7 +127,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `add_outgoing_connection_with_config` and
   `add_incoming_connection_with_config`, which take it; the incoming one
   attaches a callback connection over any transport, where the call it replaces
-  was Unix-only. `RpcClientConfig::tls` resolves its host once per config and
+  was Unix-only. Both refuse a config that sets anything session-wide, such as
+  `timeout`, with `BadValue` — the session they join already has its settings
+  — where the calls they replace accept a `timeout` and ignore it, and still
+  do. `RpcClientConfig::tls` resolves its host once per config and
   opens every connection that config makes to that address (AOSP
   `setupInetClient` does the same); `handshake_timeout` bounds its `connect(2)`
   and TLS handshake too.
@@ -150,16 +153,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `false` on such a parcel in every feature configuration, which is what makes
   `write_blob` store its payload inline there. Nothing about the wire changes,
   and no signature changes; a build with `rpc` behaves as before.
-- **An attach refuses a config that carries a session `timeout`.**
-  `RpcSession::add_outgoing_connection_android13plus_with_config` and
-  `add_incoming_connection_android13plus_with_config` (and the
-  `add_{outgoing,incoming}_connection_with_config` pair that replaces them)
-  return `StatusCode::BadValue` for a config built with
-  `.timeout(..)`. An attach joins a session that already has its deadline, so
-  the value had nowhere to go: it was previously accepted and ignored, which
-  left a caller believing it had bounded replies on that session. Set the
-  deadline where the session is founded, or with `RpcSession::set_timeout`.
-  `handshake_timeout`, which does apply per connection, is unaffected.
 
 ### Deprecated
 

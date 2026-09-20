@@ -148,6 +148,15 @@ impl<'a> RpcUnixClientConfig<'a> {
             handshake_timeout: self.handshake_timeout,
         }
     }
+
+    /// For the deprecated attach calls, which 0.12.0 shipped accepting a
+    /// session `timeout` and ignoring it; they keep doing that.
+    fn into_attach(self) -> RpcClientConfig<'a> {
+        RpcClientConfig {
+            timeout: None,
+            ..self.into_generic()
+        }
+    }
 }
 
 fn unix_connect(addr: RpcUnixAddr<'_>) -> Result<Box<dyn RpcTransport>> {
@@ -338,6 +347,19 @@ struct AttachParts<'a> {
 /// and `incoming_connections > 0` (attaching joins a session someone else
 /// owns; growing the pool is the owner's business) — the consuming setup
 /// call rejects the combination with `BadValue`.
+///
+/// # Manual attach
+///
+/// [`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config)
+/// and
+/// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config)
+/// open one connection on an [`RpcSession`] that already exists. Their
+/// config says how to reach the server — `session_id`, which is required,
+/// and the per-connection knobs — and nothing about the session, whose
+/// settings were fixed when it was founded. A config that asks for more
+/// than one connection or sets something session-wide is
+/// [`StatusCode::BadValue`]; `fd_mode` may restate the mode the session
+/// negotiated and nothing else.
 pub struct RpcClientConfig<'a> {
     source: ClientSource<'a>,
     max_version: u32,
@@ -432,8 +454,8 @@ impl<'a> RpcClientConfig<'a> {
     /// TLS-handshaken. It should bound its own blocking steps
     /// (`connect(2)`, a TLS handshake) if the peer may be silent —
     /// [`handshake_timeout`](Self::handshake_timeout) covers only the
-    /// android-13+ handshake that follows, and only the constructors
-    /// above apply it earlier than that.
+    /// android-13+ handshake that follows; its own doc says which
+    /// constructor applies it to anything earlier.
     ///
     /// `connect` must be [`Send`]: the config can be built on one thread
     /// and consumed on another, which is what the `RpcUnixClientConfig`
@@ -545,13 +567,9 @@ impl<'a> RpcClientConfig<'a> {
     /// peer that completes the handshake and then answers neither would
     /// block the caller forever. Default `None` (no deadline).
     ///
-    /// It belongs to the call that *founds* a session. The attach calls —
-    /// [`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config),
-    /// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config)
-    /// and the deprecated `_android13plus_with_config` pair — join a
-    /// session that already has its deadline, so they refuse a config
-    /// carrying this with [`StatusCode::BadValue`] rather than drop it
-    /// silently. Change an existing session's deadline through
+    /// This is a session-wide setting, so it belongs to the call that
+    /// *founds* a session and a [manual attach](Self#manual-attach)
+    /// refuses it. Change an existing session's deadline through
     /// [`RpcSession::set_timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -2118,9 +2136,8 @@ impl RpcSessionInner {
     /// at all), so the trade favors mixed-waiter correctness.
     ///
     /// `Err(DeadObject)` for a torn-down session; `Err(BadType)` for a
-    /// transport whose traits differ from the founding connection's, as
-    /// [`add_incoming_slot_capped`](Self::add_incoming_slot_capped)
-    /// already reports it. The two are kept apart because a live session
+    /// transport whose traits differ from the founding connection's.
+    /// The two are kept apart because a live session
     /// refusing a mismatched transport must not reach the caller as a
     /// dead one — the caller's answer to `DeadObject` is to drop the
     /// proxy or close the session.
@@ -2169,8 +2186,8 @@ impl RpcSessionInner {
     /// the same critical section — the anti-resurrection gate. Counts
     /// only `incoming` slots (AOSP caps `mIncoming.size()`, not the
     /// callback connections the client opened toward us). Returns
-    /// `Err(FailedTransaction)` at the cap, `Err(DeadObject)` for a
-    /// torn-down session.
+    /// `Err(FailedTransaction)` at the cap; its other refusals are
+    /// [`add_slot_inner`](Self::add_slot_inner)'s, with the same codes.
     fn add_incoming_slot_capped(
         &self,
         transport: Box<dyn RpcTransport>,
@@ -5107,7 +5124,9 @@ impl RpcSession {
         )
     }
 
-    /// Client multi-outgoing using a [`RpcUnixClientConfig`].
+    /// Client multi-outgoing using a [`RpcUnixClientConfig`], held to the
+    /// [manual attach](RpcClientConfig#manual-attach) rule except that a
+    /// session `timeout` is ignored rather than refused.
     #[deprecated(
         since = "0.13.0",
         note = "use `add_outgoing_connection_with_config` with a `RpcClientConfig`"
@@ -5118,19 +5137,13 @@ impl RpcSession {
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
         self.add_outgoing_connection_named(
-            config.into_generic(),
+            config.into_attach(),
             "RpcUnixClientConfig::handshake_timeout",
         )
     }
 
-    /// Client multi-outgoing using a [`RpcClientConfig`] — the config's
-    /// `session_id` is required (this is an attach), and every field an
-    /// attach cannot honor must be left unset, or the call is
-    /// [`StatusCode::BadValue`]: `outgoing_connections` and
-    /// `incoming_connections`, since this call opens exactly one
-    /// connection, and [`timeout`](RpcClientConfig::timeout), since the
-    /// session it joins already has its deadline. `fd_mode` may be given
-    /// only as the mode this session negotiated.
+    /// Client multi-outgoing using a [`RpcClientConfig`], which is held
+    /// to the [manual attach](RpcClientConfig#manual-attach) rule.
     pub fn add_outgoing_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
         self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
     }
@@ -5263,10 +5276,10 @@ impl RpcSession {
     /// android-13+ server session this client founded and serve it on a
     /// thread owned by this session — the manual, one-at-a-time form of
     /// [`RpcUnixClientConfig::incoming_connections`] (AOSP
-    /// `RpcSession::addIncomingConnection`). `config` must carry this
-    /// session's id (`get_session_id()`), no fan-out and no incoming
-    /// count of its own; the server adds the connection as a slot it
-    /// sends on. Returns the new slot id.
+    /// `RpcSession::addIncomingConnection`). `config` is held to the
+    /// [manual attach](RpcClientConfig#manual-attach) rule, except that a
+    /// session `timeout` is ignored rather than refused; the server adds
+    /// the connection as a slot it sends on. Returns the new slot id.
     ///
     /// Profile uniformity is enforced as for the outgoing attach
     /// (R34 ⇒ `BadType`; a server that negotiates the attach below the
@@ -5283,20 +5296,15 @@ impl RpcSession {
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
         self.add_incoming_connection_named(
-            config.into_generic(),
+            config.into_attach(),
             "RpcUnixClientConfig::handshake_timeout",
         )
     }
 
     /// Open one *additional* incoming (callback) connection using a
     /// [`RpcClientConfig`] — on any transport, not only a Unix socket.
-    /// The config's `session_id` is required and every field an attach
-    /// cannot honor must be left unset, or the call is
-    /// [`StatusCode::BadValue`]: `outgoing_connections` and
-    /// `incoming_connections`, since this call opens exactly one
-    /// connection, and [`timeout`](RpcClientConfig::timeout), since the
-    /// session it joins already has its deadline. `fd_mode` may be given
-    /// only as the mode this session negotiated.
+    /// The config is held to the
+    /// [manual attach](RpcClientConfig#manual-attach) rule.
     pub fn add_incoming_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
         self.add_incoming_connection_named(config, "RpcClientConfig::handshake_timeout")
     }
