@@ -22,8 +22,10 @@ interface IStreamSource {
      *
      * Credits are counted in IStreamSink.onBatch calls, not in items or
      * bytes, and they add up: two grants of 4 leave the producer able to
-     * send 8 batches. The producer caps what one batch may hold, so a
-     * granted window bounds the bytes in flight as well as the calls.
+     * send 8 batches. A producer sends a batch once it reaches a byte
+     * threshold, so a granted window bounds the bytes in flight only
+     * for items smaller than that threshold: a larger item still goes
+     * out, in a batch of its own.
      *
      * `credits` must be positive; a producer ignores a grant that is
      * not. A grant that cannot be delivered fails at the sender — the
