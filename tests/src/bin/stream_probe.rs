@@ -15,7 +15,10 @@
 //!   answers `FAILED_TRANSACTION` rather than blocking;
 //! * a consumer whose process is gone turns the producer's next batch
 //!   into `DeadObject` — and a producer parked for credit never gets
-//!   that far, which is the case `link_to_death` on the sink covers.
+//!   that far, which is the case `link_to_death` on the sink covers. The
+//!   consumer's own link, on the source that arrived in `onStart`, is
+//!   made from a binder thread inside a `oneway` handler, which only a
+//!   real driver exercises.
 //!
 //! ```text
 //! stream_probe serve   <name>
@@ -57,10 +60,9 @@ impl IStreamDemo for DemoSvc {
         max_batch_bytes: i32,
         initial_credits: i32,
         delay_micros: i32,
-    ) -> BinderResult<SIBinder> {
-        let (mut producer, source) =
+    ) -> BinderResult<()> {
+        let mut producer =
             Sink::<i32>::with_limits(sink, max_batch_bytes as usize, initial_credits as u32)?;
-        let handle = source.as_binder();
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
@@ -68,7 +70,6 @@ impl IStreamDemo for DemoSvc {
         // The handler returns the source at once; the pushing happens on
         // this thread, outside any transaction.
         thread::spawn(move || {
-            let _source = source;
             let mut stopped_early = false;
             for item in 0..count {
                 if let Err(e) = producer.send(&item) {
@@ -90,7 +91,19 @@ impl IStreamDemo for DemoSvc {
             }
             finished.store(true, Ordering::SeqCst);
         });
-        Ok(handle)
+        Ok(())
+    }
+
+    // The async producer and the failing terminator are covered by the
+    // RPC half; this probe exists for what only the driver shows.
+    fn r#subscribeAsync(
+        &self,
+        _sink: &SIBinder,
+        _count: i32,
+        _max_batch_bytes: i32,
+        _initial_credits: i32,
+    ) -> BinderResult<()> {
+        Err(Status::from(ExceptionCode::UnsupportedOperation))
     }
 
     fn r#subscribeFailing(
@@ -99,9 +112,7 @@ impl IStreamDemo for DemoSvc {
         _count: i32,
         _code: i32,
         _message: &str,
-    ) -> BinderResult<SIBinder> {
-        // The failing terminator is covered by the RPC half; this probe
-        // exists for what only the driver shows.
+    ) -> BinderResult<()> {
         Err(Status::from(ExceptionCode::UnsupportedOperation))
     }
 
@@ -141,10 +152,8 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
 fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    let source = demo
-        .r#subscribe(&sink_binder, count, max_batch_bytes, initial_credits, 0)
+    demo.r#subscribe(&sink_binder, count, max_batch_bytes, initial_credits, 0)
         .map_err(|e| e.transaction_error())?;
-    rx.attach_source(&source)?;
 
     let mut received = 0i32;
     let mut ordered = true;
@@ -188,16 +197,14 @@ fn die(
 ) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    let source = demo
-        .r#subscribe(
-            &sink_binder,
-            i32::MAX,
-            max_batch_bytes,
-            initial_credits,
-            delay_micros,
-        )
-        .map_err(|e| e.transaction_error())?;
-    rx.attach_source(&source)?;
+    demo.r#subscribe(
+        &sink_binder,
+        i32::MAX,
+        max_batch_bytes,
+        initial_credits,
+        delay_micros,
+    )
+    .map_err(|e| e.transaction_error())?;
 
     let mut received = 0;
     while received < take {
@@ -225,10 +232,8 @@ fn die(
 fn orphan(name: &str) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    let source = demo
-        .r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5000)
+    demo.r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5000)
         .map_err(|e| e.transaction_error())?;
-    rx.attach_source(&source)?;
 
     let mut received = 0;
     let outcome = loop {

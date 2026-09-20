@@ -9,7 +9,8 @@
 //! this a binder mechanism: the sink goes out **as a binder object in an
 //! argument**, arrives in another address space as a proxy with no
 //! interface on it, and the producer's `oneway onBatch` has to reach the
-//! receiver through it — while the credit runs the other way.
+//! receiver through it — while the source the producer introduces itself
+//! with travels the same way, and the credit granted on it runs back.
 //!
 //! It also pins the reason streaming needs more of an RPC session than
 //! an ordinary call does. The producer pushes from a thread of its own,
@@ -47,10 +48,22 @@ struct DemoSvc {
 
 impl Interface for DemoSvc {}
 
+/// Where `subscribeAsync` runs its producers. Process-wide and never
+/// dropped: a runtime dropped with a blocking task in flight waits for it.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("runtime")
+    })
+}
+
 impl DemoSvc {
     /// Start the producer on a thread of its own. That is the whole
-    /// point: the handler returns the source right away and the pushing
-    /// happens outside any transaction.
+    /// point: the handler returns right away and the pushing happens
+    /// outside any transaction.
     fn spawn(
         &self,
         sink: &SIBinder,
@@ -59,17 +72,12 @@ impl DemoSvc {
         initial_credits: u32,
         delay: Duration,
         ending: Option<Status>,
-    ) -> BinderResult<SIBinder> {
-        let (mut producer, source) =
-            Sink::<i32>::with_limits(sink, max_batch_bytes, initial_credits)?;
-        let handle = source.as_binder();
+    ) -> BinderResult<()> {
+        let mut producer = Sink::<i32>::with_limits(sink, max_batch_bytes, initial_credits)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
         thread::spawn(move || {
-            // Held so the source object outlives the stream even if the
-            // consumer is slow to resolve it.
-            let _source = source;
             let mut stopped_early = false;
             for item in 0..count {
                 if let Err(e) = producer.send(&item) {
@@ -93,7 +101,7 @@ impl DemoSvc {
             }
             finished.store(true, Ordering::SeqCst);
         });
-        Ok(handle)
+        Ok(())
     }
 }
 
@@ -105,7 +113,7 @@ impl IStreamDemo for DemoSvc {
         max_batch_bytes: i32,
         initial_credits: i32,
         delay_micros: i32,
-    ) -> BinderResult<SIBinder> {
+    ) -> BinderResult<()> {
         self.spawn(
             sink,
             count,
@@ -116,13 +124,42 @@ impl IStreamDemo for DemoSvc {
         )
     }
 
+    fn r#subscribeAsync(
+        &self,
+        sink: &SIBinder,
+        count: i32,
+        max_batch_bytes: i32,
+        initial_credits: i32,
+    ) -> BinderResult<()> {
+        let mut producer =
+            Sink::<i32>::with_limits(sink, max_batch_bytes as usize, initial_credits as u32)?;
+        let sent = self.sent.clone();
+        let finished = self.finished.clone();
+        let last_error = self.last_error.clone();
+        runtime().spawn(async move {
+            let outcome = async {
+                for item in 0..count {
+                    producer.send_async(&item).await?;
+                    sent.fetch_add(1, Ordering::SeqCst);
+                }
+                producer.end_async().await
+            }
+            .await;
+            if let Err(e) = outcome {
+                last_error.store(i32::from(e), Ordering::SeqCst);
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+
     fn r#subscribeFailing(
         &self,
         sink: &SIBinder,
         count: i32,
         code: i32,
         message: &str,
-    ) -> BinderResult<SIBinder> {
+    ) -> BinderResult<()> {
         self.spawn(
             sink,
             count,
@@ -209,14 +246,9 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     );
 
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    let source = f
-        .demo
+    f.demo
         .r#subscribe(&sink_binder, 1000, 64, DEFAULT_CREDIT_WINDOW as i32, 0)
         .expect("subscribe");
-    // The source arrives as a proxy with no interface on it — the RPC
-    // wire carries an address and no descriptor — so this is also the
-    // hand-built `request` path.
-    rx.attach_source(&source).expect("attach_source");
 
     let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
     assert_eq!(got, (0..1000).collect::<Vec<_>>());
@@ -224,6 +256,38 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
         rx.end_status().expect("a terminator arrived").is_ok(),
         "a stream that ran out ends with no exception"
     );
+}
+
+/// The same stream with the producer as a task: waiting for credit
+/// suspends it, and each batch is sent from the blocking pool.
+///
+/// One opening credit and four-byte batches, so all but the first of the
+/// 300 batches wait on a grant that has to cross the session first.
+#[test]
+fn an_async_producer_streams_across_a_session() {
+    let f = fixture("async", 1);
+
+    let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(2);
+    f.demo
+        .r#subscribeAsync(&sink_binder, 300, 4, 1)
+        .expect("subscribeAsync");
+
+    let mut got = Vec::new();
+    while got.len() < 300 {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(item)) => got.push(item),
+            other => panic!("stalled after {} items: {other:?}", got.len()),
+        }
+    }
+    assert_eq!(got, (0..300).collect::<Vec<_>>());
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("a clean end")
+            .is_none()
+            && rx.is_finished(),
+        "the terminator follows the last batch"
+    );
+    assert_eq!(f.demo.r#lastError().expect("lastError"), 0);
 }
 
 /// The producer runs outside any handler, so a session that cannot carry
@@ -257,11 +321,9 @@ fn a_failing_stream_keeps_its_service_specific_code_across_the_wire() {
     let f = fixture("fail", 1);
 
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    let source = f
-        .demo
+    f.demo
         .r#subscribeFailing(&sink_binder, 3, 77, "quota exhausted")
         .expect("subscribeFailing");
-    rx.attach_source(&source).expect("attach_source");
 
     assert_eq!(rx.next().expect("item 0").expect("ok"), 0);
     assert_eq!(rx.next().expect("item 1").expect("ok"), 1);
@@ -283,12 +345,12 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
     let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
     // Four bytes to a batch is one integer to a batch, and one opening
     // credit, so exactly one item may leave before a grant.
-    let source = f
-        .demo
+    f.demo
         .r#subscribe(&sink_binder, 100, 4, 1, 0)
         .expect("subscribe");
 
-    // Deliberately before `attach_source`: nothing can grant credit yet.
+    // Nothing has been read yet, and credit is only granted for batches
+    // the consumer has taken.
     thread::sleep(Duration::from_millis(200));
     assert_eq!(
         f.demo.r#sent().expect("sent"),
@@ -296,7 +358,6 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
         "the opening window is one batch, and nothing has granted more"
     );
 
-    rx.attach_source(&source).expect("attach_source");
     let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
     assert_eq!(got, (0..100).collect::<Vec<_>>());
 }
@@ -305,21 +366,25 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
 /// dead process does on kernel binder (`run_stream_ac.sh`).
 ///
 /// Back-pressure means there is usually no call in flight to fail, so
-/// nothing reports the loss on its own: the death link `attach_source`
-/// puts on the source is what ends the wait.
+/// nothing reports the loss on its own: the death link the receiver put
+/// on the source when `onStart` arrived is what ends the wait.
 #[test]
 fn a_session_that_ends_releases_a_blocked_consumer() {
     let f = fixture("dead", 1);
 
     let (mut rx, sink_binder) = Receiver::<i32>::new();
-    // Paced at 5 ms an item with credit to spare, so when the session
+    // Half a minute between items and credit to spare: after the first
+    // item nothing else arrives within this test, so when the session
     // goes the consumer is waiting and the producer is not parked.
-    let source = f
-        .demo
-        .r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5_000)
+    f.demo
+        .r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 30_000_000)
         .expect("subscribe");
-    rx.attach_source(&source).expect("attach_source");
     assert!(rx.next().expect("item 0").is_ok());
+    // Pays the credit owed for that batch, so nothing is owed when the
+    // session goes. Otherwise the grant made before waiting would run
+    // into the dead session and report the loss itself, and this test
+    // would pass without the death link it is here for.
+    assert!(rx.try_recv().expect("still running").is_none());
 
     f.client.close_session();
 
@@ -350,11 +415,9 @@ fn dropping_the_receiver_stops_the_producer() {
     let f = fixture("drop", 1);
 
     let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
-    let source = f
-        .demo
+    f.demo
         .r#subscribe(&sink_binder, 1_000_000, 4, 1, 0)
         .expect("subscribe");
-    rx.attach_source(&source).expect("attach_source");
     assert_eq!(rx.next().expect("item 0").expect("ok"), 0);
 
     // Parked, and nothing left to grant: with the receiver still here

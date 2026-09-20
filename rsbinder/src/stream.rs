@@ -6,14 +6,17 @@
 //! A binder method returns one value. A method that would return a
 //! million rows either builds the whole list in memory on both sides or
 //! invents its own paging protocol. This module is the third option: the
-//! consumer hands the producer a **sink** to push batches into, and gets
-//! back a **source** it grants credit on, so the producer can only run as
+//! consumer hands the producer a **sink** to push batches into, and
+//! grants credit back as it drains them, so the producer can only run as
 //! far ahead as the consumer allows.
 //!
 //! The contract is two ordinary `.aidl` interfaces,
 //! `rsbinder.stream.IStreamSink` and `rsbinder.stream.IStreamSource`
 //! (`rsbinder/aidl/stream/`), so a C++ or Java peer can be either end
-//! without rsbinder on its side.
+//! without rsbinder on its side. Their shape is the reactive-streams one
+//! — `onStart` / `onBatch` / `onEnd` one way, `request` / `cancel` the
+//! other — and every call in it is `oneway`, so neither end ever waits
+//! on the other's threads.
 //!
 //! ```no_run
 //! # use rsbinder::*;
@@ -21,10 +24,10 @@
 //! # #[derive(Default)] struct Row;
 //! # impl Serialize for Row { fn serialize(&self, _p: &mut Parcel) -> Result<()> { Ok(()) } }
 //! # fn rows() -> Vec<Row> { Vec::new() }
-//! # fn in_a_handler(sink_binder: &SIBinder) -> Result<SIBinder> {
-//! // Service: called with the consumer's sink, hands back the source.
-//! let (mut sink, source) = Sink::<Row>::new(sink_binder)?;
-//! let handle = source.as_binder();
+//! # fn in_a_handler(sink_binder: &SIBinder) -> Result<()> {
+//! // Service: called with the consumer's sink. The method itself has
+//! // nothing to return — the stream's own calls carry everything.
+//! let mut sink = Sink::<Row>::new(sink_binder)?;
 //! std::thread::spawn(move || {
 //!     for row in rows() {
 //!         // Blocks here once the granted window is used up.
@@ -34,21 +37,31 @@
 //!     }
 //!     let _ = sink.end();
 //! });
-//! Ok(handle)
+//! Ok(())
 //! # }
 //! ```
+//!
+//! An async service does the same from a task, where waiting for credit
+//! suspends the task instead of parking a thread:
+#![cfg_attr(
+    feature = "tokio",
+    doc = "[`Sink::send_async`] and [`Sink::end_async`]."
+)]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = "`Sink::send_async` and `Sink::end_async` (`tokio` feature)."
+)]
 //!
 //! ```no_run
 //! # use rsbinder::*;
 //! # use rsbinder::stream::Receiver;
 //! # #[derive(Default)] struct Row;
 //! # impl Deserialize for Row { fn deserialize(_p: &mut Parcel) -> Result<Self> { Ok(Row) } }
-//! # fn subscribe(_sink: &SIBinder) -> Result<SIBinder> { unimplemented!() }
+//! # fn subscribe(_sink: &SIBinder) -> Result<()> { unimplemented!() }
 //! # fn consume() -> Result<()> {
-//! // Consumer: make the receiver, pass its sink, attach the source.
+//! // Consumer: make the receiver, pass its sink, read.
 //! let (mut rx, sink_binder) = Receiver::<Row>::new();
-//! let source = subscribe(&sink_binder)?;
-//! rx.attach_source(&source)?;
+//! subscribe(&sink_binder)?;
 //! for row in &mut rx {
 //!     let _row = row?;
 //! }
@@ -97,15 +110,16 @@
 //! watches the other's binder instead: the producer's [`Sink::send`]
 //! reports [`StatusCode::DeadObject`] rather than staying parked for
 //! credit, and the consumer's [`Receiver::recv`] yields that same error
-//! rather than waiting for a batch. The consumer's half needs
-//! [`Receiver::attach_source`] — before that it holds no remote handle to
-//! watch.
+//! rather than waiting for a batch. The consumer starts watching when the
+//! producer's `onStart` arrives, which is before any batch can.
 //!
-//! **Ordering.** `onBatch` and `onEnd` are both `oneway` to the same
-//! object, and the kernel keeps `oneway` calls to one node in order, so
-//! the terminator cannot overtake the batches. The credit call runs the
-//! other way and is `twoway`, which is how a grant also reports that the
-//! consumer is still alive.
+//! **Ordering.** `onStart`, `onBatch` and `onEnd` are all `oneway` to the
+//! same object, and both transports keep `oneway` calls to one object in
+//! order — the kernel per node, an RPC session per address — so the
+//! source is known before the first batch and the terminator cannot
+//! overtake the last. Credit runs the other way and is `oneway` too: a
+//! grant costs the consumer one local send, never a wait on the
+//! producer's threads.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -120,7 +134,7 @@ use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
 // The generated contract is an implementation detail: the public surface
-// here is `Sink`, `Receiver` and `Source`, all of which speak `SIBinder`.
+// here is `Sink` and `Receiver`, both of which speak `SIBinder`.
 // Exposing the tree would put every generated trait, proxy and stub under
 // the crate's stability promise, and a caller that wants the raw
 // interface can compile the shipped `.aidl` itself.
@@ -164,7 +178,7 @@ pub const DEFAULT_CREDIT_WINDOW: u32 = 4;
 // Shared credit state (producer side)
 // ---------------------------------------------------------------------
 
-/// What the producer waits on and the [`Source`]'s binder feeds.
+/// What the producer waits on and the source object's binder feeds.
 #[derive(Default)]
 struct CreditState {
     /// Batches the producer may still send.
@@ -182,6 +196,10 @@ struct Credit {
     /// Woken by a grant, a cancel and the consumer's death — each of the
     /// three releases a waiting producer.
     wake: Condvar,
+    /// The same three, for a producer suspended in
+    /// [`wait_credit_async`](Self::wait_credit_async).
+    #[cfg(feature = "tokio")]
+    notify: tokio::sync::Notify,
 }
 
 impl Credit {
@@ -194,17 +212,39 @@ impl Credit {
             let mut state = self.lock();
             state.available = state.available.saturating_add(credits as u64);
         }
-        self.wake.notify_all();
+        self.wake_all();
     }
 
     fn cancel(&self) {
         self.lock().canceled = true;
-        self.wake.notify_all();
+        self.wake_all();
     }
 
     fn mark_dead(&self) {
         self.lock().dead = true;
+        self.wake_all();
+    }
+
+    fn wake_all(&self) {
         self.wake.notify_all();
+        #[cfg(feature = "tokio")]
+        self.notify.notify_waiters();
+    }
+
+    /// One step of taking a credit: the answer if there is one now,
+    /// `None` if the caller has to wait.
+    fn poll_credit(state: &mut CreditState) -> Option<Result<()>> {
+        if state.dead {
+            return Some(Err(StatusCode::DeadObject));
+        }
+        if state.canceled {
+            return Some(Err(StatusCode::InvalidOperation));
+        }
+        if state.available > 0 {
+            state.available -= 1;
+            return Some(Ok(()));
+        }
+        None
     }
 
     fn is_canceled(&self) -> bool {
@@ -237,17 +277,26 @@ impl Credit {
     fn wait_credit(&self) -> Result<()> {
         let mut state = self.lock();
         loop {
-            if state.dead {
-                return Err(StatusCode::DeadObject);
-            }
-            if state.canceled {
-                return Err(StatusCode::InvalidOperation);
-            }
-            if state.available > 0 {
-                state.available -= 1;
-                return Ok(());
+            if let Some(answer) = Self::poll_credit(&mut state) {
+                return answer;
             }
             state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// [`wait_credit`](Self::wait_credit) that suspends the task instead
+    /// of parking the thread.
+    #[cfg(feature = "tokio")]
+    async fn wait_credit_async(&self) -> Result<()> {
+        loop {
+            // Created before the check: a `Notified` receives
+            // `notify_waiters` from the moment it exists, so a grant that
+            // lands between the check and the await is not missed.
+            let notified = self.notify.notified();
+            if let Some(answer) = Self::poll_credit(&mut self.lock()) {
+                return answer;
+            }
+            notified.await;
         }
     }
 }
@@ -297,11 +346,10 @@ impl IStreamSource for SourceObject {
         if credits <= 0 {
             // A grant of nothing is a caller mistake, and a negative one
             // would have to mean "take credit back", which the producer
-            // may already have spent.
-            return Err(Status::from((
-                ExceptionCode::IllegalArgument,
-                "IStreamSource.request needs a positive credit count",
-            )));
+            // may already have spent. The call is `oneway`, so the log
+            // is the only place this can be said.
+            log::warn!("stream: ignoring a grant of {credits} credits");
+            return Ok(());
         }
         self.0.grant(credits as u32);
         Ok(())
@@ -310,47 +358,6 @@ impl IStreamSource for SourceObject {
     fn r#cancel(&self) -> BinderResult<()> {
         self.0.cancel();
         Ok(())
-    }
-}
-
-/// The producer end as the consumer sees it: the binder to hand back,
-/// and what it reports.
-///
-/// Created together with a [`Sink`] by [`Sink::new`]. Keep it alive for
-/// as long as the stream runs — dropping it does not stop the stream,
-/// but the consumer's grants land nowhere once its binder is gone.
-pub struct Source {
-    credit: Arc<Credit>,
-    binder: SIBinder,
-}
-
-impl Source {
-    /// The binder to return from the method that started the stream.
-    ///
-    /// Declare it in `.aidl` as `rsbinder.stream.IStreamSource`, or as a
-    /// bare `IBinder`; the consumer passes it to
-    /// [`Receiver::attach_source`] either way.
-    pub fn as_binder(&self) -> SIBinder {
-        self.binder.clone()
-    }
-
-    /// Batches the producer may still send without waiting.
-    pub fn credits(&self) -> u64 {
-        self.credit.lock().available
-    }
-
-    /// Whether the consumer has asked for no more items.
-    pub fn is_canceled(&self) -> bool {
-        self.credit.is_canceled()
-    }
-}
-
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Source")
-            .field("credits", &self.credits())
-            .field("canceled", &self.is_canceled())
-            .finish()
     }
 }
 
@@ -426,15 +433,16 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
 /// The producer's handle on a stream: write items in, they leave in
 /// batches.
 ///
-/// Made by [`Sink::new`] from the sink binder the consumer supplied,
-/// together with the [`Source`] to hand back. Values of `T` are encoded
-/// with the same codec as [`crate::to_bytes`], so the consumer's `T` need
-/// only agree on the wire, not be the same Rust type.
+/// Made by [`Sink::new`] from the sink binder the consumer supplied.
+/// Values of `T` are encoded with the same codec as [`crate::to_bytes`],
+/// so the consumer's `T` need only agree on the wire, not be the same
+/// Rust type.
 ///
-/// Every method that produces takes `&mut self`, so one thread at a time
-/// sends and the pending batch needs no lock of its own. Moving the sink
-/// to a worker thread after construction is the usual shape — see the
-/// [module docs](self).
+/// Every method that produces takes `&mut self`, so one thread or task at
+/// a time sends and the pending batch needs no lock of its own. Moving
+/// the sink to a worker thread after construction is the usual shape —
+/// see the [module docs](self) — and with the `tokio` feature the
+/// `*_async` methods do the same from a task.
 ///
 /// Call [`end`](Self::end) on every path, including the failing ones.
 /// A `Sink` dropped without it still flushes what it can and still
@@ -442,7 +450,8 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
 /// but the stream is reported as having ended badly, because from the
 /// consumer's side that is all a vanished producer can mean.
 pub struct Sink<T: ?Sized> {
-    peer: Peer<dyn IStreamSink>,
+    /// Shared so an async send can move it onto the blocking pool.
+    peer: Arc<Peer<dyn IStreamSink>>,
     credit: Arc<Credit>,
     /// Items encoded so far, awaiting a batch send.
     batch: Parcel,
@@ -451,6 +460,10 @@ pub struct Sink<T: ?Sized> {
     /// Set once a terminator has gone out, so `Drop` does not send a
     /// second one.
     ended: bool,
+    /// The object the consumer grants credit on. Held here so it lives
+    /// exactly as long as the producer does; the consumer got its own
+    /// reference in `onStart`.
+    _source: SIBinder,
     /// Holds the death link on the sink; the binder keeps only a `Weak`.
     _death: Option<Arc<dyn crate::DeathRecipient>>,
     _item: PhantomData<fn(&T)>,
@@ -474,7 +487,9 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   A binder with no interface yet — an RPC proxy fresh off the wire
     ///   — cannot be checked and is accepted; a wrong one then shows up
     ///   as the consumer's server refusing the interface token.
-    pub fn new(sink: &SIBinder) -> Result<(Self, Source)> {
+    /// - Whatever sending `onStart` fails with — [`StatusCode::DeadObject`]
+    ///   for a consumer that is already gone.
+    pub fn new(sink: &SIBinder) -> Result<Self> {
         Self::with_limits(sink, DEFAULT_MAX_BATCH_BYTES, DEFAULT_CREDIT_WINDOW)
     }
 
@@ -503,7 +518,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
         sink: &SIBinder,
         max_batch_bytes: usize,
         initial_credits: u32,
-    ) -> Result<(Self, Source)> {
+    ) -> Result<Self> {
         if initial_credits == 0 {
             log::error!("Sink::with_limits: the opening window must be at least one batch");
             return Err(StatusCode::BadValue);
@@ -516,25 +531,22 @@ impl<T: Serialize + ?Sized> Sink<T> {
         )?;
         let credit = Arc::new(Credit::default());
         credit.grant(initial_credits);
-        let source_binder = BnStreamSource::new_binder(SourceObject(credit.clone())).as_binder();
+        let source = BnStreamSource::new_binder(SourceObject(credit.clone())).as_binder();
         let death = watch_death(sink, SinkDeath(credit.clone()));
-        let sink = Sink {
-            peer,
-            credit: credit.clone(),
+        // Before anything else can be sent, so the consumer knows where
+        // to grant and whom to watch by the time the first batch lands.
+        peer.on_start(&source)?;
+        Ok(Sink {
+            peer: Arc::new(peer),
+            credit,
             batch: Parcel::new_data_only(),
             count: 0,
             max_batch_bytes: max_batch_bytes.max(1),
             ended: false,
+            _source: source,
             _death: death,
             _item: PhantomData,
-        };
-        Ok((
-            sink,
-            Source {
-                credit,
-                binder: source_binder,
-            },
-        ))
+        })
     }
 
     /// Add one item to the stream.
@@ -562,6 +574,15 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   item holding a binder or a file descriptor. The already-queued
     ///   items are unaffected and still go out.
     pub fn send(&mut self, item: &T) -> Result<()> {
+        if self.encode(item)? {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Queue one item. `true` when the batch has reached its threshold
+    /// and should go out.
+    fn encode(&mut self, item: &T) -> Result<bool> {
         let mark = self.batch.data_size();
         if let Err(e) = self.batch.write(item) {
             // A failed encode may have written part of the item. Cut the
@@ -571,10 +592,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
             return Err(e);
         }
         self.count += 1;
-        if self.batch.data_size() >= self.max_batch_bytes {
-            self.flush()?;
-        }
-        Ok(())
+        Ok(self.batch.data_size() >= self.max_batch_bytes)
     }
 
     /// [`send`](Self::send) for each item in turn, stopping at the first
@@ -606,7 +624,8 @@ impl<T: Serialize + ?Sized> Sink<T> {
             return Ok(());
         }
         self.credit.wait_credit()?;
-        self.send_batch()
+        let (bytes, count) = self.take_pending()?;
+        self.peer.on_batch(&bytes, count)
     }
 
     /// Finish the stream: the items ran out, nothing went wrong.
@@ -667,6 +686,81 @@ impl<T: Serialize + ?Sized> Sink<T> {
         self.peer.on_end(exception, service_specific, message)
     }
 
+    /// [`send`](Self::send) for a producer running as a task.
+    ///
+    /// Same contract, with the two waits moved off the executor thread:
+    /// waiting for credit suspends the task, and the batch itself is
+    /// sent from the blocking pool, the way every generated async proxy
+    /// sends ([`Tokio`](crate::Tokio)).
+    ///
+    /// The item is encoded **when this is called**, not when the future
+    /// is first polled, so the future does not borrow `item` and stays
+    /// `Send` whatever `T` is. Dropping the future unpolled therefore
+    /// leaves the item queued. Dropping it mid-wait is safe too: a credit
+    /// not yet taken stays with the stream, and a batch already handed to
+    /// the pool still goes out.
+    #[cfg(feature = "tokio")]
+    #[must_use = "the item is queued, but a full batch is only sent when this is awaited"]
+    pub fn send_async(
+        &mut self,
+        item: &T,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        let encoded = self.encode(item);
+        async move {
+            if encoded? {
+                self.flush_async().await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// [`flush`](Self::flush) for a producer running as a task.
+    #[cfg(feature = "tokio")]
+    pub async fn flush_async(&mut self) -> Result<()> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        self.credit.wait_credit_async().await?;
+        let (bytes, count) = self.take_pending()?;
+        let peer = self.peer.clone();
+        on_pool(move || peer.on_batch(&bytes, count)).await
+    }
+
+    /// [`end`](Self::end) for a producer running as a task.
+    #[cfg(feature = "tokio")]
+    pub async fn end_async(self) -> Result<()> {
+        self.terminate_async(ExceptionCode::None as i32, 0, None)
+            .await
+    }
+
+    /// [`end_with`](Self::end_with) for a producer running as a task.
+    #[cfg(feature = "tokio")]
+    pub async fn end_with_async(self, status: &Status) -> Result<()> {
+        let (exception, service_specific, message) = status_fields(status)?;
+        self.terminate_async(exception, service_specific, message)
+            .await
+    }
+
+    #[cfg(feature = "tokio")]
+    async fn terminate_async(
+        mut self,
+        exception: i32,
+        service_specific: i32,
+        message: Option<String>,
+    ) -> Result<()> {
+        // Same rule as `terminate`: only a cancel lets the terminator go
+        // out after a failed flush.
+        if let Err(e) = self.flush_async().await {
+            if !self.credit.is_canceled() {
+                self.ended = true;
+                return Err(e);
+            }
+        }
+        self.ended = true;
+        let peer = self.peer.clone();
+        on_pool(move || peer.on_end(exception, service_specific, message.as_deref())).await
+    }
+
     /// Whether the consumer has asked for no more items.
     ///
     /// The one way to tell a cancelled stream from an unusable transport
@@ -714,14 +808,27 @@ impl<T: Serialize + ?Sized> Sink<T> {
 // terminating do not, and `Drop` has to be implemented for exactly the
 // bounds the struct was declared with.
 impl<T: ?Sized> Sink<T> {
-    /// Hand the pending batch to the consumer. A credit must already
-    /// have been taken for it.
-    fn send_batch(&mut self) -> Result<()> {
+    /// Take the pending batch out, leaving an empty one. The caller has
+    /// taken a credit for it and sends it next.
+    fn take_pending(&mut self) -> Result<(Vec<u8>, i32)> {
         let batch = std::mem::replace(&mut self.batch, Parcel::new_data_only());
         let count = std::mem::replace(&mut self.count, 0);
-        let bytes = batch.into_bytes()?;
-        self.peer.on_batch(&bytes, count)
+        Ok((batch.into_bytes()?, count))
     }
+}
+
+/// Run one binder call on the blocking pool and await its result.
+///
+/// Through [`Tokio`](crate::Tokio) rather than `spawn_blocking` directly:
+/// inside a transaction handler the call has to stay on the current
+/// thread — the kernel's deadlock avoidance and the RPC stack's
+/// connection pin both depend on it — and that rule lives there.
+#[cfg(feature = "tokio")]
+async fn on_pool<F>(call: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    <crate::Tokio as crate::BinderAsyncPool>::spawn(call, |result| async move { result }).await
 }
 
 impl<T: ?Sized> Drop for Sink<T> {
@@ -744,7 +851,10 @@ impl<T: ?Sized> Drop for Sink<T> {
             return;
         }
         if self.count > 0 && self.credit.try_credit() {
-            if let Err(e) = self.send_batch() {
+            let sent = self
+                .take_pending()
+                .and_then(|(bytes, count)| self.peer.on_batch(&bytes, count));
+            if let Err(e) = sent {
                 log::warn!("stream: the last batch could not be delivered: {e:?}");
             }
         }
@@ -774,6 +884,21 @@ impl<I: FromIBinder + ?Sized> Peer<I> {
 }
 
 impl Peer<dyn IStreamSink> {
+    fn on_start(&self, source: &SIBinder) -> Result<()> {
+        match self {
+            Peer::Typed(sink) => sink.r#onStart(source).map_err(StatusCode::from),
+            #[cfg(feature = "rpc")]
+            Peer::Unstamped(binder) => {
+                let proxy = Self::rpc_proxy(binder)?;
+                let mut data = proxy.build_request(<BpStreamSink as crate::Proxy>::descriptor())?;
+                data.write(source)?;
+                proxy
+                    .transact(sink_transactions::r#onStart, &data, ONEWAY_FLAGS)
+                    .map(|_| ())
+            }
+        }
+    }
+
     fn on_batch(&self, items: &[u8], count: i32) -> Result<()> {
         match self {
             Peer::Typed(sink) => sink.r#onBatch(items, count).map_err(StatusCode::from),
@@ -887,7 +1012,10 @@ fn exception_from_i32(exception: i32) -> Result<ExceptionCode> {
 // Consumer
 // ---------------------------------------------------------------------
 
-/// Batches and the terminator, as they arrive.
+/// What the sink object receives, and what the consumer has asked for.
+///
+/// Shared between the binder threads that deliver the producer's calls
+/// and the one thread or task that consumes.
 #[derive(Default)]
 struct StreamState {
     /// Undecoded batches: bytes and the item count the producer stated.
@@ -895,8 +1023,20 @@ struct StreamState {
     /// surfaces as its error rather than being dropped on a binder
     /// worker.
     batches: VecDeque<(Vec<u8>, i32)>,
-    /// Set once by `onEnd`; `None` while the stream runs.
+    /// Set once — by `onEnd`, by the producer's death, or by a grant that
+    /// could not be sent with nothing left to prompt another. `None`
+    /// while the stream runs.
     end: Option<Status>,
+    /// Where to grant and cancel; `None` until `onStart` arrives.
+    source: Option<Arc<Peer<dyn IStreamSource>>>,
+    /// Holds the death link on the source; the binder keeps only a
+    /// `Weak`.
+    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The consumer wants no more. An `onStart` that arrives after this
+    /// is answered with a cancel on the spot.
+    canceled: bool,
+    /// The receiver is gone, so nothing will drain a batch again.
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -917,6 +1057,18 @@ impl Stream {
         #[cfg(feature = "tokio")]
         self.notify.notify_waiters();
     }
+
+    /// End the stream with `status` unless something already has.
+    fn end_with(&self, status: Status) {
+        {
+            let mut state = self.lock();
+            if state.end.is_some() {
+                return;
+            }
+            state.end = Some(status);
+        }
+        self.wake();
+    }
 }
 
 /// Watches the producer's source so a consumer blocked in
@@ -924,19 +1076,15 @@ impl Stream {
 ///
 /// It ends the stream the same way a terminator does, with
 /// [`StatusCode::DeadObject`] as the reason, so every consuming path
-/// reports it without a case of its own.
-struct SourceDeath(Arc<Stream>);
+/// reports it without a case of its own. `Weak`, because the stream
+/// state owns this recipient.
+struct SourceDeath(std::sync::Weak<Stream>);
 
 impl crate::DeathRecipient for SourceDeath {
     fn binder_died(&self, _who: &crate::WIBinder) {
-        {
-            let mut state = self.0.lock();
-            if state.end.is_some() {
-                return;
-            }
-            state.end = Some(Status::from(StatusCode::DeadObject));
+        if let Some(stream) = self.0.upgrade() {
+            stream.end_with(Status::from(StatusCode::DeadObject));
         }
-        self.0.wake();
     }
 }
 
@@ -946,6 +1094,43 @@ struct SinkObject(Arc<Stream>);
 impl Interface for SinkObject {}
 
 impl IStreamSink for SinkObject {
+    fn r#onStart(&self, source: &SIBinder) -> BinderResult<()> {
+        let peer = match resolve_peer::<dyn IStreamSource>(
+            source,
+            <BpStreamSource as crate::Proxy>::descriptor(),
+            "IStreamSink.onStart",
+        ) {
+            Ok(peer) => Arc::new(peer),
+            Err(code) => {
+                // Without a usable source there is no way to grant, so
+                // the stream would stall after the opening window. Say
+                // so now; the call is `oneway`, so the consumer is the
+                // only one who can be told.
+                self.0.end_with(Status::from(code));
+                return Ok(());
+            }
+        };
+        // Linked before taking the lock: no binder call under it.
+        let death = watch_death(source, SourceDeath(Arc::downgrade(&self.0)));
+        let cancel_now = {
+            let mut state = self.0.lock();
+            if state.source.is_some() {
+                log::warn!("stream: ignoring a second onStart");
+                return Ok(());
+            }
+            if !state.closed {
+                state.source = Some(peer.clone());
+                state.death = death;
+            }
+            state.canceled
+        };
+        if cancel_now {
+            // The consumer gave up before the producer got this far.
+            let _ = peer.cancel();
+        }
+        Ok(())
+    }
+
     fn r#onBatch(&self, items: &[u8], count: i32) -> BinderResult<()> {
         if count < 0 {
             return Err(Status::from((
@@ -955,10 +1140,10 @@ impl IStreamSink for SinkObject {
         }
         {
             let mut state = self.0.lock();
-            // After the terminator nothing is part of the stream. A
-            // producer that keeps sending is misbehaving; dropping is
-            // quieter than growing a queue nobody drains.
-            if state.end.is_some() {
+            // After the terminator nothing is part of the stream, and
+            // after the receiver is gone nothing drains. Dropping is
+            // quieter than growing a queue nobody reads.
+            if state.end.is_some() || state.closed {
                 return Ok(());
             }
             state.batches.push_back((items.to_vec(), count));
@@ -979,24 +1164,27 @@ impl IStreamSink for SinkObject {
             // stop; report the decode failure as the reason it did.
             Err(code) => Status::from(code),
         };
-        {
-            let mut state = self.0.lock();
-            if state.end.is_none() {
-                state.end = Some(status);
-            }
-        }
-        self.0.wake();
+        self.0.end_with(status);
         Ok(())
     }
+}
+
+/// What the queue holds right now.
+enum Queued {
+    Batch((Vec<u8>, i32)),
+    /// Nothing queued and the stream is over.
+    End,
+    /// Nothing queued and the stream is still running.
+    Nothing,
 }
 
 /// The consumer's end of a stream: items come out in the order the
 /// producer sent them.
 ///
 /// Made by [`Receiver::new`], which also produces the sink binder to pass
-/// to the service. Attach the source the service returns with
-/// [`attach_source`](Self::attach_source) — without it the producer stops
-/// once its opening window is used up.
+/// to the service. That is the whole setup: the producer introduces
+/// itself over the sink, and from then on the receiver grants credit as
+/// it drains and watches the producer for death.
 ///
 /// Consume with [`recv`](Self::recv), or by iterating: `Receiver`
 /// implements [`Iterator`] over `BinderResult<T>`, ending when the
@@ -1004,7 +1192,6 @@ impl IStreamSink for SinkObject {
 pub struct Receiver<T> {
     stream: Arc<Stream>,
     sink_binder: SIBinder,
-    source: Option<Peer<dyn IStreamSource>>,
     window: u32,
     /// Batches taken from the queue but not yet paid for with a grant.
     unacked: u32,
@@ -1013,8 +1200,6 @@ pub struct Receiver<T> {
     /// Set once the terminator or a decode failure has been reported, so
     /// the error is yielded once and the stream then reads as finished.
     finished: bool,
-    /// Holds the death link on the source; the binder keeps only a `Weak`.
-    _death: Option<Arc<dyn crate::DeathRecipient>>,
 }
 
 impl<T: Deserialize> Receiver<T> {
@@ -1039,12 +1224,10 @@ impl<T: Deserialize> Receiver<T> {
         let receiver = Receiver {
             stream,
             sink_binder: sink_binder.clone(),
-            source: None,
             window: window.max(1),
             unacked: 0,
             decoded: VecDeque::new(),
             finished: false,
-            _death: None,
         };
         (receiver, sink_binder)
     }
@@ -1053,32 +1236,6 @@ impl<T: Deserialize> Receiver<T> {
     /// [`new`](Self::new) returned.
     pub fn sink_binder(&self) -> SIBinder {
         self.sink_binder.clone()
-    }
-
-    /// Take the source the service returned, so grants can reach the
-    /// producer.
-    ///
-    /// Until this is called the producer runs on its opening window alone
-    /// and then stops. Calling it twice replaces the source.
-    ///
-    /// This is also where the producer's process starts being watched: if
-    /// it dies the stream ends with [`StatusCode::DeadObject`] instead of
-    /// leaving [`recv`](Self::recv) blocked for a batch that nobody will
-    /// send. A receiver with no source attached has no remote handle to
-    /// watch and so keeps waiting.
-    ///
-    /// # Errors
-    ///
-    /// [`StatusCode::BadType`] when `source` states an interface other
-    /// than `rsbinder.stream.IStreamSource`.
-    pub fn attach_source(&mut self, source: &SIBinder) -> Result<()> {
-        self.source = Some(resolve_peer::<dyn IStreamSource>(
-            source,
-            <BpStreamSource as crate::Proxy>::descriptor(),
-            "Receiver::attach_source",
-        )?);
-        self._death = watch_death(source, SourceDeath(self.stream.clone()));
-        Ok(())
     }
 
     /// The next item, blocking until one arrives.
@@ -1091,36 +1248,18 @@ impl<T: Deserialize> Receiver<T> {
     /// available from [`end_status`](Self::end_status) afterwards.
     pub fn recv(&mut self) -> Option<BinderResult<T>> {
         loop {
-            if let Some(item) = self.decoded.pop_front() {
-                return Some(Ok(item));
+            if let Some(done) = self.advance() {
+                return done;
             }
-            if self.finished {
-                return None;
-            }
-            let batch = {
-                let mut state = self.stream.lock();
-                loop {
-                    if let Some(batch) = state.batches.pop_front() {
-                        break Some(batch);
-                    }
-                    if state.end.is_some() {
-                        break None;
-                    }
-                    state = self
-                        .stream
-                        .arrived
-                        .wait(state)
-                        .unwrap_or_else(|e| e.into_inner());
-                }
-            };
-            match batch {
-                Some(batch) => {
-                    if let Err(e) = self.take_batch(batch) {
-                        self.finished = true;
-                        return Some(Err(e.into()));
-                    }
-                }
-                None => return self.finish(),
+            // Nothing queued. Re-checked under the lock, so a batch that
+            // landed since `advance` looked is not slept through.
+            let mut state = self.stream.lock();
+            while state.batches.is_empty() && state.end.is_none() {
+                state = self
+                    .stream
+                    .arrived
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
             }
         }
     }
@@ -1131,30 +1270,9 @@ impl<T: Deserialize> Receiver<T> {
     /// running; the stream being over reads as `Ok(None)` too, which
     /// [`is_finished`](Self::is_finished) tells apart.
     pub fn try_recv(&mut self) -> BinderResult<Option<T>> {
-        loop {
-            if let Some(item) = self.decoded.pop_front() {
-                return Ok(Some(item));
-            }
-            if self.finished {
-                return Ok(None);
-            }
-            let batch = {
-                let mut state = self.stream.lock();
-                match state.batches.pop_front() {
-                    Some(batch) => Some(batch),
-                    None if state.end.is_some() => None,
-                    None => return Ok(None),
-                }
-            };
-            match batch {
-                Some(batch) => {
-                    if let Err(e) = self.take_batch(batch) {
-                        self.finished = true;
-                        return Err(e.into());
-                    }
-                }
-                None => return self.finish().transpose(),
-            }
+        match self.advance() {
+            Some(done) => done.transpose(),
+            None => Ok(None),
         }
     }
 
@@ -1165,41 +1283,21 @@ impl<T: Deserialize> Receiver<T> {
     pub fn recv_timeout(&mut self, timeout: Duration) -> BinderResult<Option<T>> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(item) = self.decoded.pop_front() {
-                return Ok(Some(item));
+            if let Some(done) = self.advance() {
+                return done.transpose();
             }
-            if self.finished {
-                return Ok(None);
-            }
-            let batch = {
-                let mut state = self.stream.lock();
-                loop {
-                    if let Some(batch) = state.batches.pop_front() {
-                        break Some(batch);
-                    }
-                    if state.end.is_some() {
-                        break None;
-                    }
-                    let left = match deadline.checked_duration_since(Instant::now()) {
-                        Some(left) if !left.is_zero() => left,
-                        _ => return Ok(None),
-                    };
-                    let (next, _) = self
-                        .stream
-                        .arrived
-                        .wait_timeout(state, left)
-                        .unwrap_or_else(|e| e.into_inner());
-                    state = next;
-                }
-            };
-            match batch {
-                Some(batch) => {
-                    if let Err(e) = self.take_batch(batch) {
-                        self.finished = true;
-                        return Err(e.into());
-                    }
-                }
-                None => return self.finish().transpose(),
+            let mut state = self.stream.lock();
+            while state.batches.is_empty() && state.end.is_none() {
+                let left = match deadline.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => left,
+                    _ => return Ok(None),
+                };
+                let (next, _) = self
+                    .stream
+                    .arrived
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
             }
         }
     }
@@ -1211,50 +1309,25 @@ impl<T: Deserialize> Receiver<T> {
     /// in the public signature: that would bind rsbinder's API to a
     /// `futures-core` major version. Adapt it where you need one.
     ///
-    /// Granting credit back to the producer is a `twoway` binder call,
-    /// which is synchronous, so this can block the thread for the
-    /// duration of that call once per half window. Run it on a
-    /// multi-threaded runtime.
+    /// Nothing in here waits on the producer. Granting credit is a
+    /// `oneway` call — one local send, returning before the producer has
+    /// run — so it is made inline rather than moved to the blocking pool,
+    /// where the hand-off would cost more than the call. Cancel-safe: a
+    /// future dropped mid-wait loses no item and no credit.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Option<BinderResult<T>> {
         loop {
-            if let Some(item) = self.decoded.pop_front() {
-                return Some(Ok(item));
-            }
-            if self.finished {
-                return None;
-            }
-            // Register before looking: `notify_waiters` only wakes
-            // waiters that already exist, so a batch landing between the
-            // check and the await would otherwise be missed. Registered
-            // through a clone of the handle so the waiter does not
-            // borrow `self` across the decode below.
+            // Created before looking: a `Notified` receives
+            // `notify_waiters` from the moment it exists, so a batch
+            // landing between the look and the await is not missed.
+            // Through a clone of the handle so the waiter does not borrow
+            // `self` across `advance`.
             let stream = self.stream.clone();
             let notified = stream.notify.notified();
-            // Two levels: the outer `None` is "nothing has arrived yet",
-            // the inner one is "the terminator has". Resolved inside the
-            // block so the guard is gone before the await below.
-            let ready = {
-                let mut state = stream.lock();
-                match state.batches.pop_front() {
-                    Some(batch) => Some(Some(batch)),
-                    None if state.end.is_some() => Some(None),
-                    None => None,
-                }
-            };
-            let Some(batch) = ready else {
-                notified.await;
-                continue;
-            };
-            match batch {
-                Some(batch) => {
-                    if let Err(e) = self.take_batch(batch) {
-                        self.finished = true;
-                        return Some(Err(e.into()));
-                    }
-                }
-                None => return self.finish(),
+            if let Some(done) = self.advance() {
+                return done;
             }
+            notified.await;
         }
     }
 
@@ -1278,14 +1351,70 @@ impl<T: Deserialize> Receiver<T> {
     /// Releases a producer parked waiting for credit, and its
     /// [`Sink::send`] then reports [`StatusCode::InvalidOperation`].
     /// Items already in flight may still arrive, and the producer may
-    /// still send a terminator.
+    /// still send a terminator. A cancel made before the producer has
+    /// introduced itself is held and sent the moment it does.
     ///
     /// Sent automatically when a `Receiver` is dropped, so a consumer
     /// that walks away does not leave the producer waiting.
     pub fn cancel(&self) -> Result<()> {
-        match &self.source {
+        let source = {
+            let mut state = self.stream.lock();
+            state.canceled = true;
+            state.source.clone()
+        };
+        match source {
             Some(source) => source.cancel(),
             None => Ok(()),
+        }
+    }
+
+    /// Everything the consuming paths share: hand out an item, or decode
+    /// the next batch, or report the end.
+    ///
+    /// `Some` is the caller's answer. `None` means nothing is queued and
+    /// the stream is still running, so the caller waits in whatever way
+    /// it waits — and this has already granted whatever credit was owed,
+    /// because a consumer about to wait is the last chance to: a
+    /// producer out of credit sends nothing that would prompt a later
+    /// grant.
+    fn advance(&mut self) -> Option<Option<BinderResult<T>>> {
+        loop {
+            if let Some(item) = self.decoded.pop_front() {
+                return Some(Some(Ok(item)));
+            }
+            if self.finished {
+                return Some(None);
+            }
+            match self.poll_queue() {
+                Queued::Batch(batch) => {
+                    if let Err(e) = self.take_batch(batch) {
+                        self.finished = true;
+                        return Some(Some(Err(e.into())));
+                    }
+                }
+                Queued::End => return Some(self.finish()),
+                Queued::Nothing => {
+                    if self.unacked == 0 {
+                        return None;
+                    }
+                    self.replenish(true);
+                    // A failed grant ends the stream; look again rather
+                    // than go and wait for a batch that cannot come.
+                    let ended = self.stream.lock().end.is_some();
+                    if !ended {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_queue(&self) -> Queued {
+        let mut state = self.stream.lock();
+        match state.batches.pop_front() {
+            Some(batch) => Queued::Batch(batch),
+            None if state.end.is_some() => Queued::End,
+            None => Queued::Nothing,
         }
     }
 
@@ -1294,7 +1423,7 @@ impl<T: Deserialize> Receiver<T> {
         match self.decode_batch(&bytes, count) {
             Ok(()) => {
                 self.unacked += 1;
-                self.replenish();
+                self.replenish(false);
                 Ok(())
             }
             Err(e) => {
@@ -1335,26 +1464,44 @@ impl<T: Deserialize> Receiver<T> {
     }
 
     /// Give the producer credit for the batches taken since the last
-    /// grant, once enough have piled up to be worth a round trip.
+    /// grant.
     ///
-    /// Half a window rather than every batch: `request` is a `twoway`
-    /// call, and granting one at a time would put a round trip between
-    /// every pair of batches. Half keeps the producer supplied while the
-    /// consumer is still draining the other half.
-    fn replenish(&mut self) {
+    /// With more batches already queued (`idle` false) the grant waits
+    /// until half a window is owed: every grant is a transaction, and
+    /// half keeps the producer supplied while the consumer drains the
+    /// other half. With nothing queued (`idle` true) whatever is owed
+    /// goes now. Holding it back then is how a producer whose opening
+    /// window is smaller than that half would stall for good — it is out
+    /// of credit, so no further batch arrives to push the count over the
+    /// threshold.
+    ///
+    /// A grant that fails to send keeps its credit for the next attempt.
+    /// When there will be no next attempt — the consumer is about to
+    /// wait — the failure ends the stream instead, since both ends would
+    /// otherwise wait on each other.
+    fn replenish(&mut self, idle: bool) {
         let threshold = (self.window / 2).max(1);
-        if self.unacked < threshold {
+        if self.unacked == 0 || (!idle && self.unacked < threshold) {
             return;
         }
-        let Some(source) = &self.source else {
+        // Cloned out so the lock is not held across the binder call. No
+        // source yet means a producer that has not sent `onStart`; the
+        // credit stays owed until it does.
+        let Some(source) = self.stream.lock().source.clone() else {
             return;
         };
-        let credits = std::mem::take(&mut self.unacked);
-        if let Err(e) = source.request(credits as i32) {
-            // The producer is gone or refused the grant. Nothing further
-            // will arrive, and `recv` finds that out through the queue
-            // rather than here.
-            log::warn!("stream: granting {credits} credits failed: {e:?}");
+        match source.request(self.unacked as i32) {
+            Ok(()) => self.unacked = 0,
+            Err(e) if idle => {
+                log::warn!("stream: granting {} credits failed: {e:?}", self.unacked);
+                self.stream.end_with(Status::from(e));
+            }
+            Err(e) => {
+                log::warn!(
+                    "stream: granting {} credits failed, will retry: {e:?}",
+                    self.unacked
+                );
+            }
         }
     }
 
@@ -1380,7 +1527,17 @@ impl<T: Deserialize> Iterator for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        if let Some(source) = &self.source {
+        let source = {
+            let mut state = self.stream.lock();
+            state.canceled = true;
+            state.closed = true;
+            state.batches.clear();
+            // Dropping the recipient is what lets the link lapse; the
+            // binder only ever held a `Weak`.
+            state.death = None;
+            state.source.take()
+        };
+        if let Some(source) = source {
             // A producer parked on `wait_credit` has no other way to
             // learn that nobody is reading any more.
             let _ = source.cancel();
@@ -1393,7 +1550,7 @@ impl<T> std::fmt::Debug for Receiver<T> {
         f.debug_struct("Receiver")
             .field("window", &self.window)
             .field("finished", &self.finished)
-            .field("attached", &self.source.is_some())
+            .field("started", &self.stream.lock().source.is_some())
             .finish()
     }
 }
@@ -1412,7 +1569,7 @@ impl Peer<dyn IStreamSource> {
                     .transact(
                         generated::rsbinder::stream::IStreamSource::transactions::r#request,
                         &data,
-                        crate::FLAG_CLEAR_BUF | crate::FLAG_PRIVATE_LOCAL,
+                        ONEWAY_FLAGS,
                     )
                     .map(|_| ())
             }
@@ -1456,13 +1613,9 @@ mod tests {
         max_batch_bytes: usize,
         initial_credits: u32,
     ) -> (Sink<T>, Receiver<T>) {
-        let (mut rx, sink_binder) = Receiver::<T>::with_credit_window(window);
-        let (sink, source) = Sink::<T>::with_limits(&sink_binder, max_batch_bytes, initial_credits)
+        let (rx, sink_binder) = Receiver::<T>::with_credit_window(window);
+        let sink = Sink::<T>::with_limits(&sink_binder, max_batch_bytes, initial_credits)
             .expect("a local binder can always be called back");
-        rx.attach_source(&source.as_binder())
-            .expect("attach_source");
-        // The receiver's typed handle keeps the source object alive, so
-        // the producer's credit state outlives this value.
         (sink, rx)
     }
 
@@ -1492,9 +1645,7 @@ mod tests {
     #[test]
     fn a_full_window_stops_the_producer_until_the_consumer_drains() {
         let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
-        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
-        rx.attach_source(&source.as_binder())
-            .expect("attach_source");
+        let mut sink = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
 
         let (progress, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
@@ -1534,9 +1685,7 @@ mod tests {
         // drained batch is paid back at once; four bytes to a batch makes
         // a batch and an `i32` the same thing.
         let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(2);
-        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
-        rx.attach_source(&source.as_binder())
-            .expect("attach_source");
+        let mut sink = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
 
         let sent = Arc::new(AtomicUsize::new(0));
         let counter = sent.clone();
@@ -1603,12 +1752,104 @@ mod tests {
         );
     }
 
+    /// A producer whose opening window is smaller than the consumer's
+    /// grant threshold runs out of credit before the threshold is ever
+    /// reached. The consumer has to grant what it owes before it waits,
+    /// or both ends wait on each other.
+    #[test]
+    fn an_opening_window_below_the_grant_threshold_does_not_stall() {
+        // Threshold is half of eight; the producer opens with one.
+        let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(8);
+        let mut sink = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
+
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let sent = sink.send_all((0..20).collect::<Vec<i32>>().iter());
+            let _ = done.send(sent.and_then(|()| sink.end()));
+        });
+
+        let mut got = Vec::new();
+        while got.len() < 20 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Some(item)) => got.push(item),
+                other => panic!("stalled after {} items: {other:?}", got.len()),
+            }
+        }
+        assert_eq!(got, (0..20).collect::<Vec<_>>());
+        watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the producer must finish")
+            .expect("send and end");
+    }
+
+    /// A consumer that gave up before the producer got as far as
+    /// introducing itself is answered the moment it does.
+    #[test]
+    fn a_receiver_dropped_before_the_stream_starts_cancels_it_on_arrival() {
+        let (rx, sink_binder) = Receiver::<i32>::new();
+        drop(rx);
+
+        let mut sink = Sink::<i32>::new(&sink_binder).expect("the sink object is still there");
+        assert!(sink.is_canceled(), "`onStart` must have been answered");
+        assert_eq!(
+            sink.send(&1).and_then(|()| sink.flush()).err(),
+            Some(StatusCode::InvalidOperation)
+        );
+    }
+
+    /// An async producer waiting for credit gives the thread back. On a
+    /// current-thread runtime that is the difference between finishing
+    /// and deadlock: the consumer task that would grant the credit runs
+    /// on the same thread the producer would otherwise be parked on.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn an_async_producer_waits_for_credit_without_holding_the_thread() {
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let got = runtime.block_on(async {
+                let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
+                let mut sink = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
+                let credit_spent = Arc::new(tokio::sync::Notify::new());
+                let spent = credit_spent.clone();
+                // `tokio::spawn` is also the check that the futures are
+                // `Send`.
+                let producer = tokio::spawn(async move {
+                    // Spends the only credit.
+                    sink.send_async(&0).await?;
+                    spent.notify_one();
+                    // So this one finds none, and nothing is reading yet.
+                    for item in 1..50i32 {
+                        sink.send_async(&item).await?;
+                    }
+                    sink.end_async().await
+                });
+                // Held back until the producer is out of credit, so its
+                // next send has to wait rather than find a fresh grant.
+                credit_spent.notified().await;
+                let mut got = Vec::new();
+                while let Some(item) = rx.recv_async().await {
+                    got.push(item.expect("item"));
+                }
+                producer.await.expect("join").expect("send and end");
+                got
+            });
+            let _ = done.send(got);
+        });
+        assert_eq!(
+            watch
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the stream must finish on a single thread"),
+            (0..50).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_cancel_releases_a_producer_waiting_for_credit() {
-        let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
-        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
-        rx.attach_source(&source.as_binder())
-            .expect("attach_source");
+        let (rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
+        let mut sink = Sink::<i32>::with_limits(&sink_binder, 4, 1).expect("with_limits");
 
         let (outcome, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
@@ -1666,9 +1907,7 @@ mod tests {
     fn a_dropped_sink_with_no_credit_still_ends_the_stream() {
         let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
         // Eight bytes to a batch is two `i32`s, and one opening credit.
-        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 8, 1).expect("with_limits");
-        rx.attach_source(&source.as_binder())
-            .expect("attach_source");
+        let mut sink = Sink::<i32>::with_limits(&sink_binder, 8, 1).expect("with_limits");
 
         sink.send(&0).expect("send");
         // Fills the batch, so this one spends the only credit.

@@ -14,7 +14,9 @@
 #       FAILED_TRANSACTION;
 #   (3) a peer whose process is gone ends the stream on both sides —
 #       including when nothing is in flight to fail, which is what the
-#       death link on the sink and on the source exist for.
+#       death link on the sink and on the source exist for. The
+#       consumer's link is made inside the `oneway onStart` handler, on
+#       a binder thread, which only a real driver exercises.
 #
 #   cargo build -p rsbinder-tools --bin rsb_hub
 #   cargo build -p tests --bin stream_probe
@@ -118,10 +120,12 @@ fi
 
 note "AC-7.4 (kernel)  a consumer that dies is seen by a producer parked for credit"
 if start rsb107.parked > /dev/null; then
-    # One opening credit and nothing to replenish it: the producer is
-    # parked in `wait_credit` with no batch in flight. Nothing can fail,
-    # so only the death link on the sink ends this wait — without it the
-    # producer thread is there for the life of the process.
+    # One opening credit, and a consumer that leaves as soon as it has the
+    # one item — before it would wait, which is when it grants what it
+    # owes. The producer is parked in `wait_credit` with no batch in
+    # flight. Nothing can fail, so only the death link on the sink ends
+    # this wait — without it the producer thread is there for the life of
+    # the process.
     timeout 60 $PROBE die rsb107.parked 1 4 1 0 > "$OUT" 2>/tmp/rsb107-parked.err
     if grep -qx 'RESULT die 1' "$OUT"; then
         sleep 2

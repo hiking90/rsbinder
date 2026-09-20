@@ -16,34 +16,45 @@ This changelog starts at 0.9.0. For earlier releases, see the
 ### Added
 
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
-  producer, `Receiver<T>` for the consumer and `Source` for the credit the
-  consumer grants back. The consumer hands the producer a sink binder and
-  receives a source; items are encoded with the same codec as `to_bytes`,
-  carried in batches capped at `DEFAULT_MAX_BATCH_BYTES`, and the producer
-  blocks once it has `DEFAULT_CREDIT_WINDOW` batches in flight with none
-  granted. `Receiver` yields `BinderResult<T>` through `recv`, `try_recv`,
-  `recv_timeout`, `Iterator`, and `recv_async` with the `tokio` feature; no
-  `futures-core` type appears in the public API. The stream ends with a status,
-  so a service-specific failure reaches the consumer with its code and message
-  intact even though the method that started the stream already returned.
-  Dropping a `Receiver` cancels, releasing a producer waiting for credit.
+  producer and `Receiver<T>` for the consumer. The consumer makes a receiver,
+  passes its sink binder to the service, and reads; the service wraps that
+  binder in a `Sink` and writes. Items are encoded with the same codec as
+  `to_bytes`, carried in batches capped at `DEFAULT_MAX_BATCH_BYTES`, and the
+  producer waits once it has `DEFAULT_CREDIT_WINDOW` batches in flight with
+  none granted — `send`/`flush`/`end` park the thread, and with the `tokio`
+  feature `send_async`/`flush_async`/`end_async`/`end_with_async` suspend the
+  task instead and send from the blocking pool. `Receiver` yields
+  `BinderResult<T>` through `recv`, `try_recv`, `recv_timeout`, `Iterator`,
+  and `recv_async` with the `tokio` feature; no `futures-core` type appears in
+  the public API. The stream ends with a status, so a service-specific failure
+  reaches the consumer with its code and message intact even though the method
+  that started the stream already returned.
+  The contract is two ordinary AIDL interfaces shipped in
+  `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` (`onStart`,
+  `onBatch`, `onEnd`) and `IStreamSource` (`request`, `cancel`) — so a C++ or
+  Java peer can be either end. It is the reactive-streams shape, and every
+  call in it is `oneway`: the producer introduces itself with `onStart`, so
+  the method that starts a stream has nothing to return, and a credit grant
+  costs the consumer one local send rather than a wait on the producer's
+  threads. The consumer grants half a window at a time while batches keep
+  arriving and whatever it owes before it waits, so a producer whose opening
+  window is small does not stall; a grant that cannot be sent is retried, or
+  ends the stream when nothing would prompt a retry.
   Batches leave on the byte threshold and on `flush`/`end`, never on a clock,
   so a producer whose items arrive at their own pace calls `flush` to decide
   when the consumer sees them; `Sink::pending` reports what is still queued.
   Dropping a `Sink` without `end` delivers what credit allows and terminates
   the stream with `EX_ILLEGAL_STATE` rather than leaving the consumer blocked
   — that flush does not wait for credit, and the terminator's message says how
-  many items were lost.
+  many items were lost. Dropping a `Receiver` cancels, releasing a producer
+  waiting for credit, including one that has not introduced itself yet.
   Each end watches the other's binder for death, because back-pressure means
-  there is usually no call in flight to fail: a producer parked for credit and
-  a consumer blocked in `recv` both end with `DeadObject` when the peer's
+  there is usually no call in flight to fail: a producer waiting for credit
+  and a consumer blocked in `recv` both end with `DeadObject` when the peer's
   process goes, rather than waiting forever.
-  The contract is two ordinary AIDL interfaces shipped in
-  `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` and
-  `IStreamSource` — so a C++ or Java peer can be either end. `Sink::new`
-  refuses a transport that cannot carry a call to the consumer outside a
-  handler, which on the RPC stack means a client that opened no incoming
-  connections.
+  `Sink::new` refuses a transport that cannot carry a call to the consumer
+  outside a handler, which on the RPC stack means a client that opened no
+  incoming connections.
 - **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
   `set_calling_work_source_uid`, `get_calling_work_source_uid`,
   `clear_calling_work_source`, `restore_calling_work_source`,

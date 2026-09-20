@@ -10,9 +10,11 @@ package rsbinder.stream;
  * the consumer grants the producer permission to send more, and where it
  * says it wants no more at all.
  *
- * The service hands this object to the consumer alongside taking its
- * IStreamSink — typically as the return value of the method that starts
- * the stream.
+ * The producer hands this object to the consumer in
+ * IStreamSink.onStart. Both methods are `oneway`: a grant is a
+ * notification, not a question, and a consumer that had to wait for the
+ * producer's reply before taking its next batch would be paced by how
+ * busy the producer's threads are.
  */
 interface IStreamSource {
     /**
@@ -23,12 +25,16 @@ interface IStreamSource {
      * send 8 batches. The producer caps what one batch may hold, so a
      * granted window bounds the bytes in flight as well as the calls.
      *
-     * `twoway`, so a return also tells the consumer the producer is
-     * still there. It travels consumer to producer, the opposite
-     * direction from IStreamSink, so it neither needs nor disturbs the
-     * ordering the sink relies on.
+     * `credits` must be positive; a producer ignores a grant that is
+     * not. A grant that cannot be delivered fails at the sender — the
+     * driver reports a dead or full receiver on a `oneway` call too — so
+     * a consumer keeps the credit and grants it again later.
+     *
+     * It travels consumer to producer, the opposite direction from
+     * IStreamSink, so it neither needs nor disturbs the ordering the
+     * sink relies on.
      */
-    void request(int credits);
+    oneway void request(int credits);
 
     /**
      * No more items are wanted.

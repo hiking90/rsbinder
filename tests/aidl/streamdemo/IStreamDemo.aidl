@@ -4,13 +4,13 @@
 // Plan 10-7 fixture: a service that streams integers into a sink the
 // caller supplies.
 //
-// The sink and the source are `IBinder` rather than
-// `rsbinder.stream.IStreamSink` / `IStreamSource`: every crate that
-// compiles those AIDLs gets its own Rust types, so importing them here
-// would produce a second pair incompatible with the ones inside
+// The sink is `IBinder` rather than `rsbinder.stream.IStreamSink`: every
+// crate that compiles that AIDL gets its own Rust types, so importing it
+// here would produce a second set incompatible with the ones inside
 // `rsbinder::stream` (the wire is identical either way). That is also
-// the shape `rsbinder::stream` asks for — `Sink::new` and
-// `Receiver::attach_source` both take a bare binder.
+// the shape `rsbinder::stream` asks for — `Sink::new` takes a bare
+// binder. The methods return nothing: the producer introduces itself to
+// the sink with `onStart`, so there is no source to hand back.
 package streamdemo;
 
 interface IStreamDemo {
@@ -18,14 +18,17 @@ interface IStreamDemo {
     // at most `maxBatchBytes`, and the producer opens with
     // `initialCredits` of them. `delayMicros` paces the producer, which
     // is how a test decides whether a consumer that dies finds it holding
-    // credit or parked waiting for some. Returns the source to grant
-    // credit on.
-    IBinder subscribe(IBinder sink, int count, int maxBatchBytes, int initialCredits,
-                      int delayMicros);
+    // credit or parked waiting for some.
+    void subscribe(IBinder sink, int count, int maxBatchBytes, int initialCredits,
+                   int delayMicros);
+
+    // `subscribe`, with the producer running as a task on the service's
+    // async runtime instead of a thread of its own.
+    void subscribeAsync(IBinder sink, int count, int maxBatchBytes, int initialCredits);
 
     // Stream `count` integers and then end with a service-specific
     // failure carrying `code` and `message`.
-    IBinder subscribeFailing(IBinder sink, int count, int code, String message);
+    void subscribeFailing(IBinder sink, int count, int code, String message);
 
     // How many items the producer has handed to the sink so far.
     int sent();

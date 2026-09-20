@@ -10,15 +10,39 @@ package rsbinder.stream;
  * and to say the stream is over.
  *
  * rsbinder distributes this file so a C++ or Java peer can take part
- * without rsbinder on its side. Both methods are `oneway`, which is what
- * keeps the batches in order: the kernel orders `oneway` calls to one
- * node against each other, but not against a `twoway` to a different
- * node, so a reply-carrying method here would let `onEnd` overtake the
- * batches it is supposed to follow.
+ * without rsbinder on its side. Every method is `oneway`, which is what
+ * keeps the calls in order: the kernel orders `oneway` calls to one node
+ * against each other, but not against a `twoway` to a different node, so
+ * a reply-carrying method here would let `onEnd` overtake the batches it
+ * is supposed to follow.
+ *
+ * The shape is the reactive-streams one — `onStart` / `onBatch` /
+ * `onEnd` here are `onSubscribe` / `onNext` / `onComplete`-or-`onError`
+ * there, and IStreamSource is the `Subscription`.
  *
  * Flow control is not here — it runs the other way, over IStreamSource.
  */
 interface IStreamSink {
+    /**
+     * The stream exists, and `source` is where to grant credit and to
+     * cancel.
+     *
+     * Sent once, before any batch. `source` is an IStreamSource; it is
+     * declared `IBinder` so that a peer casts it itself
+     * (`IStreamSource::asInterface`, `IStreamSource.Stub.asInterface`)
+     * rather than having the generated stub do so — the wire is the same
+     * binder object either way.
+     *
+     * The consumer should watch `source` for death from here on: with
+     * back-pressure in play there is usually no call in flight to fail,
+     * so a producer that dies is otherwise indistinguishable from one
+     * with nothing to send yet.
+     *
+     * A producer may already hold an opening window of credit and send
+     * batches right behind this call, without waiting for a grant.
+     */
+    oneway void onStart(IBinder source);
+
     /**
      * One batch of items.
      *
