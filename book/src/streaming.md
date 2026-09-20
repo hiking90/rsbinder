@@ -92,20 +92,30 @@ Java process can be either end without rsbinder on its side:
 package rsbinder.stream;
 
 interface IStreamSink {                      // implemented by the consumer
-    oneway void onStart(IBinder source);     // an IStreamSource; sent once, first
+    // `source` is an IStreamSource, `credits` the window the producer opens
+    // with; sent once, first.
+    oneway void onStart(IBinder source, int credits);
     oneway void onBatch(in byte[] items, int count);
     oneway void onEnd(int exception, int serviceSpecific, @nullable String message);
 }
 
 interface IStreamSource {                    // implemented by the producer
-    oneway void request(int credits);
+    // `total` batches granted in all since the stream began — a running
+    // total, not an amount to add.
+    oneway void request(long total);
     oneway void cancel();
 }
 ```
 
 This is the [reactive-streams](https://www.reactive-streams.org/) contract
 under binder names: `onStart` / `onBatch` / `onEnd` are `onSubscribe` / `onNext`
-/ `onComplete`-or-`onError`, and `IStreamSource` is the `Subscription`.
+/ `onComplete`-or-`onError`, and `IStreamSource` is the `Subscription`. It
+differs in one place: reactive-streams' `request(n)` adds `n`, and
+`request(total)` here states a running total. A `oneway` call that reports
+failure has almost always not arrived, but its sender cannot always tell, and
+an amount sent again would then be counted twice or not at all. A total is
+counted once whichever happened, which is what lets the two ends agree on how
+many batches the producer may send.
 
 **Every call is `oneway`.** Both transports keep `oneway` calls to one object in
 order — the kernel per node, an RPC session per address — which is what
@@ -126,13 +136,29 @@ batches are already queued, and everything it owes before it goes to wait.
 Only the producer's opening window bounds what is in flight. A grant pays for a
 batch the consumer has already drained, one for one, so the ceiling stays
 whatever `initial_credits` was; `Receiver::with_credit_window(n)` sets the grant
-threshold — a grant leaves once half of `n` is owed — not how far the producer
-may run ahead.
+threshold — a grant leaves once half of `n` is owed, or the whole opening window
+if that is less — not how far the producer may run ahead.
+
+**The consumer holds the producer to its credit.** The producer states its
+opening window in `onStart`, so the consumer knows everything the producer may
+send: that window, plus what has been granted since. A batch beyond it ends the
+stream with `EX_ILLEGAL_STATE` instead of being queued, which is what bounds the
+memory a producer can make the consumer's process hold. That matters most when
+the consumer is the service — an upload — and its producer is a client it has no
+reason to trust.
+
+How wide a window a consumer takes is the consumer's to say:
+`Receiver::with_limits(n, max_opening)`. A producer that opens wider is refused
+at the start, with `EX_ILLEGAL_ARGUMENT`, before any item. The default is
+`DEFAULT_CREDIT_WINDOW`, the same number the producer defaults to, so the two
+defaults always agree; a wider window has to be asked for on both sides. The
+producer hears of a refusal as a cancel — `onStart` is `oneway` — and the reason
+is in the consumer's error and in its log.
 
 | Constant | Value | Set it with |
 |---|---|---|
 | `DEFAULT_MAX_BATCH_BYTES` | 16 KB | `Sink::with_limits(sink, max_batch_bytes, initial_credits)` |
-| `DEFAULT_CREDIT_WINDOW` | 4 batches | `initial_credits` in the same call — the producer's ceiling — and `Receiver::with_credit_window(n)` for the consumer's grant threshold (half of `n`) |
+| `DEFAULT_CREDIT_WINDOW` | 4 batches | `initial_credits` in the same call — the producer's ceiling; `Receiver::with_credit_window(n)` for the consumer's grant threshold (half of `n`); `Receiver::with_limits(n, max_opening)` for the widest opening window the consumer accepts |
 
 The values are sized against the kernel driver. A process's `oneway`
 transactions share half its binder mapping — about 512 KB at the default 1 MB —
@@ -328,13 +354,23 @@ Compile the two `.aidl` files from `rsbinder/aidl/stream/` with the platform's
   bytes into a parcel — C++ `Parcel::setData`, Java `Parcel.unmarshall` followed
   by `setDataPosition(0)`, NDK `AParcel_unmarshal` followed by
   `AParcel_setDataPosition(p, 0)` — and read the item type `count` times. Call
-  `request(n)` as you drain. An rsbinder producer opens with a window of its
-  own, so the first grant can follow the first batch; a producer written to
-  start at zero needs one from `onStart`.
+  `request(total)` as you drain, where `total` is how many batches you have
+  drained since the stream began; if the call fails, call it again later with
+  whatever the total is by then. The producer opens with the `credits` that
+  `onStart` states, so the first grant can follow the first batch. To bound your
+  queue, hold the producer to `credits` plus the highest total you have sent or
+  tried to send, and decide in `onStart` how large a `credits` you accept.
 - **As the producer**, implement `IStreamSource` and count: each `onBatch` spends
-  one credit, `request(n)` adds `n`, `onEnd` spends none, and after `cancel` only
-  `onEnd` may still be sent. **Open with at least one credit of your own.** An
-  rsbinder consumer grants only for batches it has already drained, so a
-  producer that starts at zero waits for a grant that nothing can trigger.
+  one credit, `onEnd` spends none, and after `cancel` only `onEnd` may still be
+  sent. `request(total)` is worth `total` minus the highest total you have seen,
+  and nothing when that is not positive — keep the highest, not a sum. **Open
+  with at least one credit of your own, and state it in `onStart`.** An rsbinder
+  consumer grants only for batches it has already drained, so a producer that
+  starts at zero waits for a grant that nothing can trigger — and it ends the
+  stream on a batch sent beyond the stated window plus its grants, or on a
+  window wider than it accepts (4 unless it was made with
+  `Receiver::with_limits`). If an `onBatch` fails in a way that does not tell
+  you whether it arrived, stop sending batches and send `onEnd`: you no longer
+  know how much credit you have.
   `onEnd`'s three arguments are the fields of a `binder::Status`; `-129`, `-127`
   and `-128` are never sent.

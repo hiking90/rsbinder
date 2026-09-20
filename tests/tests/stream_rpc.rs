@@ -258,6 +258,41 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     );
 }
 
+/// The opening window travels in `onStart`, and the consumer holds the
+/// producer to what it accepts. Over a session the sink is an RPC proxy
+/// with no descriptor, so that `onStart` is the hand-built request, not
+/// the generated proxy's.
+#[test]
+fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
+    let f = fixture("wide", 1);
+
+    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    f.demo
+        .r#subscribe(&sink_binder, 1000, 64, DEFAULT_CREDIT_WINDOW as i32 + 1, 0)
+        .expect("`onStart` is oneway, so the service cannot hear the refusal");
+
+    let refusal = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect_err("the stream must end before any item");
+    assert_eq!(refusal.exception_code(), ExceptionCode::IllegalArgument);
+
+    // The same service, a consumer made for that window: every item.
+    let (mut rx, sink_binder) =
+        Receiver::<i32>::with_limits(DEFAULT_CREDIT_WINDOW, DEFAULT_CREDIT_WINDOW + 1);
+    f.demo
+        .r#subscribe(&sink_binder, 1000, 64, DEFAULT_CREDIT_WINDOW as i32 + 1, 0)
+        .expect("subscribe");
+    // With a bound: a grant that did not cross the wire leaves both ends
+    // alive and waiting, which is a hang rather than a failure.
+    let mut got = 0;
+    while got < 1000 {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(_)) => got += 1,
+            other => panic!("stalled after {got} items: {other:?}"),
+        }
+    }
+}
+
 /// The same stream with the producer as a task: waiting for credit
 /// suspends it, and each batch is sent from the blocking pool.
 ///
@@ -372,7 +407,8 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
 fn a_session_that_ends_releases_a_blocked_consumer() {
     let f = fixture("dead", 1);
 
-    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    // A consumer takes no wider an opening window than it was made for.
+    let (mut rx, sink_binder) = Receiver::<i32>::with_limits(DEFAULT_CREDIT_WINDOW, 1_000_000);
     // Half a minute between items and credit to spare: after the first
     // item nothing else arrives within this test, so when the session
     // goes the consumer is waiting and the producer is not parked.

@@ -148,10 +148,16 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
     <dyn IStreamDemo as FromIBinder>::try_from(binder)
 }
 
+/// A consumer takes no wider an opening window than it was made for, so
+/// each mode makes one for the window it asks the service to open with.
+fn receiver_for(initial_credits: i32) -> (Receiver<i32>, SIBinder) {
+    Receiver::with_limits(4, initial_credits.max(1) as u32)
+}
+
 /// Take the whole stream and report what arrived.
 fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    let (mut rx, sink_binder) = receiver_for(initial_credits);
     demo.r#subscribe(&sink_binder, count, max_batch_bytes, initial_credits, 0)
         .map_err(|e| e.transaction_error())?;
 
@@ -196,7 +202,7 @@ fn die(
     delay_micros: i32,
 ) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    let (mut rx, sink_binder) = receiver_for(initial_credits);
     demo.r#subscribe(
         &sink_binder,
         i32::MAX,
@@ -231,7 +237,7 @@ fn die(
 /// wait.
 fn orphan(name: &str) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = Receiver::<i32>::new();
+    let (mut rx, sink_binder) = receiver_for(1_000_000);
     demo.r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5000)
         .map_err(|e| e.transaction_error())?;
 

@@ -34,14 +34,32 @@ This changelog starts at 0.9.0. For earlier releases, see the
   The contract is two ordinary AIDL interfaces shipped in
   `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` (`onStart`,
   `onBatch`, `onEnd`) and `IStreamSource` (`request`, `cancel`) — so a C++ or
-  Java peer can be either end. It is the reactive-streams shape, and every
+  Java peer can be either end. It is the reactive-streams shape — except that
+  `request(long total)` states a running total where reactive-streams'
+  `request(n)` adds `n`, so that a grant sent again is counted once — and every
   call in it is `oneway`: the producer introduces itself with `onStart`, so
   the method that starts a stream has nothing to return, and a credit grant
   costs the consumer one local send rather than a wait on the producer's
   threads. The consumer grants half a window at a time while batches keep
   arriving and whatever it owes before it waits, so a producer whose opening
   window is small does not stall; a grant that cannot be sent is retried, or
-  ends the stream when nothing would prompt a retry.
+  ends the stream when nothing would prompt a retry — a consumer about to
+  block on a producer that has used all the credit it is known to have.
+  `try_recv`, and `recv_timeout` with a timeout an `Instant` can express,
+  return to a caller who calls again, so there a failed grant never ends the
+  stream.
+  The producer states its opening window in `onStart`, and the consumer holds
+  it to that window plus what it has granted: a batch beyond it ends the
+  stream with `EX_ILLEGAL_STATE` rather than being queued, which bounds the
+  memory an untrusted producer — a client uploading to a service — can make
+  the consumer hold, at the opening window, however many grants that
+  producer makes fail. A batch the driver refuses (`FailedTransaction`, a
+  consumer whose `oneway` buffer is full) did not arrive, so its credit comes
+  back and the stream goes on, its items counted as lost; after any other
+  failure the producer cannot know how much credit it has, and sends only the
+  terminator. `Receiver::with_limits` sets the widest opening window a
+  consumer accepts (`DEFAULT_CREDIT_WINDOW` by default, the producer's own
+  default); a wider one is refused at the start with `EX_ILLEGAL_ARGUMENT`.
   Batches leave on the byte threshold and on `flush`/`end`, never on a clock,
   so a producer whose items arrive at their own pace calls `flush` to decide
   when the consumer sees them; `Sink::pending` reports what is still queued.

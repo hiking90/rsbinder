@@ -24,8 +24,8 @@ package rsbinder.stream;
  */
 interface IStreamSink {
     /**
-     * The stream exists, and `source` is where to grant credit and to
-     * cancel.
+     * The stream exists, `source` is where to grant credit and to
+     * cancel, and `credits` is the window the producer opens with.
      *
      * Sent once, before any batch. `source` is an IStreamSource; it is
      * declared `IBinder` so that a peer casts it itself
@@ -38,15 +38,22 @@ interface IStreamSink {
      * so a producer that dies is otherwise indistinguishable from one
      * with nothing to send yet.
      *
-     * A producer opens with a window of credit of its own and sends
-     * batches right behind this call, without waiting for a grant. It
-     * has to: a consumer grants credit for batches it has drained, so
-     * one that starts at zero would wait for a grant that nothing can
-     * trigger. A consumer that grants from here instead — which this
-     * interface permits but rsbinder's does not do — only widens that
-     * window.
+     * A producer opens with `credits` batches of credit of its own and
+     * sends them right behind this call, without waiting for a grant. It
+     * has to open with at least one: a consumer grants credit for
+     * batches it has drained, so a producer that starts at zero would
+     * wait for a grant that nothing can trigger.
+     *
+     * The window is stated so that the consumer can hold the producer to
+     * it. Everything the producer may send is this number plus what
+     * IStreamSource.request has granted since, and a consumer ends the
+     * stream on a batch beyond that rather than queue without bound. A
+     * consumer also has a largest window it accepts, and ends the stream
+     * here, before any batch, when `credits` is above it or is not
+     * positive — so a producer that wants a wide window needs a consumer
+     * that was set up to take one.
      */
-    oneway void onStart(IBinder source);
+    oneway void onStart(IBinder source, int credits);
 
     /**
      * One batch of items.
@@ -63,8 +70,9 @@ interface IStreamSink {
      * anything in the receiving process, so the producer refuses an item
      * containing one rather than sending a number that would be a lie.
      *
-     * Each call spends one credit granted through
-     * IStreamSource.request.
+     * Each call spends one credit, of the opening window or of those
+     * granted through IStreamSource.request. A call made with none left
+     * ends the stream.
      */
     oneway void onBatch(in byte[] items, int count);
 

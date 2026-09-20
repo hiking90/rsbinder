@@ -18,19 +18,31 @@ package rsbinder.stream;
  */
 interface IStreamSource {
     /**
-     * Grant `credits` more batches.
+     * The consumer has now granted `total` batches in all, since the
+     * stream began and beyond the window the producer opened with.
+     *
+     * A running total, not an amount to add. The producer keeps the
+     * highest total it has seen and gains the difference: after
+     * `request(4)`, a `request(6)` is worth two more batches, and a
+     * second `request(4)` — or any total not above the highest — is
+     * worth none. That makes a grant safe to send again. A `oneway` call
+     * that reports failure to its sender has almost always not arrived,
+     * but a sender cannot always tell, and an amount to add would then
+     * be counted twice or not at all; a total is counted once whichever
+     * happened. It is also why the two ends can agree on how many
+     * batches the producer may send, which IStreamSink.onStart relies
+     * on.
      *
      * Credits are counted in IStreamSink.onBatch calls, not in items or
-     * bytes, and they add up: two grants of 4 leave the producer able to
-     * send 8 batches. A producer sends a batch once it reaches a byte
-     * threshold, so a granted window bounds the bytes in flight only
-     * for items smaller than that threshold: a larger item still goes
-     * out, with the batch it was added to.
+     * bytes. A producer sends a batch once it reaches a byte threshold,
+     * so a granted window bounds the bytes in flight only for items
+     * smaller than that threshold: a larger item still goes out, with
+     * the batch it was added to.
      *
-     * `credits` must be positive; a producer ignores a grant that is
-     * not. A grant that cannot be delivered fails at the sender — the
-     * driver reports a dead or full receiver on a `oneway` call too — so
-     * a consumer keeps the credit and grants it again later.
+     * A grant that cannot be delivered fails at the sender — the driver
+     * reports a dead or full receiver on a `oneway` call too — and the
+     * consumer sends its total again later, by then perhaps a larger
+     * one.
      *
      * A consumer grants again for every batch it drains, for as long as
      * it wants more: a producer that runs out of credit sends nothing
@@ -42,7 +54,7 @@ interface IStreamSource {
      * IStreamSink, so it neither needs nor disturbs the ordering the
      * sink relies on.
      */
-    oneway void request(int credits);
+    oneway void request(long total);
 
     /**
      * No more items are wanted.

@@ -3728,6 +3728,7 @@ pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Durati
 pub fn rsbinder::stream::Receiver<T>::sink_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> rsbinder::BinderResult<core::option::Option<T>>
 pub fn rsbinder::stream::Receiver<T>::with_credit_window(u32) -> (Self, rsbinder::SIBinder)
+pub fn rsbinder::stream::Receiver<T>::with_limits(u32, u32) -> (Self, rsbinder::SIBinder)
 impl<T: rsbinder::Deserialize> core::iter::traits::iterator::Iterator for rsbinder::stream::Receiver<T>
 pub type rsbinder::stream::Receiver<T>::Item = core::result::Result<T, rsbinder::Status>
 pub fn rsbinder::stream::Receiver<T>::next(&mut self) -> core::option::Option<Self::Item>
