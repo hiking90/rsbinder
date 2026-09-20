@@ -99,4 +99,20 @@ fn main() {
         .output(PathBuf::from("cancellation_signal.rs"))
         .generate()
         .unwrap();
+
+    // Plan 10-7: the streaming contract. rsbinder's own package rather
+    // than a vendored AOSP one — AOSP has no streaming interface — so it
+    // sits in `aidl/stream/` under the package path the descriptor
+    // names. The two interfaces are the two directions of one stream and
+    // are compiled together into one module tree.
+    new_builder()
+        .source(PathBuf::from(
+            "aidl/stream/rsbinder/stream/IStreamSink.aidl",
+        ))
+        .source(PathBuf::from(
+            "aidl/stream/rsbinder/stream/IStreamSource.aidl",
+        ))
+        .output(PathBuf::from("stream.rs"))
+        .generate()
+        .unwrap();
 }

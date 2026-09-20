@@ -15,6 +15,24 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
+  producer, `Receiver<T>` for the consumer and `Source` for the credit the
+  consumer grants back. The consumer hands the producer a sink binder and
+  receives a source; items are encoded with the same codec as `to_bytes`,
+  carried in batches capped at `DEFAULT_MAX_BATCH_BYTES`, and the producer
+  blocks once it has `DEFAULT_CREDIT_WINDOW` batches in flight with none
+  granted. `Receiver` yields `BinderResult<T>` through `recv`, `try_recv`,
+  `recv_timeout`, `Iterator`, and `recv_async` with the `tokio` feature; no
+  `futures-core` type appears in the public API. The stream ends with a status,
+  so a service-specific failure reaches the consumer with its code and message
+  intact even though the method that started the stream already returned.
+  Dropping a `Receiver` cancels, releasing a producer waiting for credit.
+  The contract is two ordinary AIDL interfaces shipped in
+  `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` and
+  `IStreamSource` — so a C++ or Java peer can be either end. `Sink::new`
+  refuses a transport that cannot carry a call to the consumer outside a
+  handler, which on the RPC stack means a client that opened no incoming
+  connections.
 - **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
   `set_calling_work_source_uid`, `get_calling_work_source_uid`,
   `clear_calling_work_source`, `restore_calling_work_source`,

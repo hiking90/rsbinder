@@ -2571,6 +2571,68 @@ pub fn rsbinder::shared_memory::wire::BpMemoryHeap::size(&self) -> usize
 pub fn rsbinder::shared_memory::export_heap<H: rsbinder::shared_memory::IMemoryHeap + 'static>(alloc::sync::Arc<H>) -> rsbinder::SIBinder
 pub const fn rsbinder::shared_memory::is_supported() -> bool
 pub fn rsbinder::shared_memory::region_size<F: std::os::fd::owned::AsFd>(F) -> rsbinder::Result<usize>
+pub mod rsbinder::stream
+pub struct rsbinder::stream::Receiver<T>
+impl<T: rsbinder::Deserialize> rsbinder::stream::Receiver<T>
+pub fn rsbinder::stream::Receiver<T>::attach_source(&mut self, &rsbinder::SIBinder) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Receiver<T>::cancel(&self) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Receiver<T>::end_status(&self) -> core::option::Option<rsbinder::Status>
+pub fn rsbinder::stream::Receiver<T>::is_finished(&self) -> bool
+pub fn rsbinder::stream::Receiver<T>::new() -> (Self, rsbinder::SIBinder)
+pub fn rsbinder::stream::Receiver<T>::recv(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
+pub async fn rsbinder::stream::Receiver<T>::recv_async(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
+pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Duration) -> rsbinder::BinderResult<core::option::Option<T>>
+pub fn rsbinder::stream::Receiver<T>::sink_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> rsbinder::BinderResult<core::option::Option<T>>
+pub fn rsbinder::stream::Receiver<T>::with_credit_window(u32) -> (Self, rsbinder::SIBinder)
+impl<T: rsbinder::Deserialize> core::iter::traits::iterator::Iterator for rsbinder::stream::Receiver<T>
+pub type rsbinder::stream::Receiver<T>::Item = core::result::Result<T, rsbinder::Status>
+pub fn rsbinder::stream::Receiver<T>::next(&mut self) -> core::option::Option<Self::Item>
+impl<T> core::fmt::Debug for rsbinder::stream::Receiver<T>
+pub fn rsbinder::stream::Receiver<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T> core::ops::drop::Drop for rsbinder::stream::Receiver<T>
+pub fn rsbinder::stream::Receiver<T>::drop(&mut self)
+impl<T> core::marker::Freeze for rsbinder::stream::Receiver<T>
+impl<T> core::marker::Send for rsbinder::stream::Receiver<T> where T: core::marker::Send
+impl<T> core::marker::Sync for rsbinder::stream::Receiver<T> where T: core::marker::Sync
+impl<T> core::marker::Unpin for rsbinder::stream::Receiver<T> where T: core::marker::Unpin
+impl<T> core::marker::UnsafeUnpin for rsbinder::stream::Receiver<T>
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Receiver<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Receiver<T>
+pub struct rsbinder::stream::Sink<T: ?core::marker::Sized>
+impl<T: rsbinder::Serialize + ?core::marker::Sized> rsbinder::stream::Sink<T>
+pub fn rsbinder::stream::Sink<T>::credits(&self) -> u64
+pub fn rsbinder::stream::Sink<T>::end(self) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Sink<T>::end_with(self, &rsbinder::Status) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Sink<T>::flush(&mut self) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Sink<T>::is_canceled(&self) -> bool
+pub fn rsbinder::stream::Sink<T>::new(&rsbinder::SIBinder) -> rsbinder::Result<(Self, rsbinder::stream::Source)>
+pub fn rsbinder::stream::Sink<T>::send(&mut self, &T) -> rsbinder::Result<()>
+pub fn rsbinder::stream::Sink<T>::send_all<'a, I>(&mut self, I) -> rsbinder::Result<()> where I: core::iter::traits::collect::IntoIterator<Item = &'a T>, T: 'a
+pub fn rsbinder::stream::Sink<T>::with_limits(&rsbinder::SIBinder, usize, u32) -> rsbinder::Result<(Self, rsbinder::stream::Source)>
+impl<T> core::marker::Freeze for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
+impl<T> core::marker::Send for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
+impl<T> core::marker::Sync for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
+impl<T> core::marker::Unpin for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
+impl<T> core::marker::UnsafeUnpin for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Sink<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Sink<T>
+pub struct rsbinder::stream::Source
+impl rsbinder::stream::Source
+pub fn rsbinder::stream::Source::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::stream::Source::credits(&self) -> u64
+pub fn rsbinder::stream::Source::is_canceled(&self) -> bool
+impl core::fmt::Debug for rsbinder::stream::Source
+pub fn rsbinder::stream::Source::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::stream::Source
+impl core::marker::Send for rsbinder::stream::Source
+impl core::marker::Sync for rsbinder::stream::Source
+impl core::marker::Unpin for rsbinder::stream::Source
+impl core::marker::UnsafeUnpin for rsbinder::stream::Source
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Source
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Source
+pub const rsbinder::stream::DEFAULT_CREDIT_WINDOW: u32
+pub const rsbinder::stream::DEFAULT_MAX_BATCH_BYTES: usize
 pub mod rsbinder::thread_state
 #[non_exhaustive] pub enum rsbinder::thread_state::Caller
 pub rsbinder::thread_state::Caller::Kernel

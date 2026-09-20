@@ -215,6 +215,16 @@ fn main() {
             .generate()
             .unwrap();
 
+        // Plan 10-7: a service that streams into a caller-supplied sink,
+        // for `tests/stream_rpc.rs`. That test is the wire half of
+        // `rsbinder::stream` — its unit tests keep both ends in one
+        // process, where no parcel is ever built.
+        rsbinder_aidl::Builder::new()
+            .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))
+            .output(PathBuf::from("stream_demo.rs"))
+            .generate()
+            .unwrap();
+
         // Plan 2-19 P3: the `.aidl` half of the macro interop test
         // (`tests/macro_cross.rs`), which declares the same interface as a
         // Rust trait and calls in both directions.

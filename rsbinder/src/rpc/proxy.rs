@@ -198,6 +198,14 @@ impl RpcProxy {
         Ok(data)
     }
 
+    /// This proxy's session capabilities, for a caller holding only the
+    /// binder. `RpcSession::caps` answers the same question given the
+    /// session, which a hand-written stub that came by its proxy through
+    /// `read_binder` does not have.
+    pub(crate) fn session_caps(&self) -> crate::TransportCaps {
+        self.session.caps()
+    }
+
     /// Send an outbound transaction to the remote object. Returns the
     /// reply parcel (`None` for oneway).
     pub fn transact(

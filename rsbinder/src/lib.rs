@@ -326,6 +326,11 @@ pub mod blob;
 // their intra-doc links at the crate root, breaking them.
 pub mod cancel;
 
+// Streaming a sequence of values with credit-based back-pressure
+// (`rsbinder.stream.IStreamSink` / `IStreamSource`). Plain comment for
+// the same reason as `cancel` above.
+pub mod stream;
+
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
