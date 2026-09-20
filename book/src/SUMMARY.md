@@ -19,6 +19,7 @@
     - [Callbacks and Interfaces](./callbacks-and-interfaces.md)
     - [ParcelFileDescriptor](./parcel-file-descriptor.md)
     - [Shared Memory](./shared-memory.md)
+    - [Streaming](./streaming.md)
     - [Error Handling](./error-handling.md)
     - [Observability](./observability.md)
     - [Service Manager (HUB)](./service-manager.md)

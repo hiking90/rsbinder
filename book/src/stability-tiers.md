@@ -107,6 +107,26 @@ tweaks; wire formats are already locked.
 - **Awaitable lookups and death (new in 0.12.0, `tokio` feature)** —
   `wait_for_interface_async`, `check_interface_async`, `death_signal` /
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
+- **Streaming (new in 0.13.0)** — the `stream` module: `Sink`, `Receiver`,
+  and the two AIDL interfaces in `rsbinder/aidl/stream/`
+  (`rsbinder.stream.IStreamSink` / `IStreamSource`). The contract is rsbinder's
+  own rather than AOSP's, written as ordinary AIDL so a C++ or Java peer can be
+  either end. Validated rsbinder-to-rsbinder over kernel binder (two processes,
+  including a real Android driver) and over RPC; a gate against a C++ peer is
+  the remaining step. See [Streaming](./streaming.md).
+- **Observability (new in 0.13.0)** — the work source functions
+  (`set_calling_work_source_uid` and the five beside it, the AOSP
+  `IPCThreadState` set), `Remotable::transaction_name` with
+  `rsbinder_aidl::Builder::trace`, and the `observe` module
+  (`TransactionObserver`, `set_observer`, `LogObserver`). None of it changes
+  the wire: the work source uses a header field kernel binder already has. The
+  work source is STAGE3-gated against real `libbinder`. See
+  [Observability](./observability.md).
+- **`RpcClientConfig` (new in 0.13.0)** — one android-13+ client configuration
+  for every transport (`unix`, `unix_abstract`, `vsock`, `tls`, `tcp_debug`,
+  `new`), with `incoming_connections` and `outgoing_connections` on all of
+  them. It replaces `RpcUnixClientConfig` and the Unix-only multi-connection
+  helpers, which are deprecated and go in the release after.
 - **AIDL compiler, beyond the Stable entry points** —
   `Builder::{dest_dir, hash}` and the public `render` module, the seam
   `rsbinder-macros` plugs into. Its input structs are `#[non_exhaustive]`, so
