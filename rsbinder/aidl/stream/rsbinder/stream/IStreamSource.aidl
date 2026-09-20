@@ -25,7 +25,7 @@ interface IStreamSource {
      * send 8 batches. A producer sends a batch once it reaches a byte
      * threshold, so a granted window bounds the bytes in flight only
      * for items smaller than that threshold: a larger item still goes
-     * out, in a batch of its own.
+     * out, with the batch it was added to.
      *
      * `credits` must be positive; a producer ignores a grant that is
      * not. A grant that cannot be delivered fails at the sender — the

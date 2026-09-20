@@ -120,6 +120,15 @@
 //! overtake the last. Credit runs the other way and is `oneway` too: a
 //! grant never waits on the producer's threads, though on the RPC stack
 //! the send itself waits for a free outgoing connection on the session.
+//!
+//! # Async
+//!
+//! With the `tokio` feature, every `*_async` method makes its binder call
+//! from the blocking pool, so a send that waits on the transport does not
+//! hold an executor thread. **Poll them inside a Tokio runtime**: outside
+//! one the hand-off panics, as `tokio::task::spawn_blocking` does. A call
+//! from inside a transaction handler makes its binder call on the calling
+//! thread instead and is exempt.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -560,6 +569,52 @@ impl Drop for BatchInTransit {
     }
 }
 
+/// The terminator on its way to the blocking pool. A pool task has the
+/// same ways out as a batch, and a terminator that goes nowhere leaves the
+/// consumer blocked with both processes alive — so one dropped unsent is
+/// sent from wherever the drop happens.
+#[cfg(feature = "tokio")]
+struct TerminatorInTransit {
+    peer: Arc<Peer<dyn IStreamSink>>,
+    exception: i32,
+    service_specific: i32,
+    message: Option<String>,
+    /// What the send came to, wherever it was made from: the pool's own
+    /// answer says only whether the pool ran the task.
+    outcome: Arc<Mutex<Option<Result<()>>>>,
+    sent: bool,
+}
+
+#[cfg(feature = "tokio")]
+impl TerminatorInTransit {
+    fn send(mut self) {
+        self.deliver();
+    }
+
+    fn deliver(&mut self) {
+        // Before the call: a send that was tried is not tried again.
+        self.sent = true;
+        let sent = self.peer.on_end(
+            self.exception,
+            self.service_specific,
+            self.message.as_deref(),
+        );
+        if let Err(e) = sent {
+            log::warn!("stream: the terminator could not be delivered: {e:?}");
+        }
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(sent);
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl Drop for TerminatorInTransit {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.deliver();
+        }
+    }
+}
+
 /// The producer's handle on a stream: write items in, they leave in
 /// batches.
 ///
@@ -637,7 +692,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// and need not know this number: grants add to whatever is left.
     ///
     /// `max_batch_bytes` is a threshold, not a hard cap — an item larger
-    /// than it still goes out, in a batch of its own. Keep
+    /// than it still goes out, with the batch it was added to. Keep
     /// `initial_credits * max_batch_bytes` within the budget
     /// [`DEFAULT_MAX_BATCH_BYTES`] describes, or the driver starts
     /// counting this stream as a spam suspect.
@@ -816,8 +871,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// [`StatusCode::BadValue`] for a status that cannot be carried:
     /// `EX_TRANSACTION_FAILED` reports that the binder layer failed,
-    /// which a call that arrived cannot claim, and the two reply-header
-    /// markers (`-127`, `-128`) mean nothing outside a reply. The sink is
+    /// which a call that arrived cannot claim, the two reply-header
+    /// markers (`-127`, `-128`) mean nothing outside a reply, and
+    /// `JustError` stands for a code this build could not read, which the
+    /// consumer could not read either. The sink is
     /// consumed either way, so the stream still ends — with
     /// `EX_ILLEGAL_ARGUMENT`, saying the producer's own status was the
     /// thing that could not be sent.
@@ -911,6 +968,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// leaves the item queued. Dropping it mid-wait is safe too: a credit
     /// not yet taken stays with the stream, and a batch already handed to
     /// the pool still goes out.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime — see the [module docs](self#async).
     #[cfg(feature = "tokio")]
     #[must_use = "the item is queued, but a full batch is only sent when this is awaited"]
     pub fn send_async(
@@ -927,6 +988,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     }
 
     /// [`flush`](Self::flush) for a producer running as a task.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime — see the [module docs](self#async).
     #[cfg(feature = "tokio")]
     pub async fn flush_async(&mut self) -> Result<()> {
         if self.count == 0 {
@@ -941,7 +1006,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
             // The outcome is the batch's to settle, not this future's:
             // dropping the future detaches the pool task, and a task the
             // runtime drops unrun never returns anything.
-            let _ = on_pool(move || {
+            let _ = on_pool(batch, move |batch| {
                 batch.send(&peer);
                 Ok(())
             })
@@ -958,6 +1023,11 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// the pool, and a future dropped before that leaves the stream to
     /// [`Drop`](Sink#impl-Drop-for-Sink), which ends it as failed rather
     /// than as done.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime — see the [module docs](self#async). The
+    /// terminator is still sent.
     #[cfg(feature = "tokio")]
     pub async fn end_async(self) -> Result<()> {
         self.terminate_async(ExceptionCode::None as i32, 0, None)
@@ -965,8 +1035,8 @@ impl<T: Serialize + ?Sized> Sink<T> {
     }
 
     /// [`end_with`](Self::end_with) for a producer running as a task,
-    /// with the same caveat about a dropped future as
-    /// [`end_async`](Self::end_async).
+    /// with the same caveat about a dropped future, and the same panic,
+    /// as [`end_async`](Self::end_async).
     #[cfg(feature = "tokio")]
     pub async fn end_with_async(self, status: &Status) -> Result<()> {
         match status_fields(status) {
@@ -1022,21 +1092,31 @@ impl<T: Serialize + ?Sized> Sink<T> {
                 }
                 _ => (exception, service_specific, message),
             };
-        let peer = self.peer.clone();
+        let outcome = Arc::new(Mutex::new(None));
+        let terminator = TerminatorInTransit {
+            peer: self.peer.clone(),
+            exception,
+            service_specific,
+            message,
+            outcome: outcome.clone(),
+            sent: false,
+        };
         // Set only now: everything above suspends, and a future dropped
         // there has to leave `Drop` a stream still to terminate. From
-        // here there is no suspension point before `on_pool` hands the
-        // call to `spawn_blocking`, which a dropped future cannot recall.
+        // here the terminator is the token's to send, whatever becomes
+        // of this future or of the pool task.
         self.ended = true;
-        let ended =
-            on_pool(move || peer.on_end(exception, service_specific, message.as_deref())).await;
+        let pooled = on_pool(terminator, |terminator| {
+            terminator.send();
+            Ok(())
+        })
+        .await;
+        // The token's own answer where it has one: a terminator sent from
+        // its `Drop`, because the pool never ran it, was still sent.
+        let sent = outcome.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let ended = sent.unwrap_or(pooled);
         match failed {
-            Some(e) if !canceled => {
-                if let Err(end) = ended {
-                    log::warn!("stream: the terminator could not be delivered: {end:?}");
-                }
-                Err(e)
-            }
+            Some(e) if !canceled => Err(e),
             _ => ended,
         }
     }
@@ -1113,42 +1193,91 @@ impl<T: ?Sized> Sink<T> {
     }
 }
 
-/// Run one binder call on the blocking pool and await its result.
+/// A token and what to do with it, as the task a pool is handed. The
+/// token sits in a slot rather than in the task so that [`carry`] can
+/// take it back.
+#[cfg(feature = "tokio")]
+struct Carried<R, F> {
+    slot: Arc<Mutex<Option<R>>>,
+    run: F,
+}
+
+#[cfg(feature = "tokio")]
+impl<R, F: FnOnce(R) -> Result<()>> Carried<R, F> {
+    fn run(self) -> Result<()> {
+        let token = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match token {
+            Some(token) => (self.run)(token),
+            // Taken back: the hand-off failed and the token has settled.
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+struct TakeBack<R> {
+    slot: Arc<Mutex<Option<R>>>,
+    armed: bool,
+}
+
+#[cfg(feature = "tokio")]
+impl<R> Drop for TakeBack<R> {
+    fn drop(&mut self) {
+        if self.armed {
+            let token = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // Dropped with the slot unlocked: settling makes binder calls.
+            drop(token);
+        }
+    }
+}
+
+/// Give `hand_off` a task that runs `run` on `token`. A task dropped unrun
+/// drops the token with it, which is how a token settles. The one way out
+/// that skips even that is a hand-off that queues the task and then
+/// unwinds — `spawn_blocking` does, when the OS refuses a thread — leaving
+/// the task neither run nor dropped; the token is dropped here instead.
+#[cfg(feature = "tokio")]
+fn carry<R, F, H, O>(token: R, run: F, hand_off: H) -> O
+where
+    H: FnOnce(Carried<R, F>) -> O,
+{
+    let slot = Arc::new(Mutex::new(Some(token)));
+    let mut guard = TakeBack {
+        slot: slot.clone(),
+        armed: true,
+    };
+    let handed = hand_off(Carried { slot, run });
+    guard.armed = false;
+    handed
+}
+
+/// Make one binder call from the blocking pool, with the token the call
+/// is made for. Handed over when this is called, not when the future is
+/// polled, so dropping the future detaches the call. `Err` says only that
+/// the pool did not run it; what the call did is the token's to report.
 /// Through [`Tokio`](crate::Tokio) rather than `spawn_blocking` directly,
 /// because inside a transaction handler the call has to stay on the
 /// current thread and that rule lives there.
 #[cfg(feature = "tokio")]
-async fn on_pool<F>(call: F) -> Result<()>
+fn on_pool<R, F>(token: R, run: F) -> crate::BoxFuture<'static, Result<()>>
 where
-    F: FnOnce() -> Result<()> + Send + 'static,
+    R: Send + 'static,
+    F: FnOnce(R) -> Result<()> + Send + 'static,
 {
-    <crate::Tokio as crate::BinderAsyncPool>::spawn(call, |result| async move { result }).await
-}
-
-/// Run `call` on the blocking pool without waiting for it. `spawn` hands
-/// the call to the pool when it is called, not when its future is polled,
-/// so the future can go.
-#[cfg(feature = "tokio")]
-fn detach_on_pool<F>(call: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    drop(<crate::Tokio as crate::BinderAsyncPool>::spawn(
-        call,
-        |()| async { Ok::<(), StatusCode>(()) },
-    ));
-}
-
-/// Send a grant from the blocking pool: on the RPC stack the send waits
-/// for a free outgoing connection. The outcome is the token's to settle,
-/// so a pool task that never runs still gives the credit back.
-#[cfg(feature = "tokio")]
-async fn grant_on_pool(grant: GrantToken) {
-    let _ = on_pool(move || {
-        grant.send();
-        Ok(())
+    carry(token, run, |task| {
+        <crate::Tokio as crate::BinderAsyncPool>::spawn(
+            move || task.run(),
+            |result| async move { result },
+        )
     })
-    .await;
+}
+
+/// What an async consumer hands to [`on_pool`]: on the RPC stack a grant
+/// waits for a free outgoing connection.
+#[cfg(feature = "tokio")]
+fn send_grant(grant: GrantToken) -> Result<()> {
+    grant.send();
+    Ok(())
 }
 
 impl<T: ?Sized> Drop for Sink<T> {
@@ -1306,9 +1435,11 @@ fn truncated_terminator(exception: i32, lost: i32) -> Option<String> {
 fn status_fields(status: &Status) -> Result<(i32, i32, Option<String>)> {
     let exception = status.exception_code();
     match exception {
+        // What `exception_from_i32` would refuse on the other side.
         ExceptionCode::TransactionFailed
         | ExceptionCode::HasNotedAppOpsReplyHeader
-        | ExceptionCode::HasReplyHeader => {
+        | ExceptionCode::HasReplyHeader
+        | ExceptionCode::JustError => {
             log::error!("Sink::end: {exception} cannot be carried as a stream terminator");
             Err(StatusCode::BadValue)
         }
@@ -1826,13 +1957,9 @@ impl<T: Deserialize> Receiver<T> {
     ///
     /// # Panics
     ///
-    /// The grant reaches `tokio::task::spawn_blocking`, which panics when
-    /// there is no Tokio runtime context, so poll this inside one —
-    /// [`Sink::send_async`] has the same requirement. A call from inside
-    /// a transaction handler runs the grant on the calling thread and is
-    /// exempt. Nothing grants before a batch has been drained, so a
-    /// consumer polled outside a runtime fails on a later call rather
-    /// than the first.
+    /// Outside a Tokio runtime — see the [module docs](self#async).
+    /// Nothing grants before a batch has been drained, so a consumer
+    /// polled outside one fails on a later call rather than the first.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Option<BinderResult<T>> {
         loop {
@@ -1936,20 +2063,31 @@ impl<T: Deserialize> Receiver<T> {
                 Queued::Batch(batch) => match self.take_batch(batch) {
                     Ok(()) => {
                         if let Some(grant) = self.grant_due(false) {
-                            grant_on_pool(grant).await;
+                            // Owed again if the pool did not run it, and
+                            // the idle grant below is where that ends.
+                            let _ = on_pool(grant, send_grant).await;
                         }
                     }
                     Err(e) => {
                         let (answer, cancel) = self.batch_failed(e);
                         // Not awaited: the error is this call's to yield,
                         // and a future dropped at an await would lose it.
-                        detach_on_pool(move || cancel.send());
+                        drop(on_pool(cancel, |cancel| {
+                            cancel.send();
+                            Ok(())
+                        }));
                         return Some(answer);
                     }
                 },
                 Queued::End => return Some(self.finish()),
                 Queued::Nothing => {
-                    grant_on_pool(self.grant_due(true)?).await;
+                    if let Err(e) = on_pool(self.grant_due(true)?, send_grant).await {
+                        // The pool is gone, so the credit that came back
+                        // can never be sent: retrying would spin, woken
+                        // each time by the refund. Sent from here for the
+                        // same reason.
+                        self.stream.fail(Status::from(e), false).send();
+                    }
                     let ended = self.stream.lock().end.is_some();
                     if !ended {
                         return None;
@@ -2192,6 +2330,7 @@ mod tests {
         /// How many `onBatch` calls to refuse; the next one clears it.
         refuse: AtomicUsize,
         end: Mutex<Option<(i32, Option<String>)>>,
+        ends: AtomicUsize,
     }
 
     /// A sink that refuses batches on request and records its terminator.
@@ -2217,6 +2356,7 @@ mod tests {
         ) -> BinderResult<()> {
             *self.0.end.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((exception, message.map(str::to_owned)));
+            self.0.ends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2413,6 +2553,174 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the consumer finishes"));
         consumer.join().expect("consumer thread");
+    }
+
+    /// A terminator reaches the consumer exactly once, whichever way it
+    /// goes: one that goes nowhere leaves the consumer blocked with both
+    /// processes alive, so no death link ends the wait either.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_terminator_in_transit_is_sent_on_every_way_out() {
+        for way in [WayOut::Accepted, WayOut::DroppedUnsent, WayOut::Unwound] {
+            let recorded = Arc::new(Recorded::default());
+            let binder = BnStreamSink::new_binder(RefusingSink(recorded.clone())).as_binder();
+            let peer = resolve_peer::<dyn IStreamSink>(
+                &binder,
+                <BpStreamSink as crate::Proxy>::descriptor(),
+                "test",
+            )
+            .expect("a local sink");
+            let outcome = Arc::new(Mutex::new(None));
+            let terminator = TerminatorInTransit {
+                peer: Arc::new(peer),
+                exception: ExceptionCode::None as i32,
+                service_specific: 0,
+                message: None,
+                outcome: outcome.clone(),
+                sent: false,
+            };
+
+            match way {
+                WayOut::Accepted => terminator.send(),
+                WayOut::DroppedUnsent => drop(terminator),
+                WayOut::Unwound => unwind_past(terminator),
+                WayOut::Refused => unreachable!(),
+            }
+            assert_eq!(recorded.ends.load(Ordering::SeqCst), 1, "{way:?}");
+            assert_eq!(
+                outcome.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                Some(Ok(())),
+                "{way:?}: the caller is told what the send came to, not where it ran"
+            );
+        }
+    }
+
+    /// `spawn_blocking` queues the task before it finds the OS will not
+    /// give it a thread, and then panics: the task is neither run nor
+    /// dropped. Nothing may be left waiting on a token inside it.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_hand_off_that_queues_and_unwinds_gives_the_token_back() {
+        let credit = Arc::new(Credit::default());
+        let ledger = Arc::new(Ledger::default());
+        credit.grant(1);
+        assert!(credit.try_credit());
+        let batch = BatchInTransit::new(credit.clone(), ledger.clone(), 2);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let mut queued = None;
+        let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            carry(
+                batch,
+                move |batch: BatchInTransit| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(batch);
+                    Ok(())
+                },
+                |task| {
+                    queued = Some(task);
+                    std::panic::resume_unwind(Box::new("no thread to run it"));
+                },
+            )
+        }));
+        assert!(handed.is_err());
+
+        assert!(
+            !ledger.lock().in_transit,
+            "or `Drop for Sink` waits forever"
+        );
+        assert_eq!(credit.lock().available, 1);
+        assert_eq!(ledger.lost(), 2);
+
+        // The queue is drained later, by a spawn that does find a thread.
+        queued.expect("queued").run().expect("a task with no token");
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the token settled once");
+        assert_eq!(ledger.lost(), 2);
+    }
+
+    /// A pool that drops the terminator's task unrun says the task
+    /// failed. The terminator went out all the same, from the token's
+    /// `Drop`, and that is what the caller asked about.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn an_end_the_pool_drops_unrun_reports_the_send_not_the_pool() {
+        let recorded = Arc::new(Recorded::default());
+        let binder = BnStreamSink::new_binder(RefusingSink(recorded.clone())).as_binder();
+        let sink = Sink::<i32>::new(&binder).expect("a local sink");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+
+        assert_eq!(handle.block_on(sink.end_async()), Ok(()));
+        assert_eq!(recorded.ends.load(Ordering::SeqCst), 1);
+    }
+
+    /// `end_async` polled where the pool cannot take the terminator: the
+    /// stream is already marked ended by then, so `Drop` will not send
+    /// one, and it must not be the case that nothing does.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn an_end_the_pool_cannot_take_still_terminates_the_stream() {
+        let recorded = Arc::new(Recorded::default());
+        let binder = BnStreamSink::new_binder(RefusingSink(recorded.clone())).as_binder();
+        let sink = Sink::<i32>::new(&binder).expect("a local sink");
+
+        // No runtime here, so `spawn_blocking` panics with the call in hand.
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut end = std::pin::pin!(sink.end_async());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let _ = std::future::Future::poll(end.as_mut(), &mut context);
+        }));
+        assert!(polled.is_err(), "there is no pool to hand the call to");
+        assert_eq!(
+            recorded.ends.load(Ordering::SeqCst),
+            1,
+            "the terminator goes out once, from wherever the call was dropped"
+        );
+    }
+
+    /// A consumer driven on a runtime whose pool is gone cannot send the
+    /// credit it owes. It has to say so: parking would wait on a producer
+    /// that is out of credit, and retrying would spin on its own refund.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_consumer_whose_pool_is_gone_ends_the_stream() {
+        let calls = Arc::new(SourceCalls::default());
+        let source = BnStreamSource::new_binder(RefusingSource(calls.clone())).as_binder();
+        let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(2);
+        let sink: Strong<dyn IStreamSink> =
+            FromIBinder::try_from(sink_binder).expect("the receiver's own sink");
+        sink.r#onStart(&source).expect("onStart");
+        rx.stream.lock().owed = 1;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let last = handle.block_on(rx.recv_async());
+            // Sent back alive: dropping the receiver cancels too, and
+            // would race the count below.
+            let _ = done.send((last, rx));
+        });
+        let (last, _rx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the consumer must neither park nor spin");
+        assert!(matches!(last, Some(Err(_))), "{last:?}");
+        assert_eq!(
+            calls.canceled.load(Ordering::SeqCst),
+            1,
+            "the producer is released, from this thread since no pool will"
+        );
     }
 
     #[test]
@@ -2889,7 +3197,9 @@ mod tests {
 
         sink.r#onStart(&source).expect("onStart");
         let mut granted = false;
-        for _ in 0..500 {
+        // Shorter than the consumer's own timeout, which would otherwise
+        // wake it and pass this without the `onStart` wake.
+        for _ in 0..200 {
             if credit.try_credit() {
                 granted = true;
                 break;
@@ -2907,6 +3217,38 @@ mod tests {
             "the terminator ends the stream"
         );
         consumer.join().expect("consumer thread");
+    }
+
+    /// What the producer agrees to send and what the consumer agrees to
+    /// read are one set: a status accepted here and refused there makes
+    /// `end_with` succeed while the consumer's stream ends on `BadValue`.
+    #[test]
+    fn a_status_the_producer_accepts_is_one_the_consumer_reads() {
+        for code in [
+            ExceptionCode::None,
+            ExceptionCode::Security,
+            ExceptionCode::BadParcelable,
+            ExceptionCode::IllegalArgument,
+            ExceptionCode::NullPointer,
+            ExceptionCode::IllegalState,
+            ExceptionCode::NetworkMainThread,
+            ExceptionCode::UnsupportedOperation,
+            ExceptionCode::ServiceSpecific,
+            ExceptionCode::Parcelable,
+            ExceptionCode::HasNotedAppOpsReplyHeader,
+            ExceptionCode::HasReplyHeader,
+            ExceptionCode::TransactionFailed,
+            ExceptionCode::JustError,
+        ] {
+            let Ok((exception, service_specific, message)) = status_fields(&Status::from(code))
+            else {
+                continue;
+            };
+            assert!(
+                status_from_fields(exception, service_specific, message.as_deref()).is_ok(),
+                "{code:?} is sent and cannot be read"
+            );
+        }
     }
 
     #[test]

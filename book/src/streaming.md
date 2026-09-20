@@ -143,7 +143,7 @@ itself. Raise either number and `initial_credits × batch` is the budget to watc
 exhausting the space does not slow a sender down, it fails the call.
 
 The batch size is a threshold, not a cap: an item larger than it still goes out,
-in a batch of its own.
+with the batch it was added to.
 
 ## When a batch leaves
 

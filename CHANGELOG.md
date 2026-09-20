@@ -20,7 +20,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   passes its sink binder to the service, and reads; the service wraps that
   binder in a `Sink` and writes. Items are encoded with the same codec as
   `to_bytes`, carried in batches sent once they reach `DEFAULT_MAX_BATCH_BYTES`
-  (a threshold, not a cap — a larger item goes out in a batch of its own), and the
+  (a threshold, not a cap — a larger item goes out with the batch it was added
+  to), and the
   producer waits once it has `DEFAULT_CREDIT_WINDOW` batches in flight with
   none granted — `send`/`flush`/`end` park the thread, and with the `tokio`
   feature `send_async`/`flush_async`/`end_async`/`end_with_async` suspend the
