@@ -62,6 +62,31 @@
 //! [`TransportCaps::CALLBACKS`](crate::TransportCaps::CALLBACKS) rather
 //! than letting the first batch fail minutes later.
 //!
+//! # When a batch leaves
+//!
+//! Two things send one, and no clock is either of them: the pending
+//! batch reaching [`DEFAULT_MAX_BATCH_BYTES`] (or whatever
+//! [`Sink::with_limits`] was given), and a call to [`Sink::flush`] or
+//! [`Sink::end`]. Which of those a producer needs follows from how its
+//! items arrive.
+//!
+//! * **Items already in hand** — a query result, a directory listing, a
+//!   file read in chunks. The byte threshold does the batching; `end`
+//!   sends the remainder. Nothing else to do.
+//! * **Items arriving at their own pace** — an event feed, a sensor, a
+//!   log tail. Call `flush` at the point where what has been sent so far
+//!   is what the consumer should have now, typically after each event or
+//!   each burst. Without it an item sits in the pending batch until the
+//!   *next* [`Sink::send`] fills it, which for an idle producer is not a
+//!   bounded wait: the consumer stays blocked in [`Receiver::recv`] and
+//!   cannot tell that from a producer with nothing to report.
+//!   [`Sink::pending`] is what a service checks to confirm that
+//!   diagnosis.
+//!
+//! Flushing after every item costs a batching producer nothing — `send`
+//! has already sent them and `flush` on an empty batch returns at once —
+//! so a producer unsure which it is can simply flush.
+//!
 //! **Items carry no binder and no file descriptor.** A batch is bytes
 //! with no object table, so an item holding either is refused at
 //! [`send`](Sink::send) — see [`crate::to_bytes`], which uses the same
@@ -184,6 +209,20 @@ impl Credit {
 
     fn is_canceled(&self) -> bool {
         self.lock().canceled
+    }
+
+    /// Take one credit if one is there, without waiting.
+    ///
+    /// For [`Sink`]'s `Drop`, which has to be able to give up: a wait
+    /// there would hold whatever thread is unwinding for as long as the
+    /// consumer takes to grant.
+    fn try_credit(&self) -> bool {
+        let mut state = self.lock();
+        if state.dead || state.canceled || state.available == 0 {
+            return false;
+        }
+        state.available -= 1;
+        true
     }
 
     /// Take one credit, waiting until one is granted.
@@ -397,9 +436,11 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
 /// to a worker thread after construction is the usual shape — see the
 /// [module docs](self).
 ///
-/// Dropping a `Sink` without [`end`](Self::end) leaves the consumer
-/// waiting for a terminator that never comes; the pending batch is
-/// discarded. Call `end` even on failure.
+/// Call [`end`](Self::end) on every path, including the failing ones.
+/// A `Sink` dropped without it still flushes what it can and still
+/// terminates the stream — its `Drop` does, and documents the limits —
+/// but the stream is reported as having ended badly, because from the
+/// consumer's side that is all a vanished producer can mean.
 pub struct Sink<T: ?Sized> {
     peer: Peer<dyn IStreamSink>,
     credit: Arc<Credit>,
@@ -407,6 +448,9 @@ pub struct Sink<T: ?Sized> {
     batch: Parcel,
     count: i32,
     max_batch_bytes: usize,
+    /// Set once a terminator has gone out, so `Drop` does not send a
+    /// second one.
+    ended: bool,
     /// Holds the death link on the sink; the binder keeps only a `Weak`.
     _death: Option<Arc<dyn crate::DeathRecipient>>,
     _item: PhantomData<fn(&T)>,
@@ -480,6 +524,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
             batch: Parcel::new_data_only(),
             count: 0,
             max_batch_bytes: max_batch_bytes.max(1),
+            ended: false,
             _death: death,
             _item: PhantomData,
         };
@@ -500,6 +545,13 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// go and the consumer has granted no credit for it — that is the
     /// back-pressure, and it is why a `Sink` belongs on a thread of its
     /// own rather than on a binder worker.
+    ///
+    /// Nothing else sends for you. A producer that goes quiet with items
+    /// queued leaves them queued, and the consumer, which is blocked in
+    /// [`Receiver::recv`], cannot tell that from a producer with nothing
+    /// to say yet. Call [`flush`](Self::flush) whenever the items so far
+    /// are what the consumer should have now; see the [module
+    /// docs](self#when-a-batch-leaves) for which producers have to.
     ///
     /// # Errors
     ///
@@ -541,16 +593,20 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// Send whatever is queued, even if the batch is not full.
     ///
     /// Blocks for credit when there is something to send. Does nothing,
-    /// and cannot block, when nothing is queued.
+    /// and cannot block, when nothing is queued, so calling it after
+    /// every item costs a producer that fills batches anyway nothing —
+    /// [`send`](Self::send) has already sent them.
+    ///
+    /// This is the whole of the timing contract: batches leave on a byte
+    /// threshold and on this call, never on a clock. A producer whose
+    /// items arrive at their own pace decides here when the consumer
+    /// sees them.
     pub fn flush(&mut self) -> Result<()> {
         if self.count == 0 {
             return Ok(());
         }
         self.credit.wait_credit()?;
-        let batch = std::mem::replace(&mut self.batch, Parcel::new_data_only());
-        let count = std::mem::replace(&mut self.count, 0);
-        let bytes = batch.into_bytes()?;
-        self.peer.on_batch(&bytes, count)
+        self.send_batch()
     }
 
     /// Finish the stream: the items ran out, nothing went wrong.
@@ -559,9 +615,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// — unless the consumer has cancelled, in which case they are
     /// dropped and only the terminator goes out.
     ///
-    /// A `Sink` dropped without this leaves the consumer waiting for a
-    /// terminator that never arrives, so call it on every path, including
-    /// the failing ones — [`end_with`](Self::end_with) is that path.
+    /// Call it on every path, including the failing ones —
+    /// [`end_with`](Self::end_with) is that path. A `Sink` dropped
+    /// without either ends the stream as having failed, which is the
+    /// only honest reading of a producer that vanished.
     pub fn end(self) -> Result<()> {
         self.terminate(ExceptionCode::None as i32, 0, None)
     }
@@ -599,9 +656,14 @@ impl<T: Serialize + ?Sized> Sink<T> {
             // the terminator still has to go out. Anything else — a dead
             // consumer above all — leaves nothing to tell.
             if !self.credit.is_canceled() {
+                // `Drop` runs next and must not send a second
+                // terminator: the stream is over either way, and the
+                // failure the caller is about to see is the report.
+                self.ended = true;
                 return Err(e);
             }
         }
+        self.ended = true;
         self.peer.on_end(exception, service_specific, message)
     }
 
@@ -619,6 +681,18 @@ impl<T: Serialize + ?Sized> Sink<T> {
         self.credit.lock().available
     }
 
+    /// Items queued for the next batch — accepted by
+    /// [`send`](Self::send) and not yet sent.
+    ///
+    /// Zero right after [`flush`](Self::flush) and after any `send` that
+    /// crossed the byte threshold. A non-zero reading while the consumer
+    /// reports nothing arriving is the signature of a producer that
+    /// should be flushing: the items are here, not lost and not in
+    /// flight.
+    pub fn pending(&self) -> usize {
+        self.count as usize
+    }
+
     /// Cut the pending batch back to `len` bytes.
     ///
     /// `Parcel` has no truncate — its write cursor may sit anywhere, so
@@ -633,6 +707,58 @@ impl<T: Serialize + ?Sized> Sink<T> {
         rebuilt.set_data_position(bytes.len());
         self.batch = rebuilt;
         Ok(())
+    }
+}
+
+// Encoding items needs `Serialize`; handing the finished bytes over and
+// terminating do not, and `Drop` has to be implemented for exactly the
+// bounds the struct was declared with.
+impl<T: ?Sized> Sink<T> {
+    /// Hand the pending batch to the consumer. A credit must already
+    /// have been taken for it.
+    fn send_batch(&mut self) -> Result<()> {
+        let batch = std::mem::replace(&mut self.batch, Parcel::new_data_only());
+        let count = std::mem::replace(&mut self.count, 0);
+        let bytes = batch.into_bytes()?;
+        self.peer.on_batch(&bytes, count)
+    }
+}
+
+impl<T: ?Sized> Drop for Sink<T> {
+    /// Deliver what is queued and end the stream.
+    ///
+    /// A producer that goes away without [`end`](Sink::end) leaves the
+    /// consumer blocked in [`Receiver::recv`] for a terminator that no
+    /// longer has a sender, and the consumer cannot recover on its own:
+    /// the producer's process is still running, so no death link fires.
+    /// This is the fallback for that, not a substitute for `end` — the
+    /// stream is reported as having failed, since a producer that
+    /// vanished mid-stream has no way to say it was done.
+    ///
+    /// The flush here does not wait for credit. Blocking in a `Drop`
+    /// would hold the unwinding thread for as long as the consumer takes
+    /// to grant, so items that cannot leave now are lost and the
+    /// terminator's message says how many.
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        if self.count > 0 && self.credit.try_credit() {
+            if let Err(e) = self.send_batch() {
+                log::warn!("stream: the last batch could not be delivered: {e:?}");
+            }
+        }
+        let message = format!(
+            "the stream's producer dropped its sink without ending the stream; \
+             {} queued item(s) were not sent",
+            self.count
+        );
+        if let Err(e) = self
+            .peer
+            .on_end(ExceptionCode::IllegalState as i32, 0, Some(&message))
+        {
+            log::warn!("stream: the terminator could not be delivered: {e:?}");
+        }
     }
 }
 
@@ -1510,6 +1636,69 @@ mod tests {
             "`is_canceled` is what tells that refusal from an unusable transport"
         );
         producer.join().expect("producer thread");
+    }
+
+    /// A producer that goes away mid-stream still delivers what it had
+    /// and still ends the stream, because the consumer blocked in `recv`
+    /// has no other way to find out.
+    #[test]
+    fn a_dropped_sink_flushes_and_reports_that_it_never_ended() {
+        let (mut sink, mut rx) = pair::<i32>(
+            DEFAULT_CREDIT_WINDOW,
+            DEFAULT_MAX_BATCH_BYTES,
+            DEFAULT_CREDIT_WINDOW,
+        );
+        sink.send(&1).expect("send");
+        sink.send(&2).expect("send");
+        assert_eq!(sink.pending(), 2, "neither item filled a 16 KB batch");
+        drop(sink);
+
+        assert_eq!(rx.next().expect("item 1").expect("ok"), 1);
+        assert_eq!(rx.next().expect("item 2").expect("ok"), 2);
+        let failure = rx.next().expect("a terminator").expect_err("an error");
+        assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
+        assert!(rx.next().is_none(), "the stream is over");
+    }
+
+    /// The same drop with no credit left: the queued item cannot go out,
+    /// and waiting for a grant would park whichever thread is dropping.
+    #[test]
+    fn a_dropped_sink_with_no_credit_still_ends_the_stream() {
+        let (mut rx, sink_binder) = Receiver::<i32>::with_credit_window(1);
+        // Eight bytes to a batch is two `i32`s, and one opening credit.
+        let (mut sink, source) = Sink::<i32>::with_limits(&sink_binder, 8, 1).expect("with_limits");
+        rx.attach_source(&source.as_binder())
+            .expect("attach_source");
+
+        sink.send(&0).expect("send");
+        // Fills the batch, so this one spends the only credit.
+        sink.send(&1).expect("send");
+        // Queued with nothing left to send it, and nothing draining yet,
+        // so no grant is coming either.
+        sink.send(&2).expect("send");
+        assert_eq!(sink.credits(), 0);
+        assert_eq!(sink.pending(), 1);
+
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            drop(sink);
+            let _ = done.send(());
+        });
+        watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drop must not wait for credit");
+
+        assert_eq!(rx.next().expect("item 0").expect("ok"), 0);
+        assert_eq!(rx.next().expect("item 1").expect("ok"), 1);
+        let failure = rx.next().expect("a terminator").expect_err("an error");
+        assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
+        assert!(
+            failure
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "the terminator says what was lost: {failure:?}"
+        );
     }
 
     /// `EX_TRANSACTION_FAILED` says the binder layer failed, which a call

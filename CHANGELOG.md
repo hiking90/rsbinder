@@ -27,6 +27,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   so a service-specific failure reaches the consumer with its code and message
   intact even though the method that started the stream already returned.
   Dropping a `Receiver` cancels, releasing a producer waiting for credit.
+  Batches leave on the byte threshold and on `flush`/`end`, never on a clock,
+  so a producer whose items arrive at their own pace calls `flush` to decide
+  when the consumer sees them; `Sink::pending` reports what is still queued.
+  Dropping a `Sink` without `end` delivers what credit allows and terminates
+  the stream with `EX_ILLEGAL_STATE` rather than leaving the consumer blocked
+  — that flush does not wait for credit, and the terminator's message says how
+  many items were lost.
   Each end watches the other's binder for death, because back-pressure means
   there is usually no call in flight to fail: a producer parked for credit and
   a consumer blocked in `recv` both end with `DeadObject` when the peer's

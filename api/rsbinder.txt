@@ -2607,9 +2607,12 @@ pub fn rsbinder::stream::Sink<T>::end_with(self, &rsbinder::Status) -> rsbinder:
 pub fn rsbinder::stream::Sink<T>::flush(&mut self) -> rsbinder::Result<()>
 pub fn rsbinder::stream::Sink<T>::is_canceled(&self) -> bool
 pub fn rsbinder::stream::Sink<T>::new(&rsbinder::SIBinder) -> rsbinder::Result<(Self, rsbinder::stream::Source)>
+pub fn rsbinder::stream::Sink<T>::pending(&self) -> usize
 pub fn rsbinder::stream::Sink<T>::send(&mut self, &T) -> rsbinder::Result<()>
 pub fn rsbinder::stream::Sink<T>::send_all<'a, I>(&mut self, I) -> rsbinder::Result<()> where I: core::iter::traits::collect::IntoIterator<Item = &'a T>, T: 'a
 pub fn rsbinder::stream::Sink<T>::with_limits(&rsbinder::SIBinder, usize, u32) -> rsbinder::Result<(Self, rsbinder::stream::Source)>
+impl<T: ?core::marker::Sized> core::ops::drop::Drop for rsbinder::stream::Sink<T>
+pub fn rsbinder::stream::Sink<T>::drop(&mut self)
 impl<T> core::marker::Freeze for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
 impl<T> core::marker::Send for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
 impl<T> core::marker::Sync for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
