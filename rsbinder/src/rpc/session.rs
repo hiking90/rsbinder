@@ -161,7 +161,11 @@ fn unix_connect(addr: RpcUnixAddr<'_>) -> Result<Box<dyn RpcTransport>> {
 }
 
 /// Opens one connection to the server; see [`RpcClientConfig::new`].
-type Connector<'a> = Box<dyn FnMut() -> Result<Box<dyn RpcTransport>> + 'a>;
+///
+/// `Send` so that a [`RpcClientConfig`] can be built on one thread and
+/// consumed on another, which is what the `RpcUnixClientConfig` it
+/// replaces allowed.
+type Connector<'a> = Box<dyn FnMut() -> Result<Box<dyn RpcTransport>> + Send + 'a>;
 
 /// Where a [`RpcClientConfig`] opens its connections. The connect
 /// function is built from this once the handshake deadline is known, so
@@ -230,7 +234,8 @@ impl<'a> ClientSource<'a> {
 
 /// A fresh TCP connection and TLS session to `host:port`, each blocking
 /// step bounded by `handshake_timeout`. The first address that connects
-/// is pinned for the session's later connections, as AOSP
+/// is pinned in `pinned`, which lives in the connector one config built,
+/// so it covers the connections that config opens, as AOSP
 /// `setupInetClient` resolves once: another server behind the same name
 /// would not know the session id.
 #[cfg(feature = "rpc-tls")]
@@ -391,11 +396,14 @@ impl<'a> RpcClientConfig<'a> {
     /// before any RPC byte), and every connection gets its own TLS
     /// session.
     ///
-    /// `host` is resolved once, and every further connection of the
-    /// session goes to the address the founding one reached — AOSP
-    /// `setupInetClient` resolves once too. A second resolve could land a
-    /// fan-out or incoming connection on another server behind the same
-    /// name, which does not know the session id.
+    /// `host` is resolved once per config: the first connection this
+    /// config opens resolves it, and every further connection *it* opens
+    /// goes to the address that one reached — AOSP `setupInetClient`
+    /// resolves once too. A second resolve could land a fan-out or
+    /// incoming connection on another server behind the same name, which
+    /// does not know the session id. An attach built from another config
+    /// resolves again, so name the address the session was founded on (an
+    /// IP literal) when `host` has more than one.
     #[cfg(feature = "rpc-tls")]
     pub fn tls(
         host: &'a str,
@@ -427,6 +435,11 @@ impl<'a> RpcClientConfig<'a> {
     /// android-13+ handshake that follows, and only the constructors
     /// above apply it earlier than that.
     ///
+    /// `connect` must be [`Send`]: the config can be built on one thread
+    /// and consumed on another, which is what the `RpcUnixClientConfig`
+    /// it replaces allowed. A closure capturing an [`Rc`](std::rc::Rc) or
+    /// another `!Send` handle does not compile here.
+    ///
     /// ```no_run
     /// # #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
     /// # fn f() -> rsbinder::Result<()> {
@@ -443,7 +456,7 @@ impl<'a> RpcClientConfig<'a> {
     /// ```
     pub fn new(
         max_version: u32,
-        connect: impl FnMut() -> Result<Box<dyn RpcTransport>> + 'a,
+        connect: impl FnMut() -> Result<Box<dyn RpcTransport>> + Send + 'a,
     ) -> Self {
         Self::with_source(ClientSource::Custom(Box::new(connect)), max_version)
     }
@@ -531,6 +544,15 @@ impl<'a> RpcClientConfig<'a> {
     /// timeout on the returned session instead leaves those unbounded: a
     /// peer that completes the handshake and then answers neither would
     /// block the caller forever. Default `None` (no deadline).
+    ///
+    /// It belongs to the call that *founds* a session. The attach calls —
+    /// [`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config),
+    /// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config)
+    /// and the deprecated `_android13plus_with_config` pair — join a
+    /// session that already has its deadline, so they refuse a config
+    /// carrying this with [`StatusCode::BadValue`] rather than drop it
+    /// silently. Change an existing session's deadline through
+    /// [`RpcSession::set_timeout`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -2095,7 +2117,15 @@ impl RpcSessionInner {
     /// count and is zero on the default single-slot path (no waiters
     /// at all), so the trade favors mixed-waiter correctness.
     ///
-    /// `None` for a torn-down session. That gate sits in the *same*
+    /// `Err(DeadObject)` for a torn-down session; `Err(BadType)` for a
+    /// transport whose traits differ from the founding connection's, as
+    /// [`add_incoming_slot_capped`](Self::add_incoming_slot_capped)
+    /// already reports it. The two are kept apart because a live session
+    /// refusing a mismatched transport must not reach the caller as a
+    /// dead one — the caller's answer to `DeadObject` is to drop the
+    /// proxy or close the session.
+    ///
+    /// The teardown gate sits in the *same*
     /// critical section as the push (like
     /// [`add_slot_inner_capped`](Self::add_slot_inner_capped)): an
     /// attach's own pre-check is a snapshot taken before a connect +
@@ -2103,7 +2133,7 @@ impl RpcSessionInner {
     /// this very lock. A slot pushed after that is never shut down by the
     /// death sequence, so a serve loop on it blocks in `recv` forever,
     /// pinning the whole session graph.
-    fn add_slot_inner(&self, transport: Box<dyn RpcTransport>, role: SlotRole) -> Option<u64> {
+    fn add_slot_inner(&self, transport: Box<dyn RpcTransport>, role: SlotRole) -> Result<u64> {
         // `Arc::from(Box<dyn T>)` is the stable std conversion that
         // re-takes the heap allocation under an `Arc` without copying
         // (impl<T: ?Sized> From<Box<T>> for Arc<T>). The slot holds
@@ -2112,8 +2142,11 @@ impl RpcSessionInner {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         // Anti-resurrection gate — must share the push's critical section
         // (see this fn's rustdoc).
-        if self.shared.lifecycle.is_torn_down() || !st.admits(&*transport) {
-            return None;
+        if self.shared.lifecycle.is_torn_down() {
+            return Err(StatusCode::DeadObject);
+        }
+        if !st.admits(&*transport) {
+            return Err(StatusCode::BadType);
         }
         let id = st.next_slot_id;
         st.next_slot_id += 1;
@@ -2128,7 +2161,7 @@ impl RpcSessionInner {
         });
         drop(st);
         self.slot_cv.notify_all();
-        Some(id)
+        Ok(id)
     }
 
     /// Server attach: add a serve-driven slot, enforcing the
@@ -2181,15 +2214,19 @@ impl RpcSessionInner {
     /// connection slot (no `live_conns` bump — client outgoing slots
     /// are not serve-driven). See
     /// [`RpcSession::add_outgoing_connection_android13plus`].
-    /// `None` for a torn-down session.
-    fn add_outgoing_slot(&self, transport: Box<dyn RpcTransport>) -> Option<u64> {
+    /// Same refusals as [`add_slot_inner`](Self::add_slot_inner).
+    fn add_outgoing_slot(&self, transport: Box<dyn RpcTransport>) -> Result<u64> {
         self.add_slot_inner(transport, SlotRole::Outgoing)
     }
 
     /// Like [`add_slot_inner`](Self::add_slot_inner) but enforces a
     /// maximum number of callback (`Outgoing`) slots **atomically** under
-    /// the `conn_state` lock: returns `None` (adding nothing, closing
-    /// `transport`) when the pool already holds `cap` of them. Serve-driven
+    /// the `conn_state` lock: returns `Err(FailedTransaction)` (adding
+    /// nothing, closing `transport`) when the pool already holds `cap` of
+    /// them, and the two refusals of `add_slot_inner` as it does — a
+    /// budget that is spent, a session that is dead and a transport that
+    /// does not match are three different things to the caller that has
+    /// to answer them. Serve-driven
     /// slots do not count — a client's outgoing fan-out must never eat
     /// into its callback budget. Used for the server callback-slot
     /// admission cap — callback slots have no serve loop and are only
@@ -2214,12 +2251,12 @@ impl RpcSessionInner {
         transport: Box<dyn RpcTransport>,
         cap: usize,
         claimed: bool,
-    ) -> Option<u64> {
+    ) -> Result<u64> {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         // Anti-resurrection gate — same critical section as the cap check,
         // for the same reason (see this fn's rustdoc).
         if self.shared.lifecycle.is_torn_down() {
-            return None;
+            return Err(StatusCode::DeadObject);
         }
         if st
             .slots
@@ -2227,9 +2264,11 @@ impl RpcSessionInner {
             .filter(|s| s.role == SlotRole::Outgoing)
             .count()
             >= cap
-            || !st.admits(&*transport)
         {
-            return None;
+            return Err(StatusCode::FailedTransaction);
+        }
+        if !st.admits(&*transport) {
+            return Err(StatusCode::BadType);
         }
         let transport: Arc<dyn RpcTransport> = Arc::from(transport);
         let id = st.next_slot_id;
@@ -2245,7 +2284,7 @@ impl RpcSessionInner {
         });
         drop(st);
         self.slot_cv.notify_all();
-        Some(id)
+        Ok(id)
     }
 
     /// A nested (reentrant) client call on `slot_id` stopped waiting for
@@ -3986,10 +4025,11 @@ impl RpcSession {
     /// the lifecycle count (callback slots are not serve-driven; AOSP
     /// also does not gate session lifetime on `mOutgoing.size()`).
     /// `Err(DeadObject)` if the session was already torn down when the
-    /// call started (the lifecycle covers both `Dying` and `Dead` in a
-    /// single check), or `Err(FailedTransaction)` if the session already
-    /// holds `cap` callback slots — or died in between, which the
-    /// atomic gate below catches under the same lock as the cap.
+    /// call started, or died in between — which the atomic gate below
+    /// catches under the same lock as the cap (the lifecycle covers both
+    /// `Dying` and `Dead` in a single check). `Err(FailedTransaction)` if
+    /// the session already holds `cap` callback slots, `Err(BadType)` if
+    /// the transport does not match the founding connection's.
     ///
     /// `cap` and the teardown gate are both enforced atomically inside
     /// [`add_slot_inner_capped`] (`RpcSessionInner`) so concurrent attach
@@ -4021,10 +4061,7 @@ impl RpcSession {
         if self.inner.shared.lifecycle.is_torn_down() {
             return Err(StatusCode::DeadObject);
         }
-        let slot_id = self
-            .inner
-            .add_slot_inner_capped(transport, cap, true)
-            .ok_or(StatusCode::FailedTransaction)?;
+        let slot_id = self.inner.add_slot_inner_capped(transport, cap, true)?;
         let transport = {
             let st = self.inner.conn_state.lock().expect("conn_state poisoned");
             st.slots
@@ -4073,9 +4110,7 @@ impl RpcSession {
         if self.inner.shared.lifecycle.is_torn_down() {
             return Err(StatusCode::DeadObject);
         }
-        self.inner
-            .add_slot_inner_capped(transport, cap, false)
-            .ok_or(StatusCode::FailedTransaction)
+        self.inner.add_slot_inner_capped(transport, cap, false)
     }
 
     /// This session's full inner state — including
@@ -5082,21 +5117,34 @@ impl RpcSession {
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
-        self.add_outgoing_connection_with_config(config.into_generic())
+        self.add_outgoing_connection_named(
+            config.into_generic(),
+            "RpcUnixClientConfig::handshake_timeout",
+        )
     }
 
     /// Client multi-outgoing using a [`RpcClientConfig`] — the config's
-    /// `session_id` is required (this is an attach), and its fan-out and
-    /// incoming counts must be left at their defaults, since this call
-    /// opens exactly one connection.
+    /// `session_id` is required (this is an attach), and every field an
+    /// attach cannot honor must be left unset, or the call is
+    /// [`StatusCode::BadValue`]: `outgoing_connections` and
+    /// `incoming_connections`, since this call opens exactly one
+    /// connection, and [`timeout`](RpcClientConfig::timeout), since the
+    /// session it joins already has its deadline. `fd_mode` may be given
+    /// only as the mode this session negotiated.
     pub fn add_outgoing_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
+        self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
+    }
+
+    /// `what` names the setter the caller used, so a deprecated wrapper's
+    /// caller is not pointed at a setter it never had.
+    fn add_outgoing_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
             max_version,
             session_id,
             fd_mode,
             handshake_timeout,
-        } = self.attach_parts(config)?;
+        } = self.attach_parts(config, what)?;
         self.add_outgoing_connection_android13plus_transport(
             &mut connect,
             max_version,
@@ -5108,14 +5156,14 @@ impl RpcSession {
 
     /// The single connection and knobs a manual attach runs on, with the
     /// combinations an attach cannot express refused first.
-    fn attach_parts<'a>(&self, config: RpcClientConfig<'a>) -> Result<AttachParts<'a>> {
-        reject_zero_handshake_timeout(
-            config.handshake_timeout,
-            "RpcClientConfig::handshake_timeout",
-        )?;
+    fn attach_parts<'a>(&self, config: RpcClientConfig<'a>, what: &str) -> Result<AttachParts<'a>> {
+        reject_zero_handshake_timeout(config.handshake_timeout, what)?;
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
             || config.session_id.len() != 32
+            // The attach joins a session that already has its deadline;
+            // accepting one here would silently drop it.
+            || config.timeout.is_some()
         {
             return Err(StatusCode::BadValue);
         }
@@ -5159,6 +5207,13 @@ impl RpcSession {
             WireProfile::Android13Plus(c) => c.version(),
             WireProfile::R34(_) => return Err(StatusCode::BadType),
         };
+        // Checked here, as the incoming attach does: `add_outgoing_slot`
+        // refuses a torn-down session anyway, and reaching it would have
+        // cost a connect, a handshake and the `confirm_attach` roundtrip
+        // — and left the server holding a slot and a worker thread.
+        if self.inner.shared.lifecycle.is_torn_down() {
+            return Err(StatusCode::DeadObject);
+        }
         let effective_max = max_version.min(session_version);
         let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
             FD_MODE_UNIX
@@ -5201,9 +5256,7 @@ impl RpcSession {
                 return Err(StatusCode::from(e));
             }
         }
-        self.inner
-            .add_outgoing_slot(t)
-            .ok_or(StatusCode::DeadObject)
+        self.inner.add_outgoing_slot(t)
     }
 
     /// Open one *additional* **incoming (callback) connection** to the
@@ -5229,22 +5282,35 @@ impl RpcSession {
         &self,
         config: RpcUnixClientConfig,
     ) -> Result<u64> {
-        self.add_incoming_connection_with_config(config.into_generic())
+        self.add_incoming_connection_named(
+            config.into_generic(),
+            "RpcUnixClientConfig::handshake_timeout",
+        )
     }
 
     /// Open one *additional* incoming (callback) connection using a
     /// [`RpcClientConfig`] — on any transport, not only a Unix socket.
-    /// The config's `session_id` is required and its fan-out and incoming
-    /// counts must be left at their defaults, since this call opens
-    /// exactly one connection.
+    /// The config's `session_id` is required and every field an attach
+    /// cannot honor must be left unset, or the call is
+    /// [`StatusCode::BadValue`]: `outgoing_connections` and
+    /// `incoming_connections`, since this call opens exactly one
+    /// connection, and [`timeout`](RpcClientConfig::timeout), since the
+    /// session it joins already has its deadline. `fd_mode` may be given
+    /// only as the mode this session negotiated.
     pub fn add_incoming_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
+        self.add_incoming_connection_named(config, "RpcClientConfig::handshake_timeout")
+    }
+
+    /// `what` names the setter the caller used, so a deprecated wrapper's
+    /// caller is not pointed at a setter it never had.
+    fn add_incoming_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
             max_version,
             session_id,
             fd_mode,
             handshake_timeout,
-        } = self.attach_parts(config)?;
+        } = self.attach_parts(config, what)?;
         self.add_incoming_connection_android13plus_transport(
             &mut connect,
             max_version,
@@ -5299,10 +5365,7 @@ impl RpcSession {
         }
         // Dropping `t` on refusal closes the socket, so the peer sees EOF
         // on a connection this session will never serve.
-        let slot_id = self
-            .inner
-            .add_slot_inner(t, SlotRole::Incoming)
-            .ok_or(StatusCode::DeadObject)?;
+        let slot_id = self.inner.add_slot_inner(t, SlotRole::Incoming)?;
         let inner = Arc::clone(&self.inner);
         // Bump *before* the spawn so the counter is never observed low
         // between here and the thread's first instruction.
@@ -6500,11 +6563,9 @@ mod tests {
         session.close_session();
 
         let (t, _p) = MemTransport::pair();
-        assert!(
-            session
-                .inner
-                .add_slot_inner_capped(Box::new(t), 2, false)
-                .is_none(),
+        assert_eq!(
+            session.inner.add_slot_inner_capped(Box::new(t), 2, false),
+            Err(StatusCode::DeadObject),
             "no slot may be pushed onto a torn-down session"
         );
         assert_eq!(session.inner.slot_count(), 0, "the dead pool stays empty");
@@ -6521,13 +6582,19 @@ mod tests {
         let session = RpcSession::from_android13plus(Box::new(t0), codec, FD_MODE_NONE, false)
             .expect("build session");
 
+        // All three report the mismatch as itself: the session is alive
+        // and its callback budget untouched, so `DeadObject` or
+        // `FailedTransaction` would send the caller after the wrong cause.
         let (u, _pu) = UnixTransport::pair().expect("socketpair");
-        assert!(session.inner.add_outgoing_slot(Box::new(u)).is_none());
+        assert_eq!(
+            session.inner.add_outgoing_slot(Box::new(u)),
+            Err(StatusCode::BadType)
+        );
         let (u, _pu) = UnixTransport::pair().expect("socketpair");
-        assert!(session
-            .inner
-            .add_slot_inner_capped(Box::new(u), 2, false)
-            .is_none());
+        assert_eq!(
+            session.inner.add_slot_inner_capped(Box::new(u), 2, false),
+            Err(StatusCode::BadType)
+        );
         let (u, _pu) = UnixTransport::pair().expect("socketpair");
         assert_eq!(
             session.inner.add_incoming_slot_capped(Box::new(u), 2),
@@ -6537,7 +6604,7 @@ mod tests {
 
         let (m, _pm) = MemTransport::pair();
         assert!(
-            session.inner.add_outgoing_slot(Box::new(m)).is_some(),
+            session.inner.add_outgoing_slot(Box::new(m)).is_ok(),
             "a slot of the founding kind still joins"
         );
     }

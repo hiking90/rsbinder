@@ -19,7 +19,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   producer and `Receiver<T>` for the consumer. The consumer makes a receiver,
   passes its sink binder to the service, and reads; the service wraps that
   binder in a `Sink` and writes. Items are encoded with the same codec as
-  `to_bytes`, carried in batches capped at `DEFAULT_MAX_BATCH_BYTES`, and the
+  `to_bytes`, carried in batches sent once they reach `DEFAULT_MAX_BATCH_BYTES`
+  (a threshold, not a cap — a larger item goes out in a batch of its own), and the
   producer waits once it has `DEFAULT_CREDIT_WINDOW` batches in flight with
   none granted — `send`/`flush`/`end` park the thread, and with the `tokio`
   feature `send_async`/`flush_async`/`end_async`/`end_with_async` suspend the
@@ -126,9 +127,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `add_outgoing_connection_with_config` and
   `add_incoming_connection_with_config`, which take it; the incoming one
   attaches a callback connection over any transport, where the call it replaces
-  was Unix-only. `RpcClientConfig::tls` resolves its host once and opens every
-  connection of the session to that address (AOSP `setupInetClient` does the
-  same); `handshake_timeout` bounds its `connect(2)` and TLS handshake too.
+  was Unix-only. `RpcClientConfig::tls` resolves its host once per config and
+  opens every connection that config makes to that address (AOSP
+  `setupInetClient` does the same); `handshake_timeout` bounds its `connect(2)`
+  and TLS handshake too.
   Requesting `FileDescriptorTransportMode::Unix` on a transport that cannot
   pass descriptors is now `BadValue` from the setup call, decided by the
   founding connection's `supports_fd_passing()`, instead of failing on the
@@ -139,15 +141,25 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Storing a
   value was never a transport concern: the encoder runs in the session-less
   parcel mode, and it is the *absence* of a session that refuses a binder
-  (`BadType`) and a file descriptor (`FdsNotAllowed`). Those refusals now
-  compile into a build without `rpc` as well, where the same writes previously
-  reached the kernel arm — a binder went out as a `flat_binder_object` (or
-  panicked in a process that never opened the driver) and an fd was dup'd and
-  marshalled as `BINDER_TYPE_FD`. Reading is refused the same way, so a forged
+  (`BadType`) and a file descriptor (`FdsNotAllowed`). A build without `rpc`
+  had no session-less parcel mode to run in and did not compile the two
+  functions at all; the mode and both functions are now there without the
+  feature, with those refusals applied at the write. Reading is refused the
+  same way, so a forged
   object in stored bytes cannot become a proxy. `Parcel::allow_fds` answers
   `false` on such a parcel in every feature configuration, which is what makes
   `write_blob` store its payload inline there. Nothing about the wire changes,
   and no signature changes; a build with `rpc` behaves as before.
+- **An attach refuses a config that carries a session `timeout`.**
+  `RpcSession::add_outgoing_connection_android13plus_with_config` and
+  `add_incoming_connection_android13plus_with_config` (and the
+  `add_{outgoing,incoming}_connection_with_config` pair that replaces them)
+  return `StatusCode::BadValue` for a config built with
+  `.timeout(..)`. An attach joins a session that already has its deadline, so
+  the value had nowhere to go: it was previously accepted and ignored, which
+  left a caller believing it had bounded replies on that session. Set the
+  deadline where the session is founded, or with `RpcSession::set_timeout`.
+  `handshake_timeout`, which does apply per connection, is unaffected.
 
 ### Deprecated
 

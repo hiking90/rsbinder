@@ -191,8 +191,14 @@ if start rsb107.holding > /dev/null; then
     # batch is what reports the death.
     probe 60 die rsb107.holding 3 4 100000 2000 > "$OUT" 2>/tmp/rsb107-holding.err
     if grep -qx 'RESULT die 3' "$OUT"; then
-        sleep 2
-        probe 60 status rsb107.holding > "$OUT" 2>>/tmp/rsb107-holding.err
+        # Polled, not slept on: the gate's predicate is readable directly,
+        # and how long the death notification takes to reach the
+        # producer's binder thread is the device's business.
+        for _ in $(seq 1 20); do
+            probe 60 status rsb107.holding > "$OUT" 2>>/tmp/rsb107-holding.err
+            grep -q 'finished=true dead=true' "$OUT" && break
+            sleep 0.5
+        done
         if grep -q 'finished=true dead=true' "$OUT"; then
             ok "the producer's next batch reported DeadObject and it stopped"
         else
@@ -215,8 +221,12 @@ if start rsb107.parked > /dev/null; then
     # the process.
     probe 60 die rsb107.parked 1 4 1 0 > "$OUT" 2>/tmp/rsb107-parked.err
     if grep -qx 'RESULT die 1' "$OUT"; then
-        sleep 2
-        probe 60 status rsb107.parked > "$OUT" 2>>/tmp/rsb107-parked.err
+        # Polled for the same reason as the gate above.
+        for _ in $(seq 1 20); do
+            probe 60 status rsb107.parked > "$OUT" 2>>/tmp/rsb107-parked.err
+            grep -q 'finished=true dead=true' "$OUT" && break
+            sleep 0.5
+        done
         if grep -q 'finished=true dead=true' "$OUT"; then
             ok "the parked producer was released with DeadObject"
         else
@@ -237,10 +247,21 @@ if [ -n "$SVC" ]; then
     # `recv` with nothing in flight when the service is killed.
     probe 60 orphan rsb107.orphan > "$OUT" 2>/tmp/rsb107-orphan.err &
     CONSUMER=$!
-    sleep 2
+    # Waited on the service's own counter, not a clock: the gate below
+    # asks for at least one item, and a fixed sleep decides that gate on
+    # an `adb` round trip or a cold device. `sent` counts items this
+    # producer has actually handed to the driver (one item fills a batch
+    # here), and `oneway` order puts that batch on the consumer's node
+    # ahead of the kill.
+    for _ in $(seq 1 40); do
+        probe 20 status rsb107.orphan 2>/dev/null | grep -q 'sent=[1-9]' && break
+        sleep 0.5
+    done
     stop "$SVC"
     wait "$CONSUMER"
-    if grep -q '^RESULT orphan [0-9]* err:DeadObject$' "$OUT"; then
+    # At least one item: `[0-9]*` would also pass a run where no batch
+    # ever arrived and only the death link fired.
+    if grep -q '^RESULT orphan [1-9][0-9]* err:DeadObject$' "$OUT"; then
         ok "the blocked consumer was released with DeadObject: $(cat "$OUT")"
     else
         bad "got '$(cat "$OUT")' (want 'RESULT orphan <n> err:DeadObject')"

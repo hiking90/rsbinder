@@ -38,8 +38,13 @@ interface IStreamSink {
      * so a producer that dies is otherwise indistinguishable from one
      * with nothing to send yet.
      *
-     * A producer may already hold an opening window of credit and send
-     * batches right behind this call, without waiting for a grant.
+     * A producer opens with a window of credit of its own and sends
+     * batches right behind this call, without waiting for a grant. It
+     * has to: a consumer grants credit for batches it has drained, so
+     * one that starts at zero would wait for a grant that nothing can
+     * trigger. A consumer that grants from here instead — which this
+     * interface permits but rsbinder's does not do — only widens that
+     * window.
      */
     oneway void onStart(IBinder source);
 

@@ -66,6 +66,11 @@ path = "tests/observer_rpc.rs"
 required-features = ["rpc"]
 
 [[test]]
+name = "stream_rpc"
+path = "tests/stream_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
 name = "aidl_spans"
 path = "tests/aidl_spans.rs"
 required-features = ["rpc", "tracing"]

@@ -47,7 +47,7 @@ reason the producer does not run on the binder thread that took the call:
 use rsbinder::stream::Sink;
 
 impl ILogService for LogService {
-    fn r#tail(&self, sink: &rsbinder::SIBinder, tag: &str) -> rsbinder::status::Result<()> {
+    fn r#tail(&self, sink: &rsbinder::SIBinder, tag: &str) -> rsbinder::BinderResult<()> {
         let mut sink = Sink::<LogLine>::new(sink)?;
         let lines = self.open(tag);
         std::thread::spawn(move || {
@@ -77,7 +77,8 @@ for line in &mut lines {
 
 `Receiver<T>` is an `Iterator<Item = BinderResult<T>>` that ends when the
 producer does; `recv`, `try_recv` and `recv_timeout` are the same thing one item
-at a time. The two ends need not share a Rust type — items are encoded with the
+at a time, differing only in how long they wait for one — each may still send a
+grant it owes before it answers. The two ends need not share a Rust type — items are encoded with the
 codec [`to_bytes`](./data-serialization.md) uses, so they only have to agree on
 the wire. For the same reason **an item may hold neither a binder nor a file
 descriptor**; `send` refuses one that does.
@@ -111,7 +112,9 @@ order — the kernel per node, an RPC session per address — which is what
 guarantees the source is known before the first batch and that `onEnd` cannot
 overtake the last one. It also means neither end ever waits on the other's
 threads: granting credit costs the consumer one local send, however busy the
-producer's process is.
+producer's process is. On the kernel that send is all it costs; over RPC it also
+waits for a free outgoing connection on the session — see [Over
+RPC](#over-rpc).
 
 ## Credit, batches and the two constants
 
@@ -120,17 +123,23 @@ credit, spends one per batch, and waits when it has none; the consumer grants
 credit back for the batches it has taken — half a window at a time while more
 batches are already queued, and everything it owes before it goes to wait.
 
+Only the producer's opening window bounds what is in flight. A grant pays for a
+batch the consumer has already drained, one for one, so the ceiling stays
+whatever `initial_credits` was; `Receiver::with_credit_window(n)` sets the grant
+threshold — a grant leaves once half of `n` is owed — not how far the producer
+may run ahead.
+
 | Constant | Value | Set it with |
 |---|---|---|
 | `DEFAULT_MAX_BATCH_BYTES` | 16 KB | `Sink::with_limits(sink, max_batch_bytes, initial_credits)` |
-| `DEFAULT_CREDIT_WINDOW` | 4 batches | the same, and `Receiver::with_credit_window(n)` on the consumer |
+| `DEFAULT_CREDIT_WINDOW` | 4 batches | `initial_credits` in the same call — the producer's ceiling — and `Receiver::with_credit_window(n)` for the consumer's grant threshold (half of `n`) |
 
 The values are sized against the kernel driver. A process's `oneway`
 transactions share half its binder mapping — about 512 KB at the default 1 MB —
 and once less than a tenth of the mapping is free (about 102 KB) the driver
 starts checking individual senders for spam. A full default window is 64 KB in
 flight, which stays under that line, so one stream never trips the check by
-itself. Raise either number and `window × batch` is the budget to watch;
+itself. Raise either number and `initial_credits × batch` is the budget to watch;
 exhausting the space does not slow a sender down, it fails the call.
 
 The batch size is a threshold, not a cap: an item larger than it still goes out,
@@ -194,7 +203,10 @@ in the same sense.
 
 ## Async
 
-Both ends have `tokio` counterparts, behind the default `tokio` feature.
+Both ends have `tokio` counterparts, behind the default `tokio` feature. Each
+of them sends from the blocking pool, so **poll them inside a Tokio runtime
+context** — `spawn_blocking` panics outside one. (A call made from inside a
+transaction handler runs on the calling thread and is exempt.)
 
 The consumer awaits `recv_async()`. There is no `futures::Stream` impl — that
 would tie rsbinder's public API to a `futures-core` major version — so adapt it
@@ -225,8 +237,15 @@ tokio::spawn(async move {
 
 `send_async` encodes the item when it is called rather than when it is first
 polled, so the future does not borrow the item and is `Send` whatever the item
-type is. All of these are cancel-safe: a future dropped mid-wait loses no item
-and no credit.
+type is. `send_async`, `flush_async` and `recv_async` are cancel-safe: a future
+dropped mid-wait loses no item and no credit. A batch already handed to the
+blocking pool still goes out, and a send that then fails is not forgotten with
+the future — the next call that actually sends a batch (`flush_async`, or a
+`send`/`send_async` that fills one) returns that failure, or the terminator
+does, and the terminator counts those items as lost. The two terminators are not
+waits to abandon — a dropped `end_async` or `end_with_async` leaves the stream
+to `Drop`, which ends it as `EX_ILLEGAL_STATE` without waiting for credit, so
+whatever was still queued is reported lost.
 
 ## Over RPC
 
@@ -269,7 +288,7 @@ interface ITemperatureListener {
 struct Listener(tokio::sync::watch::Sender<f32>);
 
 impl ITemperatureListener for Listener {
-    fn r#onChanged(&self, celsius: f32) -> rsbinder::status::Result<()> {
+    fn r#onChanged(&self, celsius: f32) -> rsbinder::BinderResult<()> {
         self.0.send_replace(celsius); // overwrite and return
         Ok(())
     }
@@ -314,5 +333,8 @@ Compile the two `.aidl` files from `rsbinder/aidl/stream/` with the platform's
   start at zero needs one from `onStart`.
 - **As the producer**, implement `IStreamSource` and count: each `onBatch` spends
   one credit, `request(n)` adds `n`, `onEnd` spends none, and after `cancel` only
-  `onEnd` may still be sent. `onEnd`'s three arguments are the fields of a
-  `binder::Status`; `-129`, `-127` and `-128` are never sent.
+  `onEnd` may still be sent. **Open with at least one credit of your own.** An
+  rsbinder consumer grants only for batches it has already drained, so a
+  producer that starts at zero waits for a grant that nothing can trigger.
+  `onEnd`'s three arguments are the fields of a `binder::Status`; `-129`, `-127`
+  and `-128` are never sent.

@@ -94,11 +94,20 @@ run_pair() {
     echo
     echo "=== $1"
     echo "==> killing any old launcher + cleaning state"
-    adb -s "$DEVICE" shell "pkill -9 -f rpc_incoming_interop 2>/dev/null; rm -f $SOCK /data/local/tmp/rsinc.stdout /data/local/tmp/rsinc.stderr; sleep 1" || true
+    # Bracket pattern: the plain one matches this `sh -c` itself, and
+    # `pkill -f` kills the shell before it reaches the `rm` and the sleep.
+    adb -s "$DEVICE" shell "pkill -9 -f '[r]pc_incoming_interop' 2>/dev/null; rm -f $SOCK /data/local/tmp/rsinc.stdout /data/local/tmp/rsinc.stderr; sleep 1" || true
 
     echo "==> starting libbinder server launcher (background)"
     adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_incoming_interop_launcher $2 > /data/local/tmp/rsinc.stdout 2> /data/local/tmp/rsinc.stderr &" &
-    sleep 3
+    # The launcher prints READY once it has bound, and the client's session
+    # setup has no retry: a fixed sleep decides this gate on a cold device.
+    for _ in $(seq 1 40); do
+        if [ -n "$(adb -s "$DEVICE" shell "grep READY /data/local/tmp/rsinc.stderr 2>/dev/null")" ]; then
+            break
+        fi
+        sleep 0.5
+    done
     adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
 
     echo "==> running rsbinder client"
@@ -113,7 +122,7 @@ run_pair() {
     adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
 
     echo "==> stopping launcher"
-    adb -s "$DEVICE" shell "pkill -9 -f rpc_incoming_interop_launcher 2>/dev/null; rm -f $SOCK" || true
+    adb -s "$DEVICE" shell "pkill -9 -f '[r]pc_incoming_interop_launcher' 2>/dev/null; rm -f $SOCK" || true
 
     if ! grep -q '^client-exit=0$' <<<"$client_out"; then
         echo "FAIL ($1): rsbinder client exited non-zero"

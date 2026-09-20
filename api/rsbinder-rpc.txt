@@ -2435,14 +2435,14 @@ impl<'a> rsbinder::rpc::session::RpcClientConfig<'a>
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::fd_mode(self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::handshake_timeout(self, core::time::Duration) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::incoming_connections(self, u32) -> Self
-pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + 'a) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + core::marker::Send + 'a) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::outgoing_connections(self, u32) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::session_id(self, &'a [u8]) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::timeout(self, core::time::Duration) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix(&'a std::path::Path, u32) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix_abstract(&'a [u8], u32) -> Self
 impl<'a> core::marker::Freeze for rsbinder::rpc::session::RpcClientConfig<'a>
-impl<'a> !core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> !core::marker::Sync for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> core::marker::Unpin for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> core::marker::UnsafeUnpin for rsbinder::rpc::session::RpcClientConfig<'a>
@@ -2909,14 +2909,14 @@ impl<'a> rsbinder::rpc::session::RpcClientConfig<'a>
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::fd_mode(self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::handshake_timeout(self, core::time::Duration) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::incoming_connections(self, u32) -> Self
-pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + 'a) -> Self
+pub fn rsbinder::rpc::session::RpcClientConfig<'a>::new(u32, impl core::ops::function::FnMut() -> rsbinder::Result<alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>> + core::marker::Send + 'a) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::outgoing_connections(self, u32) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::session_id(self, &'a [u8]) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::timeout(self, core::time::Duration) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix(&'a std::path::Path, u32) -> Self
 pub fn rsbinder::rpc::session::RpcClientConfig<'a>::unix_abstract(&'a [u8], u32) -> Self
 impl<'a> core::marker::Freeze for rsbinder::rpc::session::RpcClientConfig<'a>
-impl<'a> !core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
+impl<'a> core::marker::Send for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> !core::marker::Sync for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> core::marker::Unpin for rsbinder::rpc::session::RpcClientConfig<'a>
 impl<'a> core::marker::UnsafeUnpin for rsbinder::rpc::session::RpcClientConfig<'a>

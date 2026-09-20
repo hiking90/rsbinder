@@ -30,6 +30,12 @@ interface IStreamSource {
      * driver reports a dead or full receiver on a `oneway` call too — so
      * a consumer keeps the credit and grants it again later.
      *
+     * A consumer grants again for every batch it drains, for as long as
+     * it wants more: a producer that runs out of credit sends nothing
+     * further, and nothing else will prompt it to. There is no timeout on
+     * that wait, and with both processes alive no death link ends it
+     * either.
+     *
      * It travels consumer to producer, the opposite direction from
      * IStreamSink, so it neither needs nor disturbs the ordering the
      * sink relies on.
